@@ -11,6 +11,20 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Fixed
+
+- **`mms add --from-clients` no longer saves a prefix longer than the
+  tool-name hard limit once a truncated base collides 99 times** (#825).
+  Truncation reserved a fixed two characters for the collision suffix, which
+  covers `2` through `99`; the hundredth server sharing a truncated base took
+  a three-digit suffix and overflowed by one character, leaving zero room for
+  the upstream tool name so clients drop those tools silently. The reservation
+  is now derived from the suffix actually applied — shrink by the measured
+  overflow, re-suffix, re-measure — so the guarantee holds at any collision
+  count. **Behavior change**: in that case the saved prefix is one or more
+  characters shorter than before; prefixes below 99 collisions are unchanged,
+  and this path only ever runs where nobody could re-prompt.
+
 ## [0.2.0] — 2026-08-10
 
 ### Upgrade notes

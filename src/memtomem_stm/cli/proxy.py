@@ -3386,12 +3386,26 @@ def _auto_prefix(name: str, taken: set[str], warnings: list[str]) -> str:
     hold up front, so an over-budget suggestion is truncated rather than
     saved or refused. Truncation happens on the *base*, before the
     collision suffix is re-applied, so the shortened value stays unique.
+
+    How much room that suffix needs is not known up front: it widens with
+    the number of servers already truncated onto the same base, so reserving
+    a fixed two characters held only to ``base99`` and let the hundredth
+    collision overflow (#825). Shrink by whatever the suffixed value actually
+    overflows by, and re-measure — each pass gives up at least one character,
+    so the loop ends.
     """
     hard_limit = tool_name_budget.prefix_hard_limit()
     prefix = _suggest_prefix(name, taken)
     if len(prefix) > hard_limit:
-        base = _suggest_prefix(name, set())[: max(hard_limit - 2, 1)].rstrip("_") or "srv"
-        prefix = _suggest_prefix(base, taken)
+        full = _suggest_prefix(name, set())
+        room = hard_limit
+        while True:
+            base = full[:room].rstrip("_") or "srv"
+            prefix = _suggest_prefix(base, taken)
+            overflow = len(prefix) - hard_limit
+            if overflow <= 0 or room <= 1:
+                break
+            room = max(1, room - overflow)
     warn_at = tool_name_budget.prefix_warn_threshold()
     if len(prefix) > warn_at:
         max_tool = tool_name_budget.TOOL_NAME_LIMIT - tool_name_budget.overhead() - len(prefix)

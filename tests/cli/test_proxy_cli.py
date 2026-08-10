@@ -6255,6 +6255,51 @@ class TestAddFromClientsNonInteractive:
         assert prefixes.prefix_format_error(saved["prefix"]) is None
         assert "leaves only" in result.output  # budget warning surfaced
 
+    def test_auto_prefix_stays_within_budget_past_a_two_digit_suffix(
+        self, runner, config, monkeypatch
+    ):
+        """#825: truncation reserved a fixed two characters for the collision
+        suffix, which covers ``2``-``99`` and nothing beyond. Names that all
+        truncate to the same base drive the suffix to three digits, and the
+        hundredth one overflowed the hard limit — silently, because this path
+        has no prompt to re-run. Anything under 100 collisions passes either
+        way, so the count is the test."""
+        from memtomem_stm.proxy import prefixes, tool_name_budget
+
+        hard_limit = tool_name_budget.prefix_hard_limit()
+        # Identical for the first hard_limit characters, unique in full, so
+        # every candidate truncates onto one base and collides there.
+        names = [("x" * hard_limit) + f"{index:05d}" for index in range(120)]
+        self._seed_config(config, {})
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": name,
+                    "source": "X",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                }
+                for name in names
+            ],
+        )
+
+        result = runner.invoke(cli, ["add", "--from-clients", "--all", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+
+        servers = json.loads(config.read_text(encoding="utf-8"))["upstream_servers"]
+        assert len(servers) == len(names)
+        saved = {name: entry["prefix"] for name, entry in servers.items()}
+        over_budget = {name: prefix for name, prefix in saved.items() if len(prefix) > hard_limit}
+        assert not over_budget, (
+            f"prefixes above the {hard_limit}-char hard limit: "
+            f"{ {name: (prefix, len(prefix)) for name, prefix in over_budget.items()} }"
+        )
+        for prefix in saved.values():
+            assert prefixes.prefix_format_error(prefix) is None
+        # Truncation must not collapse distinct servers onto one prefix — the
+        # runtime refuses a config with duplicates.
+        assert len(set(saved.values())) == len(names)
+
     def test_select_imports_only_the_named_servers(self, runner, config, monkeypatch):
         self._seed_config(config, {})
         self._stub_candidates(monkeypatch, self._two_candidates())
