@@ -15,11 +15,18 @@ changes inline only. See the deprecation policy in
 
 ### Upgrade notes
 
-- **Upgrade memtomem-stm and memtomem core together.** The proxy now requires
-  `mcp[cli]>=2,<3`; core 0.4.0 is the first Core release on that SDK major.
-  A stack mixing one package on `mcp` 1.x with one on 2.x does not resolve,
-  and there is no escape hatch — the SDK supports no dual 1.x/2.x codebase.
-  Stay on memtomem-stm 0.1.45 with core 0.3.x if you cannot move both (#801).
+- **If memtomem-stm shares a Python environment with memtomem core, upgrade
+  core to 0.4.0 with it.** The proxy now requires `mcp[cli]>=2,<3`, and 0.4.0
+  is the first core release on that SDK major: core 0.3.14 caps `mcp<2`, so a
+  resolver refuses the pair outright, while 0.3.13 and earlier declare no upper
+  bound and instead fail at import once `mcp` 2.x is installed
+  (`mcp.server.fastmcp` is gone). Installing memtomem-stm 0.1.45 alongside core
+  0.3.x is the fallback if you cannot move both. **Separate environments are
+  unaffected** — including the documented one-`uv tool install`-per-package
+  setup — because the two are separate processes that talk over MCP, not
+  Python imports. The weekly compatibility matrix exercises exactly that: this
+  proxy on `mcp` 2.x against cores 0.3.8 through 0.3.14 pinned to `mcp<2`
+  (#801).
 - **`mms doctor` now exits 1 on an unreachable Ollama endpoint or a missing
   model** that the effective config actively depends on, where it previously
   passed while runtime silently fell back to BM25 or truncation. Dormant LLM
@@ -78,9 +85,12 @@ changes inline only. See the deprecation policy in
   connect timeout covers connect/write/pool, the read leg keeps the SDK's
   long default so live streams are not cut short).
   **Behavior change**: the floor is hard — the SDK supports no dual 1.x/2.x
-  codebase — so **memtomem-stm and memtomem core must be upgraded together**;
-  a resolver will refuse a mix of one package on `mcp` 1.x and one on 2.x.
-  The proxy's own wire behavior is unchanged.
+  codebase — so **a Python environment holding both memtomem-stm and memtomem
+  core needs core 0.4.0**; a resolver will refuse a mix of one package on
+  `mcp` 1.x and one on 2.x. This is a packaging constraint, not a protocol
+  one: separate environments keep working against older cores, which is what
+  the core-compatibility matrix asserts. The proxy's own wire behavior is
+  unchanged.
 - **Fixed a silent drop of `tools/list_changed` under the 2.0 SDK.** 2.0 turned
   `ServerNotification` from a RootModel into a plain union, so the notification
   handler receives the notification itself and the previous `.root` unwrap
