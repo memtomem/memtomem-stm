@@ -3387,25 +3387,33 @@ def _auto_prefix(name: str, taken: set[str], warnings: list[str]) -> str:
     saved or refused. Truncation happens on the *base*, before the
     collision suffix is re-applied, so the shortened value stays unique.
 
-    How much room that suffix needs is not known up front: it widens with
-    the number of servers already truncated onto the same base, so reserving
-    a fixed two characters held only to ``base99`` and let the hundredth
-    collision overflow (#825). Shrink by whatever the suffixed value actually
-    overflows by, and re-measure — each pass gives up at least one character,
-    so the loop ends.
+    How much room that suffix needs is not known before a base is chosen: it
+    widens with the number of servers already truncated onto the same base, so
+    the fixed two-character reservation held only to ``base99`` and let the
+    hundredth collision overflow (#825). The reservation stays — it is what
+    every sub-100 case resolves on, and widening it by default would spend
+    tool-name budget nothing asks for — but it now gives up one further
+    character at a time for as long as the suffixed value overflows. Stepping
+    by one never skips a base length that would have fit.
+
+    One case has no answer to give: when ``prefix_hard_limit()`` is itself
+    near zero — reachable only by pointing ``MMS_CLIENT_SERVER_NAME`` at an
+    absurdly long client-side name — a single collision suffix cannot fit
+    under it. The loop stops at a one-character base and returns a value the
+    warning below reports as over-budget, which is the same thing the fixed
+    reservation did there.
     """
     hard_limit = tool_name_budget.prefix_hard_limit()
     prefix = _suggest_prefix(name, taken)
     if len(prefix) > hard_limit:
         full = _suggest_prefix(name, set())
-        room = hard_limit
+        room = max(hard_limit - 2, 1)
         while True:
             base = full[:room].rstrip("_") or "srv"
             prefix = _suggest_prefix(base, taken)
-            overflow = len(prefix) - hard_limit
-            if overflow <= 0 or room <= 1:
+            if len(prefix) <= hard_limit or room <= 1:
                 break
-            room = max(1, room - overflow)
+            room -= 1
     warn_at = tool_name_budget.prefix_warn_threshold()
     if len(prefix) > warn_at:
         max_tool = tool_name_budget.TOOL_NAME_LIMIT - tool_name_budget.overhead() - len(prefix)

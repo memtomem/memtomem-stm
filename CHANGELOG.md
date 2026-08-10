@@ -18,12 +18,16 @@ changes inline only. See the deprecation policy in
   Truncation reserved a fixed two characters for the collision suffix, which
   covers `2` through `99`; the hundredth server sharing a truncated base took
   a three-digit suffix and overflowed by one character, leaving zero room for
-  the upstream tool name so clients drop those tools silently. The reservation
-  is now derived from the suffix actually applied — shrink by the measured
-  overflow, re-suffix, re-measure — so the guarantee holds at any collision
-  count. **Behavior change**: in that case the saved prefix is one or more
-  characters shorter than before; prefixes below 99 collisions are unchanged,
-  and this path only ever runs where nobody could re-prompt.
+  the upstream tool name so clients drop those tools silently. The two-char
+  reservation stays — it is what every sub-100 case resolves on — and the base
+  now gives up one further character at a time for as long as the suffixed
+  value still overflows. **Behavior change**: past 99 collisions on one
+  truncated base the saved prefix is shorter than before, where the old value
+  was one the tool-name budget forbids; every prefix below that threshold is
+  byte-for-byte unchanged. The one case still without an answer is a
+  `prefix_hard_limit()` near zero — reachable only by pointing
+  `MMS_CLIENT_SERVER_NAME` at an absurdly long client-side name — where no
+  suffix fits at all; that was equally true before.
 
 ## [0.2.0] — 2026-08-10
 

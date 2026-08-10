@@ -6300,6 +6300,40 @@ class TestAddFromClientsNonInteractive:
         # runtime refuses a config with duplicates.
         assert len(set(saved.values())) == len(names)
 
+    def test_auto_prefix_keeps_the_two_char_reservation_below_the_overflow(
+        self, runner, config, monkeypatch
+    ):
+        """The #825 fix must not spend tool-name budget on cases that never
+        overflowed. Truncation has always reserved two characters for the
+        collision suffix, so an over-budget name with no collisions resolves
+        two characters below the hard limit — and a 3-char upstream tool
+        still composes. Widening the reservation to the full limit would
+        keep every prefix "legal" while silently dropping those tools."""
+        from memtomem_stm.proxy import tool_name_budget
+
+        hard_limit = tool_name_budget.prefix_hard_limit()
+        long_name = "x" * (hard_limit + 20)
+        self._seed_config(config, {})
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": long_name,
+                    "source": "X",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+
+        result = runner.invoke(cli, ["add", "--from-clients", "--all", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+
+        prefix = json.loads(config.read_text(encoding="utf-8"))["upstream_servers"][long_name][
+            "prefix"
+        ]
+        assert len(prefix) == hard_limit - 2
+        assert not tool_name_budget.overflows(prefix, "abc")
+
     def test_select_imports_only_the_named_servers(self, runner, config, monkeypatch):
         self._seed_config(config, {})
         self._stub_candidates(monkeypatch, self._two_candidates())
