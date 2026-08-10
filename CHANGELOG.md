@@ -11,6 +11,26 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-08-10
+
+### Upgrade notes
+
+- **Upgrade memtomem-stm and memtomem core together.** The proxy now requires
+  `mcp[cli]>=2,<3`; core 0.4.0 is the first Core release on that SDK major.
+  A stack mixing one package on `mcp` 1.x with one on 2.x does not resolve,
+  and there is no escape hatch — the SDK supports no dual 1.x/2.x codebase.
+  Stay on memtomem-stm 0.1.45 with core 0.3.x if you cannot move both (#801).
+- **`mms doctor` now exits 1 on an unreachable Ollama endpoint or a missing
+  model** that the effective config actively depends on, where it previously
+  passed while runtime silently fell back to BM25 or truncation. Dormant LLM
+  blocks, `auto`, extraction, and non-Ollama providers are still not probed
+  (#820).
+- **`mms add --from-clients` suggests different prefixes in two cases**:
+  underscore runs now collapse with `_{2,}` (`a___b` → `a_b`, where the old
+  single pass left `a__b` — a value the proxy refuses to load), and an
+  over-budget suggestion is truncated to the tool-name hard limit instead of
+  being offered to a prompt (#819).
+
 ### Added
 
 - **`mms doctor` now diagnoses active Ollama model dependencies** (#820,
