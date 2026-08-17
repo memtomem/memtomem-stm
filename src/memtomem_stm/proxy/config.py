@@ -14,7 +14,9 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, Self, Union, get_args, get_origin
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic.fields import FieldInfo
 from pydantic_core import ErrorDetails
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
 
 from memtomem_stm.proxy import prefixes
 
@@ -529,6 +531,125 @@ def _env_override_hint(
     if not implicated:
         return ""
     return " (env override(s) implicated: " + ", ".join(sorted(implicated)) + ")"
+
+
+def live_env_paths(
+    entries: list[tuple[str, tuple[str, ...]]],
+) -> list[tuple[str, tuple[str, ...]]]:
+    """The entries a later one did not cover, keeping order.
+
+    Settings resolves a mapping parent and a deeper child last-one-wins, so a
+    variable whose path a LATER variable covers contributed nothing to the
+    resolved config. Naming it points the operator at a value that is not in
+    the config being complained about, and hides the one that is. A later
+    variable that goes DEEPER does not cover it: settings merges that on top
+    and both are really present.
+    """
+    return [
+        (name, path)
+        for index, (name, path) in enumerate(entries)
+        if not any(path[: len(later)] == later for _, later in entries[index + 1 :])
+    ]
+
+
+def env_var_hint_for_validation_error(
+    exc: Exception, environ: Mapping[str, str] | None = None
+) -> str:
+    """Name the ``MEMTOMEM_STM_*`` var(s) implicated in an ``STMConfig`` error.
+
+    The sibling of ``_env_override_hint`` for the OTHER failure point: that one
+    explains a merged-config failure inside the load path, which owns an env
+    overlay to attribute against; this one explains ``STMConfig()`` itself
+    failing, where the only evidence is the error location and the environment.
+
+    Hints are derived from the var names that EXIST, never synthesized from the
+    error location, so the operator is only ever pointed at something they set:
+
+    - a var at or above the location is named (``…__CACHE__ENABLED=nope``, and
+      an aggregate ``…__UPSTREAM_SERVERS`` payload whose inner entry faulted);
+    - a var BELOW the location is named too, because a model-level validator
+      reports at the model's own path while the offending field sits under it;
+    - a ``missing`` error is the exception that needs its SIBLINGS: the field
+      the error names is precisely the one nobody set, so the vars that created
+      the incomplete entry are the ones to fix (``…__GH__COMMAND`` for a
+      ``upstream_servers.gh.prefix`` that is missing). A var ABOVE that entry
+      qualifies only if its JSON payload actually reaches it — otherwise a
+      ``MEMTOMEM_STM_PROXY`` block carrying nothing but ``cache`` settings gets
+      blamed for an upstream server it never mentions.
+
+    A model-level error names every var under the model, the way
+    ``_env_override_hint`` names every leaf for a root error: the validator
+    that failed spans them, so narrowing would mean guessing.
+
+    A variable a later one covered is never named — it did not contribute the
+    value being complained about. See ``live_env_paths``.
+
+    Matching is case-insensitive because settings resolves names that way; only
+    names, never values, are rendered (cf. ``hide_input_in_errors``).
+    """
+    if not isinstance(exc, ValidationError):
+        return ""
+    env = os.environ if environ is None else environ
+    prefix = "memtomem_stm_"
+    var_paths: dict[tuple[str, ...], str] = {}
+    for key in env:
+        lowered = key.lower()
+        if lowered.startswith(prefix) and len(lowered) > len(prefix):
+            var_paths[tuple(lowered[len(prefix) :].split("__"))] = key
+
+    def _starts_with(path: tuple[str, ...], head: tuple[str, ...]) -> bool:
+        return path[: len(head)] == head
+
+    def _payload_reaches(name: str, path: tuple[str, ...], target: tuple[str, ...]) -> bool:
+        """Whether the var's JSON payload declares anything at *target*.
+
+        Keys are matched case-insensitively as a fallback, because an error
+        location reports a model field by its DECLARED name while the payload
+        may spell it any way settings accepts (``'{"UPSTREAM_SERVERS": …}'``).
+        Exact first, so a mapping whose keys are operator data — a server named
+        ``GH`` is not the one named ``gh`` — is read literally where it can be.
+        """
+        try:
+            node = json.loads(env[name])
+        except (TypeError, ValueError):
+            return False  # a scalar var above the entry declared no entry
+        for key in target[len(path) :]:
+            if not isinstance(node, dict):
+                return False
+            if key in node:
+                node = node[key]
+                continue
+            folded = [k for k in node if str(k).lower() == key.lower()]
+            if not folded:
+                return False
+            node = node[folded[0]]
+        return True
+
+    # First position, last value — the collapse settings applies to
+    # case-equivalent names — then drop the variables a later one covered.
+    live = live_env_paths([(name, path) for path, name in var_paths.items()])
+
+    implicated: set[str] = set()
+    for err in exc.errors():
+        loc = tuple(str(part) for part in err.get("loc", ()))
+        if not loc:
+            continue  # no path to attribute; naming every var would be noise
+        for name, path in live:
+            if err.get("type") == "missing":
+                # Siblings of the missing field: a var that set one of them, or
+                # a payload var above the entry that does declare it.
+                parent = loc[:-1]
+                if not parent:
+                    continue
+                if _starts_with(path, parent) or (
+                    _starts_with(parent, path) and _payload_reaches(name, path, parent)
+                ):
+                    implicated.add(name)
+            elif _starts_with(loc, path) or _starts_with(path, loc):
+                implicated.add(name)
+    if not implicated:
+        return ""
+    return " (env var(s) implicated: " + ", ".join(sorted(implicated)) + ")"
 
 
 class CompressionStrategy(StrEnum):
@@ -1795,6 +1916,164 @@ class ProxyConfig(BaseModel):
             return ConfigLoadResult(
                 config=None, error=_sanitized_load_error(exc), unknown_keys=unknown_keys
             )
+
+
+def _resolve_config_path_for_completion(
+    proxy_init: dict[str, Any] | None, proxy_env: dict[str, Any]
+) -> Path:
+    """Where the config file lives, per the precedence that names it.
+
+    ``config_path`` is itself configurable, so the completion source cannot ask
+    a validated ``ProxyConfig`` for it — that config is what is being built.
+    Init kwargs outrank the environment, matching the source order, and the
+    field default is the last word. A value that is PRESENT but empty is
+    honored, not skipped: ``config_path=""`` resolves to ``Path(".")`` at
+    runtime, and reading the default file instead would complete a server out
+    of a file the running config never names.
+
+    A present value of some other type needs no handling of its own: the field
+    is a ``Path``, which pydantic refuses to build from anything but a string
+    or a path (``bytes`` included), so such a config fails validation whatever
+    this returns.
+    """
+    for source in (proxy_init, proxy_env):
+        if isinstance(source, dict) and "config_path" in source:
+            raw = source["config_path"]
+            if isinstance(raw, str | Path):
+                return Path(raw).expanduser()
+    return Path(str(ProxyConfig.model_fields["config_path"].default)).expanduser()
+
+
+def _completed_entry_validates(file_entry: dict[str, Any], env_entry: dict[str, Any]) -> bool:
+    """Whether the file's entry, with the environment's fields on top, stands up.
+
+    The gate that keeps the completion incapable of breaking a config that
+    worked. Emitting the file's entry can only help when the result VALIDATES;
+    when it does not — a file field that is invalid on its own, an entry a
+    higher-precedence source was already completing — contributing nothing
+    leaves exactly the outcome the operator had before this source existed,
+    including the identity of the error they were already getting.
+
+    Asking whether the *environment's* fragment validates alone would be the
+    wrong question in both directions: it says "skip" for a per-field override
+    of an optional field, where the file has everything else to give
+    (``…__GH__PREFIX`` over a file-declared server), and it says "complete" for
+    a fragment that a broken file entry then fails.
+
+    The merge is the shallow approximation of what ``deep_update`` does one
+    level down; it decides eligibility only, and the real layering is settings'.
+    """
+    try:
+        UpstreamServerConfig.model_validate({**file_entry, **env_entry})
+    except Exception:
+        return False
+    return True
+
+
+def _file_upstream_servers(path: Path) -> dict[str, Any]:
+    """``upstream_servers`` as the file literally spells it, or ``{}``.
+
+    Deliberately raw and forgiving: this runs during ``STMConfig()``, where a
+    broken file must not become a construction failure. Every diagnostic about
+    the file — unknown keys, permissions, parse errors — belongs to
+    ``load_from_file_with_status``, which reads it again for real.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    servers = data.get("upstream_servers")
+    return servers if isinstance(servers, dict) else {}
+
+
+class UpstreamServerCompletionSource(PydanticBaseSettingsSource):
+    """Completes a file-declared upstream server that env vars override per field.
+
+    ``MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__<NAME>__<FIELD>`` is a documented
+    override shape, but settings validates the fragment it built from the
+    environment on its own, where a server carrying one field has no ``prefix``
+    — so overriding one field of a server the FILE declares made ``STMConfig()``
+    refuse to construct, naming a field the operator did set in a file the
+    process never opened (#835). That killed the server at startup and every
+    ``STMConfig()`` in the CLI with it.
+
+    Ordered BELOW the environment source, this supplies the file's entry for
+    exactly those server names the environment mentions, so ``deep_update``
+    lands the env fields on top and validation sees the completed server —
+    the same config the load path would later merge. Servers the environment
+    does not mention are NOT supplied: the config-file boundary
+    (``docs/configuration.md``) keeps the file's own upstreams arriving through
+    ``load_from_file_with_status``, whose warnings have nowhere to go from
+    inside a settings source.
+
+    Server names match exactly, without case folding, because settings does not
+    fold mapping keys either: the environment always yields a lower-cased name,
+    so a file server spelled ``GitHub`` is not completed by ``…__GITHUB__…`` —
+    and is not merged with it downstream either, which is the point. Anything
+    that goes wrong here yields ``{}``, leaving the pre-#835 behavior.
+    """
+
+    def __init__(
+        self,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+    ) -> None:
+        super().__init__(settings_cls)
+        self._init_settings = init_settings
+        self._env_settings = env_settings
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        # This source contributes a subtree through __call__; the per-field hook
+        # is part of the ABC and is never consulted for it.
+        raise NotImplementedError
+
+    def __call__(self) -> dict[str, Any]:
+        try:
+            return self._completion()
+        except Exception:
+            # A completion is an optimization on the operator's behalf; it must
+            # never be the reason a config fails to build.
+            logger.debug("Upstream-server completion skipped", exc_info=True)
+            return {}
+
+    def _completion(self) -> dict[str, Any]:
+        proxy_init = self._init_settings().get("proxy")
+        if proxy_init is not None and not isinstance(proxy_init, dict):
+            # An explicit `proxy=` object replaces the field wholesale, so there
+            # is no env fragment left for the file to complete.
+            return {}
+        try:
+            env_data = self._env_settings()
+        except Exception:
+            # A malformed complex value; the main build raises it unchanged.
+            return {}
+        proxy_env = env_data.get("proxy")
+        if not isinstance(proxy_env, dict):
+            return {}
+        env_servers = proxy_env.get("upstream_servers")
+        if not isinstance(env_servers, dict):
+            return {}
+        # A non-mapping env entry replaces the whole server rather than
+        # overriding fields of it, so the file has nothing to contribute.
+        env_entries = {
+            name: entry for name, entry in env_servers.items() if isinstance(entry, dict)
+        }
+        if not env_entries:
+            return {}
+        file_servers = _file_upstream_servers(
+            _resolve_config_path_for_completion(proxy_init, proxy_env)
+        )
+        completion = {}
+        for name, env_entry in env_entries.items():
+            file_entry = file_servers.get(name)
+            if isinstance(file_entry, dict) and _completed_entry_validates(file_entry, env_entry):
+                completion[name] = file_entry
+        if not completion:
+            return {}
+        return {"proxy": {"upstream_servers": completion}}
 
 
 class ProxyConfigLoader:
