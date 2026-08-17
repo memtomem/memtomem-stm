@@ -208,6 +208,8 @@ Each call to `stm_proxy_read_more` resets the TTL. The `ttl` field is omitted on
 }
 ```
 
+The `progressive` block is **optional**: setting `"compression": "progressive"` without it applies the defaults shown above (`chunk_size` 4000, `max_stored` 200, `ttl_seconds` 1800, `include_structure_hint` true).
+
 Progressive is **opt-in only** — `auto` strategy never selects it because it changes the agent interaction pattern (requires calling `stm_proxy_read_more`). When configured, the proxied tool description includes a convention suffix (`| Chunked: use stm_proxy_read_more for more`) so the agent knows to expect chunked delivery.
 
 > **Note**: Memory surfacing (Stage 3) on progressive delivery is **mode-aware**. It runs on the first chunk when `injection_mode` is `append` or `section` — both modes preserve the `PROGRESSIVE_FOOTER_TOKEN` concat invariant that `stm_proxy_read_more` relies on. It is **skipped only for `prepend`**, which would shift character offsets for subsequent `stm_proxy_read_more` calls.

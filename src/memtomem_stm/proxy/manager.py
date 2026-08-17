@@ -2396,6 +2396,18 @@ class ProxyManager:
             if override.extraction is not None:
                 extraction_enabled = override.extraction
 
+        # #830: ``"compression": "progressive"`` with no ``"progressive"``
+        # block used to fall through to ``get_compressor(PROGRESSIVE)`` — a
+        # NoopCompressor — and ship the full response verbatim. The block is
+        # optional (docs/compression.md documents per-field defaults, and the
+        # tool description advertises chunking off the strategy alone), so
+        # apply ``ProgressiveConfig()`` here. Conditional on the RESOLVED
+        # strategy, and placed after the override merge, so a tool override
+        # selecting progressive is covered while non-progressive configs keep
+        # ``progressive=None`` and their cache fingerprint unchanged.
+        if compression == CompressionStrategy.PROGRESSIVE and progressive_cfg is None:
+            progressive_cfg = ProgressiveConfig()
+
         return ToolConfig(
             compression=compression,
             max_chars=max_chars,
@@ -4182,8 +4194,12 @@ class ProxyManager:
         # Read by the metrics block in ``_call_tool_inner`` to pick the token
         # estimator, so it must track the gate exactly.
         unicode_token_gate = False
-        if tc.compression == CompressionStrategy.PROGRESSIVE and tc.progressive:
-            pcfg = tc.progressive
+        if tc.compression == CompressionStrategy.PROGRESSIVE:
+            # ``_resolve_tool_config`` already defaults the block on this
+            # strategy (#830); the fallback keeps a directly-constructed
+            # ToolConfig off the silent-passthrough path, and mirrors the
+            # ratio-guard Tier-1 call below.
+            pcfg = tc.progressive or ProgressiveConfig()
             if len(cleaned) <= pcfg.chunk_size:
                 # Content fits in one chunk — passthrough
                 compressed = cleaned
