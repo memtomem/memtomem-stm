@@ -533,6 +533,25 @@ def _env_override_hint(
     return " (env override(s) implicated: " + ", ".join(sorted(implicated)) + ")"
 
 
+def live_env_paths(
+    entries: list[tuple[str, tuple[str, ...]]],
+) -> list[tuple[str, tuple[str, ...]]]:
+    """The entries a later one did not cover, keeping order.
+
+    Settings resolves a mapping parent and a deeper child last-one-wins, so a
+    variable whose path a LATER variable covers contributed nothing to the
+    resolved config. Naming it points the operator at a value that is not in
+    the config being complained about, and hides the one that is. A later
+    variable that goes DEEPER does not cover it: settings merges that on top
+    and both are really present.
+    """
+    return [
+        (name, path)
+        for index, (name, path) in enumerate(entries)
+        if not any(path[: len(later)] == later for _, later in entries[index + 1 :])
+    ]
+
+
 def env_var_hint_for_validation_error(
     exc: Exception, environ: Mapping[str, str] | None = None
 ) -> str:
@@ -562,6 +581,9 @@ def env_var_hint_for_validation_error(
     ``_env_override_hint`` names every leaf for a root error: the validator
     that failed spans them, so narrowing would mean guessing.
 
+    A variable a later one covered is never named — it did not contribute the
+    value being complained about. See ``live_env_paths``.
+
     Matching is case-insensitive because settings resolves names that way; only
     names, never values, are rendered (cf. ``hide_input_in_errors``).
     """
@@ -579,23 +601,40 @@ def env_var_hint_for_validation_error(
         return path[: len(head)] == head
 
     def _payload_reaches(name: str, path: tuple[str, ...], target: tuple[str, ...]) -> bool:
-        """Whether the var's JSON payload declares anything at *target*."""
+        """Whether the var's JSON payload declares anything at *target*.
+
+        Keys are matched case-insensitively as a fallback, because an error
+        location reports a model field by its DECLARED name while the payload
+        may spell it any way settings accepts (``'{"UPSTREAM_SERVERS": …}'``).
+        Exact first, so a mapping whose keys are operator data — a server named
+        ``GH`` is not the one named ``gh`` — is read literally where it can be.
+        """
         try:
             node = json.loads(env[name])
         except (TypeError, ValueError):
             return False  # a scalar var above the entry declared no entry
         for key in target[len(path) :]:
-            if not isinstance(node, dict) or key not in node:
+            if not isinstance(node, dict):
                 return False
-            node = node[key]
+            if key in node:
+                node = node[key]
+                continue
+            folded = [k for k in node if str(k).lower() == key.lower()]
+            if not folded:
+                return False
+            node = node[folded[0]]
         return True
+
+    # First position, last value — the collapse settings applies to
+    # case-equivalent names — then drop the variables a later one covered.
+    live = live_env_paths([(name, path) for path, name in var_paths.items()])
 
     implicated: set[str] = set()
     for err in exc.errors():
         loc = tuple(str(part) for part in err.get("loc", ()))
         if not loc:
             continue  # no path to attribute; naming every var would be noise
-        for path, name in var_paths.items():
+        for name, path in live:
             if err.get("type") == "missing":
                 # Siblings of the missing field: a var that set one of them, or
                 # a payload var above the entry that does declare it.
@@ -1891,6 +1930,11 @@ def _resolve_config_path_for_completion(
     honored, not skipped: ``config_path=""`` resolves to ``Path(".")`` at
     runtime, and reading the default file instead would complete a server out
     of a file the running config never names.
+
+    A present value of some other type needs no handling of its own: the field
+    is a ``Path``, which pydantic refuses to build from anything but a string
+    or a path (``bytes`` included), so such a config fails validation whatever
+    this returns.
     """
     for source in (proxy_init, proxy_env):
         if isinstance(source, dict) and "config_path" in source:
@@ -1900,19 +1944,27 @@ def _resolve_config_path_for_completion(
     return Path(str(ProxyConfig.model_fields["config_path"].default)).expanduser()
 
 
-def _validates_as_upstream_server(entry: dict[str, Any]) -> bool:
-    """Whether the environment's fragment for one server stands on its own.
+def _completed_entry_validates(file_entry: dict[str, Any], env_entry: dict[str, Any]) -> bool:
+    """Whether the file's entry, with the environment's fields on top, stands up.
 
     The gate that keeps the completion incapable of breaking a config that
-    worked: an entry settings would have accepted needs nothing from the file,
-    so merging the file's version in could only introduce a failure the
-    operator did not have before (a file field that is invalid on its own, say)
-    — while an entry that fails here was already failing, which is the whole of
-    #835. Validating rather than looking for ``prefix`` keeps that true if a
-    second required field is ever added.
+    worked. Emitting the file's entry can only help when the result VALIDATES;
+    when it does not — a file field that is invalid on its own, an entry a
+    higher-precedence source was already completing — contributing nothing
+    leaves exactly the outcome the operator had before this source existed,
+    including the identity of the error they were already getting.
+
+    Asking whether the *environment's* fragment validates alone would be the
+    wrong question in both directions: it says "skip" for a per-field override
+    of an optional field, where the file has everything else to give
+    (``…__GH__PREFIX`` over a file-declared server), and it says "complete" for
+    a fragment that a broken file entry then fails.
+
+    The merge is the shallow approximation of what ``deep_update`` does one
+    level down; it decides eligibility only, and the real layering is settings'.
     """
     try:
-        UpstreamServerConfig.model_validate(entry)
+        UpstreamServerConfig.model_validate({**file_entry, **env_entry})
     except Exception:
         return False
     return True
@@ -2004,21 +2056,21 @@ class UpstreamServerCompletionSource(PydanticBaseSettingsSource):
         env_servers = proxy_env.get("upstream_servers")
         if not isinstance(env_servers, dict):
             return {}
-        names = [
-            name
-            for name, entry in env_servers.items()
-            # A non-mapping env entry replaces the whole server rather than
-            # overriding fields of it, so the file has nothing to contribute.
-            if isinstance(entry, dict) and not _validates_as_upstream_server(entry)
-        ]
-        if not names:
+        # A non-mapping env entry replaces the whole server rather than
+        # overriding fields of it, so the file has nothing to contribute.
+        env_entries = {
+            name: entry for name, entry in env_servers.items() if isinstance(entry, dict)
+        }
+        if not env_entries:
             return {}
         file_servers = _file_upstream_servers(
             _resolve_config_path_for_completion(proxy_init, proxy_env)
         )
-        completion = {
-            name: file_servers[name] for name in names if isinstance(file_servers.get(name), dict)
-        }
+        completion = {}
+        for name, env_entry in env_entries.items():
+            file_entry = file_servers.get(name)
+            if isinstance(file_entry, dict) and _completed_entry_validates(file_entry, env_entry):
+                completion[name] = file_entry
         if not completion:
             return {}
         return {"proxy": {"upstream_servers": completion}}

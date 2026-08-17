@@ -245,6 +245,40 @@ class TestIncompleteEnvServerStillFailsLoudly:
             " (env var(s) implicated: MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND)"
         )
 
+    def test_hint_skips_a_variable_a_later_payload_overwrote(self, tmp_path, clean_env):
+        """Settings resolves a mapping parent and a deeper child last-one-wins,
+        so the aggregate here replaced the per-field variable's whole subtree.
+        Naming that variable sends the operator to edit a value that is not in
+        the config at all."""
+        clean_env.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(tmp_path / "absent.json"))
+        clean_env.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND", "old")
+        clean_env.setenv(
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS", json.dumps({"gh": {"command": "new"}})
+        )
+
+        with pytest.raises(ValidationError) as caught:
+            STMConfig()
+
+        assert env_var_hint_for_validation_error(caught.value) == (
+            " (env var(s) implicated: MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS)"
+        )
+
+    def test_hint_matches_a_payload_field_key_the_way_settings_does(self, tmp_path, clean_env):
+        """An error location reports a model field by its DECLARED name, while
+        the payload may spell it any way settings accepts. Comparing raw keys
+        left this hint empty for a variable that plainly declared the server."""
+        clean_env.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(tmp_path / "absent.json"))
+        clean_env.setenv(
+            "MEMTOMEM_STM_PROXY", json.dumps({"UPSTREAM_SERVERS": {"gh": {"command": "x"}}})
+        )
+
+        with pytest.raises(ValidationError) as caught:
+            STMConfig()
+
+        assert env_var_hint_for_validation_error(caught.value) == (
+            " (env var(s) implicated: MEMTOMEM_STM_PROXY)"
+        )
+
     def test_hint_names_an_aggregate_payload_that_does_declare_the_server(
         self, tmp_path, clean_env
     ):
@@ -327,10 +361,10 @@ class TestCompletionSourceIsInert:
 
         assert caught.value.errors()[0]["loc"] == ("proxy", "upstream_servers", "fake", "prefix")
 
-    def test_a_complete_env_server_is_left_alone(self, tmp_path, clean_env):
+    def test_an_invalid_file_entry_is_not_merged_in(self, tmp_path, clean_env):
         """The gate that keeps the completion from breaking a working config:
-        an env entry that validates on its own gets nothing from the file, so a
-        file field that is invalid by itself cannot fail a construction that
+        the file's entry is emitted only when the COMPLETED server validates,
+        so a file field invalid by itself cannot fail a construction that
         succeeded before. The file's `args` here is not a list."""
         path = write_config(tmp_path, {"fake": {"prefix": "fk", "args": 7}})
         clean_env.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(path))
@@ -342,16 +376,51 @@ class TestCompletionSourceIsInert:
         assert (server.prefix, server.command) == ("ev", "env-cmd")
         assert server.args == []  # the file's broken value was never consulted
 
-    def test_an_incomplete_entry_over_a_broken_file_entry_still_fails(self, tmp_path, clean_env):
-        """The converse, so the gate above is not mistaken for "never fail":
-        this entry needs the file, the file's entry is invalid, and the failure
-        is the one the operator already had before the completion existed."""
+    def test_an_invalid_file_entry_leaves_the_original_error_intact(self, tmp_path, clean_env):
+        """The converse, so the gate is not mistaken for "never fail": this
+        entry needs the file and the file's entry is invalid, so the completion
+        contributes nothing and the operator keeps the error they already had —
+        the missing `prefix`, NOT a new one about the file's `args`. Pinning the
+        error's identity is the point; asserting only that something raised
+        would pass while the completion swapped one failure for another."""
         path = write_config(tmp_path, {"fake": {"prefix": "fk", "args": 7}})
         clean_env.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(path))
         clean_env.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-cmd")
 
-        with pytest.raises(ValidationError):
+        with pytest.raises(ValidationError) as caught:
             STMConfig()
+
+        assert [(e["loc"], e["type"]) for e in caught.value.errors()] == [
+            (("proxy", "upstream_servers", "fake", "prefix"), "missing")
+        ]
+
+    def test_a_valid_fragment_still_gets_the_file_fields_it_omitted(self, tmp_path, clean_env):
+        """Per-field layering does not begin at `prefix`. An override of an
+        OPTIONAL field leaves a fragment that validates on its own, and the file
+        still has the rest of the server to give — asking whether the env
+        fragment alone validates would drop it."""
+        path = write_config(tmp_path, {"fake": FILE_SERVER})
+        clean_env.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(path))
+        clean_env.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__PREFIX", "ev")
+
+        server = STMConfig().proxy.upstream_servers["fake"]
+
+        assert server.prefix == "ev"  # env wins
+        assert (server.command, server.args) == ("file-server", ["--from-file"])
+
+    def test_a_higher_precedence_source_completing_the_server_is_not_overridden(
+        self, tmp_path, clean_env
+    ):
+        """Init kwargs outrank both the environment and this source. When they
+        already complete the server, an invalid file entry must not be merged
+        underneath and fail a construction that worked."""
+        path = write_config(tmp_path, {"fake": {"prefix": "file", "args": 7}})
+        clean_env.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(path))
+        clean_env.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "x")
+
+        config = STMConfig(proxy={"upstream_servers": {"fake": {"prefix": "init"}}})
+
+        assert config.proxy.upstream_servers["fake"].prefix == "init"
 
     def test_an_empty_config_path_is_honored_not_replaced_by_the_default(
         self, tmp_path, clean_env, monkeypatch
