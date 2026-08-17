@@ -520,6 +520,21 @@ class TestMalformedValuesSurviveAsRawStrings:
             "enabled": "true",
         }
 
+    def test_a_malformed_value_a_later_payload_replaced_is_not_restored(self) -> None:
+        """Order decides whether a malformed value is still there to keep.
+
+        Re-inserting one settings had already replaced would overwrite the
+        payload that WON with the string that lost — turning an overlay
+        settings accepts into one validation rejects, which is the opposite of
+        this path's purpose. The reverse order is the control above.
+        """
+        env = {
+            "MEMTOMEM_STM_PROXY__TOOLGRAPH__ARGS": "not-a-list",
+            "MEMTOMEM_STM_PROXY__TOOLGRAPH": '{"args": ["serve"]}',
+        }
+
+        assert collect_proxy_env_overrides(env) == {"toolgraph": {"args": ["serve"]}}
+
     def test_several_malformed_values_are_all_kept(self) -> None:
         """Attribution is by exclusion, so it has to find every culprit, not
         just the first one settings happened to raise on."""

@@ -122,19 +122,11 @@ def _parent_and_key(
 def _live_var_paths(scoped: dict[str, str]) -> list[tuple[str, tuple[str, ...]]]:
     """The variables that still contributed something, in environment order.
 
-    Settings resolves a mapping parent and a deeper child last-one-wins, so a
-    variable whose path a LATER variable covers wrote nothing into the result
-    — the later payload replaced its whole subtree. Attributing to it would
-    name a variable whose value is not in the config being complained about,
-    and hide the one that is. A later variable that goes DEEPER does not cover
-    it: settings merges that on top, and both are really there.
+    The proxy-scoped reading of ``live_env_paths``: settings resolves a mapping
+    parent and a deeper child last-one-wins, so a variable whose path a LATER
+    variable covers wrote nothing into the result.
     """
-    entries = [(name, _var_path(name)) for name in scoped]
-    return [
-        (name, path)
-        for index, (name, path) in enumerate(entries)
-        if not any(path[: len(later)] == later for _, later in entries[index + 1 :])
-    ]
+    return live_env_paths([(name, _var_path(name)) for name in scoped])
 
 
 def _mark_payload_provenance(fragment: dict[str, Any], scoped: dict[str, str]) -> None:
@@ -241,8 +233,14 @@ def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> dict[s
         except SettingsError:  # pragma: no cover - every culprit was removed
             logger.debug("Env overlay rebuild failed after dropping malformed values")
             fragment = {}
+        # Only the ones a later variable did not cover: re-inserting a
+        # malformed value that settings had already replaced would overwrite
+        # the payload that won with the string that lost, turning an overlay
+        # settings accepts into one validation rejects.
+        live = {name for name, _ in _live_var_paths(scoped)}
         for name in malformed:
-            _insert_raw(fragment, _var_path(name), scoped[name])
+            if name in live:
+                _insert_raw(fragment, _var_path(name), scoped[name])
 
     _mark_payload_provenance(fragment, scoped)
     return fragment
