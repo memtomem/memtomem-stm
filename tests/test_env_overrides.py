@@ -131,6 +131,60 @@ class TestComplexEnvValuesMatchSettings:
         env = {"MEMTOMEM_STM_PROXY__BOGUS_KEY": '{"a": 1}'}
         assert collect_proxy_env_overrides(env) == {"bogus_key": '{"a": 1}'}
 
+    @pytest.mark.parametrize(
+        "items",
+        [
+            [("MEMTOMEM_STM_PROXY__CACHE", '{"enabled": false}'), ("…__CACHE__ENABLED", "true")],
+            [("…__CACHE__ENABLED", "true"), ("MEMTOMEM_STM_PROXY__CACHE", '{"enabled": false}')],
+            [("MEMTOMEM_STM_PROXY__CACHE", "null"), ("…__CACHE__ENABLED", "true")],
+            [("…__CACHE__ENABLED", "true"), ("MEMTOMEM_STM_PROXY__CACHE", "null")],
+            [("memtomem_stm_proxy__cache__enabled", "false")],
+            [("MEMTOMEM_STM_PROXY__CACHE____ENABLED", "false")],
+        ],
+        ids=[
+            "mapping-parent-first",
+            "mapping-child-first",
+            "scalar-parent-first",
+            "scalar-child-first",
+            "lowercase-name",
+            "empty-delimiter-component",
+        ],
+    )
+    def test_parent_child_and_name_matching_follow_settings(self, monkeypatch, items) -> None:
+        """Settings resolves a mapping parent against a deeper child by
+        last-one-wins, keeps a *non-mapping* parent either way, matches names
+        case-insensitively, and ignores a name with an empty component. Each
+        is a way the rebuild could accept an environment the server rejects
+        (or miss one it honors), so each is pinned against settings itself.
+
+        Order is expressed through the environment because that is what
+        settings reads it from — sorting the vars here changed the answer.
+        """
+        from memtomem_stm.config import STMConfig
+
+        for name in [n for n in os.environ if n.upper().startswith("MEMTOMEM_STM_PROXY")]:
+            monkeypatch.delenv(name, raising=False)
+        for name, value in items:
+            monkeypatch.setenv(name.replace("…", "MEMTOMEM_STM_PROXY"), value)
+
+        def outcome(build):
+            """Resolved config, or the rejection — same shape either way.
+
+            Settings validates the whole ``STMConfig``, so its error paths
+            carry a leading ``proxy``; strip it to compare like with like.
+            """
+            try:
+                return build().model_dump()
+            except ValidationError as exc:
+                return sorted(
+                    (tuple(e["loc"][1:] if e["loc"][:1] == ("proxy",) else e["loc"]), e["type"])
+                    for e in exc.errors()
+                )
+
+        assert outcome(lambda: ProxyConfig.model_validate(collect_proxy_env_overrides())) == outcome(
+            lambda: STMConfig().proxy
+        )
+
     @pytest.mark.parametrize("reverse", [False, True], ids=["parent-first", "child-first"])
     def test_non_mapping_parent_is_not_resurrected_by_a_deeper_var(self, reverse) -> None:
         """`CACHE=null` is a supplied value, not an absence. Settings keeps it
@@ -172,6 +226,26 @@ class TestComplexEnvValuesMatchSettings:
         assert "GH" not in hint
         assert "API_TOKEN" not in hint
         assert "s3cret" not in hint
+
+    def test_leaf_error_inside_a_payload_names_the_payload_var(self) -> None:
+        """The location-resolution half: when the error lands on a scalar
+        *inside* the payload, the walk must not synthesize a var name out of
+        the path it consumed — that name does not exist, and the last segment
+        can be an operator-chosen key like `API_TOKEN`."""
+        env = {
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": json.dumps(
+                {"gh": {"prefix": "gh", "command": "c", "env": {"API_TOKEN": ["not", "a", "str"]}}}
+            )
+        }
+        overrides = collect_proxy_env_overrides(env)
+        with pytest.raises(ValidationError) as exc_info:
+            ProxyConfig.model_validate(overrides)
+        assert any(
+            "env" in [str(p) for p in e["loc"]] for e in exc_info.value.errors()
+        ), exc_info.value.errors()
+
+        hint = _env_override_hint(exc_info.value, overrides)
+        assert hint == " (env override(s) implicated: MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS)"
 
     def test_deeper_var_inside_a_decoded_payload_is_still_named(self) -> None:
         """The merge half: a var that writes into the payload is a real var,

@@ -144,19 +144,23 @@ def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> dict[s
     validation as a string and fails a config the server accepts (#834).
     """
     env = environ if environ is not None else dict(os.environ)
-    paths: list[tuple[list[str], str]] = []
-    for key, val in env.items():
-        if not key.startswith(_PROXY_ENV_PREFIX):
-            continue
-        path = [p.lower() for p in key[len(_PROXY_ENV_PREFIX) :].split("__") if p]
-        if path:
-            paths.append((path, val))
-
     overrides: dict[str, Any] = {}
-    # Shallowest first, so a parent var is in place before anything that
-    # would descend through it. Settings resolves the two independently of
-    # process env order, and so must this.
-    for path, val in sorted(paths, key=lambda item: len(item[0])):
+    # Environment order is preserved: settings resolves a mapping parent and
+    # a deeper child by last-one-wins, so reordering here would hand the
+    # rebuild a different config than the server runs.
+    for key, val in env.items():
+        # Settings matches env names case-insensitively by default, so
+        # `memtomem_stm_proxy__cache__enabled` reaches the server and must
+        # reach this rebuild too.
+        if not key.upper().startswith(_PROXY_ENV_PREFIX):
+            continue
+        parts = key.upper()[len(_PROXY_ENV_PREFIX) :].split("__")
+        # An empty component means a malformed name (`CACHE____ENABLED`).
+        # Settings ignores those; collapsing them here would silently honor a
+        # var the server does not.
+        if not parts or any(not part for part in parts):
+            continue
+        path = [part.lower() for part in parts]
         cursor: dict[str, Any] = overrides
         for part in path[:-1]:
             # `get(part)` would read a supplied JSON `null` as "absent" and
@@ -421,8 +425,15 @@ def _env_override_hint(
             continue
         node: Any = env_overrides
         consumed: list[str] = []
+        # The payload this walk last descended through, if any: a leaf inside
+        # a decoded payload was not supplied by a var of its own, and its key
+        # may be operator-chosen (an `env` entry).
+        owner: _EnvJsonDict | None = None
+        owner_wrote_leaf = False
         for part in loc:
             if isinstance(node, dict) and part in node:
+                owner = node if isinstance(node, _EnvJsonDict) else None
+                owner_wrote_leaf = bool(owner and str(part) in owner.explicit_keys)
                 node = node[part]
                 consumed.append(str(part))
             else:
@@ -433,7 +444,10 @@ def _env_override_hint(
             # Landed on an env leaf — exact when consumed == loc; when the
             # error location goes deeper, this leaf REPLACED a container the
             # model expected, so it is still the var to fix.
-            implicated.add(_PROXY_ENV_PREFIX + "__".join(p.upper() for p in consumed))
+            if owner is not None and not owner_wrote_leaf:
+                implicated.add(_name(owner.var_path))
+            else:
+                implicated.add(_name(consumed))
         else:
             # A subtree the env touched: a cross-field validator error there
             # (consumed == loc) or a walk that broke inside it (e.g. the
@@ -1569,10 +1583,10 @@ class ProxyConfig(BaseModel):
 
         With ``missing_ok=False`` a missing file returns ``None`` instead of
         the env-only/defaults rebuild. Callers that already hold a better
-        env-aware config than the raw-string overlay can produce — e.g.
-        ``STMConfig()``'s pydantic-settings parse, which decodes JSON-encoded
-        complex env values the overlay cannot — use this to decline the swap
-        in a single atomic call, rather than a separate ``exists()``
+        env-aware config than a rebuild from the overlay — ``STMConfig()``'s
+        pydantic-settings parse, which is the authoritative reading of the
+        environment — use this to decline the swap in a single atomic call,
+        rather than a separate ``exists()``
         pre-check that races with file deletion. A file deleted between the
         existence check and the read also lands on ``None`` here, so every
         disappearance mode converges on "do not swap".
