@@ -7729,7 +7729,18 @@ def doctor(
                 effective_data = _deep_merge(data, collect_proxy_env_overrides())
                 effective_config = ProxyConfig.model_validate(effective_data)
 
-            raw_servers = data.get("upstream_servers", {})
+            # Every server-shaped check below reads the EFFECTIVE map, not the
+            # file's: MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__* can add or
+            # override upstreams, and those are the ones the server would
+            # serve — reporting "no upstream servers configured" over an
+            # env-supplied one is the same doctor-disagrees-with-runtime defect
+            # as #831 itself. Only a schema-invalid config falls back to the
+            # raw file, since there is no effective snapshot to trust.
+            raw_servers = (
+                effective_data.get("upstream_servers", {})
+                if effective_config is not None
+                else data.get("upstream_servers", {})
+            )
             servers = (
                 {n: c for n, c in raw_servers.items() if isinstance(c, dict)}
                 if isinstance(raw_servers, dict)
@@ -7740,22 +7751,21 @@ def doctor(
             # `config.proxy.enabled` gate, so a disabled proxy probes green per
             # server while advertising none of them to clients (#831). Shared
             # inert-state predicate with `mms config validate` and the runtime
-            # load advisory. Judged entirely on the env-overlaid config — both
-            # halves, not just `enabled`: MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__*
-            # can supply servers the file never mentions, and gating this on the
-            # raw file's servers would leave that setup inert with a clean
-            # report. (The staged probes below stay file-scoped, so env-only
-            # servers are still unprobed — a separate gap.)
+            # load advisory, evaluated against the same env-overlaid document
+            # the server would run with.
             if effective_config is not None:
                 from memtomem_stm.proxy.config import _upstream_inert_state
 
                 inert = _upstream_inert_state(effective_data, enabled=effective_config.enabled)
-                effective_count = len(effective_config.upstream_servers)
                 # `resolved` is argv-derived: a path carrying CR/LF would forge
                 # an extra `next:` line, which is why `next_action` may only be
                 # a literal or a `_shell_join` render (see the render comment).
+                # An unsafe path takes the whole hint with it — leaving the
+                # prose around the diagnostic would hand the user a line that
+                # still starts with a runnable word (`set ...`).
                 path_hint = _shell_join([str(resolved)])
-                if inert is None and effective_count:
+                unrenderable = path_hint == _HINT_UNRENDERABLE
+                if inert is None and servers:
                     check(
                         "proxy_enabled",
                         "proxy enabled",
@@ -7768,9 +7778,11 @@ def doctor(
                         "proxy enabled",
                         "FAIL",
                         f'proxy disabled — "enabled" is unset (defaults to false); '
-                        f"{effective_count} configured upstream server(s) will NOT be "
+                        f"{len(servers)} configured upstream server(s) will NOT be "
                         "advertised to MCP clients",
-                        f'add "enabled": true to {path_hint}  '
+                        _HINT_UNRENDERABLE
+                        if unrenderable
+                        else f'add "enabled": true to {path_hint}  '
                         '# or "enabled": false to pin control-only mode',
                     )
                 elif inert == "explicit":
@@ -7778,9 +7790,12 @@ def doctor(
                         "proxy_enabled",
                         "proxy enabled",
                         "WARN",
-                        f"proxy explicitly disabled — {effective_count} configured upstream "
+                        f"proxy explicitly disabled — {len(servers)} configured upstream "
                         "server(s) are not advertised (control-only mode)",
-                        f'set "enabled": true in {path_hint}  # if upstream tools should be served',
+                        _HINT_UNRENDERABLE
+                        if unrenderable
+                        else f'set "enabled": true in {path_hint}  '
+                        "# if upstream tools should be served",
                     )
 
             if servers:

@@ -520,6 +520,8 @@ Options:
 
 One read-only diagnostic pass over the whole setup, designed for "I just installed this — why isn't it working?". Every check prints `PASS` / `WARN` / `FAIL`, a short cause, and — for anything that isn't a `PASS` — a `next:` line you can run as-is. **Exit code is 1 when any check FAILs; WARN-only runs exit 0.** That makes `mms doctor` the scriptable success gate for a fresh install: [`health`](#health) stays the always-exit-0 connectivity inspection, [`config validate`](#config-validate) stays the strict schema lint.
 
+Every check from `proxy enabled` onward reads the **env-overlaid** config — the same composite the server would run with, so `MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__*` servers are counted, transport/prefix-checked and probed like file-declared ones, and an env override of a file-declared field is what gets probed. Only a schema-invalid config falls back to the raw file, since no effective snapshot exists to trust.
+
 Checks, in order:
 
 | check | reuses | FAIL / WARN when |
@@ -527,7 +529,7 @@ Checks, in order:
 | `config file` | same path resolution as `status`/`health` | FAIL: file missing → `next: mms init` (short-circuits the report) |
 | `config JSON` | the `config validate` parse guard | FAIL: unparseable / non-object root (short-circuits) |
 | `config schema` | the `status`/`health` schema check | FAIL: valid JSON, invalid schema — a running server would silently fall back to env/defaults |
-| `proxy enabled` | the shared inert-state predicate (`config validate` + the runtime load advisory), read off the env-overlaid config — both `enabled` and the server list, so env-only upstreams count | FAIL: upstream servers configured but top-level `enabled` unset — the silent `false` default advertises none of them to clients while every direct probe still passes; WARN: explicitly disabled (control-only mode). Omitted when no upstreams are configured |
+| `proxy enabled` | the shared inert-state predicate (`config validate` + the runtime load advisory) | FAIL: upstream servers configured but top-level `enabled` unset — the silent `false` default advertises none of them to clients while each server still probes green; WARN: explicitly disabled (control-only mode). Omitted when no upstreams are configured |
 | `server transports` | the `add` VAL-3/VAL-4 rule | FAIL: stdio server without `command`, network server without `url` |
 | `prefixes` | the shared `proxy/prefixes.py` validators the runtime load path enforces | FAIL: empty or duplicate prefixes (same wording as the server's load rejection) |
 | `upstream: <name>` | the same staged probe as `health` | FAIL: probe failed — names the stage reached; a dead stdio binary gets a `command -v <cmd>` next action |

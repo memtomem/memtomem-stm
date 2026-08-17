@@ -11462,6 +11462,11 @@ class TestDoctor:
     @pytest.fixture(autouse=True)
     def _isolated_home(self, monkeypatch, tmp_path):
         set_home(monkeypatch, tmp_path / "home")
+        # Doctor reads the env-overlaid config, so an inherited
+        # MEMTOMEM_STM_PROXY__* would silently rewrite the config under test —
+        # an ambient ENABLED=true turns the #831 FAIL cases into PASSes.
+        for name in [n for n in os.environ if n.startswith("MEMTOMEM_STM_PROXY__")]:
+            monkeypatch.delenv(name, raising=False)
         monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND", "__missing_ltm__")
         project = tmp_path / "project"
         project.mkdir()
@@ -11596,10 +11601,18 @@ class TestDoctor:
 
     def test_env_only_upstreams_with_disabled_proxy_fail(self, runner, config, monkeypatch):
         """MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__* supplies servers the file
-        never mentions, and they are just as inert. Gating the check on the
+        never mentions, and they are just as inert. Scoping doctor to the
         file's servers would report `no upstream servers configured` and exit
-        0 for a runtime that has one it will never advertise."""
-        self._stub_probe(monkeypatch)
+        0 for a runtime that has one it will never advertise — and the whole
+        report must agree, so the env server is probed like any other."""
+        probed: dict[str, dict] = {}
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        async def fake_probe_servers(servers, timeout):
+            probed.update(servers)
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
         config.write_text(
             json.dumps({"cache": {"tool_annotation_policy": "strict"}}), encoding="utf-8"
         )
@@ -11612,6 +11625,30 @@ class TestDoctor:
         assert check is not None
         assert check["status"] == "FAIL"
         assert "1 configured upstream server(s)" in check["detail"]
+        # No contradicting "no upstream servers configured" alongside it, and
+        # the env server reaches the probe like a file-declared one.
+        assert self._check_by_id(result, "upstreams") is None
+        assert self._check_by_id(result, "upstream:fx")["status"] == "PASS"
+        assert list(probed) == ["fx"]
+
+    def test_env_overrides_file_server_in_probe(self, runner, config, monkeypatch):
+        """Env wins over the file at runtime, so the probed command must be
+        the env one — probing the shadowed file value would diagnose a server
+        the proxy never starts."""
+        probed: dict[str, dict] = {}
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        async def fake_probe_servers(servers, timeout):
+            probed.update(servers)
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        self._healthy_config(config)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-server")
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert probed["fake"]["command"] == "env-server"
 
     def test_next_action_refuses_unrenderable_config_path(self, runner, tmp_path, monkeypatch):
         """`next_action` is printed verbatim, so a CR/LF in the argv-supplied
@@ -11636,8 +11673,17 @@ class TestDoctor:
         result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
         check = self._check_by_id(result, "proxy_enabled")
         assert check["status"] == "FAIL"
-        assert _HINT_UNRENDERABLE in check["next_action"]
-        assert "\n" not in check["next_action"]
+        # The diagnostic replaces the hint entirely: keeping the prose around
+        # it would leave a `next:` line still starting with a runnable word.
+        assert check["next_action"] == _HINT_UNRENDERABLE
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        next_lines = [ln for ln in result.output.splitlines() if ln.strip().startswith("next:")]
+        assert f"next: {_HINT_UNRENDERABLE}" in [ln.strip() for ln in next_lines]
+        # Nothing the check emitted carries the raw path forward: the only
+        # place the newline survives is doctor's own header, which is outside
+        # this check's surface.
+        assert not [ln for ln in next_lines if "proxy.json" in ln]
 
     def test_disabled_without_upstreams_skips_check(self, runner, config, monkeypatch):
         """Nothing is inert without upstreams — the existing `upstreams` WARN
