@@ -473,6 +473,35 @@ class TestProvenanceSurvivesOverwritingVariables:
         assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS)" in hint
         assert "__GH" not in hint
 
+    def test_a_payload_does_not_own_an_entry_a_deeper_variable_created(self) -> None:
+        """A payload owns what it declared, not what it was merged with.
+
+        The aggregate here declares `other` and knows nothing about `gh`, which
+        a deeper variable created; the resolved node holds both. Marking the
+        whole node as the payload's would report its name for an entry it has
+        nothing to do with. The assertion is exact — checking only that the
+        child appears would pass with the parent spuriously named too.
+        """
+        env = {
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": '{"other": {"prefix": "other"}}',
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND": "gh-mcp",
+        }
+
+        assert self._hint_for(env) == (
+            " (env override(s) implicated: MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND)"
+        )
+
+    def test_a_payload_does_own_the_entry_it_declared(self) -> None:
+        """The control: when the payload DID declare the entry, it is named —
+        so the test above cannot pass by the marking having stopped working."""
+        env = {
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": '{"gh": {"command": "x"}}',
+        }
+
+        assert self._hint_for(env) == (
+            " (env override(s) implicated: MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS)"
+        )
+
     def test_a_deeper_variable_still_counts_when_nothing_covers_it(self) -> None:
         """The control: a later variable that goes DEEPER is merged on top, not
         replaced, so both are real and the deeper one stays nameable."""

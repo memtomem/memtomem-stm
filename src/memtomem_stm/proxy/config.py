@@ -129,6 +129,25 @@ def _live_var_paths(scoped: dict[str, str]) -> list[tuple[str, tuple[str, ...]]]
     return live_env_paths([(name, _var_path(name)) for name in scoped])
 
 
+def _claim_payload_subtree(node: dict[str, Any], payload: dict[str, Any], path: list[str]) -> Any:
+    """Mark *node* as the variable's, but only where the payload reached.
+
+    The node is what settings RESOLVED, which can hold branches the payload
+    never contained — a deeper variable creating a sibling entry the aggregate
+    did not declare. Wrapping those too would let the payload's name be
+    reported for an entry it has nothing to do with, so the walk descends by
+    the payload and leaves everything else exactly as it found it.
+    """
+    claimed = _EnvJsonDict({}, path)
+    for key, value in node.items():
+        inner = payload.get(key)
+        if isinstance(value, dict) and isinstance(inner, dict):
+            claimed[key] = _claim_payload_subtree(value, inner, path)
+        else:
+            claimed[key] = value
+    return claimed
+
+
 def _mark_payload_provenance(fragment: dict[str, Any], scoped: dict[str, str]) -> None:
     """Record which subtrees one variable's JSON payload supplied.
 
@@ -155,7 +174,7 @@ def _mark_payload_provenance(fragment: dict[str, Any], scoped: dict[str, str]) -
             continue
         # Later variables re-wrap, so the surviving var_path is the one whose
         # payload settings let win.
-        parent[key] = _EnvJsonDict(parent[key], list(path))
+        parent[key] = _claim_payload_subtree(parent[key], decoded, list(path))
     for name, path in paths:
         # A deeper variable that wrote INTO a payload is a real variable and
         # must stay nameable, so record its key on the payload it landed in.
