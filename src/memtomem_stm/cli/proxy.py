@@ -7751,10 +7751,9 @@ def doctor(
             # `config.proxy.enabled` gate, so a disabled proxy probes green per
             # server while advertising none of them to clients (#831). Shared
             # inert-state predicate with `mms config validate` and the runtime
-            # load advisory, evaluated against the env-overlaid document. That
-            # overlay is a reconstruction, not the server's resolver: values it
-            # keeps as strings where pydantic-settings would decode them (#834)
-            # land here as a schema FAIL rather than as a wrong answer.
+            # load advisory, evaluated against the env-overlaid document —
+            # a reconstruction of what the server resolves, including the
+            # JSON-decoding pydantic-settings applies to complex fields (#834).
             if effective_config is not None:
                 from memtomem_stm.proxy.config import _upstream_inert_state
 

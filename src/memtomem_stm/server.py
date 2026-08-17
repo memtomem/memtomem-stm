@@ -111,14 +111,14 @@ def _apply_proxy_file_config(config: STMConfig, proxy_env_overrides: dict[str, A
 
     When the file is MISSING, ``config.proxy`` is deliberately left as
     constructed: ``STMConfig()``'s pydantic-settings parse already applied
-    every env var, including JSON-encoded complex values (e.g.
-    ``MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS='{"gh": ...}'``) that the
-    raw-string overlay dict cannot represent — rebuilding the config from
-    the overlay alone could only lose information, and a validation failure
-    in that rebuild would silently collapse a working env-only setup to
-    defaults. ``missing_ok=False`` makes that decision inside the single
-    ``load_from_file`` call (missing → ``None`` → no swap), so there is no
-    separate existence pre-check to race with file deletion.
+    every env var, so rebuilding from the overlay can only add failure modes
+    — a validation failure in that rebuild would silently collapse a working
+    env-only setup to defaults. (The overlay now decodes JSON-encoded complex
+    values the same way settings does (#834), so the two agree on content;
+    this stays the authoritative parse regardless.) ``missing_ok=False``
+    makes that decision inside the single ``load_from_file`` call (missing →
+    ``None`` → no swap), so there is no separate existence pre-check to race
+    with file deletion.
 
     Replacing ``config.proxy`` happens after ``STMConfig.model_post_init``
     already ran, so its ``consumer_model`` propagation is re-applied here —

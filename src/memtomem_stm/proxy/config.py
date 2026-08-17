@@ -24,6 +24,165 @@ logger = logging.getLogger(__name__)
 _PROXY_ENV_PREFIX = "MEMTOMEM_STM_PROXY__"
 
 
+def _unwrap_annotation(annotation: Any) -> Any:
+    """Strip ``Annotated`` and a lone ``| None`` so the shape shows through."""
+    if get_origin(annotation) is Annotated:
+        annotation = get_args(annotation)[0]
+    if get_origin(annotation) in (Union, types.UnionType):
+        arms = [arm for arm in get_args(annotation) if arm is not type(None)]
+        if len(arms) == 1:
+            return _unwrap_annotation(arms[0])
+    return annotation
+
+
+def _env_child_annotation(annotation: Any, part: str) -> Any | None:
+    """Annotation reached by descending *part* — ``None`` if it goes nowhere.
+
+    Models resolve by field name; ``dict[...]`` resolves to its value type
+    because the key is operator-chosen (``upstream_servers.<name>``,
+    ``env.<VAR>``). Anything else has no children.
+    """
+    if (arms := _model_arms(annotation)) is not None:
+        for arm in arms:
+            field = arm.model_fields.get(part)
+            if field is not None:
+                return field.annotation
+        return None
+    unwrapped = _unwrap_annotation(annotation)
+    if get_origin(unwrapped) is dict:
+        args = get_args(unwrapped)
+        return args[1] if len(args) == 2 else None
+    return None
+
+
+def _env_leaf_annotation(path: list[str]) -> tuple[Any | None, bool]:
+    """The annotation an env var's path addresses, and whether reaching it
+    crossed a container.
+
+    The annotation is ``None`` when the path addresses nothing the models
+    declare. The flag matters for field-key casing: settings stops
+    normalizing at a container, and it does not resume on the far side — a
+    payload at ``…__UPSTREAM_SERVERS__GH`` is a model's, but its uppercase
+    field keys are rejected exactly like those written inline in the
+    aggregate map.
+    """
+    annotation: Any = ProxyConfig
+    crossed_container = False
+    for part in path:
+        if _model_arms(annotation) is None:
+            # Descending through a mapping's values, not a model's fields.
+            crossed_container = True
+        child = _env_child_annotation(annotation, part)
+        if child is None:
+            return None, crossed_container
+        annotation = child
+    return annotation, crossed_container
+
+
+def _env_leaf_is_complex(annotation: Any | None) -> bool:
+    """Whether ``pydantic-settings`` would JSON-decode this var's value.
+
+    It decodes exactly the *complex* fields — models and containers — and
+    leaves scalars to normal coercion, so this reads the annotation the same
+    way and answers the same question (#834). An unaddressable path answers
+    False and keeps its raw string: nothing here can say what type a key that
+    no model declares was meant to be, and validation ignores it either way.
+    """
+    if annotation is None:
+        return False
+    if _model_arms(annotation) is not None:
+        return True
+    return get_origin(_unwrap_annotation(annotation)) in (dict, list, tuple, set)
+
+
+_MISSING = object()
+
+
+class _EnvJsonDict(dict[str, Any]):
+    """A mapping that came from ONE env var's JSON payload.
+
+    ``_env_override_hint`` names env vars by walking the overlay's leaves,
+    which only works while every leaf corresponds to a var the operator set.
+    A decoded payload breaks that: ``UPSTREAM_SERVERS='{"gh": {…}}'`` has
+    leaves like ``gh.command`` that no var supplied, and naming them invents
+    variables — and echoes user-controlled mapping keys (an ``env`` entry is
+    keyed by the operator's own names) into a warning. Marking the decoded
+    subtree lets the hint stop at the var that actually exists.
+
+    Every mapping inside the payload is wrapped, each carrying ``var_path``
+    — the path of the var that supplied it — so a hint that starts anywhere
+    inside the payload still names the one variable that exists.
+
+    ``explicit_keys`` records keys a *deeper* var then set inside this
+    payload, since settings merges those on top; they are real vars and must
+    still be nameable.
+    """
+
+    def __init__(self, data: dict[str, Any], var_path: list[str]) -> None:
+        super().__init__(
+            {
+                key: (_EnvJsonDict(value, var_path) if type(value) is dict else value)
+                for key, value in data.items()
+            }
+        )
+        self.var_path = list(var_path)
+        self.explicit_keys: set[str] = set()
+
+
+def _canonical_field_keys(value: Any, annotation: Any) -> Any:
+    """Rewrite model-field keys in a decoded payload to their declared names.
+
+    Settings matches field names case-insensitively, so
+    ``CACHE='{"ENABLED": false}'`` sets ``cache.enabled`` for the server. The
+    models keep ``extra="ignore"``, so leaving ``ENABLED`` here would drop it
+    silently and the rebuild would report the default.
+
+    The rewrite follows model fields and **stops at any container**, which is
+    where settings stops: ``CACHE='{"ENABLED": false}'`` configures the
+    server, while ``UPSTREAM_SERVERS='{"GH": {"PREFIX": …}}'`` and
+    ``…__UPSTREAM_SERVERS__GH='{"PREFIX": …}'`` are both *rejected* by it —
+    the fields sit under ``dict[str, UpstreamServerConfig]``. Canonicalizing
+    past that boundary would make this rebuild accept an environment the
+    server refuses, which is the failure this whole function guards against.
+    Keys under a mapping are operator data anyway: a server named ``GH`` is
+    not the server named ``gh``.
+    """
+    if not isinstance(value, dict):
+        return value
+    if (arms := _model_arms(annotation)) is None:
+        return value
+    fields = {
+        name.lower(): (name, field.annotation)
+        for arm in arms
+        for name, field in arm.model_fields.items()
+    }
+    out: dict[str, Any] = {}
+    for key, item in value.items():
+        name, field_annotation = fields.get(str(key).lower(), (str(key), None))
+        out[name] = _canonical_field_keys(item, field_annotation)
+    return out
+
+
+def _decode_env_value(path: list[str], raw: str) -> Any:
+    """Env string as pydantic-settings would read it for this field.
+
+    A malformed JSON payload is left as the raw string on purpose: settings
+    raises on it, and here the string reaches ``model_validate``, which names
+    the field. Silently substituting a default would be the dark failure this
+    module exists to prevent.
+    """
+    annotation, crossed_container = _env_leaf_annotation(path)
+    if not _env_leaf_is_complex(annotation):
+        return raw
+    try:
+        decoded = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return raw
+    if not crossed_container:
+        decoded = _canonical_field_keys(decoded, annotation)
+    return _EnvJsonDict(decoded, path) if type(decoded) is dict else decoded
+
+
 def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> dict[str, Any]:
     """Build a nested dict from ``MEMTOMEM_STM_PROXY__*`` env vars.
 
@@ -34,25 +193,66 @@ def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> dict[s
     unconditional; env wins purely through this overlay).
 
     The returned dict mirrors the JSON config shape — nested by ``__``
-    delimiters, lower-cased — and pydantic's coercion handles type
-    conversion at validation time.
+    delimiters, lower-cased — and pydantic's coercion handles scalar type
+    conversion at validation time. Values addressing a *complex* field
+    (a model or container) are JSON-decoded first, because that is what
+    ``STMConfig``'s pydantic-settings parse does with them: without it,
+    ``UPSTREAM_SERVERS='{"gh": …}'`` or ``…__ARGS='["--one"]'`` reaches
+    validation as a string and fails a config the server accepts (#834).
     """
     env = environ if environ is not None else dict(os.environ)
-    overrides: dict[str, Any] = {}
+    # Settings matches env names case-insensitively by default, so
+    # `memtomem_stm_proxy__cache__enabled` reaches the server and must reach
+    # this rebuild too. It lowercases the whole mapping BEFORE nesting it, so
+    # two spellings of one name collapse into a single entry — last value,
+    # first position. Assigning into a dict reproduces exactly that, and it
+    # matters: the surviving position decides whether a parent payload or a
+    # deeper child wins below.
+    # Lowercase both sides rather than upper-casing the name: settings
+    # lowercases, and the two are not inverses. `MEMTOMEM_ſTM_PROXY__…`
+    # upper-cases onto the prefix (U+017F → "S") while settings, which never
+    # upper-cases, ignores the variable entirely.
+    prefix = _PROXY_ENV_PREFIX.lower()
+    lowered: dict[str, str] = {}
     for key, val in env.items():
-        if not key.startswith(_PROXY_ENV_PREFIX):
-            continue
-        path = [p.lower() for p in key[len(_PROXY_ENV_PREFIX) :].split("__") if p]
+        lowered_key = key.lower()
+        if lowered_key.startswith(prefix):
+            lowered[lowered_key] = val
+
+    overrides: dict[str, Any] = {}
+    # Environment order is preserved from here on: settings resolves a
+    # mapping parent and a deeper child by last-one-wins, so reordering would
+    # hand the rebuild a different config than the server runs.
+    for key, val in lowered.items():
+        path = key[len(prefix) :].split("__")
+        # Empty components are kept, not dropped: settings turns a doubled
+        # delimiter into an empty *key*, which is a real mapping entry
+        # (`…__UPSTREAM_SERVERS____PREFIX` configures the server named "").
+        # Dropping the component would silently rename that entry, and
+        # dropping the whole var would hide one the server honors.
         if not path:
             continue
-        cursor = overrides
+        cursor: dict[str, Any] = overrides
         for part in path[:-1]:
-            existing = cursor.get(part)
+            # `get(part)` would read a supplied JSON `null` as "absent" and
+            # let the branch below rebuild it into a mapping.
+            existing = cursor.get(part, _MISSING)
+            if existing is not _MISSING and not isinstance(existing, dict):
+                # A parent var supplied a non-mapping (`CACHE=null`). Settings
+                # keeps that value and lets validation reject the config; it
+                # does not let the deeper var quietly resurrect a mapping, so
+                # neither does this — otherwise the rebuild accepts an
+                # environment the server refuses.
+                cursor = {}
+                break
             if not isinstance(existing, dict):
                 existing = {}
                 cursor[part] = existing
             cursor = existing
-        cursor[path[-1]] = val
+        else:
+            if isinstance(cursor, _EnvJsonDict):
+                cursor.explicit_keys.add(path[-1])
+            cursor[path[-1]] = _decode_env_value(path, val)
     return overrides
 
 
@@ -242,17 +442,32 @@ def _env_override_hint(
         return ""
     implicated: set[str] = set()
 
+    def _name(prefix: list[str]) -> str:
+        return _PROXY_ENV_PREFIX + "__".join(p.upper() for p in prefix)
+
     def _add_leaves(path: list[str], subtree: dict[str, Any]) -> None:
         stack: list[tuple[list[str], dict[str, Any]]] = [(path, subtree)]
         while stack:
             prefix, node = stack.pop()
+            if isinstance(node, _EnvJsonDict):
+                # One var supplied this whole payload; its inner keys are not
+                # vars. Name that var — wherever inside the payload this walk
+                # started — then descend only where a deeper var did set
+                # something (settings merges those on top).
+                implicated.add(_name(node.var_path))
+                for key, value in node.items():
+                    if isinstance(value, dict):
+                        # Keep walking: a deeper var may have written further
+                        # inside this payload.
+                        stack.append(([*prefix, str(key)], value))
+                    elif key in node.explicit_keys:
+                        implicated.add(_name([*prefix, str(key)]))
+                continue
             for key, value in node.items():
                 if isinstance(value, dict):
                     stack.append(([*prefix, str(key)], value))
                 else:
-                    implicated.add(
-                        _PROXY_ENV_PREFIX + "__".join(p.upper() for p in [*prefix, str(key)])
-                    )
+                    implicated.add(_name([*prefix, str(key)]))
 
     def _error_key(e: ErrorDetails) -> tuple[tuple[Any, ...], str, str]:
         return (tuple(e.get("loc", ())), str(e.get("type", "")), str(e.get("msg", "")))
@@ -281,8 +496,15 @@ def _env_override_hint(
             continue
         node: Any = env_overrides
         consumed: list[str] = []
+        # The payload this walk last descended through, if any: a leaf inside
+        # a decoded payload was not supplied by a var of its own, and its key
+        # may be operator-chosen (an `env` entry).
+        owner: _EnvJsonDict | None = None
+        owner_wrote_leaf = False
         for part in loc:
             if isinstance(node, dict) and part in node:
+                owner = node if isinstance(node, _EnvJsonDict) else None
+                owner_wrote_leaf = bool(owner and str(part) in owner.explicit_keys)
                 node = node[part]
                 consumed.append(str(part))
             else:
@@ -293,7 +515,10 @@ def _env_override_hint(
             # Landed on an env leaf — exact when consumed == loc; when the
             # error location goes deeper, this leaf REPLACED a container the
             # model expected, so it is still the var to fix.
-            implicated.add(_PROXY_ENV_PREFIX + "__".join(p.upper() for p in consumed))
+            if owner is not None and not owner_wrote_leaf:
+                implicated.add(_name(owner.var_path))
+            else:
+                implicated.add(_name(consumed))
         else:
             # A subtree the env touched: a cross-field validator error there
             # (consumed == loc) or a walk that broke inside it (e.g. the
@@ -1429,10 +1654,10 @@ class ProxyConfig(BaseModel):
 
         With ``missing_ok=False`` a missing file returns ``None`` instead of
         the env-only/defaults rebuild. Callers that already hold a better
-        env-aware config than the raw-string overlay can produce — e.g.
-        ``STMConfig()``'s pydantic-settings parse, which decodes JSON-encoded
-        complex env values the overlay cannot — use this to decline the swap
-        in a single atomic call, rather than a separate ``exists()``
+        env-aware config than a rebuild from the overlay — ``STMConfig()``'s
+        pydantic-settings parse, which is the authoritative reading of the
+        environment — use this to decline the swap in a single atomic call,
+        rather than a separate ``exists()``
         pre-check that races with file deletion. A file deleted between the
         existence check and the read also lands on ``None`` here, so every
         disappearance mode converges on "do not swap".

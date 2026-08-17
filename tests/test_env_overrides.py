@@ -8,15 +8,18 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from memtomem_stm.proxy.config import (
     ProxyConfig,
     ProxyConfigLoader,
     _deep_merge,
+    _env_override_hint,
     collect_proxy_env_overrides,
 )
 
@@ -56,6 +59,306 @@ class TestCollectProxyEnvOverrides:
 
     def test_empty_when_no_proxy_env(self) -> None:
         assert collect_proxy_env_overrides({"FOO": "bar"}) == {}
+
+
+class TestComplexEnvValuesMatchSettings:
+    """#834: pydantic-settings JSON-decodes *complex* fields (models and
+    containers) and coerces scalars normally. The overlay has to answer the
+    same question the same way, or a config the server runs is one this
+    rebuild rejects — the whole reason the overlay exists is to reproduce
+    what the server resolves.
+
+    Every case below is pinned against ``STMConfig()`` itself in
+    ``test_overlay_agrees_with_pydantic_settings`` rather than against my
+    reading of the settings docs.
+    """
+
+    def test_aggregate_server_map_is_decoded(self) -> None:
+        env = {
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": '{"gh": {"prefix": "gh", "command": "s"}}'
+        }
+        assert collect_proxy_env_overrides(env) == {
+            "upstream_servers": {"gh": {"prefix": "gh", "command": "s"}}
+        }
+
+    def test_single_server_and_list_leaf_are_decoded(self) -> None:
+        env = {
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH": '{"prefix": "gh", "command": "s"}',
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__ARGS": '["--one", "--two"]',
+        }
+        assert collect_proxy_env_overrides(env) == {
+            "upstream_servers": {
+                "gh": {"prefix": "gh", "command": "s"},
+                "fx": {"args": ["--one", "--two"]},
+            }
+        }
+
+    def test_scalar_leaves_stay_strings(self) -> None:
+        """Decoding a scalar would change meaning: a command of "null" or a
+        prefix of "1" must reach pydantic as the string it is."""
+        env = {
+            "MEMTOMEM_STM_PROXY__ENABLED": "true",
+            "MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS": "9999",
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__COMMAND": "null",
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__PREFIX": "1",
+        }
+        assert collect_proxy_env_overrides(env) == {
+            "enabled": "true",
+            "default_max_result_chars": "9999",
+            "upstream_servers": {"fx": {"command": "null", "prefix": "1"}},
+        }
+
+    def test_free_form_dict_leaf_is_not_decoded(self) -> None:
+        """``env``/``headers`` are ``dict[str, str]``: the dict itself is
+        complex, but a value *inside* it is a plain string."""
+        env = {
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__ENV": '{"A": "1"}',
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__HEADERS__X": "[not json]",
+        }
+        assert collect_proxy_env_overrides(env) == {
+            "upstream_servers": {
+                "fx": {"env": {"A": "1"}, "headers": {"x": "[not json]"}},
+            }
+        }
+
+    def test_field_canonicalization_stops_at_containers(self) -> None:
+        """Settings rewrites field keys only while walking model fields and
+        stops at a container, so `CACHE='{"ENABLED": …}'` configures the
+        server while the same casing under `upstream_servers` does not (it is
+        rejected). Rewriting past that boundary would make this rebuild
+        accept an environment the server refuses — the exact failure the
+        rebuild exists to avoid — so the payload is left verbatim there.
+
+        Mapping keys are operator data either way: a server named `GH` is not
+        the server named `gh`.
+        """
+        env = {
+            "MEMTOMEM_STM_PROXY__CACHE": json.dumps({"ENABLED": False}),
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": json.dumps(
+                {"GH": {"PREFIX": "gh", "Command": "s", "ENV": {"API_TOKEN": "v"}}}
+            ),
+        }
+        assert collect_proxy_env_overrides(env) == {
+            "cache": {"enabled": False},
+            "upstream_servers": {
+                "GH": {"PREFIX": "gh", "Command": "s", "ENV": {"API_TOKEN": "v"}}
+            },
+        }
+
+    def test_malformed_json_for_a_complex_field_stays_raw(self) -> None:
+        """Left for validation to name the field — substituting a default
+        would be the silent degrade this module exists to prevent."""
+        env = {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": "{not json"}
+        assert collect_proxy_env_overrides(env) == {"upstream_servers": "{not json"}
+
+    def test_unknown_key_stays_raw(self) -> None:
+        env = {"MEMTOMEM_STM_PROXY__BOGUS_KEY": '{"a": 1}'}
+        assert collect_proxy_env_overrides(env) == {"bogus_key": '{"a": 1}'}
+
+    @pytest.mark.parametrize(
+        "items",
+        [
+            [("MEMTOMEM_STM_PROXY__CACHE", '{"enabled": false}'), ("…__CACHE__ENABLED", "true")],
+            [("…__CACHE__ENABLED", "true"), ("MEMTOMEM_STM_PROXY__CACHE", '{"enabled": false}')],
+            [("MEMTOMEM_STM_PROXY__CACHE", "null"), ("…__CACHE__ENABLED", "true")],
+            [("…__CACHE__ENABLED", "true"), ("MEMTOMEM_STM_PROXY__CACHE", "null")],
+            [("memtomem_stm_proxy__cache__enabled", "false")],
+            [("MEMTOMEM_STM_PROXY__CACHE____ENABLED", "false")],
+            [
+                ("MEMTOMEM_STM_PROXY__CACHE", '{"enabled": true}'),
+                ("…__CACHE__ENABLED", "false"),
+                ("memtomem_stm_proxy__cache", '{"enabled": true}'),
+            ],
+            [("MEMTOMEM_STM_PROXY__CACHE", '{"ENABLED": false}')],
+            [("MEMTOMEM_STM_PROXY__CACHE", '{"Enabled": false}')],
+            [("…__UPSTREAM_SERVERS", '{"GH": {"PREFIX": "gh", "COMMAND": "s"}}')],
+            [("…__UPSTREAM_SERVERS__GH", '{"PREFIX": "gh", "COMMAND": "s"}')],
+            [("…__UPSTREAM_SERVERS", '{"gh": {"prefix": "gh", "command": "s", "CACHE": true}}')],
+            [("…__TOOLGRAPH", '{"ENABLED": true, "ARGS": ["x"]}')],
+            [("…__UPSTREAM_SERVERS____PREFIX", "gh"), ("…__UPSTREAM_SERVERS____COMMAND", "s")],
+            [
+                ("…__UPSTREAM_SERVERS__FX__PREFIX", "fx"),
+                ("…__UPSTREAM_SERVERS__FX__COMMAND", "s"),
+                ("…__UPSTREAM_SERVERS__FX__ENV__", "v"),
+            ],
+            [("MEMTOMEM_ſTM_PROXY__ENABLED", "true")],
+        ],
+        ids=[
+            "mapping-parent-first",
+            "mapping-child-first",
+            "scalar-parent-first",
+            "scalar-child-first",
+            "lowercase-name",
+            "empty-delimiter-component",
+            "case-equivalent-names-collapse",
+            "uppercase-json-field-key",
+            "mixed-case-json-field-key",
+            "uppercase-fields-under-a-container",
+            "uppercase-fields-in-a-container-value",
+            "duplicate-cased-keys-under-a-container",
+            "uppercase-fields-of-a-nested-model",
+            "empty-component-names-a-server",
+            "empty-component-inside-a-free-form-dict",
+            "unicode-name-that-upper-cases-onto-the-prefix",
+        ],
+    )
+    def test_parent_child_and_name_matching_follow_settings(self, monkeypatch, items) -> None:
+        """Settings resolves a mapping parent against a deeper child by
+        last-one-wins, keeps a *non-mapping* parent either way, matches names
+        case-insensitively, and ignores a name with an empty component. Each
+        is a way the rebuild could accept an environment the server rejects
+        (or miss one it honors), so each is pinned against settings itself.
+
+        Order is expressed through the environment because that is what
+        settings reads it from — sorting the vars here changed the answer.
+        """
+        from memtomem_stm.config import STMConfig
+
+        for name in [n for n in os.environ if n.upper().startswith("MEMTOMEM_STM_PROXY")]:
+            monkeypatch.delenv(name, raising=False)
+        for name, value in items:
+            monkeypatch.setenv(name.replace("…", "MEMTOMEM_STM_PROXY"), value)
+
+        def outcome(build):
+            """Resolved config, or the rejection — same shape either way.
+
+            Settings validates the whole ``STMConfig``, so its error paths
+            carry a leading ``proxy``; strip it to compare like with like.
+            """
+            try:
+                return build().model_dump()
+            except ValidationError as exc:
+                return sorted(
+                    (tuple(e["loc"][1:] if e["loc"][:1] == ("proxy",) else e["loc"]), e["type"])
+                    for e in exc.errors()
+                )
+
+        assert outcome(lambda: ProxyConfig.model_validate(collect_proxy_env_overrides())) == outcome(
+            lambda: STMConfig().proxy
+        )
+
+    @pytest.mark.parametrize("reverse", [False, True], ids=["parent-first", "child-first"])
+    def test_non_mapping_parent_is_not_resurrected_by_a_deeper_var(self, reverse) -> None:
+        """`CACHE=null` is a supplied value, not an absence. Settings keeps it
+        and lets validation reject the config; letting the deeper var rebuild
+        a mapping would make this rebuild *accept* an environment the server
+        refuses. Both orders, because process env order is arbitrary while
+        settings' answer is not."""
+        items = [
+            ("MEMTOMEM_STM_PROXY__CACHE", "null"),
+            ("MEMTOMEM_STM_PROXY__CACHE__ENABLED", "true"),
+        ]
+        env = dict(reversed(items) if reverse else items)
+        assert collect_proxy_env_overrides(env) == {"cache": None}
+
+    def test_non_mapping_parent_covers_every_json_scalar(self) -> None:
+        for raw in ("null", "1", "true", '""', "[]"):
+            env = {
+                "MEMTOMEM_STM_PROXY__CACHE": raw,
+                "MEMTOMEM_STM_PROXY__CACHE__ENABLED": "true",
+            }
+            assert collect_proxy_env_overrides(env)["cache"] == json.loads(raw), raw
+
+    def test_decoded_payload_is_named_by_its_own_var_not_invented_leaves(self) -> None:
+        """`_env_override_hint` names vars by walking overlay leaves, so a
+        decoded payload must not contribute leaves of its own: those vars do
+        not exist, and an `env` payload is keyed by operator-chosen names
+        that would then be echoed into the warning."""
+        env = {
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": json.dumps(
+                {"gh": {"prefix": "", "command": "c", "env": {"API_TOKEN": "s3cret"}}}
+            )
+        }
+        overrides = collect_proxy_env_overrides(env)
+        with pytest.raises(ValidationError) as exc_info:
+            ProxyConfig.model_validate(overrides)
+
+        hint = _env_override_hint(exc_info.value, overrides)
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS" in hint
+        assert "GH" not in hint
+        assert "API_TOKEN" not in hint
+        assert "s3cret" not in hint
+
+    def test_leaf_error_inside_a_payload_names_the_payload_var(self) -> None:
+        """The location-resolution half: when the error lands on a scalar
+        *inside* the payload, the walk must not synthesize a var name out of
+        the path it consumed — that name does not exist, and the last segment
+        can be an operator-chosen key like `API_TOKEN`."""
+        env = {
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": json.dumps(
+                {"gh": {"prefix": "gh", "command": "c", "env": {"API_TOKEN": ["not", "a", "str"]}}}
+            )
+        }
+        overrides = collect_proxy_env_overrides(env)
+        with pytest.raises(ValidationError) as exc_info:
+            ProxyConfig.model_validate(overrides)
+        assert any(
+            "env" in [str(p) for p in e["loc"]] for e in exc_info.value.errors()
+        ), exc_info.value.errors()
+
+        hint = _env_override_hint(exc_info.value, overrides)
+        assert hint == " (env override(s) implicated: MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS)"
+
+    def test_deeper_var_inside_a_decoded_payload_is_still_named(self) -> None:
+        """The merge half: a var that writes into the payload is a real var,
+        so it stays nameable — otherwise fixing the provenance leak would
+        blind the diagnostic to the leaf that actually broke."""
+        env = {
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": json.dumps(
+                {"gh": {"prefix": "gh", "command": "c"}}
+            ),
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__PREFIX": "   ",
+        }
+        overrides = collect_proxy_env_overrides(env)
+        with pytest.raises(ValidationError) as exc_info:
+            ProxyConfig.model_validate(overrides)
+
+        hint = _env_override_hint(exc_info.value, overrides)
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__PREFIX" in hint
+
+    @pytest.mark.parametrize(
+        "env",
+        [
+            {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": '{"gh": {"prefix": "gh", "command": "s"}}'},
+            {
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__PREFIX": "fx",
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__COMMAND": "s",
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__ARGS": '["--one"]',
+            },
+            {
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__PREFIX": "fx",
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__COMMAND": "s",
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__ENV": '{"A": "1"}',
+            },
+            {
+                "MEMTOMEM_STM_PROXY__ENABLED": "true",
+                "MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS": "9999",
+                "MEMTOMEM_STM_PROXY__CONFIG_PATH": "/tmp/x.json",
+                "MEMTOMEM_STM_PROXY__DEFAULT_COMPRESSION": "truncate",
+            },
+            # The other vars `docs/reference/environment-variables.md` types
+            # as JSON — the same defect reached all of them, not just servers.
+            {
+                "MEMTOMEM_STM_PROXY__TOOLGRAPH__ARGS": '["serve", "--fast"]',
+                "MEMTOMEM_STM_PROXY__TOOLGRAPH__SERVER_NAME_MAP": '{"a": "b"}',
+                "MEMTOMEM_STM_PROXY__CACHE": '{"enabled": false}',
+            },
+        ],
+        ids=["aggregate-map", "list-leaf", "dict-leaf", "scalars", "documented-json-vars"],
+    )
+    def test_overlay_agrees_with_pydantic_settings(self, monkeypatch, env) -> None:
+        """The oracle: whatever ``STMConfig()`` builds from these vars, the
+        overlay rebuild must build too."""
+        from memtomem_stm.config import STMConfig
+
+        for name in [n for n in os.environ if n.upper().startswith("MEMTOMEM_STM_PROXY")]:
+            monkeypatch.delenv(name, raising=False)
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+
+        settings_proxy = STMConfig().proxy
+        overlay_proxy = ProxyConfig.model_validate(collect_proxy_env_overrides())
+        assert overlay_proxy.model_dump() == settings_proxy.model_dump()
 
 
 class TestDeepMerge:
