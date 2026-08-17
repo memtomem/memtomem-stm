@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 
 import pytest
+from helpers import set_home
 from pydantic import ValidationError
 
 from memtomem_stm.config import STMConfig
@@ -228,28 +229,78 @@ class TestIncompleteEnvServerStillFailsLoudly:
     def test_hint_is_empty_for_a_non_validation_error(self) -> None:
         assert env_var_hint_for_validation_error(RuntimeError("boom")) == ""
 
+    def test_hint_skips_an_aggregate_payload_that_declares_no_upstreams(self, tmp_path, clean_env):
+        """A payload var sitting ABOVE the incomplete entry is only implicated
+        when it actually reaches it. A `MEMTOMEM_STM_PROXY` block carrying only
+        cache settings did not declare the server and must not be blamed for
+        it."""
+        clean_env.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(tmp_path / "absent.json"))
+        clean_env.setenv("MEMTOMEM_STM_PROXY", json.dumps({"cache": {"enabled": False}}))
+        clean_env.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND", "x")
+
+        with pytest.raises(ValidationError) as caught:
+            STMConfig()
+
+        assert env_var_hint_for_validation_error(caught.value) == (
+            " (env var(s) implicated: MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND)"
+        )
+
+    def test_hint_names_an_aggregate_payload_that_does_declare_the_server(
+        self, tmp_path, clean_env
+    ):
+        """The positive control: the same shape, with a payload that does reach
+        the entry, must still be named — otherwise the test above would pass
+        against a helper that had simply stopped naming payload vars."""
+        clean_env.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(tmp_path / "absent.json"))
+        clean_env.setenv(
+            "MEMTOMEM_STM_PROXY", json.dumps({"upstream_servers": {"gh": {"command": "x"}}})
+        )
+
+        with pytest.raises(ValidationError) as caught:
+            STMConfig()
+
+        assert env_var_hint_for_validation_error(caught.value) == (
+            " (env var(s) implicated: MEMTOMEM_STM_PROXY)"
+        )
+
 
 class TestCompletionSourceIsInert:
     """Failure modes of the completion all resolve to "contribute nothing",
     leaving the pre-#835 behavior rather than a new way for a config to break."""
 
-    def test_broken_file(self, tmp_path, clean_env):
+    @pytest.mark.parametrize(
+        ("content", "shape"),
+        [("{not json", "malformed-json"), ("[]", "non-object-root"), ("{}", "no-upstreams-key")],
+    )
+    def test_unusable_file_contributes_nothing(self, tmp_path, clean_env, content, shape):
+        """The error must be the untouched env fragment's own — a different one
+        would mean the completion contributed something out of a file it should
+        not have been able to read."""
         path = tmp_path / "stm_proxy.json"
-        path.write_text("{not json", encoding="utf-8")
+        path.write_text(content, encoding="utf-8")
         clean_env.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(path))
         clean_env.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-server")
 
-        with pytest.raises(ValidationError):
+        with pytest.raises(ValidationError) as caught:
             STMConfig()
 
-    def test_non_object_root(self, tmp_path, clean_env):
+        assert [(e["loc"], e["type"]) for e in caught.value.errors()] == [
+            (("proxy", "upstream_servers", "fake", "prefix"), "missing")
+        ], shape
+
+    def test_a_directory_in_place_of_the_file_contributes_nothing(self, tmp_path, clean_env):
+        """``read_text`` on a directory raises ``IsADirectoryError`` on POSIX and
+        ``PermissionError`` on Windows — both are ``OSError``, which is why the
+        guard catches the base class."""
         path = tmp_path / "stm_proxy.json"
-        path.write_text("[]", encoding="utf-8")
+        path.mkdir()
         clean_env.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(path))
         clean_env.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-server")
 
-        with pytest.raises(ValidationError):
+        with pytest.raises(ValidationError) as caught:
             STMConfig()
+
+        assert caught.value.errors()[0]["type"] == "missing"
 
     def test_explicit_proxy_argument_wins_wholesale(self, tmp_path, clean_env):
         """An explicit ``proxy=`` object replaces the field, so there is no env
@@ -275,6 +326,67 @@ class TestCompletionSourceIsInert:
             STMConfig()
 
         assert caught.value.errors()[0]["loc"] == ("proxy", "upstream_servers", "fake", "prefix")
+
+    def test_a_complete_env_server_is_left_alone(self, tmp_path, clean_env):
+        """The gate that keeps the completion from breaking a working config:
+        an env entry that validates on its own gets nothing from the file, so a
+        file field that is invalid by itself cannot fail a construction that
+        succeeded before. The file's `args` here is not a list."""
+        path = write_config(tmp_path, {"fake": {"prefix": "fk", "args": 7}})
+        clean_env.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(path))
+        clean_env.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__PREFIX", "ev")
+        clean_env.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-cmd")
+
+        server = STMConfig().proxy.upstream_servers["fake"]
+
+        assert (server.prefix, server.command) == ("ev", "env-cmd")
+        assert server.args == []  # the file's broken value was never consulted
+
+    def test_an_incomplete_entry_over_a_broken_file_entry_still_fails(self, tmp_path, clean_env):
+        """The converse, so the gate above is not mistaken for "never fail":
+        this entry needs the file, the file's entry is invalid, and the failure
+        is the one the operator already had before the completion existed."""
+        path = write_config(tmp_path, {"fake": {"prefix": "fk", "args": 7}})
+        clean_env.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(path))
+        clean_env.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-cmd")
+
+        with pytest.raises(ValidationError):
+            STMConfig()
+
+    def test_an_empty_config_path_is_honored_not_replaced_by_the_default(
+        self, tmp_path, clean_env, monkeypatch
+    ):
+        """``config_path=""`` resolves to ``Path(".")`` at runtime. Treating it
+        as absent would complete a server out of the default file, which the
+        running config does not name."""
+        default_home = tmp_path / "home"
+        (default_home / ".memtomem").mkdir(parents=True)
+        (default_home / ".memtomem" / "stm_proxy.json").write_text(
+            json.dumps({"upstream_servers": {"fake": FILE_SERVER}}), encoding="utf-8"
+        )
+        set_home(monkeypatch, default_home)
+        clean_env.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", "")
+        clean_env.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-server")
+
+        with pytest.raises(ValidationError):
+            STMConfig()
+
+    def test_the_default_path_is_used_when_no_config_path_is_set(
+        self, tmp_path, clean_env, monkeypatch
+    ):
+        """The positive control for the case above — without it, that test
+        would pass just as well if the default were never consulted at all."""
+        default_home = tmp_path / "home"
+        (default_home / ".memtomem").mkdir(parents=True)
+        (default_home / ".memtomem" / "stm_proxy.json").write_text(
+            json.dumps({"upstream_servers": {"fake": FILE_SERVER}}), encoding="utf-8"
+        )
+        set_home(monkeypatch, default_home)
+        clean_env.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-server")
+
+        server = STMConfig().proxy.upstream_servers["fake"]
+
+        assert (server.prefix, server.command) == ("fk", "env-server")
 
     def test_file_upstreams_do_not_leak_when_env_touches_another_field(self, tmp_path, clean_env):
         """The boundary: only env-mentioned server NAMES are completed. A var

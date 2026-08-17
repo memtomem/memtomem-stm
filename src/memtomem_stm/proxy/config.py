@@ -553,7 +553,14 @@ def env_var_hint_for_validation_error(
     - a ``missing`` error is the exception that needs its SIBLINGS: the field
       the error names is precisely the one nobody set, so the vars that created
       the incomplete entry are the ones to fix (``…__GH__COMMAND`` for a
-      ``upstream_servers.gh.prefix`` that is missing).
+      ``upstream_servers.gh.prefix`` that is missing). A var ABOVE that entry
+      qualifies only if its JSON payload actually reaches it — otherwise a
+      ``MEMTOMEM_STM_PROXY`` block carrying nothing but ``cache`` settings gets
+      blamed for an upstream server it never mentions.
+
+    A model-level error names every var under the model, the way
+    ``_env_override_hint`` names every leaf for a root error: the validator
+    that failed spans them, so narrowing would mean guessing.
 
     Matching is case-insensitive because settings resolves names that way; only
     names, never values, are rendered (cf. ``hide_input_in_errors``).
@@ -571,6 +578,18 @@ def env_var_hint_for_validation_error(
     def _starts_with(path: tuple[str, ...], head: tuple[str, ...]) -> bool:
         return path[: len(head)] == head
 
+    def _payload_reaches(name: str, path: tuple[str, ...], target: tuple[str, ...]) -> bool:
+        """Whether the var's JSON payload declares anything at *target*."""
+        try:
+            node = json.loads(env[name])
+        except (TypeError, ValueError):
+            return False  # a scalar var above the entry declared no entry
+        for key in target[len(path) :]:
+            if not isinstance(node, dict) or key not in node:
+                return False
+            node = node[key]
+        return True
+
     implicated: set[str] = set()
     for err in exc.errors():
         loc = tuple(str(part) for part in err.get("loc", ()))
@@ -579,9 +598,13 @@ def env_var_hint_for_validation_error(
         for path, name in var_paths.items():
             if err.get("type") == "missing":
                 # Siblings of the missing field: a var that set one of them, or
-                # a payload var at/above the entry that declared it incomplete.
+                # a payload var above the entry that does declare it.
                 parent = loc[:-1]
-                if parent and (_starts_with(path, parent) or _starts_with(parent, path)):
+                if not parent:
+                    continue
+                if _starts_with(path, parent) or (
+                    _starts_with(parent, path) and _payload_reaches(name, path, parent)
+                ):
                     implicated.add(name)
             elif _starts_with(loc, path) or _starts_with(path, loc):
                 implicated.add(name)
@@ -1864,14 +1887,35 @@ def _resolve_config_path_for_completion(
     ``config_path`` is itself configurable, so the completion source cannot ask
     a validated ``ProxyConfig`` for it — that config is what is being built.
     Init kwargs outrank the environment, matching the source order, and the
-    field default is the last word.
+    field default is the last word. A value that is PRESENT but empty is
+    honored, not skipped: ``config_path=""`` resolves to ``Path(".")`` at
+    runtime, and reading the default file instead would complete a server out
+    of a file the running config never names.
     """
     for source in (proxy_init, proxy_env):
-        if isinstance(source, dict):
-            raw = source.get("config_path")
-            if isinstance(raw, str | Path) and str(raw):
+        if isinstance(source, dict) and "config_path" in source:
+            raw = source["config_path"]
+            if isinstance(raw, str | Path):
                 return Path(raw).expanduser()
     return Path(str(ProxyConfig.model_fields["config_path"].default)).expanduser()
+
+
+def _validates_as_upstream_server(entry: dict[str, Any]) -> bool:
+    """Whether the environment's fragment for one server stands on its own.
+
+    The gate that keeps the completion incapable of breaking a config that
+    worked: an entry settings would have accepted needs nothing from the file,
+    so merging the file's version in could only introduce a failure the
+    operator did not have before (a file field that is invalid on its own, say)
+    — while an entry that fails here was already failing, which is the whole of
+    #835. Validating rather than looking for ``prefix`` keeps that true if a
+    second required field is ever added.
+    """
+    try:
+        UpstreamServerConfig.model_validate(entry)
+    except Exception:
+        return False
+    return True
 
 
 def _file_upstream_servers(path: Path) -> dict[str, Any]:
@@ -1960,9 +2004,13 @@ class UpstreamServerCompletionSource(PydanticBaseSettingsSource):
         env_servers = proxy_env.get("upstream_servers")
         if not isinstance(env_servers, dict):
             return {}
-        # A non-mapping env entry replaces the whole server rather than
-        # overriding fields of it, so the file has nothing to contribute.
-        names = [name for name, entry in env_servers.items() if isinstance(entry, dict)]
+        names = [
+            name
+            for name, entry in env_servers.items()
+            # A non-mapping env entry replaces the whole server rather than
+            # overriding fields of it, so the file has nothing to contribute.
+            if isinstance(entry, dict) and not _validates_as_upstream_server(entry)
+        ]
         if not names:
             return {}
         file_servers = _file_upstream_servers(
