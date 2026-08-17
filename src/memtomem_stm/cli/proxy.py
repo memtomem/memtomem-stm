@@ -7751,8 +7751,10 @@ def doctor(
             # `config.proxy.enabled` gate, so a disabled proxy probes green per
             # server while advertising none of them to clients (#831). Shared
             # inert-state predicate with `mms config validate` and the runtime
-            # load advisory, evaluated against the same env-overlaid document
-            # the server would run with.
+            # load advisory, evaluated against the env-overlaid document. That
+            # overlay carries leaf-style env vars only; the aggregate-JSON form
+            # is #834, and lands here as a schema FAIL rather than a wrong
+            # answer.
             if effective_config is not None:
                 from memtomem_stm.proxy.config import _upstream_inert_state
 

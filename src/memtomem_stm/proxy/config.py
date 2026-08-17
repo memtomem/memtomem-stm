@@ -120,30 +120,44 @@ def _upstream_inert_state(
     return "explicit" if "enabled" in data else "default"
 
 
-def _warn_if_upstreams_inert(
-    data: dict[str, Any],
-    config: ProxyConfig,
+def model_upstream_inert_state(config: ProxyConfig) -> Literal["default", "explicit"] | None:
+    """:func:`_upstream_inert_state` for a config with no raw dict behind it.
+
+    The server's env-only startup keeps the ``STMConfig`` pydantic-settings
+    parse instead of rebuilding from the overlay (see
+    ``_apply_proxy_file_config``), so the only record of whether ``enabled``
+    was *stated* is ``model_fields_set`` — the same signal the #288 surfacing
+    advisory reads.
+    """
+    if config.enabled or not config.upstream_servers:
+        return None
+    return "explicit" if "enabled" in config.model_fields_set else "default"
+
+
+def warn_if_upstreams_inert(
+    state: Literal["default", "explicit"] | None,
+    count: int,
     resolved: Path,
     *,
     logger_: logging.Logger,
 ) -> None:
-    """Log the "#288 enabled but inert" advisory for the upstream half (#831).
+    """Log the "#288 inert config" advisory for the upstream half (#831).
 
-    One emitter for both load paths — the file load and the env-only startup
-    that has no file to read — so the wording can't drift between the shape
-    that has a config to inspect and the shape that doesn't.
+    One emitter for every path that can reach this state — the file load, the
+    env-only load, and the server's missing-file no-swap — so the wording
+    can't drift between the shapes that have a config file to inspect and the
+    one that doesn't.
     """
-    inert = _upstream_inert_state(data, enabled=config.enabled)
-    if not inert:
+    if not state:
         return
     logger_.warning(
         "Proxy config %s configures %d upstream server(s) but the proxy is "
-        "disabled%s — config is enabled but inert; upstream tools will not be "
-        'advertised to MCP clients. Add "enabled": true (or remove '
+        "disabled%s — the upstream configuration is present but inert; upstream tools "
+        'will not be advertised to MCP clients. Add "enabled": true (or remove '
         "upstream_servers) to silence.",
         resolved,
-        len(config.upstream_servers),
-        " explicitly" if inert == "explicit" else ' ("enabled" is unset and defaults to false)',
+        count,
+        " explicitly" if state == "explicit" else ' ("enabled" is unset and defaults to false)',
     )
 
 
@@ -1462,12 +1476,16 @@ class ProxyConfig(BaseModel):
                 try:
                     env_config = ProxyConfig.model_validate(env_overrides)
                     if log_warnings:
-                        # An env-only setup is a supported startup shape, so it
-                        # needs the same inert-upstream advisory as a file —
-                        # otherwise the one configuration with no file to
-                        # inspect is also the one that warns about nothing.
-                        _warn_if_upstreams_inert(
-                            env_overrides, env_config, resolved, logger_=logger
+                        # An env-only setup is a supported shape and needs the
+                        # same inert-upstream advisory as a file. This branch
+                        # is the `missing_ok=True` callers (CLI, loader); the
+                        # server takes `missing_ok=False` and warns from
+                        # `_apply_proxy_file_config` instead.
+                        warn_if_upstreams_inert(
+                            _upstream_inert_state(env_overrides, enabled=env_config.enabled),
+                            len(env_config.upstream_servers),
+                            resolved,
+                            logger_=logger,
                         )
                     return ConfigLoadResult(config=env_config, error=None)
                 except Exception as exc:
@@ -1526,7 +1544,12 @@ class ProxyConfig(BaseModel):
             if log_warnings:
                 # Checked against the MERGED data so an env-enabled proxy
                 # stays quiet.
-                _warn_if_upstreams_inert(data, config, resolved, logger_=logger)
+                warn_if_upstreams_inert(
+                    _upstream_inert_state(data, enabled=config.enabled),
+                    len(config.upstream_servers),
+                    resolved,
+                    logger_=logger,
+                )
             return ConfigLoadResult(config=config, error=None, unknown_keys=unknown_keys)
         except (json.JSONDecodeError, Exception) as exc:
             # The parse-failure warning dominates; the unknown-keys warning is

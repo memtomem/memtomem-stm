@@ -283,7 +283,7 @@ class TestLoadFromFileWithStatus:
             with caplog.at_level(logging.WARNING):
                 result = ProxyConfig.load_from_file_with_status(cfg_file)
             assert result.config is not None
-            advisories = [r for r in caplog.records if "enabled but inert" in r.getMessage()]
+            advisories = [r for r in caplog.records if "present but inert" in r.getMessage()]
             assert len(advisories) == 1, extra
             assert expected in advisories[0].getMessage()
 
@@ -298,14 +298,14 @@ class TestLoadFromFileWithStatus:
         with caplog.at_level(logging.WARNING):
             result = ProxyConfig.load_from_file_with_status(missing, overrides)
         assert result.config is not None and not result.config.enabled
-        advisories = [r for r in caplog.records if "enabled but inert" in r.getMessage()]
+        advisories = [r for r in caplog.records if "present but inert" in r.getMessage()]
         assert len(advisories) == 1
         assert '"enabled" is unset' in advisories[0].getMessage()
 
         caplog.clear()
         with caplog.at_level(logging.WARNING):
             ProxyConfig.load_from_file_with_status(missing, {**overrides, "enabled": True})
-        assert not [r for r in caplog.records if "enabled but inert" in r.getMessage()]
+        assert not [r for r in caplog.records if "present but inert" in r.getMessage()]
 
     def test_inert_upstream_warning_suppressed_when_serving(self, tmp_path, caplog):
         """Silent in both non-inert shapes — enabled (env-enabled included,
@@ -326,7 +326,7 @@ class TestLoadFromFileWithStatus:
                 result = ProxyConfig.load_from_file_with_status(cfg_file, overrides)
             assert result.config is not None
             assert not [
-                r for r in caplog.records if "enabled but inert" in r.getMessage()
+                r for r in caplog.records if "present but inert" in r.getMessage()
             ], (data, overrides)
 
     def test_missing_cache_policy_warns_with_migration_hint(self, tmp_path, caplog):
