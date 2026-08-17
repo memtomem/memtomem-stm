@@ -11651,13 +11651,18 @@ class TestDoctor:
         assert probed["fake"]["command"] == "env-server"
 
     def test_next_action_refuses_unrenderable_config_path(self, runner, tmp_path, monkeypatch):
-        """`next_action` is printed verbatim, so a CR/LF in the argv-supplied
-        path must not forge an extra `next:` line — the hint collapses to the
-        shared unrenderable diagnostic instead."""
+        """`next_action` is printed verbatim, so a line-breaking character in
+        the argv-supplied path must not forge an extra `next:` line — the hint
+        collapses to the shared unrenderable diagnostic instead.
+
+        The separator is U+2028 rather than a raw newline because NTFS refuses
+        filenames below U+0020, so a `\\n` case cannot exist on Windows; U+2028
+        is a legal filename character on both filesystems and breaks the line
+        in exactly the terminals this guard is for."""
         from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE
 
         self._stub_probe(monkeypatch)
-        config = tmp_path / "stm\nproxy.json"
+        config = tmp_path / "stm proxy.json"
         config.write_text(
             json.dumps(
                 {
@@ -11683,7 +11688,7 @@ class TestDoctor:
         # And nothing anywhere in the report forges a line out of the path —
         # the header renders it escaped like every other argv-derived value.
         assert not [ln for ln in result.output.splitlines() if ln.startswith("proxy.json")]
-        assert "stm\\u000Aproxy.json" in result.output
+        assert "stm\\u2028proxy.json" in result.output
 
     def test_recovery_hints_are_not_runnable_commands(self, runner, config, monkeypatch):
         """Both hints tell you to edit a file; a pasted `next:` line must be
