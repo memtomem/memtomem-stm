@@ -175,6 +175,13 @@ class TestComplexEnvValuesMatchSettings:
             [("…__UPSTREAM_SERVERS__GH", '{"PREFIX": "gh", "COMMAND": "s"}')],
             [("…__UPSTREAM_SERVERS", '{"gh": {"prefix": "gh", "command": "s", "CACHE": true}}')],
             [("…__TOOLGRAPH", '{"ENABLED": true, "ARGS": ["x"]}')],
+            [("…__UPSTREAM_SERVERS____PREFIX", "gh"), ("…__UPSTREAM_SERVERS____COMMAND", "s")],
+            [
+                ("…__UPSTREAM_SERVERS__FX__PREFIX", "fx"),
+                ("…__UPSTREAM_SERVERS__FX__COMMAND", "s"),
+                ("…__UPSTREAM_SERVERS__FX__ENV__", "v"),
+            ],
+            [("MEMTOMEM_ſTM_PROXY__ENABLED", "true")],
         ],
         ids=[
             "mapping-parent-first",
@@ -190,6 +197,9 @@ class TestComplexEnvValuesMatchSettings:
             "uppercase-fields-in-a-container-value",
             "duplicate-cased-keys-under-a-container",
             "uppercase-fields-of-a-nested-model",
+            "empty-component-names-a-server",
+            "empty-component-inside-a-free-form-dict",
+            "unicode-name-that-upper-cases-onto-the-prefix",
         ],
     )
     def test_parent_child_and_name_matching_follow_settings(self, monkeypatch, items) -> None:

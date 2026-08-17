@@ -208,21 +208,29 @@ def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> dict[s
     # first position. Assigning into a dict reproduces exactly that, and it
     # matters: the surviving position decides whether a parent payload or a
     # deeper child wins below.
+    # Lowercase both sides rather than upper-casing the name: settings
+    # lowercases, and the two are not inverses. `MEMTOMEM_ſTM_PROXY__…`
+    # upper-cases onto the prefix (U+017F → "S") while settings, which never
+    # upper-cases, ignores the variable entirely.
+    prefix = _PROXY_ENV_PREFIX.lower()
     lowered: dict[str, str] = {}
     for key, val in env.items():
-        if key.upper().startswith(_PROXY_ENV_PREFIX):
-            lowered[key.lower()] = val
+        lowered_key = key.lower()
+        if lowered_key.startswith(prefix):
+            lowered[lowered_key] = val
 
     overrides: dict[str, Any] = {}
     # Environment order is preserved from here on: settings resolves a
     # mapping parent and a deeper child by last-one-wins, so reordering would
     # hand the rebuild a different config than the server runs.
     for key, val in lowered.items():
-        path = key[len(_PROXY_ENV_PREFIX) :].split("__")
-        # An empty component means a malformed name (`CACHE____ENABLED`).
-        # Settings ignores those; collapsing them here would silently honor a
-        # var the server does not.
-        if not path or any(not part for part in path):
+        path = key[len(prefix) :].split("__")
+        # Empty components are kept, not dropped: settings turns a doubled
+        # delimiter into an empty *key*, which is a real mapping entry
+        # (`…__UPSTREAM_SERVERS____PREFIX` configures the server named "").
+        # Dropping the component would silently rename that entry, and
+        # dropping the whole var would hide one the server honors.
+        if not path:
             continue
         cursor: dict[str, Any] = overrides
         for part in path[:-1]:
