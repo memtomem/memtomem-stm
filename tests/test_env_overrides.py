@@ -348,7 +348,15 @@ class TestComplexEnvValuesMatchSettings:
     )
     def test_overlay_agrees_with_pydantic_settings(self, monkeypatch, env) -> None:
         """The oracle: whatever ``STMConfig()`` builds from these vars, the
-        overlay rebuild must build too."""
+        overlay rebuild must build too.
+
+        Now that the rebuild asks an ``EnvSettingsSource`` instead of
+        reproducing one (#837), this no longer guards a reimplementation of
+        settings' semantics — there is none left to drift. What it still
+        guards is everything wrapped AROUND the source: the name filter, the
+        mapping hook, the malformed-value path, and the source behaving the
+        same way on whatever ``pydantic-settings`` a contributor resolves.
+        """
         from memtomem_stm.config import STMConfig
 
         for name in [n for n in os.environ if n.upper().startswith("MEMTOMEM_STM_PROXY")]:
@@ -359,6 +367,113 @@ class TestComplexEnvValuesMatchSettings:
         settings_proxy = STMConfig().proxy
         overlay_proxy = ProxyConfig.model_validate(collect_proxy_env_overrides())
         assert overlay_proxy.model_dump() == settings_proxy.model_dump()
+
+
+class TestSettingsSourceCanaries:
+    """Guards on the seam between this module and ``pydantic-settings``.
+
+    The rebuild delegates every env-resolution rule to an
+    ``EnvSettingsSource`` (#837), so the failure mode that remains is not a
+    semantic divergence but the delegation itself breaking: a constructor that
+    stops accepting what we pass, or the mapping hook no longer being
+    consulted. The declared floor is ``>=2.7`` while behavior is measured on
+    what the lockfile resolves, so these have to fail loudly rather than
+    silently reading the wrong environment.
+    """
+
+    def test_source_constructs_with_only_settings_cls(self) -> None:
+        """``settings_cls`` is the one constructor argument whose position and
+        meaning are stable across the supported range; every other knob is read
+        off ``model_config``. Passing more would pin us to one release."""
+        from pydantic_settings import EnvSettingsSource
+
+        from memtomem_stm.config import STMConfig
+
+        source = EnvSettingsSource(STMConfig)
+
+        assert source.env_prefix == "MEMTOMEM_STM_"
+        assert source.env_nested_delimiter == "__"
+
+    def test_mapping_hook_is_actually_consulted(self, monkeypatch) -> None:
+        """If the hook stopped being called, the rebuild would silently resolve
+        the PROCESS environment while claiming to answer about the mapping it
+        was handed — a wrong answer, not an error. Contrast a variable set only
+        in the process with one set only in the mapping.
+        """
+        for name in [n for n in os.environ if n.upper().startswith("MEMTOMEM_STM_PROXY")]:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS", "1111")
+
+        result = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY__MAX_UPSTREAM_CHARS": "2222"})
+
+        assert result == {"max_upstream_chars": "2222"}
+
+    def test_source_output_matches_a_hand_built_expectation(self, monkeypatch) -> None:
+        """A written-down expectation of what the source resolves, so an
+        upgrade that changes explosion, decoding or case folding trips here
+        with a readable diff instead of surfacing as a config bug."""
+        env = {
+            "MEMTOMEM_STM_PROXY__ENABLED": "true",
+            "MEMTOMEM_STM_PROXY__CACHE": '{"ENABLED": false}',
+            "MEMTOMEM_STM_PROXY__CACHE__TTL_SECONDS": "5",
+            "memtomem_stm_proxy__upstream_servers__gh__args": '["--one"]',
+        }
+
+        assert collect_proxy_env_overrides(env) == {
+            "enabled": "true",  # scalars stay strings; pydantic coerces later
+            "cache": {"enabled": False, "ttl_seconds": "5"},  # field key folded
+            "upstream_servers": {"gh": {"args": ["--one"]}},  # complex decoded
+        }
+
+
+class TestMalformedValuesSurviveAsRawStrings:
+    """The one place the source's behavior is deliberately NOT adopted.
+
+    ``EnvSettingsSource`` raises on a complex value it cannot decode. The
+    overlay instead keeps the raw string so it reaches ``model_validate``,
+    which names the field — the diagnostic the load path's warning is built
+    on. Dropping the variable, or substituting a default, would be the silent
+    degrade this module exists to prevent.
+    """
+
+    def test_one_malformed_value_keeps_the_rest(self) -> None:
+        env = {
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": "{not json",
+            "MEMTOMEM_STM_PROXY__ENABLED": "true",
+        }
+
+        assert collect_proxy_env_overrides(env) == {
+            "upstream_servers": "{not json",
+            "enabled": "true",
+        }
+
+    def test_several_malformed_values_are_all_kept(self) -> None:
+        """Attribution is by exclusion, so it has to find every culprit, not
+        just the first one settings happened to raise on."""
+        env = {
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": "{not json",
+            "MEMTOMEM_STM_PROXY__CACHE": "[unclosed",
+            "MEMTOMEM_STM_PROXY__TOOLGRAPH__ARGS": "not-a-list",
+            "MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS": "9999",
+        }
+
+        assert collect_proxy_env_overrides(env) == {
+            "upstream_servers": "{not json",
+            "cache": "[unclosed",
+            "toolgraph": {"args": "not-a-list"},
+            "default_max_result_chars": "9999",
+        }
+
+    def test_a_malformed_value_reaches_validation_naming_its_field(self) -> None:
+        """The point of keeping it raw: the error names the field the operator
+        has to fix. A dropped variable would validate cleanly and run a config
+        the operator never wrote."""
+        overrides = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY__CACHE": "[unclosed"})
+
+        with pytest.raises(ValidationError) as caught:
+            ProxyConfig.model_validate(overrides)
+
+        assert caught.value.errors()[0]["loc"] == ("cache",)
 
 
 class TestDeepMerge:
