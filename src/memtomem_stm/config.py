@@ -9,9 +9,9 @@ from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
-from memtomem_stm.proxy.config import ProxyConfig
+from memtomem_stm.proxy.config import ProxyConfig, UpstreamServerCompletionSource
 from memtomem_stm.surfacing.config import SurfacingConfig
 
 
@@ -512,6 +512,31 @@ class STMConfig(BaseSettings):
     tools back into MCP advertisement. Claude Code defers tool schemas via
     its own mechanism so this flag has no effect there. Read via env var
     ``MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS`` at server import time."""
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Add the upstream-server completion source at the LOWEST precedence.
+
+        A per-field override of a file-declared upstream server used to fail
+        validation here, because the env fragment carries one field and no
+        ``prefix`` (#835). The completion source hands the file's entry for
+        those server names to the merge, below the environment, so env fields
+        still win — see ``UpstreamServerCompletionSource`` for its scope.
+        """
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            file_secret_settings,
+            UpstreamServerCompletionSource(settings_cls, init_settings, env_settings),
+        )
 
     def model_post_init(self, __context: object) -> None:
         # Propagate consumer_model from proxy to surfacing for model-aware defaults

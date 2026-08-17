@@ -14,7 +14,9 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, Self, Union, get_args, get_origin
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic.fields import FieldInfo
 from pydantic_core import ErrorDetails
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
 
 from memtomem_stm.proxy import prefixes
 
@@ -529,6 +531,63 @@ def _env_override_hint(
     if not implicated:
         return ""
     return " (env override(s) implicated: " + ", ".join(sorted(implicated)) + ")"
+
+
+def env_var_hint_for_validation_error(
+    exc: Exception, environ: Mapping[str, str] | None = None
+) -> str:
+    """Name the ``MEMTOMEM_STM_*`` var(s) implicated in an ``STMConfig`` error.
+
+    The sibling of ``_env_override_hint`` for the OTHER failure point: that one
+    explains a merged-config failure inside the load path, which owns an env
+    overlay to attribute against; this one explains ``STMConfig()`` itself
+    failing, where the only evidence is the error location and the environment.
+
+    Hints are derived from the var names that EXIST, never synthesized from the
+    error location, so the operator is only ever pointed at something they set:
+
+    - a var at or above the location is named (``…__CACHE__ENABLED=nope``, and
+      an aggregate ``…__UPSTREAM_SERVERS`` payload whose inner entry faulted);
+    - a var BELOW the location is named too, because a model-level validator
+      reports at the model's own path while the offending field sits under it;
+    - a ``missing`` error is the exception that needs its SIBLINGS: the field
+      the error names is precisely the one nobody set, so the vars that created
+      the incomplete entry are the ones to fix (``…__GH__COMMAND`` for a
+      ``upstream_servers.gh.prefix`` that is missing).
+
+    Matching is case-insensitive because settings resolves names that way; only
+    names, never values, are rendered (cf. ``hide_input_in_errors``).
+    """
+    if not isinstance(exc, ValidationError):
+        return ""
+    env = os.environ if environ is None else environ
+    prefix = "memtomem_stm_"
+    var_paths: dict[tuple[str, ...], str] = {}
+    for key in env:
+        lowered = key.lower()
+        if lowered.startswith(prefix) and len(lowered) > len(prefix):
+            var_paths[tuple(lowered[len(prefix) :].split("__"))] = key
+
+    def _starts_with(path: tuple[str, ...], head: tuple[str, ...]) -> bool:
+        return path[: len(head)] == head
+
+    implicated: set[str] = set()
+    for err in exc.errors():
+        loc = tuple(str(part) for part in err.get("loc", ()))
+        if not loc:
+            continue  # no path to attribute; naming every var would be noise
+        for path, name in var_paths.items():
+            if err.get("type") == "missing":
+                # Siblings of the missing field: a var that set one of them, or
+                # a payload var at/above the entry that declared it incomplete.
+                parent = loc[:-1]
+                if parent and (_starts_with(path, parent) or _starts_with(parent, path)):
+                    implicated.add(name)
+            elif _starts_with(loc, path) or _starts_with(path, loc):
+                implicated.add(name)
+    if not implicated:
+        return ""
+    return " (env var(s) implicated: " + ", ".join(sorted(implicated)) + ")"
 
 
 class CompressionStrategy(StrEnum):
@@ -1795,6 +1854,126 @@ class ProxyConfig(BaseModel):
             return ConfigLoadResult(
                 config=None, error=_sanitized_load_error(exc), unknown_keys=unknown_keys
             )
+
+
+def _resolve_config_path_for_completion(
+    proxy_init: dict[str, Any] | None, proxy_env: dict[str, Any]
+) -> Path:
+    """Where the config file lives, per the precedence that names it.
+
+    ``config_path`` is itself configurable, so the completion source cannot ask
+    a validated ``ProxyConfig`` for it — that config is what is being built.
+    Init kwargs outrank the environment, matching the source order, and the
+    field default is the last word.
+    """
+    for source in (proxy_init, proxy_env):
+        if isinstance(source, dict):
+            raw = source.get("config_path")
+            if isinstance(raw, str | Path) and str(raw):
+                return Path(raw).expanduser()
+    return Path(str(ProxyConfig.model_fields["config_path"].default)).expanduser()
+
+
+def _file_upstream_servers(path: Path) -> dict[str, Any]:
+    """``upstream_servers`` as the file literally spells it, or ``{}``.
+
+    Deliberately raw and forgiving: this runs during ``STMConfig()``, where a
+    broken file must not become a construction failure. Every diagnostic about
+    the file — unknown keys, permissions, parse errors — belongs to
+    ``load_from_file_with_status``, which reads it again for real.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    servers = data.get("upstream_servers")
+    return servers if isinstance(servers, dict) else {}
+
+
+class UpstreamServerCompletionSource(PydanticBaseSettingsSource):
+    """Completes a file-declared upstream server that env vars override per field.
+
+    ``MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__<NAME>__<FIELD>`` is a documented
+    override shape, but settings validates the fragment it built from the
+    environment on its own, where a server carrying one field has no ``prefix``
+    — so overriding one field of a server the FILE declares made ``STMConfig()``
+    refuse to construct, naming a field the operator did set in a file the
+    process never opened (#835). That killed the server at startup and every
+    ``STMConfig()`` in the CLI with it.
+
+    Ordered BELOW the environment source, this supplies the file's entry for
+    exactly those server names the environment mentions, so ``deep_update``
+    lands the env fields on top and validation sees the completed server —
+    the same config the load path would later merge. Servers the environment
+    does not mention are NOT supplied: the config-file boundary
+    (``docs/configuration.md``) keeps the file's own upstreams arriving through
+    ``load_from_file_with_status``, whose warnings have nowhere to go from
+    inside a settings source.
+
+    Server names match exactly, without case folding, because settings does not
+    fold mapping keys either: the environment always yields a lower-cased name,
+    so a file server spelled ``GitHub`` is not completed by ``…__GITHUB__…`` —
+    and is not merged with it downstream either, which is the point. Anything
+    that goes wrong here yields ``{}``, leaving the pre-#835 behavior.
+    """
+
+    def __init__(
+        self,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+    ) -> None:
+        super().__init__(settings_cls)
+        self._init_settings = init_settings
+        self._env_settings = env_settings
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        # This source contributes a subtree through __call__; the per-field hook
+        # is part of the ABC and is never consulted for it.
+        raise NotImplementedError
+
+    def __call__(self) -> dict[str, Any]:
+        try:
+            return self._completion()
+        except Exception:
+            # A completion is an optimization on the operator's behalf; it must
+            # never be the reason a config fails to build.
+            logger.debug("Upstream-server completion skipped", exc_info=True)
+            return {}
+
+    def _completion(self) -> dict[str, Any]:
+        proxy_init = self._init_settings().get("proxy")
+        if proxy_init is not None and not isinstance(proxy_init, dict):
+            # An explicit `proxy=` object replaces the field wholesale, so there
+            # is no env fragment left for the file to complete.
+            return {}
+        try:
+            env_data = self._env_settings()
+        except Exception:
+            # A malformed complex value; the main build raises it unchanged.
+            return {}
+        proxy_env = env_data.get("proxy")
+        if not isinstance(proxy_env, dict):
+            return {}
+        env_servers = proxy_env.get("upstream_servers")
+        if not isinstance(env_servers, dict):
+            return {}
+        # A non-mapping env entry replaces the whole server rather than
+        # overriding fields of it, so the file has nothing to contribute.
+        names = [name for name, entry in env_servers.items() if isinstance(entry, dict)]
+        if not names:
+            return {}
+        file_servers = _file_upstream_servers(
+            _resolve_config_path_for_completion(proxy_init, proxy_env)
+        )
+        completion = {
+            name: file_servers[name] for name in names if isinstance(file_servers.get(name), dict)
+        }
+        if not completion:
+            return {}
+        return {"proxy": {"upstream_servers": completion}}
 
 
 class ProxyConfigLoader:

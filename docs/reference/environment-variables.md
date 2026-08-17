@@ -15,6 +15,17 @@ and OTLP settings are environment/default-only. Proxy environment values are
 layered over the file. The proxy's `consumer_model` propagation into surfacing
 is the documented exception across those domains.
 
+Layering reaches inside an upstream server: a single field of a server the file
+declares can be overridden at
+`MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__<NAME>__<FIELD>` (for example
+`MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND`), and the file supplies the
+fields the variable omits. `<NAME>` arrives lower-cased, so this form addresses
+a server the file keys in lower case; to override one field of a server keyed
+with capitals, spell it in the aggregate JSON form, whose keys are taken
+verbatim — `MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS='{"GH": {"command": "…"}}'`.
+A name that matches no server in the file declares a new one, which must then
+carry every required field itself, `PREFIX` included.
+
 Defaults below are model defaults before config-file or environment overlays.
 Paths containing `~` are expanded at their use sites. Never paste configured
 secret values into issue reports.

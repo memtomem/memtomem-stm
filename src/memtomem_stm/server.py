@@ -30,6 +30,7 @@ from memtomem_stm.proxy.compression_feedback import CompressionFeedbackTracker
 from memtomem_stm.proxy.config import (
     ProxyConfig,
     collect_proxy_env_overrides,
+    env_var_hint_for_validation_error,
     model_upstream_inert_state,
     warn_if_upstreams_inert,
 )
@@ -108,6 +109,14 @@ def _apply_proxy_file_config(config: STMConfig, proxy_env_overrides: dict[str, A
     fields (notably ``upstream_servers``) survive. The load used to be
     skipped entirely whenever ``MEMTOMEM_STM_PROXY__ENABLED`` was set, which
     started the proxy enabled but with zero upstreams — proxying nothing.
+
+    This is not the only place the file and the environment meet: a per-field
+    override of a file-declared upstream server is completed from the file
+    during ``STMConfig()`` itself, by ``UpstreamServerCompletionSource``, or
+    validation would reject the env fragment before reaching here (#835). That
+    source supplies only the server names the environment mentions, so the
+    file's own upstreams still arrive through this load — with the warnings a
+    settings source has no way to emit.
 
     When the file is MISSING, ``config.proxy`` is deliberately left as
     constructed: ``STMConfig()``'s pydantic-settings parse already applied
@@ -2181,9 +2190,15 @@ def main() -> None:
     # here, after a plain stderr basicConfig, is the readable version.
     try:
         startup_config = STMConfig()
-    except Exception:
+    except Exception as exc:
         logging.basicConfig(level=logging.WARNING, format=STDERR_FORMAT)
-        logger.exception("Invalid MEMTOMEM_STM_* environment configuration")
+        # The traceback renders the failing LOCATION; the hint renders the
+        # variable name the operator has to edit, which for a missing field is
+        # never the location itself (#835).
+        logger.exception(
+            "Invalid MEMTOMEM_STM_* environment configuration%s",
+            env_var_hint_for_validation_error(exc),
+        )
         raise
     configure_server_logging(startup_config)
     # Exception barrier (#209): without this, an unhandled exception from

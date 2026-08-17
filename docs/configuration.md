@@ -37,6 +37,12 @@ flowchart LR
    only and hot-reloaded for supported fields.
 3. **Defaults** — baseline values for both domains.
 
+Layering applies per field, including inside an upstream server: setting
+`MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__<NAME>__<FIELD>` overrides that one
+field and the file supplies the rest of the server. See the
+[environment variable reference](reference/environment-variables.md) for how
+`<NAME>` is matched.
+
 For most quick-start scenarios you can ignore the config file entirely and use the [CLI](cli.md) (`mms add ...`) plus a few env vars.
 
 ## Environment Variables
