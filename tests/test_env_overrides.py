@@ -13,11 +13,13 @@ import time
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from memtomem_stm.proxy.config import (
     ProxyConfig,
     ProxyConfigLoader,
     _deep_merge,
+    _env_override_hint,
     collect_proxy_env_overrides,
 )
 
@@ -129,6 +131,65 @@ class TestComplexEnvValuesMatchSettings:
         env = {"MEMTOMEM_STM_PROXY__BOGUS_KEY": '{"a": 1}'}
         assert collect_proxy_env_overrides(env) == {"bogus_key": '{"a": 1}'}
 
+    @pytest.mark.parametrize("reverse", [False, True], ids=["parent-first", "child-first"])
+    def test_non_mapping_parent_is_not_resurrected_by_a_deeper_var(self, reverse) -> None:
+        """`CACHE=null` is a supplied value, not an absence. Settings keeps it
+        and lets validation reject the config; letting the deeper var rebuild
+        a mapping would make this rebuild *accept* an environment the server
+        refuses. Both orders, because process env order is arbitrary while
+        settings' answer is not."""
+        items = [
+            ("MEMTOMEM_STM_PROXY__CACHE", "null"),
+            ("MEMTOMEM_STM_PROXY__CACHE__ENABLED", "true"),
+        ]
+        env = dict(reversed(items) if reverse else items)
+        assert collect_proxy_env_overrides(env) == {"cache": None}
+
+    def test_non_mapping_parent_covers_every_json_scalar(self) -> None:
+        for raw in ("null", "1", "true", '""', "[]"):
+            env = {
+                "MEMTOMEM_STM_PROXY__CACHE": raw,
+                "MEMTOMEM_STM_PROXY__CACHE__ENABLED": "true",
+            }
+            assert collect_proxy_env_overrides(env)["cache"] == json.loads(raw), raw
+
+    def test_decoded_payload_is_named_by_its_own_var_not_invented_leaves(self) -> None:
+        """`_env_override_hint` names vars by walking overlay leaves, so a
+        decoded payload must not contribute leaves of its own: those vars do
+        not exist, and an `env` payload is keyed by operator-chosen names
+        that would then be echoed into the warning."""
+        env = {
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": json.dumps(
+                {"gh": {"prefix": "", "command": "c", "env": {"API_TOKEN": "s3cret"}}}
+            )
+        }
+        overrides = collect_proxy_env_overrides(env)
+        with pytest.raises(ValidationError) as exc_info:
+            ProxyConfig.model_validate(overrides)
+
+        hint = _env_override_hint(exc_info.value, overrides)
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS" in hint
+        assert "GH" not in hint
+        assert "API_TOKEN" not in hint
+        assert "s3cret" not in hint
+
+    def test_deeper_var_inside_a_decoded_payload_is_still_named(self) -> None:
+        """The merge half: a var that writes into the payload is a real var,
+        so it stays nameable — otherwise fixing the provenance leak would
+        blind the diagnostic to the leaf that actually broke."""
+        env = {
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": json.dumps(
+                {"gh": {"prefix": "gh", "command": "c"}}
+            ),
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__PREFIX": "   ",
+        }
+        overrides = collect_proxy_env_overrides(env)
+        with pytest.raises(ValidationError) as exc_info:
+            ProxyConfig.model_validate(overrides)
+
+        hint = _env_override_hint(exc_info.value, overrides)
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__PREFIX" in hint
+
     @pytest.mark.parametrize(
         "env",
         [
@@ -143,7 +204,12 @@ class TestComplexEnvValuesMatchSettings:
                 "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__COMMAND": "s",
                 "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__ENV": '{"A": "1"}',
             },
-            {"MEMTOMEM_STM_PROXY__ENABLED": "true", "MEMTOMEM_STM_PROXY__MAX_TOOLS": "7"},
+            {
+                "MEMTOMEM_STM_PROXY__ENABLED": "true",
+                "MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS": "9999",
+                "MEMTOMEM_STM_PROXY__CONFIG_PATH": "/tmp/x.json",
+                "MEMTOMEM_STM_PROXY__DEFAULT_COMPRESSION": "truncate",
+            },
             # The other vars `docs/reference/environment-variables.md` types
             # as JSON — the same defect reached all of them, not just servers.
             {

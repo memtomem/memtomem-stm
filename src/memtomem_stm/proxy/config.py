@@ -60,10 +60,9 @@ def _env_leaf_is_complex(path: list[str]) -> bool:
 
     It decodes exactly the *complex* fields — models and containers — and
     leaves scalars to normal coercion, so this walks ``ProxyConfig`` the same
-    way and answers the same question (#834). An unknown path answers False:
-    the raw string then reaches validation, which is where a typo'd key is
-    already reported (``find_unknown_keys``), instead of being second-guessed
-    here.
+    way and answers the same question (#834). An unknown path answers False
+    and keeps its raw string: nothing here can say what type a key that no
+    model declares was meant to be, and validation ignores it either way.
     """
     annotation: Any = ProxyConfig
     for part in path:
@@ -74,6 +73,40 @@ def _env_leaf_is_complex(path: list[str]) -> bool:
     if _model_arms(annotation) is not None:
         return True
     return get_origin(_unwrap_annotation(annotation)) in (dict, list, tuple, set)
+
+
+_MISSING = object()
+
+
+class _EnvJsonDict(dict[str, Any]):
+    """A mapping that came from ONE env var's JSON payload.
+
+    ``_env_override_hint`` names env vars by walking the overlay's leaves,
+    which only works while every leaf corresponds to a var the operator set.
+    A decoded payload breaks that: ``UPSTREAM_SERVERS='{"gh": {…}}'`` has
+    leaves like ``gh.command`` that no var supplied, and naming them invents
+    variables — and echoes user-controlled mapping keys (an ``env`` entry is
+    keyed by the operator's own names) into a warning. Marking the decoded
+    subtree lets the hint stop at the var that actually exists.
+
+    Every mapping inside the payload is wrapped, each carrying ``var_path``
+    — the path of the var that supplied it — so a hint that starts anywhere
+    inside the payload still names the one variable that exists.
+
+    ``explicit_keys`` records keys a *deeper* var then set inside this
+    payload, since settings merges those on top; they are real vars and must
+    still be nameable.
+    """
+
+    def __init__(self, data: dict[str, Any], var_path: list[str]) -> None:
+        super().__init__(
+            {
+                key: (_EnvJsonDict(value, var_path) if type(value) is dict else value)
+                for key, value in data.items()
+            }
+        )
+        self.var_path = list(var_path)
+        self.explicit_keys: set[str] = set()
 
 
 def _decode_env_value(path: list[str], raw: str) -> Any:
@@ -87,9 +120,10 @@ def _decode_env_value(path: list[str], raw: str) -> Any:
     if not _env_leaf_is_complex(path):
         return raw
     try:
-        return json.loads(raw)
+        decoded = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
         return raw
+    return _EnvJsonDict(decoded, path) if type(decoded) is dict else decoded
 
 
 def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> dict[str, Any]:
@@ -110,21 +144,40 @@ def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> dict[s
     validation as a string and fails a config the server accepts (#834).
     """
     env = environ if environ is not None else dict(os.environ)
-    overrides: dict[str, Any] = {}
+    paths: list[tuple[list[str], str]] = []
     for key, val in env.items():
         if not key.startswith(_PROXY_ENV_PREFIX):
             continue
         path = [p.lower() for p in key[len(_PROXY_ENV_PREFIX) :].split("__") if p]
-        if not path:
-            continue
-        cursor = overrides
+        if path:
+            paths.append((path, val))
+
+    overrides: dict[str, Any] = {}
+    # Shallowest first, so a parent var is in place before anything that
+    # would descend through it. Settings resolves the two independently of
+    # process env order, and so must this.
+    for path, val in sorted(paths, key=lambda item: len(item[0])):
+        cursor: dict[str, Any] = overrides
         for part in path[:-1]:
-            existing = cursor.get(part)
+            # `get(part)` would read a supplied JSON `null` as "absent" and
+            # let the branch below rebuild it into a mapping.
+            existing = cursor.get(part, _MISSING)
+            if existing is not _MISSING and not isinstance(existing, dict):
+                # A parent var supplied a non-mapping (`CACHE=null`). Settings
+                # keeps that value and lets validation reject the config; it
+                # does not let the deeper var quietly resurrect a mapping, so
+                # neither does this — otherwise the rebuild accepts an
+                # environment the server refuses.
+                cursor = {}
+                break
             if not isinstance(existing, dict):
                 existing = {}
                 cursor[part] = existing
             cursor = existing
-        cursor[path[-1]] = _decode_env_value(path, val)
+        else:
+            if isinstance(cursor, _EnvJsonDict):
+                cursor.explicit_keys.add(path[-1])
+            cursor[path[-1]] = _decode_env_value(path, val)
     return overrides
 
 
@@ -314,17 +367,32 @@ def _env_override_hint(
         return ""
     implicated: set[str] = set()
 
+    def _name(prefix: list[str]) -> str:
+        return _PROXY_ENV_PREFIX + "__".join(p.upper() for p in prefix)
+
     def _add_leaves(path: list[str], subtree: dict[str, Any]) -> None:
         stack: list[tuple[list[str], dict[str, Any]]] = [(path, subtree)]
         while stack:
             prefix, node = stack.pop()
+            if isinstance(node, _EnvJsonDict):
+                # One var supplied this whole payload; its inner keys are not
+                # vars. Name that var — wherever inside the payload this walk
+                # started — then descend only where a deeper var did set
+                # something (settings merges those on top).
+                implicated.add(_name(node.var_path))
+                for key, value in node.items():
+                    if isinstance(value, dict):
+                        # Keep walking: a deeper var may have written further
+                        # inside this payload.
+                        stack.append(([*prefix, str(key)], value))
+                    elif key in node.explicit_keys:
+                        implicated.add(_name([*prefix, str(key)]))
+                continue
             for key, value in node.items():
                 if isinstance(value, dict):
                     stack.append(([*prefix, str(key)], value))
                 else:
-                    implicated.add(
-                        _PROXY_ENV_PREFIX + "__".join(p.upper() for p in [*prefix, str(key)])
-                    )
+                    implicated.add(_name([*prefix, str(key)]))
 
     def _error_key(e: ErrorDetails) -> tuple[tuple[Any, ...], str, str]:
         return (tuple(e.get("loc", ())), str(e.get("type", "")), str(e.get("msg", "")))
