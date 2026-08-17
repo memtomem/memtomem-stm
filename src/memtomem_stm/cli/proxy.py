@@ -7762,7 +7762,9 @@ def doctor(
                 # a literal or a `_shell_join` render (see the render comment).
                 # An unsafe path takes the whole hint with it — leaving the
                 # prose around the diagnostic would hand the user a line that
-                # still starts with a runnable word (`set ...`).
+                # still starts with a runnable word (`set ...`). Both hints are
+                # edit-this-file instructions, not commands, so they lead with
+                # `#`: a pasted `next:` line must never *do* anything.
                 path_hint = _shell_join([str(resolved)])
                 unrenderable = path_hint == _HINT_UNRENDERABLE
                 if inert is None and servers:
@@ -7782,8 +7784,8 @@ def doctor(
                         "advertised to MCP clients",
                         _HINT_UNRENDERABLE
                         if unrenderable
-                        else f'add "enabled": true to {path_hint}  '
-                        '# or "enabled": false to pin control-only mode',
+                        else f'# add "enabled": true to {path_hint}  '
+                        '(or "enabled": false to pin control-only mode)',
                     )
                 elif inert == "explicit":
                     check(
@@ -7794,8 +7796,8 @@ def doctor(
                         "server(s) are not advertised (control-only mode)",
                         _HINT_UNRENDERABLE
                         if unrenderable
-                        else f'set "enabled": true in {path_hint}  '
-                        "# if upstream tools should be served",
+                        else f'# set "enabled": true in {path_hint}  '
+                        "(if upstream tools should be served)",
                     )
 
             if servers:
@@ -8300,7 +8302,10 @@ def doctor(
             payload["surfacing"] = surfacing_status
         click.echo(_json_dumps(payload, indent=2, ensure_ascii=False))
     else:
-        click.echo(_hdr(f"Doctor: {resolved}"))
+        # `resolved` is argv-derived like every other rendered value here: an
+        # unescaped CR/LF in the path would forge a line of its own above the
+        # report (#754/#755 escape prose everywhere else for this reason).
+        click.echo(_hdr(f"Doctor: {_disp(str(resolved))}"))
         click.echo("=" * 30)
         for c in checks:
             styled = _DOCTOR_STYLES[c["status"]](c["status"])

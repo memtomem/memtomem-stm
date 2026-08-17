@@ -11680,10 +11680,31 @@ class TestDoctor:
         result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
         next_lines = [ln for ln in result.output.splitlines() if ln.strip().startswith("next:")]
         assert f"next: {_HINT_UNRENDERABLE}" in [ln.strip() for ln in next_lines]
-        # Nothing the check emitted carries the raw path forward: the only
-        # place the newline survives is doctor's own header, which is outside
-        # this check's surface.
-        assert not [ln for ln in next_lines if "proxy.json" in ln]
+        # And nothing anywhere in the report forges a line out of the path —
+        # the header renders it escaped like every other argv-derived value.
+        assert not [ln for ln in result.output.splitlines() if ln.startswith("proxy.json")]
+        assert "stm\\u000Aproxy.json" in result.output
+
+    def test_recovery_hints_are_not_runnable_commands(self, runner, config, monkeypatch):
+        """Both hints tell you to edit a file; a pasted `next:` line must be
+        inert, not the shell's `set` builtin rewriting positional params."""
+        self._stub_probe(monkeypatch)
+        for extra in ({}, {"enabled": False}):
+            config.write_text(
+                json.dumps(
+                    {
+                        **extra,
+                        "cache": {"tool_annotation_policy": "strict"},
+                        "upstream_servers": {
+                            "fake": {"prefix": "fk", "transport": "stdio", "command": "x"}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+            hint = self._check_by_id(result, "proxy_enabled")["next_action"]
+            assert hint.startswith("#"), hint
 
     def test_disabled_without_upstreams_skips_check(self, runner, config, monkeypatch):
         """Nothing is inert without upstreams — the existing `upstreams` WARN

@@ -120,6 +120,33 @@ def _upstream_inert_state(
     return "explicit" if "enabled" in data else "default"
 
 
+def _warn_if_upstreams_inert(
+    data: dict[str, Any],
+    config: ProxyConfig,
+    resolved: Path,
+    *,
+    logger_: logging.Logger,
+) -> None:
+    """Log the "#288 enabled but inert" advisory for the upstream half (#831).
+
+    One emitter for both load paths — the file load and the env-only startup
+    that has no file to read — so the wording can't drift between the shape
+    that has a config to inspect and the shape that doesn't.
+    """
+    inert = _upstream_inert_state(data, enabled=config.enabled)
+    if not inert:
+        return
+    logger_.warning(
+        "Proxy config %s configures %d upstream server(s) but the proxy is "
+        "disabled%s — config is enabled but inert; upstream tools will not be "
+        'advertised to MCP clients. Add "enabled": true (or remove '
+        "upstream_servers) to silence.",
+        resolved,
+        len(config.upstream_servers),
+        " explicitly" if inert == "explicit" else ' ("enabled" is unset and defaults to false)',
+    )
+
+
 def _sanitized_load_error(exc: Exception) -> str:
     """Error summary safe to surface beyond the local process log.
 
@@ -1433,9 +1460,16 @@ class ProxyConfig(BaseModel):
                 return ConfigLoadResult(config=None, error=None)
             if env_overrides:
                 try:
-                    return ConfigLoadResult(
-                        config=ProxyConfig.model_validate(env_overrides), error=None
-                    )
+                    env_config = ProxyConfig.model_validate(env_overrides)
+                    if log_warnings:
+                        # An env-only setup is a supported startup shape, so it
+                        # needs the same inert-upstream advisory as a file —
+                        # otherwise the one configuration with no file to
+                        # inspect is also the one that warns about nothing.
+                        _warn_if_upstreams_inert(
+                            env_overrides, env_config, resolved, logger_=logger
+                        )
+                    return ConfigLoadResult(config=env_config, error=None)
                 except Exception as exc:
                     logger.warning(
                         "Env-only proxy config failed validation: %s%s — using defaults",
@@ -1489,24 +1523,10 @@ class ProxyConfig(BaseModel):
                     "pin current behavior) to silence this.",
                     resolved,
                 )
-            if log_warnings and (inert := _upstream_inert_state(data, enabled=config.enabled)):
-                # "Enabled but inert" (#288), the upstream half: the servers
-                # are configured and reachable but never advertised, so the
-                # only symptom is tools that silently don't exist. Checked
-                # against the MERGED data so an env-enabled proxy stays quiet.
-                logger.warning(
-                    "Proxy config %s configures %d upstream server(s) but the proxy is "
-                    "disabled%s — config is enabled but inert; upstream tools will not be "
-                    'advertised to MCP clients. Add "enabled": true (or remove '
-                    "upstream_servers) to silence.",
-                    resolved,
-                    len(config.upstream_servers),
-                    (
-                        " explicitly"
-                        if inert == "explicit"
-                        else ' ("enabled" is unset and defaults to false)'
-                    ),
-                )
+            if log_warnings:
+                # Checked against the MERGED data so an env-enabled proxy
+                # stays quiet.
+                _warn_if_upstreams_inert(data, config, resolved, logger_=logger)
             return ConfigLoadResult(config=config, error=None, unknown_keys=unknown_keys)
         except (json.JSONDecodeError, Exception) as exc:
             # The parse-failure warning dominates; the unknown-keys warning is

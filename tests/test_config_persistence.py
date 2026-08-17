@@ -287,6 +287,26 @@ class TestLoadFromFileWithStatus:
             assert len(advisories) == 1, extra
             assert expected in advisories[0].getMessage()
 
+    def test_env_only_config_without_file_warns_inert(self, tmp_path, caplog):
+        """An env-only startup has no file to read, so it takes the early
+        missing-file return — the one shape with nothing to inspect must not
+        also be the one shape that warns about nothing."""
+        import logging
+
+        missing = tmp_path / "stm_proxy.json"
+        overrides = {"upstream_servers": {"fx": {"prefix": "fx", "command": "fx-server"}}}
+        with caplog.at_level(logging.WARNING):
+            result = ProxyConfig.load_from_file_with_status(missing, overrides)
+        assert result.config is not None and not result.config.enabled
+        advisories = [r for r in caplog.records if "enabled but inert" in r.getMessage()]
+        assert len(advisories) == 1
+        assert '"enabled" is unset' in advisories[0].getMessage()
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            ProxyConfig.load_from_file_with_status(missing, {**overrides, "enabled": True})
+        assert not [r for r in caplog.records if "enabled but inert" in r.getMessage()]
+
     def test_inert_upstream_warning_suppressed_when_serving(self, tmp_path, caplog):
         """Silent in both non-inert shapes — enabled (env-enabled included,
         since the advisory reads the merged data) and no upstreams at all."""

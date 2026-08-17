@@ -520,7 +520,7 @@ Options:
 
 One read-only diagnostic pass over the whole setup, designed for "I just installed this — why isn't it working?". Every check prints `PASS` / `WARN` / `FAIL`, a short cause, and — for anything that isn't a `PASS` — a `next:` line you can run as-is. **Exit code is 1 when any check FAILs; WARN-only runs exit 0.** That makes `mms doctor` the scriptable success gate for a fresh install: [`health`](#health) stays the always-exit-0 connectivity inspection, [`config validate`](#config-validate) stays the strict schema lint.
 
-Every check from `proxy enabled` onward reads the **env-overlaid** config — the same composite the server would run with, so `MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__*` servers are counted, transport/prefix-checked and probed like file-declared ones, and an env override of a file-declared field is what gets probed. Only a schema-invalid config falls back to the raw file, since no effective snapshot exists to trust.
+The server-shaped checks (`proxy enabled`, `server transports`, `prefixes`, `upstream: <name>`, and the `upstreams` warning) read the **env-overlaid** config — the same composite the server would run with — so `MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__*` servers are counted, validated and probed like file-declared ones, and an env override of a file-declared field is what gets probed. Only a schema-invalid config falls back to the raw file, since no effective snapshot exists to trust. The remaining config checks (`cache policy`, `compression tuning`) still read the file as written.
 
 Checks, in order:
 
