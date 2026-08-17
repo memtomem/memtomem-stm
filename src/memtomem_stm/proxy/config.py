@@ -119,6 +119,24 @@ def _parent_and_key(
     return (cursor, path[-1]) if isinstance(cursor, dict) else (None, path[-1])
 
 
+def _live_var_paths(scoped: dict[str, str]) -> list[tuple[str, tuple[str, ...]]]:
+    """The variables that still contributed something, in environment order.
+
+    Settings resolves a mapping parent and a deeper child last-one-wins, so a
+    variable whose path a LATER variable covers wrote nothing into the result
+    — the later payload replaced its whole subtree. Attributing to it would
+    name a variable whose value is not in the config being complained about,
+    and hide the one that is. A later variable that goes DEEPER does not cover
+    it: settings merges that on top, and both are really there.
+    """
+    entries = [(name, _var_path(name)) for name in scoped]
+    return [
+        (name, path)
+        for index, (name, path) in enumerate(entries)
+        if not any(path[: len(later)] == later for _, later in entries[index + 1 :])
+    ]
+
+
 def _mark_payload_provenance(fragment: dict[str, Any], scoped: dict[str, str]) -> None:
     """Record which subtrees one variable's JSON payload supplied.
 
@@ -127,8 +145,12 @@ def _mark_payload_provenance(fragment: dict[str, Any], scoped: dict[str, str]) -
     decoded payload breaks that, so the subtree is marked with the variable
     that carried it — see ``_EnvJsonDict``. Settings decides what a payload
     IS; this only records where each one came from.
+
+    Malformed variables belong here too: one that landed inside a payload is
+    still the variable the operator has to fix, and naming only the payload
+    would point at the wrong one.
     """
-    paths = [(name, _var_path(name)) for name in scoped]
+    paths = _live_var_paths(scoped)
     for name, path in paths:
         try:
             decoded = json.loads(scoped[name])
@@ -208,7 +230,6 @@ def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> dict[s
 
     try:
         fragment = _settings_proxy_fragment(scoped)
-        malformed: list[str] = []
     except SettingsError:
         # Decoding is per-variable, so a variable that fails ON ITS OWN is a
         # culprit and one that parses alone cannot be: settings stays the
@@ -223,7 +244,7 @@ def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> dict[s
         for name in malformed:
             _insert_raw(fragment, _var_path(name), scoped[name])
 
-    _mark_payload_provenance(fragment, {k: v for k, v in scoped.items() if k not in malformed})
+    _mark_payload_provenance(fragment, scoped)
     return fragment
 
 

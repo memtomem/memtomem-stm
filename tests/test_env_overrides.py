@@ -426,6 +426,79 @@ class TestSettingsSourceCanaries:
         }
 
 
+class TestProvenanceSurvivesOverwritingVariables:
+    """Which variable a warning names, when more than one wrote to a path.
+
+    Provenance is reconstructed from the variable names after settings has
+    resolved them (#837), so it has to answer a question the resolved fragment
+    no longer records: which variable's value actually SURVIVED. Settings
+    resolves a mapping parent and a deeper child last-one-wins, so a variable a
+    later payload covered contributed nothing — naming it points the operator
+    at a value that is not in the config being complained about, and hides the
+    one that is.
+
+    The oracles cannot catch this: they compare validated model dumps, which
+    discard the provenance entirely.
+    """
+
+    def _hint_for(self, env: dict[str, str]) -> str:
+        overrides = collect_proxy_env_overrides(env)
+        try:
+            ProxyConfig.model_validate(overrides)
+        except ValidationError as exc:
+            return _env_override_hint(exc, overrides)
+        raise AssertionError("expected the override to fail validation")
+
+    def test_later_payload_wins_over_an_earlier_child(self) -> None:
+        hint = self._hint_for(
+            {
+                "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES": "100",
+                "MEMTOMEM_STM_PROXY__CACHE": '{"max_entries": 0}',
+            }
+        )
+
+        assert "MEMTOMEM_STM_PROXY__CACHE)" in hint  # the payload that supplied 0
+        assert "MAX_ENTRIES" not in hint  # its 100 never reached the config
+
+    def test_later_aggregate_wins_over_an_earlier_payload(self) -> None:
+        hint = self._hint_for(
+            {
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH": '{"prefix": "gh", "command": "old"}',
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": (
+                    '{"gh": {"prefix": "gh", "command": ["bad"]}}'
+                ),
+            }
+        )
+
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS)" in hint
+        assert "__GH" not in hint
+
+    def test_a_deeper_variable_still_counts_when_nothing_covers_it(self) -> None:
+        """The control: a later variable that goes DEEPER is merged on top, not
+        replaced, so both are real and the deeper one stays nameable."""
+        hint = self._hint_for(
+            {
+                "MEMTOMEM_STM_PROXY__CACHE": '{"enabled": false}',
+                "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES": "-1",
+            }
+        )
+
+        assert "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES" in hint
+
+    def test_a_malformed_variable_inside_a_payload_is_named(self) -> None:
+        """A malformed value is re-inserted raw INSIDE a decoded payload. It is
+        still the variable the operator has to fix, so naming only the payload
+        would point at the wrong one."""
+        hint = self._hint_for(
+            {
+                "MEMTOMEM_STM_PROXY__TOOLGRAPH": '{"args": ["serve"]}',
+                "MEMTOMEM_STM_PROXY__TOOLGRAPH__ARGS": "not-a-list",
+            }
+        )
+
+        assert "MEMTOMEM_STM_PROXY__TOOLGRAPH__ARGS" in hint
+
+
 class TestMalformedValuesSurviveAsRawStrings:
     """The one place the source's behavior is deliberately NOT adopted.
 
