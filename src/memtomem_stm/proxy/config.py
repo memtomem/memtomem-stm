@@ -24,6 +24,74 @@ logger = logging.getLogger(__name__)
 _PROXY_ENV_PREFIX = "MEMTOMEM_STM_PROXY__"
 
 
+def _unwrap_annotation(annotation: Any) -> Any:
+    """Strip ``Annotated`` and a lone ``| None`` so the shape shows through."""
+    if get_origin(annotation) is Annotated:
+        annotation = get_args(annotation)[0]
+    if get_origin(annotation) in (Union, types.UnionType):
+        arms = [arm for arm in get_args(annotation) if arm is not type(None)]
+        if len(arms) == 1:
+            return _unwrap_annotation(arms[0])
+    return annotation
+
+
+def _env_child_annotation(annotation: Any, part: str) -> Any | None:
+    """Annotation reached by descending *part* — ``None`` if it goes nowhere.
+
+    Models resolve by field name; ``dict[...]`` resolves to its value type
+    because the key is operator-chosen (``upstream_servers.<name>``,
+    ``env.<VAR>``). Anything else has no children.
+    """
+    if (arms := _model_arms(annotation)) is not None:
+        for arm in arms:
+            field = arm.model_fields.get(part)
+            if field is not None:
+                return field.annotation
+        return None
+    unwrapped = _unwrap_annotation(annotation)
+    if get_origin(unwrapped) is dict:
+        args = get_args(unwrapped)
+        return args[1] if len(args) == 2 else None
+    return None
+
+
+def _env_leaf_is_complex(path: list[str]) -> bool:
+    """Whether ``pydantic-settings`` would JSON-decode this var's value.
+
+    It decodes exactly the *complex* fields — models and containers — and
+    leaves scalars to normal coercion, so this walks ``ProxyConfig`` the same
+    way and answers the same question (#834). An unknown path answers False:
+    the raw string then reaches validation, which is where a typo'd key is
+    already reported (``find_unknown_keys``), instead of being second-guessed
+    here.
+    """
+    annotation: Any = ProxyConfig
+    for part in path:
+        child = _env_child_annotation(annotation, part)
+        if child is None:
+            return False
+        annotation = child
+    if _model_arms(annotation) is not None:
+        return True
+    return get_origin(_unwrap_annotation(annotation)) in (dict, list, tuple, set)
+
+
+def _decode_env_value(path: list[str], raw: str) -> Any:
+    """Env string as pydantic-settings would read it for this field.
+
+    A malformed JSON payload is left as the raw string on purpose: settings
+    raises on it, and here the string reaches ``model_validate``, which names
+    the field. Silently substituting a default would be the dark failure this
+    module exists to prevent.
+    """
+    if not _env_leaf_is_complex(path):
+        return raw
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return raw
+
+
 def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> dict[str, Any]:
     """Build a nested dict from ``MEMTOMEM_STM_PROXY__*`` env vars.
 
@@ -34,8 +102,12 @@ def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> dict[s
     unconditional; env wins purely through this overlay).
 
     The returned dict mirrors the JSON config shape — nested by ``__``
-    delimiters, lower-cased — and pydantic's coercion handles type
-    conversion at validation time.
+    delimiters, lower-cased — and pydantic's coercion handles scalar type
+    conversion at validation time. Values addressing a *complex* field
+    (a model or container) are JSON-decoded first, because that is what
+    ``STMConfig``'s pydantic-settings parse does with them: without it,
+    ``UPSTREAM_SERVERS='{"gh": …}'`` or ``…__ARGS='["--one"]'`` reaches
+    validation as a string and fails a config the server accepts (#834).
     """
     env = environ if environ is not None else dict(os.environ)
     overrides: dict[str, Any] = {}
@@ -52,7 +124,7 @@ def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> dict[s
                 existing = {}
                 cursor[part] = existing
             cursor = existing
-        cursor[path[-1]] = val
+        cursor[path[-1]] = _decode_env_value(path, val)
     return overrides
 
 

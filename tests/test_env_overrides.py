@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -56,6 +57,116 @@ class TestCollectProxyEnvOverrides:
 
     def test_empty_when_no_proxy_env(self) -> None:
         assert collect_proxy_env_overrides({"FOO": "bar"}) == {}
+
+
+class TestComplexEnvValuesMatchSettings:
+    """#834: pydantic-settings JSON-decodes *complex* fields (models and
+    containers) and coerces scalars normally. The overlay has to answer the
+    same question the same way, or a config the server runs is one this
+    rebuild rejects — the whole reason the overlay exists is to reproduce
+    what the server resolves.
+
+    Every case below is pinned against ``STMConfig()`` itself in
+    ``test_overlay_agrees_with_pydantic_settings`` rather than against my
+    reading of the settings docs.
+    """
+
+    def test_aggregate_server_map_is_decoded(self) -> None:
+        env = {
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": '{"gh": {"prefix": "gh", "command": "s"}}'
+        }
+        assert collect_proxy_env_overrides(env) == {
+            "upstream_servers": {"gh": {"prefix": "gh", "command": "s"}}
+        }
+
+    def test_single_server_and_list_leaf_are_decoded(self) -> None:
+        env = {
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH": '{"prefix": "gh", "command": "s"}',
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__ARGS": '["--one", "--two"]',
+        }
+        assert collect_proxy_env_overrides(env) == {
+            "upstream_servers": {
+                "gh": {"prefix": "gh", "command": "s"},
+                "fx": {"args": ["--one", "--two"]},
+            }
+        }
+
+    def test_scalar_leaves_stay_strings(self) -> None:
+        """Decoding a scalar would change meaning: a command of "null" or a
+        prefix of "1" must reach pydantic as the string it is."""
+        env = {
+            "MEMTOMEM_STM_PROXY__ENABLED": "true",
+            "MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS": "9999",
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__COMMAND": "null",
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__PREFIX": "1",
+        }
+        assert collect_proxy_env_overrides(env) == {
+            "enabled": "true",
+            "default_max_result_chars": "9999",
+            "upstream_servers": {"fx": {"command": "null", "prefix": "1"}},
+        }
+
+    def test_free_form_dict_leaf_is_not_decoded(self) -> None:
+        """``env``/``headers`` are ``dict[str, str]``: the dict itself is
+        complex, but a value *inside* it is a plain string."""
+        env = {
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__ENV": '{"A": "1"}',
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__HEADERS__X": "[not json]",
+        }
+        assert collect_proxy_env_overrides(env) == {
+            "upstream_servers": {
+                "fx": {"env": {"A": "1"}, "headers": {"x": "[not json]"}},
+            }
+        }
+
+    def test_malformed_json_for_a_complex_field_stays_raw(self) -> None:
+        """Left for validation to name the field — substituting a default
+        would be the silent degrade this module exists to prevent."""
+        env = {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": "{not json"}
+        assert collect_proxy_env_overrides(env) == {"upstream_servers": "{not json"}
+
+    def test_unknown_key_stays_raw(self) -> None:
+        env = {"MEMTOMEM_STM_PROXY__BOGUS_KEY": '{"a": 1}'}
+        assert collect_proxy_env_overrides(env) == {"bogus_key": '{"a": 1}'}
+
+    @pytest.mark.parametrize(
+        "env",
+        [
+            {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": '{"gh": {"prefix": "gh", "command": "s"}}'},
+            {
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__PREFIX": "fx",
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__COMMAND": "s",
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__ARGS": '["--one"]',
+            },
+            {
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__PREFIX": "fx",
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__COMMAND": "s",
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__ENV": '{"A": "1"}',
+            },
+            {"MEMTOMEM_STM_PROXY__ENABLED": "true", "MEMTOMEM_STM_PROXY__MAX_TOOLS": "7"},
+            # The other vars `docs/reference/environment-variables.md` types
+            # as JSON — the same defect reached all of them, not just servers.
+            {
+                "MEMTOMEM_STM_PROXY__TOOLGRAPH__ARGS": '["serve", "--fast"]',
+                "MEMTOMEM_STM_PROXY__TOOLGRAPH__SERVER_NAME_MAP": '{"a": "b"}',
+                "MEMTOMEM_STM_PROXY__CACHE": '{"enabled": false}',
+            },
+        ],
+        ids=["aggregate-map", "list-leaf", "dict-leaf", "scalars", "documented-json-vars"],
+    )
+    def test_overlay_agrees_with_pydantic_settings(self, monkeypatch, env) -> None:
+        """The oracle: whatever ``STMConfig()`` builds from these vars, the
+        overlay rebuild must build too."""
+        from memtomem_stm.config import STMConfig
+
+        for name in [n for n in os.environ if n.startswith("MEMTOMEM_STM_PROXY")]:
+            monkeypatch.delenv(name, raising=False)
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+
+        settings_proxy = STMConfig().proxy
+        overlay_proxy = ProxyConfig.model_validate(collect_proxy_env_overrides())
+        assert overlay_proxy.model_dump() == settings_proxy.model_dump()
 
 
 class TestDeepMerge:
