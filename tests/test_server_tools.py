@@ -2226,11 +2226,16 @@ class TestApplyProxyFileConfig:
         that will actually run. Explicitness comes from `model_fields_set`,
         since there is no raw dict to look for the key in."""
         import logging
+        import os
 
         from memtomem_stm.proxy.config import collect_proxy_env_overrides
         from memtomem_stm.server import _apply_proxy_file_config
 
         missing = tmp_path / "stm_proxy.json"
+        # STMConfig() reads the whole namespace, so an inherited upstream or
+        # ENABLED would change both the asserted server set and the advisory.
+        for name in [n for n in os.environ if n.startswith("MEMTOMEM_STM_PROXY")]:
+            monkeypatch.delenv(name, raising=False)
         monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__PREFIX", "fx")
         monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__COMMAND", "fx-server")
 

@@ -7752,9 +7752,9 @@ def doctor(
             # server while advertising none of them to clients (#831). Shared
             # inert-state predicate with `mms config validate` and the runtime
             # load advisory, evaluated against the env-overlaid document. That
-            # overlay carries leaf-style env vars only; the aggregate-JSON form
-            # is #834, and lands here as a schema FAIL rather than a wrong
-            # answer.
+            # overlay is a reconstruction, not the server's resolver: values it
+            # keeps as strings where pydantic-settings would decode them (#834)
+            # land here as a schema FAIL rather than as a wrong answer.
             if effective_config is not None:
                 from memtomem_stm.proxy.config import _upstream_inert_state
 
@@ -7774,7 +7774,9 @@ def doctor(
                         "proxy_enabled",
                         "proxy enabled",
                         "PASS",
-                        "enabled — upstream tools are advertised to clients",
+                        # Only the gate is proven here — whether a given server
+                        # then yields tools is what `upstream: <name>` reports.
+                        "enabled — the proxy advertises its upstream servers' tools",
                     )
                 elif inert == "default":
                     check(

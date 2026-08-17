@@ -147,14 +147,20 @@ def warn_if_upstreams_inert(
     env-only load, and the server's missing-file no-swap — so the wording
     can't drift between the shapes that have a config file to inspect and the
     one that doesn't.
+
+    The message says the gate is *applied at startup* because this also runs
+    under ``ProxyConfigLoader``'s hot reload, where tool registration is
+    already done: flipping a running proxy to ``enabled: false`` does not
+    unadvertise anything until the next start, so an unqualified "will not be
+    advertised" would be a false operational signal there.
     """
     if not state:
         return
     logger_.warning(
         "Proxy config %s configures %d upstream server(s) but the proxy is "
-        "disabled%s — the upstream configuration is present but inert; upstream tools "
-        'will not be advertised to MCP clients. Add "enabled": true (or remove '
-        "upstream_servers) to silence.",
+        "disabled%s — the upstream configuration is present but inert; the gate is "
+        "applied at startup, so upstream tools are not advertised to MCP clients until "
+        'it is true. Add "enabled": true (or remove upstream_servers) to silence.',
         resolved,
         count,
         " explicitly" if state == "explicit" else ' ("enabled" is unset and defaults to false)',
