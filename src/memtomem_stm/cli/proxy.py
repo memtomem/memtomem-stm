@@ -7736,47 +7736,54 @@ def doctor(
                 else {}
             )
 
+            # 4. proxy enabled — upstream tools are only registered inside the
+            # `config.proxy.enabled` gate, so a disabled proxy probes green per
+            # server while advertising none of them to clients (#831). Shared
+            # inert-state predicate with `mms config validate` and the runtime
+            # load advisory. Judged entirely on the env-overlaid config — both
+            # halves, not just `enabled`: MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__*
+            # can supply servers the file never mentions, and gating this on the
+            # raw file's servers would leave that setup inert with a clean
+            # report. (The staged probes below stay file-scoped, so env-only
+            # servers are still unprobed — a separate gap.)
+            if effective_config is not None:
+                from memtomem_stm.proxy.config import _upstream_inert_state
+
+                inert = _upstream_inert_state(effective_data, enabled=effective_config.enabled)
+                effective_count = len(effective_config.upstream_servers)
+                # `resolved` is argv-derived: a path carrying CR/LF would forge
+                # an extra `next:` line, which is why `next_action` may only be
+                # a literal or a `_shell_join` render (see the render comment).
+                path_hint = _shell_join([str(resolved)])
+                if inert is None and effective_count:
+                    check(
+                        "proxy_enabled",
+                        "proxy enabled",
+                        "PASS",
+                        "enabled — upstream tools are advertised to clients",
+                    )
+                elif inert == "default":
+                    check(
+                        "proxy_enabled",
+                        "proxy enabled",
+                        "FAIL",
+                        f'proxy disabled — "enabled" is unset (defaults to false); '
+                        f"{effective_count} configured upstream server(s) will NOT be "
+                        "advertised to MCP clients",
+                        f'add "enabled": true to {path_hint}  '
+                        '# or "enabled": false to pin control-only mode',
+                    )
+                elif inert == "explicit":
+                    check(
+                        "proxy_enabled",
+                        "proxy enabled",
+                        "WARN",
+                        f"proxy explicitly disabled — {effective_count} configured upstream "
+                        "server(s) are not advertised (control-only mode)",
+                        f'set "enabled": true in {path_hint}  # if upstream tools should be served',
+                    )
+
             if servers:
-                # 4. proxy enabled — upstream tools are only registered inside
-                # the `config.proxy.enabled` gate, so a disabled proxy probes
-                # green per server while advertising none of them to clients
-                # (#831). Shared inert-state predicate with `mms config
-                # validate` and the runtime load advisory; evaluated against
-                # the env-overlaid config because MEMTOMEM_STM_PROXY__ENABLED
-                # is what the server would actually run with.
-                if effective_config is not None:
-                    from memtomem_stm.proxy.config import _upstream_inert_state
-
-                    inert = _upstream_inert_state(effective_data, enabled=effective_config.enabled)
-                    if inert is None:
-                        check(
-                            "proxy_enabled",
-                            "proxy enabled",
-                            "PASS",
-                            "enabled — upstream tools are advertised to clients",
-                        )
-                    elif inert == "default":
-                        check(
-                            "proxy_enabled",
-                            "proxy enabled",
-                            "FAIL",
-                            f'proxy disabled — "enabled" is unset (defaults to false); '
-                            f"{len(servers)} configured upstream server(s) will NOT be "
-                            "advertised to MCP clients",
-                            f'add "enabled": true to {resolved}  '
-                            '# or "enabled": false to pin control-only mode',
-                        )
-                    else:
-                        check(
-                            "proxy_enabled",
-                            "proxy enabled",
-                            "WARN",
-                            f"proxy explicitly disabled — {len(servers)} configured upstream "
-                            "server(s) are not advertised (control-only mode)",
-                            f'set "enabled": true in {resolved}  '
-                            "# if upstream tools should be served",
-                        )
-
                 # 5. per-transport required fields — shared with `add`
                 # VAL-3/VAL-4 via `_transport_field_error`.
                 transport_problems = [

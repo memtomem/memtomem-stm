@@ -11594,6 +11594,51 @@ class TestDoctor:
         assert check is not None
         assert check["status"] == "PASS"
 
+    def test_env_only_upstreams_with_disabled_proxy_fail(self, runner, config, monkeypatch):
+        """MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__* supplies servers the file
+        never mentions, and they are just as inert. Gating the check on the
+        file's servers would report `no upstream servers configured` and exit
+        0 for a runtime that has one it will never advertise."""
+        self._stub_probe(monkeypatch)
+        config.write_text(
+            json.dumps({"cache": {"tool_annotation_policy": "strict"}}), encoding="utf-8"
+        )
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__PREFIX", "fx")
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__COMMAND", "fx-server")
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+        assert result.exit_code == 1, result.output
+        check = self._check_by_id(result, "proxy_enabled")
+        assert check is not None
+        assert check["status"] == "FAIL"
+        assert "1 configured upstream server(s)" in check["detail"]
+
+    def test_next_action_refuses_unrenderable_config_path(self, runner, tmp_path, monkeypatch):
+        """`next_action` is printed verbatim, so a CR/LF in the argv-supplied
+        path must not forge an extra `next:` line — the hint collapses to the
+        shared unrenderable diagnostic instead."""
+        from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE
+
+        self._stub_probe(monkeypatch)
+        config = tmp_path / "stm\nproxy.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "upstream_servers": {
+                        "fake": {"prefix": "fk", "transport": "stdio", "command": "x"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+        check = self._check_by_id(result, "proxy_enabled")
+        assert check["status"] == "FAIL"
+        assert _HINT_UNRENDERABLE in check["next_action"]
+        assert "\n" not in check["next_action"]
+
     def test_disabled_without_upstreams_skips_check(self, runner, config, monkeypatch):
         """Nothing is inert without upstreams — the existing `upstreams` WARN
         already covers an empty config, so the check is omitted entirely."""

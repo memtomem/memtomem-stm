@@ -527,7 +527,7 @@ Checks, in order:
 | `config file` | same path resolution as `status`/`health` | FAIL: file missing → `next: mms init` (short-circuits the report) |
 | `config JSON` | the `config validate` parse guard | FAIL: unparseable / non-object root (short-circuits) |
 | `config schema` | the `status`/`health` schema check | FAIL: valid JSON, invalid schema — a running server would silently fall back to env/defaults |
-| `proxy enabled` | the shared inert-state predicate (`config validate` + the runtime load advisory), read off the env-overlaid config | FAIL: upstream servers configured but top-level `enabled` unset — the silent `false` default advertises none of them to clients while every direct probe still passes; WARN: explicitly disabled (control-only mode). Omitted when no upstreams are configured |
+| `proxy enabled` | the shared inert-state predicate (`config validate` + the runtime load advisory), read off the env-overlaid config — both `enabled` and the server list, so env-only upstreams count | FAIL: upstream servers configured but top-level `enabled` unset — the silent `false` default advertises none of them to clients while every direct probe still passes; WARN: explicitly disabled (control-only mode). Omitted when no upstreams are configured |
 | `server transports` | the `add` VAL-3/VAL-4 rule | FAIL: stdio server without `command`, network server without `url` |
 | `prefixes` | the shared `proxy/prefixes.py` validators the runtime load path enforces | FAIL: empty or duplicate prefixes (same wording as the server's load rejection) |
 | `upstream: <name>` | the same staged probe as `health` | FAIL: probe failed — names the stage reached; a dead stdio binary gets a `command -v <cmd>` next action |
