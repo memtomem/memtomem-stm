@@ -121,6 +121,22 @@ class TestComplexEnvValuesMatchSettings:
             }
         }
 
+    def test_operator_chosen_keys_keep_their_case(self) -> None:
+        """Field names are canonicalized because settings matches them
+        case-insensitively; mapping keys are not, because they are data — a
+        server named `GH` is not the server named `gh`, and an env var named
+        `API_TOKEN` is not `api_token`."""
+        env = {
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": json.dumps(
+                {"GH": {"PREFIX": "gh", "Command": "s", "ENV": {"API_TOKEN": "v"}}}
+            )
+        }
+        assert collect_proxy_env_overrides(env) == {
+            "upstream_servers": {
+                "GH": {"prefix": "gh", "command": "s", "env": {"API_TOKEN": "v"}}
+            }
+        }
+
     def test_malformed_json_for_a_complex_field_stays_raw(self) -> None:
         """Left for validation to name the field — substituting a default
         would be the silent degrade this module exists to prevent."""
@@ -140,6 +156,13 @@ class TestComplexEnvValuesMatchSettings:
             [("…__CACHE__ENABLED", "true"), ("MEMTOMEM_STM_PROXY__CACHE", "null")],
             [("memtomem_stm_proxy__cache__enabled", "false")],
             [("MEMTOMEM_STM_PROXY__CACHE____ENABLED", "false")],
+            [
+                ("MEMTOMEM_STM_PROXY__CACHE", '{"enabled": true}'),
+                ("…__CACHE__ENABLED", "false"),
+                ("memtomem_stm_proxy__cache", '{"enabled": true}'),
+            ],
+            [("MEMTOMEM_STM_PROXY__CACHE", '{"ENABLED": false}')],
+            [("MEMTOMEM_STM_PROXY__CACHE", '{"Enabled": false}')],
         ],
         ids=[
             "mapping-parent-first",
@@ -148,6 +171,9 @@ class TestComplexEnvValuesMatchSettings:
             "scalar-child-first",
             "lowercase-name",
             "empty-delimiter-component",
+            "case-equivalent-names-collapse",
+            "uppercase-json-field-key",
+            "mixed-case-json-field-key",
         ],
     )
     def test_parent_child_and_name_matching_follow_settings(self, monkeypatch, items) -> None:

@@ -55,21 +55,29 @@ def _env_child_annotation(annotation: Any, part: str) -> Any | None:
     return None
 
 
-def _env_leaf_is_complex(path: list[str]) -> bool:
-    """Whether ``pydantic-settings`` would JSON-decode this var's value.
-
-    It decodes exactly the *complex* fields — models and containers — and
-    leaves scalars to normal coercion, so this walks ``ProxyConfig`` the same
-    way and answers the same question (#834). An unknown path answers False
-    and keeps its raw string: nothing here can say what type a key that no
-    model declares was meant to be, and validation ignores it either way.
-    """
+def _env_leaf_annotation(path: list[str]) -> Any | None:
+    """The annotation an env var's path addresses — ``None`` if it addresses
+    nothing the models declare."""
     annotation: Any = ProxyConfig
     for part in path:
         child = _env_child_annotation(annotation, part)
         if child is None:
-            return False
+            return None
         annotation = child
+    return annotation
+
+
+def _env_leaf_is_complex(annotation: Any | None) -> bool:
+    """Whether ``pydantic-settings`` would JSON-decode this var's value.
+
+    It decodes exactly the *complex* fields — models and containers — and
+    leaves scalars to normal coercion, so this reads the annotation the same
+    way and answers the same question (#834). An unaddressable path answers
+    False and keeps its raw string: nothing here can say what type a key that
+    no model declares was meant to be, and validation ignores it either way.
+    """
+    if annotation is None:
+        return False
     if _model_arms(annotation) is not None:
         return True
     return get_origin(_unwrap_annotation(annotation)) in (dict, list, tuple, set)
@@ -109,6 +117,44 @@ class _EnvJsonDict(dict[str, Any]):
         self.explicit_keys: set[str] = set()
 
 
+def _canonical_field_keys(value: Any, annotation: Any) -> Any:
+    """Rewrite model-field keys in a decoded payload to their declared names.
+
+    Settings matches field names case-insensitively, so
+    ``CACHE='{"ENABLED": false}'`` sets ``cache.enabled`` for the server. The
+    models keep ``extra="ignore"``, so leaving ``ENABLED`` here would drop it
+    silently and the rebuild would report the default.
+
+    Only *field* positions are canonicalized. Keys under a mapping —
+    ``upstream_servers`` names, ``env``/``headers`` entries — are operator
+    data that settings preserves verbatim, and a server named ``GH`` is not
+    the server named ``gh``.
+    """
+    if isinstance(value, list):
+        item_annotation = _unwrap_annotation(annotation)
+        args = get_args(item_annotation)
+        return [_canonical_field_keys(item, args[0] if args else None) for item in value]
+    if not isinstance(value, dict):
+        return value
+    if (arms := _model_arms(annotation)) is not None:
+        fields = {
+            name.lower(): (name, field.annotation)
+            for arm in arms
+            for name, field in arm.model_fields.items()
+        }
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            name, field_annotation = fields.get(str(key).lower(), (str(key), None))
+            out[name] = _canonical_field_keys(item, field_annotation)
+        return out
+    unwrapped = _unwrap_annotation(annotation)
+    if get_origin(unwrapped) is dict:
+        args = get_args(unwrapped)
+        value_annotation = args[1] if len(args) == 2 else None
+        return {key: _canonical_field_keys(item, value_annotation) for key, item in value.items()}
+    return value
+
+
 def _decode_env_value(path: list[str], raw: str) -> Any:
     """Env string as pydantic-settings would read it for this field.
 
@@ -117,12 +163,14 @@ def _decode_env_value(path: list[str], raw: str) -> Any:
     the field. Silently substituting a default would be the dark failure this
     module exists to prevent.
     """
-    if not _env_leaf_is_complex(path):
+    annotation = _env_leaf_annotation(path)
+    if not _env_leaf_is_complex(annotation):
         return raw
     try:
         decoded = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
         return raw
+    decoded = _canonical_field_keys(decoded, annotation)
     return _EnvJsonDict(decoded, path) if type(decoded) is dict else decoded
 
 
@@ -144,23 +192,29 @@ def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> dict[s
     validation as a string and fails a config the server accepts (#834).
     """
     env = environ if environ is not None else dict(os.environ)
-    overrides: dict[str, Any] = {}
-    # Environment order is preserved: settings resolves a mapping parent and
-    # a deeper child by last-one-wins, so reordering here would hand the
-    # rebuild a different config than the server runs.
+    # Settings matches env names case-insensitively by default, so
+    # `memtomem_stm_proxy__cache__enabled` reaches the server and must reach
+    # this rebuild too. It lowercases the whole mapping BEFORE nesting it, so
+    # two spellings of one name collapse into a single entry — last value,
+    # first position. Assigning into a dict reproduces exactly that, and it
+    # matters: the surviving position decides whether a parent payload or a
+    # deeper child wins below.
+    lowered: dict[str, str] = {}
     for key, val in env.items():
-        # Settings matches env names case-insensitively by default, so
-        # `memtomem_stm_proxy__cache__enabled` reaches the server and must
-        # reach this rebuild too.
-        if not key.upper().startswith(_PROXY_ENV_PREFIX):
-            continue
-        parts = key.upper()[len(_PROXY_ENV_PREFIX) :].split("__")
+        if key.upper().startswith(_PROXY_ENV_PREFIX):
+            lowered[key.lower()] = val
+
+    overrides: dict[str, Any] = {}
+    # Environment order is preserved from here on: settings resolves a
+    # mapping parent and a deeper child by last-one-wins, so reordering would
+    # hand the rebuild a different config than the server runs.
+    for key, val in lowered.items():
+        path = key[len(_PROXY_ENV_PREFIX) :].split("__")
         # An empty component means a malformed name (`CACHE____ENABLED`).
         # Settings ignores those; collapsing them here would silently honor a
         # var the server does not.
-        if not parts or any(not part for part in parts):
+        if not path or any(not part for part in path):
             continue
-        path = [part.lower() for part in parts]
         cursor: dict[str, Any] = overrides
         for part in path[:-1]:
             # `get(part)` would read a supplied JSON `null` as "absent" and
