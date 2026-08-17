@@ -121,20 +121,28 @@ class TestComplexEnvValuesMatchSettings:
             }
         }
 
-    def test_operator_chosen_keys_keep_their_case(self) -> None:
-        """Field names are canonicalized because settings matches them
-        case-insensitively; mapping keys are not, because they are data — a
-        server named `GH` is not the server named `gh`, and an env var named
-        `API_TOKEN` is not `api_token`."""
+    def test_field_canonicalization_stops_at_containers(self) -> None:
+        """Settings rewrites field keys only while walking model fields and
+        stops at a container, so `CACHE='{"ENABLED": …}'` configures the
+        server while the same casing under `upstream_servers` does not (it is
+        rejected). Rewriting past that boundary would make this rebuild
+        accept an environment the server refuses — the exact failure the
+        rebuild exists to avoid — so the payload is left verbatim there.
+
+        Mapping keys are operator data either way: a server named `GH` is not
+        the server named `gh`.
+        """
         env = {
+            "MEMTOMEM_STM_PROXY__CACHE": json.dumps({"ENABLED": False}),
             "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": json.dumps(
                 {"GH": {"PREFIX": "gh", "Command": "s", "ENV": {"API_TOKEN": "v"}}}
-            )
+            ),
         }
         assert collect_proxy_env_overrides(env) == {
+            "cache": {"enabled": False},
             "upstream_servers": {
-                "GH": {"prefix": "gh", "command": "s", "env": {"API_TOKEN": "v"}}
-            }
+                "GH": {"PREFIX": "gh", "Command": "s", "ENV": {"API_TOKEN": "v"}}
+            },
         }
 
     def test_malformed_json_for_a_complex_field_stays_raw(self) -> None:
@@ -163,6 +171,10 @@ class TestComplexEnvValuesMatchSettings:
             ],
             [("MEMTOMEM_STM_PROXY__CACHE", '{"ENABLED": false}')],
             [("MEMTOMEM_STM_PROXY__CACHE", '{"Enabled": false}')],
+            [("…__UPSTREAM_SERVERS", '{"GH": {"PREFIX": "gh", "COMMAND": "s"}}')],
+            [("…__UPSTREAM_SERVERS__GH", '{"PREFIX": "gh", "COMMAND": "s"}')],
+            [("…__UPSTREAM_SERVERS", '{"gh": {"prefix": "gh", "command": "s", "CACHE": true}}')],
+            [("…__TOOLGRAPH", '{"ENABLED": true, "ARGS": ["x"]}')],
         ],
         ids=[
             "mapping-parent-first",
@@ -174,6 +186,10 @@ class TestComplexEnvValuesMatchSettings:
             "case-equivalent-names-collapse",
             "uppercase-json-field-key",
             "mixed-case-json-field-key",
+            "uppercase-fields-under-a-container",
+            "uppercase-fields-in-a-container-value",
+            "duplicate-cased-keys-under-a-container",
+            "uppercase-fields-of-a-nested-model",
         ],
     )
     def test_parent_child_and_name_matching_follow_settings(self, monkeypatch, items) -> None:
@@ -325,7 +341,7 @@ class TestComplexEnvValuesMatchSettings:
         overlay rebuild must build too."""
         from memtomem_stm.config import STMConfig
 
-        for name in [n for n in os.environ if n.startswith("MEMTOMEM_STM_PROXY")]:
+        for name in [n for n in os.environ if n.upper().startswith("MEMTOMEM_STM_PROXY")]:
             monkeypatch.delenv(name, raising=False)
         for name, value in env.items():
             monkeypatch.setenv(name, value)

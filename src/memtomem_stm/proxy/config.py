@@ -55,16 +55,28 @@ def _env_child_annotation(annotation: Any, part: str) -> Any | None:
     return None
 
 
-def _env_leaf_annotation(path: list[str]) -> Any | None:
-    """The annotation an env var's path addresses — ``None`` if it addresses
-    nothing the models declare."""
+def _env_leaf_annotation(path: list[str]) -> tuple[Any | None, bool]:
+    """The annotation an env var's path addresses, and whether reaching it
+    crossed a container.
+
+    The annotation is ``None`` when the path addresses nothing the models
+    declare. The flag matters for field-key casing: settings stops
+    normalizing at a container, and it does not resume on the far side — a
+    payload at ``…__UPSTREAM_SERVERS__GH`` is a model's, but its uppercase
+    field keys are rejected exactly like those written inline in the
+    aggregate map.
+    """
     annotation: Any = ProxyConfig
+    crossed_container = False
     for part in path:
+        if _model_arms(annotation) is None:
+            # Descending through a mapping's values, not a model's fields.
+            crossed_container = True
         child = _env_child_annotation(annotation, part)
         if child is None:
-            return None
+            return None, crossed_container
         annotation = child
-    return annotation
+    return annotation, crossed_container
 
 
 def _env_leaf_is_complex(annotation: Any | None) -> bool:
@@ -125,34 +137,30 @@ def _canonical_field_keys(value: Any, annotation: Any) -> Any:
     models keep ``extra="ignore"``, so leaving ``ENABLED`` here would drop it
     silently and the rebuild would report the default.
 
-    Only *field* positions are canonicalized. Keys under a mapping —
-    ``upstream_servers`` names, ``env``/``headers`` entries — are operator
-    data that settings preserves verbatim, and a server named ``GH`` is not
-    the server named ``gh``.
+    The rewrite follows model fields and **stops at any container**, which is
+    where settings stops: ``CACHE='{"ENABLED": false}'`` configures the
+    server, while ``UPSTREAM_SERVERS='{"GH": {"PREFIX": …}}'`` and
+    ``…__UPSTREAM_SERVERS__GH='{"PREFIX": …}'`` are both *rejected* by it —
+    the fields sit under ``dict[str, UpstreamServerConfig]``. Canonicalizing
+    past that boundary would make this rebuild accept an environment the
+    server refuses, which is the failure this whole function guards against.
+    Keys under a mapping are operator data anyway: a server named ``GH`` is
+    not the server named ``gh``.
     """
-    if isinstance(value, list):
-        item_annotation = _unwrap_annotation(annotation)
-        args = get_args(item_annotation)
-        return [_canonical_field_keys(item, args[0] if args else None) for item in value]
     if not isinstance(value, dict):
         return value
-    if (arms := _model_arms(annotation)) is not None:
-        fields = {
-            name.lower(): (name, field.annotation)
-            for arm in arms
-            for name, field in arm.model_fields.items()
-        }
-        out: dict[str, Any] = {}
-        for key, item in value.items():
-            name, field_annotation = fields.get(str(key).lower(), (str(key), None))
-            out[name] = _canonical_field_keys(item, field_annotation)
-        return out
-    unwrapped = _unwrap_annotation(annotation)
-    if get_origin(unwrapped) is dict:
-        args = get_args(unwrapped)
-        value_annotation = args[1] if len(args) == 2 else None
-        return {key: _canonical_field_keys(item, value_annotation) for key, item in value.items()}
-    return value
+    if (arms := _model_arms(annotation)) is None:
+        return value
+    fields = {
+        name.lower(): (name, field.annotation)
+        for arm in arms
+        for name, field in arm.model_fields.items()
+    }
+    out: dict[str, Any] = {}
+    for key, item in value.items():
+        name, field_annotation = fields.get(str(key).lower(), (str(key), None))
+        out[name] = _canonical_field_keys(item, field_annotation)
+    return out
 
 
 def _decode_env_value(path: list[str], raw: str) -> Any:
@@ -163,14 +171,15 @@ def _decode_env_value(path: list[str], raw: str) -> Any:
     the field. Silently substituting a default would be the dark failure this
     module exists to prevent.
     """
-    annotation = _env_leaf_annotation(path)
+    annotation, crossed_container = _env_leaf_annotation(path)
     if not _env_leaf_is_complex(annotation):
         return raw
     try:
         decoded = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
         return raw
-    decoded = _canonical_field_keys(decoded, annotation)
+    if not crossed_container:
+        decoded = _canonical_field_keys(decoded, annotation)
     return _EnvJsonDict(decoded, path) if type(decoded) is dict else decoded
 
 
