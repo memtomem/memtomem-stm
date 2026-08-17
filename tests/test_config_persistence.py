@@ -265,6 +265,70 @@ class TestLoadFromFileWithStatus:
         assert result.config is None
         assert [r for r in caplog.records if "Failed to parse" in r.getMessage()]
 
+    def test_upstreams_with_disabled_proxy_warn_inert(self, tmp_path, caplog):
+        """#831: upstream tools are only registered behind the enabled gate,
+        so a disabled proxy with configured servers advertises nothing while
+        every direct probe of those servers still succeeds. The advisory
+        names which of the two ways the proxy ended up disabled."""
+        import logging
+
+        cfg_file = tmp_path / "stm_proxy.json"
+        servers = {"upstream_servers": {"fx": {"prefix": "fx", "command": "fx-server"}}}
+        for extra, expected in (
+            ({}, '"enabled" is unset and defaults to false'),
+            ({"enabled": False}, "disabled explicitly"),
+        ):
+            caplog.clear()
+            cfg_file.write_text(json.dumps({**servers, **extra}))
+            with caplog.at_level(logging.WARNING):
+                result = ProxyConfig.load_from_file_with_status(cfg_file)
+            assert result.config is not None
+            advisories = [r for r in caplog.records if "present but inert" in r.getMessage()]
+            assert len(advisories) == 1, extra
+            assert expected in advisories[0].getMessage()
+
+    def test_env_only_config_without_file_warns_inert(self, tmp_path, caplog):
+        """An env-only startup has no file to read, so it takes the early
+        missing-file return — the one shape with nothing to inspect must not
+        also be the one shape that warns about nothing."""
+        import logging
+
+        missing = tmp_path / "stm_proxy.json"
+        overrides = {"upstream_servers": {"fx": {"prefix": "fx", "command": "fx-server"}}}
+        with caplog.at_level(logging.WARNING):
+            result = ProxyConfig.load_from_file_with_status(missing, overrides)
+        assert result.config is not None and not result.config.enabled
+        advisories = [r for r in caplog.records if "present but inert" in r.getMessage()]
+        assert len(advisories) == 1
+        assert '"enabled" is unset' in advisories[0].getMessage()
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            ProxyConfig.load_from_file_with_status(missing, {**overrides, "enabled": True})
+        assert not [r for r in caplog.records if "present but inert" in r.getMessage()]
+
+    def test_inert_upstream_warning_suppressed_when_serving(self, tmp_path, caplog):
+        """Silent in both non-inert shapes — enabled (env-enabled included,
+        since the advisory reads the merged data) and no upstreams at all."""
+        import logging
+
+        cfg_file = tmp_path / "stm_proxy.json"
+        servers = {"upstream_servers": {"fx": {"prefix": "fx", "command": "fx-server"}}}
+        cases: list[tuple[dict, dict | None]] = [
+            ({"enabled": True, **servers}, None),
+            (servers, {"enabled": True}),
+            ({"enabled": False}, None),
+        ]
+        for data, overrides in cases:
+            caplog.clear()
+            cfg_file.write_text(json.dumps(data))
+            with caplog.at_level(logging.WARNING):
+                result = ProxyConfig.load_from_file_with_status(cfg_file, overrides)
+            assert result.config is not None
+            assert not [
+                r for r in caplog.records if "present but inert" in r.getMessage()
+            ], (data, overrides)
+
     def test_missing_cache_policy_warns_with_migration_hint(self, tmp_path, caplog):
         """A legacy file that never sets cache.tool_annotation_policy keeps the
         conservative default but gets a one-line migration advisory (new

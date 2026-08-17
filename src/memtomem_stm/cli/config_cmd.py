@@ -31,6 +31,7 @@ from memtomem_stm.proxy.config import (
     ProxyConfig,
     _has_annotation_policy,
     _permissive_mode,
+    _upstream_inert_state,
     find_unknown_keys,
 )
 
@@ -100,12 +101,31 @@ def validate_command(config_path: str, as_json: bool) -> None:
             errors.append(f"cannot read file: {exc}")
         if data is not None:
             unknown_keys = find_unknown_keys(ProxyConfig, data)
+            parsed: ProxyConfig | None = None
             try:
-                ProxyConfig.model_validate(data)
+                parsed = ProxyConfig.model_validate(data)
             except ValidationError as exc:
                 for err in exc.errors():
                     loc = ".".join(str(part) for part in err["loc"])
                     errors.append(f"{loc}: {err['msg']}" if loc else err["msg"])
+            if parsed is not None and (
+                inert := _upstream_inert_state(data, enabled=parsed.enabled)
+            ):
+                # Same advisory (and same shared predicate) as the runtime load
+                # path and `mms doctor` (#831). Suppressed when validation
+                # failed: those errors dominate and `parsed.enabled` would be
+                # unknown anyway.
+                warnings.append(
+                    f"{len(parsed.upstream_servers)} upstream server(s) configured but the "
+                    "proxy is disabled"
+                    + (
+                        " explicitly"
+                        if inert == "explicit"
+                        else ' ("enabled" is unset and defaults to false)'
+                    )
+                    + " — upstream tools will not be advertised to MCP clients. Add "
+                    '"enabled": true (or remove upstream_servers) to silence this.'
+                )
             cache = data.get("cache")
             cache_enabled = cache.get("enabled", True) if isinstance(cache, dict) else True
             if cache_enabled and not _has_annotation_policy(data):

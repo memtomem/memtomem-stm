@@ -27,7 +27,12 @@ from memtomem_stm import __version__ as _stm_version
 from memtomem_stm.config import STMConfig
 from memtomem_stm.logging_setup import STDERR_FORMAT, configure_server_logging
 from memtomem_stm.proxy.compression_feedback import CompressionFeedbackTracker
-from memtomem_stm.proxy.config import ProxyConfig, collect_proxy_env_overrides
+from memtomem_stm.proxy.config import (
+    ProxyConfig,
+    collect_proxy_env_overrides,
+    model_upstream_inert_state,
+    warn_if_upstreams_inert,
+)
 from memtomem_stm.proxy.manager import ProxyManager
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
@@ -126,6 +131,18 @@ def _apply_proxy_file_config(config: STMConfig, proxy_env_overrides: dict[str, A
     )
     if result.config is not None:
         config.proxy = result.config
+    else:
+        # No swap: either the file is missing (the env-only startup described
+        # above) or it failed to load. `load_from_file` warned in every case it
+        # inspected a file, but the no-swap path leaves `config.proxy` as
+        # pydantic-settings built it — so the inert-upstream advisory (#831)
+        # has to be raised here, against the config that will actually run.
+        warn_if_upstreams_inert(
+            model_upstream_inert_state(config.proxy),
+            len(config.proxy.upstream_servers),
+            config.proxy.config_path,
+            logger_=logger,
+        )
     if config.proxy.consumer_model and not config.surfacing.consumer_model:
         config.surfacing.consumer_model = config.proxy.consumer_model
     return result.error

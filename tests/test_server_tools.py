@@ -2217,6 +2217,51 @@ class TestApplyProxyFileConfig:
         assert config.proxy.enabled is True  # env wins over the file's False
         assert set(config.proxy.upstream_servers) == {"gh"}  # file fields survive
 
+    def test_env_only_inert_upstreams_warn_on_the_no_swap_path(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The env-only startup has no file, and `missing_ok=False` means the
+        loader returns before it can warn about anything — so the advisory
+        (#831) has to come from here, against the pydantic-settings config
+        that will actually run. Explicitness comes from `model_fields_set`,
+        since there is no raw dict to look for the key in."""
+        import logging
+        import os
+
+        from memtomem_stm.proxy.config import collect_proxy_env_overrides
+        from memtomem_stm.server import _apply_proxy_file_config
+
+        missing = tmp_path / "stm_proxy.json"
+        # STMConfig() reads the whole namespace, so an inherited upstream or
+        # ENABLED would change both the asserted server set and the advisory.
+        for name in [n for n in os.environ if n.startswith("MEMTOMEM_STM_PROXY")]:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__PREFIX", "fx")
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__COMMAND", "fx-server")
+
+        for env_enabled, expected in ((None, '"enabled" is unset'), ("false", "explicitly")):
+            caplog.clear()
+            if env_enabled is None:
+                monkeypatch.delenv("MEMTOMEM_STM_PROXY__ENABLED", raising=False)
+            else:
+                monkeypatch.setenv("MEMTOMEM_STM_PROXY__ENABLED", env_enabled)
+            config = STMConfig()
+            config.proxy.config_path = missing
+            with caplog.at_level(logging.WARNING):
+                _apply_proxy_file_config(config, collect_proxy_env_overrides())
+            assert set(config.proxy.upstream_servers) == {"fx"}
+            advisories = [r for r in caplog.records if "present but inert" in r.getMessage()]
+            assert len(advisories) == 1, env_enabled
+            assert expected in advisories[0].getMessage()
+
+        caplog.clear()
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__ENABLED", "true")
+        config = STMConfig()
+        config.proxy.config_path = missing
+        with caplog.at_level(logging.WARNING):
+            _apply_proxy_file_config(config, collect_proxy_env_overrides())
+        assert not [r for r in caplog.records if "present but inert" in r.getMessage()]
+
     def test_file_consumer_model_reaches_surfacing_budgets(self, tmp_path, monkeypatch):
         import json
 

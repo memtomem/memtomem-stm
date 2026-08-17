@@ -92,6 +92,81 @@ def _has_annotation_policy(data: dict[str, Any]) -> bool:
     return isinstance(cache, dict) and "tool_annotation_policy" in cache
 
 
+def _upstream_inert_state(
+    data: dict[str, Any], *, enabled: bool
+) -> Literal["default", "explicit"] | None:
+    """Whether configured upstreams are inert because the proxy is disabled.
+
+    Upstream tools are only registered when ``proxy.enabled`` is true, so a
+    disabled proxy with a populated ``upstream_servers`` advertises nothing to
+    MCP clients while every direct probe of those servers still succeeds
+    (#831). Shared by the load path, ``mms config validate`` and ``mms
+    doctor`` so the three advisories can't drift apart.
+
+    Returns ``None`` when there is nothing to say (proxy enabled, or no
+    upstreams), ``"explicit"`` when the config states ``enabled`` itself — an
+    operator choosing control-only mode — and ``"default"`` when the key is
+    absent and the silent ``False`` default is what disabled the proxy.
+
+    ``enabled`` is passed in from the *validated* model rather than read off
+    ``data`` so env-string coercion ("0", "false") can't make the callers
+    disagree with the runtime.
+    """
+    if enabled:
+        return None
+    servers = data.get("upstream_servers")
+    if not isinstance(servers, dict) or not servers:
+        return None
+    return "explicit" if "enabled" in data else "default"
+
+
+def model_upstream_inert_state(config: ProxyConfig) -> Literal["default", "explicit"] | None:
+    """:func:`_upstream_inert_state` for a config with no raw dict behind it.
+
+    The server's env-only startup keeps the ``STMConfig`` pydantic-settings
+    parse instead of rebuilding from the overlay (see
+    ``_apply_proxy_file_config``), so the only record of whether ``enabled``
+    was *stated* is ``model_fields_set`` — the same signal the #288 surfacing
+    advisory reads.
+    """
+    if config.enabled or not config.upstream_servers:
+        return None
+    return "explicit" if "enabled" in config.model_fields_set else "default"
+
+
+def warn_if_upstreams_inert(
+    state: Literal["default", "explicit"] | None,
+    count: int,
+    resolved: Path,
+    *,
+    logger_: logging.Logger,
+) -> None:
+    """Log the "#288 inert config" advisory for the upstream half (#831).
+
+    One emitter for every path that can reach this state — the file load, the
+    env-only load, and the server's missing-file no-swap — so the wording
+    can't drift between the shapes that have a config file to inspect and the
+    one that doesn't.
+
+    The message says the gate is *applied at startup* because this also runs
+    under ``ProxyConfigLoader``'s hot reload, where tool registration is
+    already done: flipping a running proxy to ``enabled: false`` does not
+    unadvertise anything until the next start, so an unqualified "will not be
+    advertised" would be a false operational signal there.
+    """
+    if not state:
+        return
+    logger_.warning(
+        "Proxy config %s configures %d upstream server(s) but the proxy is "
+        "disabled%s — the upstream configuration is present but inert; the gate is "
+        "applied at startup, so upstream tools are not advertised to MCP clients until "
+        'it is true. Add "enabled": true (or remove upstream_servers) to silence.',
+        resolved,
+        count,
+        " explicitly" if state == "explicit" else ' ("enabled" is unset and defaults to false)',
+    )
+
+
 def _sanitized_load_error(exc: Exception) -> str:
     """Error summary safe to surface beyond the local process log.
 
@@ -1405,9 +1480,20 @@ class ProxyConfig(BaseModel):
                 return ConfigLoadResult(config=None, error=None)
             if env_overrides:
                 try:
-                    return ConfigLoadResult(
-                        config=ProxyConfig.model_validate(env_overrides), error=None
-                    )
+                    env_config = ProxyConfig.model_validate(env_overrides)
+                    if log_warnings:
+                        # An env-only setup is a supported shape and needs the
+                        # same inert-upstream advisory as a file. This branch
+                        # is the `missing_ok=True` callers (CLI, loader); the
+                        # server takes `missing_ok=False` and warns from
+                        # `_apply_proxy_file_config` instead.
+                        warn_if_upstreams_inert(
+                            _upstream_inert_state(env_overrides, enabled=env_config.enabled),
+                            len(env_config.upstream_servers),
+                            resolved,
+                            logger_=logger,
+                        )
+                    return ConfigLoadResult(config=env_config, error=None)
                 except Exception as exc:
                     logger.warning(
                         "Env-only proxy config failed validation: %s%s — using defaults",
@@ -1460,6 +1546,15 @@ class ProxyConfig(BaseModel):
                     '"cache": {"tool_annotation_policy": "strict"} (or "conservative" to '
                     "pin current behavior) to silence this.",
                     resolved,
+                )
+            if log_warnings:
+                # Checked against the MERGED data so an env-enabled proxy
+                # stays quiet.
+                warn_if_upstreams_inert(
+                    _upstream_inert_state(data, enabled=config.enabled),
+                    len(config.upstream_servers),
+                    resolved,
+                    logger_=logger,
                 )
             return ConfigLoadResult(config=config, error=None, unknown_keys=unknown_keys)
         except (json.JSONDecodeError, Exception) as exc:
