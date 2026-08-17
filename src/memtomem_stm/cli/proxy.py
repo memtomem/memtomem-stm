@@ -7699,6 +7699,7 @@ def doctor(
             # stay meaningful.
             schema_error = _runtime_schema_validation_error(data)
             effective_config: Any | None = None
+            effective_data: dict[str, Any] = {}
             if schema_error:
                 # A pydantic error can echo the rejected input_value (or a
                 # validator message quoting it), so scrub it against every
@@ -7722,9 +7723,11 @@ def doctor(
                     collect_proxy_env_overrides,
                 )
 
-                effective_config = ProxyConfig.model_validate(
-                    _deep_merge(data, collect_proxy_env_overrides())
-                )
+                # One merged dict for both the model and the inert-state
+                # predicate below: they must judge the same document, or
+                # doctor could report an `enabled` the model never saw.
+                effective_data = _deep_merge(data, collect_proxy_env_overrides())
+                effective_config = ProxyConfig.model_validate(effective_data)
 
             raw_servers = data.get("upstream_servers", {})
             servers = (
@@ -7734,7 +7737,47 @@ def doctor(
             )
 
             if servers:
-                # 4. per-transport required fields — shared with `add`
+                # 4. proxy enabled — upstream tools are only registered inside
+                # the `config.proxy.enabled` gate, so a disabled proxy probes
+                # green per server while advertising none of them to clients
+                # (#831). Shared inert-state predicate with `mms config
+                # validate` and the runtime load advisory; evaluated against
+                # the env-overlaid config because MEMTOMEM_STM_PROXY__ENABLED
+                # is what the server would actually run with.
+                if effective_config is not None:
+                    from memtomem_stm.proxy.config import _upstream_inert_state
+
+                    inert = _upstream_inert_state(effective_data, enabled=effective_config.enabled)
+                    if inert is None:
+                        check(
+                            "proxy_enabled",
+                            "proxy enabled",
+                            "PASS",
+                            "enabled — upstream tools are advertised to clients",
+                        )
+                    elif inert == "default":
+                        check(
+                            "proxy_enabled",
+                            "proxy enabled",
+                            "FAIL",
+                            f'proxy disabled — "enabled" is unset (defaults to false); '
+                            f"{len(servers)} configured upstream server(s) will NOT be "
+                            "advertised to MCP clients",
+                            f'add "enabled": true to {resolved}  '
+                            '# or "enabled": false to pin control-only mode',
+                        )
+                    else:
+                        check(
+                            "proxy_enabled",
+                            "proxy enabled",
+                            "WARN",
+                            f"proxy explicitly disabled — {len(servers)} configured upstream "
+                            "server(s) are not advertised (control-only mode)",
+                            f'set "enabled": true in {resolved}  '
+                            "# if upstream tools should be served",
+                        )
+
+                # 5. per-transport required fields — shared with `add`
                 # VAL-3/VAL-4 via `_transport_field_error`.
                 transport_problems = [
                     f"{n}: {terr}"
@@ -7764,7 +7807,7 @@ def doctor(
                         f"{len(servers)} server(s) have their required connection fields",
                     )
 
-                # 5. prefixes — same shared validators the runtime load path
+                # 6. prefixes — same shared validators the runtime load path
                 # uses (`proxy/prefixes.py`), so doctor can't disagree with
                 # what the server would refuse.
                 prefix_map = {n: str(cfg.get("prefix", "") or "") for n, cfg in servers.items()}
@@ -7786,7 +7829,7 @@ def doctor(
                 else:
                     check("prefixes", "prefixes", "PASS", "unique and non-empty")
 
-                # 6. staged probe per server — the shared StagedProbeResult
+                # 7. staged probe per server — the shared StagedProbeResult
                 # `health` renders; doctor adds the per-stage next action.
                 results = asyncio.run(_probe_servers(servers, timeout))
                 servers_payload = {n: r.as_dict() for n, r in results.items()}
@@ -7954,7 +7997,7 @@ def doctor(
                     f"mms register --client auto {cfg_arg}",
                 )
 
-            # 7. cache policy — same condition + shared predicate as
+            # 8. cache policy — same condition + shared predicate as
             # `mms config validate` and the runtime load advisory (#658).
             from memtomem_stm.proxy.config import _has_annotation_policy
 
@@ -7977,7 +8020,7 @@ def doctor(
                     f'{resolved}  # or "conservative" to pin current behavior',
                 )
 
-            # 8. Tuning readiness — read-only.  This is a discoverability
+            # 9. Tuning readiness — read-only.  This is a discoverability
             # hint, not an automatic config mutation; the existing
             # preview/apply boundary remains authoritative in ``mms tune``.
             tuning = _tuning_readiness(data)
@@ -8006,7 +8049,7 @@ def doctor(
                     "no proxy metrics recorded yet",
                 )
 
-            # 9. LTM server — never FAIL: LTM is optional, and an unreachable
+            # 10. LTM server — never FAIL: LTM is optional, and an unreachable
             # or unconfigured LTM only disables surfacing, not the proxy
             # core. A FAIL here would break the exit-code gate on every
             # fresh install without a memtomem server.
@@ -8084,7 +8127,7 @@ def doctor(
                     ),
                 )
 
-            # 9. Warm-daemon timeout advice.  Ping telemetry is passive; the
+            # 11. Warm-daemon timeout advice.  Ping telemetry is passive; the
             # optional measurement above is the only path that executes a
             # synthetic search.  These are WARN-only operational checks: an
             # undersized budget degrades surfacing but never breaks proxying.

@@ -57,6 +57,41 @@ class TestConfigValidate:
         assert result.exit_code == 0, result.output
         assert "OK" in result.output
 
+    def test_disabled_proxy_with_upstreams_warns_but_exits_zero(self, runner, config):
+        """#831: a config that lists upstreams the proxy will never advertise
+        is still schema-valid, so this stays an advisory — but it must be
+        said, and it must distinguish the unset default from an explicit
+        control-only choice."""
+        for extra, expected in (
+            ({}, '"enabled" is unset and defaults to false'),
+            ({"enabled": False}, "disabled explicitly"),
+        ):
+            config.write_text(
+                json.dumps(
+                    {**extra, "upstream_servers": {"gh": {"prefix": "gh", "command": "gh-server"}}}
+                )
+            )
+            config.chmod(0o600)
+            result = _validate(runner, config)
+            assert result.exit_code == 0, result.output
+            assert "1 upstream server(s) configured but the proxy is disabled" in result.output
+            assert expected in result.output
+
+    def test_disabled_proxy_advisory_suppressed(self, runner, config):
+        """Silent when the proxy serves its upstreams, when there is nothing
+        to serve, and when validation already failed (those errors dominate
+        and `enabled` is unknown)."""
+        servers = {"gh": {"prefix": "gh", "command": "gh-server"}}
+        for data in (
+            {"enabled": True, "upstream_servers": servers},
+            {"upstream_servers": {}},
+            {"upstream_servers": {"gh": {"prefix": 42, "command": "gh-server"}}},
+        ):
+            config.write_text(json.dumps(data))
+            config.chmod(0o600)
+            result = _validate(runner, config)
+            assert "but the proxy is disabled" not in result.output, data
+
     def test_missing_cache_policy_warns_but_exits_zero(self, runner, config):
         """A key-less legacy config gets the same migration advisory as the
         runtime load path — as a warning only, so validate stays usable as a

@@ -11473,8 +11473,12 @@ class TestDoctor:
 
     @staticmethod
     def _healthy_config(config, *, strict_cache: bool = True) -> None:
+        # "enabled": True mirrors what `mms init` writes — without it the
+        # proxy_enabled check FAILs (#831), which is a different scenario
+        # than "healthy".
         data = {
-            "upstream_servers": {"fake": {"prefix": "fk", "transport": "stdio", "command": "x"}}
+            "enabled": True,
+            "upstream_servers": {"fake": {"prefix": "fk", "transport": "stdio", "command": "x"}},
         }
         if strict_cache:
             data["cache"] = {"tool_annotation_policy": "strict"}
@@ -11498,6 +11502,110 @@ class TestDoctor:
         assert "upstream: fake" in result.output
         assert "2 tool(s)" in result.output
         assert "Summary: 0 FAIL, 1 WARN," in result.output
+
+    @staticmethod
+    def _stub_probe(monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+    @staticmethod
+    def _check_by_id(result, check_id):
+        payload = json.loads(result.output)
+        return next((c for c in payload["checks"] if c["id"] == check_id), None)
+
+    def test_unset_enabled_with_upstreams_fails(self, runner, config, monkeypatch):
+        """#831: the upstream probes pass while the proxy advertises none of
+        them, so doctor must not report a clean run. An omitted `enabled` is
+        the silent-default trap — FAIL so the quickstart gate exits 1."""
+        self._stub_probe(monkeypatch)
+        config.write_text(
+            json.dumps(
+                {
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "upstream_servers": {
+                        "fake": {"prefix": "fk", "transport": "stdio", "command": "x"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 1, result.output
+        assert "proxy enabled" in result.output
+        # The misleading half of #831 still renders — the point is that the
+        # report no longer *ends* clean.
+        assert "upstream: fake" in result.output
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+        check = self._check_by_id(result, "proxy_enabled")
+        assert check is not None
+        assert check["status"] == "FAIL"
+        assert '"enabled" is unset' in check["detail"]
+        assert '"enabled": true' in check["next_action"]
+
+    def test_explicit_disabled_with_upstreams_warns(self, runner, config, monkeypatch):
+        """Control-only mode is a supported deployment, so an explicit
+        `"enabled": false` is an advisory, not a gate failure."""
+        self._stub_probe(monkeypatch)
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": False,
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "upstream_servers": {
+                        "fake": {"prefix": "fk", "transport": "stdio", "command": "x"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        check = self._check_by_id(result, "proxy_enabled")
+        assert check is not None
+        assert check["status"] == "WARN"
+        assert "control-only mode" in check["detail"]
+
+    def test_env_enabled_overrides_unset_file(self, runner, config, monkeypatch):
+        """The check reads the env-overlaid config the server would run with,
+        so MEMTOMEM_STM_PROXY__ENABLED=true clears the file-level omission."""
+        self._stub_probe(monkeypatch)
+        config.write_text(
+            json.dumps(
+                {
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "upstream_servers": {
+                        "fake": {"prefix": "fk", "transport": "stdio", "command": "x"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__ENABLED", "true")
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+        check = self._check_by_id(result, "proxy_enabled")
+        assert check is not None
+        assert check["status"] == "PASS"
+
+    def test_disabled_without_upstreams_skips_check(self, runner, config, monkeypatch):
+        """Nothing is inert without upstreams — the existing `upstreams` WARN
+        already covers an empty config, so the check is omitted entirely."""
+        self._stub_probe(monkeypatch)
+        config.write_text(
+            json.dumps({"cache": {"tool_annotation_policy": "strict"}, "upstream_servers": {}}),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+        assert self._check_by_id(result, "proxy_enabled") is None
+        assert self._check_by_id(result, "upstreams")["status"] == "WARN"
 
     def test_active_ollama_embedding_inventory_passes(self, runner, config, monkeypatch):
         from memtomem_stm.cli import proxy as proxy_mod
@@ -12984,6 +13092,7 @@ class TestDoctor:
             "config_file",
             "config_json",
             "config_schema",
+            "proxy_enabled",
             "server_transports",
             "prefixes",
             "upstream:fake",
@@ -13126,6 +13235,7 @@ class TestDoctor:
         config.write_text(
             json.dumps(
                 {
+                    "enabled": True,
                     "cache": {"tool_annotation_policy": "strict"},
                     "upstream_servers": {
                         "fake": {

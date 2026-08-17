@@ -92,6 +92,34 @@ def _has_annotation_policy(data: dict[str, Any]) -> bool:
     return isinstance(cache, dict) and "tool_annotation_policy" in cache
 
 
+def _upstream_inert_state(
+    data: dict[str, Any], *, enabled: bool
+) -> Literal["default", "explicit"] | None:
+    """Whether configured upstreams are inert because the proxy is disabled.
+
+    Upstream tools are only registered when ``proxy.enabled`` is true, so a
+    disabled proxy with a populated ``upstream_servers`` advertises nothing to
+    MCP clients while every direct probe of those servers still succeeds
+    (#831). Shared by the load path, ``mms config validate`` and ``mms
+    doctor`` so the three advisories can't drift apart.
+
+    Returns ``None`` when there is nothing to say (proxy enabled, or no
+    upstreams), ``"explicit"`` when the config states ``enabled`` itself — an
+    operator choosing control-only mode — and ``"default"`` when the key is
+    absent and the silent ``False`` default is what disabled the proxy.
+
+    ``enabled`` is passed in from the *validated* model rather than read off
+    ``data`` so env-string coercion ("0", "false") can't make the callers
+    disagree with the runtime.
+    """
+    if enabled:
+        return None
+    servers = data.get("upstream_servers")
+    if not isinstance(servers, dict) or not servers:
+        return None
+    return "explicit" if "enabled" in data else "default"
+
+
 def _sanitized_load_error(exc: Exception) -> str:
     """Error summary safe to surface beyond the local process log.
 
@@ -1460,6 +1488,24 @@ class ProxyConfig(BaseModel):
                     '"cache": {"tool_annotation_policy": "strict"} (or "conservative" to '
                     "pin current behavior) to silence this.",
                     resolved,
+                )
+            if log_warnings and (inert := _upstream_inert_state(data, enabled=config.enabled)):
+                # "Enabled but inert" (#288), the upstream half: the servers
+                # are configured and reachable but never advertised, so the
+                # only symptom is tools that silently don't exist. Checked
+                # against the MERGED data so an env-enabled proxy stays quiet.
+                logger.warning(
+                    "Proxy config %s configures %d upstream server(s) but the proxy is "
+                    "disabled%s — config is enabled but inert; upstream tools will not be "
+                    'advertised to MCP clients. Add "enabled": true (or remove '
+                    "upstream_servers) to silence.",
+                    resolved,
+                    len(config.upstream_servers),
+                    (
+                        " explicitly"
+                        if inert == "explicit"
+                        else ' ("enabled" is unset and defaults to false)'
+                    ),
                 )
             return ConfigLoadResult(config=config, error=None, unknown_keys=unknown_keys)
         except (json.JSONDecodeError, Exception) as exc:
