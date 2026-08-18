@@ -23,7 +23,7 @@ import pytest
 from helpers import set_home
 from pydantic import ValidationError
 
-from memtomem_stm.config import STMConfig
+from memtomem_stm.config import STMConfig, stm_config_for_cli
 from memtomem_stm.proxy.config import (
     ProxyConfig,
     collect_proxy_env_overrides,
@@ -466,6 +466,58 @@ class TestCompletionSourceIsInert:
         clean_env.setenv("MEMTOMEM_STM_PROXY__CACHE__ENABLED", "false")
 
         assert STMConfig().proxy.upstream_servers == {}
+
+
+class TestCliConfigPathInjection:
+    """``stm_config_for_cli`` threads a command's ``--config`` into the build (#839).
+
+    The CLI flag used to be invisible to ``STMConfig()``, so STMConfig-backed
+    checks resolved a different file than the command's own proxy checks.
+    """
+
+    def test_explicit_path_beats_env_config_path(self, tmp_path, clean_env):
+        """The #839 repro: the flag's file declares the server the env
+        overrides per field, so completion must read the FLAG's file even
+        when ``CONFIG_PATH`` names another."""
+        flag = write_config(tmp_path, {"fake": FILE_SERVER})
+        other = tmp_path / "other.json"
+        other.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+        clean_env.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(other))
+        clean_env.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-server")
+
+        config = stm_config_for_cli(flag)
+
+        assert config.proxy.config_path == flag
+        server = config.proxy.upstream_servers["fake"]
+        assert server.command == "env-server"  # env still wins per field
+        assert server.prefix == "fk"  # completed from the FLAG's file
+
+    def test_none_keeps_the_env_config_path_governing(self, tmp_path, clean_env):
+        """No explicit flag → the bare construction, where ``CONFIG_PATH``
+        keeps working exactly as before."""
+        path = write_config(tmp_path, {"fake": FILE_SERVER})
+        clean_env.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(path))
+        clean_env.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-server")
+
+        config = stm_config_for_cli(None)
+
+        assert config.proxy.config_path == path
+        assert config.proxy.upstream_servers["fake"].prefix == "fk"
+
+    def test_init_dict_deep_merges_with_the_env_fragment(self, tmp_path, clean_env):
+        """The mechanism the fix rides on: pydantic-settings deep-merges a
+        PLAIN init dict over the env fragment, so injecting ``config_path``
+        must not clobber env-provided ``proxy`` fields. If a pydantic-settings
+        upgrade changes this, this test screams before the CLI misbehaves."""
+        flag = write_config(tmp_path, {"fake": FILE_SERVER})
+        clean_env.setenv("MEMTOMEM_STM_PROXY__ENABLED", "true")
+        clean_env.setenv("MEMTOMEM_STM_PROXY__CONSUMER_MODEL", "claude-sonnet-5")
+
+        config = stm_config_for_cli(flag)
+
+        assert config.proxy.config_path == flag  # init wins for its own key
+        assert config.proxy.enabled is True  # env siblings survive the merge
+        assert config.proxy.consumer_model == "claude-sonnet-5"
 
 
 class TestBareBlockPayloadCovering:

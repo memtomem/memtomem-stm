@@ -542,3 +542,36 @@ class STMConfig(BaseSettings):
         # Propagate consumer_model from proxy to surfacing for model-aware defaults
         if self.proxy.consumer_model and not self.surfacing.consumer_model:
             self.surfacing.consumer_model = self.proxy.consumer_model
+
+
+def stm_config_for_cli(config_path: str | Path | None = None) -> STMConfig:
+    """``STMConfig`` built against the config file a CLI command resolved.
+
+    A command's ``--config <path>`` lives in Click and never reaches a bare
+    ``STMConfig()``, which resolves the file from
+    ``MEMTOMEM_STM_PROXY__CONFIG_PATH`` or the field default — so the two can
+    disagree about which file is in play (#839, visible since the completion
+    source made construction file-dependent). ``None`` keeps the bare
+    construction, where the env var governs. Who passes a path differs by
+    caller class: diagnostic commands (doctor/health/stats) pass it only when
+    Click reports a non-default source for ``--config`` — typed on the command
+    line, or mapped via ``default_map`` (``_explicit_config_path``) — while
+    registration (``_registration_command``) passes its path unconditionally,
+    default included — that path is serialized into the managed entry's
+    environment, so the policy must resolve against the same file. For a
+    passed path the precedence is: that path > env ``CONFIG_PATH`` > field
+    default.
+
+    The path is injected as a **plain init dict**, which pydantic-settings
+    deep-merges over the env fragment — env-provided ``proxy`` fields survive
+    while ``config_path`` wins per-key, and the completion source reads init
+    before env. A ``ProxyConfig`` instance would replace the field wholesale
+    and silence the env, so never "tidy" this into one. The string stays raw
+    (no ``expanduser``/``resolve``): the field is stored raw by convention and
+    every consumer expands at the use site, matching how the env value
+    arrives.
+    """
+    if config_path is None:
+        return STMConfig()
+    # The dict (not ProxyConfig) is load-bearing — see the docstring.
+    return STMConfig(proxy={"config_path": str(config_path)})  # type: ignore[arg-type]

@@ -4495,6 +4495,64 @@ class TestInitMcpRegistration:
     stub) and replace ``_run_claude_mcp`` with an in-process recorder so
     assertions can check exact argv."""
 
+    def test_registration_command_survives_partial_env_override(self, tmp_path, monkeypatch):
+        """#839 (review round 1): ``_registration_command`` serializes the
+        ``--config`` path into the registration env but resolved the runtime
+        policy from a bare ``STMConfig()`` — a per-field env override of a
+        server only that file declares crashed ``init``/``register``."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config = tmp_path / "stm_proxy.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {"fake": {"prefix": "fk", "command": "file-server"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-server")
+
+        _cmd, _args, env = proxy_mod._registration_command(config)
+
+        # The policy resolves against the same file the env line names.
+        assert env["MEMTOMEM_STM_PROXY__CONFIG_PATH"] == str(config.expanduser().resolve())
+        assert env["MEMTOMEM_STM_SURFACING__USE_DAEMON"] == "true"
+
+    def test_registration_uses_the_default_path_over_ambient_config_path(
+        self, tmp_path, monkeypatch
+    ):
+        """The "default included" half of the round-1 fix: registering the
+        Click-default path while ambient ``CONFIG_PATH`` names another file
+        must resolve the policy against the file being REGISTERED — that is
+        the path the env line serializes, and gating on explicitness here
+        would hand the completion to a file the registration never reads."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        home = tmp_path / "home"
+        set_home(monkeypatch, home)
+        default_path = Path("~/.memtomem/stm_proxy.json").expanduser()
+        default_path.parent.mkdir(parents=True, exist_ok=True)
+        default_path.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {"fake": {"prefix": "fk", "command": "file-server"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        other = tmp_path / "other.json"
+        other.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(other))
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-server")
+
+        _cmd, _args, env = proxy_mod._registration_command(Path("~/.memtomem/stm_proxy.json"))
+
+        assert env["MEMTOMEM_STM_PROXY__CONFIG_PATH"] == str(default_path.resolve())
+        assert env["MEMTOMEM_STM_SURFACING__USE_DAEMON"] == "true"
+
     @pytest.fixture
     def no_discovery(self, monkeypatch):
         from memtomem_stm.cli import proxy as proxy_mod
@@ -10184,7 +10242,7 @@ class TestHealth:
         monkeypatch.setattr(
             proxy_mod,
             "_surfacing_bootstrap_status",
-            lambda _timeout: {
+            lambda _timeout, **_kw: {
                 "enabled": None,
                 "feedback_enabled": None,
                 "feedback_db": None,
@@ -11489,6 +11547,30 @@ class TestDoctor:
             data["cache"] = {"tool_annotation_policy": "strict"}
         config.write_text(json.dumps(data), encoding="utf-8")
 
+    def test_config_flag_reaches_stmconfig_backed_checks(self, runner, config, monkeypatch):
+        """#839: ``--config`` must steer the STMConfig-backed checks too.
+
+        A per-field env override of a server the FLAG's file declares used to
+        fail the bare ``STMConfig()`` behind the ``ltm server`` check, because
+        that construction resolved the DEFAULT config path (which declares no
+        such server) — misattributing a config error to a subtree the check
+        does not read, while ``config schema`` (which merges the flag's file
+        itself) passed.
+        """
+        self._stub_probe(monkeypatch)
+        self._healthy_config(config)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-server")
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+        schema_check = self._check_by_id(result, "config_schema")
+        assert schema_check is not None and schema_check["status"] == "PASS", result.output
+        ltm_check = self._check_by_id(result, "ltm")
+        assert ltm_check is not None
+        # Positive control: the expected cause (the fixture's unreachable LTM
+        # command) still renders — the check ran, it just isn't misattributed.
+        assert "validation error" not in ltm_check["detail"], ltm_check["detail"]
+        assert "Field required" not in ltm_check["detail"], ltm_check["detail"]
+
     def test_healthy_config_warn_only_exits_zero(self, runner, config, monkeypatch):
         """정상 scenario: all checks PASS except the expected LTM WARN —
         WARN-only must exit 0 or a fresh install without a memtomem server
@@ -12757,7 +12839,7 @@ class TestDoctor:
         monkeypatch.setattr(
             proxy_mod,
             "_surfacing_bootstrap_status",
-            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False: {
+            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False, config_path=None: {
                 "enabled": True,
                 "feedback_enabled": False,
                 "feedback_db": None,
@@ -12807,7 +12889,7 @@ class TestDoctor:
         monkeypatch.setattr(
             proxy_mod,
             "_surfacing_bootstrap_status",
-            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False: {
+            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False, config_path=None: {
                 "enabled": True,
                 "feedback_enabled": False,
                 "feedback_db": None,
@@ -12851,7 +12933,9 @@ class TestDoctor:
         monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
         calls: list[bool] = []
 
-        def fake_bootstrap(_timeout, *, measure_ltm=False, prefer_hook_daemon=False):
+        def fake_bootstrap(
+            _timeout, *, measure_ltm=False, prefer_hook_daemon=False, config_path=None
+        ):
             assert prefer_hook_daemon is True
             calls.append(measure_ltm)
             return {

@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 import shlex
 from dataclasses import dataclass
+from pathlib import Path
 
 _DAEMON_GRACE_SECONDS = 1.0
 
@@ -204,6 +205,7 @@ def resolve_host_runtime_policy(
     existing_command: str | None = None,
     use_daemon: bool | None = None,
     surfacing_timeout_seconds: float | None = None,
+    config_path: str | Path | None = None,
 ) -> HostRuntimePolicy:
     """Resolve CLI overrides > existing registration > effective config.
 
@@ -211,10 +213,15 @@ def resolve_host_runtime_policy(
     existing registration that explicitly opted in is retained on refresh;
     ``--inherit-runtime-env`` is the escape hatch for removing all serialized
     management from a hook command.
-    """
-    from memtomem_stm.config import STMConfig
 
-    config = STMConfig()
+    *config_path* is the config file the caller is registering or diagnosing
+    (#839): ``init``/``register`` serialize that exact path into the managed
+    entry's environment, so the policy must resolve against it too — a bare
+    construction reads the default/env path, which can name a different file.
+    """
+    from memtomem_stm.config import stm_config_for_cli
+
+    config = stm_config_for_cli(config_path)
     existing = (
         parse_managed_hook_runtime(existing_command)
         if existing_command is not None

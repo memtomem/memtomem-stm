@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, NoReturn, TextIO
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 import click
+from click.core import ParameterSource
 
 if TYPE_CHECKING:
     import httpx
@@ -480,18 +481,34 @@ def _transport_field_error(transport: str, command: str, url: str) -> str | None
     return None
 
 
-def _logging_destination_status() -> dict[str, Any]:
+def _explicit_config_path(config_path: str) -> str | None:
+    """The command's ``--config`` value, or ``None`` when it is Click's default.
+
+    STMConfig-backed checks honor the flag only when Click reports a
+    non-default source for it — typed on the command line, or mapped via
+    ``default_map`` (#839); otherwise ``MEMTOMEM_STM_PROXY__CONFIG_PATH``
+    keeps governing the bare construction. Outside a Click context (a helper
+    called directly in tests), the caller's value is trusted as explicit.
+    """
+    ctx = click.get_current_context(silent=True)
+    if ctx is None:
+        return config_path
+    src = ctx.get_parameter_source("config_path")
+    return None if src is ParameterSource.DEFAULT else config_path
+
+
+def _logging_destination_status(config_path: str | None = None) -> dict[str, Any]:
     """Active log destination for ``mms health`` (#612) — the point of the
     opt-in file log is diagnosability, so health says where to look.
     ValidationError-guarded: a bad ``MEMTOMEM_STM_*`` env value must not
     break a diagnostics command."""
     from pydantic import ValidationError
 
-    from memtomem_stm.config import STMConfig
+    from memtomem_stm.config import stm_config_for_cli
     from memtomem_stm.logging_setup import describe_log_destination
 
     try:
-        return describe_log_destination(STMConfig())
+        return describe_log_destination(stm_config_for_cli(config_path))
     except ValidationError as exc:
         return {"error": f"invalid MEMTOMEM_STM_* environment ({exc.error_count()} error(s))"}
 
@@ -675,8 +692,11 @@ def _registration_command(config_path: Path) -> tuple[str, list[str], dict[str, 
     env = {"MEMTOMEM_STM_PROXY__CONFIG_PATH": str(config_path.expanduser().resolve())}
     # A newly managed MCP host uses the shared warm daemon.  Serialize the
     # deadline and privacy policy as well: GUI-launched clients often do not
-    # inherit the shell environment in which `mms register` ran.
-    policy = resolve_host_runtime_policy(use_daemon=True)
+    # inherit the shell environment in which `mms register` ran.  The policy
+    # resolves against the same file the env line above names (#839) —
+    # unconditionally, default path included, because that path is what the
+    # registration being written will read.
+    policy = resolve_host_runtime_policy(use_daemon=True, config_path=config_path)
     env.update(policy.mcp_env())
     return command, ["-m", "memtomem_stm"], env
 
@@ -2024,9 +2044,10 @@ def stats(
     Reads ``proxy_metrics.db`` and ``stm_feedback.db`` read-only (it never
     creates or migrates them) and reports all-time totals. The live MCP server
     keeps additional in-memory counters that a separate CLI process cannot see,
-    so the numbers here reflect only what has been written to disk.
+    so the numbers here reflect only what has been written to disk. An explicit
+    ``--config`` also steers the STMConfig-backed feedback-DB location (#839).
     """
-    from memtomem_stm.config import STMConfig
+    from memtomem_stm.config import STMConfig, stm_config_for_cli
     from memtomem_stm.proxy.config import ProxyConfig, collect_proxy_env_overrides
     from memtomem_stm.proxy.metrics_store import read_compression_summary
     from memtomem_stm.surfacing.feedback_store import read_surfacing_summary
@@ -2052,9 +2073,11 @@ def stats(
     # ``proxy_metrics.db`` the server writes to even when the proxy is enabled
     # via ``MEMTOMEM_STM_PROXY__ENABLED``. (The server used to skip the file
     # in env-enabled mode and this command mirrored the bypass; both honor the
-    # file now.) ``STMConfig()`` still supplies the surfacing feedback path.
+    # file now.) ``STMConfig`` still supplies the surfacing feedback path,
+    # built against an explicit ``--config`` so its completion source reads
+    # the same file as the load below (#839).
     try:
-        stm_config: STMConfig | None = STMConfig()
+        stm_config: STMConfig | None = stm_config_for_cli(_explicit_config_path(config_path))
     except Exception:
         stm_config = None
     feedback_path = (
@@ -6832,20 +6855,23 @@ def _surfacing_bootstrap_status(
     *,
     measure_ltm: bool = False,
     prefer_hook_daemon: bool = False,
+    config_path: str | None = None,
 ) -> dict[str, Any]:
     """Return surfacing bootstrap readiness without starting the proxy.
 
     *timeout* is the ``mms health --timeout`` value, forwarded into the LTM
-    probe so the documented per-server bound covers it too.
+    probe so the documented per-server bound covers it too. *config_path* is
+    the command's explicit ``--config``, threaded so the ``STMConfig`` here
+    reads the same file as the command's own proxy checks (#839).
     """
     try:
-        from memtomem_stm.config import STMConfig
+        from memtomem_stm.config import stm_config_for_cli
         from memtomem_stm.surfacing.feedback_store import (
             inspect_feedback_db,
             read_surfacing_summary,
         )
 
-        config = STMConfig()
+        config = stm_config_for_cli(config_path)
         surfacing = config.surfacing
         db_status = inspect_feedback_db(surfacing.feedback_db_path)
         return {
@@ -6995,7 +7021,11 @@ def health(
     timeout: int = 10,
     show_names: bool = False,
 ) -> None:
-    """Check upstream server connectivity."""
+    """Check upstream server connectivity.
+
+    An explicit ``--config`` also steers the STMConfig-backed sections
+    (surfacing bootstrap, logging destination), not just the proxy file (#839).
+    """
     path = Path(config_path)
     resolved = path.expanduser().resolve()
 
@@ -7014,14 +7044,15 @@ def health(
 
     data = _load(path)
     servers: dict[str, Any] = data.get("upstream_servers", {})
-    surfacing_status = _surfacing_bootstrap_status(float(timeout))
+    explicit_config = _explicit_config_path(config_path)
+    surfacing_status = _surfacing_bootstrap_status(float(timeout), config_path=explicit_config)
     config_error = _runtime_schema_validation_error(data)
     if config_error:
         # A schema error can echo the rejected input_value (or a validator
         # message quoting it), so scrub it against configured server secrets
         # before it lands in text/--json output.
         config_error = sanitize_secrets(config_error, _all_config_secret_values(data))
-    logging_status = _logging_destination_status()
+    logging_status = _logging_destination_status(explicit_config)
     obs_tools_hint = _hidden_obs_tools_hint()
 
     # JSON output format matches ``status --json`` / ``list --json`` (indent=2,
@@ -7623,6 +7654,8 @@ def doctor(
     `mms config validate`. The default never modifies state or runs a search.
     ``--measure-ltm`` explicitly authorizes read-only synthetic searches against
     an already running daemon; it still never edits configuration or LTM data.
+    An explicit ``--config`` also steers the STMConfig-backed checks (LTM /
+    surfacing), not just the proxy-file checks (#839).
     """
     path = Path(config_path)
     resolved = path.expanduser().resolve()
@@ -8084,6 +8117,7 @@ def doctor(
                 float(timeout),
                 measure_ltm=measure_ltm,
                 prefer_hook_daemon=True,
+                config_path=_explicit_config_path(config_path),
             )
             ltm = surfacing_status.get("ltm_server")
             if isinstance(ltm, dict) and ltm.get("connected"):

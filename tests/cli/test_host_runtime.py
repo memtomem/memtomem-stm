@@ -99,3 +99,45 @@ def test_mcp_policy_serializes_shared_daemon_contract() -> None:
         "MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS": "12",
         "MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT": "false",
     }
+
+
+def test_explicit_config_path_reaches_the_policy_construction(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#839 (review round 1): ``init``/``register`` resolve the policy via
+    ``_registration_command`` while holding the ``--config`` path, but the
+    bare construction read the default file — so a per-field env override of
+    a server only the flag's file declares refused to build and crashed the
+    registration.
+
+    Home is already redirected by the root conftest's autouse
+    ``isolate_home``; ambient ``MEMTOMEM_STM_PROXY*`` variables are cleared
+    here so a developer shell exporting e.g. ``CONFIG_PATH`` cannot make the
+    positive control's expected failure disappear."""
+    import json
+    import os
+
+    from pydantic import ValidationError
+
+    for name in [n for n in os.environ if n.startswith("MEMTOMEM_STM_PROXY")]:
+        monkeypatch.delenv(name, raising=False)
+
+    config = tmp_path / "stm_proxy.json"
+    config.write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "upstream_servers": {"fake": {"prefix": "fk", "command": "file-server"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-server")
+
+    # Positive control: the override really is live and really does break the
+    # bare construction (the default path declares no such server).
+    with pytest.raises(ValidationError):
+        resolve_host_runtime_policy()
+
+    policy = resolve_host_runtime_policy(config_path=config)
+    assert policy.use_daemon is True
