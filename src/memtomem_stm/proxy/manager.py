@@ -54,6 +54,7 @@ from memtomem_stm.proxy.compression import (
 from memtomem_stm.proxy.config import (
     CleaningConfig,
     CompressionStrategy,
+    EnvOverlayResult,
     ExposureProfile,
     ExtractionStrategy,
     HybridConfig,
@@ -508,7 +509,7 @@ class ProxyManager:
         index_engine: FileIndexer | None = None,
         surfacing_engine: SurfacingEngine | None = None,
         cache: ProxyCache | None = None,
-        env_overrides: dict[str, Any] | None = None,
+        env_overrides: EnvOverlayResult | dict[str, Any] | None = None,
         progressive_reads_tracker: ProgressiveReadsTracker | None = None,
         selection_log: SelectionTelemetryLog | None = None,
     ) -> None:

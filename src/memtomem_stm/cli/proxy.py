@@ -458,7 +458,7 @@ def _runtime_schema_validation_error(data: dict[str, Any]) -> str | None:
     """Validate file data with the same proxy env overlay as the server."""
     from memtomem_stm.proxy.config import collect_proxy_env_overrides
 
-    return _schema_validation_error(data, env_overrides=collect_proxy_env_overrides())
+    return _schema_validation_error(data, env_overrides=collect_proxy_env_overrides().fragment)
 
 
 _CONFIG_INVALID_WARNING = (
@@ -7726,7 +7726,7 @@ def doctor(
                 # One merged dict for both the model and the inert-state
                 # predicate below: they must judge the same document, or
                 # doctor could report an `enabled` the model never saw.
-                effective_data = _deep_merge(data, collect_proxy_env_overrides())
+                effective_data = _deep_merge(data, collect_proxy_env_overrides().fragment)
                 effective_config = ProxyConfig.model_validate(effective_data)
 
             # Every server-shaped check below reads the EFFECTIVE map, not the

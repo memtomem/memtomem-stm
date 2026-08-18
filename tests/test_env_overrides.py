@@ -27,18 +27,18 @@ from memtomem_stm.proxy.config import (
 class TestCollectProxyEnvOverrides:
     def test_top_level_field(self) -> None:
         env = {"MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS": "9999"}
-        assert collect_proxy_env_overrides(env) == {"default_max_result_chars": "9999"}
+        assert collect_proxy_env_overrides(env).fragment == {"default_max_result_chars": "9999"}
 
     def test_nested_field_via_double_underscore(self) -> None:
         env = {"MEMTOMEM_STM_PROXY__CACHE__ENABLED": "true"}
-        assert collect_proxy_env_overrides(env) == {"cache": {"enabled": "true"}}
+        assert collect_proxy_env_overrides(env).fragment == {"cache": {"enabled": "true"}}
 
     def test_deeply_nested_field(self) -> None:
         env = {
             "MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__EMBEDDING_PROVIDER": "openai",
             "MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__EMBEDDING_MODEL": "text-embedding-3-small",
         }
-        assert collect_proxy_env_overrides(env) == {
+        assert collect_proxy_env_overrides(env).fragment == {
             "relevance_scorer": {
                 "embedding_provider": "openai",
                 "embedding_model": "text-embedding-3-small",
@@ -47,7 +47,7 @@ class TestCollectProxyEnvOverrides:
 
     def test_toolgraph_nested_field(self) -> None:
         env = {"MEMTOMEM_STM_PROXY__TOOLGRAPH__ENABLED": "true"}
-        assert collect_proxy_env_overrides(env) == {"toolgraph": {"enabled": "true"}}
+        assert collect_proxy_env_overrides(env).fragment == {"toolgraph": {"enabled": "true"}}
 
     def test_unrelated_env_vars_ignored(self) -> None:
         env = {
@@ -55,10 +55,10 @@ class TestCollectProxyEnvOverrides:
             "MEMTOMEM_STM_SURFACING__ENABLED": "true",  # surfacing prefix, not proxy
             "MEMTOMEM_STM_PROXY__ENABLED": "true",
         }
-        assert collect_proxy_env_overrides(env) == {"enabled": "true"}
+        assert collect_proxy_env_overrides(env).fragment == {"enabled": "true"}
 
     def test_empty_when_no_proxy_env(self) -> None:
-        assert collect_proxy_env_overrides({"FOO": "bar"}) == {}
+        assert collect_proxy_env_overrides({"FOO": "bar"}).fragment == {}
 
 
 class TestComplexEnvValuesMatchSettings:
@@ -77,7 +77,7 @@ class TestComplexEnvValuesMatchSettings:
         env = {
             "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": '{"gh": {"prefix": "gh", "command": "s"}}'
         }
-        assert collect_proxy_env_overrides(env) == {
+        assert collect_proxy_env_overrides(env).fragment == {
             "upstream_servers": {"gh": {"prefix": "gh", "command": "s"}}
         }
 
@@ -86,7 +86,7 @@ class TestComplexEnvValuesMatchSettings:
             "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH": '{"prefix": "gh", "command": "s"}',
             "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__ARGS": '["--one", "--two"]',
         }
-        assert collect_proxy_env_overrides(env) == {
+        assert collect_proxy_env_overrides(env).fragment == {
             "upstream_servers": {
                 "gh": {"prefix": "gh", "command": "s"},
                 "fx": {"args": ["--one", "--two"]},
@@ -102,7 +102,7 @@ class TestComplexEnvValuesMatchSettings:
             "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__COMMAND": "null",
             "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__PREFIX": "1",
         }
-        assert collect_proxy_env_overrides(env) == {
+        assert collect_proxy_env_overrides(env).fragment == {
             "enabled": "true",
             "default_max_result_chars": "9999",
             "upstream_servers": {"fx": {"command": "null", "prefix": "1"}},
@@ -115,7 +115,7 @@ class TestComplexEnvValuesMatchSettings:
             "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__ENV": '{"A": "1"}',
             "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FX__HEADERS__X": "[not json]",
         }
-        assert collect_proxy_env_overrides(env) == {
+        assert collect_proxy_env_overrides(env).fragment == {
             "upstream_servers": {
                 "fx": {"env": {"A": "1"}, "headers": {"x": "[not json]"}},
             }
@@ -138,7 +138,7 @@ class TestComplexEnvValuesMatchSettings:
                 {"GH": {"PREFIX": "gh", "Command": "s", "ENV": {"API_TOKEN": "v"}}}
             ),
         }
-        assert collect_proxy_env_overrides(env) == {
+        assert collect_proxy_env_overrides(env).fragment == {
             "cache": {"enabled": False},
             "upstream_servers": {
                 "GH": {"PREFIX": "gh", "Command": "s", "ENV": {"API_TOKEN": "v"}}
@@ -149,11 +149,11 @@ class TestComplexEnvValuesMatchSettings:
         """Left for validation to name the field — substituting a default
         would be the silent degrade this module exists to prevent."""
         env = {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": "{not json"}
-        assert collect_proxy_env_overrides(env) == {"upstream_servers": "{not json"}
+        assert collect_proxy_env_overrides(env).fragment == {"upstream_servers": "{not json"}
 
     def test_unknown_key_stays_raw(self) -> None:
         env = {"MEMTOMEM_STM_PROXY__BOGUS_KEY": '{"a": 1}'}
-        assert collect_proxy_env_overrides(env) == {"bogus_key": '{"a": 1}'}
+        assert collect_proxy_env_overrides(env).fragment == {"bogus_key": '{"a": 1}'}
 
     @pytest.mark.parametrize(
         "items",
@@ -233,7 +233,7 @@ class TestComplexEnvValuesMatchSettings:
                     for e in exc.errors()
                 )
 
-        assert outcome(lambda: ProxyConfig.model_validate(collect_proxy_env_overrides())) == outcome(
+        assert outcome(lambda: ProxyConfig.model_validate(collect_proxy_env_overrides().fragment)) == outcome(
             lambda: STMConfig().proxy
         )
 
@@ -249,7 +249,7 @@ class TestComplexEnvValuesMatchSettings:
             ("MEMTOMEM_STM_PROXY__CACHE__ENABLED", "true"),
         ]
         env = dict(reversed(items) if reverse else items)
-        assert collect_proxy_env_overrides(env) == {"cache": None}
+        assert collect_proxy_env_overrides(env).fragment == {"cache": None}
 
     def test_non_mapping_parent_covers_every_json_scalar(self) -> None:
         for raw in ("null", "1", "true", '""', "[]"):
@@ -257,7 +257,7 @@ class TestComplexEnvValuesMatchSettings:
                 "MEMTOMEM_STM_PROXY__CACHE": raw,
                 "MEMTOMEM_STM_PROXY__CACHE__ENABLED": "true",
             }
-            assert collect_proxy_env_overrides(env)["cache"] == json.loads(raw), raw
+            assert collect_proxy_env_overrides(env).fragment["cache"] == json.loads(raw), raw
 
     def test_decoded_payload_is_named_by_its_own_var_not_invented_leaves(self) -> None:
         """`_env_override_hint` names vars by walking overlay leaves, so a
@@ -271,7 +271,7 @@ class TestComplexEnvValuesMatchSettings:
         }
         overrides = collect_proxy_env_overrides(env)
         with pytest.raises(ValidationError) as exc_info:
-            ProxyConfig.model_validate(overrides)
+            ProxyConfig.model_validate(overrides.fragment)
 
         hint = _env_override_hint(exc_info.value, overrides)
         assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS" in hint
@@ -291,7 +291,7 @@ class TestComplexEnvValuesMatchSettings:
         }
         overrides = collect_proxy_env_overrides(env)
         with pytest.raises(ValidationError) as exc_info:
-            ProxyConfig.model_validate(overrides)
+            ProxyConfig.model_validate(overrides.fragment)
         assert any(
             "env" in [str(p) for p in e["loc"]] for e in exc_info.value.errors()
         ), exc_info.value.errors()
@@ -311,7 +311,7 @@ class TestComplexEnvValuesMatchSettings:
         }
         overrides = collect_proxy_env_overrides(env)
         with pytest.raises(ValidationError) as exc_info:
-            ProxyConfig.model_validate(overrides)
+            ProxyConfig.model_validate(overrides.fragment)
 
         hint = _env_override_hint(exc_info.value, overrides)
         assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__PREFIX" in hint
@@ -365,7 +365,7 @@ class TestComplexEnvValuesMatchSettings:
             monkeypatch.setenv(name, value)
 
         settings_proxy = STMConfig().proxy
-        overlay_proxy = ProxyConfig.model_validate(collect_proxy_env_overrides())
+        overlay_proxy = ProxyConfig.model_validate(collect_proxy_env_overrides().fragment)
         assert overlay_proxy.model_dump() == settings_proxy.model_dump()
 
 
@@ -406,7 +406,7 @@ class TestSettingsSourceCanaries:
 
         result = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY__MAX_UPSTREAM_CHARS": "2222"})
 
-        assert result == {"max_upstream_chars": "2222"}
+        assert result.fragment == {"max_upstream_chars": "2222"}
 
     def test_source_output_matches_a_hand_built_expectation(self, monkeypatch) -> None:
         """A written-down expectation of what the source resolves, so an
@@ -419,7 +419,7 @@ class TestSettingsSourceCanaries:
             "memtomem_stm_proxy__upstream_servers__gh__args": '["--one"]',
         }
 
-        assert collect_proxy_env_overrides(env) == {
+        assert collect_proxy_env_overrides(env).fragment == {
             "enabled": "true",  # scalars stay strings; pydantic coerces later
             "cache": {"enabled": False, "ttl_seconds": "5"},  # field key folded
             "upstream_servers": {"gh": {"args": ["--one"]}},  # complex decoded
@@ -444,7 +444,7 @@ class TestProvenanceSurvivesOverwritingVariables:
     def _hint_for(self, env: dict[str, str]) -> str:
         overrides = collect_proxy_env_overrides(env)
         try:
-            ProxyConfig.model_validate(overrides)
+            ProxyConfig.model_validate(overrides.fragment)
         except ValidationError as exc:
             return _env_override_hint(exc, overrides)
         raise AssertionError("expected the override to fail validation")
@@ -576,7 +576,7 @@ class TestDivergenceEightIsClosedByDelegating:
         }
 
         # `provider` is gone: the payload's whole `llm` branch was replaced.
-        assert collect_proxy_env_overrides(env) == {
+        assert collect_proxy_env_overrides(env).fragment == {
             "extraction": {"llm": {"llm_timeout_seconds": "30"}}
         }
 
@@ -620,7 +620,7 @@ class TestMalformedValuesSurviveAsRawStrings:
             "MEMTOMEM_STM_PROXY__ENABLED": "true",
         }
 
-        assert collect_proxy_env_overrides(env) == {
+        assert collect_proxy_env_overrides(env).fragment == {
             "upstream_servers": "{not json",
             "enabled": "true",
         }
@@ -638,7 +638,7 @@ class TestMalformedValuesSurviveAsRawStrings:
             "MEMTOMEM_STM_PROXY__TOOLGRAPH": '{"args": ["serve"]}',
         }
 
-        assert collect_proxy_env_overrides(env) == {"toolgraph": {"args": ["serve"]}}
+        assert collect_proxy_env_overrides(env).fragment == {"toolgraph": {"args": ["serve"]}}
 
     def test_several_malformed_values_are_all_kept(self) -> None:
         """Attribution is by exclusion, so it has to find every culprit, not
@@ -650,7 +650,7 @@ class TestMalformedValuesSurviveAsRawStrings:
             "MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS": "9999",
         }
 
-        assert collect_proxy_env_overrides(env) == {
+        assert collect_proxy_env_overrides(env).fragment == {
             "upstream_servers": "{not json",
             "cache": "[unclosed",
             "toolgraph": {"args": "not-a-list"},
@@ -664,7 +664,7 @@ class TestMalformedValuesSurviveAsRawStrings:
         overrides = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY__CACHE": "[unclosed"})
 
         with pytest.raises(ValidationError) as caught:
-            ProxyConfig.model_validate(overrides)
+            ProxyConfig.model_validate(overrides.fragment)
 
         assert caught.value.errors()[0]["loc"] == ("cache",)
 
@@ -1115,4 +1115,4 @@ def test_collect_uses_real_environ_when_arg_omitted(monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS", "4242")
     monkeypatch.delenv("MEMTOMEM_STM_PROXY__ENABLED", raising=False)
     out = collect_proxy_env_overrides()
-    assert out.get("default_max_result_chars") == "4242"
+    assert out.fragment.get("default_max_result_chars") == "4242"

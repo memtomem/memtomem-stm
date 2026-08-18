@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -34,35 +35,48 @@ _PROXY_ENV_PREFIX = "MEMTOMEM_STM_PROXY__"
 _MISSING = object()
 
 
-class _EnvJsonDict(dict[str, Any]):
-    """A mapping that came from ONE env var's JSON payload.
+@dataclass(frozen=True)
+class EnvOverlayResult:
+    """The resolved proxy env overlay plus the raw variables that produced it.
 
-    ``_env_override_hint`` names env vars by walking the overlay's leaves,
-    which only works while every leaf corresponds to a var the operator set.
-    A decoded payload breaks that: ``UPSTREAM_SERVERS='{"gh": {…}}'`` has
-    leaves like ``gh.command`` that no var supplied, and naming them invents
-    variables — and echoes user-controlled mapping keys (an ``env`` entry is
-    keyed by the operator's own names) into a warning. Marking the decoded
-    subtree lets the hint stop at the var that actually exists.
+    ``fragment`` is exactly what settings resolved (plain dicts, no marks) and
+    is the only part most callers consume. The raw sides exist for
+    ``_env_override_hint``, which attributes validation errors to variables by
+    *re-measuring* the environment (leave-one-out trials, see the hint), not
+    by inferring which variable supplied which subtree — the reconstruction
+    #843 removed after four review rounds each found a fresh counterexample
+    in it.
 
-    Every mapping inside the payload is wrapped, each carrying ``var_path``
-    — the path of the var that supplied it — so a hint that starts anywhere
-    inside the payload still names the one variable that exists.
-
-    ``explicit_keys`` records keys a *deeper* var then set inside this
-    payload, since settings merges those on top; they are real vars and must
-    still be nameable.
+    ``names`` maps each lowered name to the ORIGINAL spelling that supplied
+    the surviving value (last case-equivalent spelling wins, matching the
+    value collapse in ``_MappingEnvSource._load_env_vars``), so warnings
+    render a variable the operator can actually find on a case-sensitive
+    system. ``malformed`` records the names settings refuses to decode — a
+    per-variable fact, computed once so per-trial rebuilds need not re-probe.
     """
 
-    def __init__(self, data: dict[str, Any], var_path: list[str]) -> None:
-        super().__init__(
-            {
-                key: (_EnvJsonDict(value, var_path) if type(value) is dict else value)
-                for key, value in data.items()
-            }
-        )
-        self.var_path = list(var_path)
-        self.explicit_keys: set[str] = set()
+    fragment: dict[str, Any]
+    scoped: dict[str, str]
+    names: dict[str, str]
+    malformed: frozenset[str]
+
+    def __bool__(self) -> bool:
+        return bool(self.fragment)
+
+
+def _as_overlay(value: EnvOverlayResult | dict[str, Any] | None) -> EnvOverlayResult | None:
+    """Normalize the ``env_overrides`` boundary.
+
+    Callers that build a plain dict by hand (tests, mostly) keep working: the
+    fragment is honored everywhere, but with no raw variables to measure the
+    hint stays silent — attribution requires the overlay to come from
+    ``collect_proxy_env_overrides``.
+    """
+    if value is None:
+        return None
+    if isinstance(value, EnvOverlayResult):
+        return value
+    return EnvOverlayResult(fragment=value, scoped={}, names={}, malformed=frozenset())
 
 
 class _MappingEnvSource(EnvSettingsSource):
@@ -107,18 +121,6 @@ def _var_path(name: str) -> tuple[str, ...]:
     return tuple(name[len(_PROXY_ENV_PREFIX) :].split("__"))
 
 
-def _parent_and_key(
-    fragment: dict[str, Any], path: tuple[str, ...]
-) -> tuple[dict[str, Any] | None, str]:
-    """The mapping holding *path*'s last component, if the walk stays in dicts."""
-    cursor: Any = fragment
-    for part in path[:-1]:
-        if not isinstance(cursor, dict) or part not in cursor:
-            return None, path[-1]
-        cursor = cursor[part]
-    return (cursor, path[-1]) if isinstance(cursor, dict) else (None, path[-1])
-
-
 def _live_var_paths(scoped: dict[str, str]) -> list[tuple[str, tuple[str, ...]]]:
     """The variables that still contributed something, in environment order.
 
@@ -129,78 +131,33 @@ def _live_var_paths(scoped: dict[str, str]) -> list[tuple[str, tuple[str, ...]]]
     return live_env_paths([(name, _var_path(name)) for name in scoped])
 
 
-def _claim_payload_subtree(node: dict[str, Any], payload: dict[str, Any], path: list[str]) -> Any:
-    """Mark *node* as the variable's, but only where the payload reached.
+def _fragment_for(scoped: dict[str, str], malformed: frozenset[str]) -> dict[str, Any]:
+    """The overlay fragment for *scoped*, with malformed values kept raw.
 
-    The node is what settings RESOLVED, which can hold branches the payload
-    never contained — a deeper variable creating a sibling entry the aggregate
-    did not declare. Wrapping those too would let the payload's name be
-    reported for an entry it has nothing to do with, so the walk descends by
-    the payload and leaves everything else exactly as it found it.
+    The one place the overlay pipeline lives: resolve the decodable variables
+    with settings, then re-insert each malformed value as its raw string —
+    but only where a later variable did not cover it, since re-inserting a
+    value settings had already replaced would overwrite the payload that won
+    with the string that lost. The collector calls this once for the full
+    environment; ``_env_override_hint`` calls it per leave-one-out trial so
+    every trial reproduces the pipeline exactly, malformed handling included.
 
-    The two sides do not spell keys alike: settings canonicalizes a model field
-    written in any case (``'{"LLM": …}'`` resolves to ``llm``), so an exact
-    comparison would fail to recognize the payload's OWN branch and go on to
-    synthesize a variable name for it — worse than over-claiming, because the
-    name does not exist.
-
-    Exact match first, then a case-insensitive fallback for the fields settings
-    folded — but only when the payload's own spelling is ABSENT from the
-    resolved node. Settings folds field names and leaves mapping keys verbatim,
-    so a node holding both spellings is a mapping holding two distinct entries
-    (a server keyed ``GH`` beside one a deeper variable created as ``gh``), and
-    the fallback would hand the payload an entry that is not its own.
+    ``malformed`` is supplied by the caller (a per-variable fact — decoding
+    is per-variable — computed once by ``collect_proxy_env_overrides``), so a
+    trial does not re-probe every variable.
     """
-    claimed = _EnvJsonDict({}, path)
-    folded = {str(key).lower(): key for key in payload}
-    for key, value in node.items():
-        inner: Any = None
-        if key in payload:
-            inner = payload[key]
-        else:
-            payload_key = folded.get(str(key).lower())
-            if payload_key is not None and payload_key not in node:
-                inner = payload[payload_key]
-        if isinstance(value, dict) and isinstance(inner, dict):
-            claimed[key] = _claim_payload_subtree(value, inner, path)
-        else:
-            claimed[key] = value
-    return claimed
-
-
-def _mark_payload_provenance(fragment: dict[str, Any], scoped: dict[str, str]) -> None:
-    """Record which subtrees one variable's JSON payload supplied.
-
-    ``_env_override_hint`` names variables by walking this overlay's leaves,
-    which only holds while every leaf corresponds to a variable that exists. A
-    decoded payload breaks that, so the subtree is marked with the variable
-    that carried it — see ``_EnvJsonDict``. Settings decides what a payload
-    IS; this only records where each one came from.
-
-    Malformed variables belong here too: one that landed inside a payload is
-    still the variable the operator has to fix, and naming only the payload
-    would point at the wrong one.
-    """
-    paths = _live_var_paths(scoped)
-    for name, path in paths:
-        try:
-            decoded = json.loads(scoped[name])
-        except ValueError:
-            continue  # a scalar (or malformed) value supplies no payload
-        if not isinstance(decoded, dict):
-            continue
-        parent, key = _parent_and_key(fragment, path)
-        if parent is None or not isinstance(parent.get(key), dict):
-            continue
-        # Later variables re-wrap, so the surviving var_path is the one whose
-        # payload settings let win.
-        parent[key] = _claim_payload_subtree(parent[key], decoded, list(path))
-    for name, path in paths:
-        # A deeper variable that wrote INTO a payload is a real variable and
-        # must stay nameable, so record its key on the payload it landed in.
-        parent, key = _parent_and_key(fragment, path)
-        if isinstance(parent, _EnvJsonDict):
-            parent.explicit_keys.add(key)
+    survivors = {k: v for k, v in scoped.items() if k not in malformed}
+    try:
+        fragment = _settings_proxy_fragment(survivors)
+    except SettingsError:  # pragma: no cover - every undecodable value was removed
+        logger.debug("Env overlay rebuild failed after dropping malformed values")
+        fragment = {}
+    if malformed:
+        live = {name for name, _ in _live_var_paths(scoped)}
+        for name in scoped:  # environment order, matching settings
+            if name in malformed and name in live:
+                _insert_raw(fragment, _var_path(name), scoped[name])
+    return fragment
 
 
 def _insert_raw(fragment: dict[str, Any], path: tuple[str, ...], raw: str) -> None:
@@ -219,10 +176,10 @@ def _insert_raw(fragment: dict[str, Any], path: tuple[str, ...], raw: str) -> No
     cursor[path[-1]] = raw
 
 
-def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> dict[str, Any]:
-    """Build a nested dict from ``MEMTOMEM_STM_PROXY__*`` env vars.
+def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> EnvOverlayResult:
+    """Resolve ``MEMTOMEM_STM_PROXY__*`` env vars into an overlay.
 
-    Used to layer env-set proxy fields on top of the JSON config file so the
+    The ``fragment`` is layered on top of the JSON config file so the
     documented precedence (env > file > defaults) holds end-to-end. Without
     this, the file-load path in ``server.py`` would clobber every env-set
     field (``MEMTOMEM_STM_PROXY__ENABLED`` included — the file load is
@@ -235,15 +192,17 @@ def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> dict[s
     review rounds of #836 each found a fresh divergence between the two, all
     from the same root cause; asking settings is how that class closes (#837).
 
-    Two things stay this module's own, because a settings source does not do
-    them:
+    One thing stays this module's own, because a settings source does not do
+    it: a **malformed** complex value makes the source raise, while here it
+    has to survive as the raw string and reach ``model_validate``, which names
+    the field (see ``_fragment_for``). Substituting a default would be the
+    silent degrade this module exists to prevent. Decoding is per-variable, so
+    a variable that fails ON ITS OWN is a culprit and one that parses alone
+    cannot be: settings stays the oracle even for attributing its own error.
 
-    - a **malformed** complex value makes the source raise, while here it has
-      to survive as the raw string and reach ``model_validate``, which names
-      the field. Substituting a default would be the silent degrade this
-      module exists to prevent.
-    - **provenance** — which variable supplied which subtree — which
-      ``_env_override_hint`` needs to name variables that exist.
+    The raw sides of the result exist for ``_env_override_hint``, which
+    attributes a later validation failure by re-measuring the environment
+    rather than by provenance inference (#843).
     """
     env = environ if environ is not None else dict(os.environ)
     # Lowercase both sides rather than upper-casing the name: settings
@@ -252,37 +211,25 @@ def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> dict[s
     # upper-cases, ignores the variable entirely.
     prefix = _PROXY_ENV_PREFIX.lower()
     scoped: dict[str, str] = {}
+    names: dict[str, str] = {}
     for key, val in env.items():
         lowered_key = key.lower()
         if lowered_key.startswith(prefix):
+            # Case-equivalent spellings collapse the same way the values do:
+            # last one wins, so the rendered name is the spelling that
+            # supplied the surviving value.
             scoped[lowered_key] = val
+            names[lowered_key] = key
     if not scoped:
-        return {}
+        return EnvOverlayResult(fragment={}, scoped={}, names={}, malformed=frozenset())
 
     try:
         fragment = _settings_proxy_fragment(scoped)
+        malformed: frozenset[str] = frozenset()
     except SettingsError:
-        # Decoding is per-variable, so a variable that fails ON ITS OWN is a
-        # culprit and one that parses alone cannot be: settings stays the
-        # oracle even for attributing its own error.
-        malformed = [name for name in scoped if _fails_to_decode(name, scoped[name])]
-        survivors = {k: v for k, v in scoped.items() if k not in malformed}
-        try:
-            fragment = _settings_proxy_fragment(survivors)
-        except SettingsError:  # pragma: no cover - every culprit was removed
-            logger.debug("Env overlay rebuild failed after dropping malformed values")
-            fragment = {}
-        # Only the ones a later variable did not cover: re-inserting a
-        # malformed value that settings had already replaced would overwrite
-        # the payload that won with the string that lost, turning an overlay
-        # settings accepts into one validation rejects.
-        live = {name for name, _ in _live_var_paths(scoped)}
-        for name in malformed:
-            if name in live:
-                _insert_raw(fragment, _var_path(name), scoped[name])
-
-    _mark_payload_provenance(fragment, scoped)
-    return fragment
+        malformed = frozenset(name for name in scoped if _fails_to_decode(name, scoped[name]))
+        fragment = _fragment_for(scoped, malformed)
+    return EnvOverlayResult(fragment=fragment, scoped=scoped, names=names, malformed=malformed)
 
 
 def _fails_to_decode(name: str, value: str) -> bool:
@@ -432,141 +379,261 @@ def _sanitized_load_error(exc: Exception) -> str:
     return str(exc)
 
 
+_AMBIENT_VALIDATION_VARS = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
+"""Process-env inputs ``ProxyConfig`` validation itself reads.
+
+``LLMCompressorConfig._require_api_key_for_hosted_providers`` consults these
+(stripped), so the same config dict can validate differently as they come and
+go. The hint memo key includes their presence so a cached attribution never
+outlives the validation behavior it measured; a drift-guard test pins that
+each listed var actually affects validation.
+"""
+
+_ErrorKey = tuple[tuple[Any, ...], str, str]
+
+_hint_memo: dict[str, str] = {}
+
+
+def _error_key(e: ErrorDetails) -> _ErrorKey:
+    return (tuple(e.get("loc", ())), str(e.get("type", "")), str(e.get("msg", "")))
+
+
+def _validation_error_keys(data: dict[str, Any] | None) -> frozenset[_ErrorKey]:
+    """Error keys *data* reproduces ON ITS OWN under the lenient validation.
+
+    Used for both directions of the differential probe: the file alone
+    (empty when there is no file — every failure is env-caused) and the env
+    overlay alone. A non-pydantic failure attributes nothing.
+    """
+    if data is None:
+        return frozenset()
+    try:
+        ProxyConfig.model_validate(data)
+    except ValidationError as exc:
+        return frozenset(_error_key(e) for e in exc.errors())
+    except Exception:
+        return frozenset()
+    return frozenset()
+
+
+def _overlay_value_at(fragment: dict[str, Any], loc: tuple[Any, ...]) -> Any:
+    """The overlay's value at *loc*, walking the resolved fragment.
+
+    Returns the replacing non-dict when the walk dead-ends on one (an env
+    string clobbered a container the model expected — the env still supplied
+    whatever sits under *loc*), and ``_MISSING`` when the overlay never
+    touched the path. Integer loc parts (list indices) match nothing in a
+    dict fragment except through a non-dict dead-end above them.
+    """
+    node: Any = fragment
+    for part in loc:
+        if not isinstance(node, dict):
+            return node
+        if part in node:
+            node = node[part]
+        elif str(part) in node:
+            node = node[str(part)]
+        else:
+            return _MISSING
+    return node
+
+
+def _hint_memo_key(
+    overlay: EnvOverlayResult,
+    file_data: dict[str, Any] | None,
+    merged_errors: list[ErrorDetails],
+) -> str:
+    """Digest of everything attribution depends on.
+
+    ``scoped`` items in INSERTION order — environment order affects
+    parent/child resolution, so sorting would collapse environments that
+    resolve differently. ``names`` is included so a respelled variable
+    re-renders. Hashed so raw (possibly secret-bearing) values are not
+    retained in the cache key.
+    """
+    ambient = tuple(
+        (name, bool(os.environ.get(name, "").strip())) for name in _AMBIENT_VALIDATION_VARS
+    )
+    payload = repr(
+        (
+            tuple(overlay.scoped.items()),
+            tuple(overlay.names.items()),
+            tuple(sorted(overlay.malformed)),
+            file_data,
+            tuple(_error_key(e) for e in merged_errors),
+            ambient,
+        )
+    )
+    return hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()
+
+
 def _env_override_hint(
     exc: Exception,
-    env_overrides: dict[str, Any] | None,
+    env_overrides: EnvOverlayResult | dict[str, Any] | None,
     file_data: dict[str, Any] | None = None,
 ) -> str:
     """Name the env var(s) implicated in a config ValidationError.
 
-    A malformed ``MEMTOMEM_STM_PROXY__*`` value fails validation of the
-    MERGED config, and the load falls back to defaults with a single warning
-    — without this hint the operator sees "Failed to parse proxy config
-    <file>" and debugs the FILE while the file is fine. (Fallback semantics
-    are unchanged: this only improves the warning.)
+    A broken ``MEMTOMEM_STM_PROXY__*`` value fails validation of the MERGED
+    config, and the load falls back to defaults with a single warning —
+    without this hint the operator sees "Failed to parse proxy config <file>"
+    and debugs the FILE while the file is fine. (Fallback semantics are
+    unchanged: this only improves the warning.)
 
-    Attribution is two-staged:
+    Attribution is by MEASUREMENT, not provenance inference (#843): a
+    variable is implicated in an error exactly when removing that one
+    variable and re-resolving the WHOLE remaining environment — settings
+    itself, then the same merge and validation the caller ran — makes that
+    error disappear without confounds. Only variable names the operator
+    actually set are ever rendered (in their original spelling), so the hint
+    cannot synthesize a name or echo a payload-internal mapping key.
 
-    1. DIFFERENTIAL pre-filter — every error of the merged config whose
-       ``(loc, type, msg)`` the file reproduces ON ITS OWN is file-caused
-       and skipped: an env var that merely touched the same subtree (an
-       innocent ``tail_mode`` under a hybrid block whose ordering the file
-       itself breaks) must not be implicated. The file-alone validation runs
-       lazily, once, only on this already-failing path. The error TYPE keeps
-       an env value that re-breaks a file-broken location DIFFERENTLY
-       (gt-violation -> int-parsing) attributed; the MESSAGE disambiguates
-       model validators, which all share ``type="value_error"`` — a
-       file-caused duplicate-prefix error must not mask a separate
-       env-caused empty-prefix error at the same root location (and an env
-       var that changes an aggregated root message, e.g. adds a collision,
-       is attributed too).
+    Per error, in order:
 
-    2. NAMING — hints are derived from the env overlay's LEAVES, the var
-       names the operator actually set, never synthesized from the error
-       location alone (a model-level validator reports at the MODEL's path,
-       e.g. ``upstream_servers.gh.hybrid``, and naming that prefix would
-       point at a var that was never set):
+    1. **File pre-filter**: an error whose ``(loc, type, msg)`` the file
+       reproduces on its own is file-caused and skipped — unless the overlay
+       supplies the value at ``loc``, in which case the file's reproduction
+       is about a value the merged config does not even hold (file ``-5`` vs
+       env ``-6`` yield the identical gt-violation key) and measurement
+       proceeds.
+    2. **Clean implication**: removing the variable clears the error, and
+       every error the trial NEWLY reveals sits at the same loc (pydantic
+       skips model/root validators when a trial introduces a field error
+       elsewhere — such a disappearance is masking, not causation) and is
+       not one the file produces alone (revealing a file-alone error means
+       the variable was REPAIRING the file, and a repairer is not a causer).
+       Both guards are waived for a variable at-or-above the error's loc
+       when the overlay supplies that loc — the shape where the variable
+       supplied the failing value itself, which may legitimately also reveal
+       the file's own error there (or elsewhere) on removal.
+    3. **Fallbacks** when no variable is cleanly implicated:
+       an error the file does NOT reproduce is certainly env-caused, so
+       every live variable whose path prefix-relates to the loc is named
+       (for ``missing``, relative to the parent entry; a root error relates
+       to all), excluding repairers and variables whose removal changed
+       nothing; an error the file DOES reproduce names only variables
+       at-or-above the loc, and only when the overlay's value there is a
+       non-dict — an observable scalar/container overwrite — since a
+       dict-valued aggregate under a model validator is ambiguous.
 
-       - a location resolving to an env leaf names that leaf (also when the
-         location runs PAST it — the env string replaced a container);
-       - a location resolving to an env subtree — a cross-field validator
-         there, or a missing required field of an env-created entry — names
-         every env leaf under it;
-       - a ROOT-level error (``loc=()``, duplicate/empty upstream prefixes)
-         has no path at all and names every env leaf;
-       - a location the env never touched names nothing.
+    Documented no-hint corners (adjudicated in #843's plan review): a root
+    error the file reproduces identically stays file-attributed even when an
+    env payload shadows the file with the same broken content — at
+    ``loc=()`` the shadower is indistinguishable from an innocent variable,
+    and diagnosis converges sequentially (fix the file; a still-broken
+    overlay then attributes cleanly). Likewise an env value that only
+    changes the file's own aggregated root message may go unnamed rather
+    than risk naming a repairer.
+
+    Trials are memoized (size-1, keyed on everything attribution reads)
+    because a failed hot reload re-runs this warning every poll.
     """
-    if not env_overrides or not isinstance(exc, ValidationError):
+    overlay = _as_overlay(env_overrides)
+    if overlay is None or not overlay.fragment or not isinstance(exc, ValidationError):
         return ""
-    implicated: set[str] = set()
+    if not overlay.scoped:
+        return ""  # hand-built overlay: fragment honored, nothing to measure
+    merged_errors = exc.errors()
+    memo_key = _hint_memo_key(overlay, file_data, merged_errors)
+    cached = _hint_memo.get(memo_key)
+    if cached is not None:
+        return cached
+    hint = _attribute_env_overrides(overlay, merged_errors, file_data)
+    _hint_memo.clear()  # size-1: the loader retries one failing state
+    _hint_memo[memo_key] = hint
+    return hint
 
-    def _name(prefix: list[str]) -> str:
-        return _PROXY_ENV_PREFIX + "__".join(p.upper() for p in prefix)
 
-    def _add_leaves(path: list[str], subtree: dict[str, Any]) -> None:
-        stack: list[tuple[list[str], dict[str, Any]]] = [(path, subtree)]
-        while stack:
-            prefix, node = stack.pop()
-            if isinstance(node, _EnvJsonDict):
-                # One var supplied this whole payload; its inner keys are not
-                # vars. Name that var — wherever inside the payload this walk
-                # started — then descend only where a deeper var did set
-                # something (settings merges those on top).
-                implicated.add(_name(node.var_path))
-                for key, value in node.items():
-                    if isinstance(value, dict):
-                        # Keep walking: a deeper var may have written further
-                        # inside this payload.
-                        stack.append(([*prefix, str(key)], value))
-                    elif key in node.explicit_keys:
-                        implicated.add(_name([*prefix, str(key)]))
-                continue
-            for key, value in node.items():
-                if isinstance(value, dict):
-                    stack.append(([*prefix, str(key)], value))
-                else:
-                    implicated.add(_name([*prefix, str(key)]))
+def _attribute_env_overrides(
+    overlay: EnvOverlayResult,
+    merged_errors: list[ErrorDetails],
+    file_data: dict[str, Any] | None,
+) -> str:
+    """Leave-one-out attribution over the live variables. See the hint."""
+    scoped = overlay.scoped
+    fragment = overlay.fragment
+    merged_keys = frozenset(_error_key(e) for e in merged_errors)
+    file_alone_keys = _validation_error_keys(file_data)
+    # What the overlay reproduces ON ITS OWN. Model validators raise-and-stop,
+    # so a trial can swap an env-caused root error for the file's own root
+    # error at the same loc — the reveal then looks like a repair. An error
+    # the overlay reproduces alone is env-caused regardless of that reveal,
+    # so it lifts the repairer guard (the file-alone validation is the same
+    # probe in the other direction).
+    env_alone_keys = _validation_error_keys(fragment) if file_data is not None else frozenset()
+    merged_data = _deep_merge(file_data, fragment) if file_data is not None else fragment
+    live = _live_var_paths(scoped)
 
-    def _error_key(e: ErrorDetails) -> tuple[tuple[Any, ...], str, str]:
-        return (tuple(e.get("loc", ())), str(e.get("type", "")), str(e.get("msg", "")))
-
-    file_error_keys: frozenset[tuple[tuple[Any, ...], str, str]] | None = None
-
-    def _file_alone_error_keys() -> frozenset[tuple[tuple[Any, ...], str, str]]:
-        if file_data is None:
-            return frozenset()  # no file at all: every failure is env-caused
+    # One trial per live variable: the config without it. A variable a later
+    # one covered is not live — it contributed nothing, and its value
+    # resurfaces naturally inside the trial that removes the coverer.
+    trials: dict[str, tuple[frozenset[_ErrorKey], dict[str, Any]] | None] = {}
+    for name, _path in live:
+        remaining = {k: v for k, v in scoped.items() if k != name}
+        trial_fragment = _fragment_for(remaining, overlay.malformed - {name}) if remaining else {}
+        trial_data = (
+            _deep_merge(file_data, trial_fragment) if file_data is not None else trial_fragment
+        )
         try:
-            ProxyConfig.model_validate(file_data)
-        except ValidationError as file_exc:
-            return frozenset(_error_key(e) for e in file_exc.errors())
-        except Exception:  # non-pydantic failure: attribute nothing to the file
-            return frozenset()
-        return frozenset()
-
-    for err in exc.errors():
-        loc = err.get("loc", ())
-        if file_error_keys is None:
-            file_error_keys = _file_alone_error_keys()
-        if _error_key(err) in file_error_keys:
-            continue  # the file fails this same check on its own — file-caused
-        if not loc:
-            _add_leaves([], env_overrides)
-            continue
-        node: Any = env_overrides
-        consumed: list[str] = []
-        # The payload this walk last descended through, if any: a leaf inside
-        # a decoded payload was not supplied by a var of its own, and its key
-        # may be operator-chosen (an `env` entry).
-        owner: _EnvJsonDict | None = None
-        owner_wrote_leaf = False
-        for part in loc:
-            if isinstance(node, dict) and part in node:
-                owner = node if isinstance(node, _EnvJsonDict) else None
-                owner_wrote_leaf = bool(owner and str(part) in owner.explicit_keys)
-                node = node[part]
-                consumed.append(str(part))
-            else:
-                break
-        if not consumed:
-            continue  # the env overlay never touched this error's path
-        if not isinstance(node, dict):
-            # Landed on an env leaf — exact when consumed == loc; when the
-            # error location goes deeper, this leaf REPLACED a container the
-            # model expected, so it is still the var to fix.
-            if owner is not None and not owner_wrote_leaf:
-                implicated.add(_name(owner.var_path))
-            else:
-                implicated.add(_name(consumed))
+            ProxyConfig.model_validate(trial_data)
+        except ValidationError as trial_exc:
+            trials[name] = (frozenset(_error_key(e) for e in trial_exc.errors()), trial_data)
+        except Exception:  # non-pydantic: no attribution from this trial
+            trials[name] = None
         else:
-            # A subtree the env touched: a cross-field validator error there
-            # (consumed == loc) or a walk that broke inside it (e.g. the
-            # missing required field of an env-created entry — the file-
-            # caused variants were already filtered above). Name the env
-            # leaves under it.
-            _add_leaves(consumed, node)
+            trials[name] = (frozenset(), trial_data)
+
+    implicated: set[str] = set()
+    for err in merged_errors:
+        key = _error_key(err)
+        loc = tuple(err.get("loc", ()))
+        loc_strs = tuple(str(part) for part in loc)
+        overlay_at_loc = _overlay_value_at(fragment, loc) if loc else _MISSING
+        reaches = overlay_at_loc is not _MISSING
+        if key in file_alone_keys and not reaches:
+            continue  # exclusively file-caused
+        clean: set[str] = set()
+        repairers: set[str] = set()
+        noops: set[str] = set()
+        for name, path in live:
+            trial = trials[name]
+            if trial is None:
+                continue
+            trial_keys, trial_data = trial
+            if trial_data == merged_data:
+                noops.add(name)  # removal changed nothing observable
+                continue
+            if key in trial_keys:
+                continue  # removal did not clear this error
+            if reaches and loc_strs[: len(path)] == path:
+                clean.add(name)  # supplied the failing value itself
+                continue
+            revealed = trial_keys - merged_keys
+            masked = any(r[0] != loc for r in revealed)
+            repaired = key not in env_alone_keys and any(r in file_alone_keys for r in revealed)
+            if repaired:
+                repairers.add(name)
+            if masked or repaired:
+                continue
+            clean.add(name)
+        if clean:
+            implicated.update(clean)
+            continue
+        if key not in file_alone_keys:
+            rel = loc_strs[:-1] if err.get("type") == "missing" else loc_strs
+            for name, path in live:
+                if name in repairers or name in noops:
+                    continue
+                if path[: len(rel)] == rel or rel[: len(path)] == path:
+                    implicated.add(name)
+        elif reaches and not isinstance(overlay_at_loc, dict):
+            for name, path in live:
+                if name not in noops and loc_strs[: len(path)] == path:
+                    implicated.add(name)
     if not implicated:
         return ""
-    return " (env override(s) implicated: " + ", ".join(sorted(implicated)) + ")"
+    rendered = sorted(overlay.names.get(name, name.upper()) for name in implicated)
+    return " (env override(s) implicated: " + ", ".join(rendered) + ")"
 
 
 def live_env_paths(
@@ -1795,7 +1862,7 @@ class ProxyConfig(BaseModel):
     @staticmethod
     def load_from_file(
         path: Path,
-        env_overrides: dict[str, Any] | None = None,
+        env_overrides: EnvOverlayResult | dict[str, Any] | None = None,
         *,
         missing_ok: bool = True,
         log_warnings: bool = True,
@@ -1829,7 +1896,7 @@ class ProxyConfig(BaseModel):
     @staticmethod
     def load_from_file_with_status(
         path: Path,
-        env_overrides: dict[str, Any] | None = None,
+        env_overrides: EnvOverlayResult | dict[str, Any] | None = None,
         *,
         missing_ok: bool = True,
         log_warnings: bool = True,
@@ -1856,13 +1923,15 @@ class ProxyConfig(BaseModel):
         mode this module exists to prevent.
         """
         resolved = path.expanduser().resolve()
+        overlay = _as_overlay(env_overrides)
+        env_data = overlay.fragment if overlay is not None else None
         if not resolved.exists():
             logger.debug("Proxy config file not found: %s", resolved)
             if not missing_ok:
                 return ConfigLoadResult(config=None, error=None)
-            if env_overrides:
+            if env_data:
                 try:
-                    env_config = ProxyConfig.model_validate(env_overrides)
+                    env_config = ProxyConfig.model_validate(env_data)
                     if log_warnings:
                         # An env-only setup is a supported shape and needs the
                         # same inert-upstream advisory as a file. This branch
@@ -1870,7 +1939,7 @@ class ProxyConfig(BaseModel):
                         # server takes `missing_ok=False` and warns from
                         # `_apply_proxy_file_config` instead.
                         warn_if_upstreams_inert(
-                            _upstream_inert_state(env_overrides, enabled=env_config.enabled),
+                            _upstream_inert_state(env_data, enabled=env_config.enabled),
                             len(env_config.upstream_servers),
                             resolved,
                             logger_=logger,
@@ -1880,7 +1949,7 @@ class ProxyConfig(BaseModel):
                     logger.warning(
                         "Env-only proxy config failed validation: %s%s — using defaults",
                         exc,
-                        _env_override_hint(exc, env_overrides),
+                        _env_override_hint(exc, overlay),
                     )
             return ConfigLoadResult(config=ProxyConfig(), error=None)
         # Warn if config is group/world-readable (may contain API keys)
@@ -1903,7 +1972,7 @@ class ProxyConfig(BaseModel):
                 raise ValueError(f"config root must be a JSON object, got {type(loaded).__name__}")
             file_data = loaded
             unknown_keys = tuple(find_unknown_keys(ProxyConfig, file_data))
-            data = _deep_merge(file_data, env_overrides) if env_overrides else file_data
+            data = _deep_merge(file_data, env_data) if env_data else file_data
             config = ProxyConfig.model_validate(data)
             if unknown_keys and log_warnings:
                 # One aggregated line, not one per key: the hot-reload loader
@@ -1947,7 +2016,7 @@ class ProxyConfig(BaseModel):
                 "Failed to parse proxy config %s: %s%s",
                 resolved,
                 exc,
-                _env_override_hint(exc, env_overrides, file_data),
+                _env_override_hint(exc, overlay, file_data),
             )
             return ConfigLoadResult(
                 config=None, error=_sanitized_load_error(exc), unknown_keys=unknown_keys
@@ -2120,11 +2189,13 @@ class ProxyConfigLoader:
     contents after the agent edits ``stm_proxy.json`` at runtime.
     """
 
-    def __init__(self, path: Path, env_overrides: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self, path: Path, env_overrides: EnvOverlayResult | dict[str, Any] | None = None
+    ) -> None:
         self._path = path.expanduser().resolve()
         self._cached: ProxyConfig | None = None
         self._mtime: float = 0.0
-        self._env_overrides = env_overrides or {}
+        self._env_overrides = env_overrides if env_overrides else None
 
     def seed(self, config: ProxyConfig) -> None:
         self._cached = config
