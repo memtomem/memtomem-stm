@@ -532,10 +532,18 @@ def _env_override_hint(
     and diagnosis converges sequentially (fix the file; a still-broken
     overlay then attributes cleanly). Likewise an env value that only
     changes the file's own aggregated root message may go unnamed rather
-    than risk naming a repairer.
+    than risk naming a repairer. And a shadowed value that is the coerced
+    TWIN of the survivor (a payload's numeric ``-5`` under a deeper
+    ``"-5"``) is not recognized as the same supply — key-level measurement
+    cannot see pydantic coercion without re-deriving the schema, the class
+    #842 closed — so the survivor is named and the twin surfaces on the
+    next load.
 
     Trials are memoized (size-1, keyed on everything attribution reads)
-    because a failed hot reload re-runs this warning every poll.
+    because a failed hot reload re-runs this warning every poll. Settings
+    RESOLUTIONS stay linear in the live-variable count (the pinned bound);
+    per-trial bookkeeping (`_live_var_paths` inside malformed rebuilds) is
+    quadratic in variables but constant-factor cheap.
     """
     overlay = _as_overlay(env_overrides)
     if overlay is None or not overlay.fragment or not isinstance(exc, ValidationError):
@@ -696,6 +704,16 @@ def _attribute_env_overrides(
             rel = loc_strs[:-1] if err.get("type") == "missing" else loc_strs
             for name, path in live:
                 if name in swapped or (name in noops and key not in _solo_keys(name)):
+                    continue
+                trial = trials[name]
+                if trial is not None and key in trial[0] and key not in _solo_keys(name):
+                    # The EXACT error survived this variable's removal and the
+                    # variable alone reproduces nothing: a bystander that
+                    # merely shares the failing subtree (an unrelated timeout
+                    # beside the reconnect pair, diff review R4). Variables
+                    # whose removal mutated the error stay, as do exact
+                    # survivors with solo evidence (same-value
+                    # overdetermination).
                     continue
                 below = path[: len(rel)] == rel
                 above = rel[: len(path)] == path

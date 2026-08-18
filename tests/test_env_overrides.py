@@ -1435,6 +1435,37 @@ class TestLeaveOneOutAttribution:
         assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS," not in hint
         assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS)" not in hint
 
+    def test_bystander_below_a_model_error_is_not_named(self) -> None:
+        """Diff review R4: the exact error survives the timeout variable's
+        removal and its solo fragment reproduces nothing — sharing the
+        failing entry does not make it a cause."""
+        hint = self._hint(
+            {
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__RECONNECT_DELAY_SECONDS": "40",
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__CALL_TIMEOUT_SECONDS": "200",
+            },
+            {"upstream_servers": {"gh": {"prefix": "gh", "command": "gh-mcp"}}},
+        )
+
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__RECONNECT_DELAY_SECONDS" in hint
+        assert "CALL_TIMEOUT_SECONDS" not in hint
+
+    def test_coerced_twin_value_is_a_documented_sequential_limit(self) -> None:
+        """Diff review R4, adjudicated as a documented limit rather than
+        machinery: the payload's numeric -5 and the deeper variable's string
+        "-5" are the same value after pydantic coercion, but key-level
+        measurement cannot see coercion without re-deriving the schema — the
+        class #842 closed. The surviving variable is named; fixing it
+        surfaces the payload with clean attribution on the next load."""
+        hint = self._hint(
+            {
+                "MEMTOMEM_STM_PROXY__CACHE": '{"max_entries": -5}',
+                "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES": "-5",
+            }
+        )
+
+        assert hint == (" (env override(s) implicated: MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES)")
+
     def test_identical_root_error_in_file_and_env_stays_file_attributed(self) -> None:
         """R3, adjudicated: when the file alone reproduces the root error and
         no removal changes it (an env payload shadowing the file with the
