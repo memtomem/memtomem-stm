@@ -25,6 +25,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -5123,6 +5124,46 @@ class TestRegisterCommand:
 
         assert result.exit_code == 0, result.output
         assert seen["config_path"] == env_config.resolve()
+
+    def test_registration_command_renders_a_broken_env_as_click_error(
+        self, tmp_path, monkeypatch
+    ):
+        """#847 round 2: a broken MEMTOMEM_STM_* env failing the policy's
+        STMConfig construction must leave ``_registration_command`` as a
+        ClickException naming the variable, not a raw ValidationError."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        set_home(monkeypatch, tmp_path / "home")
+        config = tmp_path / "stm_proxy.json"
+        config.write_text(
+            json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8"
+        )
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND", "x")
+
+        with pytest.raises(click.ClickException) as caught:
+            proxy_mod._registration_command(config)
+
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND" in caught.value.message
+
+    def test_register_json_keeps_its_document_on_a_broken_env(self, runner, tmp_path, monkeypatch):
+        """#847 round 2: ``mms register --json`` with a broken env must emit
+        the JSON result document (ok=false + message), not a traceback and no
+        document — exactly the output mode automation parses."""
+        set_home(monkeypatch, tmp_path / "home")
+        config = tmp_path / "stm_proxy.json"
+        config.write_text(
+            json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8"
+        )
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND", "x")
+
+        result = runner.invoke(
+            cli, ["register", "--mcp", "json", "--json", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["ok"] is False
+        assert "invalid MEMTOMEM_STM_* configuration" in payload["message"]
 
     def test_register_runs_flow_when_config_exists(self, runner, config, fake_claude):
         """With a config present, ``mms register`` drops straight into the

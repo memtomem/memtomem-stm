@@ -623,6 +623,11 @@ class TestLogStmConfigFailure:
         message = records[0].getMessage()
         assert "running the probe" in message
         assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND" in message
+        # The attached exception is the SUPPLIED one — `exc_info=True` would
+        # capture the ambient exception, which is None outside an `except`
+        # block and would silently drop the traceback (review round 2).
+        assert records[0].exc_info is not None
+        assert records[0].exc_info[1] is caught.value
         # Names only, never values — in the hint and in the attached traceback
         # (STMConfig sets hide_input_in_errors at the root).
         assert "hunter2-cmd" not in caplog.text

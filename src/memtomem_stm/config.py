@@ -601,7 +601,10 @@ def log_stm_config_failure(
     ``exc_info=False`` is for sites that re-raise into a barrier which logs
     the traceback itself (the hook's pass-through guard): the hint line and
     the traceback then appear exactly once each instead of the traceback
-    twice per tool call (#847 review round 1).
+    twice per tool call (#847 review round 1). When attaching, pass *exc*
+    itself rather than ``True``: ``True`` captures whatever exception is
+    ambient at call time — ``None`` outside an ``except`` block — not the
+    one this line is reporting.
     """
     from memtomem_stm.proxy.config import env_var_hint_for_validation_error
 
@@ -609,5 +612,5 @@ def log_stm_config_failure(
         "invalid MEMTOMEM_STM_* configuration while %s%s",
         context,
         env_var_hint_for_validation_error(exc),
-        exc_info=exc_info,
+        exc_info=exc if exc_info else None,
     )

@@ -695,6 +695,9 @@ def _detect_install_type() -> tuple[str, list[str]]:
 
 def _registration_command(config_path: Path) -> tuple[str, list[str], dict[str, str]]:
     """Stable cross-platform command and environment for new registrations."""
+    from pydantic import ValidationError
+    from pydantic_settings import SettingsError
+
     # Keep a virtualenv's python symlink intact. ``Path.resolve()`` follows it
     # to the base interpreter, which can no longer import the installed STM.
     command = os.path.abspath(sys.executable)
@@ -705,7 +708,21 @@ def _registration_command(config_path: Path) -> tuple[str, list[str], dict[str, 
     # resolves against the same file the env line above names (#839) —
     # unconditionally, default path included, because that path is what the
     # registration being written will read.
-    policy = resolve_host_runtime_policy(use_daemon=True, config_path=config_path)
+    try:
+        policy = resolve_host_runtime_policy(use_daemon=True, config_path=config_path)
+    except (ValidationError, SettingsError) as exc:
+        # A broken MEMTOMEM_STM_* env fails the policy's STMConfig
+        # construction (#847 review round 2). ClickException keeps both
+        # contracts: text mode prints one clean line, and the ``--json``
+        # wrapper renders its error document instead of losing the run to a
+        # raw traceback.
+        from memtomem_stm.proxy.config import env_var_hint_for_validation_error
+
+        detail = env_var_hint_for_validation_error(exc) or f": {_disp(str(exc))}"
+        raise click.ClickException(
+            "invalid MEMTOMEM_STM_* configuration prevented resolving the "
+            "registration's runtime policy" + detail
+        ) from exc
     env.update(policy.mcp_env())
     return command, ["-m", "memtomem_stm"], env
 
@@ -8386,8 +8403,8 @@ def doctor(
             "env_overrides",
             "env overrides",
             "WARN",
-            "bare STMConfig() fails — hook surfacing/compression silently "
-            "degrade to pass-through and the daemon cannot start"
+            "bare STMConfig() fails — hook surfacing/compression degrade "
+            "to pass-through (logged per call) and the daemon cannot start"
             + env_var_hint_for_validation_error(exc),
             "unset or fix the MEMTOMEM_STM_* variable(s) named above",
         )

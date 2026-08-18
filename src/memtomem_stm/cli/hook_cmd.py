@@ -1191,6 +1191,7 @@ def hook_install_command(
     concurrent mms runs cannot interleave (the host app's own concurrent writes
     are caught by ``apply_change``'s staleness guard instead)."""
     from pydantic import ValidationError
+    from pydantic_settings import SettingsError
 
     from memtomem_stm.proxy.config import env_var_hint_for_validation_error
 
@@ -1222,13 +1223,19 @@ def hook_install_command(
             # messages interpolate a config path and a parser's own text, and
             # this is where they become terminal output (#780).
             raise click.ClickException(_disp(str(exc))) from exc
-        except ValidationError as exc:
+        except (ValidationError, SettingsError) as exc:
             # A broken MEMTOMEM_STM_* env fails the policy's STMConfig
-            # construction (#847). Same non-zero exit, but a message naming
-            # the implicated var instead of a raw traceback.
+            # construction (#847): a ValidationError for a wrong value, a
+            # SettingsError when settings cannot even decode one (malformed
+            # JSON payload). Same non-zero exit, but a message naming the
+            # problem instead of a raw traceback. The hint renders "" for a
+            # SettingsError, so fall back to its own message — it names the
+            # failing field ("error parsing value for field ...") and, by
+            # settings' contract, carries no configured value.
+            detail = env_var_hint_for_validation_error(exc) or f": {_disp(str(exc))}"
             raise click.ClickException(
                 "invalid MEMTOMEM_STM_* configuration prevented resolving the "
-                "hook runtime policy" + env_var_hint_for_validation_error(exc)
+                "hook runtime policy" + detail
             ) from exc
         hint = ["mms", "hook", "install", "--host", host]
         if surfacing_timeout is not None:

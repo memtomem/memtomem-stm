@@ -810,3 +810,17 @@ def test_hook_install_broken_proxy_env_fails_cleanly(
     # resolver-side log record prints the raw traceback alongside the clean
     # ClickException.
     assert not [r for r in caplog.records if r.exc_info]
+
+
+def test_hook_install_malformed_bare_payload_fails_cleanly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A payload settings cannot even decode raises SettingsError, not
+    ValidationError — it must get the same clean failure (#847 round 2)."""
+    monkeypatch.setenv("MEMTOMEM_STM_PROXY", "{")
+
+    result = CliRunner().invoke(cli, ["hook", "install", "--host", "claude"])
+
+    assert result.exit_code == 1
+    assert "invalid MEMTOMEM_STM_* configuration" in result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
