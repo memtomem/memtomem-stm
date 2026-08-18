@@ -33,7 +33,11 @@ if TYPE_CHECKING:
 
     from memtomem_stm.proxy.tuner import TuningRecommendation
 
-from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG
+from memtomem_stm.cli._defaults import (
+    _CONFIG_PATH_ENV,
+    DEFAULT_PROXY_CONFIG,
+    resolve_cli_config_path,
+)
 
 # Re-exported deliberately: ``_disp`` and ``_disp_escapes`` were defined here
 # until #760 moved them to a leaf every CLI module can import. Importing them
@@ -332,7 +336,7 @@ def _setup_json_result(action: str):  # noqa: ANN201
                     click.echo(exc.format_message(), err=True)
 
             config_path = (
-                Path(kwargs.get("config_path", str(_DEFAULT_CONFIG))).expanduser().resolve()
+                Path(resolve_cli_config_path(kwargs.get("config_path")).path).expanduser().resolve()
             )
             server_names: list[str] = []
             config_data: dict[str, Any] | None = None
@@ -487,8 +491,13 @@ def _explicit_config_path(config_path: str) -> str | None:
     STMConfig-backed checks honor the flag only when Click reports a
     non-default source for it — typed on the command line, or mapped via
     ``default_map`` (#839); otherwise ``MEMTOMEM_STM_PROXY__CONFIG_PATH``
-    keeps governing the bare construction. Outside a Click context (a helper
-    called directly in tests), the caller's value is trusted as explicit.
+    keeps governing the bare construction. Since #848 callers pass the
+    ``resolve_cli_config_path``-resolved value (an untyped flag resolves to
+    the env path before this gate), so returning ``None`` here hands the SAME
+    file to the bare construction — the gate now only preserves
+    ``stm_config_for_cli(None)``'s env-parse semantics, not which file wins.
+    Outside a Click context (a helper called directly in tests), the caller's
+    value is trusted as explicit.
     """
     ctx = click.get_current_context(silent=True)
     if ctx is None:
@@ -1385,10 +1394,11 @@ def gateway_group() -> None:
 
 
 @gateway_group.command(name="status")
-@click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+@click.option("--config", "config_path", default=None, show_default=str(_DEFAULT_CONFIG))
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
-def gateway_status(config_path: str, *, as_json: bool = False) -> None:
+def gateway_status(config_path: str | None, *, as_json: bool = False) -> None:
     """Show the configured policy source and validate the active bundle."""
+    config_path = resolve_cli_config_path(config_path).path
     from pydantic import ValidationError
 
     from memtomem_stm.proxy.config import ProxyConfig
@@ -1456,10 +1466,11 @@ def gateway_status(config_path: str, *, as_json: bool = False) -> None:
 
 @gateway_group.command(name="explain")
 @click.argument("tool_key")
-@click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+@click.option("--config", "config_path", default=None, show_default=str(_DEFAULT_CONFIG))
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
-def gateway_explain(tool_key: str, config_path: str, *, as_json: bool = False) -> None:
+def gateway_explain(tool_key: str, config_path: str | None, *, as_json: bool = False) -> None:
     """Explain one qualified ``server::tool`` decision from the bundle."""
+    config_path = resolve_cli_config_path(config_path).path
     from pydantic import ValidationError
 
     from memtomem_stm.proxy.config import ProxyConfig
@@ -1507,14 +1518,14 @@ def gateway_explain(tool_key: str, config_path: str, *, as_json: bool = False) -
 
 @gateway_group.command(name="mode")
 @click.argument("profile", type=click.Choice(["strict", "review", "explore"]))
-@click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+@click.option("--config", "config_path", default=None, show_default=str(_DEFAULT_CONFIG))
 @click.option("--bundle", "bundle_path", type=click.Path(path_type=Path), default=None)
 @click.option("--apply", "do_apply", is_flag=True, help="Write the configuration.")
 @click.option("--dry-run", is_flag=True, help="Explicitly preview without writing.")
 @with_config_write_lock(skip=lambda kwargs: not kwargs.get("do_apply"))
 def gateway_mode(
     profile: str,
-    config_path: str,
+    config_path: str | None,
     bundle_path: Path | None,
     do_apply: bool,
     dry_run: bool,
@@ -1524,6 +1535,7 @@ def gateway_mode(
     The default is a safe preview. Use ``--apply`` to enable the bundle source
     and atomically align both Toolgraph query and STM exposure profiles.
     """
+    config_path = resolve_cli_config_path(config_path).path
     if do_apply and dry_run:
         raise click.UsageError("--apply and --dry-run are mutually exclusive")
     path = Path(config_path)
@@ -1763,10 +1775,11 @@ def _tuning_readiness(data: dict[str, Any]) -> dict[str, Any]:
 
 
 @cli.command()
-@click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+@click.option("--config", "config_path", default=None, show_default=str(_DEFAULT_CONFIG))
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
-def status(config_path: str, *, as_json: bool = False) -> None:
+def status(config_path: str | None, *, as_json: bool = False) -> None:
     """Show proxy gateway config summary (path, enabled flag, server count)."""
+    config_path = resolve_cli_config_path(config_path).path
     path = Path(config_path)
     resolved = path.expanduser().resolve()
 
@@ -1839,10 +1852,11 @@ def status(config_path: str, *, as_json: bool = False) -> None:
 
 
 @cli.command(name="list")
-@click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+@click.option("--config", "config_path", default=None, show_default=str(_DEFAULT_CONFIG))
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
-def list_servers(config_path: str, *, as_json: bool = False) -> None:
+def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
     """List configured upstream servers."""
+    config_path = resolve_cli_config_path(config_path).path
     path = Path(config_path)
     resolved = path.expanduser().resolve()
 
@@ -2021,7 +2035,7 @@ def _render_surfacing_block(summary: dict[str, Any]) -> None:
 
 
 @cli.command()
-@click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+@click.option("--config", "config_path", default=None, show_default=str(_DEFAULT_CONFIG))
 @click.option("--tool", "tool_filter", default=None, help="Filter to one upstream tool name.")
 @click.option(
     "--source",
@@ -2033,7 +2047,7 @@ def _render_surfacing_block(summary: dict[str, Any]) -> None:
 )
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
 def stats(
-    config_path: str,
+    config_path: str | None,
     *,
     tool_filter: str | None = None,
     source_filter: str | None = None,
@@ -2047,6 +2061,7 @@ def stats(
     so the numbers here reflect only what has been written to disk. An explicit
     ``--config`` also steers the STMConfig-backed feedback-DB location (#839).
     """
+    config_path = resolve_cli_config_path(config_path).path
     from memtomem_stm.config import STMConfig, stm_config_for_cli
     from memtomem_stm.proxy.config import ProxyConfig, collect_proxy_env_overrides
     from memtomem_stm.proxy.metrics_store import read_compression_summary
@@ -2158,7 +2173,7 @@ def stats(
 
 @cli.command()
 @click.argument("name", required=False)
-@click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+@click.option("--config", "config_path", default=None, show_default=str(_DEFAULT_CONFIG))
 @click.option("--command", "command", default="", help="Executable command (stdio).")
 @click.option("--args", "args_str", default="", help="Space-separated arguments.")
 @click.option(
@@ -2252,7 +2267,7 @@ def stats(
 @with_config_write_lock(json_envelope=True)
 def add(
     name: str | None,
-    config_path: str,
+    config_path: str | None,
     command: str,
     args_str: str,
     prefix: str,
@@ -2271,6 +2286,7 @@ def add(
     as_json: bool = False,
 ) -> None:
     """Add an upstream MCP server to the proxy configuration."""
+    config_path = resolve_cli_config_path(config_path).path
     path = Path(config_path)
 
     # ``--select a,b --select c`` and ``--select a --select b`` are the same
@@ -3969,7 +3985,7 @@ def _confirm_validation() -> bool:
 
 
 @cli.command()
-@click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+@click.option("--config", "config_path", default=None, show_default=str(_DEFAULT_CONFIG))
 @click.option(
     "--no-validate",
     is_flag=True,
@@ -4055,7 +4071,7 @@ def _confirm_validation() -> bool:
 @with_config_write_lock(json_envelope=True)
 @_setup_json_result("init")
 def init(
-    config_path: str,
+    config_path: str | None,
     no_validate: bool,
     mcp_mode: str | None,
     client_mode: str | None,
@@ -4075,6 +4091,7 @@ def init(
     that config and continues client registration. Use ``mms add`` to append
     more servers.
     """
+    config_path = resolve_cli_config_path(config_path).path
     path = Path(config_path)
     resolved = path.expanduser().resolve()
 
@@ -4347,8 +4364,8 @@ def init(
 @click.option(
     "--config",
     "config_path",
-    default=str(_DEFAULT_CONFIG),
-    show_default=True,
+    default=None,
+    show_default=str(_DEFAULT_CONFIG),
     help="Path to the proxy config (must already exist — run `mms init` first).",
 )
 @click.option(
@@ -4377,7 +4394,7 @@ def init(
 @click.option("--json", "as_json", is_flag=True, help="Output one JSON result document.")
 @_setup_json_result("register")
 def register(
-    config_path: str,
+    config_path: str | None,
     mcp_mode: str | None,
     client_mode: str | None,
     replace_registration: bool,
@@ -4395,6 +4412,7 @@ def register(
     (or the ``--config`` path) exists. Safe to re-run; pre-checks existing
     Claude Code registration and defaults to 'keep' when already registered.
     """
+    config_path = resolve_cli_config_path(config_path).path
     resolved = Path(config_path).expanduser().resolve()
     if client_mode is not None and mcp_mode is not None:
         raise click.UsageError("use either --client or the legacy --mcp flag, not both")
@@ -4469,7 +4487,7 @@ def _remove_eject_hint(name: str, entry: Any, resolved: Path) -> str | None:
 
 @cli.command()
 @click.argument("name")
-@click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+@click.option("--config", "config_path", default=None, show_default=str(_DEFAULT_CONFIG))
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation.")
 @click.option(
     "--json",
@@ -4478,8 +4496,9 @@ def _remove_eject_hint(name: str, entry: Any, resolved: Path) -> str | None:
     help="Output as JSON for scripting (requires --yes).",
 )
 @with_config_write_lock(json_envelope=True)
-def remove(name: str, config_path: str, yes: bool, as_json: bool = False) -> None:
+def remove(name: str, config_path: str | None, yes: bool, as_json: bool = False) -> None:
     """Remove an upstream MCP server from the proxy configuration."""
+    config_path = resolve_cli_config_path(config_path).path
     path = Path(config_path)
     # Missing-config guard matching prune/register: _load returns the default
     # empty config for a missing file, which would misreport a wrong --config
@@ -4544,9 +4563,9 @@ def remove(name: str, config_path: str, yes: bool, as_json: bool = False) -> Non
 @cli.command()
 @click.argument("name")
 @click.argument("state", type=click.Choice(["on", "off"]), required=False)
-@click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+@click.option("--config", "config_path", default=None, show_default=str(_DEFAULT_CONFIG))
 @with_config_write_lock(skip=lambda kwargs: kwargs.get("state") is None)
-def surfacing(name: str, state: str | None, config_path: str) -> None:
+def surfacing(name: str, state: str | None, config_path: str | None) -> None:
     """Toggle proactive memory surfacing for an upstream server.
 
     \b
@@ -4564,6 +4583,7 @@ def surfacing(name: str, state: str | None, config_path: str) -> None:
     For tool-grained or cross-server glob scope instead, set
     ``MEMTOMEM_STM_SURFACING__EXCLUDE_TOOLS`` (matches ``server__tool``).
     """
+    config_path = resolve_cli_config_path(config_path).path
     path = Path(config_path)
     data = _load(path)
     servers: dict[str, Any] = data.get("upstream_servers", {})
@@ -4926,7 +4946,7 @@ def _apply_tune_changes(data: dict[str, Any], selected: list[_TuneChange]) -> No
 
 
 @cli.command()
-@click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+@click.option("--config", "config_path", default=None, show_default=str(_DEFAULT_CONFIG))
 @click.option(
     "--apply",
     "do_apply",
@@ -4952,7 +4972,7 @@ def _apply_tune_changes(data: dict[str, Any], selected: list[_TuneChange]) -> No
 @click.option("--json", "as_json", is_flag=True, help="Preview as JSON for scripting.")
 @with_config_write_lock(skip=lambda kwargs: not kwargs.get("do_apply"))
 def tune(
-    config_path: str,
+    config_path: str | None,
     do_apply: bool,
     assume_yes: bool,
     since_hours: float,
@@ -4979,6 +4999,7 @@ def tune(
     server performs at startup — but only when the DB files already exist;
     a preview never creates anything.
     """
+    config_path = resolve_cli_config_path(config_path).path
     from memtomem_stm.proxy.compression_feedback_store import CompressionFeedbackStore
     from memtomem_stm.proxy.config import ProxyConfig, collect_proxy_env_overrides
     from memtomem_stm.proxy.metrics_store import MetricsStore
@@ -5126,7 +5147,7 @@ def tune(
 
 @cli.command()
 @click.argument("names", nargs=-1)
-@click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+@click.option("--config", "config_path", default=None, show_default=str(_DEFAULT_CONFIG))
 @click.option(
     "--all",
     "all_servers",
@@ -5155,7 +5176,7 @@ def tune(
 @with_config_write_lock(skip=lambda kwargs: bool(kwargs.get("dry_run")), json_envelope=True)
 def prune(
     names: tuple[str, ...],
-    config_path: str,
+    config_path: str | None,
     all_servers: bool,
     assume_yes: bool,
     dry_run: bool,
@@ -5169,6 +5190,7 @@ def prune(
     picking up compression, caching, and LTM surfacing, and collapsing the
     duplicate tool advertisement. STM's own config is not touched.
     """
+    config_path = resolve_cli_config_path(config_path).path
     if names and all_servers:
         raise click.UsageError("--all cannot be combined with explicit NAMES.")
     if not names and not all_servers:
@@ -5884,7 +5906,7 @@ def _eject_verify(plan: _EjectPlan) -> list[str]:
 
 @cli.command()
 @click.argument("names", nargs=-1, required=True)
-@click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+@click.option("--config", "config_path", default=None, show_default=str(_DEFAULT_CONFIG))
 @click.option(
     "--to",
     "to_target",
@@ -5942,7 +5964,7 @@ def _eject_verify(plan: _EjectPlan) -> list[str]:
 @with_config_write_lock(skip=lambda kwargs: bool(kwargs.get("dry_run")), json_envelope=True)
 def eject(
     names: tuple[str, ...],
-    config_path: str,
+    config_path: str | None,
     to_target: str | None,
     keep: bool,
     force: bool,
@@ -5960,6 +5982,7 @@ def eject(
     removes the STM entry. Any failure leaves the server registered in at
     least one place — worst case is dual registration, never disappearance.
     """
+    config_path = resolve_cli_config_path(config_path).path
     path = Path(config_path)
     resolved = path.expanduser().resolve()
     if not resolved.exists():
@@ -6987,8 +7010,8 @@ async def _probe_servers(servers: dict[str, Any], timeout: float) -> dict[str, S
 @click.option(
     "--config",
     "config_path",
-    default=str(_DEFAULT_CONFIG),
-    show_default=True,
+    default=None,
+    show_default=str(_DEFAULT_CONFIG),
 )
 @click.option(
     "--json",
@@ -7015,7 +7038,7 @@ async def _probe_servers(servers: dict[str, Any], timeout: float) -> dict[str, S
     ),
 )
 def health(
-    config_path: str,
+    config_path: str | None,
     *,
     as_json: bool = False,
     timeout: int = 10,
@@ -7026,6 +7049,7 @@ def health(
     An explicit ``--config`` also steers the STMConfig-backed sections
     (surfacing bootstrap, logging destination), not just the proxy file (#839).
     """
+    config_path = resolve_cli_config_path(config_path).path
     path = Path(config_path)
     resolved = path.expanduser().resolve()
 
@@ -7613,8 +7637,8 @@ def _runtime_profile_doctor_checks(profile: Any) -> list[tuple[str, str, str, st
 @click.option(
     "--config",
     "config_path",
-    default=str(_DEFAULT_CONFIG),
-    show_default=True,
+    default=None,
+    show_default=str(_DEFAULT_CONFIG),
 )
 @click.option(
     "--json",
@@ -7638,7 +7662,7 @@ def _runtime_profile_doctor_checks(profile: Any) -> list[tuple[str, str, str, st
     ),
 )
 def doctor(
-    config_path: str,
+    config_path: str | None,
     *,
     as_json: bool = False,
     timeout: int = 10,
@@ -7657,6 +7681,8 @@ def doctor(
     An explicit ``--config`` also steers the STMConfig-backed checks (LTM /
     surfacing), not just the proxy-file checks (#839).
     """
+    resolved_cfg = resolve_cli_config_path(config_path)
+    config_path = resolved_cfg.path
     path = Path(config_path)
     resolved = path.expanduser().resolve()
     # Only the path token needs shell-safe rendering; the surrounding hints are
@@ -7685,11 +7711,29 @@ def doctor(
     surfacing_status: dict[str, Any] | None = None
 
     # 1. config file exists — every later check reads it, so FAIL
-    # short-circuits the report instead of cascading noise.
+    # short-circuits the report instead of cascading noise. The detail names
+    # which source picked the file (#848): with no flag typed the env var
+    # governs, so a transcript must say what was actually checked. A
+    # ``default_map``-mapped value reports "--config" — Click counts it as an
+    # explicit parameter source, and so does ``_explicit_config_path``.
+    # The env label renders the canonical spelling even when a
+    # case-equivalent variable or the bare MEMTOMEM_STM_PROXY payload named
+    # the file — the resolver honors every spelling settings does.
+    source_label = {
+        "flag": "from --config",
+        "env": f"from {_CONFIG_PATH_ENV}",
+        "default": "default",
+    }[resolved_cfg.source]
     if not resolved.exists():
-        check("config_file", "config file", "FAIL", f"not found: {resolved}", "mms init")
+        check(
+            "config_file",
+            "config file",
+            "FAIL",
+            f"not found: {resolved} ({source_label})",
+            "mms init",
+        )
     else:
-        check("config_file", "config file", "PASS", str(resolved))
+        check("config_file", "config file", "PASS", f"{resolved} ({source_label})")
 
         # 2. JSON validity — mirrors `mms config validate`'s parse guard
         # (NOT `_load`, which SystemExits with its own styled message).

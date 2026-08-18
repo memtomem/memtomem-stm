@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -33,6 +34,16 @@ def isolate_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
     """
     patch = pytest.MonkeyPatch()
     set_home(patch, tmp_path_factory.mktemp("home"))
+    # HOME isolation alone no longer covers the config path: since #848 an
+    # ambient MEMTOMEM_STM_PROXY__CONFIG_PATH (any case-equivalent spelling,
+    # or the bare MEMTOMEM_STM_PROXY payload) steers no-flag CLI commands
+    # straight past the redirected home to a developer's real config. Clear
+    # exactly the variables that can name a config path; tests that exercise
+    # them set their own afterward.
+    for name in list(os.environ):
+        lowered = name.lower()
+        if lowered in ("memtomem_stm_proxy__config_path", "memtomem_stm_proxy"):
+            patch.delenv(name, raising=False)
     yield
     patch.undo()
 

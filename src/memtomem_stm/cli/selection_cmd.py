@@ -6,7 +6,7 @@ from pathlib import Path
 
 import click
 
-from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG
+from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG, resolve_cli_config_path
 from memtomem_stm.proxy.config import ProxyConfig, collect_proxy_env_overrides
 from memtomem_stm.proxy.selection_eval import (
     SelectionEvaluationError,
@@ -24,7 +24,7 @@ def selection_group() -> None:
 
 
 @selection_group.command(name="replay")
-@click.option("--config", "config_path", default=str(_DEFAULT_CONFIG), show_default=True)
+@click.option("--config", "config_path", default=None, show_default=str(_DEFAULT_CONFIG))
 @click.option(
     "--log",
     "log_path",
@@ -54,7 +54,7 @@ def selection_group() -> None:
 )
 @click.option("--json", "as_json", is_flag=True, help="Output stable JSON for scripting.")
 def replay_command(
-    config_path: str,
+    config_path: str | None,
     log_path: Path | None,
     dataset_path: Path | None,
     active_only: bool,
@@ -68,6 +68,7 @@ def replay_command(
     ranking runs against the sanitized labelled corpus, never raw prompts.
     Recommendations are previews and never modify the proxy config.
     """
+    config_path = resolve_cli_config_path(config_path).path
     if no_telemetry and log_path is not None:
         raise click.UsageError("--no-telemetry cannot be combined with --log")
 

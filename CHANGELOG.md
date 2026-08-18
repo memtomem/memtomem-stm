@@ -13,6 +13,24 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **An untyped `--config` now honors `MEMTOMEM_STM_PROXY__CONFIG_PATH`**
+  (#848). Every `--config` option defaulted to the literal
+  `~/.memtomem/stm_proxy.json`, so with the env var exported and no flag typed
+  a command's file loads read the default file while its `STMConfig`-backed
+  checks read the env-named one — `mms doctor` could validate one file's
+  schema and probe another's completion source, and `mms init`/`register`/
+  `project route` wrote to a file the server never reads. All `--config`
+  options now resolve explicit flag > env `CONFIG_PATH` > default, and
+  doctor's `config file` check names which source picked the file.
+  **Behavior change**: no-flag runs with the env var set now act on the
+  env-named file (previously the default file); help text renders the default
+  as `[default: (~/.memtomem/stm_proxy.json)]` (Click's dynamic-default
+  form). Every env spelling the server honors steers the CLI the same way
+  (case-equivalents and the bare `MEMTOMEM_STM_PROXY` JSON payload included);
+  a present-but-empty value falls back to the default file — the server
+  degrades on the directory it coerces to, and a CLI command needs a real
+  file target.
+
 - **`mms add --from-clients` no longer saves a prefix longer than the
   tool-name hard limit once a truncated base collides 99 times** (#825).
   Truncation reserved a fixed two characters for the collision suffix, which

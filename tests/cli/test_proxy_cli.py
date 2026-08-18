@@ -3129,6 +3129,22 @@ class TestInit:
         assert "mms add" in result.output
         assert "mms list" in result.output
 
+    def test_init_no_flag_aborts_on_the_env_named_config(self, runner, tmp_path, monkeypatch):
+        """#848: with no ``--config`` typed, init targets the env-named file —
+        that is the file the server reads, so the no-clobber guard must act on
+        it. Before the fix the untyped Click default won and init walked past
+        this existing config into the wizard."""
+        set_home(monkeypatch, tmp_path / "home")
+        env_config = tmp_path / "env_config.json"
+        env_config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(env_config))
+
+        result = runner.invoke(cli, ["init"])
+
+        assert result.exit_code == 1, result.output
+        assert "config already exists" in result.output
+        assert str(env_config.resolve()) in result.output
+
     def test_init_invalid_prefix_reprompts(self, runner, config, no_discovery):
         """Bad prefix → re-ask instead of aborting; saves on the retry value."""
         result = runner.invoke(
@@ -4523,11 +4539,14 @@ class TestInitMcpRegistration:
     def test_registration_uses_the_default_path_over_ambient_config_path(
         self, tmp_path, monkeypatch
     ):
-        """The "default included" half of the round-1 fix: registering the
-        Click-default path while ambient ``CONFIG_PATH`` names another file
-        must resolve the policy against the file being REGISTERED — that is
-        the path the env line serializes, and gating on explicitness here
-        would hand the completion to a file the registration never reads."""
+        """The "default included" half of the round-1 fix: whatever path
+        ``_registration_command`` is HANDED, the policy resolves against that
+        file and the env line serializes it — gating on explicitness here
+        would hand the completion to a file the registration never reads.
+        This pins the direct-call contract only; at the command layer an
+        untyped ``--config`` resolves ambient ``CONFIG_PATH`` first (#848,
+        ``test_register_no_flag_resolves_the_env_named_config``), so the
+        default path in this scenario now requires typing it."""
         from memtomem_stm.cli import proxy as proxy_mod
 
         home = tmp_path / "home"
@@ -5079,6 +5098,31 @@ class TestRegisterCommand:
         assert result.exit_code == 1
         assert "config not found" in result.output
         assert "mms init" in result.output
+
+    def test_register_no_flag_resolves_the_env_named_config(self, runner, tmp_path, monkeypatch):
+        """#848: an untyped ``--config`` resolves env ``CONFIG_PATH``, so the
+        existence guard and the serialized registration act on the file the
+        server actually reads. Before the fix this aborted "config not found"
+        against the absent default path."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        set_home(monkeypatch, tmp_path / "home")
+        env_config = tmp_path / "env_config.json"
+        env_config.write_text(
+            json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8"
+        )
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(env_config))
+        seen: dict = {}
+
+        def fake_integration(_choice, **kwargs):
+            seen.update(kwargs)
+
+        monkeypatch.setattr(proxy_mod, "_run_mcp_integration", fake_integration)
+
+        result = runner.invoke(cli, ["register"])
+
+        assert result.exit_code == 0, result.output
+        assert seen["config_path"] == env_config.resolve()
 
     def test_register_runs_flow_when_config_exists(self, runner, config, fake_claude):
         """With a config present, ``mms register`` drops straight into the
@@ -11570,6 +11614,49 @@ class TestDoctor:
         # command) still renders — the check ran, it just isn't misattributed.
         assert "validation error" not in ltm_check["detail"], ltm_check["detail"]
         assert "Field required" not in ltm_check["detail"], ltm_check["detail"]
+
+    def test_no_flag_honors_env_config_path(self, runner, tmp_path, monkeypatch):
+        """#848: with no ``--config`` typed, the file-loading checks must read
+        the env-named file. Before the fix they read the Click default (absent
+        here) and FAILed ``config_file`` while the STMConfig-backed checks
+        honored the env var — one doctor run, two files."""
+        self._stub_probe(monkeypatch)
+        env_config = tmp_path / "env_config.json"
+        self._healthy_config(env_config)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(env_config))
+
+        result = runner.invoke(cli, ["doctor", "--json"])
+
+        file_check = self._check_by_id(result, "config_file")
+        assert file_check is not None and file_check["status"] == "PASS", result.output
+        assert str(env_config.resolve()) in file_check["detail"]
+        schema_check = self._check_by_id(result, "config_schema")
+        assert schema_check is not None and schema_check["status"] == "PASS", result.output
+
+    def test_config_file_check_names_its_source(self, runner, config, tmp_path, monkeypatch):
+        """The ``config_file`` detail names which source picked the file, so a
+        doctor transcript is unambiguous about what was actually checked."""
+        self._stub_probe(monkeypatch)
+        self._healthy_config(config)
+
+        flagged = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+        assert "(from --config)" in self._check_by_id(flagged, "config_file")["detail"]
+
+        env_config = tmp_path / "env_config.json"
+        self._healthy_config(env_config)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(env_config))
+        via_env = runner.invoke(cli, ["doctor", "--json"])
+        assert "(from MEMTOMEM_STM_PROXY__CONFIG_PATH)" in (
+            self._check_by_id(via_env, "config_file")["detail"]
+        )
+
+        monkeypatch.delenv("MEMTOMEM_STM_PROXY__CONFIG_PATH")
+        defaulted = runner.invoke(cli, ["doctor", "--json"])
+        default_check = self._check_by_id(defaulted, "config_file")
+        # The isolated HOME has no default file — the source suffix must
+        # render on the FAIL branch too.
+        assert default_check["status"] == "FAIL"
+        assert "(default)" in default_check["detail"]
 
     def test_healthy_config_warn_only_exits_zero(self, runner, config, monkeypatch):
         """정상 scenario: all checks PASS except the expected LTM WARN —
