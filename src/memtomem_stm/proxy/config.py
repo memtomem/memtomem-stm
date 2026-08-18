@@ -459,6 +459,9 @@ def _hint_memo_key(
             tuple(overlay.scoped.items()),
             tuple(overlay.names.items()),
             tuple(sorted(overlay.malformed)),
+            overlay.fragment,  # normally f(scoped), but the carrier is only
+            # shallowly frozen and constructible by hand; attribution reads
+            # the fragment directly, so it is part of the identity
             file_data,
             tuple(_error_key(e) for e in merged_errors),
             ambient,
@@ -496,30 +499,31 @@ def _env_override_hint(
        is about a value the merged config does not even hold (file ``-5`` vs
        env ``-6`` yield the identical gt-violation key) and measurement
        proceeds.
-    2. **Clean implication**: removing the variable clears the error, and
-       every error the trial NEWLY reveals sits at the same loc (pydantic
-       skips model/root validators when a trial introduces a field error
-       elsewhere — such a disappearance is masking, not causation) and is
-       not one the file produces alone (revealing a file-alone error means
-       the variable was REPAIRING the file, and a repairer is not a causer —
-       unless removing that same variable from the overlay ALONE also clears
-       the error, which proves the variable env-caused it and the reveal is
-       just model validators raising-and-stopping).
-       Both guards are waived for a variable at-or-above the error's loc
-       when the overlay supplies that loc — the shape where the variable
-       supplied the failing value itself, which may legitimately also reveal
-       the file's own error there (or elsewhere) on removal.
+    2. **Clean implication**: removing the variable clears the error — where
+       "clears" excludes the same validator re-firing at the same non-root
+       loc with different embedded values (a mutation, not a clearing; root
+       errors keep full-key identity because distinct validators share
+       ``value_error`` there and only the message tells them apart). A trial
+       that clears the error while genuinely REVEALING other errors proves
+       nothing by itself — pydantic masks model validators behind new field
+       errors, and raise-and-stop root validators surface the next error in
+       line, so a repairing variable looks exactly like a causer. Such a
+       confounded trial implicates only when the variable's own fragment,
+       validated alone WITHOUT the file, reproduces the error (file-free on
+       purpose: a single-variable overlay merged with the file is the merged
+       config, which reproduces everything vacuously).
     3. **Fallbacks** when no variable is cleanly implicated:
-       an error the file does NOT reproduce is certainly env-caused, so
-       every live variable whose path prefix-relates to the loc is named
-       (for ``missing``, relative to the parent entry; a root error relates
-       to all), excluding repairers and variables whose removal changed
-       nothing — unless such a variable ALONE reproduces the error (two
-       variables supplying the same failing value make every single removal
-       a no-op); an error the file DOES reproduce names only variables
-       at-or-above the loc, and only when the overlay's value there is a
-       non-dict — an observable scalar/container overwrite — since a
-       dict-valued aggregate under a model validator is ambiguous.
+       an error the file does NOT reproduce is certainly env-caused —
+       variables below the loc (below the parent entry for ``missing``; a
+       root error relates to all) are named, and a variable ABOVE it only
+       with supply evidence: its own fragment holds the loc, and for a value
+       error holds the very value the merged config complains about, so a
+       shadowed different value or a sibling-only aggregate stays out;
+       swap-only clearers are excluded, and a no-op removal (two variables
+       supplying the same failing value) additionally needs its fragment to
+       reproduce the error alone. An error the file DOES reproduce names
+       only variables supplying the merged value at the loc as an observable
+       non-dict overwrite.
 
     Documented no-hint corners (adjudicated in #843's plan review): a root
     error the file reproduces identically stays file-attributed even when an
@@ -633,7 +637,21 @@ def _attribute_env_overrides(
                 continue
             if key in trial_keys:
                 continue  # removal did not clear this error
-            revealed = trial_keys - merged_keys
+            if loc and any(r[0] == loc and r[1] == key[1] for r in trial_keys):
+                # Same validator at the same non-root loc re-fired with a
+                # different message (validators embed the offending values):
+                # the error MUTATED, it did not clear — a contextual pair
+                # like head_chars/min_head_chars would otherwise read as
+                # cleared-plus-revealed in both directions and nobody would
+                # be named (diff review R3). Root errors keep full-key
+                # identity: distinct validators share ``value_error`` there,
+                # and the message is what tells them apart.
+                continue
+            revealed = {
+                r
+                for r in trial_keys - merged_keys
+                if not (r[0] and any(m[0] == r[0] and m[1] == r[1] for m in merged_keys))
+            }
             if revealed and not _solo_causes(name):
                 # The removal did not just clear the error, it swapped it for
                 # others: pydantic masks model validators behind new field
@@ -649,30 +667,53 @@ def _attribute_env_overrides(
             implicated.update(clean)
             continue
 
+        def _ancestor_supplies(name: str) -> bool:
+            # Candidate-specific supply evidence for a variable ABOVE the
+            # error's path (diff review R3): its own fragment must hold the
+            # loc — and for a value error, hold the very value the merged
+            # config complains about, so a payload whose different broken
+            # value merely shares the generic error key stays out (fixing
+            # the merged value first is the sequential diagnosis).
+            if err.get("type") == "missing":
+                target = loc[:-1]
+                return bool(target) and (
+                    _overlay_value_at(_solo_fragment(name), target) is not _MISSING
+                )
+            solo_at = _overlay_value_at(_solo_fragment(name), loc)
+            return solo_at is not _MISSING and solo_at == _overlay_value_at(merged_data, loc)
+
         if key not in file_alone_keys:
             # Certainly env-caused, but no single removal was cleanly
-            # implicating (overdetermined among env vars, or masked in every
-            # trial): coarse path attribution, excluding swap-only clearers
-            # and no-op removals — unless the no-op variable ALONE reproduces
-            # the error (two variables supplying the same failing value make
-            # every single removal a no-op; an empty ancestor payload
-            # reproduces nothing and stays excluded).
+            # implicating (overdetermined among env vars, mutated in every
+            # trial, or masked in every trial): coarse path attribution,
+            # excluding swap-only clearers; a variable BELOW the loc supplied
+            # part of the failing subtree, while one ABOVE it needs the
+            # supply evidence (an aggregate holding only a sibling entry is
+            # an ancestor but not a cause); a no-op removal additionally
+            # needs its fragment to reproduce the error alone (two variables
+            # supplying the same failing value make every single removal a
+            # no-op; an empty ancestor payload reproduces nothing).
             rel = loc_strs[:-1] if err.get("type") == "missing" else loc_strs
             for name, path in live:
                 if name in swapped or (name in noops and key not in _solo_keys(name)):
                     continue
-                if path[: len(rel)] == rel or rel[: len(path)] == path:
-                    implicated.add(name)
+                below = path[: len(rel)] == rel
+                above = rel[: len(path)] == path
+                if not (below or above):
+                    continue
+                if not below and loc and not _ancestor_supplies(name):
+                    continue
+                implicated.add(name)
         elif reaches and not isinstance(overlay_at_loc, dict):
             # File/env overdetermination that passed the pre-filter: name
-            # only variables whose OWN fragment supplies the loc (file `-5`
-            # beside env `-6` — or the identical `-5`), never one that
-            # merely sits above it; only observable non-dict overwrites at
-            # the loc qualify at all.
+            # only variables whose OWN fragment supplies the merged value at
+            # the loc (file `-5` beside env `-6` — or the identical `-5`),
+            # never one that merely sits above it; only observable non-dict
+            # overwrites at the loc qualify at all.
             for name, path in live:
                 if loc_strs[: len(path)] != path:
                     continue
-                if _overlay_value_at(_solo_fragment(name), loc) is _MISSING:
+                if not _ancestor_supplies(name):
                     continue
                 implicated.add(name)
     if not implicated:

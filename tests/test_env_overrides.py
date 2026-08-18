@@ -1359,6 +1359,82 @@ class TestLeaveOneOutAttribution:
 
         assert hint == (" (env override(s) implicated: MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES)")
 
+    def test_contextual_pair_names_both_halves(self) -> None:
+        """Diff review R3: validators embed the offending values in their
+        message, so removing either half of an inconsistent pair re-fires
+        the same validator with different numbers — that is a MUTATION of
+        the error, not a clearing, and both halves are named (narrowing a
+        cross-field violation further would mean guessing)."""
+        hint = self._hint(
+            {
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__PREFIX": "gh",
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__HYBRID__HEAD_CHARS": "50",
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__HYBRID__MIN_HEAD_CHARS": "9000",
+            }
+        )
+
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__HYBRID__HEAD_CHARS" in hint
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__HYBRID__MIN_HEAD_CHARS" in hint
+        assert "PREFIX" not in hint
+
+    def test_env_rebreaking_a_file_broken_pair_is_still_named(self) -> None:
+        """Diff review R3, the file-broken variant: the env override changes
+        the numbers of an ordering violation the file already had — a
+        different message, so the pre-filter lets it through, and the
+        mutation rule keeps the override named instead of reading the
+        trial's re-fired validator as a confound."""
+        hint = self._hint(
+            {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__HYBRID__MIN_HEAD_CHARS": "8000"},
+            {
+                "upstream_servers": {
+                    "gh": {
+                        "prefix": "gh",
+                        "command": "gh-mcp",
+                        "hybrid": {"head_chars": 50, "min_head_chars": 9000},
+                    }
+                }
+            },
+        )
+
+        assert hint == (
+            " (env override(s) implicated: "
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__HYBRID__MIN_HEAD_CHARS)"
+        )
+
+    def test_shadowed_payload_value_is_not_named_for_the_survivors_error(self) -> None:
+        """Diff review R3: the payload's -5 lost to the deeper -6, and the
+        two produce the same generic error key. Only the variable whose own
+        fragment holds the MERGED value is named; the shadowed one surfaces
+        sequentially once the survivor is fixed."""
+        hint = self._hint(
+            {
+                "MEMTOMEM_STM_PROXY__CACHE": '{"max_entries": -5}',
+                "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES": "-6",
+            }
+        )
+
+        assert hint == (" (env override(s) implicated: MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES)")
+
+    def test_sibling_only_aggregate_is_excluded_from_coarse_attribution(self) -> None:
+        """Diff review R3: the aggregate holds only the `other` entry — an
+        ancestor of the overdetermined error under `gh`, but not a supplier
+        of anything at its loc — and stays unnamed beside the two variables
+        that do supply the failing value."""
+        hint = self._hint(
+            {
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": '{"other": {"prefix": "other"}}',
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH": (
+                    '{"prefix": "gh", "hybrid": {"head_chars": -1}}'
+                ),
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__HYBRID__HEAD_CHARS": "-1",
+            }
+        )
+
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH" in hint
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__HYBRID__HEAD_CHARS" in hint
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS," not in hint
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS)" not in hint
+
     def test_identical_root_error_in_file_and_env_stays_file_attributed(self) -> None:
         """R3, adjudicated: when the file alone reproduces the root error and
         no removal changes it (an env payload shadowing the file with the
@@ -1521,14 +1597,15 @@ class TestHintMemoizationAndCost:
 
         assert calls["n"] > after_first  # ambient change: trials re-ran
 
-    def test_ambient_key_changes_the_attribution_not_just_the_recompute(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Positive control for the digest's ambient tuple: the SAME overlay,
-        file, and captured errors attribute differently as the provider key
-        comes and goes — without the key the env-set openai provider is what
-        demands the missing key (named); with it, the removal trial swaps to
-        the file's anthropic error and nothing is cleanly implicated."""
+    def test_ambient_key_toggles_the_memo_identity(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Positive control for the digest's ambient tuple, at the unit
+        level: with everything else fixed, toggling a provider key changes
+        the memo key itself, so a cached attribution can never be served
+        across the toggle. (The attribution text of a provider-sensitive
+        scenario converges to the same correct answer in both ambient states
+        under the final algorithm, so the pin lives on the digest.)"""
+        from memtomem_stm.proxy.config import _hint_memo_key
+
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         overrides = collect_proxy_env_overrides(
@@ -1541,13 +1618,16 @@ class TestHintMemoizationAndCost:
             captured = exc
         else:  # pragma: no cover - the construction must fail
             raise AssertionError("expected the merged config to fail validation")
+        errors = captured.errors()
 
-        without_key = _env_override_hint(captured, overrides, file_data)
+        without_key = _hint_memo_key(overrides, file_data, errors)
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-        with_key = _env_override_hint(captured, overrides, file_data)
+        with_key = _hint_memo_key(overrides, file_data, errors)
+        monkeypatch.setenv("OPENAI_API_KEY", "   ")  # whitespace = absent
+        stripped = _hint_memo_key(overrides, file_data, errors)
 
-        assert "MEMTOMEM_STM_PROXY__EXTRACTION__LLM__PROVIDER" in without_key
-        assert with_key == ""
+        assert without_key != with_key
+        assert stripped == without_key  # presence is stripped, like validation
 
     def test_insertion_order_is_part_of_the_memo_identity(self) -> None:
         """Environment order decides parent-vs-child resolution, so the two
@@ -1592,13 +1672,14 @@ class TestHintMemoizationAndCost:
         quadratic in settings resolutions)."""
         import time as time_module
 
-        env = {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__S0__PREFIX": "{not json"}
+        env = {"MEMTOMEM_STM_PROXY__TOOLGRAPH__ARGS": "{not json"}
         for i in range(9):
             env[f"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__T{i}__PREFIX"] = f"t{i}"
             env[f"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__T{i}__COMMAND"] = f"t{i}-mcp"
         env["MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES"] = "-1"
         assert len(env) == 20
         overrides, exc = self._failing(env)
+        assert overrides.malformed  # the malformed branch is genuinely exercised
         calls = self._counting_fragment_resolver(monkeypatch)
 
         start = time_module.monotonic()
@@ -1612,13 +1693,14 @@ class TestHintMemoizationAndCost:
         assert elapsed < 10  # generous absolute bound; the count is the pin
 
     def test_hundred_variable_smoke_stays_linear(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        env = {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__S0__PREFIX": "{not json"}
+        env = {"MEMTOMEM_STM_PROXY__TOOLGRAPH__ARGS": "{not json"}
         for i in range(49):
             env[f"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__U{i}__PREFIX"] = f"u{i}"
             env[f"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__U{i}__COMMAND"] = f"u{i}-mcp"
         env["MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES"] = "-1"
         assert len(env) == 100
         overrides, exc = self._failing(env)
+        assert overrides.malformed  # the malformed branch is genuinely exercised
         calls = self._counting_fragment_resolver(monkeypatch)
 
         hint = _env_override_hint(exc, overrides)
