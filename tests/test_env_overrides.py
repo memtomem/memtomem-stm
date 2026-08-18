@@ -502,6 +502,35 @@ class TestProvenanceSurvivesOverwritingVariables:
             " (env override(s) implicated: MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS)"
         )
 
+    def test_a_payload_owns_a_field_it_spelled_in_another_case(self) -> None:
+        """Settings canonicalizes a model field written in any case, so the
+        payload's own branch does not come back under the key it wrote. Failing
+        to recognize it made the hint SYNTHESIZE a variable name for a payload
+        leaf — worse than naming too many, because that name does not exist."""
+        env = {
+            "MEMTOMEM_STM_PROXY__EXTRACTION": (
+                '{"LLM": {"provider": "ollama", "llm_timeout_seconds": 0}}'
+            )
+        }
+
+        assert self._hint_for(env) == (
+            " (env override(s) implicated: MEMTOMEM_STM_PROXY__EXTRACTION)"
+        )
+
+    def test_a_mapping_key_in_another_case_is_a_different_entry(self) -> None:
+        """The boundary of the rule above: settings folds field names but takes
+        mapping keys verbatim, so a payload keyed `GH` and a deeper variable's
+        `gh` are two servers. Folding here would hand the payload an entry that
+        is not its own — the resolved node holding BOTH spellings is the tell."""
+        env = {
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": '{"GH": {"prefix": "gh"}}',
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND": "x",
+        }
+
+        assert self._hint_for(env) == (
+            " (env override(s) implicated: MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND)"
+        )
+
     def test_a_deeper_variable_still_counts_when_nothing_covers_it(self) -> None:
         """The control: a later variable that goes DEEPER is merged on top, not
         replaced, so both are real and the deeper one stays nameable."""
@@ -526,6 +555,53 @@ class TestProvenanceSurvivesOverwritingVariables:
         )
 
         assert "MEMTOMEM_STM_PROXY__TOOLGRAPH__ARGS" in hint
+
+
+class TestDivergenceEightIsClosedByDelegating:
+    """A disagreement the hand-written rebuild had, found while reviewing its
+    replacement — the ninth of the class #837 was filed about.
+
+    A payload spelling a model field in another case does NOT merge with a
+    deeper variable addressing the same field. Settings explodes the deeper
+    variable into its own branch and canonicalizes afterwards, so the branches
+    never meet and the later one replaces the earlier; the hand-written rebuild
+    canonicalized first and merged them. It therefore reported a config the
+    server does not run — the exact failure the overlay exists to prevent.
+    """
+
+    def test_a_cased_payload_field_does_not_merge_with_a_deeper_variable(self) -> None:
+        env = {
+            "MEMTOMEM_STM_PROXY__EXTRACTION": '{"LLM": {"provider": "ollama"}}',
+            "MEMTOMEM_STM_PROXY__EXTRACTION__LLM__LLM_TIMEOUT_SECONDS": "30",
+        }
+
+        # `provider` is gone: the payload's whole `llm` branch was replaced.
+        assert collect_proxy_env_overrides(env) == {
+            "extraction": {"llm": {"llm_timeout_seconds": "30"}}
+        }
+
+    def test_the_settings_parse_agrees(self, monkeypatch) -> None:
+        """The oracle for the case above, stated separately so the expectation
+        is not just this module's own reading: settings resolves the same
+        thing, and rejects the config for the DEFAULT provider — which is only
+        possible if the payload's `provider` never arrived.
+
+        `OPENAI_API_KEY` is cleared because that default is what makes the
+        rejection observable: with a key present the config validates and the
+        test would pass or fail on an ambient variable it does not control.
+        """
+        from memtomem_stm.config import STMConfig
+
+        for name in [n for n in os.environ if n.upper().startswith("MEMTOMEM_STM_PROXY")]:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__EXTRACTION", '{"LLM": {"provider": "ollama"}}')
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__EXTRACTION__LLM__LLM_TIMEOUT_SECONDS", "30")
+
+        with pytest.raises(ValidationError) as caught:
+            STMConfig()
+
+        assert "openai" in str(caught.value)  # the default, not the payload's ollama
 
 
 class TestMalformedValuesSurviveAsRawStrings:

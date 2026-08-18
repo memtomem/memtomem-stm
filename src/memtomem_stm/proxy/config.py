@@ -137,10 +137,30 @@ def _claim_payload_subtree(node: dict[str, Any], payload: dict[str, Any], path: 
     did not declare. Wrapping those too would let the payload's name be
     reported for an entry it has nothing to do with, so the walk descends by
     the payload and leaves everything else exactly as it found it.
+
+    The two sides do not spell keys alike: settings canonicalizes a model field
+    written in any case (``'{"LLM": …}'`` resolves to ``llm``), so an exact
+    comparison would fail to recognize the payload's OWN branch and go on to
+    synthesize a variable name for it — worse than over-claiming, because the
+    name does not exist.
+
+    Exact match first, then a case-insensitive fallback for the fields settings
+    folded — but only when the payload's own spelling is ABSENT from the
+    resolved node. Settings folds field names and leaves mapping keys verbatim,
+    so a node holding both spellings is a mapping holding two distinct entries
+    (a server keyed ``GH`` beside one a deeper variable created as ``gh``), and
+    the fallback would hand the payload an entry that is not its own.
     """
     claimed = _EnvJsonDict({}, path)
+    folded = {str(key).lower(): key for key in payload}
     for key, value in node.items():
-        inner = payload.get(key)
+        inner: Any = None
+        if key in payload:
+            inner = payload[key]
+        else:
+            payload_key = folded.get(str(key).lower())
+            if payload_key is not None and payload_key not in node:
+                inner = payload[payload_key]
         if isinstance(value, dict) and isinstance(inner, dict):
             claimed[key] = _claim_payload_subtree(value, inner, path)
         else:
