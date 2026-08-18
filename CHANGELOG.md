@@ -11,15 +11,86 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Added
+
+- **`mms doctor` gained an `env overrides` check, and a failing bare
+  `STMConfig()` now says so instead of degrading in silence** (#850). Several
+  construction sites read only the `surfacing` or `hook` subtree, but a
+  validation failure anywhere in `proxy` fails the whole construction — so a
+  broken `MEMTOMEM_STM_*` variable turned surfacing off, or stopped the
+  daemon, with nothing printed. Five sites now emit one WARNING naming the
+  implicated variables, names only and never values: three in `mms hook`,
+  `mms daemon`'s config load, and `daemon.server.run()`. Two CLI boundaries —
+  `mms hook install` and the registration command — render the failure as a
+  clean error instead of a traceback, so `mms register --json` still emits its
+  result document. The new doctor check reports `bare STMConfig() constructs —
+  hook/daemon env path healthy`, or warns that `bare STMConfig() fails — hook
+  surfacing/compression degrade to pass-through (logged per call) and the
+  daemon cannot start`, reading the ambient environment rather than the
+  `--config` file because that is the view the hook and daemon get. Variable
+  names are appended when the failure is a validation error the hint can
+  attribute; a malformed JSON payload raises a settings error it cannot, and
+  that row carries the message alone. **Behavior change**: new WARNING lines
+  on the affected paths, a `ClickException` where those two commands
+  previously raised a traceback, and one more doctor row; the check can only
+  WARN, so no exit code changes. This does not make the readers tolerant of an
+  unrelated `proxy` failure — issue #847 tracks that half and stays open. A
+  detached daemon whose config fails to build still has no file log
+  destination, since `data_dir` is unknowable from that config; the doctor
+  check is the coverage for it.
+
+### Changed
+
+- **Environment-override warnings now name the variables by measurement
+  instead of inference** (#844, closes #843). Provenance was reconstructed
+  after the overlay resolved, which could not be checked against anything; a
+  variable is now credited by removing it, re-resolving the rest of the
+  environment, and seeing whether the error survives. Across twelve probe
+  environments six hints are byte-identical and six change, each a fix: an
+  innocent `…CACHE__ENABLED` is no longer named, a variable set in lowercase
+  renders the operator's own spelling rather than an uppercased name that does
+  not exist, a payload and a deeper variable supplying the same bad value now
+  name both, and a case that produced no hint at all now produces one.
+  **Behavior change**: warning text only — which configs load, and what they
+  resolve to, is unchanged.
+
+- **The environment overlay resolves through pydantic-settings itself**
+  (#842, closes #837). `collect_proxy_env_overrides` hand-reproduced the
+  server's resolution — prefix matching, case folding, `__` explosion,
+  complex-field detection, JSON decoding, field-key canonicalization — and is
+  now an `EnvSettingsSource` call. Fifteen of sixteen probe environments
+  resolve byte-identically; the sixteenth is a difference kept on purpose,
+  since a malformed complex value has to stay a raw string so validation names
+  the field the warning is built on. Reviewing the replacement also settled a
+  disagreement the hand-written version carried: a block payload spelling a
+  model field in another case does not merge with a deeper variable addressing
+  that same field, so the overlay no longer reports a config the server does
+  not run (`EXTRACTION='{"LLM": {"provider": "ollama"}}'` alongside
+  `EXTRACTION__LLM__LLM_TIMEOUT_SECONDS` claimed `ollama` was configured while
+  `STMConfig()` rejects the config for the default provider).
+  **Behavior change**: none external — that disagreement was introduced by
+  #836 earlier in this same unreleased cycle and never shipped, so against
+  0.2.0 both spellings resolve to the same fragment as before.
+
+- docs: the reviewed-resume guide is rebuilt on the `mcp` 2.x stack (#827).
+  [0.1.45] recorded that the guide repeated its `mcp<2` constraint on the
+  `uvx` command STM uses to launch the LTM server (#800); with core 0.4.0 and
+  memtomem-stm 0.2.0 both declaring `mcp[cli]>=2,<3`, repeating that
+  constraint now makes the environment unresolvable rather than merely
+  under-pinned. Both `uv tool install` lines and the `LTM_MCP_ARGS` export
+  drop it, and the stated floors move with them. **Behavior change**: none
+  external.
+
 ### Fixed
 
 - **An untyped `--config` now honors `MEMTOMEM_STM_PROXY__CONFIG_PATH`**
-  (#848). Every `--config` option defaulted to the literal
+  (#849, closes #848). Every `--config` option defaulted to the literal
   `~/.memtomem/stm_proxy.json`, so with the env var exported and no flag typed
   a command's file loads read the default file while its `STMConfig`-backed
-  checks read the env-named one — `mms doctor` could validate one file's
-  schema and probe another's completion source, and `mms init`/`register`/
-  `project route` wrote to a file the server never reads. All `--config`
+  checks read the env-named one — `mms doctor` could validate the schema of
+  one file while the checks built from `STMConfig` reported on the other, and
+  `mms init`/`register`/`project route` wrote to a file the server never
+  reads. All `--config`
   options now resolve explicit flag > env `CONFIG_PATH` > default, and
   doctor's `config file` check names which source picked the file.
   **Behavior change**: no-flag runs with the env var set now act on the
@@ -31,21 +102,137 @@ changes inline only. See the deprecation policy in
   degrades on the directory it coerces to, and a CLI command needs a real
   file target.
 
+- **An explicit `--config` now steers the checks that build an `STMConfig`**
+  (#846, closes #839). The flag lived only in Click, so every bare
+  `STMConfig()` behind a CLI check resolved from
+  `MEMTOMEM_STM_PROXY__CONFIG_PATH` or the field default — and once #838 made
+  that construction file-dependent, `mms doctor --config other.json` could
+  report the `ltm server` check as a validation error about a subtree that
+  check does not read, while `mms stats` silently used the default feedback
+  database. The path is now injected into the construction, and the flag is
+  honored whenever Click reports a non-default source for it (typed on the
+  command line, or supplied through `default_map`); otherwise the environment
+  keeps governing, as before. **Behavior change**: `mms doctor`, `mms health`,
+  and `mms stats` run their `STMConfig`-backed checks against the file named
+  by `--config`, where with `MEMTOMEM_STM_PROXY__CONFIG_PATH` set they
+  previously ran against the env-named file, and the registration flow behind
+  `mms init` and `mms register` resolves the host runtime policy it serializes
+  into the registration's environment — the registered command itself is fixed
+  independently — from that same file. `mms hook install` has
+  no `--config` option and still resolves its policy from the ambient
+  environment. This is the typed-flag half of the split; the untyped half is
+  the `CONFIG_PATH` entry above.
+
+- **A bare `MEMTOMEM_STM_PROXY` JSON payload is visible to the overlay**
+  (#845, closes #840). pydantic-settings honors that variable as one payload
+  for the whole proxy block, but the overlay's name filter required the
+  trailing `__` — so the variable configured the running server while every
+  overlay-based diagnostic (doctor's effective-config validation, `mms stats`,
+  `mms tune`, hot reload) reasoned about a config the server was not running,
+  and with a config file present the file appeared to win. The filter now
+  accepts the exact bare name. A payload that is not an object, and one that
+  is not valid JSON, are each ignored with a warning saying the server itself
+  rejects that environment at startup; a `null` payload stays silent.
+  **Behavior change**: `env > file` precedence now holds for the bare payload
+  and hints can name it. Variables carrying the `__` delimiter resolve exactly
+  as before. Two hint-attribution changes come with it: a hint no longer drops
+  a deeper variable when a block-name object payload appears later in the
+  environment, and it no longer names a descendant that settings ignores
+  because a non-mapping parent shadows it, in either environment order.
+
+- **Overriding one field of a file-declared upstream server no longer breaks
+  every `STMConfig()`** (#838, closes #835).
+  `MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__<NAME>__<FIELD>` is the documented
+  `env > file > defaults` shape, but pydantic-settings validated the env-only
+  fragment, where a server carrying a single overridden field has no
+  `prefix` — so the override did not lose to the file, it stopped the config
+  from constructing at all, naming a field the operator had set in a file the
+  process never opened. It killed the server before logging was configured and
+  degraded every CLI construction behind its guards. A completion source
+  ordered below the environment now supplies the file's entry for exactly the
+  server names the environment mentions, and the hint names the variable to
+  edit — which, for a missing field, is never the field the validation error
+  reports. Server names match without case folding in the per-field form,
+  which `docs/configuration.md` and `docs/reference/environment-variables.md`
+  now state. **Behavior change**: `STMConfig()` reads the config file when the
+  environment overrides an upstream server's field, where it previously never
+  opened it; only the mentioned server names are read out of it, the file's
+  entry is emitted only when the completed server validates, and a server only
+  the environment declares still fails to validate as before.
+
+- **JSON-valued environment overrides are decoded the way the server decodes
+  them** (#836, closes #834). The overlay stored every
+  `MEMTOMEM_STM_PROXY__*` value as a raw string while the server's
+  pydantic-settings JSON-decode complex fields, so every variable the
+  documentation already types as JSON diverged — the aggregate
+  `UPSTREAM_SERVERS` map, `TOOLGRAPH__ARGS`, `TOOLGRAPH__SERVER_NAME_MAP`,
+  `CACHE`, and per-server `ARGS`/`ENV`/`HEADERS`. What an operator saw was
+  `mms doctor` failing its `config schema` check against their valid file —
+  `config file present but fails validation — a running server falls back to
+  env/defaults` — with a next action pointing at `mms config validate`, which
+  passes by contract because it is file-only; hot reload discarded the same
+  config. Complex fields are now decoded and scalars
+  are not, so a `command` of `"null"` stays a command; field-key casing inside
+  a decoded payload is canonicalized, stopping at container boundaries, so
+  `CACHE='{"ENABLED": false}'` configures the server; name matching is
+  case-insensitive with case-equivalent names collapsing; and malformed JSON
+  stays raw so validation names the field. **Behavior change**: on affected
+  configs `mms doctor` now reports `PASS config schema` and exits 0 where it
+  previously reported that failure and exited 1, and it probes env-declared
+  upstream servers it used to ignore. Hints no longer invent variables nobody
+  set, nor echo an operator's own mapping keys back into the warning.
+
+- **`mms doctor` flags upstream servers configured behind a disabled proxy**
+  (#833, closes #831). Upstream tools register only inside the
+  `config.proxy.enabled` gate and that field defaults to `False`, so a
+  hand-written `stm_proxy.json` omitting the top-level `"enabled": true`
+  advertised zero upstream tools while doctor reported `PASS upstream: fx 1
+  tool(s)` and exited 0. A new `proxy enabled` check reports the unset case as
+  `proxy disabled — "enabled" is unset (defaults to false); <N> configured
+  upstream server(s) will NOT be advertised to MCP clients`, and an explicit
+  `false` as control-only mode. The same predicate now drives a single runtime
+  warning and an advisory in `mms config validate`, and doctor's server-shaped
+  checks all read the same env-overlaid map. **Behavior change**: a config
+  with `upstream_servers` and no top-level `enabled` key makes `mms doctor`
+  exit 1 where it previously exited 0, which can newly fail a scripted
+  quickstart gate; the fix is the printed next action, or pinning `"enabled":
+  false` to declare control-only mode, which downgrades the check to a
+  warning. `mms config validate` gains the advisory but never changes its exit
+  code.
+
+- **`"compression": "progressive"` applies its defaults when the sibling
+  block is omitted** (#832, closes #830). The gate required both the strategy
+  and a `progressive` block, and the progressive compressor is a no-op on the
+  generic path, so such a server shipped the full upstream response verbatim —
+  no chunking, no footer, and no warning, with the ratio guard unable to catch
+  a 1.0 no-op ratio. The block now defaults to `ProgressiveConfig()` when the
+  resolved strategy is progressive, applied after the tool-override merge so
+  that non-progressive servers keep their response-cache fingerprint.
+  `docs/compression.md` states that the block is optional and lists the
+  defaults it applies (`chunk_size` 4000, `max_stored` 200, `ttl_seconds`
+  1800, `include_structure_hint` true). **Behavior change**: on such servers a
+  response longer than `chunk_size` now returns a first chunk plus the
+  `stm_proxy_read_more` footer instead of the whole body — responses that
+  already fit are still returned unchanged — and those servers take a one-time
+  response-cache invalidation as the fingerprint flips from null to the
+  defaults, re-fetching bodies that were cached as the uncompressed
+  passthroughs this bug produced.
+
 - **`mms add --from-clients` no longer saves a prefix longer than the
-  tool-name hard limit once a truncated base collides 99 times** (#825).
-  Truncation reserved a fixed two characters for the collision suffix, which
-  covers `2` through `99`; the hundredth server sharing a truncated base took
-  a three-digit suffix and overflowed by one character, leaving zero room for
-  the upstream tool name so clients drop those tools silently. The two-char
-  reservation stays — it is what every sub-100 case resolves on — and the base
-  now gives up one further character at a time for as long as the suffixed
-  value still overflows. **Behavior change**: past 99 collisions on one
-  truncated base the saved prefix is shorter than before, where the old value
-  was one the tool-name budget forbids; every prefix below that threshold is
-  byte-for-byte unchanged. The one case still without an answer is a
-  `prefix_hard_limit()` near zero — reachable only by pointing
-  `MMS_CLIENT_SERVER_NAME` at an absurdly long client-side name — where no
-  suffix fits at all; that was equally true before.
+  tool-name hard limit once a truncated base collides 99 times** (#826,
+  closes #825). Truncation reserved a fixed two characters for the collision
+  suffix, which covers `2` through `99`; the hundredth server sharing a
+  truncated base took a three-digit suffix and overflowed by one character,
+  leaving zero room for the upstream tool name so clients drop those tools
+  silently. The two-char reservation stays — it is what every sub-100 case
+  resolves on — and the base now gives up one further character at a time
+  for as long as the suffixed value still overflows. **Behavior change**:
+  past 99 collisions on one truncated base the saved prefix is shorter than
+  before, where the old value was one the tool-name budget forbids; every
+  prefix below that threshold is byte-for-byte unchanged. The one case still
+  without an answer is a `prefix_hard_limit()` near zero — reachable only by
+  pointing `MMS_CLIENT_SERVER_NAME` at an absurdly long client-side name —
+  where no suffix fits at all; that was equally true before.
 
 ## [0.2.0] — 2026-08-10
 
