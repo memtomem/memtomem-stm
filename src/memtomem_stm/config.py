@@ -578,7 +578,9 @@ def stm_config_for_cli(config_path: str | Path | None = None) -> STMConfig:
     return STMConfig(proxy={"config_path": str(config_path)})  # type: ignore[arg-type]
 
 
-def log_stm_config_failure(exc: Exception, *, logger: logging.Logger, context: str) -> None:
+def log_stm_config_failure(
+    exc: Exception, *, logger: logging.Logger, context: str, exc_info: bool = True
+) -> None:
     """One consistent line for a failing bare ``STMConfig()`` construction (#847).
 
     Several CLI/daemon sites construct ``STMConfig()`` to read only the
@@ -595,6 +597,11 @@ def log_stm_config_failure(exc: Exception, *, logger: logging.Logger, context: s
     to pass-through, exit non-zero) — changing WHICH paths fail is the
     tolerant-construction half of #847, deferred behind its wait-for-signal
     gate.
+
+    ``exc_info=False`` is for sites that re-raise into a barrier which logs
+    the traceback itself (the hook's pass-through guard): the hint line and
+    the traceback then appear exactly once each instead of the traceback
+    twice per tool call (#847 review round 1).
     """
     from memtomem_stm.proxy.config import env_var_hint_for_validation_error
 
@@ -602,5 +609,5 @@ def log_stm_config_failure(exc: Exception, *, logger: logging.Logger, context: s
         "invalid MEMTOMEM_STM_* configuration while %s%s",
         context,
         env_var_hint_for_validation_error(exc),
-        exc_info=True,
+        exc_info=exc_info,
     )

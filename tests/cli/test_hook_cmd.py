@@ -1245,3 +1245,13 @@ def test_cli_broken_proxy_env_passes_through_and_logs_the_hint(
     assert result.exit_code == 0
     assert json.loads(result.output) == {}
     assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND" in caplog.text
+    # Logged exactly once each (#847 review round 1): one hint line (no
+    # traceback of its own) and one barrier warning that owns the traceback —
+    # not two traceback blocks per tool call.
+    hint_records = [
+        r for r in caplog.records if "invalid MEMTOMEM_STM_* configuration" in r.getMessage()
+    ]
+    assert len(hint_records) == 1
+    assert not hint_records[0].exc_info
+    traceback_records = [r for r in caplog.records if r.exc_info]
+    assert len(traceback_records) == 1

@@ -17,6 +17,7 @@ Coverage:
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import tomllib
 from dataclasses import replace
@@ -791,14 +792,21 @@ def _config_has_stm_command(parsed: dict, host: str) -> bool:
     return False
 
 
-def test_hook_install_broken_proxy_env_fails_cleanly(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_hook_install_broken_proxy_env_fails_cleanly(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     """#847 observability: a proxy-subtree env break used to escape ``mms hook
     install`` as a raw ValidationError traceback. It must now exit non-zero
     with a clean message naming the implicated var — same failure, legible."""
     monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND", "x")
 
-    result = CliRunner().invoke(cli, ["hook", "install", "--host", "claude"])
+    with caplog.at_level(logging.WARNING):
+        result = CliRunner().invoke(cli, ["hook", "install", "--host", "claude"])
 
     assert result.exit_code == 1
     assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND" in result.output
     assert result.exception is None or isinstance(result.exception, SystemExit)
+    # The command owns this failure's output (#847 review round 1): no
+    # resolver-side log record prints the raw traceback alongside the clean
+    # ClickException.
+    assert not [r for r in caplog.records if r.exc_info]

@@ -484,7 +484,9 @@ async def _run_surfacing_hook_inner(
     except Exception as exc:
         # Observability only (#847): the outer barrier still turns this into
         # the `{}` pass-through, but no longer silently.
-        log_stm_config_failure(exc, logger=logger, context="running the surfacing hook")
+        log_stm_config_failure(
+            exc, logger=logger, context="running the surfacing hook", exc_info=False
+        )
         raise
     if not surfacing_cfg.enabled:
         return {}
@@ -636,7 +638,9 @@ async def _run_hook(
             try:
                 config = STMConfig()
             except Exception as exc:
-                log_stm_config_failure(exc, logger=logger, context="routing the hook to the daemon")
+                log_stm_config_failure(
+                    exc, logger=logger, context="routing the hook to the daemon", exc_info=False
+                )
                 raise
         # Reject ineligible calls (surfacing globally off, non-PostToolUse, or
         # a non-allowlisted tool) before routing to / spawning the daemon — an
@@ -783,7 +787,9 @@ async def _orchestrate(
     except Exception as exc:
         # Raised before the compression/surfacing split, so this one failure
         # kills both halves — the hint line is the only attributable trace.
-        log_stm_config_failure(exc, logger=logger, context="orchestrating the hook")
+        # exc_info=False: the pass-through barrier logs the traceback once
+        # already — this line carries the hint, not a second traceback.
+        log_stm_config_failure(exc, logger=logger, context="orchestrating the hook", exc_info=False)
         raise
     replacement_allowed = (
         adapter.can_replace_output
