@@ -24,7 +24,9 @@ server, which lets any entrypoint be registered with an MCP client.
 | `mms eject` | Restore an imported host entry and remove it from STM |
 
 Not every command accepts `--config`; use the command's own `--help` output as
-the option source of truth.
+the option source of truth. Where the flag exists but is not typed, the CLI
+resolves `MEMTOMEM_STM_PROXY__CONFIG_PATH` before the default path, matching
+the proxy server (explicit `--config` > env `CONFIG_PATH` > default).
 
 `mms register` writes the proxy path plus managed shared-daemon, surfacing
 timeout, and query-text privacy values into new client registrations. Existing

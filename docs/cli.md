@@ -74,10 +74,12 @@ Commands:
   version    Show the installed memtomem-stm version.
 ```
 
-Commands that operate on the proxy configuration accept `--config TEXT`
-(default `~/.memtomem/stm_proxy.json`). Registry, project, host, hook, and
-version commands have their own option surfaces; use each command's `--help`
-output as the source of truth.
+Commands that operate on the proxy configuration accept `--config TEXT`. An
+untyped flag resolves `MEMTOMEM_STM_PROXY__CONFIG_PATH` — the same variable
+the proxy server reads — before falling back to `~/.memtomem/stm_proxy.json`,
+so precedence is: explicit `--config` > env `CONFIG_PATH` > default. Registry,
+project, host, hook, and version commands have their own option surfaces; use
+each command's `--help` output as the source of truth.
 
 `mms --version` and `mms version` both print `memtomem-stm X.Y.Z` — the flag is the idiomatic Click form, the subcommand is kept for backwards compatibility.
 
@@ -91,7 +93,7 @@ The `--json` single-document contract covers well-formed invocations: success an
 Usage: mms init [OPTIONS]
 
 Options:
-  --config TEXT             [default: ~/.memtomem/stm_proxy.json]
+  --config TEXT             [default: (~/.memtomem/stm_proxy.json)]
   --no-validate             Skip the connectivity probe entirely (default:
                             prompt, probe on yes).
   --mcp [claude|json|skip]  Pre-answer the MCP-registration prompt for
@@ -166,7 +168,7 @@ Usage: mms register [OPTIONS]
 Options:
   --config TEXT             Path to the proxy config (must already exist —
                             run `mms init` first).  [default:
-                            ~/.memtomem/stm_proxy.json]
+                            (~/.memtomem/stm_proxy.json)]
   --mcp [claude|json|skip]  Pre-answer the registration prompt for scripted
                             runs: 'claude' = `claude mcp add`, 'json' =
                             write .mcp.json, 'skip' = print manual hints.
@@ -193,7 +195,7 @@ mms register --mcp skip   # scripted: print manual paste hints, exit
 Usage: mms add [OPTIONS] [NAME]
 
 Options:
-  --config TEXT                   [default: ~/.memtomem/stm_proxy.json]
+  --config TEXT                   [default: (~/.memtomem/stm_proxy.json)]
   --command TEXT                  Executable command (stdio).
   --args TEXT                     Space-separated arguments.
   --prefix TEXT                   Tool namespace (e.g. 'fs' -> tools appear
@@ -292,7 +294,7 @@ The import→prune transition is reversible: every import records an `origin` pr
 Usage: mms list [OPTIONS]
 
 Options:
-  --config TEXT  [default: ~/.memtomem/stm_proxy.json]
+  --config TEXT  [default: (~/.memtomem/stm_proxy.json)]
   --json         Output as JSON for scripting.
 ```
 
@@ -306,7 +308,7 @@ The ORIGIN column summarizes import provenance: `-` for entries added manually (
 Usage: mms remove [OPTIONS] NAME
 
 Options:
-  --config TEXT  [default: ~/.memtomem/stm_proxy.json]
+  --config TEXT  [default: (~/.memtomem/stm_proxy.json)]
   -y, --yes      Skip confirmation.
   --json         Output as JSON for scripting (requires --yes).
 ```
@@ -386,7 +388,7 @@ mms health --timeout 5     # 5s per-server timeout (default: 10)
 Usage: mms prune [OPTIONS] [NAMES]...
 
 Options:
-  --config TEXT  [default: ~/.memtomem/stm_proxy.json]
+  --config TEXT  [default: (~/.memtomem/stm_proxy.json)]
   --all          Prune every dual-registered upstream. Required when no NAMES
                  given.
   -y, --yes      Skip the confirm prompt (scripts / CI / non-TTY callers).
@@ -420,7 +422,7 @@ mms prune --all --yes --json # machine-readable result summary
 Usage: mms eject [OPTIONS] NAMES...
 
 Options:
-  --config TEXT         [default: ~/.memtomem/stm_proxy.json]
+  --config TEXT         [default: (~/.memtomem/stm_proxy.json)]
   --to TARGET           Restore target for entries without a usable origin:
                         claude-user | claude-project[:PATH] | mcp-json[:PATH]
                         | claude-desktop. Entries with a recorded origin
@@ -470,7 +472,7 @@ mms eject github --dry-run         # preview the per-entry plan; no writes
 Usage: mms surfacing NAME [on|off]
 
 Options:
-  --config TEXT  [default: ~/.memtomem/stm_proxy.json]
+  --config TEXT  [default: (~/.memtomem/stm_proxy.json)]
 ```
 
 Toggles `surfacing_enabled` on an upstream in `stm_proxy.json` (default `on`). With no state it prints the current value; `mms list` shows it per server (SURFACING column). A running proxy hot-reloads the change without a restart. Because the flag lives in the shared proxy config — not per-client `env` — every MCP client that proxies through this `mms` sees the same scope. When off, surfacing is skipped before the LTM search for every tool on that server (counted as `upstream_disabled` in `stm_surfacing_stats`). For tool-grained or cross-server glob scope, use the `MEMTOMEM_STM_SURFACING__EXCLUDE_TOOLS` env glob instead (matches `server__tool`). See [surfacing.md](surfacing.md#scoping-surfacing-per-upstream).
@@ -481,7 +483,7 @@ Toggles `surfacing_enabled` on an upstream in `stm_proxy.json` (default `on`). W
 Usage: mms health [OPTIONS]
 
 Options:
-  --config TEXT            [default: ~/.memtomem/stm_proxy.json]
+  --config TEXT            [default: (~/.memtomem/stm_proxy.json)]
   --json                   Output as JSON for scripting.
   --timeout INTEGER RANGE  Per-server connection timeout in seconds.
                            [default: 10; x>=1]
@@ -509,7 +511,7 @@ decide readiness.
 Usage: mms doctor [OPTIONS]
 
 Options:
-  --config TEXT            [default: ~/.memtomem/stm_proxy.json]
+  --config TEXT            [default: (~/.memtomem/stm_proxy.json)]
   --json                   Output as JSON for scripting.
   --timeout INTEGER RANGE  Per-connection probe timeout in seconds.
                            [default: 10; x>=1]
@@ -558,7 +560,7 @@ edits STM configuration or LTM content.
 Usage: mms status [OPTIONS]
 
 Options:
-  --config TEXT  [default: ~/.memtomem/stm_proxy.json]
+  --config TEXT  [default: (~/.memtomem/stm_proxy.json)]
   --json         Output as JSON for scripting.
 ```
 
@@ -574,7 +576,7 @@ When the file is valid JSON but fails schema validation (the state a running ser
 Usage: mms config validate [OPTIONS]
 
 Options:
-  --config TEXT  Path to the proxy config JSON.  [default: ~/.memtomem/stm_proxy.json]
+  --config TEXT  Path to the proxy config JSON.  [default: (~/.memtomem/stm_proxy.json)]
   --json         Output as JSON for scripting.
 ```
 
@@ -593,7 +595,7 @@ Group/world-readable file permissions produce a warning line but exit 0 on their
 Usage: mms stats [OPTIONS]
 
 Options:
-  --config TEXT              [default: ~/.memtomem/stm_proxy.json]
+  --config TEXT              [default: (~/.memtomem/stm_proxy.json)]
   --tool TEXT                Filter to one upstream tool name.
   --source [mcp|hook]        Filter compression rows by provenance: 'mcp'
                              (proxied upstream tools) or 'hook' (native
@@ -621,7 +623,7 @@ pinned threshold. STM never changes `min_score` in response to this diagnostic.
 Usage: mms tune [OPTIONS]
 
 Options:
-  --config TEXT        [default: ~/.memtomem/stm_proxy.json]
+  --config TEXT        [default: (~/.memtomem/stm_proxy.json)]
   --apply              Write the accepted overrides into the config (default: preview only).
   -y, --yes            Apply all recommendations without prompting (scripts / CI / non-TTY).
   --since-hours FLOAT  Analysis window over the metrics/feedback stores.  [default: 24.0]
@@ -647,7 +649,7 @@ Unlike `mms stats`, this command opens the stores read-write to run their idempo
 Usage: mms selection replay [OPTIONS]
 
 Options:
-  --config TEXT          [default: ~/.memtomem/stm_proxy.json]
+  --config TEXT          [default: (~/.memtomem/stm_proxy.json)]
   --log FILE             Override selection_telemetry.path.
   --dataset FILE         Override the packaged labelled v1 corpus.
   --active-only          Exclude numeric rotated log backups.
@@ -864,7 +866,8 @@ Usage: mms project route [OPTIONS]
 
 Options:
   --project TEXT  Target project (default: detect from cwd).
-  --config PATH   STM proxy config target.
+  --config PATH   STM proxy config target.  [default:
+                  (~/.memtomem/stm_proxy.json)]
   --apply         Write the validated additive plan (preview by default).
   --json          Machine-readable output.
 ```
