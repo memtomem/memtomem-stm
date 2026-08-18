@@ -672,7 +672,42 @@ def _attribute_env_overrides(
             # are interacting, and the probe may borrow the file's half of
             # the entry (the prefix that lets the failing validator run).
             if any(r in file_alone_keys for r in revealed):
-                return key in _solo_keys(name)
+                solo = _solo_keys(name)
+                if key in solo:
+                    return True
+                # One escalation (diff review R6): when the file-free probe
+                # could not even RUN the failing check — it fails with
+                # ``missing`` errors on this error's own branch, the entry
+                # fields the file supplies — AND the candidate supplies a
+                # field this error's message names, complete with the file
+                # and ask again. The field-name gate is what separates a
+                # causer (its ``reconnect_delay_seconds`` is in the message
+                # comparing reconnect to its maximum) from a repairer whose
+                # contribution the failing check never reads (R5's
+                # ``max_reconnect_delay_seconds`` under a call-timeout
+                # message); validator messages conventionally name the
+                # fields they compare, and a message that does not keeps the
+                # variable unnamed — the fail-safe direction. Root errors
+                # never escalate: for them the file-completed probe of a
+                # lone variable is the merged config itself.
+                blocked = bool(loc) and any(
+                    r[1] == "missing" and (r[0][: len(loc)] == loc or loc[: len(r[0])] == r[0])
+                    for r in solo
+                )
+                if not blocked:
+                    return False
+                supplied = _overlay_value_at(_solo_fragment(name), loc)
+                names_under: set[str] = set()
+                stack = [supplied]
+                while stack:
+                    node = stack.pop()
+                    if isinstance(node, dict):
+                        for k, v in node.items():
+                            names_under.add(str(k))
+                            stack.append(v)
+                if not any(re.search(rf"\b{re.escape(field)}\b", key[2]) for field in names_under):
+                    return False
+                return key in _solo_with_file_keys(name)
             return key in _solo_with_file_keys(name)
 
         clean: set[str] = set()

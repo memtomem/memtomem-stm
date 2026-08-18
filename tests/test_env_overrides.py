@@ -1488,6 +1488,29 @@ class TestLeaveOneOutAttribution:
 
         assert hint == ""
 
+    def test_aggregate_repairing_one_branch_and_breaking_another_is_named(self) -> None:
+        """Diff review R6: the aggregate repairs `c`'s whitespace prefix AND
+        supplies the reconnect value that breaks file-completed `gh`. Its
+        removal reveals the file's own error (repair shape), and its
+        file-free probe cannot run the failing check (`gh.prefix` lives in
+        the file) — but it supplies the very field the error message names,
+        so the file-completed probe answers and the aggregate is named."""
+        hint = self._hint(
+            {
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": (
+                    '{"gh": {"reconnect_delay_seconds": 40}, "c": {"prefix": "c"}}'
+                )
+            },
+            {
+                "upstream_servers": {
+                    "gh": {"prefix": "gh", "command": "gh-mcp"},
+                    "c": {"prefix": "   ", "command": "c-mcp"},
+                }
+            },
+        )
+
+        assert hint == " (env override(s) implicated: MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS)"
+
     def test_identical_root_error_in_file_and_env_stays_file_attributed(self) -> None:
         """R3, adjudicated: when the file alone reproduces the root error and
         no removal changes it (an env payload shadowing the file with the
