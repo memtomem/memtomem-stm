@@ -619,16 +619,30 @@ def _attribute_env_overrides(
         if clean:
             implicated.update(clean)
             continue
+
+        # A no-op trial usually means the variable contributed nothing — but
+        # when two variables supply the SAME value at the error's loc, every
+        # single removal is a no-op (the sibling keeps the value alive). A
+        # variable at-or-above a loc whose overlay value is an observable
+        # non-dict is supplier-shaped and stays a fallback candidate.
+        def _supplier_shaped(path: tuple[str, ...]) -> bool:
+            return (
+                reaches and not isinstance(overlay_at_loc, dict) and loc_strs[: len(path)] == path
+            )
+
         if key not in file_alone_keys:
             rel = loc_strs[:-1] if err.get("type") == "missing" else loc_strs
             for name, path in live:
-                if name in repairers or name in noops:
+                if name in repairers or (name in noops and not _supplier_shaped(path)):
                     continue
                 if path[: len(rel)] == rel or rel[: len(path)] == path:
                     implicated.add(name)
         elif reaches and not isinstance(overlay_at_loc, dict):
+            # The gate above makes every at-or-above candidate
+            # supplier-shaped, so a no-op removal does not disqualify here
+            # either (file and env holding the identical broken value).
             for name, path in live:
-                if name not in noops and loc_strs[: len(path)] == path:
+                if loc_strs[: len(path)] == path:
                     implicated.add(name)
     if not implicated:
         return ""

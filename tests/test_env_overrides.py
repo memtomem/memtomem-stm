@@ -429,16 +429,16 @@ class TestSettingsSourceCanaries:
 class TestProvenanceSurvivesOverwritingVariables:
     """Which variable a warning names, when more than one wrote to a path.
 
-    Provenance is reconstructed from the variable names after settings has
-    resolved them (#837), so it has to answer a question the resolved fragment
-    no longer records: which variable's value actually SURVIVED. Settings
-    resolves a mapping parent and a deeper child last-one-wins, so a variable a
-    later payload covered contributed nothing — naming it points the operator
-    at a value that is not in the config being complained about, and hides the
-    one that is.
+    Settings resolves a mapping parent and a deeper child last-one-wins, so a
+    variable a later payload covered contributed nothing — naming it points
+    the operator at a value that is not in the config being complained about,
+    and hides the one that is. Attribution answers this by MEASUREMENT
+    (#843): a variable is named when removing it and re-resolving the whole
+    remaining environment makes the error disappear, so the winner is
+    whichever removal actually changes the outcome.
 
     The oracles cannot catch this: they compare validated model dumps, which
-    discard the provenance entirely.
+    discard variable identity entirely.
     """
 
     def _hint_for(self, env: dict[str, str]) -> str:
@@ -545,8 +545,9 @@ class TestProvenanceSurvivesOverwritingVariables:
 
     def test_a_malformed_variable_inside_a_payload_is_named(self) -> None:
         """A malformed value is re-inserted raw INSIDE a decoded payload. It is
-        still the variable the operator has to fix, so naming only the payload
-        would point at the wrong one."""
+        still the variable the operator has to fix — and the ONLY one: the
+        payload whose own args were valid must not be named alongside it (the
+        exact assertion closed a hole the positive-only form left, #843)."""
         hint = self._hint_for(
             {
                 "MEMTOMEM_STM_PROXY__TOOLGRAPH": '{"args": ["serve"]}',
@@ -554,7 +555,9 @@ class TestProvenanceSurvivesOverwritingVariables:
             }
         )
 
-        assert "MEMTOMEM_STM_PROXY__TOOLGRAPH__ARGS" in hint
+        assert hint == (
+            " (env override(s) implicated: MEMTOMEM_STM_PROXY__TOOLGRAPH__ARGS)"
+        )
 
 
 class TestDivergenceEightIsClosedByDelegating:
@@ -1116,3 +1119,419 @@ def test_collect_uses_real_environ_when_arg_omitted(monkeypatch: pytest.MonkeyPa
     monkeypatch.delenv("MEMTOMEM_STM_PROXY__ENABLED", raising=False)
     out = collect_proxy_env_overrides()
     assert out.fragment.get("default_max_result_chars") == "4242"
+
+
+class TestLeaveOneOutAttribution:
+    """Regression pins for the #843 rewrite: attribution is leave-one-out
+    measurement, and every counterexample the plan-review rounds produced
+    against a weaker rule is pinned here. Each test names the review round
+    that constructed it."""
+
+    def _hint(
+        self, env: dict[str, str], file_data: dict[str, object] | None = None
+    ) -> str:
+        overrides = collect_proxy_env_overrides(env)
+        data = (
+            _deep_merge(dict(file_data), overrides.fragment)
+            if file_data is not None
+            else overrides.fragment
+        )
+        try:
+            ProxyConfig.model_validate(data)
+        except ValidationError as exc:
+            return _env_override_hint(
+                exc, overrides, dict(file_data) if file_data is not None else None
+            )
+        raise AssertionError("expected the merged config to fail validation")
+
+    def test_dead_child_under_a_non_mapping_parent_is_not_named(self) -> None:
+        """R1: settings lets ``CACHE=null`` block the deeper variable in either
+        order, so the child contributed nothing — its removal changes nothing
+        observable and it must not be named for the parent's error."""
+        hint = self._hint(
+            {
+                "MEMTOMEM_STM_PROXY__CACHE": "null",
+                "MEMTOMEM_STM_PROXY__CACHE__ENABLED": "true",
+            }
+        )
+
+        assert hint == " (env override(s) implicated: MEMTOMEM_STM_PROXY__CACHE)"
+
+    def test_mixed_subtree_root_error_spares_the_innocent_variable(self) -> None:
+        """R1: a duplicate-prefix root error implicates the variables whose
+        removal clears it, not every variable that happens to be set."""
+        file_data = {
+            "upstream_servers": {
+                "a": {"prefix": "pa", "command": "a-mcp"},
+                "b": {"prefix": "pb", "command": "b-mcp"},
+            }
+        }
+        hint = self._hint(
+            {
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__A__PREFIX": "pb",
+                "MEMTOMEM_STM_PROXY__CACHE__ENABLED": "true",
+            },
+            file_data,
+        )
+
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__A__PREFIX" in hint
+        assert "CACHE__ENABLED" not in hint
+
+    def test_hint_renders_the_original_spelling(self) -> None:
+        """R1: settings accepts a lowercase-spelled variable, and the hint must
+        name THAT spelling — an uppercased reconstruction does not exist on a
+        case-sensitive system."""
+        hint = self._hint({"memtomem_stm_proxy__cache__max_entries": "-5"})
+
+        assert "memtomem_stm_proxy__cache__max_entries" in hint
+        assert "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES" not in hint
+
+    def test_overdetermined_error_falls_back_to_path_attribution(self) -> None:
+        """A payload and a deeper variable supplying the SAME failing value:
+        removing either leaves the error via the other, so no removal is
+        cleanly implicating — the coarse fallback names both rather than
+        going silent on a certainly-env-caused error."""
+        hint = self._hint(
+            {
+                "MEMTOMEM_STM_PROXY__TOOLGRAPH": '{"args": "not-a-list"}',
+                "MEMTOMEM_STM_PROXY__TOOLGRAPH__ARGS": '"not-a-list"',
+            }
+        )
+
+        assert "MEMTOMEM_STM_PROXY__TOOLGRAPH," in hint or (
+            "MEMTOMEM_STM_PROXY__TOOLGRAPH)" in hint
+        )
+        assert "MEMTOMEM_STM_PROXY__TOOLGRAPH__ARGS" in hint
+
+    def test_aggregate_above_a_deeper_vars_error_is_not_named(self) -> None:
+        """Non-missing variant of the payload-ownership pin: the aggregate
+        declared only ``other``; the failing value under ``gh`` came from the
+        deeper variables, so the aggregate's removal leaves the error and the
+        aggregate stays unnamed."""
+        hint = self._hint(
+            {
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": '{"other": {"prefix": "other"}}',
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__PREFIX": "gh",
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__HYBRID__HEAD_CHARS": "-1",
+            }
+        )
+
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__HYBRID__HEAD_CHARS" in hint
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS)" not in hint
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS," not in hint
+
+    def test_masked_innocent_entry_is_not_named_for_a_root_error(self) -> None:
+        """R2: removing the innocent entry's prefix makes pydantic report a
+        ``missing`` field error, which SUPPRESSES the root validators — the
+        duplicate-prefix error 'disappears' without the innocent variable
+        having caused it. The masking guard refuses that implication; the
+        variables whose clean removal resolves the collision are named."""
+        file_data = {
+            "upstream_servers": {
+                "a": {"prefix": "pa", "command": "a-mcp"},
+                "b": {"prefix": "pb", "command": "b-mcp"},
+            }
+        }
+        hint = self._hint(
+            {
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__A__PREFIX": "shared",
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__B__PREFIX": "shared",
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__INNOCENT__PREFIX": "inn",
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__INNOCENT__COMMAND": "inn-mcp",
+            },
+            file_data,
+        )
+
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__A__PREFIX" in hint
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__B__PREFIX" in hint
+        assert "INNOCENT" not in hint
+
+    def test_env_var_rebreaking_the_same_error_key_is_still_named(self) -> None:
+        """R2: file ``-5`` and env ``-6`` produce the IDENTICAL error key, so
+        the naive file pre-filter would call it file-caused and hide the env
+        variable that supplies the value the merged config actually holds."""
+        hint = self._hint(
+            {"MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES": "-6"},
+            {"cache": {"max_entries": -5}},
+        )
+
+        assert "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES" in hint
+
+    def test_repairing_variable_is_not_named_for_the_error_it_reveals(self) -> None:
+        """R3: the env variable FIXES the file's empty prefix, and the fix
+        un-masks the file's own duplicate-prefix error (model validators
+        raise-and-stop). The repairer must not be named for the error its
+        repair revealed."""
+        file_data = {
+            "upstream_servers": {
+                "a": {"prefix": "x", "command": "a-mcp"},
+                "b": {"prefix": "x", "command": "b-mcp"},
+                "c": {"prefix": "   ", "command": "c-mcp"},
+            }
+        }
+        hint = self._hint(
+            {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__C__PREFIX": "c"}, file_data
+        )
+
+        assert hint == ""
+
+    def test_identical_root_error_in_file_and_env_stays_file_attributed(self) -> None:
+        """R3, adjudicated: when the file alone reproduces the root error and
+        no removal changes it (an env payload shadowing the file with the
+        same broken map), the hint stays silent — at ``loc=()`` the shadower
+        is indistinguishable from an innocent variable, and diagnosis
+        converges sequentially through the file."""
+        broken = {
+            "upstream_servers": {
+                "a": {"prefix": "x", "command": "a-mcp"},
+                "b": {"prefix": "x", "command": "b-mcp"},
+            }
+        }
+        hint = self._hint(
+            {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": json.dumps(broken["upstream_servers"])},
+            broken,
+        )
+
+        assert hint == ""
+
+    def test_dual_role_variable_is_named_for_the_error_it_supplies(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """R4: the payload both repairs the file (its ollama provider removes
+        the api-key requirement) and supplies the failing timeout. Removal
+        reveals the file's own api-key error, but a variable at-or-above the
+        error's loc that the overlay reaches supplied the failing value —
+        the supplier exception keeps it named."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        hint = self._hint(
+            {
+                "MEMTOMEM_STM_PROXY__EXTRACTION__LLM": (
+                    '{"provider": "ollama", "llm_timeout_seconds": 0}'
+                )
+            },
+            {"extraction": {"llm": {"provider": "openai"}}},
+        )
+
+        assert "MEMTOMEM_STM_PROXY__EXTRACTION__LLM" in hint
+
+    def test_noop_aggregate_over_a_file_broken_block_is_not_named(self) -> None:
+        """R4: an empty payload merged into the file's broken hybrid block
+        changes nothing (the trial's merged data equals the original), so the
+        error stays file-attributed with no hint — and a payload duplicating
+        the file's own values is the same no-op."""
+        file_data = {
+            "upstream_servers": {
+                "gh": {
+                    "prefix": "gh",
+                    "command": "gh-mcp",
+                    "hybrid": {"head_chars": 50, "min_head_chars": 9000},
+                }
+            }
+        }
+        for payload in ("{}", '{"head_chars": 50}'):
+            hint = self._hint(
+                {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__HYBRID": payload}, file_data
+            )
+
+            assert hint == "", payload
+
+    def test_raw_dict_overrides_yield_no_hint_and_no_crash(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A hand-built plain dict keeps working at the load boundary: the
+        fragment is honored, but with no raw variables to measure the hint
+        stays silent (attribution requires ``collect_proxy_env_overrides``)."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"cache": {"enabled": True}}))
+
+        with caplog.at_level(logging.WARNING):
+            cfg = ProxyConfig.load_from_file(
+                cfg_file, env_overrides={"cache": {"max_entries": "abc"}}
+            )
+
+        assert cfg is None
+        assert any("Failed to parse proxy config" in r.getMessage() for r in caplog.records)
+        assert not any("implicated" in r.getMessage() for r in caplog.records)
+
+    def test_empty_environment_yields_a_falsy_overlay(self) -> None:
+        overlay = collect_proxy_env_overrides({"UNRELATED": "x"})
+
+        assert not overlay
+        assert overlay.fragment == {}
+        assert overlay.scoped == {}
+
+
+class TestHintMemoizationAndCost:
+    """The hint runs leave-one-out trials on the already-failing path, and a
+    failed hot reload re-runs the warning every poll — so trials must be
+    linear in the variable count and memoized on everything attribution
+    reads (#843)."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_memo(self):
+        from memtomem_stm.proxy import config as config_module
+
+        config_module._hint_memo.clear()
+        yield
+        config_module._hint_memo.clear()
+
+    def _failing(self, env: dict[str, str]):
+        overrides = collect_proxy_env_overrides(env)
+        try:
+            ProxyConfig.model_validate(overrides.fragment)
+        except ValidationError as exc:
+            return overrides, exc
+        raise AssertionError("expected the overlay to fail validation")
+
+    def _counting_fragment_resolver(self, monkeypatch: pytest.MonkeyPatch):
+        from memtomem_stm.proxy import config as config_module
+
+        calls = {"n": 0}
+        real = config_module._settings_proxy_fragment
+
+        def counted(scoped):
+            calls["n"] += 1
+            return real(scoped)
+
+        monkeypatch.setattr(config_module, "_settings_proxy_fragment", counted)
+        return calls
+
+    def test_identical_failed_loads_pay_the_trials_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        overrides, exc = self._failing(
+            {
+                "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES": "-1",
+                "MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS": "9000",
+            }
+        )
+        calls = self._counting_fragment_resolver(monkeypatch)
+
+        first = _env_override_hint(exc, overrides)
+        after_first = calls["n"]
+        second = _env_override_hint(exc, overrides)
+
+        assert first == second != ""
+        assert after_first > 0
+        assert calls["n"] == after_first  # memo hit: no new resolutions
+
+    def test_toggling_an_ambient_provider_key_recomputes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Validation itself reads the provider keys, so a cached attribution
+        must not outlive a key appearing or disappearing."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        overrides, exc = self._failing(
+            {
+                "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES": "-1",
+                "MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS": "9000",
+            }
+        )
+        calls = self._counting_fragment_resolver(monkeypatch)
+
+        _env_override_hint(exc, overrides)
+        after_first = calls["n"]
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        _env_override_hint(exc, overrides)
+
+        assert calls["n"] > after_first  # ambient change: trials re-ran
+
+    def test_insertion_order_is_part_of_the_memo_identity(self) -> None:
+        """Environment order decides parent-vs-child resolution, so the two
+        orders are different environments with different hints — the second
+        call must not be served the first call's cached text."""
+        forward = {
+            "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES": "-1",
+            "MEMTOMEM_STM_PROXY__CACHE": '{"max_entries": 0}',
+        }
+        reversed_env = {
+            "MEMTOMEM_STM_PROXY__CACHE": '{"max_entries": 0}',
+            "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES": "-1",
+        }
+        overrides_f, exc_f = self._failing(forward)
+        hint_f = _env_override_hint(exc_f, overrides_f)
+        overrides_r, exc_r = self._failing(reversed_env)
+        hint_r = _env_override_hint(exc_r, overrides_r)
+
+        # Forward: the later payload covers the child (0 survives) — the
+        # payload is named. Reversed: the later child merges on top (-1
+        # survives) — the child is named.
+        assert "MEMTOMEM_STM_PROXY__CACHE)" in hint_f
+        assert "MAX_ENTRIES" not in hint_f
+        assert "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES" in hint_r
+
+    def test_a_respelled_variable_rerenders(self) -> None:
+        """Same resolution, same errors — only the operator's spelling
+        changed. The rendered name must follow it, not the cached text."""
+        upper, exc_u = self._failing({"MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES": "-5"})
+        hint_u = _env_override_hint(exc_u, upper)
+        lower, exc_l = self._failing({"memtomem_stm_proxy__cache__max_entries": "-5"})
+        hint_l = _env_override_hint(exc_l, lower)
+
+        assert "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES" in hint_u
+        assert "memtomem_stm_proxy__cache__max_entries" in hint_l
+
+    def test_trial_count_stays_linear_with_a_malformed_variable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Malformedness is per-variable and precomputed at collect time; a
+        trial must not re-probe every variable (that made the malformed path
+        quadratic in settings resolutions)."""
+        import time as time_module
+
+        env = {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__S0__PREFIX": "{not json"}
+        for i in range(9):
+            env[f"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__T{i}__PREFIX"] = f"t{i}"
+            env[f"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__T{i}__COMMAND"] = f"t{i}-mcp"
+        env["MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES"] = "-1"
+        assert len(env) == 20
+        overrides, exc = self._failing(env)
+        calls = self._counting_fragment_resolver(monkeypatch)
+
+        start = time_module.monotonic()
+        hint = _env_override_hint(exc, overrides)
+        elapsed = time_module.monotonic() - start
+
+        assert "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES" in hint
+        # One resolution per leave-one-out trial (20 live vars), not one per
+        # (trial, variable) pair — a quadratic regression lands at 400+.
+        assert 0 < calls["n"] <= 2 * len(env) + 5
+        assert elapsed < 10  # generous absolute bound; the count is the pin
+
+    def test_hundred_variable_smoke_stays_linear(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env = {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__S0__PREFIX": "{not json"}
+        for i in range(49):
+            env[f"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__U{i}__PREFIX"] = f"u{i}"
+            env[f"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__U{i}__COMMAND"] = f"u{i}-mcp"
+        env["MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES"] = "-1"
+        assert len(env) == 100
+        overrides, exc = self._failing(env)
+        calls = self._counting_fragment_resolver(monkeypatch)
+
+        hint = _env_override_hint(exc, overrides)
+
+        assert "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES" in hint
+        assert 0 < calls["n"] <= 2 * len(env) + 5
+
+    def test_ambient_validation_vars_actually_affect_validation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Drift guard: every var listed in _AMBIENT_VALIDATION_VARS changes a
+        validation outcome, so the memo digest's ambient tuple is neither
+        stale nor decorative. If a validator stops (or starts) reading one,
+        this test forces the constant to follow."""
+        from memtomem_stm.proxy.config import _AMBIENT_VALIDATION_VARS
+
+        provider_for = {"OPENAI_API_KEY": "openai", "ANTHROPIC_API_KEY": "anthropic"}
+        assert set(_AMBIENT_VALIDATION_VARS) == set(provider_for)
+        for var, provider in provider_for.items():
+            for other in provider_for:
+                monkeypatch.delenv(other, raising=False)
+            data = {"extraction": {"llm": {"provider": provider}}}
+            with pytest.raises(ValidationError):
+                ProxyConfig.model_validate(data)
+            monkeypatch.setenv(var, "sk-test")
+            ProxyConfig.model_validate(data)  # the key alone flips the outcome
