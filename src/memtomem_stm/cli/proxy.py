@@ -484,10 +484,11 @@ def _transport_field_error(transport: str, command: str, url: str) -> str | None
 def _explicit_config_path(config_path: str) -> str | None:
     """The command's ``--config`` value, or ``None`` when it is Click's default.
 
-    STMConfig-backed checks honor the flag only when the operator spelled it
-    out (#839); otherwise ``MEMTOMEM_STM_PROXY__CONFIG_PATH`` keeps governing
-    the bare construction. Outside a Click context (a helper called directly
-    in tests), the caller's value is trusted as explicit.
+    STMConfig-backed checks honor the flag only when Click reports a
+    non-default source for it — typed on the command line, or mapped via
+    ``default_map`` (#839); otherwise ``MEMTOMEM_STM_PROXY__CONFIG_PATH``
+    keeps governing the bare construction. Outside a Click context (a helper
+    called directly in tests), the caller's value is trusted as explicit.
     """
     ctx = click.get_current_context(silent=True)
     if ctx is None:

@@ -108,10 +108,19 @@ def test_explicit_config_path_reaches_the_policy_construction(
     ``_registration_command`` while holding the ``--config`` path, but the
     bare construction read the default file — so a per-field env override of
     a server only the flag's file declares refused to build and crashed the
-    registration."""
+    registration.
+
+    Home is already redirected by the root conftest's autouse
+    ``isolate_home``; ambient ``MEMTOMEM_STM_PROXY*`` variables are cleared
+    here so a developer shell exporting e.g. ``CONFIG_PATH`` cannot make the
+    positive control's expected failure disappear."""
     import json
+    import os
 
     from pydantic import ValidationError
+
+    for name in [n for n in os.environ if n.startswith("MEMTOMEM_STM_PROXY")]:
+        monkeypatch.delenv(name, raising=False)
 
     config = tmp_path / "stm_proxy.json"
     config.write_text(

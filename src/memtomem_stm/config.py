@@ -554,7 +554,8 @@ def stm_config_for_cli(config_path: str | Path | None = None) -> STMConfig:
     source made construction file-dependent). ``None`` keeps the bare
     construction, where the env var governs. Who passes a path differs by
     caller class: diagnostic commands (doctor/health/stats) pass it only when
-    the operator spelled the flag out (``_explicit_config_path``), while
+    Click reports a non-default source for ``--config`` — typed on the command
+    line, or mapped via ``default_map`` (``_explicit_config_path``) — while
     registration (``_registration_command``) passes its path unconditionally,
     default included — that path is serialized into the managed entry's
     environment, so the policy must resolve against the same file. For a
