@@ -466,3 +466,25 @@ class TestCompletionSourceIsInert:
         clean_env.setenv("MEMTOMEM_STM_PROXY__CACHE__ENABLED", "false")
 
         assert STMConfig().proxy.upstream_servers == {}
+
+
+class TestBareBlockPayloadCovering:
+    """#840's sibling at the ``STMConfig()`` level: a field's own env var
+    (``MEMTOMEM_STM_PROXY`` as one JSON payload) is the BASE that exploded
+    deeper variables deep-update, so it never covers them — in either order.
+    The hint's live filter must keep the deeper variable nameable."""
+
+    def test_broken_deeper_variable_stays_named_beside_a_later_bare_payload(
+        self, tmp_path, clean_env
+    ):
+        clean_env.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(tmp_path / "absent.json"))
+        clean_env.setenv("MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES", "-1")
+        clean_env.setenv("MEMTOMEM_STM_PROXY", json.dumps({"cache": {"max_entries": 5}}))
+
+        with pytest.raises(ValidationError) as caught:
+            STMConfig()
+
+        assert caught.value.errors()[0]["loc"] == ("proxy", "cache", "max_entries")
+        assert "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES" in env_var_hint_for_validation_error(
+            caught.value
+        )

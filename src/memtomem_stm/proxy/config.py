@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 _PROXY_ENV_PREFIX = "MEMTOMEM_STM_PROXY__"
+_PROXY_ENV_BARE = _PROXY_ENV_PREFIX[:-2]  # the block's own name, one JSON payload
 
 
 _MISSING = object()
@@ -118,7 +119,15 @@ def _var_path(name: str) -> tuple[str, ...]:
     Empty components are kept, not dropped: settings turns a doubled delimiter
     into an empty *key*, which is a real mapping entry
     (``…__UPSTREAM_SERVERS____PREFIX`` configures the server named "").
+
+    The bare block name (``MEMTOMEM_STM_PROXY``, one JSON payload for the
+    whole block, #840) is the empty path: it owns the entire ``proxy``
+    subtree, so every prefix rule — a later bare payload covers every earlier
+    variable; a later deeper variable merges into it — falls out of the
+    ordinary tuple-prefix comparisons.
     """
+    if len(name) == len(_PROXY_ENV_BARE):
+        return ()
     return tuple(name[len(_PROXY_ENV_PREFIX) :].split("__"))
 
 
@@ -162,7 +171,16 @@ def _fragment_for(scoped: dict[str, str], malformed: frozenset[str]) -> dict[str
 
 
 def _insert_raw(fragment: dict[str, Any], path: tuple[str, ...], raw: str) -> None:
-    """Put an undecodable value back at its path, as the raw string."""
+    """Put an undecodable value back at its path, as the raw string.
+
+    The empty path (a malformed bare ``MEMTOMEM_STM_PROXY`` payload) has no
+    slot in a dict fragment — the raw string would BE the whole subtree — so
+    it is skipped here; ``collect_proxy_env_overrides`` warns about it once.
+    The server itself refuses to start on that value (``STMConfig()`` raises
+    ``SettingsError``), so the overlay never diverges from a running config.
+    """
+    if not path:
+        return
     cursor: dict[str, Any] = fragment
     for part in path[:-1]:
         existing = cursor.get(part, _MISSING)
@@ -211,11 +229,16 @@ def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> EnvOve
     # upper-cases onto the prefix (U+017F → "S") while settings, which never
     # upper-cases, ignores the variable entirely.
     prefix = _PROXY_ENV_PREFIX.lower()
+    bare = _PROXY_ENV_BARE.lower()
     scoped: dict[str, str] = {}
     names: dict[str, str] = {}
     for key, val in env.items():
         lowered_key = key.lower()
-        if lowered_key.startswith(prefix):
+        # The bare block name is honored by settings as one JSON payload for
+        # the whole proxy block (#840); requiring the delimiter dropped it,
+        # so with a file present the file silently won over a variable the
+        # server honors. Exact match only: `MEMTOMEM_STM_PROXYX` is neither.
+        if lowered_key == bare or lowered_key.startswith(prefix):
             # Case-equivalent spellings collapse the same way the values do:
             # last one wins, so the rendered name is the spelling that
             # supplied the surviving value.
@@ -229,6 +252,16 @@ def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> EnvOve
         malformed: frozenset[str] = frozenset()
     except SettingsError:
         malformed = frozenset(name for name in scoped if _fails_to_decode(name, scoped[name]))
+        if bare in malformed and any(name == bare for name, _ in _live_var_paths(scoped)):
+            # No dict slot can carry the raw string for the WHOLE block, so
+            # the overlay cannot keep it the way it keeps deeper malformed
+            # values. The server refuses to start on it (`STMConfig()`
+            # raises), so this warning is the CLI-side diagnostic.
+            logger.warning(
+                "Ignoring malformed %s payload (not valid JSON) — the server "
+                "itself rejects this environment at startup",
+                names[bare],
+            )
         fragment = _fragment_for(scoped, malformed)
     return EnvOverlayResult(fragment=fragment, scoped=scoped, names=names, malformed=malformed)
 
@@ -823,6 +856,8 @@ def _attribute_env_overrides(
 
 def live_env_paths(
     entries: list[tuple[str, tuple[str, ...]]],
+    *,
+    min_cover_len: int = 1,
 ) -> list[tuple[str, tuple[str, ...]]]:
     """The entries a later one did not cover, keeping order.
 
@@ -832,11 +867,23 @@ def live_env_paths(
     the config being complained about, and hides the one that is. A later
     variable that goes DEEPER does not cover it: settings merges that on top
     and both are really present.
+
+    ``min_cover_len`` excludes exact-FIELD-NAME payloads from ever covering:
+    settings reads the field's own env var as the BASE value and deep-updates
+    the delimiter-exploded variables on top, so such a payload loses to a
+    deeper variable in EITHER order (oracle-pinned, #840). Callers pass the
+    path length of their exact-name form: the proxy-scoped overlay's bare
+    ``MEMTOMEM_STM_PROXY`` is the empty path (so the default 1 excludes it);
+    ``env_var_hint_for_validation_error``'s block names are length-1 paths
+    (it passes 2).
     """
     return [
         (name, path)
         for index, (name, path) in enumerate(entries)
-        if not any(path[: len(later)] == later for _, later in entries[index + 1 :])
+        if not any(
+            len(later) >= min_cover_len and path[: len(later)] == later
+            for _, later in entries[index + 1 :]
+        )
     ]
 
 
@@ -914,8 +961,10 @@ def env_var_hint_for_validation_error(
         return True
 
     # First position, last value — the collapse settings applies to
-    # case-equivalent names — then drop the variables a later one covered.
-    live = live_env_paths([(name, path) for path, name in var_paths.items()])
+    # case-equivalent names — then drop the variables a later one covered. A
+    # length-1 path is a field's own name, whose payload is the BASE deeper
+    # variables deep-update — it never covers them (#840).
+    live = live_env_paths([(name, path) for path, name in var_paths.items()], min_cover_len=2)
 
     implicated: set[str] = set()
     for err in exc.errors():
