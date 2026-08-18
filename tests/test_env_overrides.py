@@ -348,7 +348,15 @@ class TestComplexEnvValuesMatchSettings:
     )
     def test_overlay_agrees_with_pydantic_settings(self, monkeypatch, env) -> None:
         """The oracle: whatever ``STMConfig()`` builds from these vars, the
-        overlay rebuild must build too."""
+        overlay rebuild must build too.
+
+        Now that the rebuild asks an ``EnvSettingsSource`` instead of
+        reproducing one (#837), this no longer guards a reimplementation of
+        settings' semantics — there is none left to drift. What it still
+        guards is everything wrapped AROUND the source: the name filter, the
+        mapping hook, the malformed-value path, and the source behaving the
+        same way on whatever ``pydantic-settings`` a contributor resolves.
+        """
         from memtomem_stm.config import STMConfig
 
         for name in [n for n in os.environ if n.upper().startswith("MEMTOMEM_STM_PROXY")]:
@@ -359,6 +367,306 @@ class TestComplexEnvValuesMatchSettings:
         settings_proxy = STMConfig().proxy
         overlay_proxy = ProxyConfig.model_validate(collect_proxy_env_overrides())
         assert overlay_proxy.model_dump() == settings_proxy.model_dump()
+
+
+class TestSettingsSourceCanaries:
+    """Guards on the seam between this module and ``pydantic-settings``.
+
+    The rebuild delegates every env-resolution rule to an
+    ``EnvSettingsSource`` (#837), so the failure mode that remains is not a
+    semantic divergence but the delegation itself breaking: a constructor that
+    stops accepting what we pass, or the mapping hook no longer being
+    consulted. The declared floor is ``>=2.7`` while behavior is measured on
+    what the lockfile resolves, so these have to fail loudly rather than
+    silently reading the wrong environment.
+    """
+
+    def test_source_constructs_with_only_settings_cls(self) -> None:
+        """``settings_cls`` is the one constructor argument whose position and
+        meaning are stable across the supported range; every other knob is read
+        off ``model_config``. Passing more would pin us to one release."""
+        from pydantic_settings import EnvSettingsSource
+
+        from memtomem_stm.config import STMConfig
+
+        source = EnvSettingsSource(STMConfig)
+
+        assert source.env_prefix == "MEMTOMEM_STM_"
+        assert source.env_nested_delimiter == "__"
+
+    def test_mapping_hook_is_actually_consulted(self, monkeypatch) -> None:
+        """If the hook stopped being called, the rebuild would silently resolve
+        the PROCESS environment while claiming to answer about the mapping it
+        was handed — a wrong answer, not an error. Contrast a variable set only
+        in the process with one set only in the mapping.
+        """
+        for name in [n for n in os.environ if n.upper().startswith("MEMTOMEM_STM_PROXY")]:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS", "1111")
+
+        result = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY__MAX_UPSTREAM_CHARS": "2222"})
+
+        assert result == {"max_upstream_chars": "2222"}
+
+    def test_source_output_matches_a_hand_built_expectation(self, monkeypatch) -> None:
+        """A written-down expectation of what the source resolves, so an
+        upgrade that changes explosion, decoding or case folding trips here
+        with a readable diff instead of surfacing as a config bug."""
+        env = {
+            "MEMTOMEM_STM_PROXY__ENABLED": "true",
+            "MEMTOMEM_STM_PROXY__CACHE": '{"ENABLED": false}',
+            "MEMTOMEM_STM_PROXY__CACHE__TTL_SECONDS": "5",
+            "memtomem_stm_proxy__upstream_servers__gh__args": '["--one"]',
+        }
+
+        assert collect_proxy_env_overrides(env) == {
+            "enabled": "true",  # scalars stay strings; pydantic coerces later
+            "cache": {"enabled": False, "ttl_seconds": "5"},  # field key folded
+            "upstream_servers": {"gh": {"args": ["--one"]}},  # complex decoded
+        }
+
+
+class TestProvenanceSurvivesOverwritingVariables:
+    """Which variable a warning names, when more than one wrote to a path.
+
+    Provenance is reconstructed from the variable names after settings has
+    resolved them (#837), so it has to answer a question the resolved fragment
+    no longer records: which variable's value actually SURVIVED. Settings
+    resolves a mapping parent and a deeper child last-one-wins, so a variable a
+    later payload covered contributed nothing — naming it points the operator
+    at a value that is not in the config being complained about, and hides the
+    one that is.
+
+    The oracles cannot catch this: they compare validated model dumps, which
+    discard the provenance entirely.
+    """
+
+    def _hint_for(self, env: dict[str, str]) -> str:
+        overrides = collect_proxy_env_overrides(env)
+        try:
+            ProxyConfig.model_validate(overrides)
+        except ValidationError as exc:
+            return _env_override_hint(exc, overrides)
+        raise AssertionError("expected the override to fail validation")
+
+    def test_later_payload_wins_over_an_earlier_child(self) -> None:
+        hint = self._hint_for(
+            {
+                "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES": "100",
+                "MEMTOMEM_STM_PROXY__CACHE": '{"max_entries": 0}',
+            }
+        )
+
+        assert "MEMTOMEM_STM_PROXY__CACHE)" in hint  # the payload that supplied 0
+        assert "MAX_ENTRIES" not in hint  # its 100 never reached the config
+
+    def test_later_aggregate_wins_over_an_earlier_payload(self) -> None:
+        hint = self._hint_for(
+            {
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH": '{"prefix": "gh", "command": "old"}',
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": (
+                    '{"gh": {"prefix": "gh", "command": ["bad"]}}'
+                ),
+            }
+        )
+
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS)" in hint
+        assert "__GH" not in hint
+
+    def test_a_payload_does_not_own_an_entry_a_deeper_variable_created(self) -> None:
+        """A payload owns what it declared, not what it was merged with.
+
+        The aggregate here declares `other` and knows nothing about `gh`, which
+        a deeper variable created; the resolved node holds both. Marking the
+        whole node as the payload's would report its name for an entry it has
+        nothing to do with. The assertion is exact — checking only that the
+        child appears would pass with the parent spuriously named too.
+        """
+        env = {
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": '{"other": {"prefix": "other"}}',
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND": "gh-mcp",
+        }
+
+        assert self._hint_for(env) == (
+            " (env override(s) implicated: MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND)"
+        )
+
+    def test_a_payload_does_own_the_entry_it_declared(self) -> None:
+        """The control: when the payload DID declare the entry, it is named —
+        so the test above cannot pass by the marking having stopped working."""
+        env = {
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": '{"gh": {"command": "x"}}',
+        }
+
+        assert self._hint_for(env) == (
+            " (env override(s) implicated: MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS)"
+        )
+
+    def test_a_payload_owns_a_field_it_spelled_in_another_case(self) -> None:
+        """Settings canonicalizes a model field written in any case, so the
+        payload's own branch does not come back under the key it wrote. Failing
+        to recognize it made the hint SYNTHESIZE a variable name for a payload
+        leaf — worse than naming too many, because that name does not exist."""
+        env = {
+            "MEMTOMEM_STM_PROXY__EXTRACTION": (
+                '{"LLM": {"provider": "ollama", "llm_timeout_seconds": 0}}'
+            )
+        }
+
+        assert self._hint_for(env) == (
+            " (env override(s) implicated: MEMTOMEM_STM_PROXY__EXTRACTION)"
+        )
+
+    def test_a_mapping_key_in_another_case_is_a_different_entry(self) -> None:
+        """The boundary of the rule above: settings folds field names but takes
+        mapping keys verbatim, so a payload keyed `GH` and a deeper variable's
+        `gh` are two servers. Folding here would hand the payload an entry that
+        is not its own — the resolved node holding BOTH spellings is the tell."""
+        env = {
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": '{"GH": {"prefix": "gh"}}',
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND": "x",
+        }
+
+        assert self._hint_for(env) == (
+            " (env override(s) implicated: MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND)"
+        )
+
+    def test_a_deeper_variable_still_counts_when_nothing_covers_it(self) -> None:
+        """The control: a later variable that goes DEEPER is merged on top, not
+        replaced, so both are real and the deeper one stays nameable."""
+        hint = self._hint_for(
+            {
+                "MEMTOMEM_STM_PROXY__CACHE": '{"enabled": false}',
+                "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES": "-1",
+            }
+        )
+
+        assert "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES" in hint
+
+    def test_a_malformed_variable_inside_a_payload_is_named(self) -> None:
+        """A malformed value is re-inserted raw INSIDE a decoded payload. It is
+        still the variable the operator has to fix, so naming only the payload
+        would point at the wrong one."""
+        hint = self._hint_for(
+            {
+                "MEMTOMEM_STM_PROXY__TOOLGRAPH": '{"args": ["serve"]}',
+                "MEMTOMEM_STM_PROXY__TOOLGRAPH__ARGS": "not-a-list",
+            }
+        )
+
+        assert "MEMTOMEM_STM_PROXY__TOOLGRAPH__ARGS" in hint
+
+
+class TestDivergenceEightIsClosedByDelegating:
+    """A disagreement the hand-written rebuild had, found while reviewing its
+    replacement — the ninth of the class #837 was filed about.
+
+    A payload spelling a model field in another case does NOT merge with a
+    deeper variable addressing the same field. Settings explodes the deeper
+    variable into its own branch and canonicalizes afterwards, so the branches
+    never meet and the later one replaces the earlier; the hand-written rebuild
+    canonicalized first and merged them. It therefore reported a config the
+    server does not run — the exact failure the overlay exists to prevent.
+    """
+
+    def test_a_cased_payload_field_does_not_merge_with_a_deeper_variable(self) -> None:
+        env = {
+            "MEMTOMEM_STM_PROXY__EXTRACTION": '{"LLM": {"provider": "ollama"}}',
+            "MEMTOMEM_STM_PROXY__EXTRACTION__LLM__LLM_TIMEOUT_SECONDS": "30",
+        }
+
+        # `provider` is gone: the payload's whole `llm` branch was replaced.
+        assert collect_proxy_env_overrides(env) == {
+            "extraction": {"llm": {"llm_timeout_seconds": "30"}}
+        }
+
+    def test_the_settings_parse_agrees(self, monkeypatch) -> None:
+        """The oracle for the case above, stated separately so the expectation
+        is not just this module's own reading: settings resolves the same
+        thing, and rejects the config for the DEFAULT provider — which is only
+        possible if the payload's `provider` never arrived.
+
+        `OPENAI_API_KEY` is cleared because that default is what makes the
+        rejection observable: with a key present the config validates and the
+        test would pass or fail on an ambient variable it does not control.
+        """
+        from memtomem_stm.config import STMConfig
+
+        for name in [n for n in os.environ if n.upper().startswith("MEMTOMEM_STM_PROXY")]:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__EXTRACTION", '{"LLM": {"provider": "ollama"}}')
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__EXTRACTION__LLM__LLM_TIMEOUT_SECONDS", "30")
+
+        with pytest.raises(ValidationError) as caught:
+            STMConfig()
+
+        assert "openai" in str(caught.value)  # the default, not the payload's ollama
+
+
+class TestMalformedValuesSurviveAsRawStrings:
+    """The one place the source's behavior is deliberately NOT adopted.
+
+    ``EnvSettingsSource`` raises on a complex value it cannot decode. The
+    overlay instead keeps the raw string so it reaches ``model_validate``,
+    which names the field — the diagnostic the load path's warning is built
+    on. Dropping the variable, or substituting a default, would be the silent
+    degrade this module exists to prevent.
+    """
+
+    def test_one_malformed_value_keeps_the_rest(self) -> None:
+        env = {
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": "{not json",
+            "MEMTOMEM_STM_PROXY__ENABLED": "true",
+        }
+
+        assert collect_proxy_env_overrides(env) == {
+            "upstream_servers": "{not json",
+            "enabled": "true",
+        }
+
+    def test_a_malformed_value_a_later_payload_replaced_is_not_restored(self) -> None:
+        """Order decides whether a malformed value is still there to keep.
+
+        Re-inserting one settings had already replaced would overwrite the
+        payload that WON with the string that lost — turning an overlay
+        settings accepts into one validation rejects, which is the opposite of
+        this path's purpose. The reverse order is the control above.
+        """
+        env = {
+            "MEMTOMEM_STM_PROXY__TOOLGRAPH__ARGS": "not-a-list",
+            "MEMTOMEM_STM_PROXY__TOOLGRAPH": '{"args": ["serve"]}',
+        }
+
+        assert collect_proxy_env_overrides(env) == {"toolgraph": {"args": ["serve"]}}
+
+    def test_several_malformed_values_are_all_kept(self) -> None:
+        """Attribution is by exclusion, so it has to find every culprit, not
+        just the first one settings happened to raise on."""
+        env = {
+            "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": "{not json",
+            "MEMTOMEM_STM_PROXY__CACHE": "[unclosed",
+            "MEMTOMEM_STM_PROXY__TOOLGRAPH__ARGS": "not-a-list",
+            "MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS": "9999",
+        }
+
+        assert collect_proxy_env_overrides(env) == {
+            "upstream_servers": "{not json",
+            "cache": "[unclosed",
+            "toolgraph": {"args": "not-a-list"},
+            "default_max_result_chars": "9999",
+        }
+
+    def test_a_malformed_value_reaches_validation_naming_its_field(self) -> None:
+        """The point of keeping it raw: the error names the field the operator
+        has to fix. A dropped variable would validate cleanly and run a config
+        the operator never wrote."""
+        overrides = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY__CACHE": "[unclosed"})
+
+        with pytest.raises(ValidationError) as caught:
+            ProxyConfig.model_validate(overrides)
+
+        assert caught.value.errors()[0]["loc"] == ("cache",)
 
 
 class TestDeepMerge:
