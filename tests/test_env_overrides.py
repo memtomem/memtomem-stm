@@ -1275,6 +1275,55 @@ class TestLeaveOneOutAttribution:
 
         assert hint == ""
 
+    def test_repair_only_variable_stays_blocked_beside_an_env_echoed_error(self) -> None:
+        """Diff review: the repairer-guard relaxation must be variable-
+        specific. Here the overlay ECHOES the file's duplicate prefixes (so
+        the overlay alone reproduces the error) while one variable only
+        repairs the empty `c` prefix — removing that variable from the
+        overlay alone does NOT clear the duplicate, so the guard holds and
+        the repair-only variable is not named."""
+        file_data = {
+            "upstream_servers": {
+                "a": {"prefix": "x", "command": "a-mcp"},
+                "b": {"prefix": "x", "command": "b-mcp"},
+                "c": {"prefix": "   ", "command": "c-mcp"},
+            }
+        }
+        hint = self._hint(
+            {
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__A__PREFIX": "x",
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__B__PREFIX": "x",
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__C__PREFIX": "c",
+            },
+            file_data,
+        )
+
+        assert "C__PREFIX" not in hint
+
+    def test_noop_ancestor_that_reproduces_nothing_alone_is_not_named(self) -> None:
+        """Diff review: ancestry is not supply. The empty aggregate sits
+        above the failing loc and every removal is a no-op (payload and
+        deeper var supply the same value), but only the variables that ALONE
+        reproduce the error are named."""
+        file_data = {
+            "upstream_servers": {"gh": {"prefix": "gh", "command": "gh-mcp"}}
+        }
+        hint = self._hint(
+            {
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": "{}",
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH": (
+                    '{"hybrid": {"head_chars": -1}}'
+                ),
+                "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__HYBRID__HEAD_CHARS": "-1",
+            },
+            file_data,
+        )
+
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH" in hint
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__HYBRID__HEAD_CHARS" in hint
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS," not in hint
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS)" not in hint
+
     def test_identical_root_error_in_file_and_env_stays_file_attributed(self) -> None:
         """R3, adjudicated: when the file alone reproduces the root error and
         no removal changes it (an env payload shadowing the file with the

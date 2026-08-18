@@ -501,7 +501,10 @@ def _env_override_hint(
        skips model/root validators when a trial introduces a field error
        elsewhere — such a disappearance is masking, not causation) and is
        not one the file produces alone (revealing a file-alone error means
-       the variable was REPAIRING the file, and a repairer is not a causer).
+       the variable was REPAIRING the file, and a repairer is not a causer —
+       unless removing that same variable from the overlay ALONE also clears
+       the error, which proves the variable env-caused it and the reveal is
+       just model validators raising-and-stopping).
        Both guards are waived for a variable at-or-above the error's loc
        when the overlay supplies that loc — the shape where the variable
        supplied the failing value itself, which may legitimately also reveal
@@ -511,7 +514,9 @@ def _env_override_hint(
        every live variable whose path prefix-relates to the loc is named
        (for ``missing``, relative to the parent entry; a root error relates
        to all), excluding repairers and variables whose removal changed
-       nothing; an error the file DOES reproduce names only variables
+       nothing — unless such a variable ALONE reproduces the error (two
+       variables supplying the same failing value make every single removal
+       a no-op); an error the file DOES reproduce names only variables
        at-or-above the loc, and only when the overlay's value there is a
        non-dict — an observable scalar/container overwrite — since a
        dict-valued aggregate under a model validator is ambiguous.
@@ -554,12 +559,9 @@ def _attribute_env_overrides(
     fragment = overlay.fragment
     merged_keys = frozenset(_error_key(e) for e in merged_errors)
     file_alone_keys = _validation_error_keys(file_data)
-    # What the overlay reproduces ON ITS OWN. Model validators raise-and-stop,
-    # so a trial can swap an env-caused root error for the file's own root
-    # error at the same loc — the reveal then looks like a repair. An error
-    # the overlay reproduces alone is env-caused regardless of that reveal,
-    # so it lifts the repairer guard (the file-alone validation is the same
-    # probe in the other direction).
+    # What the overlay reproduces ON ITS OWN — the entry condition for the
+    # variable-specific repairer-guard relaxation below (the file-alone
+    # validation is the same probe in the other direction).
     env_alone_keys = _validation_error_keys(fragment) if file_data is not None else frozenset()
     merged_data = _deep_merge(file_data, fragment) if file_data is not None else fragment
     live = _live_var_paths(scoped)
@@ -582,6 +584,27 @@ def _attribute_env_overrides(
             trials[name] = None
         else:
             trials[name] = (frozenset(), trial_data)
+
+    # Lazy per-variable probes for the two places a whole-overlay fact is not
+    # variable-specific enough (both from the diff review): what the overlay
+    # WITHOUT one variable reproduces on its own, and what one variable ALONE
+    # (with the file) reproduces.
+    env_alone_without: dict[str, frozenset[_ErrorKey]] = {}
+    solo_keys: dict[str, frozenset[_ErrorKey]] = {}
+
+    def _env_alone_without(name: str) -> frozenset[_ErrorKey]:
+        if name not in env_alone_without:
+            remaining = {k: v for k, v in scoped.items() if k != name}
+            frag = _fragment_for(remaining, overlay.malformed - {name}) if remaining else {}
+            env_alone_without[name] = _validation_error_keys(frag)
+        return env_alone_without[name]
+
+    def _solo_keys(name: str) -> frozenset[_ErrorKey]:
+        if name not in solo_keys:
+            frag = _fragment_for({name: scoped[name]}, overlay.malformed & {name})
+            data = _deep_merge(file_data, frag) if file_data is not None else frag
+            solo_keys[name] = _validation_error_keys(data)
+        return solo_keys[name]
 
     implicated: set[str] = set()
     for err in merged_errors:
@@ -610,9 +633,24 @@ def _attribute_env_overrides(
                 continue
             revealed = trial_keys - merged_keys
             masked = any(r[0] != loc for r in revealed)
-            repaired = key not in env_alone_keys and any(r in file_alone_keys for r in revealed)
-            if repaired:
-                repairers.add(name)
+            repaired = False
+            if any(r in file_alone_keys for r in revealed):
+                # Revealing a file-alone error means this variable was
+                # repairing the file — unless THIS variable's own removal
+                # clears the error inside the overlay alone (model validators
+                # raise-and-stop, so an env-caused root error can swap for
+                # the file's under removal, :952). The probe must be
+                # variable-specific: one variable reproducing the error in
+                # the overlay must not lift the guard for a repair-only
+                # sibling (diff review), and its own reveals at other locs
+                # are the same masking confound.
+                repaired = True
+                if key in env_alone_keys:
+                    without = _env_alone_without(name)
+                    if key not in without and all(r[0] == loc for r in (without - env_alone_keys)):
+                        repaired = False
+                if repaired:
+                    repairers.add(name)
             if masked or repaired:
                 continue
             clean.add(name)
@@ -622,26 +660,29 @@ def _attribute_env_overrides(
 
         # A no-op trial usually means the variable contributed nothing — but
         # when two variables supply the SAME value at the error's loc, every
-        # single removal is a no-op (the sibling keeps the value alive). A
-        # variable at-or-above a loc whose overlay value is an observable
-        # non-dict is supplier-shaped and stays a fallback candidate.
-        def _supplier_shaped(path: tuple[str, ...]) -> bool:
-            return (
-                reaches and not isinstance(overlay_at_loc, dict) and loc_strs[: len(path)] == path
-            )
+        # single removal is a no-op (the sibling keeps the value alive). The
+        # rescue is variable-specific sufficiency, not ancestry (diff
+        # review): the variable stays a fallback candidate only when it ALONE
+        # (with the file) reproduces this error — an empty payload above the
+        # loc is an ancestor but reproduces nothing.
+        def _noop_supplies(name: str) -> bool:
+            return key in _solo_keys(name)
 
         if key not in file_alone_keys:
             rel = loc_strs[:-1] if err.get("type") == "missing" else loc_strs
             for name, path in live:
-                if name in repairers or (name in noops and not _supplier_shaped(path)):
+                if name in repairers or (name in noops and not _noop_supplies(name)):
                     continue
                 if path[: len(rel)] == rel or rel[: len(path)] == path:
                     implicated.add(name)
         elif reaches and not isinstance(overlay_at_loc, dict):
-            # The gate above makes every at-or-above candidate
-            # supplier-shaped, so a no-op removal does not disqualify here
-            # either (file and env holding the identical broken value).
+            # File/env overdetermination that passed the pre-filter: only
+            # observable non-dict overwrites at the loc qualify, and a no-op
+            # removal (file and env holding the identical broken value) needs
+            # the same solo sufficiency.
             for name, path in live:
+                if name in noops and not _noop_supplies(name):
+                    continue
                 if loc_strs[: len(path)] == path:
                     implicated.add(name)
     if not implicated:
