@@ -8,8 +8,10 @@ The table below lists one row per leaf setting. A whole nested block can also be
 supplied as one JSON object at its parent name — `MEMTOMEM_STM_PROXY__CACHE` for
 every `MEMTOMEM_STM_PROXY__CACHE__*` leaf — including optional blocks such as
 `MEMTOMEM_STM_PROXY__EXTRACTION__LLM`, and the top-level block itself
-(`MEMTOMEM_STM_PROXY` as one JSON object for the whole proxy config). A deeper
-variable always wins over the enclosing block payload, in either order.
+(`MEMTOMEM_STM_PROXY` as one JSON object for the whole proxy config). For a
+top-level field payload like `MEMTOMEM_STM_PROXY`, a deeper variable wins in
+either order; nested block payloads (`MEMTOMEM_STM_PROXY__CACHE`) resolve
+against deeper variables last-one-wins by environment order.
 
 Environment values have the highest precedence. `~/.memtomem/stm_proxy.json`
 loads `ProxyConfig` only; root, surfacing, formation, hook, daemon, Langfuse,

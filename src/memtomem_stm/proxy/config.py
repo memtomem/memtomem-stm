@@ -121,10 +121,11 @@ def _var_path(name: str) -> tuple[str, ...]:
     (``…__UPSTREAM_SERVERS____PREFIX`` configures the server named "").
 
     The bare block name (``MEMTOMEM_STM_PROXY``, one JSON payload for the
-    whole block, #840) is the empty path: it owns the entire ``proxy``
-    subtree, so every prefix rule — a later bare payload covers every earlier
-    variable; a later deeper variable merges into it — falls out of the
-    ordinary tuple-prefix comparisons.
+    whole block, #840) is the empty path: it addresses the entire ``proxy``
+    subtree, and the ordinary tuple-prefix comparisons place it at-or-above
+    every location. It never COVERS a deeper variable, in either order —
+    settings reads it as the base value that exploded variables deep-update —
+    which ``_live_var_paths`` encodes explicitly.
     """
     if len(name) == len(_PROXY_ENV_BARE):
         return ()
@@ -136,9 +137,13 @@ def _live_var_paths(scoped: dict[str, str]) -> list[tuple[str, tuple[str, ...]]]
 
     The proxy-scoped reading of ``live_env_paths``: settings resolves a mapping
     parent and a deeper child last-one-wins, so a variable whose path a LATER
-    variable covers wrote nothing into the result.
+    variable covers wrote nothing into the result. The bare block payload
+    (empty path) is the exception — it is the base deeper variables
+    deep-update, never a coverer.
     """
-    return live_env_paths([(name, _var_path(name)) for name in scoped])
+    entries = [(name, _var_path(name)) for name in scoped]
+    non_covering = frozenset(name for name, path in entries if not path)
+    return live_env_paths(entries, non_covering=non_covering)
 
 
 def _fragment_for(scoped: dict[str, str], malformed: frozenset[str]) -> dict[str, Any]:
@@ -250,6 +255,21 @@ def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> EnvOve
     try:
         fragment = _settings_proxy_fragment(scoped)
         malformed: frozenset[str] = frozenset()
+        if bare in scoped:
+            decoded_bare = json.loads(scoped[bare])  # decodable, or settings had raised
+            if decoded_bare is not None and not isinstance(decoded_bare, dict):
+                # `[]`, a string, a number: settings decodes it, validation
+                # rejects the server outright — while the overlay would
+                # silently resolve to nothing and let diagnostics describe a
+                # config that cannot start. (`null` IS consistent: settings
+                # falls back to the field default, which is exactly what an
+                # empty overlay expresses.)
+                logger.warning(
+                    "Ignoring non-object %s payload (%s) — the server itself "
+                    "rejects this environment at startup",
+                    names[bare],
+                    type(decoded_bare).__name__,
+                )
     except SettingsError:
         malformed = frozenset(name for name in scoped if _fails_to_decode(name, scoped[name]))
         if bare in malformed and any(name == bare for name, _ in _live_var_paths(scoped)):
@@ -857,7 +877,7 @@ def _attribute_env_overrides(
 def live_env_paths(
     entries: list[tuple[str, tuple[str, ...]]],
     *,
-    min_cover_len: int = 1,
+    non_covering: frozenset[str] = frozenset(),
 ) -> list[tuple[str, tuple[str, ...]]]:
     """The entries a later one did not cover, keeping order.
 
@@ -868,21 +888,21 @@ def live_env_paths(
     variable that goes DEEPER does not cover it: settings merges that on top
     and both are really present.
 
-    ``min_cover_len`` excludes exact-FIELD-NAME payloads from ever covering:
-    settings reads the field's own env var as the BASE value and deep-updates
-    the delimiter-exploded variables on top, so such a payload loses to a
-    deeper variable in EITHER order (oracle-pinned, #840). Callers pass the
-    path length of their exact-name form: the proxy-scoped overlay's bare
-    ``MEMTOMEM_STM_PROXY`` is the empty path (so the default 1 excludes it);
-    ``env_var_hint_for_validation_error``'s block names are length-1 paths
-    (it passes 2).
+    ``non_covering`` names entries that never cover a deeper variable:
+    exact-FIELD-NAME object payloads, which settings reads as the BASE value
+    and deep-updates the delimiter-exploded variables on top of, so such a
+    payload loses to a deeper variable in EITHER order (oracle-pinned,
+    #840). Callers decide membership — the rule is about *object payloads on
+    a field's own name*, not about path length: a scalar root variable
+    (``…_LOG_LEVEL=INVALID``) genuinely discards a descendant settings
+    ignores, and must keep covering it.
     """
     return [
         (name, path)
         for index, (name, path) in enumerate(entries)
         if not any(
-            len(later) >= min_cover_len and path[: len(later)] == later
-            for _, later in entries[index + 1 :]
+            later_name not in non_covering and path[: len(later)] == later
+            for later_name, later in entries[index + 1 :]
         )
     ]
 
@@ -962,9 +982,25 @@ def env_var_hint_for_validation_error(
 
     # First position, last value — the collapse settings applies to
     # case-equivalent names — then drop the variables a later one covered. A
-    # length-1 path is a field's own name, whose payload is the BASE deeper
-    # variables deep-update — it never covers them (#840).
-    live = live_env_paths([(name, path) for path, name in var_paths.items()], min_cover_len=2)
+    # length-1 path is a field's own name; when its value is a JSON OBJECT it
+    # is the base payload deeper variables deep-update, never a coverer
+    # (#840). A scalar root value keeps covering: settings ignores the
+    # descendants of a scalar field, so resurrecting them would name
+    # variables that contributed nothing.
+    entries = [(name, path) for path, name in var_paths.items()]
+
+    def _is_object_payload(name: str, path: tuple[str, ...]) -> bool:
+        if len(path) != 1:
+            return False
+        try:
+            return isinstance(json.loads(env[name]), dict)
+        except (TypeError, ValueError):
+            return False
+
+    live = live_env_paths(
+        entries,
+        non_covering=frozenset(n for n, p in entries if _is_object_payload(n, p)),
+    )
 
     implicated: set[str] = set()
     for err in exc.errors():

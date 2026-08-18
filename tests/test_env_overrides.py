@@ -1923,3 +1923,34 @@ class TestBareProxyPayload:
 
         with pytest.raises(SettingsError):
             STMConfig()
+
+    def test_non_object_bare_payload_warns_and_resolves_to_nothing(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """`[]` (or a string, or a number) decodes fine but the server
+        rejects the config outright — the overlay cannot represent it, so it
+        warns instead of letting diagnostics describe a config that cannot
+        start."""
+        with caplog.at_level(logging.WARNING):
+            overrides = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY": "[]"})
+
+        assert overrides.fragment == {}
+        assert any("non-object" in r.getMessage() for r in caplog.records)
+
+    def test_null_bare_payload_is_consistent_silence(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`null` makes settings fall back to the field default — exactly
+        what an empty overlay expresses — so no warning; pinned against
+        ``STMConfig`` accepting the same environment."""
+        from memtomem_stm.config import STMConfig
+
+        with caplog.at_level(logging.WARNING):
+            overrides = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY": "null"})
+
+        assert overrides.fragment == {}
+        assert not caplog.records
+        for name in [n for n in os.environ if n.upper().startswith("MEMTOMEM_STM_PROXY")]:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY", "null")
+        assert STMConfig().proxy.default_max_result_chars == 16000

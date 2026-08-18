@@ -488,3 +488,18 @@ class TestBareBlockPayloadCovering:
         assert "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES" in env_var_hint_for_validation_error(
             caught.value
         )
+
+    def test_scalar_root_variable_still_covers_its_ignored_descendant(self, tmp_path, clean_env):
+        """The base-payload exemption is about OBJECT payloads: a scalar root
+        value genuinely discards a descendant settings ignores, and the hint
+        must not resurrect it (codex review of #845)."""
+        clean_env.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(tmp_path / "absent.json"))
+        clean_env.setenv("MEMTOMEM_STM_LOG_LEVEL__IGNORED", "DEBUG")
+        clean_env.setenv("MEMTOMEM_STM_LOG_LEVEL", "INVALID")
+
+        with pytest.raises(ValidationError) as caught:
+            STMConfig()
+
+        hint = env_var_hint_for_validation_error(caught.value)
+        assert "MEMTOMEM_STM_LOG_LEVEL" in hint
+        assert "IGNORED" not in hint
