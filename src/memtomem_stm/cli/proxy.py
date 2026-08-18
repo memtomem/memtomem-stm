@@ -7716,6 +7716,9 @@ def doctor(
     # governs, so a transcript must say what was actually checked. A
     # ``default_map``-mapped value reports "--config" — Click counts it as an
     # explicit parameter source, and so does ``_explicit_config_path``.
+    # The env label renders the canonical spelling even when a
+    # case-equivalent variable or the bare MEMTOMEM_STM_PROXY payload named
+    # the file — the resolver honors every spelling settings does.
     source_label = {
         "flag": "from --config",
         "env": f"from {_CONFIG_PATH_ENV}",

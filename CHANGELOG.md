@@ -25,8 +25,11 @@ changes inline only. See the deprecation policy in
   **Behavior change**: no-flag runs with the env var set now act on the
   env-named file (previously the default file); help text renders the default
   as `[default: (~/.memtomem/stm_proxy.json)]` (Click's dynamic-default
-  form); a present-but-empty env value resolves relative to the working
-  directory, matching the server.
+  form). Every env spelling the server honors steers the CLI the same way
+  (case-equivalents and the bare `MEMTOMEM_STM_PROXY` JSON payload included);
+  a present-but-empty value falls back to the default file — the server
+  degrades on the directory it coerces to, and a CLI command needs a real
+  file target.
 
 - **`mms add --from-clients` no longer saves a prefix longer than the
   tool-name hard limit once a truncated base collides 99 times** (#825).
