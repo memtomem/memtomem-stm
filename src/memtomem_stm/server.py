@@ -29,6 +29,7 @@ from memtomem_stm.logging_setup import STDERR_FORMAT, configure_server_logging
 from memtomem_stm.proxy.compression_feedback import CompressionFeedbackTracker
 from memtomem_stm.proxy.config import (
     ProxyConfig,
+    EnvOverlayResult,
     collect_proxy_env_overrides,
     env_var_hint_for_validation_error,
     model_upstream_inert_state,
@@ -95,7 +96,9 @@ class STMContext:
 CtxType = Context[STMContext, Any]
 
 
-def _apply_proxy_file_config(config: STMConfig, proxy_env_overrides: dict[str, Any]) -> str | None:
+def _apply_proxy_file_config(
+    config: STMConfig, proxy_env_overrides: EnvOverlayResult
+) -> str | None:
     """Load the JSON config file and overlay env vars on top of it, in place.
 
     Returns the load error when the file exists but failed to parse/validate
