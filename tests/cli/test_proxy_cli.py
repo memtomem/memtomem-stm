@@ -4495,6 +4495,31 @@ class TestInitMcpRegistration:
     stub) and replace ``_run_claude_mcp`` with an in-process recorder so
     assertions can check exact argv."""
 
+    def test_registration_command_survives_partial_env_override(self, tmp_path, monkeypatch):
+        """#839 (review round 1): ``_registration_command`` serializes the
+        ``--config`` path into the registration env but resolved the runtime
+        policy from a bare ``STMConfig()`` — a per-field env override of a
+        server only that file declares crashed ``init``/``register``."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config = tmp_path / "stm_proxy.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {"fake": {"prefix": "fk", "command": "file-server"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-server")
+
+        _cmd, _args, env = proxy_mod._registration_command(config)
+
+        # The policy resolves against the same file the env line names.
+        assert env["MEMTOMEM_STM_PROXY__CONFIG_PATH"] == str(config.expanduser().resolve())
+        assert env["MEMTOMEM_STM_SURFACING__USE_DAEMON"] == "true"
+
     @pytest.fixture
     def no_discovery(self, monkeypatch):
         from memtomem_stm.cli import proxy as proxy_mod

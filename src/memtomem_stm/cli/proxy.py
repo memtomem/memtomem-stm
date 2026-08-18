@@ -691,8 +691,11 @@ def _registration_command(config_path: Path) -> tuple[str, list[str], dict[str, 
     env = {"MEMTOMEM_STM_PROXY__CONFIG_PATH": str(config_path.expanduser().resolve())}
     # A newly managed MCP host uses the shared warm daemon.  Serialize the
     # deadline and privacy policy as well: GUI-launched clients often do not
-    # inherit the shell environment in which `mms register` ran.
-    policy = resolve_host_runtime_policy(use_daemon=True)
+    # inherit the shell environment in which `mms register` ran.  The policy
+    # resolves against the same file the env line above names (#839) —
+    # unconditionally, default path included, because that path is what the
+    # registration being written will read.
+    policy = resolve_host_runtime_policy(use_daemon=True, config_path=config_path)
     env.update(policy.mcp_env())
     return command, ["-m", "memtomem_stm"], env
 
