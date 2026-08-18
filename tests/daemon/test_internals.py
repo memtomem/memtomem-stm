@@ -1441,3 +1441,45 @@ class TestHandshakeCoercionHelpers:
         from memtomem_stm.cli.daemon_cmd import _as_float
 
         assert _as_float(float("inf"), default=0.0) == float("inf")
+
+
+class TestBrokenConfigObservability:
+    """#847: a bare ``STMConfig()`` failure in the daemon paths must leave a
+    legible trace. Outcomes are unchanged — both paths still raise."""
+
+    @pytest.fixture(autouse=True)
+    def _broken_proxy_env(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        for name in [n for n in os.environ if n.startswith("MEMTOMEM_STM_PROXY")]:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv(
+            "MEMTOMEM_STM_PROXY__CONFIG_PATH", str(tmp_path / "absent.json")
+        )
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND", "x")
+
+    def test_daemon_server_run_logs_before_raising(self, caplog):
+        import logging
+
+        from pydantic import ValidationError
+
+        from memtomem_stm.daemon import server as daemon_server
+
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(ValidationError):
+                daemon_server.run(config=None)
+
+        # Previously the construction sat OUTSIDE run()'s exception barrier,
+        # so the failure produced no log line at all.
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND" in caplog.text
+
+    def test_load_config_logs_before_raising(self, caplog):
+        import logging
+
+        from pydantic import ValidationError
+
+        from memtomem_stm.cli.daemon_cmd import _load_config
+
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(ValidationError):
+                _load_config()
+
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND" in caplog.text

@@ -221,6 +221,10 @@ def resolve_host_runtime_policy(
     """
     from memtomem_stm.config import stm_config_for_cli
 
+    # No log line here (#847 review round 1): the command that invoked the
+    # resolution owns the failure's output — ``mms hook install`` renders a
+    # ClickException with the env-var hint, and a resolver-side
+    # ``exc_info`` log printed the raw traceback right before it.
     config = stm_config_for_cli(config_path)
     existing = (
         parse_managed_hook_runtime(existing_command)

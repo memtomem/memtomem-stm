@@ -596,3 +596,56 @@ class TestBareBlockPayloadCovering:
         hint = env_var_hint_for_validation_error(caught.value)
         assert parent in hint
         assert "ENABLED" not in hint
+
+
+class TestLogStmConfigFailure:
+    """``log_stm_config_failure`` — the one consistent line for a failing bare
+    ``STMConfig()`` (#847). Logging only: every caller keeps its own failure
+    path (re-raise into an outer barrier, degrade, exit)."""
+
+    def test_one_warning_naming_the_implicated_var(self, tmp_path, clean_env, caplog):
+        import logging
+
+        from memtomem_stm.config import log_stm_config_failure
+
+        clean_env.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(tmp_path / "absent.json"))
+        clean_env.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND", "hunter2-cmd")
+        with pytest.raises(ValidationError) as caught:
+            STMConfig()
+
+        probe = logging.getLogger("test.log_stm_config_failure")
+        with caplog.at_level(logging.WARNING, logger=probe.name):
+            log_stm_config_failure(caught.value, logger=probe, context="running the probe")
+
+        records = [r for r in caplog.records if r.name == probe.name]
+        assert len(records) == 1
+        assert records[0].levelno == logging.WARNING
+        message = records[0].getMessage()
+        assert "running the probe" in message
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND" in message
+        # The attached exception is the SUPPLIED one — `exc_info=True` would
+        # capture the ambient exception, which is None outside an `except`
+        # block and would silently drop the traceback (review round 2).
+        assert records[0].exc_info is not None
+        assert records[0].exc_info[1] is caught.value
+        # Names only, never values — in the hint and in the attached traceback
+        # (STMConfig sets hide_input_in_errors at the root).
+        assert "hunter2-cmd" not in caplog.text
+
+    def test_non_validation_error_keeps_a_coherent_line(self, caplog):
+        import logging
+
+        from memtomem_stm.config import log_stm_config_failure
+
+        probe = logging.getLogger("test.log_stm_config_failure.other")
+        with caplog.at_level(logging.WARNING, logger=probe.name):
+            log_stm_config_failure(
+                RuntimeError("boom"), logger=probe, context="resolving hook runtime policy"
+            )
+
+        [record] = [r for r in caplog.records if r.name == probe.name]
+        # env_var_hint_for_validation_error returns "" here — no dangling
+        # format artifacts.
+        assert record.getMessage() == (
+            "invalid MEMTOMEM_STM_* configuration while resolving hook runtime policy"
+        )

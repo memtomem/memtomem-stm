@@ -17,6 +17,7 @@ Coverage:
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import tomllib
 from dataclasses import replace
@@ -789,3 +790,37 @@ def _config_has_stm_command(parsed: dict, host: str) -> bool:
             if _is_stm_hook_command(handler.get("command", "")):
                 return True
     return False
+
+
+def test_hook_install_broken_proxy_env_fails_cleanly(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#847 observability: a proxy-subtree env break used to escape ``mms hook
+    install`` as a raw ValidationError traceback. It must now exit non-zero
+    with a clean message naming the implicated var — same failure, legible."""
+    monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND", "x")
+
+    with caplog.at_level(logging.WARNING):
+        result = CliRunner().invoke(cli, ["hook", "install", "--host", "claude"])
+
+    assert result.exit_code == 1
+    assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND" in result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    # The command owns this failure's output (#847 review round 1): no
+    # resolver-side log record prints the raw traceback alongside the clean
+    # ClickException.
+    assert not [r for r in caplog.records if r.exc_info]
+
+
+def test_hook_install_malformed_bare_payload_fails_cleanly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A payload settings cannot even decode raises SettingsError, not
+    ValidationError — it must get the same clean failure (#847 round 2)."""
+    monkeypatch.setenv("MEMTOMEM_STM_PROXY", "{")
+
+    result = CliRunner().invoke(cli, ["hook", "install", "--host", "claude"])
+
+    assert result.exit_code == 1
+    assert "invalid MEMTOMEM_STM_* configuration" in result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)

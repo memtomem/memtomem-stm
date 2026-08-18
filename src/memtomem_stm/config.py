@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 import re
 from pathlib import Path
 
@@ -575,3 +576,41 @@ def stm_config_for_cli(config_path: str | Path | None = None) -> STMConfig:
         return STMConfig()
     # The dict (not ProxyConfig) is load-bearing — see the docstring.
     return STMConfig(proxy={"config_path": str(config_path)})  # type: ignore[arg-type]
+
+
+def log_stm_config_failure(
+    exc: Exception, *, logger: logging.Logger, context: str, exc_info: bool = True
+) -> None:
+    """One consistent line for a failing bare ``STMConfig()`` construction (#847).
+
+    Several CLI/daemon sites construct ``STMConfig()`` to read only the
+    ``surfacing``/``hook`` subtree, but a validation failure anywhere (a broken
+    ``MEMTOMEM_STM_PROXY__*`` override, say) fails the whole construction —
+    and until this line existed, the hook degraded and the daemon died with no
+    attributable trace. Names the implicated ``MEMTOMEM_STM_*`` var(s) via
+    :func:`~memtomem_stm.proxy.config.env_var_hint_for_validation_error` —
+    names only, never values (the attached traceback is covered by the root
+    ``hide_input_in_errors``).
+
+    Logging only, deliberately not a construct-or-``None`` helper: each caller
+    keeps its existing failure path (re-raise into an outer barrier, degrade
+    to pass-through, exit non-zero) — changing WHICH paths fail is the
+    tolerant-construction half of #847, deferred behind its wait-for-signal
+    gate.
+
+    ``exc_info=False`` is for sites that re-raise into a barrier which logs
+    the traceback itself (the hook's pass-through guard): the hint line and
+    the traceback then appear exactly once each instead of the traceback
+    twice per tool call (#847 review round 1). When attaching, pass *exc*
+    itself rather than ``True``: ``True`` captures whatever exception is
+    ambient at call time — ``None`` outside an ``except`` block — not the
+    one this line is reporting.
+    """
+    from memtomem_stm.proxy.config import env_var_hint_for_validation_error
+
+    logger.warning(
+        "invalid MEMTOMEM_STM_* configuration while %s%s",
+        context,
+        env_var_hint_for_validation_error(exc),
+        exc_info=exc if exc_info else None,
+    )

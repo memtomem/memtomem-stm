@@ -695,6 +695,9 @@ def _detect_install_type() -> tuple[str, list[str]]:
 
 def _registration_command(config_path: Path) -> tuple[str, list[str], dict[str, str]]:
     """Stable cross-platform command and environment for new registrations."""
+    from pydantic import ValidationError
+    from pydantic_settings import SettingsError
+
     # Keep a virtualenv's python symlink intact. ``Path.resolve()`` follows it
     # to the base interpreter, which can no longer import the installed STM.
     command = os.path.abspath(sys.executable)
@@ -705,7 +708,21 @@ def _registration_command(config_path: Path) -> tuple[str, list[str], dict[str, 
     # resolves against the same file the env line above names (#839) —
     # unconditionally, default path included, because that path is what the
     # registration being written will read.
-    policy = resolve_host_runtime_policy(use_daemon=True, config_path=config_path)
+    try:
+        policy = resolve_host_runtime_policy(use_daemon=True, config_path=config_path)
+    except (ValidationError, SettingsError) as exc:
+        # A broken MEMTOMEM_STM_* env fails the policy's STMConfig
+        # construction (#847 review round 2). ClickException keeps both
+        # contracts: text mode prints one clean line, and the ``--json``
+        # wrapper renders its error document instead of losing the run to a
+        # raw traceback.
+        from memtomem_stm.proxy.config import env_var_hint_for_validation_error
+
+        detail = env_var_hint_for_validation_error(exc) or f": {_disp(str(exc))}"
+        raise click.ClickException(
+            "invalid MEMTOMEM_STM_* configuration prevented resolving the "
+            "registration's runtime policy" + detail
+        ) from exc
     env.update(policy.mcp_env())
     return command, ["-m", "memtomem_stm"], env
 
@@ -8367,6 +8384,37 @@ def doctor(
                             "PASS",
                             f"configured {hook_current:g}s >= required {hook_recommended:g}s",
                         )
+
+    # Last check: bare env construction — what `mms hook` and the daemon see.
+    # Those paths have no --config flag, so this deliberately ignores the
+    # flag: a broken MEMTOMEM_STM_* env silently degrades hook surfacing/
+    # compression to pass-through and stops the daemon from starting (#847).
+    # WARN, never FAIL: the flag-driven checks above may be fully healthy,
+    # and doctor's exit code must not flip for a degradation the proxy
+    # itself does not share. Runs outside the config_file short-circuit —
+    # it does not read the file.
+    from memtomem_stm.config import STMConfig
+    from memtomem_stm.proxy.config import env_var_hint_for_validation_error
+
+    try:
+        STMConfig()
+    except Exception as exc:
+        check(
+            "env_overrides",
+            "env overrides",
+            "WARN",
+            "bare STMConfig() fails — hook surfacing/compression degrade "
+            "to pass-through (logged per call) and the daemon cannot start"
+            + env_var_hint_for_validation_error(exc),
+            "unset or fix the MEMTOMEM_STM_* variable(s) named above",
+        )
+    else:
+        check(
+            "env_overrides",
+            "env overrides",
+            "PASS",
+            "bare STMConfig() constructs — hook/daemon env path healthy",
+        )
 
     counts = {status: sum(1 for c in checks if c["status"] == status) for status in _DOCTOR_STYLES}
     overall = "fail" if counts["FAIL"] else ("warn" if counts["WARN"] else "pass")
