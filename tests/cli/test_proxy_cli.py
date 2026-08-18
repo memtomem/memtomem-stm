@@ -10184,7 +10184,7 @@ class TestHealth:
         monkeypatch.setattr(
             proxy_mod,
             "_surfacing_bootstrap_status",
-            lambda _timeout: {
+            lambda _timeout, **_kw: {
                 "enabled": None,
                 "feedback_enabled": None,
                 "feedback_db": None,
@@ -11489,6 +11489,30 @@ class TestDoctor:
             data["cache"] = {"tool_annotation_policy": "strict"}
         config.write_text(json.dumps(data), encoding="utf-8")
 
+    def test_config_flag_reaches_stmconfig_backed_checks(self, runner, config, monkeypatch):
+        """#839: ``--config`` must steer the STMConfig-backed checks too.
+
+        A per-field env override of a server the FLAG's file declares used to
+        fail the bare ``STMConfig()`` behind the ``ltm server`` check, because
+        that construction resolved the DEFAULT config path (which declares no
+        such server) — misattributing a config error to a subtree the check
+        does not read, while ``config schema`` (which merges the flag's file
+        itself) passed.
+        """
+        self._stub_probe(monkeypatch)
+        self._healthy_config(config)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-server")
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+        schema_check = self._check_by_id(result, "config_schema")
+        assert schema_check is not None and schema_check["status"] == "PASS", result.output
+        ltm_check = self._check_by_id(result, "ltm")
+        assert ltm_check is not None
+        # Positive control: the expected cause (the fixture's unreachable LTM
+        # command) still renders — the check ran, it just isn't misattributed.
+        assert "validation error" not in ltm_check["detail"], ltm_check["detail"]
+        assert "Field required" not in ltm_check["detail"], ltm_check["detail"]
+
     def test_healthy_config_warn_only_exits_zero(self, runner, config, monkeypatch):
         """정상 scenario: all checks PASS except the expected LTM WARN —
         WARN-only must exit 0 or a fresh install without a memtomem server
@@ -12757,7 +12781,7 @@ class TestDoctor:
         monkeypatch.setattr(
             proxy_mod,
             "_surfacing_bootstrap_status",
-            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False: {
+            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False, config_path=None: {
                 "enabled": True,
                 "feedback_enabled": False,
                 "feedback_db": None,
@@ -12807,7 +12831,7 @@ class TestDoctor:
         monkeypatch.setattr(
             proxy_mod,
             "_surfacing_bootstrap_status",
-            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False: {
+            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False, config_path=None: {
                 "enabled": True,
                 "feedback_enabled": False,
                 "feedback_db": None,
@@ -12851,7 +12875,9 @@ class TestDoctor:
         monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
         calls: list[bool] = []
 
-        def fake_bootstrap(_timeout, *, measure_ltm=False, prefer_hook_daemon=False):
+        def fake_bootstrap(
+            _timeout, *, measure_ltm=False, prefer_hook_daemon=False, config_path=None
+        ):
             assert prefer_hook_daemon is True
             calls.append(measure_ltm)
             return {

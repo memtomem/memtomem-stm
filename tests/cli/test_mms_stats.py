@@ -219,6 +219,57 @@ class TestMmsStats:
         # The file's seeded db is probed — its row shows up.
         assert data["compression"]["total_calls"] == 1
 
+    def test_config_flag_reaches_the_stmconfig_feedback_path(self, runner, tmp_path, monkeypatch):
+        """#839: a per-field env override of a server the ``--config`` file
+        declares used to break the bare ``STMConfig()`` behind the feedback
+        path — silently falling back to the default location and ignoring
+        ``MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH``."""
+        set_home(monkeypatch, tmp_path)
+        config = tmp_path / "stm_proxy.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {"fake": {"prefix": "fk", "command": "file-server"}},
+                }
+            )
+        )
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-server")
+        custom = tmp_path / "custom_feedback.db"
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH", str(custom))
+
+        result = runner.invoke(cli, ["stats", "--config", str(config), "--json"])
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["surfacing"]["path"] == str(custom.resolve())
+
+    def test_no_flag_keeps_env_config_path_governing(self, runner, tmp_path, monkeypatch):
+        """Without an explicit ``--config``, the STMConfig construction stays
+        bare, so ``MEMTOMEM_STM_PROXY__CONFIG_PATH`` still names the file the
+        completion source reads. Passing Click's *default* path instead of
+        ``None`` would beat the env var and regress this."""
+        set_home(monkeypatch, tmp_path)
+        env_config = tmp_path / "env_named.json"
+        env_config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {"fake": {"prefix": "fk", "command": "file-server"}},
+                }
+            )
+        )
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(env_config))
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-server")
+        custom = tmp_path / "custom_feedback.db"
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH", str(custom))
+
+        result = runner.invoke(cli, ["stats", "--json"])
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["surfacing"]["path"] == str(custom.resolve())
+
     def test_missing_file_env_only_uses_pydantic_settings_parse(
         self, runner, tmp_path, monkeypatch
     ):

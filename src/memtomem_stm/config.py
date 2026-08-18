@@ -542,3 +542,30 @@ class STMConfig(BaseSettings):
         # Propagate consumer_model from proxy to surfacing for model-aware defaults
         if self.proxy.consumer_model and not self.surfacing.consumer_model:
             self.surfacing.consumer_model = self.proxy.consumer_model
+
+
+def stm_config_for_cli(config_path: str | Path | None = None) -> STMConfig:
+    """``STMConfig`` built against the config file a CLI command resolved.
+
+    A command's ``--config <path>`` lives in Click and never reaches a bare
+    ``STMConfig()``, which resolves the file from
+    ``MEMTOMEM_STM_PROXY__CONFIG_PATH`` or the field default — so the two can
+    disagree about which file is in play (#839, visible since the completion
+    source made construction file-dependent). Callers pass the path only when
+    the operator spelled it out; ``None`` keeps the bare construction, so the
+    env var still governs when no flag was typed. Precedence: explicit flag >
+    env ``CONFIG_PATH`` > field default.
+
+    The path is injected as a **plain init dict**, which pydantic-settings
+    deep-merges over the env fragment — env-provided ``proxy`` fields survive
+    while ``config_path`` wins per-key, and the completion source reads init
+    before env. A ``ProxyConfig`` instance would replace the field wholesale
+    and silence the env, so never "tidy" this into one. The string stays raw
+    (no ``expanduser``/``resolve``): the field is stored raw by convention and
+    every consumer expands at the use site, matching how the env value
+    arrives.
+    """
+    if config_path is None:
+        return STMConfig()
+    # The dict (not ProxyConfig) is load-bearing — see the docstring.
+    return STMConfig(proxy={"config_path": str(config_path)})  # type: ignore[arg-type]
