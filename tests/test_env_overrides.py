@@ -178,6 +178,15 @@ class TestComplexEnvValuesMatchSettings:
                 ("…__UPSTREAM_SERVERS__FX__ENV__", "v"),
             ],
             [("MEMTOMEM_ſTM_PROXY__ENABLED", "true")],
+            [("MEMTOMEM_STM_PROXY", '{"default_max_result_chars": 4242}')],
+            [
+                ("MEMTOMEM_STM_PROXY", '{"default_max_result_chars": 4242}'),
+                ("…__DEFAULT_MAX_RESULT_CHARS", "9999"),
+            ],
+            [
+                ("…__DEFAULT_MAX_RESULT_CHARS", "9999"),
+                ("MEMTOMEM_STM_PROXY", '{"default_max_result_chars": 4242}'),
+            ],
         ],
         ids=[
             "mapping-parent-first",
@@ -196,6 +205,9 @@ class TestComplexEnvValuesMatchSettings:
             "empty-component-names-a-server",
             "empty-component-inside-a-free-form-dict",
             "unicode-name-that-upper-cases-onto-the-prefix",
+            "bare-block-payload",
+            "bare-payload-then-deeper",
+            "deeper-then-bare-payload",
         ],
     )
     def test_parent_child_and_name_matching_follow_settings(self, monkeypatch, items) -> None:
@@ -1803,3 +1815,142 @@ class TestHintMemoizationAndCost:
                 ProxyConfig.model_validate(data)
             monkeypatch.setenv(var, "sk-test")
             ProxyConfig.model_validate(data)  # the key alone flips the outcome
+
+
+class TestBareProxyPayload:
+    """#840: settings honors the block's own name, ``MEMTOMEM_STM_PROXY``, as
+    one JSON payload for the whole proxy block; the overlay's name filter
+    required the trailing delimiter and dropped it, so with a file present
+    the file silently won over a variable the server honors."""
+
+    def test_bare_payload_reaches_the_overlay(self) -> None:
+        overrides = collect_proxy_env_overrides(
+            {"MEMTOMEM_STM_PROXY": '{"default_max_result_chars": 4242}'}
+        )
+
+        assert overrides.fragment == {"default_max_result_chars": 4242}
+
+    @pytest.mark.parametrize("reverse", [False, True], ids=["bare-first", "deeper-first"])
+    def test_deeper_variable_wins_in_either_order(self, reverse: bool) -> None:
+        """Settings reads the field's own env var as the BASE value and
+        deep-updates exploded variables on top, so the deeper variable wins
+        regardless of environment order — pinned against ``STMConfig`` by the
+        oracle's ``deeper-then-bare-payload`` case."""
+        items = [
+            ("MEMTOMEM_STM_PROXY", '{"default_max_result_chars": 4242}'),
+            ("MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS", "9999"),
+        ]
+        if reverse:
+            items.reverse()
+
+        assert collect_proxy_env_overrides(dict(items)).fragment == {
+            "default_max_result_chars": "9999"
+        }
+
+    def test_env_wins_over_file_through_the_bare_payload(self, tmp_path: Path) -> None:
+        """The consequence #834 had: without the overlay seeing the variable,
+        the file beats a value the server honors."""
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text(json.dumps({"default_max_result_chars": 1111}))
+        overrides = collect_proxy_env_overrides(
+            {"MEMTOMEM_STM_PROXY": '{"default_max_result_chars": 4242}'}
+        )
+
+        cfg = ProxyConfig.load_from_file(cfg_file, env_overrides=overrides)
+
+        assert cfg is not None and cfg.default_max_result_chars == 4242
+
+    def test_error_inside_the_bare_payload_names_it(self) -> None:
+        overrides = collect_proxy_env_overrides(
+            {"MEMTOMEM_STM_PROXY": '{"cache": {"max_entries": -1}}'}
+        )
+        try:
+            ProxyConfig.model_validate(overrides.fragment)
+        except ValidationError as exc:
+            hint = _env_override_hint(exc, overrides)
+        else:  # pragma: no cover - the construction must fail
+            raise AssertionError("expected the overlay to fail validation")
+
+        assert hint == " (env override(s) implicated: MEMTOMEM_STM_PROXY)"
+
+    def test_broken_deeper_variable_is_named_not_the_later_bare_payload(self) -> None:
+        """The covering rule must not let a later bare payload swallow the
+        deeper variable that actually supplies the failing value (the bare
+        payload never covers — it is the base, not the winner)."""
+        overrides = collect_proxy_env_overrides(
+            {
+                "MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES": "-1",
+                "MEMTOMEM_STM_PROXY": '{"cache": {"max_entries": 5}}',
+            }
+        )
+        try:
+            ProxyConfig.model_validate(overrides.fragment)
+        except ValidationError as exc:
+            hint = _env_override_hint(exc, overrides)
+        else:  # pragma: no cover - the construction must fail
+            raise AssertionError("expected the overlay to fail validation")
+
+        assert hint == (" (env override(s) implicated: MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES)")
+
+    def test_malformed_bare_payload_is_dropped_with_a_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A raw string for the WHOLE block has no slot in a dict fragment,
+        and the server refuses to start on it anyway (``STMConfig()``
+        raises), so the overlay warns and keeps the decodable survivors."""
+        with caplog.at_level(logging.WARNING):
+            overrides = collect_proxy_env_overrides(
+                {
+                    "MEMTOMEM_STM_PROXY": "{not json",
+                    "MEMTOMEM_STM_PROXY__ENABLED": "true",
+                }
+            )
+
+        assert overrides.fragment == {"enabled": "true"}
+        assert "memtomem_stm_proxy" in overrides.malformed
+        assert any("MEMTOMEM_STM_PROXY" in r.getMessage() for r in caplog.records)
+
+    def test_settings_rejects_the_malformed_bare_payload_too(self, monkeypatch) -> None:
+        """The oracle for the drop above: the environment the overlay cannot
+        represent is one the server never runs."""
+        from pydantic_settings import SettingsError
+
+        from memtomem_stm.config import STMConfig
+
+        for name in [n for n in os.environ if n.upper().startswith("MEMTOMEM_STM_PROXY")]:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY", "{not json")
+
+        with pytest.raises(SettingsError):
+            STMConfig()
+
+    def test_non_object_bare_payload_warns_and_resolves_to_nothing(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """`[]` (or a string, or a number) decodes fine but the server
+        rejects the config outright — the overlay cannot represent it, so it
+        warns instead of letting diagnostics describe a config that cannot
+        start."""
+        with caplog.at_level(logging.WARNING):
+            overrides = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY": "[]"})
+
+        assert overrides.fragment == {}
+        assert any("non-object" in r.getMessage() for r in caplog.records)
+
+    def test_null_bare_payload_is_consistent_silence(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`null` makes settings fall back to the field default — exactly
+        what an empty overlay expresses — so no warning; pinned against
+        ``STMConfig`` accepting the same environment."""
+        from memtomem_stm.config import STMConfig
+
+        with caplog.at_level(logging.WARNING):
+            overrides = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY": "null"})
+
+        assert overrides.fragment == {}
+        assert not caplog.records
+        for name in [n for n in os.environ if n.upper().startswith("MEMTOMEM_STM_PROXY")]:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY", "null")
+        assert STMConfig().proxy.default_max_result_chars == 16000

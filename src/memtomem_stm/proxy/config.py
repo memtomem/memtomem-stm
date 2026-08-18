@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 _PROXY_ENV_PREFIX = "MEMTOMEM_STM_PROXY__"
+_PROXY_ENV_BARE = _PROXY_ENV_PREFIX[:-2]  # the block's own name, one JSON payload
 
 
 _MISSING = object()
@@ -118,7 +119,16 @@ def _var_path(name: str) -> tuple[str, ...]:
     Empty components are kept, not dropped: settings turns a doubled delimiter
     into an empty *key*, which is a real mapping entry
     (``…__UPSTREAM_SERVERS____PREFIX`` configures the server named "").
+
+    The bare block name (``MEMTOMEM_STM_PROXY``, one JSON payload for the
+    whole block, #840) is the empty path: it addresses the entire ``proxy``
+    subtree, and the ordinary tuple-prefix comparisons place it at-or-above
+    every location. It never COVERS a deeper variable, in either order —
+    settings reads it as the base value that exploded variables deep-update —
+    which ``_live_var_paths`` encodes explicitly.
     """
+    if len(name) == len(_PROXY_ENV_BARE):
+        return ()
     return tuple(name[len(_PROXY_ENV_PREFIX) :].split("__"))
 
 
@@ -127,9 +137,13 @@ def _live_var_paths(scoped: dict[str, str]) -> list[tuple[str, tuple[str, ...]]]
 
     The proxy-scoped reading of ``live_env_paths``: settings resolves a mapping
     parent and a deeper child last-one-wins, so a variable whose path a LATER
-    variable covers wrote nothing into the result.
+    variable covers wrote nothing into the result. The bare block payload
+    (empty path) is the exception — it is the base deeper variables
+    deep-update, never a coverer.
     """
-    return live_env_paths([(name, _var_path(name)) for name in scoped])
+    entries = [(name, _var_path(name)) for name in scoped]
+    non_covering = frozenset(name for name, path in entries if not path)
+    return live_env_paths(entries, non_covering=non_covering)
 
 
 def _fragment_for(scoped: dict[str, str], malformed: frozenset[str]) -> dict[str, Any]:
@@ -162,7 +176,16 @@ def _fragment_for(scoped: dict[str, str], malformed: frozenset[str]) -> dict[str
 
 
 def _insert_raw(fragment: dict[str, Any], path: tuple[str, ...], raw: str) -> None:
-    """Put an undecodable value back at its path, as the raw string."""
+    """Put an undecodable value back at its path, as the raw string.
+
+    The empty path (a malformed bare ``MEMTOMEM_STM_PROXY`` payload) has no
+    slot in a dict fragment — the raw string would BE the whole subtree — so
+    it is skipped here; ``collect_proxy_env_overrides`` warns about it once.
+    The server itself refuses to start on that value (``STMConfig()`` raises
+    ``SettingsError``), so the overlay never diverges from a running config.
+    """
+    if not path:
+        return
     cursor: dict[str, Any] = fragment
     for part in path[:-1]:
         existing = cursor.get(part, _MISSING)
@@ -211,11 +234,16 @@ def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> EnvOve
     # upper-cases onto the prefix (U+017F → "S") while settings, which never
     # upper-cases, ignores the variable entirely.
     prefix = _PROXY_ENV_PREFIX.lower()
+    bare = _PROXY_ENV_BARE.lower()
     scoped: dict[str, str] = {}
     names: dict[str, str] = {}
     for key, val in env.items():
         lowered_key = key.lower()
-        if lowered_key.startswith(prefix):
+        # The bare block name is honored by settings as one JSON payload for
+        # the whole proxy block (#840); requiring the delimiter dropped it,
+        # so with a file present the file silently won over a variable the
+        # server honors. Exact match only: `MEMTOMEM_STM_PROXYX` is neither.
+        if lowered_key == bare or lowered_key.startswith(prefix):
             # Case-equivalent spellings collapse the same way the values do:
             # last one wins, so the rendered name is the spelling that
             # supplied the surviving value.
@@ -227,8 +255,33 @@ def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> EnvOve
     try:
         fragment = _settings_proxy_fragment(scoped)
         malformed: frozenset[str] = frozenset()
+        if bare in scoped:
+            decoded_bare = json.loads(scoped[bare])  # decodable, or settings had raised
+            if decoded_bare is not None and not isinstance(decoded_bare, dict):
+                # `[]`, a string, a number: settings decodes it, validation
+                # rejects the server outright — while the overlay would
+                # silently resolve to nothing and let diagnostics describe a
+                # config that cannot start. (`null` IS consistent: settings
+                # falls back to the field default, which is exactly what an
+                # empty overlay expresses.)
+                logger.warning(
+                    "Ignoring non-object %s payload (%s) — the server itself "
+                    "rejects this environment at startup",
+                    names[bare],
+                    type(decoded_bare).__name__,
+                )
     except SettingsError:
         malformed = frozenset(name for name in scoped if _fails_to_decode(name, scoped[name]))
+        if bare in malformed and any(name == bare for name, _ in _live_var_paths(scoped)):
+            # No dict slot can carry the raw string for the WHOLE block, so
+            # the overlay cannot keep it the way it keeps deeper malformed
+            # values. The server refuses to start on it (`STMConfig()`
+            # raises), so this warning is the CLI-side diagnostic.
+            logger.warning(
+                "Ignoring malformed %s payload (not valid JSON) — the server "
+                "itself rejects this environment at startup",
+                names[bare],
+            )
         fragment = _fragment_for(scoped, malformed)
     return EnvOverlayResult(fragment=fragment, scoped=scoped, names=names, malformed=malformed)
 
@@ -823,6 +876,8 @@ def _attribute_env_overrides(
 
 def live_env_paths(
     entries: list[tuple[str, tuple[str, ...]]],
+    *,
+    non_covering: frozenset[str] = frozenset(),
 ) -> list[tuple[str, tuple[str, ...]]]:
     """The entries a later one did not cover, keeping order.
 
@@ -832,11 +887,23 @@ def live_env_paths(
     the config being complained about, and hides the one that is. A later
     variable that goes DEEPER does not cover it: settings merges that on top
     and both are really present.
+
+    ``non_covering`` names entries that never cover a deeper variable:
+    exact-FIELD-NAME object payloads, which settings reads as the BASE value
+    and deep-updates the delimiter-exploded variables on top of, so such a
+    payload loses to a deeper variable in EITHER order (oracle-pinned,
+    #840). Callers decide membership — the rule is about *object payloads on
+    a field's own name*, not about path length: a scalar root variable
+    (``…_LOG_LEVEL=INVALID``) genuinely discards a descendant settings
+    ignores, and must keep covering it.
     """
     return [
         (name, path)
         for index, (name, path) in enumerate(entries)
-        if not any(path[: len(later)] == later for _, later in entries[index + 1 :])
+        if not any(
+            later_name not in non_covering and path[: len(later)] == later
+            for later_name, later in entries[index + 1 :]
+        )
     ]
 
 
@@ -914,8 +981,55 @@ def env_var_hint_for_validation_error(
         return True
 
     # First position, last value — the collapse settings applies to
-    # case-equivalent names — then drop the variables a later one covered.
-    live = live_env_paths([(name, path) for path, name in var_paths.items()])
+    # case-equivalent names — then two settings-oracle rules before the
+    # covering filter (#840, both codex-reviewed against counterexamples):
+    #
+    # - what a variable IS is what settings RESOLVES it to, alone — never
+    #   ``json.loads`` (a scalar field given ``'{}'`` resolves to the string,
+    #   not a mapping) and never the schema re-derived by hand;
+    # - a variable under an ancestor whose resolved value is NOT a mapping is
+    #   dead in either order — settings ignores descendants of a non-mapping
+    #   parent — and must not be named (this also subsumes scalar roots
+    #   covering their ignored descendants);
+    # - a length-1 entry whose resolved value IS a mapping is the field's own
+    #   base payload, which deeper variables deep-update: it never covers.
+    entries = [(name, path) for path, name in var_paths.items()]
+
+    from memtomem_stm.config import STMConfig  # circular at module level
+
+    resolved_alone: dict[str, Any] = {}
+
+    def _resolved_value(name: str, path: tuple[str, ...]) -> Any:
+        """What settings resolves this one variable to, at its own path."""
+        if name not in resolved_alone:
+            try:
+                node: Any = _MappingEnvSource(STMConfig, {name.lower(): env[name]})()
+            except SettingsError:
+                node = _MISSING
+            else:
+                for part in path:
+                    if not isinstance(node, dict) or part not in node:
+                        node = _MISSING
+                        break
+                    node = node[part]
+            resolved_alone[name] = node
+        return resolved_alone[name]
+
+    def _dead_under_non_mapping_parent(path: tuple[str, ...]) -> bool:
+        for other, other_path in entries:
+            if len(other_path) < len(path) and path[: len(other_path)] == other_path:
+                value = _resolved_value(other, other_path)
+                if value is not _MISSING and not isinstance(value, dict):
+                    return True
+        return False
+
+    entries = [(n, p) for n, p in entries if not _dead_under_non_mapping_parent(p)]
+    live = live_env_paths(
+        entries,
+        non_covering=frozenset(
+            n for n, p in entries if len(p) == 1 and isinstance(_resolved_value(n, p), dict)
+        ),
+    )
 
     implicated: set[str] = set()
     for err in exc.errors():
