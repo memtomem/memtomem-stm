@@ -17,7 +17,7 @@ from typing import Any
 
 import click
 
-from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG
+from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG, resolve_cli_config_path
 from memtomem_stm.cli._display import _disp
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.cli._write_lock import with_config_write_lock, with_write_lock
@@ -468,7 +468,7 @@ def route_cmd(
 
     assert project.config is not None and project.marker_path is not None
     enabled = list(project.config.mcp.enabled)
-    path = Path(config_path if config_path is not None else DEFAULT_PROXY_CONFIG)
+    path = Path(resolve_cli_config_path(config_path).path)
     path = path.expanduser().resolve()
     data = _load(path)
     if "upstream_servers" not in data:

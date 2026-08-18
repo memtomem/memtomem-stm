@@ -24,7 +24,7 @@ from pathlib import Path
 import click
 from pydantic import ValidationError
 
-from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG
+from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG, resolve_cli_config_path
 from memtomem_stm.cli._display import _disp
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.proxy.config import (
@@ -63,12 +63,12 @@ def config_group() -> None:
 @click.option(
     "--config",
     "config_path",
-    default=str(_DEFAULT_CONFIG),
-    show_default=True,
+    default=None,
+    show_default=str(_DEFAULT_CONFIG),
     help="Path to the proxy config JSON.",
 )
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
-def validate_command(config_path: str, as_json: bool) -> None:
+def validate_command(config_path: str | None, as_json: bool) -> None:
     """Strictly validate the config file as written (no env overlay).
 
     Exits non-zero on parse errors, schema validation errors, unknown keys
@@ -76,6 +76,7 @@ def validate_command(config_path: str, as_json: bool) -> None:
     Env vars (MEMTOMEM_STM_PROXY__*) are deliberately not merged: this
     lints the artifact you edit and commit, not the runtime composite.
     """
+    config_path = resolve_cli_config_path(config_path).path
     resolved = Path(config_path).expanduser().resolve()
     errors: list[str] = []
     unknown_keys: list[str] = []

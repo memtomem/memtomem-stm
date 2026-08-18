@@ -396,6 +396,21 @@ def test_route_help_uses_shared_proxy_config_default(runner):
     assert str(DEFAULT_PROXY_CONFIG) in res.output
 
 
+def test_route_no_flag_honors_env_config_path(runner, sandbox, monkeypatch):
+    """#848: an untyped ``--config`` resolves ``MEMTOMEM_STM_PROXY__CONFIG_PATH``
+    — route must update the file the server reads, not the literal default."""
+    _seed_routable_project(runner)
+    config = sandbox["home"] / "env_proxy.json"
+    monkeypatch.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(config))
+
+    res = runner.invoke(project_group, ["route", "--apply", "--json"])
+
+    assert res.exit_code == 0, res.output
+    payload = json.loads(res.output)
+    assert payload["applied"] == ["filesystem", "github"]
+    assert config.exists()
+
+
 def test_route_apply_writes_valid_additive_config_and_is_idempotent(runner, sandbox):
     from memtomem_stm.proxy.config import ProxyConfig
 
