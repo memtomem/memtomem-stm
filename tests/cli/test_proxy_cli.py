@@ -5165,6 +5165,30 @@ class TestRegisterCommand:
         assert payload["ok"] is False
         assert "invalid MEMTOMEM_STM_* configuration" in payload["message"]
 
+    def test_register_json_survives_a_settings_undecodable_payload(
+        self, runner, tmp_path, monkeypatch
+    ):
+        """The SettingsError arm of the same boundary (#847 round 3): a
+        payload settings cannot decode carries a configured value in the
+        variable, so the rendered message must name the failure without
+        echoing it — and the JSON document must survive either way."""
+        set_home(monkeypatch, tmp_path / "home")
+        config = tmp_path / "stm_proxy.json"
+        config.write_text(
+            json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8"
+        )
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY", '{"cache": "s3cret-sentinel"')
+
+        result = runner.invoke(
+            cli, ["register", "--mcp", "json", "--json", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["ok"] is False
+        assert "invalid MEMTOMEM_STM_* configuration" in payload["message"]
+        assert "s3cret-sentinel" not in result.output
+
     def test_register_runs_flow_when_config_exists(self, runner, config, fake_claude):
         """With a config present, ``mms register`` drops straight into the
         3-way prompt. Option 3 (skip) prints the manual hints."""
