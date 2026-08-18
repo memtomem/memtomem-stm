@@ -46,7 +46,7 @@ from typing import Any
 
 from memtomem_stm.cli.hook_adapter import CanonicalHookCall
 from memtomem_stm.cli.hook_cmd import run_surfacing_hook
-from memtomem_stm.config import STMConfig, _is_loopback_host
+from memtomem_stm.config import STMConfig, _is_loopback_host, log_stm_config_failure
 from memtomem_stm.daemon import discovery, locking
 from memtomem_stm.daemon.latency import DaemonLatencyTracker, LatencyKind, LatencyOutcome
 from memtomem_stm.utils.anyio_shutdown import is_clean_cancel_scope_shutdown
@@ -1040,7 +1040,14 @@ def run(config: STMConfig | None = None) -> int:
     lands in that file. Re-raise after logging so the exit code still reflects
     the failure — this only adds observability.
     """
-    cfg = config if config is not None else STMConfig()
+    try:
+        cfg = config if config is not None else STMConfig()
+    except Exception as exc:
+        # The construction used to sit outside the barrier below, so a broken
+        # MEMTOMEM_STM_* env killed the daemon with no trace in the file log
+        # this docstring promises (#847). Log with the env-var hint, re-raise.
+        log_stm_config_failure(exc, logger=logger, context="starting the daemon server")
+        raise
     try:
         return asyncio.run(DaemonServer(cfg).serve())
     except (RuntimeError, ExceptionGroup) as e:

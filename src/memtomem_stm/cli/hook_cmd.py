@@ -474,12 +474,18 @@ async def _run_surfacing_hook_inner(
 
     # Lazy imports: keep ``mms hook --help`` and unrelated CLI paths off the
     # surfacing/MCP import cost.
-    from memtomem_stm.config import STMConfig
+    from memtomem_stm.config import STMConfig, log_stm_config_failure
     from memtomem_stm.surfacing.engine import SurfacingEngine
     from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
     from memtomem_stm.surfacing.observability import SurfacingObservability
 
-    surfacing_cfg = STMConfig().surfacing
+    try:
+        surfacing_cfg = STMConfig().surfacing
+    except Exception as exc:
+        # Observability only (#847): the outer barrier still turns this into
+        # the `{}` pass-through, but no longer silently.
+        log_stm_config_failure(exc, logger=logger, context="running the surfacing hook")
+        raise
     if not surfacing_cfg.enabled:
         return {}
 
@@ -623,11 +629,15 @@ async def _run_hook(
     """
     bounded = _bounded_call(call)
     if _daemon_enabled():
-        from memtomem_stm.config import STMConfig
+        from memtomem_stm.config import STMConfig, log_stm_config_failure
         from memtomem_stm.daemon import client
 
         if config is None:
-            config = STMConfig()
+            try:
+                config = STMConfig()
+            except Exception as exc:
+                log_stm_config_failure(exc, logger=logger, context="routing the hook to the daemon")
+                raise
         # Reject ineligible calls (surfacing globally off, non-PostToolUse, or
         # a non-allowlisted tool) before routing to / spawning the daemon — an
         # off-target hook call must not warm a pointless daemon. The cold path
@@ -763,12 +773,18 @@ async def _orchestrate(
     knowledge; compression still runs here in the hook process (it needs the
     original ``tool_response`` object, which is not transmitted).
     """
-    from memtomem_stm.config import STMConfig
+    from memtomem_stm.config import STMConfig, log_stm_config_failure
 
     call = adapter.parse(payload)
     if call is None:  # unusable payload → pass the tool output through untouched
         return {}
-    config = STMConfig()
+    try:
+        config = STMConfig()
+    except Exception as exc:
+        # Raised before the compression/surfacing split, so this one failure
+        # kills both halves — the hint line is the only attributable trace.
+        log_stm_config_failure(exc, logger=logger, context="orchestrating the hook")
+        raise
     replacement_allowed = (
         adapter.can_replace_output
         if allow_output_replacement is None
@@ -1168,6 +1184,10 @@ def hook_install_command(
     under the hook-host write lock, with plan and apply in one locked span so
     concurrent mms runs cannot interleave (the host app's own concurrent writes
     are caught by ``apply_change``'s staleness guard instead)."""
+    from pydantic import ValidationError
+
+    from memtomem_stm.proxy.config import env_var_hint_for_validation_error
+
     # Lazy import: the lock machinery pulls in ``mms.state`` (pydantic), and
     # this module is imported on the per-tool-call hook hot path.
     from memtomem_stm.cli import hook_hosts
@@ -1196,6 +1216,14 @@ def hook_install_command(
             # messages interpolate a config path and a parser's own text, and
             # this is where they become terminal output (#780).
             raise click.ClickException(_disp(str(exc))) from exc
+        except ValidationError as exc:
+            # A broken MEMTOMEM_STM_* env fails the policy's STMConfig
+            # construction (#847). Same non-zero exit, but a message naming
+            # the implicated var instead of a raw traceback.
+            raise click.ClickException(
+                "invalid MEMTOMEM_STM_* configuration prevented resolving the "
+                "hook runtime policy" + env_var_hint_for_validation_error(exc)
+            ) from exc
         hint = ["mms", "hook", "install", "--host", host]
         if surfacing_timeout is not None:
             hint.extend(["--surfacing-timeout", format_seconds(surfacing_timeout)])

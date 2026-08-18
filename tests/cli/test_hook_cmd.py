@@ -1227,3 +1227,21 @@ class TestHookPreviewAndErrorsEscape:
         assert res.exit_code != 0
         assert "\x1b" not in res.output and "\r" not in res.output
         assert "\\u001B" in res.output and "\\u000D" in res.output
+
+
+def test_cli_broken_proxy_env_passes_through_and_logs_the_hint(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """#847 observability: a proxy-subtree env break still degrades to `{}`
+    exit 0 (the always-exit-0 contract), but no longer silently — the log
+    names the implicated MEMTOMEM_STM_* var so the degradation is
+    attributable."""
+    import logging
+
+    monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND", "x")
+    with caplog.at_level(logging.WARNING):
+        result = CliRunner().invoke(cli, ["hook"], input=json.dumps(_READ_PAYLOAD))
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {}
+    assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND" in caplog.text

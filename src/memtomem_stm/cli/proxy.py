@@ -8368,6 +8368,37 @@ def doctor(
                             f"configured {hook_current:g}s >= required {hook_recommended:g}s",
                         )
 
+    # Last check: bare env construction — what `mms hook` and the daemon see.
+    # Those paths have no --config flag, so this deliberately ignores the
+    # flag: a broken MEMTOMEM_STM_* env silently degrades hook surfacing/
+    # compression to pass-through and stops the daemon from starting (#847).
+    # WARN, never FAIL: the flag-driven checks above may be fully healthy,
+    # and doctor's exit code must not flip for a degradation the proxy
+    # itself does not share. Runs outside the config_file short-circuit —
+    # it does not read the file.
+    from memtomem_stm.config import STMConfig
+    from memtomem_stm.proxy.config import env_var_hint_for_validation_error
+
+    try:
+        STMConfig()
+    except Exception as exc:
+        check(
+            "env_overrides",
+            "env overrides",
+            "WARN",
+            "bare STMConfig() fails — hook surfacing/compression silently "
+            "degrade to pass-through and the daemon cannot start"
+            + env_var_hint_for_validation_error(exc),
+            "unset or fix the MEMTOMEM_STM_* variable(s) named above",
+        )
+    else:
+        check(
+            "env_overrides",
+            "env overrides",
+            "PASS",
+            "bare STMConfig() constructs — hook/daemon env path healthy",
+        )
+
     counts = {status: sum(1 for c in checks if c["status"] == status) for status in _DOCTOR_STYLES}
     overall = "fail" if counts["FAIL"] else ("warn" if counts["WARN"] else "pass")
 

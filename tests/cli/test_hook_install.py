@@ -789,3 +789,16 @@ def _config_has_stm_command(parsed: dict, host: str) -> bool:
             if _is_stm_hook_command(handler.get("command", "")):
                 return True
     return False
+
+
+def test_hook_install_broken_proxy_env_fails_cleanly(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#847 observability: a proxy-subtree env break used to escape ``mms hook
+    install`` as a raw ValidationError traceback. It must now exit non-zero
+    with a clean message naming the implicated var — same failure, legible."""
+    monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND", "x")
+
+    result = CliRunner().invoke(cli, ["hook", "install", "--host", "claude"])
+
+    assert result.exit_code == 1
+    assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND" in result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)

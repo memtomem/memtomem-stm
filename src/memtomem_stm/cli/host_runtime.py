@@ -12,10 +12,13 @@ variables remain the source of truth at runtime.
 
 from __future__ import annotations
 
+import logging
 import math
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 _DAEMON_GRACE_SECONDS = 1.0
 
@@ -219,9 +222,15 @@ def resolve_host_runtime_policy(
     entry's environment, so the policy must resolve against it too — a bare
     construction reads the default/env path, which can name a different file.
     """
-    from memtomem_stm.config import stm_config_for_cli
+    from memtomem_stm.config import log_stm_config_failure, stm_config_for_cli
 
-    config = stm_config_for_cli(config_path)
+    try:
+        config = stm_config_for_cli(config_path)
+    except Exception as exc:
+        # Observability only (#847): callers keep their own failure handling
+        # (hook install renders a ClickException; init/register still abort).
+        log_stm_config_failure(exc, logger=logger, context="resolving hook runtime policy")
+        raise
     existing = (
         parse_managed_hook_runtime(existing_command)
         if existing_command is not None

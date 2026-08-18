@@ -11658,6 +11658,41 @@ class TestDoctor:
         assert default_check["status"] == "FAIL"
         assert "(default)" in default_check["detail"]
 
+    def test_env_overrides_check_warns_on_a_broken_bare_construction(
+        self, runner, config, monkeypatch
+    ):
+        """#847 observability: the ``env_overrides`` check constructs a bare
+        ``STMConfig()`` under the ambient env — exactly what the hook and the
+        daemon see (deliberately NOT ``--config``-injected). A proxy-subtree
+        break WARNs (never FAIL: the flag-driven proxy may be fully healthy)
+        and names the implicated var."""
+        self._stub_probe(monkeypatch)
+        self._healthy_config(config)
+        # Per-field override of a server only the FLAG's file declares: the
+        # --config-injected checks complete it from that file (#838/#846), so
+        # every numbered check stays healthy — but the bare construction
+        # resolves the (absent) default path and fails. Exactly the hook's
+        # and the daemon's view.
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-server")
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+
+        env_check = self._check_by_id(result, "env_overrides")
+        assert env_check is not None, result.output
+        assert env_check["status"] == "WARN"
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND" in env_check["detail"]
+        assert result.exit_code == 0, result.output  # WARN-only never exits 1
+
+    def test_env_overrides_check_passes_on_a_healthy_env(self, runner, config, monkeypatch):
+        self._stub_probe(monkeypatch)
+        self._healthy_config(config)
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+
+        env_check = self._check_by_id(result, "env_overrides")
+        assert env_check is not None, result.output
+        assert env_check["status"] == "PASS"
+
     def test_healthy_config_warn_only_exits_zero(self, runner, config, monkeypatch):
         """정상 scenario: all checks PASS except the expected LTM WARN —
         WARN-only must exit 0 or a fresh install without a memtomem server
@@ -13388,6 +13423,7 @@ class TestDoctor:
             "cache_policy",
             "tuning",
             "ltm",
+            "env_overrides",
         ]
         assert data["servers"]["fake"]["stage"] == "tools_discovered"
         assert data["surfacing"]["ltm_server"]["connected"] is False
@@ -13440,7 +13476,13 @@ class TestDoctor:
         assert result.exit_code == 1
         data = json.loads(result.output)
         assert data["status"] == "fail"
-        assert [c["id"] for c in data["checks"]] == ["config_file", "config_json"]
+        # env_overrides runs outside the config-file short-circuit — it does
+        # not read the file (#847).
+        assert [c["id"] for c in data["checks"]] == [
+            "config_file",
+            "config_json",
+            "env_overrides",
+        ]
         assert "servers" not in data
         assert "surfacing" not in data
 

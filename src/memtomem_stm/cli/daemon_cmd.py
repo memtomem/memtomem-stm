@@ -49,9 +49,24 @@ def _warn(s: str) -> str:
 
 
 def _load_config() -> STMConfig:
-    from memtomem_stm.config import STMConfig
+    from memtomem_stm.config import STMConfig, log_stm_config_failure
 
-    return STMConfig()
+    try:
+        return STMConfig()
+    except Exception as exc:
+        # #847 observability: this runs BEFORE _configure_logging (the config
+        # names the destination), so give the line a stderr handler the way
+        # server.main() does, then re-raise — every daemon subcommand still
+        # exits non-zero exactly as before. A detached run's failure stays
+        # file-less (data_dir is unknowable from a config that will not
+        # build); `mms doctor`'s env_overrides check covers that hole.
+        from memtomem_stm.logging_setup import STDERR_FORMAT
+
+        logging.basicConfig(level=logging.WARNING, format=STDERR_FORMAT)
+        log_stm_config_failure(
+            exc, logger=logging.getLogger(__name__), context="loading the daemon configuration"
+        )
+        raise
 
 
 def _as_int(value: Any, default: int = -1) -> int:
