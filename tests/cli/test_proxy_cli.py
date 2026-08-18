@@ -4539,11 +4539,14 @@ class TestInitMcpRegistration:
     def test_registration_uses_the_default_path_over_ambient_config_path(
         self, tmp_path, monkeypatch
     ):
-        """The "default included" half of the round-1 fix: registering the
-        Click-default path while ambient ``CONFIG_PATH`` names another file
-        must resolve the policy against the file being REGISTERED — that is
-        the path the env line serializes, and gating on explicitness here
-        would hand the completion to a file the registration never reads."""
+        """The "default included" half of the round-1 fix: whatever path
+        ``_registration_command`` is HANDED, the policy resolves against that
+        file and the env line serializes it — gating on explicitness here
+        would hand the completion to a file the registration never reads.
+        This pins the direct-call contract only; at the command layer an
+        untyped ``--config`` resolves ambient ``CONFIG_PATH`` first (#848,
+        ``test_register_no_flag_resolves_the_env_named_config``), so the
+        default path in this scenario now requires typing it."""
         from memtomem_stm.cli import proxy as proxy_mod
 
         home = tmp_path / "home"

@@ -245,10 +245,14 @@ class TestMmsStats:
         assert data["surfacing"]["path"] == str(custom.resolve())
 
     def test_no_flag_keeps_env_config_path_governing(self, runner, tmp_path, monkeypatch):
-        """Without an explicit ``--config``, the STMConfig construction stays
-        bare, so ``MEMTOMEM_STM_PROXY__CONFIG_PATH`` still names the file the
-        completion source reads. Passing Click's *default* path instead of
-        ``None`` would beat the env var and regress this."""
+        """Without an explicit ``--config``, ``MEMTOMEM_STM_PROXY__CONFIG_PATH``
+        names the file BOTH halves read. The STMConfig half stays a bare
+        construction (an untyped flag resolves to the env path, but
+        ``_explicit_config_path`` still reports it non-explicit, keeping the
+        env-parse semantics of ``stm_config_for_cli(None)``), and since #848
+        the file-loading half resolves the same env path instead of Click's
+        literal default — the config_status/servers assertions below pin that
+        second half."""
         set_home(monkeypatch, tmp_path)
         env_config = tmp_path / "env_named.json"
         env_config.write_text(
@@ -269,6 +273,11 @@ class TestMmsStats:
         assert result.exit_code == 0, result.output
         data = json.loads(result.output)
         assert data["surfacing"]["path"] == str(custom.resolve())
+        # File half (#848): the env-named file was loaded — not the absent
+        # default path, which would report config_status "missing" and 0
+        # servers.
+        assert data["config_status"] == "ok"
+        assert data["servers"] == 1
 
     def test_missing_file_env_only_uses_pydantic_settings_parse(
         self, runner, tmp_path, monkeypatch

@@ -491,8 +491,13 @@ def _explicit_config_path(config_path: str) -> str | None:
     STMConfig-backed checks honor the flag only when Click reports a
     non-default source for it — typed on the command line, or mapped via
     ``default_map`` (#839); otherwise ``MEMTOMEM_STM_PROXY__CONFIG_PATH``
-    keeps governing the bare construction. Outside a Click context (a helper
-    called directly in tests), the caller's value is trusted as explicit.
+    keeps governing the bare construction. Since #848 callers pass the
+    ``resolve_cli_config_path``-resolved value (an untyped flag resolves to
+    the env path before this gate), so returning ``None`` here hands the SAME
+    file to the bare construction — the gate now only preserves
+    ``stm_config_for_cli(None)``'s env-parse semantics, not which file wins.
+    Outside a Click context (a helper called directly in tests), the caller's
+    value is trusted as explicit.
     """
     ctx = click.get_current_context(silent=True)
     if ctx is None:
