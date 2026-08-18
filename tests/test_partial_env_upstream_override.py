@@ -503,3 +503,44 @@ class TestBareBlockPayloadCovering:
         hint = env_var_hint_for_validation_error(caught.value)
         assert "MEMTOMEM_STM_LOG_LEVEL" in hint
         assert "IGNORED" not in hint
+
+    def test_scalar_root_with_object_looking_value_still_covers(self, tmp_path, clean_env):
+        """codex #845 R2: `'{}'` on a scalar field resolves to the STRING —
+        json-looking is not object-payload. The ignored descendant must not
+        be resurrected, in either order."""
+        clean_env.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(tmp_path / "absent.json"))
+        clean_env.setenv("MEMTOMEM_STM_LOG_LEVEL__IGNORED", "DEBUG")
+        clean_env.setenv("MEMTOMEM_STM_LOG_LEVEL", "{}")
+
+        with pytest.raises(ValidationError) as caught:
+            STMConfig()
+
+        hint = env_var_hint_for_validation_error(caught.value)
+        assert "MEMTOMEM_STM_LOG_LEVEL" in hint
+        assert "IGNORED" not in hint
+
+    @pytest.mark.parametrize(
+        ("parent", "child"),
+        [
+            ("MEMTOMEM_STM_PROXY", "MEMTOMEM_STM_PROXY__ENABLED"),
+            ("MEMTOMEM_STM_PROXY__CACHE", "MEMTOMEM_STM_PROXY__CACHE__ENABLED"),
+        ],
+        ids=["root-parent", "nested-parent"],
+    )
+    def test_descendant_of_a_non_mapping_parent_is_dead_in_either_order(
+        self, tmp_path, clean_env, parent, child
+    ):
+        """codex #845 R2: settings ignores descendants of a non-mapping
+        parent regardless of environment order — the hint must not name the
+        ignored descendant (the parent-first order is the one the plain
+        later-covers rule missed)."""
+        clean_env.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(tmp_path / "absent.json"))
+        clean_env.setenv(parent, "[]")
+        clean_env.setenv(child, "true")
+
+        with pytest.raises(ValidationError) as caught:
+            STMConfig()
+
+        hint = env_var_hint_for_validation_error(caught.value)
+        assert parent in hint
+        assert "ENABLED" not in hint

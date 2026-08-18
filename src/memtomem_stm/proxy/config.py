@@ -981,25 +981,54 @@ def env_var_hint_for_validation_error(
         return True
 
     # First position, last value — the collapse settings applies to
-    # case-equivalent names — then drop the variables a later one covered. A
-    # length-1 path is a field's own name; when its value is a JSON OBJECT it
-    # is the base payload deeper variables deep-update, never a coverer
-    # (#840). A scalar root value keeps covering: settings ignores the
-    # descendants of a scalar field, so resurrecting them would name
-    # variables that contributed nothing.
+    # case-equivalent names — then two settings-oracle rules before the
+    # covering filter (#840, both codex-reviewed against counterexamples):
+    #
+    # - what a variable IS is what settings RESOLVES it to, alone — never
+    #   ``json.loads`` (a scalar field given ``'{}'`` resolves to the string,
+    #   not a mapping) and never the schema re-derived by hand;
+    # - a variable under an ancestor whose resolved value is NOT a mapping is
+    #   dead in either order — settings ignores descendants of a non-mapping
+    #   parent — and must not be named (this also subsumes scalar roots
+    #   covering their ignored descendants);
+    # - a length-1 entry whose resolved value IS a mapping is the field's own
+    #   base payload, which deeper variables deep-update: it never covers.
     entries = [(name, path) for path, name in var_paths.items()]
 
-    def _is_object_payload(name: str, path: tuple[str, ...]) -> bool:
-        if len(path) != 1:
-            return False
-        try:
-            return isinstance(json.loads(env[name]), dict)
-        except (TypeError, ValueError):
-            return False
+    from memtomem_stm.config import STMConfig  # circular at module level
 
+    resolved_alone: dict[str, Any] = {}
+
+    def _resolved_value(name: str, path: tuple[str, ...]) -> Any:
+        """What settings resolves this one variable to, at its own path."""
+        if name not in resolved_alone:
+            try:
+                node: Any = _MappingEnvSource(STMConfig, {name.lower(): env[name]})()
+            except SettingsError:
+                node = _MISSING
+            else:
+                for part in path:
+                    if not isinstance(node, dict) or part not in node:
+                        node = _MISSING
+                        break
+                    node = node[part]
+            resolved_alone[name] = node
+        return resolved_alone[name]
+
+    def _dead_under_non_mapping_parent(path: tuple[str, ...]) -> bool:
+        for other, other_path in entries:
+            if len(other_path) < len(path) and path[: len(other_path)] == other_path:
+                value = _resolved_value(other, other_path)
+                if value is not _MISSING and not isinstance(value, dict):
+                    return True
+        return False
+
+    entries = [(n, p) for n, p in entries if not _dead_under_non_mapping_parent(p)]
     live = live_env_paths(
         entries,
-        non_covering=frozenset(n for n, p in entries if _is_object_payload(n, p)),
+        non_covering=frozenset(
+            n for n, p in entries if len(p) == 1 and isinstance(_resolved_value(n, p), dict)
+        ),
     )
 
     implicated: set[str] = set()
