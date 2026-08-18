@@ -551,10 +551,15 @@ def stm_config_for_cli(config_path: str | Path | None = None) -> STMConfig:
     ``STMConfig()``, which resolves the file from
     ``MEMTOMEM_STM_PROXY__CONFIG_PATH`` or the field default — so the two can
     disagree about which file is in play (#839, visible since the completion
-    source made construction file-dependent). Callers pass the path only when
-    the operator spelled it out; ``None`` keeps the bare construction, so the
-    env var still governs when no flag was typed. Precedence: explicit flag >
-    env ``CONFIG_PATH`` > field default.
+    source made construction file-dependent). ``None`` keeps the bare
+    construction, where the env var governs. Who passes a path differs by
+    caller class: diagnostic commands (doctor/health/stats) pass it only when
+    the operator spelled the flag out (``_explicit_config_path``), while
+    registration (``_registration_command``) passes its path unconditionally,
+    default included — that path is serialized into the managed entry's
+    environment, so the policy must resolve against the same file. For a
+    passed path the precedence is: that path > env ``CONFIG_PATH`` > field
+    default.
 
     The path is injected as a **plain init dict**, which pydantic-settings
     deep-merges over the env fragment — env-provided ``proxy`` fields survive

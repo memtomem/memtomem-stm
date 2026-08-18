@@ -4520,6 +4520,39 @@ class TestInitMcpRegistration:
         assert env["MEMTOMEM_STM_PROXY__CONFIG_PATH"] == str(config.expanduser().resolve())
         assert env["MEMTOMEM_STM_SURFACING__USE_DAEMON"] == "true"
 
+    def test_registration_uses_the_default_path_over_ambient_config_path(
+        self, tmp_path, monkeypatch
+    ):
+        """The "default included" half of the round-1 fix: registering the
+        Click-default path while ambient ``CONFIG_PATH`` names another file
+        must resolve the policy against the file being REGISTERED — that is
+        the path the env line serializes, and gating on explicitness here
+        would hand the completion to a file the registration never reads."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        home = tmp_path / "home"
+        set_home(monkeypatch, home)
+        default_path = Path("~/.memtomem/stm_proxy.json").expanduser()
+        default_path.parent.mkdir(parents=True, exist_ok=True)
+        default_path.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {"fake": {"prefix": "fk", "command": "file-server"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        other = tmp_path / "other.json"
+        other.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(other))
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__FAKE__COMMAND", "env-server")
+
+        _cmd, _args, env = proxy_mod._registration_command(Path("~/.memtomem/stm_proxy.json"))
+
+        assert env["MEMTOMEM_STM_PROXY__CONFIG_PATH"] == str(default_path.resolve())
+        assert env["MEMTOMEM_STM_SURFACING__USE_DAEMON"] == "true"
+
     @pytest.fixture
     def no_discovery(self, monkeypatch):
         from memtomem_stm.cli import proxy as proxy_mod
