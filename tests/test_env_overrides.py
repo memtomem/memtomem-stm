@@ -1466,6 +1466,28 @@ class TestLeaveOneOutAttribution:
 
         assert hint == (" (env override(s) implicated: MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES)")
 
+    def test_repairer_exposing_the_next_check_of_the_same_validator(self) -> None:
+        """Diff review R5: one model validator holds several distinct checks
+        that all raise ``value_error`` at the same loc. The env variable
+        repairs the first check, exposing the second — a repair, not a
+        cause, even though the revealed error shares (loc, type) with the
+        file's. Check identity is the value-masked message template."""
+        hint = self._hint(
+            {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__MAX_RECONNECT_DELAY_SECONDS": "50"},
+            {
+                "upstream_servers": {
+                    "gh": {
+                        "prefix": "gh",
+                        "command": "gh-mcp",
+                        "reconnect_delay_seconds": 40,
+                        "call_timeout_seconds": 200,
+                    }
+                }
+            },
+        )
+
+        assert hint == ""
+
     def test_identical_root_error_in_file_and_env_stays_file_attributed(self) -> None:
         """R3, adjudicated: when the file alone reproduces the root error and
         no removal changes it (an env payload shadowing the file with the

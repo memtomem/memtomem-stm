@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import types
 from collections.abc import Mapping
 from urllib.parse import urlparse
@@ -398,6 +399,25 @@ def _error_key(e: ErrorDetails) -> _ErrorKey:
     return (tuple(e.get("loc", ())), str(e.get("type", "")), str(e.get("msg", "")))
 
 
+def _error_template(key: _ErrorKey) -> _ErrorKey:
+    """The error key with value-shaped tokens masked out of the message.
+
+    Validator messages are format strings embedding the offending values
+    (``reconnect_delay_seconds (40.0) must be <= …``), so two firings of the
+    SAME check differ only in those tokens, while two DISTINCT checks that
+    share ``(loc, type)`` — model validators raising ``ValueError`` at the
+    same model — keep different wording. Masking numbers and quoted strings
+    recovers the check's identity without knowing the schema; two distinct
+    checks whose wording differs only in values would be conflated, which is
+    accepted (the masking is syntactic, never a re-derivation of validator
+    semantics).
+    """
+    loc, typ, msg = key
+    msg = re.sub(r"'[^']*'", "'#'", msg)
+    msg = re.sub(r"-?\d+(?:\.\d+)?", "#", msg)
+    return (loc, typ, msg)
+
+
 def _validation_error_keys(data: dict[str, Any] | None) -> frozenset[_ErrorKey]:
     """Error keys *data* reproduces ON ITS OWN under the lenient validation.
 
@@ -615,9 +635,25 @@ def _attribute_env_overrides(
             solo_keys[name] = _validation_error_keys(_solo_fragment(name))
         return solo_keys[name]
 
+    solo_with_file_keys: dict[str, frozenset[_ErrorKey]] = {}
+
+    def _solo_with_file_keys(name: str) -> frozenset[_ErrorKey]:
+        # The candidate's fragment completed by the file — the probe for an
+        # env-internal swap, where the file's half of an entry (its prefix)
+        # is needed before the failing validator even runs. Never consulted
+        # for a repair-shaped reveal, where it would be vacuous: reveals of
+        # file-alone keys with a single live variable make this probe the
+        # merged config itself.
+        if name not in solo_with_file_keys:
+            frag = _solo_fragment(name)
+            data = _deep_merge(file_data, frag) if file_data is not None else frag
+            solo_with_file_keys[name] = _validation_error_keys(data)
+        return solo_with_file_keys[name]
+
     implicated: set[str] = set()
     for err in merged_errors:
         key = _error_key(err)
+        key_template = _error_template(key)
         loc = tuple(err.get("loc", ()))
         loc_strs = tuple(str(part) for part in loc)
         overlay_at_loc = _overlay_value_at(fragment, loc) if loc else _MISSING
@@ -625,12 +661,19 @@ def _attribute_env_overrides(
         if key in file_alone_keys and not reaches:
             continue  # exclusively file-caused
 
-        def _solo_causes(name: str) -> bool:
-            # The variable's own fragment, validated alone, reproduces this
-            # error — the candidate-specific evidence a confounded trial
-            # needs. File-free on purpose: a repairing variable's file-merged
-            # probe is the merged config itself and reproduces everything.
-            return key in _solo_keys(name)
+        def _solo_causes(name: str, revealed: frozenset[_ErrorKey]) -> bool:
+            # Candidate-specific evidence for a confounded trial: the
+            # variable's own fragment reproduces this error. Which probe
+            # depends on the reveal's shape — a reveal containing a
+            # file-alone key is repair-shaped, and the evidence must be
+            # FILE-FREE (a repairing variable's file-merged probe is the
+            # merged config itself and reproduces everything vacuously);
+            # a purely env-internal reveal means at least two live variables
+            # are interacting, and the probe may borrow the file's half of
+            # the entry (the prefix that lets the failing validator run).
+            if any(r in file_alone_keys for r in revealed):
+                return key in _solo_keys(name)
+            return key in _solo_with_file_keys(name)
 
         clean: set[str] = set()
         swapped: set[str] = set()
@@ -645,22 +688,25 @@ def _attribute_env_overrides(
                 continue
             if key in trial_keys:
                 continue  # removal did not clear this error
-            if loc and any(r[0] == loc and r[1] == key[1] for r in trial_keys):
-                # Same validator at the same non-root loc re-fired with a
-                # different message (validators embed the offending values):
-                # the error MUTATED, it did not clear — a contextual pair
-                # like head_chars/min_head_chars would otherwise read as
-                # cleared-plus-revealed in both directions and nobody would
-                # be named (diff review R3). Root errors keep full-key
-                # identity: distinct validators share ``value_error`` there,
-                # and the message is what tells them apart.
+            if loc and any(_error_template(r) == key_template for r in trial_keys):
+                # The same CHECK re-fired at the same non-root loc with
+                # different embedded values: the error MUTATED, it did not
+                # clear — a contextual pair like head_chars/min_head_chars
+                # would otherwise read as cleared-plus-revealed in both
+                # directions and nobody would be named (diff review R3).
+                # Check identity is the masked message template, not
+                # (loc, type): one model validator can hold several distinct
+                # checks that all raise ``value_error`` at the same loc, and
+                # a repair that exposes the NEXT check must not read as a
+                # mutation of the first (diff review R5). Root errors keep
+                # full-key identity throughout.
                 continue
             revealed = {
                 r
                 for r in trial_keys - merged_keys
-                if not (r[0] and any(m[0] == r[0] and m[1] == r[1] for m in merged_keys))
+                if not (r[0] and any(_error_template(m) == _error_template(r) for m in merged_keys))
             }
-            if revealed and not _solo_causes(name):
+            if revealed and not _solo_causes(name, frozenset(revealed)):
                 # The removal did not just clear the error, it swapped it for
                 # others: pydantic masks model validators behind new field
                 # errors, and raise-and-stop root validators surface the next
