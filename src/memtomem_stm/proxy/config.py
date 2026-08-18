@@ -559,10 +559,6 @@ def _attribute_env_overrides(
     fragment = overlay.fragment
     merged_keys = frozenset(_error_key(e) for e in merged_errors)
     file_alone_keys = _validation_error_keys(file_data)
-    # What the overlay reproduces ON ITS OWN — the entry condition for the
-    # variable-specific repairer-guard relaxation below (the file-alone
-    # validation is the same probe in the other direction).
-    env_alone_keys = _validation_error_keys(fragment) if file_data is not None else frozenset()
     merged_data = _deep_merge(file_data, fragment) if file_data is not None else fragment
     live = _live_var_paths(scoped)
 
@@ -585,25 +581,26 @@ def _attribute_env_overrides(
         else:
             trials[name] = (frozenset(), trial_data)
 
-    # Lazy per-variable probes for the two places a whole-overlay fact is not
-    # variable-specific enough (both from the diff review): what the overlay
-    # WITHOUT one variable reproduces on its own, and what one variable ALONE
-    # (with the file) reproduces.
-    env_alone_without: dict[str, frozenset[_ErrorKey]] = {}
+    # Lazy per-variable sufficiency probes: what one variable ALONE resolves
+    # to, and what that fragment reproduces WITHOUT the file. Every place a
+    # removal trial is ambiguous — it revealed other errors, or it changed
+    # nothing because a sibling supplies the same value — asks these instead
+    # of any whole-overlay, ancestry, or file-merged fact, which two
+    # diff-review rounds showed over-attribute (a repair-only sibling, an
+    # empty ancestor payload, a file error inherited into the probe: for a
+    # single-variable overlay a file-merged probe IS the merged config, so it
+    # reproduces every error vacuously).
+    solo_fragments: dict[str, dict[str, Any]] = {}
     solo_keys: dict[str, frozenset[_ErrorKey]] = {}
 
-    def _env_alone_without(name: str) -> frozenset[_ErrorKey]:
-        if name not in env_alone_without:
-            remaining = {k: v for k, v in scoped.items() if k != name}
-            frag = _fragment_for(remaining, overlay.malformed - {name}) if remaining else {}
-            env_alone_without[name] = _validation_error_keys(frag)
-        return env_alone_without[name]
+    def _solo_fragment(name: str) -> dict[str, Any]:
+        if name not in solo_fragments:
+            solo_fragments[name] = _fragment_for({name: scoped[name]}, overlay.malformed & {name})
+        return solo_fragments[name]
 
     def _solo_keys(name: str) -> frozenset[_ErrorKey]:
         if name not in solo_keys:
-            frag = _fragment_for({name: scoped[name]}, overlay.malformed & {name})
-            data = _deep_merge(file_data, frag) if file_data is not None else frag
-            solo_keys[name] = _validation_error_keys(data)
+            solo_keys[name] = _validation_error_keys(_solo_fragment(name))
         return solo_keys[name]
 
     implicated: set[str] = set()
@@ -615,8 +612,16 @@ def _attribute_env_overrides(
         reaches = overlay_at_loc is not _MISSING
         if key in file_alone_keys and not reaches:
             continue  # exclusively file-caused
+
+        def _solo_causes(name: str) -> bool:
+            # The variable's own fragment, validated alone, reproduces this
+            # error — the candidate-specific evidence a confounded trial
+            # needs. File-free on purpose: a repairing variable's file-merged
+            # probe is the merged config itself and reproduces everything.
+            return key in _solo_keys(name)
+
         clean: set[str] = set()
-        repairers: set[str] = set()
+        swapped: set[str] = set()
         noops: set[str] = set()
         for name, path in live:
             trial = trials[name]
@@ -628,63 +633,48 @@ def _attribute_env_overrides(
                 continue
             if key in trial_keys:
                 continue  # removal did not clear this error
-            if reaches and loc_strs[: len(path)] == path:
-                clean.add(name)  # supplied the failing value itself
-                continue
             revealed = trial_keys - merged_keys
-            masked = any(r[0] != loc for r in revealed)
-            repaired = False
-            if any(r in file_alone_keys for r in revealed):
-                # Revealing a file-alone error means this variable was
-                # repairing the file — unless THIS variable's own removal
-                # clears the error inside the overlay alone (model validators
-                # raise-and-stop, so an env-caused root error can swap for
-                # the file's under removal, :952). The probe must be
-                # variable-specific: one variable reproducing the error in
-                # the overlay must not lift the guard for a repair-only
-                # sibling (diff review), and its own reveals at other locs
-                # are the same masking confound.
-                repaired = True
-                if key in env_alone_keys:
-                    without = _env_alone_without(name)
-                    if key not in without and all(r[0] == loc for r in (without - env_alone_keys)):
-                        repaired = False
-                if repaired:
-                    repairers.add(name)
-            if masked or repaired:
+            if revealed and not _solo_causes(name):
+                # The removal did not just clear the error, it swapped it for
+                # others: pydantic masks model validators behind new field
+                # errors, and raise-and-stop root validators surface the next
+                # error at the same loc — the disappearance proves nothing by
+                # itself (a repairing variable looks exactly like this). Only
+                # a variable that reproduces the error on its own is a
+                # causer here.
+                swapped.add(name)
                 continue
             clean.add(name)
         if clean:
             implicated.update(clean)
             continue
 
-        # A no-op trial usually means the variable contributed nothing — but
-        # when two variables supply the SAME value at the error's loc, every
-        # single removal is a no-op (the sibling keeps the value alive). The
-        # rescue is variable-specific sufficiency, not ancestry (diff
-        # review): the variable stays a fallback candidate only when it ALONE
-        # (with the file) reproduces this error — an empty payload above the
-        # loc is an ancestor but reproduces nothing.
-        def _noop_supplies(name: str) -> bool:
-            return key in _solo_keys(name)
-
         if key not in file_alone_keys:
+            # Certainly env-caused, but no single removal was cleanly
+            # implicating (overdetermined among env vars, or masked in every
+            # trial): coarse path attribution, excluding swap-only clearers
+            # and no-op removals — unless the no-op variable ALONE reproduces
+            # the error (two variables supplying the same failing value make
+            # every single removal a no-op; an empty ancestor payload
+            # reproduces nothing and stays excluded).
             rel = loc_strs[:-1] if err.get("type") == "missing" else loc_strs
             for name, path in live:
-                if name in repairers or (name in noops and not _noop_supplies(name)):
+                if name in swapped or (name in noops and key not in _solo_keys(name)):
                     continue
                 if path[: len(rel)] == rel or rel[: len(path)] == path:
                     implicated.add(name)
         elif reaches and not isinstance(overlay_at_loc, dict):
-            # File/env overdetermination that passed the pre-filter: only
-            # observable non-dict overwrites at the loc qualify, and a no-op
-            # removal (file and env holding the identical broken value) needs
-            # the same solo sufficiency.
+            # File/env overdetermination that passed the pre-filter: name
+            # only variables whose OWN fragment supplies the loc (file `-5`
+            # beside env `-6` — or the identical `-5`), never one that
+            # merely sits above it; only observable non-dict overwrites at
+            # the loc qualify at all.
             for name, path in live:
-                if name in noops and not _noop_supplies(name):
+                if loc_strs[: len(path)] != path:
                     continue
-                if loc_strs[: len(path)] == path:
-                    implicated.add(name)
+                if _overlay_value_at(_solo_fragment(name), loc) is _MISSING:
+                    continue
+                implicated.add(name)
     if not implicated:
         return ""
     rendered = sorted(overlay.names.get(name, name.upper()) for name in implicated)
