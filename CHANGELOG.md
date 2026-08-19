@@ -246,39 +246,50 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - **`mms selection replay` no longer crashes on a malformed `rank` or
-  `candidate_tools`** (#855, closes #854). Three schema-v1 selection records
-  reached the operator as a traceback instead of a report: a
-  `ranked_candidates[].rank` that is a string or `null` hit `int()`, and a
-  `candidate_tools` list holding a non-string element hit `set()`. The
-  evaluator already counts a record whose shape does not hold in
-  `invariant_violations` and keeps scanning; these three coerced before
-  validating and escaped that path, and the CLI catches only
-  `SelectionEvaluationError`. Both sites now validate first, so one unreadable
-  row is a line in the report rather than the end of the run — the record
-  still counts toward `rankable_selections` but not `selected_rank_known`, so
-  an unusable rank reads as an alignment miss rather than a shrunken
-  denominator. A `rank` now feeds the metrics only when the whole entry holds,
-  which also closes `rank: 0` (division by zero in MRR), `rank: -1` (scored as
-  a rank-1 hit), and an oversized integer rank (`float()` overflow).
-  **Behavior change**, in two kinds. *Newly counted as violations* — these
-  turn a `status: ok` report into `status: invalid` and exit 1 where the
-  command previously exited 0: a `candidate_tools` element that is not a
-  string (previously accepted in silence unless it was also unhashable, which
-  crashed), and a `rank` that is not an integer, which now includes
-  `rank: true` (it passed as `True == 1`) and `rank: 1.0` (it was cast to
-  `1`). *Already counted, now also withholding the rank* — status and exit
-  code are unchanged and only the alignment metrics move: **every**
-  entry-shape violation now stops that entry's rank from reaching
-  `selected_rank`, where before the rank was recorded anyway. That covers each
-  condition the check tests — a rank that does not match the entry's position,
-  a `tool` that is not a string, a `tool` repeated within the list, and a
-  `tool` absent from `candidate_tools` — so, for example, a duplicate entry
-  for the selected tool no longer overwrites the first, valid rank, and a
-  `selected_tool` outside `candidate_tools` scores as an alignment miss
-  instead of contributing its rank. Not reachable from STM's own writer, which
-  always stamps an integer rank; reachable from hand-edited logs and other
-  producers. This does not close the whole class: the six numeric fields an
-  admitted record can still overflow or serialize as `NaN` through
+  `candidate_tools`** (#855, closes #854). The evaluator counts a record whose
+  shape does not hold in `invariant_violations` and keeps scanning, so one bad
+  row cannot cost the whole report — but two sites coerced a field before
+  validating it and escaped that path, and the CLI catches only
+  `SelectionEvaluationError`, so the operator got a traceback instead. Both
+  sites now validate first, and a `rank` reaches the metrics only when its
+  whole entry holds. Not reachable from STM's own writer, which always stamps
+  an integer rank and builds `candidate_tools` from prefixed names; reachable
+  from hand-edited logs, an older producer, or a future ranker that widens the
+  field.
+
+  **Behavior change**, grouped by what an operator observes.
+
+  *A traceback becomes a report* (exit 1 via the existing `invalid` status,
+  rather than a stack trace): a `ranked_candidates[].rank` that is absent
+  (`KeyError`), `null` (`TypeError`), a non-numeric string (`ValueError`),
+  `0` (`ZeroDivisionError` in the MRR mean), or an oversized integer
+  (`OverflowError`); and a `candidate_tools` element that is not hashable
+  (`TypeError`).
+
+  *A previously clean report becomes `invalid`*, so the command now exits 1
+  where it exited 0 — but only for inputs no other invariant already caught:
+  a `rank` that is not an integer yet compares equal to the expected one
+  (`true`, since `True == 1`, and `1.0`), and a hashable non-string
+  `candidate_tools` element such as `42`, which was accepted in silence.
+
+  *An already-`invalid` report keeps its status and exit code while its
+  coverage and alignment numbers move*: an entry whose shape the check
+  rejects no longer contributes its rank, where before it was counted as a
+  violation *and* recorded. This drops `selected_rank_known` and the
+  `mrr` denominator, and reads as an alignment miss rather than a shrunken
+  `at_k` denominator. It applies to each condition the entry check tests — a
+  rank that does not match the entry's position (including one that used to be
+  coerced, such as `"1"` or `1.5`), a non-string `tool`, a `tool` repeated
+  within the list, and a `tool` absent from `candidate_tools`. So a duplicate
+  entry for the selected tool no longer overwrites the first, valid rank, and
+  a `selected_tool` outside `candidate_tools` scores as a miss.
+
+  *Unchanged*: the containers around those entries keep their own paths — a
+  `ranked_candidates` that is not a list still contributes nothing and counts
+  no violation, and a non-dict entry still counts one and stops the list.
+
+  This does not close the whole class: the six numeric fields an admitted
+  record can still overflow or serialize as `NaN` through
   (`relevance_score`, `risk_penalty`, `final_score`, `latency_ms`,
   `retry_count`, `cost`) are tracked separately in #856.
 

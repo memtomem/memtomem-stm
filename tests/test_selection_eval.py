@@ -173,10 +173,12 @@ def _malformed_plus_good(malformed: dict) -> list[dict]:
 @pytest.mark.parametrize(
     ("bad_rank", "case"),
     [
-        ("first", "non-numeric"),
-        (None, "missing"),
-        (True, "bool"),
-        (1.0, "float"),
+        ("first", "non-numeric string"),
+        (None, "null"),
+        (True, "bool — used to pass as True == 1"),
+        (1.0, "integral float — used to be cast to 1"),
+        ("1", "numeric string — used to be cast to 1"),
+        (1.5, "fractional float — used to be truncated to 1"),
         (0, "zero — would divide by zero in MRR"),
         (-1, "negative — would score as a rank-1 hit"),
         (10**400, "oversized — would overflow float()"),
@@ -279,6 +281,58 @@ def test_malformed_sibling_entry_does_not_erase_a_valid_selected_rank(
     assert report["production"]["selected_tool_alignment"]["mrr"]["value"] == 1.0
 
 
+def test_absent_rank_key_is_counted_not_raised(tmp_path: Path) -> None:
+    """An absent key is a distinct input class from a null value: it hit KeyError."""
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    del selection["candidate_features"]["ranked_candidates"][0]["rank"]
+    _write_jsonl(log, _malformed_plus_good(selection))
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["status"] == "invalid"
+    assert report["data_quality"]["invariant_violations"] == 1
+    assert report["production"]["coverage"]["selected_rank_known"] == 1
+
+
+def test_unusable_rank_on_a_non_selected_entry_is_still_counted(tmp_path: Path) -> None:
+    """The violation does not depend on the entry being the selected one."""
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    selection["candidate_features"]["ranked_candidates"][1]["rank"] = 2.0
+    _write_jsonl(log, [selection, _execution()])
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["status"] == "invalid"
+    assert report["data_quality"]["invariant_violations"] == 1
+    # The selected entry is untouched, so its rank still reaches the metrics.
+    assert report["production"]["coverage"]["selected_rank_known"] == 1
+    assert report["production"]["selected_tool_alignment"]["mrr"]["value"] == 1.0
+
+
+def test_container_shape_violations_are_unchanged_by_the_entry_gate(tmp_path: Path) -> None:
+    """`entry_ok` governs entries; the containers around them keep their own paths."""
+    not_a_dict = _selection()
+    not_a_dict["candidate_features"]["ranked_candidates"][0] = "not-a-dict"
+    log = tmp_path / "entry.jsonl"
+    _write_jsonl(log, [not_a_dict, _execution()])
+    entry_report = evaluate_selection(telemetry_path=log).data
+
+    not_a_list = _selection()
+    not_a_list["candidate_features"]["ranked_candidates"] = "not-a-list"
+    other = tmp_path / "container.jsonl"
+    _write_jsonl(other, [not_a_list, _execution()])
+    container_report = evaluate_selection(telemetry_path=other).data
+
+    assert entry_report["data_quality"]["invariant_violations"] == 1
+    assert entry_report["production"]["coverage"]["rankable_selections"] == 1
+    # A non-list container never reaches the entry loop at all: no violation.
+    assert container_report["status"] == "ok"
+    assert container_report["data_quality"]["invariant_violations"] == 0
+    assert container_report["production"]["coverage"]["rankable_selections"] == 0
+
+
 def test_hashable_non_string_candidate_tool_is_counted(tmp_path: Path) -> None:
     """A non-string element is a violation whether or not set() chokes on it."""
     log = tmp_path / "selection.jsonl"
@@ -307,6 +361,8 @@ def test_non_string_tool_matching_selected_tool_yields_no_rank(tmp_path: Path) -
     report = evaluate_selection(telemetry_path=log).data
 
     assert report["status"] == "invalid"
+    # Two gates fire: the non-string candidate element and the non-string tool.
+    assert report["data_quality"]["invariant_violations"] == 2
     assert report["production"]["coverage"]["rankable_selections"] == 1
     assert report["production"]["coverage"]["selected_rank_known"] == 0
     assert report["production"]["selected_tool_alignment"]["mrr"]["denominator"] == 0
