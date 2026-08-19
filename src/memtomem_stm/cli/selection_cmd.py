@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
 import click
 
@@ -21,11 +21,13 @@ from memtomem_stm.proxy.selection_eval import (
     evaluate_selection,
     format_selection_report,
 )
+from memtomem_stm.cli._display import _disp
 from memtomem_stm.proxy.selection_log import (
     APPEND_WRITTEN,
     SelectionTelemetryLog,
     discover_log_files,
     find_selection,
+    rotation_lock,
 )
 from memtomem_stm.utils import json_out
 from memtomem_stm.utils.fileio import atomic_write_text
@@ -135,6 +137,11 @@ def replay_command(
 # next write, and one appended label cannot meaningfully grow the file anyway.
 _NEVER_ROTATE = sys.maxsize
 
+# The writer's hold on the rotation lock is a handful of renames, so a brief
+# retry outlasts it; failing after that reports a busy log rather than blocking
+# an operator behind a stuck holder.
+_LOCK_ATTEMPTS = 20
+
 
 @selection_group.command(name="feedback")
 @click.option("--config", "config_path", default=None, show_default=str(_DEFAULT_CONFIG))
@@ -237,30 +244,27 @@ def feedback_command(
     # between ``active → .1`` and the next append leaves the history entirely in
     # backups, and refusing to label it would contradict the default search.
     include_rotated = not active_only
-    segments_before = _segment_identities(telemetry_path, include_rotated)
-    if not segments_before:
+    if not discover_log_files(telemetry_path, include_rotated=include_rotated):
         _feedback_failure(as_json, "no_log", f"selection log not found: {telemetry_path}")
 
-    record = find_selection(
-        telemetry_path,
-        selection_id=selection_id,
-        server=server,
-        tool=tool,
-        include_rotated=include_rotated,
-    )
-    # Rotation renames every segment under the scanner's feet: a scan that
-    # straddles one can miss the newest selections (they move into a file it
-    # already passed) or resolve a selection the same rotation evicted. Detect
-    # it by identity — plain appends never change an inode, a rotation changes
-    # several — and refuse rather than label from a torn read. Detection rather
-    # than a cross-process lock: the proxy's per-call append path must not take
-    # a lock for the benefit of an occasional operator command.
-    if _segment_identities(telemetry_path, include_rotated) != segments_before:
-        _feedback_failure(
-            as_json,
-            "log_rotated",
-            "the log rotated while resolving the target selection; nothing was "
-            "written — re-run to label against the settled log",
+    # Resolve under the rotation lock. Rotation renames every segment at once,
+    # so an unguarded scan can miss the newest selections — they move into a
+    # file it already passed — or resolve one the same rotation evicts. The
+    # writer takes this lock only when it has already decided to rotate and
+    # defers instead of waiting, so holding it here cannot stall a proxied call.
+    with rotation_lock(telemetry_path, attempts=_LOCK_ATTEMPTS) as acquired:
+        if not acquired:
+            _feedback_failure(
+                as_json,
+                "log_busy",
+                "the selection log is being rotated; nothing was written — re-run",
+            )
+        record = find_selection(
+            telemetry_path,
+            selection_id=selection_id,
+            server=server,
+            tool=tool,
+            include_rotated=include_rotated,
         )
     # Resolve before writing: an id that matches nothing would append a label
     # that joins to no selection — silently useless to every reader, and
@@ -289,12 +293,24 @@ def feedback_command(
 
     # Identify the row BEFORE writing, and — when a human is at the terminal —
     # let them stop it. ``--last`` is an inference; the operator is the check on
-    # it, which they cannot be if the label is already on disk.
+    # it, which they cannot be if the label is already on disk. Values are
+    # escaped for display: ``selected_tool`` is upstream-controlled, and an ANSI
+    # or bidi sequence in it could forge the very target being confirmed.
+    if last and not assume_yes and (as_json or not _human_at_the_terminal()):
+        # A formatting flag must not authorize a write, and a script cannot
+        # answer a prompt — the repo-wide rule for a prompting action.
+        _feedback_failure(
+            as_json,
+            "confirmation_required",
+            "--last infers its target; pass --yes to confirm non-interactively",
+            exit_code=2,
+        )
     if not as_json:
         click.echo(
-            f"Selection {resolved_id} ({record.get('server')} / {record.get('selected_tool')})"
+            f"Selection {_disp(resolved_id)} "
+            f"({_disp(str(record.get('server')))} / {_disp(str(record.get('selected_tool')))})"
         )
-    if last and not assume_yes and _human_at_the_terminal():
+    if last and not assume_yes:
         click.confirm("Label this selection?", default=False, abort=True)
 
     # Carry the selection's own trace_id onto the label so the feedback record
@@ -304,14 +320,38 @@ def feedback_command(
     # ``log_feedback``. A stamp this process invented would be a claim about a
     # ranker that never ran for this call.
     ranker_version = record.get("ranker_version")
+    # Second lock hold, around verify+append. The confirmation above is human
+    # time, and a rotation landing in it can evict the very selection just
+    # agreed to — so the target is re-checked while rotation is excluded,
+    # rather than trusting a resolve that is now arbitrarily old.
     log = SelectionTelemetryLog(telemetry_path, max_bytes=_NEVER_ROTATE)
-    status = log.log_feedback(
-        selection_id=resolved_id,
-        trace_id=trace_id if isinstance(trace_id, str) else None,
-        user_corrected=corrected,
-        operator_override=overridden,
-        ranker_version=ranker_version if isinstance(ranker_version, str) else None,
-    )
+    with rotation_lock(telemetry_path, attempts=_LOCK_ATTEMPTS) as acquired:
+        if not acquired:
+            _feedback_failure(
+                as_json,
+                "log_busy",
+                "the selection log is being rotated; nothing was written — re-run",
+            )
+        if (
+            find_selection(
+                telemetry_path, selection_id=resolved_id, include_rotated=include_rotated
+            )
+            is None
+        ):
+            _feedback_failure(
+                as_json,
+                "log_rotated",
+                f"selection {resolved_id} is no longer in the log (rotated out while "
+                "confirming); nothing was written",
+            )
+        status = _write_label(
+            log,
+            selection_id=resolved_id,
+            trace_id=trace_id if isinstance(trace_id, str) else None,
+            user_corrected=corrected,
+            operator_override=overridden,
+            ranker_version=ranker_version if isinstance(ranker_version, str) else None,
+        )
     # The sink swallows write failures by design — a telemetry fault must never
     # break a proxied call — but this caller is a person waiting to hear that
     # their label exists. Reporting success for a record that never reached
@@ -336,10 +376,17 @@ def feedback_command(
     if as_json:
         click.echo(json_out.dumps(result, sort_keys=True, ensure_ascii=False))
         return
-    click.echo(f"Labelled selection {resolved_id}")
+    click.echo(f"Labelled selection {_disp(resolved_id)}")
     for field in ("user_corrected", "operator_override"):
         if result[field] is not None:
             click.echo(f"  {field}: {str(result[field]).lower()}")
+
+
+def _write_label(log: SelectionTelemetryLog, **fields: Any) -> str:
+    """Append the label. Split out so a test can observe when the write runs
+    relative to the confirmation output, which output ordering alone cannot
+    prove."""
+    return log.log_feedback(**fields)
 
 
 def _human_at_the_terminal() -> bool:
@@ -368,25 +415,12 @@ def _tri_state(positive: bool, negative: bool, name: str) -> bool | None:
     return None
 
 
-def _segment_identities(path: Path, include_rotated: bool) -> list[tuple[str, int, int]]:
-    """(name, device, inode) per log segment — an identity, not a size.
+def _feedback_failure(as_json: bool, code: str, message: str, exit_code: int = 1) -> NoReturn:
+    """Exit with a stable error code, in the caller's chosen format.
 
-    Sizes change on every proxied call, so they cannot distinguish a rotation
-    from ordinary traffic; inodes change only when files are created or
-    renamed, which is exactly what rotation does and appending does not.
+    Exit 1 is an operational failure; exit 2 is missing consent, matching the
+    ``--json``-without-``--yes`` precedent elsewhere in the CLI.
     """
-    identities: list[tuple[str, int, int]] = []
-    for segment in discover_log_files(path, include_rotated=include_rotated):
-        try:
-            info = segment.stat()
-        except OSError:
-            continue
-        identities.append((segment.name, info.st_dev, info.st_ino))
-    return identities
-
-
-def _feedback_failure(as_json: bool, code: str, message: str) -> NoReturn:
-    """Exit 1 with a stable error code, in the caller's chosen format."""
     if as_json:
         click.echo(
             json_out.dumps(
@@ -395,5 +429,7 @@ def _feedback_failure(as_json: bool, code: str, message: str) -> NoReturn:
                 ensure_ascii=False,
             )
         )
-        raise click.exceptions.Exit(1)
+        raise click.exceptions.Exit(exit_code)
+    if exit_code == 2:
+        raise click.UsageError(message)
     raise click.ClickException(message)

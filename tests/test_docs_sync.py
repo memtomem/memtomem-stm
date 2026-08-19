@@ -1984,7 +1984,11 @@ def test_adr_0001_cited_paths_and_call_site_claim_hold() -> None:
                 name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
                 if name == "log_feedback":
                     callers.append((str(path.relative_to(REPO_ROOT)), scope.name))
-    assert callers == [("src/memtomem_stm/cli/selection_cmd.py", "feedback_command")], (
+    # ``_write_label`` is the labelling command's own append helper, split out
+    # so a test can observe when the write runs; the pin names it rather than
+    # the command so that moving the call to any OTHER function is still a
+    # change this guard reports.
+    assert callers == [("src/memtomem_stm/cli/selection_cmd.py", "_write_label")], (
         f"ADR 0001 states log_feedback has exactly one production call site — the "
         f"operator labelling command — but found {callers}. Update the ADR's matrix "
         "note alongside this pin, and if a new emitter is on the request path, say "

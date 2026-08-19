@@ -28,6 +28,7 @@ from memtomem_stm.proxy.config import (
 )
 from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
 from memtomem_stm.proxy.metrics import TokenTracker
+from memtomem_stm.cli import selection_cmd
 from memtomem_stm.proxy import selection_log as selection_log_module
 from memtomem_stm.proxy.selection_log import (
     RANKER_VERSION,
@@ -973,9 +974,14 @@ def _feedback_records(path: Path) -> list[dict]:
     ]
 
 
-def _run_feedback(tmp_path: Path, log_path: Path, *args: str):
+def _run_feedback(tmp_path: Path, log_path: Path, *args: str, yes: bool = True):
+    """Invoke the command. ``--last`` is non-interactive here, and the command
+    requires explicit consent for that (a formatting flag or a pipe must not
+    authorize a write), so ``--yes`` is added by default; the tests that pin
+    the consent contract itself pass ``yes=False``."""
     from memtomem_stm.cli.proxy import cli
 
+    consent = ["--yes"] if yes and "--last" in args and "--yes" not in args else []
     return CliRunner().invoke(
         cli,
         [
@@ -986,6 +992,7 @@ def _run_feedback(tmp_path: Path, log_path: Path, *args: str):
             "--config",
             str(tmp_path / "absent-proxy.json"),
             *args,
+            *consent,
         ],
     )
 
@@ -1204,18 +1211,32 @@ class TestSelectionFeedbackRobustness:
         assert result.exit_code == 2, result.output
         assert _feedback_records(log_path) == []
 
-    def test_resolution_is_printed_before_the_write(self, tmp_path):
-        """The operator is the check on ``--last``; they cannot be one if the
-        label is already on disk when the row is named."""
+    def test_resolution_is_printed_before_the_write(self, tmp_path, monkeypatch):
+        """Observed at the write itself, not inferred from line order.
+
+        Output order alone would still pass if the append ran before either
+        line was emitted, so the write is instrumented and asked what had
+        already been printed when it fired.
+        """
         log_path = tmp_path / "log.jsonl"
         _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        seen: dict[str, str] = {}
+        real_write = selection_cmd._write_label
+
+        def observing_write(log, **fields):
+            # CliRunner wraps a BytesIO; flush the text layer first so anything
+            # already echoed is visible in the buffer at this instant.
+            sys.stdout.flush()
+            seen["at_write"] = sys.stdout.buffer.getvalue().decode("utf-8")  # type: ignore[attr-defined]
+            return real_write(log, **fields)
+
+        monkeypatch.setattr(selection_cmd, "_write_label", observing_write)
         result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected")
         assert result.exit_code == 0, result.output
-        lines = [line for line in result.output.splitlines() if line.strip()]
-        # "Selection <id> (server / tool)" precedes "Labelled selection <id>".
-        assert lines[0].startswith("Selection ")
-        assert "gh__a" in lines[0]
-        assert lines[1].startswith("Labelled selection ")
+        assert "at_write" in seen, "the write never ran"
+        assert seen["at_write"].startswith("Selection ")
+        assert "gh__a" in seen["at_write"]
+        assert "Labelled selection" not in seen["at_write"]
 
     def test_tty_confirmation_can_refuse_the_write(self, tmp_path):
         from memtomem_stm.cli.proxy import cli
@@ -1269,49 +1290,68 @@ class TestSelectionFeedbackRobustness:
         assert result.exit_code == 1
         assert json.loads(result.output)["error"] == "no_log"
 
-    def test_rotation_during_resolution_refuses_to_label(self, tmp_path):
-        """A scan straddling a rotation can miss the newest selections or
-        resolve one the same rotation evicted, so the command refuses instead
-        of labelling from a torn read.
+    def test_eviction_between_confirming_and_writing_refuses(self, tmp_path, monkeypatch):
+        """Confirmation is human time, and a rotation can land inside it.
 
-        Rotation is simulated between the pre- and post-scan identity
-        snapshots by rotating inside ``find_selection`` — the exact window the
-        check exists to cover.
+        The resolve runs under the rotation lock, but the agreement that
+        follows does not — so the target is re-checked while rotation is
+        excluded again. Simulated at that exact seam by evicting the selection
+        just before the verify.
         """
         log_path = tmp_path / "log.jsonl"
         _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
         real_find = selection_log_module.find_selection
+        state = {"evicted": False}
 
-        def rotating_find(*args, **kwargs):
-            found = real_find(*args, **kwargs)
-            # Proxy rotates: active becomes .1, a fresh active is created.
-            log_path.replace(tmp_path / "log.jsonl.1")
-            log_path.write_text("", encoding="utf-8")
-            return found
+        def evict_then_find(*args, **kwargs):
+            # The verify pass is the one that looks up an exact id.
+            if kwargs.get("selection_id") and not state["evicted"]:
+                state["evicted"] = True
+                # ``max_backups=0`` rotation unlinks the active file outright,
+                # taking the resolved selection with it.
+                log_path.unlink()
+                log_path.write_text("", encoding="utf-8")
+            return real_find(*args, **kwargs)
 
-        with mock.patch("memtomem_stm.cli.selection_cmd.find_selection", side_effect=rotating_find):
-            result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
+        def must_not_write(log, **fields):  # pragma: no cover - asserts absence
+            raise AssertionError("wrote a label for an evicted selection")
+
+        monkeypatch.setattr(selection_cmd, "find_selection", evict_then_find)
+        monkeypatch.setattr(selection_cmd, "_write_label", must_not_write)
+        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
         assert result.exit_code == 1
         assert json.loads(result.output)["error"] == "log_rotated"
         assert _feedback_records(log_path) == []
-        assert _feedback_records(tmp_path / "log.jsonl.1") == []
 
-    def test_plain_appends_do_not_trip_the_rotation_check(self, tmp_path):
-        """Positive control: the check keys on inode identity, so ordinary
-        proxy traffic during the scan must NOT be mistaken for a rotation."""
+    def test_writer_defers_rotation_while_a_reader_holds_the_lock(self, tmp_path):
+        """The writer's half of the guarantee.
+
+        Rotation must not rename segments under a reader — and must not block
+        the proxied call either, so it skips this round and retries on the next
+        append rather than waiting.
+        """
         log_path = tmp_path / "log.jsonl"
-        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
-        real_find = selection_log_module.find_selection
+        log = SelectionTelemetryLog(log_path, max_bytes=1, max_backups=3)
+        log.initialize()
 
-        def appending_find(*args, **kwargs):
-            found = real_find(*args, **kwargs)
-            with log_path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps({"event": "selection", "selection_id": "later"}) + "\n")
-            return found
+        def record(tool: str) -> None:
+            log.log_selection(
+                server="gh",
+                selected_tool=tool,
+                candidate_tools=[tool],
+                arguments={"q": tool},
+                trace_id=tool,
+            )
 
-        with mock.patch(
-            "memtomem_stm.cli.selection_cmd.find_selection", side_effect=appending_find
-        ):
-            result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
-        assert result.exit_code == 0, result.output
-        assert len(_feedback_records(log_path)) == 1
+        record("gh__a")
+        assert log_path.stat().st_size > 1  # the next append would rotate
+
+        with selection_log_module.rotation_lock(log_path) as acquired:
+            assert acquired
+            record("gh__b")
+            assert not (tmp_path / "log.jsonl.1").exists(), "rotated under the reader"
+            # Deferred, not dropped: the record still reached the active file.
+            assert "gh__b" in log_path.read_text(encoding="utf-8")
+
+        record("gh__c")  # lock released → rotation proceeds as normal
+        assert (tmp_path / "log.jsonl.1").exists()

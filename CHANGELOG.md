@@ -26,19 +26,24 @@ changes inline only. See the deprecation policy in
   rather than last-flag-wins. Resolution happens before the write, so a
   mistyped id exits 1 (`not_found`) instead of appending a label that joins to
   no selection; `--last` additionally prints the resolved selection and asks
-  for confirmation when stdin is a terminal (`--yes` skips it; no prompt is
-  shown to a script). The command reports whether the label actually reached
-  disk — the sink swallows write faults so a telemetry problem cannot break a
-  proxied call, so a failed or redacted append exits 1 (`write_failed` /
-  `write_redacted`) instead of claiming success. A rotation that lands while
-  the target is being resolved exits 1 (`log_rotated`) rather than labelling
-  from a torn read, detected by segment identity so the proxy's per-call
-  append path needs no lock. The label inherits the labelled selection's
+  for confirmation, and refuses non-interactively — a pipe, CI, or `--json` —
+  without `--yes` (exit 2, `confirmation_required`) rather than prompting where
+  nobody can answer or writing unasked. The command reports whether the label
+  actually reached disk — the sink swallows write faults so a telemetry problem
+  cannot break a proxied call, so a failed or redacted append exits 1
+  (`write_failed` / `write_redacted`) instead of claiming success. Resolution
+  runs under an advisory rotation lock and the target is re-verified under it
+  after confirmation, so a rotation can neither rename segments mid-scan nor
+  evict the agreed selection before the write (`log_rotated` / `log_busy`,
+  nothing written). The writer takes that lock only when it has already decided
+  to rotate and defers instead of waiting, leaving the per-record append path
+  lock-free. The label inherits the labelled selection's
   `ranker_version` and `trace_id`, so it lands in that call's cohort rather
   than the emitter's. Nothing on the proxy's call path emits this event and
   nothing is planned to: the client model never sees a `selection_id`, so the
   stream carries operator judgement at operator volume — ADR 0001 states that
-  and `tests/test_docs_sync.py` pins the emitter set by file, so a future
+  and `tests/test_docs_sync.py` pins the exact call site (file plus enclosing
+  function) and its count, so a future
   request-path emitter fails CI until the ADR is rewritten.
 
 - **Selection telemetry records the tool-graph's per-candidate facts, not just

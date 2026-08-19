@@ -81,12 +81,17 @@ import threading
 import time
 import uuid
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 from memtomem_stm.proxy.metrics import _percentile
 from memtomem_stm.proxy.privacy import contains_sensitive_content
 from memtomem_stm.utils import json_out
+from memtomem_stm.utils.locking import open_lock_fd, release_lock, try_lock
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +104,47 @@ APPEND_WRITTEN = "written"
 APPEND_REDACTED = "redacted"
 APPEND_FAILED = "failed"
 APPEND_STATUSES = (APPEND_WRITTEN, APPEND_REDACTED, APPEND_FAILED)
+
+
+def rotation_lock_path(log_path: Path | str) -> Path:
+    """Advisory lock guarding the log's file *identities*, not its contents.
+
+    Appends need no lock — ``O_APPEND`` is atomic for small writes, which is
+    why the writer takes none per record. Rotation is different: it renames
+    every segment at once, so a reader holding a filename can end up scanning
+    a file that is no longer what it thought, and with ``max_backups == 0``
+    the oldest content is unlinked outright. This lock exists only for that
+    window.
+    """
+    log_path = Path(log_path).expanduser()
+    return log_path.with_name(log_path.name + ".rotate.lock")
+
+
+@contextmanager
+def rotation_lock(
+    log_path: Path | str, *, attempts: int = 1, delay: float = 0.05
+) -> Iterator[bool]:
+    """Hold the rotation lock for the block; yields whether it was acquired.
+
+    Never blocks. The writer takes it *only when it has already decided to
+    rotate* and simply defers rotation when it cannot — a size-triggered
+    rotation is not urgent, and the next append retries — so a reader holding
+    the lock can never stall a proxied call. Readers may retry briefly, since
+    the writer's hold is a handful of renames.
+    """
+    fd = open_lock_fd(rotation_lock_path(log_path))
+    acquired = False
+    try:
+        for attempt in range(max(1, attempts)):
+            if try_lock(fd):
+                acquired = True
+                break
+            if attempt + 1 < max(1, attempts):
+                time.sleep(delay)
+        yield acquired
+    finally:
+        release_lock(fd)
+
 
 # Per-record default when no ranking informed the call — the client model
 # picked from the full advertised set unaided — so replay tooling can treat
@@ -413,6 +459,20 @@ class SelectionTelemetryLog:
             return
         if size < self._max_bytes:
             return
+        # The lock is taken here and nowhere else on the write path: the size
+        # check above has already passed, so this costs one open+flock per
+        # actual rotation, not per record. A reader (``mms selection feedback``)
+        # holding it means a resolve/append is in flight against these exact
+        # filenames; deferring the rotation to the next append is harmless,
+        # while renaming underneath that reader is not.
+        with rotation_lock(self._path) as acquired:
+            if not acquired:
+                logger.debug("Deferring selection-log rotation: the log is locked by a reader")
+                return
+            self._rotate_locked()
+
+    def _rotate_locked(self) -> None:
+        """Perform the renames. Caller holds both locks."""
         if self._max_backups <= 0:
             self._path.unlink(missing_ok=True)
             return

@@ -702,11 +702,15 @@ Pass exactly one selector. `--selection-id` names the row — `selection_id` is
 not printed by any reporting command (`mms selection replay` emits aggregates
 only, never per-call identifiers), so it is read out of the JSONL itself.
 `--last` resolves the most recent selection in append order, narrowed by
-`--server` / `--tool`, prints which selection it resolved to, and — when stdin
-is a terminal — asks for confirmation before writing, so the inference is
-checked by the person making the judgement. `--yes` skips the prompt, and no
-prompt is shown when stdin is not a TTY (a script would hang on one); in that
-mode the resolved selection is still printed before the write.
+`--server` / `--tool`, prints which selection it resolved to, and asks for
+confirmation before writing, so the inference is checked by the person making
+the judgement. Because that check is the only thing standing behind an
+inferred target, a non-interactive `--last` (a pipe, CI, or `--json`) is
+**refused** without `--yes` — exit 2, `confirmation_required` — rather than
+prompting where nobody can answer or writing unasked. `--selection-id` names
+its target explicitly and never prompts. Values shown at the confirmation are
+escaped for display: `selected_tool` is upstream-controlled, and an ANSI or
+bidi sequence in it could otherwise forge the very target being confirmed.
 
 Both labels are three-valued. `--no-user-corrected` records that the selection
 was **right** — a positive example, which offline evaluation needs as much as
@@ -726,14 +730,20 @@ exit 1 and emit `{"action": "selection-feedback", "ok": false, "error":
 | `no_log` | no readable log segment at the resolved path — the active file *and* every rotated backup are absent |
 | `not_found` / `no_match` | the selector resolved to nothing, checked *before* writing, so a typo never appends a label that joins to no selection |
 | `malformed_record` | the matched record carries no `selection_id` (reachable only on a hand-edited log) |
-| `log_rotated` | the proxy rotated the log while the target was being resolved; nothing was written, and re-running labels against the settled log |
+| `log_rotated` | the resolved selection was rotated out of the log while it was being confirmed; nothing was written |
+| `log_busy` | the log was being rotated and the lock could not be taken; nothing was written — re-run |
+| `confirmation_required` | `--last` used non-interactively (or with `--json`) without `--yes`; exit 2, matching the CLI-wide rule that a formatting flag must not authorize a write |
 | `write_failed` / `write_redacted` | the label did not reach disk — the sink swallows write faults so a telemetry problem cannot break a proxied call, so the command checks the append outcome instead of assuming it |
 
-`log_rotated` exists because rotation renames every segment: a scan that
-straddles one can miss the newest selections or resolve one the same rotation
-evicted. The command detects it by segment identity (inodes change on rotation,
-never on an ordinary append) rather than by locking, so the proxy's per-call
-append path stays lock-free.
+Rotation renames every segment at once, so a scan that straddles one can miss
+the newest selections — they move into a file it already passed — or resolve
+one the same rotation evicts. Resolution therefore runs while holding an
+advisory rotation lock (`<log>.rotate.lock`), and the target is re-checked
+under it again after confirmation, since a human pause is exactly when a
+rotation can land. The writer takes that lock **only when it has already
+decided to rotate**, and defers rotation to its next append rather than
+waiting — so the proxy's per-record append path stays lock-free and a labelling
+session can never stall a proxied call.
 
 ## `mms hook` — built-in tool bridge + per-host registration
 
