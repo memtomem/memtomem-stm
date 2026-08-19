@@ -22,9 +22,18 @@ changes inline only. See the deprecation policy in
   order and prints which one it resolved to before writing. Both labels are
   three-valued — `--no-user-corrected` records that the selection was *right*,
   which offline evaluation needs as much as the negative case, while omitting
-  the flag records nothing for that field. Resolution happens before the write,
-  so a mistyped id exits 1 (`not_found`) instead of appending a label that
-  joins to no selection. The label inherits the labelled selection's
+  both forms records nothing for that field, and passing both is a usage error
+  rather than last-flag-wins. Resolution happens before the write, so a
+  mistyped id exits 1 (`not_found`) instead of appending a label that joins to
+  no selection; `--last` additionally prints the resolved selection and asks
+  for confirmation when stdin is a terminal (`--yes` skips it; no prompt is
+  shown to a script). The command reports whether the label actually reached
+  disk — the sink swallows write faults so a telemetry problem cannot break a
+  proxied call, so a failed or redacted append exits 1 (`write_failed` /
+  `write_redacted`) instead of claiming success. A rotation that lands while
+  the target is being resolved exits 1 (`log_rotated`) rather than labelling
+  from a torn read, detected by segment identity so the proxy's per-call
+  append path needs no lock. The label inherits the labelled selection's
   `ranker_version` and `trace_id`, so it lands in that call's cohort rather
   than the emitter's. Nothing on the proxy's call path emits this event and
   nothing is planned to: the client model never sees a `selection_id`, so the

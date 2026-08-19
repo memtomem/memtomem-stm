@@ -92,6 +92,14 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
+# ``_append`` outcomes. Separate values because "consumed" and "on disk" are
+# not the same fact, and which one a caller needs depends on whether a human
+# is waiting to hear that their record exists.
+APPEND_WRITTEN = "written"
+APPEND_REDACTED = "redacted"
+APPEND_FAILED = "failed"
+APPEND_STATUSES = (APPEND_WRITTEN, APPEND_REDACTED, APPEND_FAILED)
+
 # Per-record default when no ranking informed the call — the client model
 # picked from the full advertised set unaided — so replay tooling can treat
 # this version as the unranked baseline. Calls where a ranker ran stamp
@@ -257,7 +265,7 @@ class SelectionTelemetryLog:
         # than persisting an orphan half (a transient failure could let the
         # execution write succeed). An intentional redaction drop still
         # returns the id: that is the documented left-outer case.
-        return selection_id if appended else None
+        return selection_id if appended != APPEND_FAILED else None
 
     def log_execution(
         self,
@@ -299,8 +307,13 @@ class SelectionTelemetryLog:
         user_corrected: bool | None = None,
         operator_override: bool | None = None,
         ranker_version: str | None = None,
-    ) -> None:
-        """Record a label for one selection.
+    ) -> str:
+        """Record a label for one selection; returns the append status.
+
+        Unlike the call-path emitters this one reports its outcome, because its
+        caller is a person waiting to hear whether the label exists. A silent
+        failure here would tell an operator their judgement was recorded when
+        nothing was written.
 
         ``ranker_version`` must be the stamp of the selection being labelled,
         not this process's: every record is self-describing, and a label that
@@ -308,7 +321,7 @@ class SelectionTelemetryLog:
         put itself in the wrong cohort the moment replay splits feedback by
         this field. The emitter reads it off the record it resolved.
         """
-        self._append(
+        return self._append(
             {
                 "schema_version": SCHEMA_VERSION,
                 "ranker_version": ranker_version or RANKER_VERSION,
@@ -330,13 +343,16 @@ class SelectionTelemetryLog:
             return False
         return self._rng.random() < self._sample_rate
 
-    def _append(self, record: dict[str, Any]) -> bool:
-        """Persist one record; ``False`` only on a write failure.
+    def _append(self, record: dict[str, Any]) -> str:
+        """Persist one record; returns one of :data:`APPEND_STATUSES`.
 
-        An intentional redaction drop returns ``True`` — the record was
-        consumed, not failed — so ``log_selection`` keeps the documented
-        left-outer pairing semantics, while a write failure tells it that
-        nothing reached disk and the pair must be skipped.
+        Three outcomes, not two, because only two of them look alike to *some*
+        callers: ``"redacted"`` means the record was consumed but wrote
+        nothing, which ``log_selection`` treats like a success (keeping the
+        documented left-outer pairing semantics) and an operator-facing caller
+        must not — a label that never reached disk is not a recorded label.
+        ``"failed"`` means the write itself failed; ``"written"`` is the only
+        outcome where the record is on disk.
         """
         # The ``.encode`` below sits outside this method's write-failure
         # handling, so an unencodable record would raise past the caller's
@@ -353,7 +369,7 @@ class SelectionTelemetryLog:
             logger.warning(
                 "Dropped a selection-telemetry record that matched a sensitive-content pattern"
             )
-            return True
+            return APPEND_REDACTED
         data = (line + "\n").encode("utf-8")
         # Synchronous file append on the asyncio event loop: while it runs,
         # every runnable coroutine stalls — other in-flight proxied calls
@@ -381,8 +397,8 @@ class SelectionTelemetryLog:
                     )
                 else:
                     logger.debug("Selection telemetry write failed", exc_info=True)
-                return False
-        return True
+                return APPEND_FAILED
+        return APPEND_WRITTEN
 
     def _rotate_if_needed_locked(self) -> None:
         """Size-based rotation: ``log → log.1 → … → log.N``, oldest dropped.

@@ -15,6 +15,7 @@ import random
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import AsyncMock
 
 import pytest
@@ -27,6 +28,7 @@ from memtomem_stm.proxy.config import (
 )
 from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
 from memtomem_stm.proxy.metrics import TokenTracker
+from memtomem_stm.proxy import selection_log as selection_log_module
 from memtomem_stm.proxy.selection_log import (
     RANKER_VERSION,
     discover_log_files,
@@ -1144,3 +1146,172 @@ class TestSelectionFeedbackCommand:
             ).exit_code
             == 0
         )
+
+
+class TestSelectionFeedbackRobustness:
+    """The failure modes a first-round review found (codex, PR #853)."""
+
+    def test_write_failure_is_reported_not_swallowed(self, tmp_path):
+        """The sink swallows write faults; this caller must not.
+
+        ``_append`` never raises — a telemetry problem must not break a
+        proxied call — so a command that ignores its outcome tells an operator
+        their label exists when the file holds nothing.
+        """
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        log_path.chmod(0o444)
+        try:
+            result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
+        finally:
+            log_path.chmod(0o644)
+        assert result.exit_code == 1
+        assert json.loads(result.output)["error"] == "write_failed"
+        assert _feedback_records(log_path) == []
+
+    def test_redacted_write_is_reported_as_a_failure(self, tmp_path, monkeypatch):
+        """A consumed-but-unwritten record is not a recorded label.
+
+        ``log_selection`` treats a redaction drop as success on purpose (its
+        pairing semantics are left-outer); for a human waiting to hear that
+        their judgement was stored, the two outcomes are not the same.
+        """
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        monkeypatch.setattr(
+            "memtomem_stm.proxy.selection_log.contains_sensitive_content", lambda _line: True
+        )
+        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
+        assert result.exit_code == 1
+        assert json.loads(result.output)["error"] == "write_redacted"
+        assert _feedback_records(log_path) == []
+
+    @pytest.mark.parametrize(
+        "flags",
+        [
+            ["--user-corrected", "--no-user-corrected"],
+            ["--no-user-corrected", "--user-corrected"],
+            ["--operator-override", "--no-operator-override"],
+        ],
+        ids=["corrected", "corrected_reversed", "override"],
+    )
+    def test_contradictory_labels_are_a_usage_error(self, tmp_path, flags):
+        """Not last-flag-wins: the two flags assert opposite facts, and
+        silently picking one inverts a training label."""
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        result = _run_feedback(tmp_path, log_path, "--last", *flags)
+        assert result.exit_code == 2, result.output
+        assert _feedback_records(log_path) == []
+
+    def test_resolution_is_printed_before_the_write(self, tmp_path):
+        """The operator is the check on ``--last``; they cannot be one if the
+        label is already on disk when the row is named."""
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected")
+        assert result.exit_code == 0, result.output
+        lines = [line for line in result.output.splitlines() if line.strip()]
+        # "Selection <id> (server / tool)" precedes "Labelled selection <id>".
+        assert lines[0].startswith("Selection ")
+        assert "gh__a" in lines[0]
+        assert lines[1].startswith("Labelled selection ")
+
+    def test_tty_confirmation_can_refuse_the_write(self, tmp_path):
+        from memtomem_stm.cli.proxy import cli
+
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        # CliRunner installs its own stdin, so patch the named decision rather
+        # than the stream object the command would have consulted.
+        with mock.patch("memtomem_stm.cli.selection_cmd._human_at_the_terminal", return_value=True):
+            result = CliRunner().invoke(
+                cli,
+                [
+                    "selection",
+                    "feedback",
+                    "--log",
+                    str(log_path),
+                    "--config",
+                    str(tmp_path / "absent.json"),
+                    "--last",
+                    "--user-corrected",
+                ],
+                input="n\n",
+            )
+        assert result.exit_code == 1
+        assert _feedback_records(log_path) == []
+
+    def test_non_tty_does_not_prompt(self, tmp_path):
+        """A script must not hang waiting for a confirmation nobody can give."""
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected")
+        assert result.exit_code == 0, result.output
+        assert "Label this selection?" not in result.output
+        assert len(_feedback_records(log_path)) == 1
+
+    def test_backups_without_an_active_file_are_labellable(self, tmp_path):
+        """A crash between ``active -> .1`` and the next append leaves the whole
+        history in backups; refusing to label it would contradict the default
+        rotated search."""
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(tmp_path / "log.jsonl.1", rows=[{"server": "gh", "tool": "gh__rot"}])
+        assert not log_path.exists()
+        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output)["selected_tool"] == "gh__rot"
+
+    def test_no_log_when_no_segment_exists_at_all(self, tmp_path):
+        result = _run_feedback(
+            tmp_path, tmp_path / "nope.jsonl", "--last", "--user-corrected", "--json"
+        )
+        assert result.exit_code == 1
+        assert json.loads(result.output)["error"] == "no_log"
+
+    def test_rotation_during_resolution_refuses_to_label(self, tmp_path):
+        """A scan straddling a rotation can miss the newest selections or
+        resolve one the same rotation evicted, so the command refuses instead
+        of labelling from a torn read.
+
+        Rotation is simulated between the pre- and post-scan identity
+        snapshots by rotating inside ``find_selection`` — the exact window the
+        check exists to cover.
+        """
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        real_find = selection_log_module.find_selection
+
+        def rotating_find(*args, **kwargs):
+            found = real_find(*args, **kwargs)
+            # Proxy rotates: active becomes .1, a fresh active is created.
+            log_path.replace(tmp_path / "log.jsonl.1")
+            log_path.write_text("", encoding="utf-8")
+            return found
+
+        with mock.patch("memtomem_stm.cli.selection_cmd.find_selection", side_effect=rotating_find):
+            result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
+        assert result.exit_code == 1
+        assert json.loads(result.output)["error"] == "log_rotated"
+        assert _feedback_records(log_path) == []
+        assert _feedback_records(tmp_path / "log.jsonl.1") == []
+
+    def test_plain_appends_do_not_trip_the_rotation_check(self, tmp_path):
+        """Positive control: the check keys on inode identity, so ordinary
+        proxy traffic during the scan must NOT be mistaken for a rotation."""
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        real_find = selection_log_module.find_selection
+
+        def appending_find(*args, **kwargs):
+            found = real_find(*args, **kwargs)
+            with log_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"event": "selection", "selection_id": "later"}) + "\n")
+            return found
+
+        with mock.patch(
+            "memtomem_stm.cli.selection_cmd.find_selection", side_effect=appending_find
+        ):
+            result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
+        assert result.exit_code == 0, result.output
+        assert len(_feedback_records(log_path)) == 1

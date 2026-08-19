@@ -21,7 +21,12 @@ from memtomem_stm.proxy.selection_eval import (
     evaluate_selection,
     format_selection_report,
 )
-from memtomem_stm.proxy.selection_log import SelectionTelemetryLog, find_selection
+from memtomem_stm.proxy.selection_log import (
+    APPEND_WRITTEN,
+    SelectionTelemetryLog,
+    discover_log_files,
+    find_selection,
+)
 from memtomem_stm.utils import json_out
 from memtomem_stm.utils.fileio import atomic_write_text
 
@@ -147,17 +152,21 @@ _NEVER_ROTATE = sys.maxsize
 )
 @click.option("--server", help="With --last: only consider selections from this upstream.")
 @click.option("--tool", help="With --last: only consider this prefixed tool name.")
+# Opposing labels are separate flags, not a Click ``--x/--no-x`` pair: a pair
+# silently lets the LAST of two contradictory flags win, which inverts a
+# training label instead of refusing an incoherent command.
+@click.option("--user-corrected", is_flag=True, help="The user corrected this selection.")
+@click.option("--no-user-corrected", is_flag=True, help="The user did NOT correct this selection.")
+@click.option("--operator-override", is_flag=True, help="An operator overrode this selection.")
 @click.option(
-    "--user-corrected/--no-user-corrected",
-    "user_corrected",
-    default=None,
-    help="Record that the selection was (or was not) corrected by the user.",
+    "--no-operator-override", is_flag=True, help="An operator did NOT override this selection."
 )
 @click.option(
-    "--operator-override/--no-operator-override",
-    "operator_override",
-    default=None,
-    help="Record that an operator overrode (or accepted) the selection.",
+    "--yes",
+    "-y",
+    "assume_yes",
+    is_flag=True,
+    help="Skip the --last confirmation prompt (implied when not a TTY).",
 )
 @click.option(
     "--active-only",
@@ -172,8 +181,11 @@ def feedback_command(
     last: bool,
     server: str | None,
     tool: str | None,
-    user_corrected: bool | None,
-    operator_override: bool | None,
+    user_corrected: bool,
+    no_user_corrected: bool,
+    operator_override: bool,
+    no_operator_override: bool,
+    assume_yes: bool,
     active_only: bool,
     as_json: bool,
 ) -> None:
@@ -184,12 +196,14 @@ def feedback_command(
 
     Pass exactly one selector. --selection-id names the row. --last resolves
     the most recent selection in append order, narrowed by --server / --tool,
-    and prints which selection it resolved to before writing.
+    prints which selection it resolved to, and asks for confirmation before
+    writing when stdin is a terminal (--yes skips the prompt).
 
     Both labels are three-valued: --no-user-corrected records that the
     selection was RIGHT, which offline evaluation needs as much as the
-    negative case, while omitting the flag records nothing for that field. At
-    least one label is required.
+    negative case, while omitting both forms records nothing for that field.
+    At least one label is required, and opposing forms of the same label are
+    a usage error rather than last-flag-wins.
     """
     # Docstring note (not for --help): this is the selection log's first and
     # only producer of the ``feedback`` event, schema-pinned since #467 with
@@ -201,7 +215,9 @@ def feedback_command(
         raise click.UsageError("pass exactly one of --selection-id or --last")
     if (server or tool) and not last:
         raise click.UsageError("--server/--tool only apply to --last")
-    if user_corrected is None and operator_override is None:
+    corrected = _tri_state(user_corrected, no_user_corrected, "user-corrected")
+    overridden = _tri_state(operator_override, no_operator_override, "operator-override")
+    if corrected is None and overridden is None:
         raise click.UsageError(
             "nothing to record: pass --user-corrected/--no-user-corrected "
             "and/or --operator-override/--no-operator-override"
@@ -217,7 +233,12 @@ def feedback_command(
     telemetry_path = (
         log_path.expanduser() if log_path is not None else cfg.selection_telemetry.path.expanduser()
     )
-    if not telemetry_path.exists():
+    # Presence is decided by the whole log, not the active file alone: a crash
+    # between ``active → .1`` and the next append leaves the history entirely in
+    # backups, and refusing to label it would contradict the default search.
+    include_rotated = not active_only
+    segments_before = _segment_identities(telemetry_path, include_rotated)
+    if not segments_before:
         _feedback_failure(as_json, "no_log", f"selection log not found: {telemetry_path}")
 
     record = find_selection(
@@ -225,8 +246,22 @@ def feedback_command(
         selection_id=selection_id,
         server=server,
         tool=tool,
-        include_rotated=not active_only,
+        include_rotated=include_rotated,
     )
+    # Rotation renames every segment under the scanner's feet: a scan that
+    # straddles one can miss the newest selections (they move into a file it
+    # already passed) or resolve a selection the same rotation evicted. Detect
+    # it by identity — plain appends never change an inode, a rotation changes
+    # several — and refuse rather than label from a torn read. Detection rather
+    # than a cross-process lock: the proxy's per-call append path must not take
+    # a lock for the benefit of an occasional operator command.
+    if _segment_identities(telemetry_path, include_rotated) != segments_before:
+        _feedback_failure(
+            as_json,
+            "log_rotated",
+            "the log rotated while resolving the target selection; nothing was "
+            "written — re-run to label against the settled log",
+        )
     # Resolve before writing: an id that matches nothing would append a label
     # that joins to no selection — silently useless to every reader, and
     # indistinguishable from a selection whose own record was dropped by the
@@ -252,6 +287,16 @@ def feedback_command(
             as_json, "malformed_record", "matched selection record carries no selection_id"
         )
 
+    # Identify the row BEFORE writing, and — when a human is at the terminal —
+    # let them stop it. ``--last`` is an inference; the operator is the check on
+    # it, which they cannot be if the label is already on disk.
+    if not as_json:
+        click.echo(
+            f"Selection {resolved_id} ({record.get('server')} / {record.get('selected_tool')})"
+        )
+    if last and not assume_yes and _human_at_the_terminal():
+        click.confirm("Label this selection?", default=False, abort=True)
+
     # Carry the selection's own trace_id onto the label so the feedback record
     # joins the metrics store the same way its selection does.
     trace_id = record.get("trace_id")
@@ -260,13 +305,23 @@ def feedback_command(
     # ranker that never ran for this call.
     ranker_version = record.get("ranker_version")
     log = SelectionTelemetryLog(telemetry_path, max_bytes=_NEVER_ROTATE)
-    log.log_feedback(
+    status = log.log_feedback(
         selection_id=resolved_id,
         trace_id=trace_id if isinstance(trace_id, str) else None,
-        user_corrected=user_corrected,
-        operator_override=operator_override,
+        user_corrected=corrected,
+        operator_override=overridden,
         ranker_version=ranker_version if isinstance(ranker_version, str) else None,
     )
+    # The sink swallows write failures by design — a telemetry fault must never
+    # break a proxied call — but this caller is a person waiting to hear that
+    # their label exists. Reporting success for a record that never reached
+    # disk is worse than the failure itself.
+    if status != APPEND_WRITTEN:
+        _feedback_failure(
+            as_json,
+            f"write_{status}",
+            f"the label was not written to {telemetry_path} (append status: {status})",
+        )
     result = {
         "action": "selection-feedback",
         "ok": True,
@@ -274,17 +329,60 @@ def feedback_command(
         "trace_id": trace_id if isinstance(trace_id, str) else None,
         "server": record.get("server"),
         "selected_tool": record.get("selected_tool"),
-        "user_corrected": user_corrected,
-        "operator_override": operator_override,
+        "user_corrected": corrected,
+        "operator_override": overridden,
         "log": str(telemetry_path),
     }
     if as_json:
         click.echo(json_out.dumps(result, sort_keys=True, ensure_ascii=False))
         return
-    click.echo(f"Labelled selection {resolved_id} ({result['server']} / {result['selected_tool']})")
+    click.echo(f"Labelled selection {resolved_id}")
     for field in ("user_corrected", "operator_override"):
         if result[field] is not None:
             click.echo(f"  {field}: {str(result[field]).lower()}")
+
+
+def _human_at_the_terminal() -> bool:
+    """Whether anyone can answer a prompt.
+
+    Named rather than inlined because it decides whether the confirmation
+    exists at all: in a pipe or CI there is nobody to ask, and prompting would
+    hang the caller instead of protecting it.
+    """
+    return sys.stdin.isatty()
+
+
+def _tri_state(positive: bool, negative: bool, name: str) -> bool | None:
+    """Fold two opposing flags into one three-valued label.
+
+    Both set is a usage error, not a precedence question: the two flags assert
+    contradictory facts about the same selection, and picking one would record
+    a label the operator did not mean.
+    """
+    if positive and negative:
+        raise click.UsageError(f"--{name} and --no-{name} contradict each other")
+    if positive:
+        return True
+    if negative:
+        return False
+    return None
+
+
+def _segment_identities(path: Path, include_rotated: bool) -> list[tuple[str, int, int]]:
+    """(name, device, inode) per log segment — an identity, not a size.
+
+    Sizes change on every proxied call, so they cannot distinguish a rotation
+    from ordinary traffic; inodes change only when files are created or
+    renamed, which is exactly what rotation does and appending does not.
+    """
+    identities: list[tuple[str, int, int]] = []
+    for segment in discover_log_files(path, include_rotated=include_rotated):
+        try:
+            info = segment.stat()
+        except OSError:
+            continue
+        identities.append((segment.name, info.st_dev, info.st_ino))
+    return identities
 
 
 def _feedback_failure(as_json: bool, code: str, message: str) -> NoReturn:

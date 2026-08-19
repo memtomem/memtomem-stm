@@ -1788,7 +1788,7 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
         "uv tool install 'memtomem[all]>=0.4,<0.5'",
         "uv tool install 'memtomem-stm>=0.2,<0.3'",
         "uv tool install --reinstall 'memtomem[all]>=0.4,<0.5'",
-        'export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS='
+        "export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS="
         '\'["--from","memtomem>=0.4,<0.5","memtomem-server"]\'',
     ):
         assert command in guide, f"reviewed-memory-resume guide lost {command!r}"
@@ -1930,10 +1930,13 @@ def test_adr_0001_cited_paths_and_call_site_claim_hold() -> None:
     expected set below makes a regex miss loud: coverage cannot silently shrink
     to an easier subset of citations.
 
-    The emitter set is pinned by FILE rather than by count, because the claim
-    the ADR makes is about *where* the signal comes from: an emitter added on
-    the proxy's request path would change the stream from operator judgement to
-    a continuous signal, which is the thing an export must not misrepresent.
+    The emitter is pinned as an exact (file, enclosing function) pair, and the
+    call count with it. The ADR claims *one* production call site in the
+    operator labelling command: a file-only pin would pass while a second
+    emitter sat in the same module, and a count-only pin would pass while the
+    emitter moved onto the proxy's request path — which is the change that
+    would turn the stream from operator judgement into a continuous signal, the
+    thing an export must not misrepresent.
     """
     body = _read("docs/adr/0001-ecosystem-integration-contracts.md")
 
@@ -1965,22 +1968,27 @@ def test_adr_0001_cited_paths_and_call_site_claim_hold() -> None:
     from memtomem_stm.proxy.selection_log import SelectionTelemetryLog
 
     assert callable(SelectionTelemetryLog.log_feedback)
-    callers: list[str] = []
+    callers: list[tuple[str, str]] = []
     for path in sorted((REPO_ROOT / "src").rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
+        # Enclosing-function lookup: walk each function body once and attribute
+        # every ``log_feedback`` call inside it, so a call that moves to another
+        # function in the same file is a different pin value.
+        for scope in ast.walk(tree):
+            if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            func = node.func
-            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-            if name == "log_feedback":
-                callers.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}")
-    emitting_files = {caller.rsplit(":", 1)[0] for caller in callers}
-    assert emitting_files == {"src/memtomem_stm/cli/selection_cmd.py"}, (
-        f"ADR 0001 states log_feedback is emitted only by the operator labelling "
-        f"command; found emitters in {sorted(emitting_files)} (call sites: {callers}). "
-        "Update the ADR's matrix note alongside this pin — and if the new emitter "
-        "is on the request path, say so, because that changes what the stream is."
+            for node in ast.walk(scope):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+                if name == "log_feedback":
+                    callers.append((str(path.relative_to(REPO_ROOT)), scope.name))
+    assert callers == [("src/memtomem_stm/cli/selection_cmd.py", "feedback_command")], (
+        f"ADR 0001 states log_feedback has exactly one production call site — the "
+        f"operator labelling command — but found {callers}. Update the ADR's matrix "
+        "note alongside this pin, and if a new emitter is on the request path, say "
+        "so explicitly, because that changes what the stream is."
     )
 
 
@@ -1992,9 +2000,7 @@ def test_cli_md_freshness_preset_table_matches_init_mapping() -> None:
     from memtomem_stm.proxy.config import CacheConfig
 
     cli_md = (REPO_ROOT / "docs" / "cli.md").read_text(encoding="utf-8")
-    table = re.search(
-        r"`--freshness` picks.*?see \[caching\]\(caching\.md\)", cli_md, re.DOTALL
-    )
+    table = re.search(r"`--freshness` picks.*?see \[caching\]\(caching\.md\)", cli_md, re.DOTALL)
     assert table, "docs/cli.md lost the --freshness preset table"
     text = table.group(0)
 
@@ -2083,3 +2089,36 @@ def test_uninstall_runbook_puts_hook_backups_where_the_writer_puts_them() -> Non
     assert not re.search(r"rm -rf[^\n]*\n[^\n]*hook[^\n]*\.bak", body), (
         "the runbook implies `rm -rf` removes hook backups; it does not"
     )
+
+
+def test_adr_0001_call_site_pin_rejects_a_second_emitter(tmp_path) -> None:
+    """The pin must fail on a second emitter, including one in the SAME file.
+
+    A file-level pin passed for that case, which is how the previous version
+    of this guard could have aged into agreeing with a false ADR. Re-runs the
+    guard's own walk over a synthetic tree rather than trusting the shape of
+    the assertion.
+    """
+    module = tmp_path / "selection_cmd.py"
+    module.write_text(
+        "def feedback_command():\n"
+        "    log.log_feedback(selection_id='a')\n"
+        "\n"
+        "def sneaky_second_emitter():\n"
+        "    log.log_feedback(selection_id='b')\n",
+        encoding="utf-8",
+    )
+    callers: list[tuple[str, str]] = []
+    tree = ast.parse(module.read_text(encoding="utf-8"))
+    for scope in ast.walk(tree):
+        if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(scope):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+            if name == "log_feedback":
+                callers.append((module.name, scope.name))
+    assert len(callers) == 2
+    assert {scope for _, scope in callers} == {"feedback_command", "sneaky_second_emitter"}

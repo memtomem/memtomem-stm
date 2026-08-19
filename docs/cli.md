@@ -682,12 +682,12 @@ Options:
                                   this upstream.
   --tool TEXT                     With --last: only consider this prefixed
                                   tool name.
-  --user-corrected / --no-user-corrected
-                                  Record that the selection was (or was not)
-                                  corrected by the user.
-  --operator-override / --no-operator-override
-                                  Record that an operator overrode (or
-                                  accepted) the selection.
+  --user-corrected                The user corrected this selection.
+  --no-user-corrected             The user did NOT correct this selection.
+  --operator-override             An operator overrode this selection.
+  --no-operator-override          An operator did NOT override this selection.
+  -y, --yes                       Skip the --last confirmation prompt (implied
+                                  when not a TTY).
   --active-only                   Resolve against the active log only,
                                   excluding numeric rotated backups.
   --json                          Output stable JSON for scripting.
@@ -698,27 +698,42 @@ log's `feedback` event. It appends a label that joins an existing `selection`
 by id; it never edits or rewrites existing records, and never rotates the log
 (the proxy owns rotation).
 
-Pass exactly one selector. `--selection-id` names the row — the id printed by
-`mms selection replay` or read out of the JSONL. `--last` resolves the most
-recent selection in append order, narrowed by `--server` / `--tool`, and prints
-which selection it resolved to before writing, so a wrong guess is caught by
-the person making the judgement.
+Pass exactly one selector. `--selection-id` names the row — `selection_id` is
+not printed by any reporting command (`mms selection replay` emits aggregates
+only, never per-call identifiers), so it is read out of the JSONL itself.
+`--last` resolves the most recent selection in append order, narrowed by
+`--server` / `--tool`, prints which selection it resolved to, and — when stdin
+is a terminal — asks for confirmation before writing, so the inference is
+checked by the person making the judgement. `--yes` skips the prompt, and no
+prompt is shown when stdin is not a TTY (a script would hang on one); in that
+mode the resolved selection is still printed before the write.
 
 Both labels are three-valued. `--no-user-corrected` records that the selection
 was **right** — a positive example, which offline evaluation needs as much as
-the negative one — while omitting the flag records nothing for that field. At
-least one label is required. Several labels may accumulate for one selection;
-per field, a later non-null value supersedes an earlier one.
+the negative one — while omitting both forms records nothing for that field. At
+least one label is required, and passing both forms of the same label is a
+usage error rather than last-flag-wins. Several labels may accumulate for one
+selection; per field, a later non-null value supersedes an earlier one.
 
 With `--json`, stdout carries `{"action": "selection-feedback", "ok": true,
 "selection_id": ..., "trace_id": ..., "server": ..., "selected_tool": ...,
 "user_corrected": ..., "operator_override": ..., "log": ...}`. Failures keep
 exit 1 and emit `{"action": "selection-feedback", "ok": false, "error":
-"<code>", "message": ...}`, where `<code>` is `no_log` (no telemetry log at the
-resolved path), `not_found` / `no_match` (the selector resolved to nothing —
-checked *before* writing, so a typo never appends a label that joins to no
-selection), or `malformed_record` (the matched record carries no
-`selection_id`, reachable only on a hand-edited log).
+"<code>", "message": ...}`, where `<code>` is one of:
+
+| code | meaning |
+| --- | --- |
+| `no_log` | no readable log segment at the resolved path — the active file *and* every rotated backup are absent |
+| `not_found` / `no_match` | the selector resolved to nothing, checked *before* writing, so a typo never appends a label that joins to no selection |
+| `malformed_record` | the matched record carries no `selection_id` (reachable only on a hand-edited log) |
+| `log_rotated` | the proxy rotated the log while the target was being resolved; nothing was written, and re-running labels against the settled log |
+| `write_failed` / `write_redacted` | the label did not reach disk — the sink swallows write faults so a telemetry problem cannot break a proxied call, so the command checks the append outcome instead of assuming it |
+
+`log_rotated` exists because rotation renames every segment: a scan that
+straddles one can miss the newest selections or resolve one the same rotation
+evicted. The command detects it by segment identity (inodes change on rotation,
+never on an ordinary append) rather than by locking, so the proxy's per-call
+append path stays lock-free.
 
 ## `mms hook` — built-in tool bridge + per-host registration
 
