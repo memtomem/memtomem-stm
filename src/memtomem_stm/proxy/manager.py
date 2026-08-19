@@ -102,8 +102,7 @@ from memtomem_stm.proxy.tool_eligibility import (
     compute_health_flags,
     filter_tools,
     interpret_verdict,
-    parse_graph_facts,
-    parse_risk_scores,
+    parse_graph_features,
     sanitize_graph_facts_row,
 )
 from memtomem_stm.proxy.toolgraph_cache import GraphConsultCache
@@ -1421,7 +1420,7 @@ class ProxyManager:
                 "penalties or candidate facts this session."
             )
             return {}, {}, False
-        return parse_graph_facts(verdict), parse_risk_scores(verdict), True
+        return (*parse_graph_features(verdict), True)
 
     def _tg_whole_call(self, knob: str, code: str, detail: str) -> None:
         """Apply a whole-call tool-graph failure per its ``on_*`` knob.

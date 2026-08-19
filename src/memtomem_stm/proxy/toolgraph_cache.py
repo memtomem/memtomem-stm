@@ -34,7 +34,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from memtomem_stm.proxy.tool_eligibility import sanitize_graph_facts_row
+from memtomem_stm.proxy.tool_eligibility import finite_risk_score, sanitize_graph_facts_row
 from memtomem_stm.utils.json_out import has_lone_surrogate
 from memtomem_stm.utils.digest import framed_digest
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
@@ -86,8 +86,8 @@ _SCOPE_KEY_VERSION_KEY = "scope_key_version"
 IDENTITY_POLICY = 2
 """Version of the identity-validation policy the stored facts were written under.
 
-A hit reconstructs only ``rejects`` / ``tool_not_found_refs`` / ``graph_facts``,
-so the response fields ``_validate_verdict_identifiers`` checks — ``agent``,
+A hit reconstructs only ``rejects`` / ``tool_not_found_refs`` / ``graph_facts``
+/ ``risk_scores``, so the response fields ``_validate_verdict_identifiers`` checks — ``agent``,
 ``profile``, ``eligible``, ``tool_key``, auxiliary ``candidates`` — are not in
 the row and cannot be revalidated after an upgrade. A pre-#783 row could
 therefore be minted by a verdict that today's policy refuses, and then serve a
@@ -280,6 +280,8 @@ class GraphConsultCache:
         verdict["graph_facts"] = {
             ref: sanitize_graph_facts_row(facts) for ref, facts in verdict["graph_facts"].items()
         }
+        # Non-raising by construction: ``_row_shape_ok`` has already refused
+        # every value ``finite_risk_score`` cannot convert.
         verdict["risk_scores"] = {
             ref: float(score) for ref, score in verdict["risk_scores"].items()
         }
@@ -295,8 +297,9 @@ class GraphConsultCache:
         outside the ``on_*``-knob ``try``, so a row that passed a
         containers-only check would crash startup. Matching ``put``'s shape
         (``rejects: {str: str}``, ``tool_not_found_refs: [str]``,
-        ``graph_facts: {str: object}``) guarantees the reconstruction can never
-        raise on a hit. The fact rows themselves need no leaf check here:
+        ``graph_facts: {str: object}``, ``risk_scores: {str: finite number}``)
+        guarantees the reconstruction can never raise on a hit. The fact rows
+        themselves need no leaf check here:
         ``get`` runs each one through ``sanitize_graph_facts_row``, which is
         total over any mapping, so a corrupted leaf becomes ``None`` rather
         than an exception.
@@ -320,13 +323,13 @@ class GraphConsultCache:
             and isinstance(risk_scores, dict)
         ):
             return False
-        # ``bool`` is an ``int`` subclass but never a valid risk score; the
-        # caller floats these outside its exception barrier.
+        # Held to the same rule a LIVE consult applies, via the same function:
+        # a stored ``10**400`` is a valid JSON integer and a valid Python one,
+        # but it has no float — and ``get`` floats these outside the caller's
+        # exception barrier, so a "shape ok" verdict here would turn a corrupt
+        # row into a startup crash instead of the documented miss.
         if not all(
-            isinstance(k, str)
-            and not has_lone_surrogate(k)
-            and isinstance(v, (int, float))
-            and not isinstance(v, bool)
+            isinstance(k, str) and not has_lone_surrogate(k) and finite_risk_score(v) is not None
             for k, v in risk_scores.items()
         ):
             return False

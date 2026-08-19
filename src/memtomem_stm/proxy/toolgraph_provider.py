@@ -118,8 +118,9 @@ def _validate_verdict_identifiers(tool: str, verdict: dict[str, Any]) -> None:
     callers rather than of this check: an ``eligible_tools`` failure rides
     ``on_protocol_error`` (``fail_start`` by default, so it refuses startup),
     while a ``rank_features`` failure is caught by
-    ``ProxyManager._fetch_risk_scores`` and degrades to no risk penalties,
-    preserving ``parse_risk_scores``'s never-raises contract.
+    ``ProxyManager._fetch_graph_facts`` and degrades to no risk penalties and
+    no candidate facts, preserving ``parse_graph_features``'s never-raises
+    contract.
     """
 
     for field in ("agent", "profile"):

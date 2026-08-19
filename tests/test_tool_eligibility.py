@@ -36,6 +36,7 @@ from memtomem_stm.proxy.metrics_store import MetricsStore
 from memtomem_stm.proxy.selection_log import SelectionTelemetryLog
 from memtomem_stm.proxy.tool_eligibility import (
     GRAPH_FACT_KEYS,
+    MAX_DENY_PATH_COUNT,
     GRAPH_VALUE_UNRECOGNIZED,
     REASON_CONFIG_HIDDEN,
     REASON_DUPLICATE_NAME,
@@ -999,6 +1000,25 @@ class TestGraphFactsEdgeCases:
         assert sanitize_graph_facts_row({"deny_path_count": -1})["deny_path_count"] is None
         assert sanitize_graph_facts_row({"deny_path_count": "two"})["deny_path_count"] is None
         assert sanitize_graph_facts_row({"deny_path_count": True})["deny_path_count"] is None
+
+    def test_an_absurd_count_records_as_unknown(self):
+        """An unbounded integer is not a large answer, it is a corrupt one —
+        and not portable as a learning feature (no float, no fixed-width
+        column). Above the bound the fact records as unknown."""
+        assert (
+            sanitize_graph_facts_row({"deny_path_count": MAX_DENY_PATH_COUNT})["deny_path_count"]
+            == MAX_DENY_PATH_COUNT
+        )
+        assert (
+            sanitize_graph_facts_row({"deny_path_count": MAX_DENY_PATH_COUNT + 1})[
+                "deny_path_count"
+            ]
+            is None
+        )
+        assert sanitize_graph_facts_row({"deny_path_count": 10**400})["deny_path_count"] is None
+        # A row with that many real paths is capped the same way.
+        many = sanitize_graph_facts_row({"deny_paths": [["x"]] * (MAX_DENY_PATH_COUNT + 1)})
+        assert many["deny_path_count"] is None
 
     @pytest.mark.parametrize("later", [0.0, None, -1.0, "nope"])
     def test_a_repeat_row_never_deletes_an_existing_penalty(self, later):

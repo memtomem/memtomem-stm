@@ -428,6 +428,13 @@ GRAPH_CLASSIFICATIONS: frozenset[str] = frozenset({"violation", "authorized_but_
 # generic fallback.
 GRAPH_VALUE_UNRECOGNIZED = "other"
 
+# Upper bound on a recorded ``deny_path_count``. The count is DENY-evidence
+# paths for ONE tool, so a value beyond this is not a large answer but a
+# corrupt one — and an unbounded integer is not portable as a learning feature
+# (it has no float, and no fixed-width column). Above the bound the fact
+# records as unknown rather than as a number nothing can use.
+MAX_DENY_PATH_COUNT = 10_000
+
 # Boolean facts copied through as-is. ``None`` (upstream's own "not knowable
 # for this row") is preserved and distinguished from ``False``.
 _GRAPH_FACT_FLAGS: tuple[str, ...] = (
@@ -484,7 +491,7 @@ def sanitize_graph_facts_row(row: Mapping[str, Any]) -> dict[str, Any]:
     facts["verdict"] = _graph_enum(row.get("verdict"), GRAPH_VERDICTS)
     facts["classification"] = _graph_enum(row.get("classification"), GRAPH_CLASSIFICATIONS)
     facts["deny_path_count"] = _deny_path_count(row)
-    facts["risk_score"] = _risk_score(row.get("risk_score"))
+    facts["risk_score"] = finite_risk_score(row.get("risk_score"))
     return facts
 
 
@@ -498,15 +505,15 @@ def _deny_path_count(row: Mapping[str, Any]) -> int | None:
     function's contract, not an optimization.
     """
     deny_paths = row.get("deny_paths")
-    if isinstance(deny_paths, list):
-        return len(deny_paths)
-    count = row.get("deny_path_count")
-    if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+    count: Any = len(deny_paths) if isinstance(deny_paths, list) else row.get("deny_path_count")
+    # The bound applies however the count was reported: a row carrying that
+    # many real paths is as unusable a feature as a stored integer claiming it.
+    if isinstance(count, int) and not isinstance(count, bool) and 0 <= count <= MAX_DENY_PATH_COUNT:
         return count
     return None
 
 
-def _risk_score(score: Any) -> float | None:
+def finite_risk_score(score: Any) -> float | None:
     """A recordable risk score, or ``None``.
 
     Total by construction. ``bool`` is an ``int`` subclass but never a valid
@@ -544,13 +551,17 @@ def parse_graph_facts(verdict: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     caller degrades to logging no facts. A later row wins on a duplicated ref
     (last-write, matching ``parse_risk_scores``).
     """
-    return _walk_features(verdict)[0]
+    return parse_graph_features(verdict)[0]
 
 
-def _walk_features(
+def parse_graph_features(
     verdict: Mapping[str, Any],
 ) -> tuple[dict[str, dict[str, Any]], dict[str, float]]:
     """One pass, two products: per-candidate facts and the penalty map.
+
+    Callers that need both — the consult, which logs the facts and penalizes
+    from the scores — take them from here, so "one response, one traversal" is
+    true at the call site rather than equal by coincidence.
 
     They differ on ONE point, and only for a payload that repeats a candidate
     (an upstream contract violation): the facts follow the last row for that
@@ -619,10 +630,10 @@ def parse_risk_scores(verdict: Mapping[str, Any]) -> dict[str, float]:
     Produced by the same walk as :func:`parse_graph_facts` (#469) rather than
     a second pass: the penalty map and the logged facts are two views of one
     response, and two independent walks would be free to disagree about which
-    rows count. See :func:`_walk_features` for the one place they deliberately
+    rows count. See :func:`parse_graph_features` for the one place they deliberately
     differ.
     """
-    return _walk_features(verdict)[1]
+    return parse_graph_features(verdict)[1]
 
 
 def filter_tools(

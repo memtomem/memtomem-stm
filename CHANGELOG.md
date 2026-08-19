@@ -32,9 +32,10 @@ changes inline only. See the deprecation policy in
   `risk_penalty_scale` is `0` and `selection_telemetry.enabled` is set — that
   one response carries both products, and gating the facts on the penalty
   knob would lose them for anyone who turned penalties off. With both off it
-  is still skipped. The #494 consult cache stores the facts instead of the
+  is still skipped. The #494 consult cache stores the facts beside the
   score map, so the first start after upgrading re-runs one full consult
-  (rows written by earlier versions cannot have the dropped rows recovered).
+  (rows written by earlier versions carry no facts, and the sparse score map
+  they do carry cannot have the dropped rows recovered from it).
   In portable-bundle mode only `risk_score` is populated: a compiled bundle
   carries the decision, not the row behind it, and — like the live consult —
   it now records a penalty only once scaling leaves one, so
