@@ -426,12 +426,35 @@ class SelectionTelemetryLog:
         # off-loop; writers already serialize on ``self._lock``.
         with self._lock:
             try:
-                self._rotate_if_needed_locked()
+                if not self._rotate_if_needed_locked():
+                    # Another writer is rotating and this configuration deletes
+                    # the file it is rotating, so an append now may land in an
+                    # inode about to be unlinked. Report the failure instead of
+                    # counting a record that may not survive.
+                    self.write_errors += 1
+                    logger.warning(
+                        "Selection telemetry write skipped: another writer is rotating the log"
+                    )
+                    return APPEND_FAILED
                 fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
                 try:
-                    os.write(fd, data)
+                    written = os.write(fd, data)
                 finally:
                     os.close(fd)
+                if written != len(data):
+                    # A short write leaves a truncated line. Readers skip
+                    # malformed lines, so the damage is contained — but the
+                    # record is NOT on disk, and a caller waiting to hear that
+                    # its label exists must not be told otherwise. Never
+                    # retried: appending the remainder would duplicate the
+                    # prefix into a second partial record.
+                    self.write_errors += 1
+                    logger.warning(
+                        "Selection telemetry write was short (%d of %d bytes)",
+                        written,
+                        len(data),
+                    )
+                    return APPEND_FAILED
                 self.events_written += 1
             except OSError:
                 self.write_errors += 1
@@ -446,19 +469,27 @@ class SelectionTelemetryLog:
                 return APPEND_FAILED
         return APPEND_WRITTEN
 
-    def _rotate_if_needed_locked(self) -> None:
-        """Size-based rotation: ``log → log.1 → … → log.N``, oldest dropped.
+    def _rotate_if_needed_locked(self) -> bool:
+        """Size-based rotation; returns whether the caller may now append.
 
-        Renames preserve the 0600 mode; the fresh file is recreated 0600 by
-        the ``os.open`` in ``_append``. With ``max_backups == 0`` the file
-        is simply truncated by deletion (append recreates it).
+        ``log → log.1 → … → log.N``, oldest dropped. Renames preserve the 0600
+        mode; the fresh file is recreated 0600 by the ``os.open`` in
+        ``_append``. With ``max_backups == 0`` the file is simply truncated by
+        deletion (append recreates it).
+
+        Returns ``False`` only when the lock is held while ``max_backups == 0``:
+        the holder may be another *writer* mid-rotation, and that configuration
+        rotates by unlinking, so an append could be written into an inode that
+        is about to disappear. With at least one backup the record survives
+        either ordering — it lands in the file that becomes ``.1``, or in the
+        fresh active — so the append proceeds.
         """
         try:
             size = self._path.stat().st_size
         except OSError:
-            return
+            return True
         if size < self._max_bytes:
-            return
+            return True
         # The lock is taken here and nowhere else on the write path: the size
         # check above has already passed, so this costs one open+flock per
         # actual rotation, not per record. A reader (``mms selection feedback``)
@@ -467,9 +498,10 @@ class SelectionTelemetryLog:
         # while renaming underneath that reader is not.
         with rotation_lock(self._path) as acquired:
             if not acquired:
-                logger.debug("Deferring selection-log rotation: the log is locked by a reader")
-                return
+                logger.debug("Deferring selection-log rotation: the log is locked")
+                return self._max_backups > 0
             self._rotate_locked()
+        return True
 
     def _rotate_locked(self) -> None:
         """Perform the renames. Caller holds both locks."""
@@ -594,7 +626,10 @@ def aggregate_selection_log(path: Path | str, *, top_n: int = 10) -> dict[str, A
     cohort split is the #468 replay signal).
     """
     path = Path(path).expanduser()
-    rotated = sum(1 for _ in path.parent.glob(f"{path.name}.*")) if path.parent.exists() else 0
+    # Numeric suffixes only — the same rule ``discover_log_files`` applies. A
+    # bare ``<log>.*`` glob also matches the rotation lock file and any operator
+    # copy, reporting backups that rotation never made.
+    rotated = len([segment for segment in discover_log_files(path) if segment != path])
     result: dict[str, Any] = {
         "path": str(path),
         "exists": path.exists(),

@@ -686,8 +686,8 @@ Options:
   --no-user-corrected             The user did NOT correct this selection.
   --operator-override             An operator overrode this selection.
   --no-operator-override          An operator did NOT override this selection.
-  -y, --yes                       Skip the --last confirmation prompt (implied
-                                  when not a TTY).
+  -y, --yes                       Confirm the --last target without prompting
+                                  (required off a TTY).
   --active-only                   Resolve against the active log only,
                                   excluding numeric rotated backups.
   --json                          Output stable JSON for scripting.

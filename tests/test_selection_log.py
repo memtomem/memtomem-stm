@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import random
 import sys
 from pathlib import Path
@@ -1322,6 +1323,149 @@ class TestSelectionFeedbackRobustness:
         assert result.exit_code == 1
         assert json.loads(result.output)["error"] == "log_rotated"
         assert _feedback_records(log_path) == []
+
+    def test_non_interactive_last_is_refused_without_yes(self, tmp_path):
+        """Consent, not a default. A pipe cannot answer a prompt, so the
+        command must refuse rather than write on an inferred target."""
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", yes=False)
+        assert result.exit_code == 2, result.output
+        assert "--yes" in result.output
+        assert _feedback_records(log_path) == []
+
+    def test_json_last_is_refused_without_yes(self, tmp_path):
+        """A formatting flag must not authorize a write (the CLI-wide rule),
+        and a prompt would corrupt the single-document stdout contract."""
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        with mock.patch("memtomem_stm.cli.selection_cmd._human_at_the_terminal", return_value=True):
+            result = _run_feedback(
+                tmp_path, log_path, "--last", "--user-corrected", "--json", yes=False
+            )
+        assert result.exit_code == 2
+        assert json.loads(result.output)["error"] == "confirmation_required"
+        assert _feedback_records(log_path) == []
+
+    def test_selection_id_never_requires_consent(self, tmp_path):
+        """Positive control for the two refusals above: the id names its own
+        target, so there is no inference to confirm."""
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        sid = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])["selection_id"]
+        result = _run_feedback(
+            tmp_path, log_path, "--selection-id", sid, "--user-corrected", yes=False
+        )
+        assert result.exit_code == 0, result.output
+        assert len(_feedback_records(log_path)) == 1
+
+    def test_resolution_reports_a_busy_log(self, tmp_path):
+        """Proves the command's FIRST lock hold exists.
+
+        ``flock`` is per open file description, so a lock taken here really does
+        block the command's own acquire — remove the ``with rotation_lock`` from
+        the resolve and this test goes green, which is what makes it evidence.
+        """
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        with selection_log_module.rotation_lock(log_path) as acquired:
+            assert acquired
+            result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
+        assert result.exit_code == 1
+        assert json.loads(result.output)["error"] == "log_busy"
+        assert _feedback_records(log_path) == []
+
+    def test_verification_after_confirming_reports_a_busy_log(self, tmp_path, monkeypatch):
+        """Proves the SECOND lock hold exists, around verify+append.
+
+        The lock is taken *during* the confirmation — precisely the window the
+        second hold covers — so a command that locked only its resolve would
+        sail past it and write. Runs in human mode because the prompt only
+        exists there; ``--yes`` would skip the very seam under test.
+        """
+        from memtomem_stm.cli.proxy import cli
+
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        held: list[object] = []
+
+        def confirm_and_lock(*args, **kwargs):
+            ctx = selection_log_module.rotation_lock(log_path)
+            assert ctx.__enter__() is True
+            held.append(ctx)
+            return True
+
+        monkeypatch.setattr(selection_cmd, "_human_at_the_terminal", lambda: True)
+        monkeypatch.setattr(selection_cmd.click, "confirm", confirm_and_lock)
+        try:
+            result = CliRunner().invoke(
+                cli,
+                [
+                    "selection",
+                    "feedback",
+                    "--log",
+                    str(log_path),
+                    "--config",
+                    str(tmp_path / "absent.json"),
+                    "--last",
+                    "--user-corrected",
+                ],
+            )
+        finally:
+            for ctx in held:
+                ctx.__exit__(None, None, None)  # type: ignore[attr-defined]
+        assert held, "the confirmation never ran"
+        assert result.exit_code == 1
+        assert "being rotated" in result.output
+        assert _feedback_records(log_path) == []
+
+    def test_a_short_write_is_not_reported_as_recorded(self, tmp_path, monkeypatch):
+        """``os.write`` may write fewer bytes; the record is then truncated and
+        not on disk, so the status must not say otherwise."""
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        real_write = os.write
+
+        def short_write(fd, data):
+            return real_write(fd, data[: len(data) // 2])
+
+        monkeypatch.setattr(selection_log_module.os, "write", short_write)
+        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
+        assert result.exit_code == 1
+        assert json.loads(result.output)["error"] == "write_failed"
+
+    def test_a_rotating_writer_does_not_silently_lose_a_contender(self, tmp_path):
+        """Two writers, ``max_backups=0``: the loser must not claim success.
+
+        That configuration rotates by unlinking, so an append racing it can be
+        written into an inode about to disappear. Reported as a failure rather
+        than counted — a lost record that was announced as written is worse
+        than a refused one.
+        """
+        log_path = tmp_path / "log.jsonl"
+        rotator = SelectionTelemetryLog(log_path, max_bytes=1, max_backups=0)
+        rotator.initialize()
+        contender = SelectionTelemetryLog(log_path, max_bytes=1, max_backups=0)
+        rotator.log_selection(
+            server="gh",
+            selected_tool="gh__a",
+            candidate_tools=["gh__a"],
+            arguments={"q": "x"},
+            trace_id="t",
+        )
+        with selection_log_module.rotation_lock(log_path) as acquired:  # the rotator
+            assert acquired
+            status = contender.log_feedback(selection_id="x", user_corrected=True)
+        assert status == "failed"
+        assert contender.events_written == 0
+        assert contender.write_errors == 1
+
+    def test_the_lock_file_is_not_counted_as_a_rotated_backup(self, tmp_path):
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        assert _run_feedback(tmp_path, log_path, "--last", "--user-corrected").exit_code == 0
+        assert selection_log_module.rotation_lock_path(log_path).exists()
+        assert aggregate_selection_log(log_path)["rotated_backups"] == 0
 
     def test_writer_defers_rotation_while_a_reader_holds_the_lock(self, tmp_path):
         """The writer's half of the guarantee.

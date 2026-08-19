@@ -173,7 +173,7 @@ _LOCK_ATTEMPTS = 20
     "-y",
     "assume_yes",
     is_flag=True,
-    help="Skip the --last confirmation prompt (implied when not a TTY).",
+    help="Confirm the --last target without prompting (required off a TTY).",
 )
 @click.option(
     "--active-only",
@@ -201,10 +201,12 @@ def feedback_command(
     Appends a feedback record that joins an existing selection by id. Existing
     records are never edited, and this command never rotates the log.
 
-    Pass exactly one selector. --selection-id names the row. --last resolves
-    the most recent selection in append order, narrowed by --server / --tool,
-    prints which selection it resolved to, and asks for confirmation before
-    writing when stdin is a terminal (--yes skips the prompt).
+    Pass exactly one selector. --selection-id names the row and never prompts.
+    --last resolves the most recent selection in append order, narrowed by
+    --server / --tool, prints which selection it resolved to, and asks for
+    confirmation before writing. Because that check is all that stands behind
+    an inferred target, --last off a terminal (a pipe, CI, or --json) is
+    refused without --yes rather than prompting where nobody can answer.
 
     Both labels are three-valued: --no-user-corrected records that the
     selection was RIGHT, which offline evaluation needs as much as the

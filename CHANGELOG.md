@@ -31,13 +31,17 @@ changes inline only. See the deprecation policy in
   nobody can answer or writing unasked. The command reports whether the label
   actually reached disk — the sink swallows write faults so a telemetry problem
   cannot break a proxied call, so a failed or redacted append exits 1
-  (`write_failed` / `write_redacted`) instead of claiming success. Resolution
+  (`write_failed` / `write_redacted`) instead of claiming success — including
+  a short `os.write`, which leaves a truncated record, and an append racing
+  another writer's `max_backups: 0` rotation, which can land in an inode about
+  to be unlinked. Resolution
   runs under an advisory rotation lock and the target is re-verified under it
   after confirmation, so a rotation can neither rename segments mid-scan nor
   evict the agreed selection before the write (`log_rotated` / `log_busy`,
   nothing written). The writer takes that lock only when it has already decided
   to rotate and defers instead of waiting, leaving the per-record append path
-  lock-free. The label inherits the labelled selection's
+  lock-free. `stm_selection_stats`' `rotated_backups` no longer counts the
+  rotation lock file (or any non-numeric sibling) as a backup. The label inherits the labelled selection's
   `ranker_version` and `trace_id`, so it lands in that call's cohort rather
   than the emitter's. Nothing on the proxy's call path emits this event and
   nothing is planned to: the client model never sees a `selection_id`, so the
