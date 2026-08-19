@@ -98,6 +98,12 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
+# Longest line the log's readers will parse. Defined here rather than in the
+# replay harness that first needed it, because the labelling command has to
+# apply the SAME cut: a line one reader parses and the other drops is a
+# selection the two disagree exists.
+MAX_LINE_BYTES = 1_048_576
+
 # ``_append`` outcomes. Separate values because "consumed" and "on disk" are
 # not the same fact, and which one a caller needs depends on whether a human
 # is waiting to hear that their record exists.
@@ -163,6 +169,24 @@ def rotation_lock(
 RANKER_VERSION = "v0-passthrough"
 
 
+def _ends_with_newline(fd: int) -> bool:
+    """Whether the file behind *fd* ends on a record boundary.
+
+    An empty file counts as terminated: there is no line to fuse with. A probe
+    that cannot run reports ``True``, which keeps the append unchanged — the
+    behavior before this check existed — rather than injecting a blank line on
+    every write because one ``lseek`` failed.
+    """
+    try:
+        if os.lseek(fd, 0, os.SEEK_END) == 0:
+            return True
+        os.lseek(fd, -1, os.SEEK_END)
+        return os.read(fd, 1) == b"\n"
+    except OSError:
+        logger.debug("Could not probe the selection log's tail", exc_info=True)
+        return True
+
+
 def _sync_parent_dir(path: Path) -> bool:
     """``fsync`` the directory holding *path*; ``True`` if it is now durable.
 
@@ -189,7 +213,13 @@ def _sync_parent_dir(path: Path) -> bool:
         logger.debug("Could not sync the selection log's directory", exc_info=True)
         return False
     finally:
-        os.close(dir_fd)
+        try:
+            os.close(dir_fd)
+        except OSError:
+            # Same reason as the append's own cleanup close: this runs after
+            # the record is complete, and raising here would be re-read as a
+            # failed write.
+            logger.debug("Could not close the selection log's directory", exc_info=True)
     return True
 
 
@@ -505,11 +535,23 @@ class SelectionTelemetryLog:
                 # the open, so at most a concurrent external creator makes it
                 # conservative (one extra directory sync), never optimistic.
                 created = durable and not self._path.exists()
-                fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                # O_RDWR rather than O_WRONLY so the tail can be probed below;
+                # O_APPEND still sends every write to the end regardless of the
+                # read offset.
+                fd = os.open(self._path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
                 closed = False
                 try:
-                    written = os.write(fd, data)
-                    if written != len(data):
+                    # A log whose last line has no newline — a crash mid-append,
+                    # or an operator's edit — would otherwise swallow this
+                    # record into that line, and THIS caller would be told its
+                    # record survived while every reader rejects the fused
+                    # line. Same repair as a short write of our own, one step
+                    # earlier: the writer that finds the damage is the one that
+                    # can still fix it. A blank line, if a concurrent writer
+                    # terminated the tail in between, is skipped by readers.
+                    payload = data if _ends_with_newline(fd) else b"\n" + data
+                    written = os.write(fd, payload)
+                    if written != len(payload):
                         # Close the fragment's LINE while the descriptor is
                         # still open. Without a newline the next append is
                         # concatenated onto it, and THAT caller — whose own
@@ -522,10 +564,10 @@ class SelectionTelemetryLog:
                         # is complete and readable, so reporting a failure
                         # would be false — and would invite a retry that
                         # duplicates the label.
-                        repaired = self._terminate_fragment(fd, data, written)
-                        if repaired and written == len(data) - 1:
-                            written = len(data)
-                    if written != len(data):
+                        repaired = self._terminate_fragment(fd, payload, written)
+                        if repaired and written == len(payload) - 1:
+                            written = len(payload)
+                    if written != len(payload):
                         # No record is on disk, and a caller waiting to hear
                         # that its label exists must not be told otherwise.
                         # Never retried at this level: appending the remainder
@@ -537,7 +579,7 @@ class SelectionTelemetryLog:
                         logger.warning(
                             "Selection telemetry write was short (%d of %d bytes)",
                             written,
-                            len(data),
+                            len(payload),
                         )
                         return APPEND_FAILED
                     # From here the record's bytes are complete in the file, so
@@ -574,7 +616,21 @@ class SelectionTelemetryLog:
                         return APPEND_UNCONFIRMED
                 finally:
                     if not closed:
-                        os.close(fd)
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            # Swallowed deliberately. This close runs on paths
+                            # that have already decided what to report — a
+                            # short write, or a flush that failed with the
+                            # record complete in the file. Letting it raise
+                            # would hand those returns to the OSError handler
+                            # below and turn an ``unconfirmed`` into a
+                            # ``failed``, which is the one answer that sends an
+                            # operator to write the label a second time.
+                            logger.debug(
+                                "Could not close the selection telemetry descriptor",
+                                exc_info=True,
+                            )
                 self.events_written += 1
             except OSError:
                 self.write_errors += 1
@@ -744,45 +800,64 @@ def find_selection(
 
     Malformed lines are skipped, not raised on — the same posture as
     :func:`aggregate_selection_log`, because a hand-edited or half-written log
-    must not make labelling impossible. Read as bytes and decoded strictly, so
-    a record truncated mid-character is skipped rather than silently repaired
-    into a different string by ``errors="replace"``: replay would count that
-    same line as malformed, and the two must not disagree about which
-    selections exist.
+    must not make labelling impossible.
+
+    What counts as a line here is what the replay harness counts, because the
+    label is written FOR that reader: bytes decoded strictly (a record
+    truncated mid-character is skipped, not repaired into a different string by
+    ``errors="replace"``), lines over :data:`MAX_LINE_BYTES` dropped, the
+    active file's unterminated tail — a record still being written — ignored,
+    and a repeated ``selection_id`` resolved last-wins the way replay folds it.
+    A selection the two disagree about is one whose label joins nothing.
 
     *tool* matches ``selected_tool``, the prefixed name the client called, so
     it uses the same vocabulary an operator reads out of a report.
     """
+    path = Path(path).expanduser()
     match: dict[str, Any] | None = None
     for log_path in discover_log_files(path, include_rotated=include_rotated):
         try:
-            with log_path.open("rb") as fh:
-                for raw_line in fh:
-                    if not raw_line.strip():
-                        continue
-                    try:
-                        record = json.loads(raw_line.decode("utf-8"))
-                    except (ValueError, TypeError, UnicodeDecodeError):
-                        continue
-                    if not isinstance(record, dict) or record.get("event") != "selection":
-                        continue
-                    if selection_id is not None:
-                        if record.get("selection_id") == selection_id:
-                            return record
-                        continue
-                    if server is not None and record.get("server") != server:
-                        continue
-                    if tool is not None and record.get("selected_tool") != tool:
-                        continue
-                    if selection_defect(record) is not None:
-                        continue
-                    # Keep scanning: the LAST match in append order wins.
-                    match = record
+            data = log_path.read_bytes()
         except OSError:
             # An unreadable segment is skipped rather than fatal — the active
             # file is usually the one being labelled, and a stale backup whose
             # permissions changed must not block that.
             continue
+        lines = data.splitlines()
+        if lines and log_path == path and not data.endswith(b"\n"):
+            # The active file's unterminated tail is a half-written record:
+            # the writer appends line-at-a-time, so a trailing fragment is one
+            # that has not landed. Replay drops it for the same reason, and a
+            # label on a selection replay never loads joins nothing.
+            lines = lines[:-1]
+        for raw_line in lines:
+            if not raw_line.strip():
+                continue
+            if len(raw_line) > MAX_LINE_BYTES:
+                continue
+            try:
+                record = json.loads(raw_line.decode("utf-8"))
+            except (ValueError, TypeError, UnicodeDecodeError):
+                continue
+            if not isinstance(record, dict) or record.get("event") != "selection":
+                continue
+            if selection_id is not None:
+                if record.get("selection_id") == selection_id:
+                    # Keep scanning rather than returning: an id can repeat in
+                    # a hand-edited or replayed-into log, and the readers this
+                    # label is written for fold duplicates last-wins. Returning
+                    # the first would inherit a cohort stamp from a record they
+                    # discard.
+                    match = record
+                continue
+            if server is not None and record.get("server") != server:
+                continue
+            if tool is not None and record.get("selected_tool") != tool:
+                continue
+            if selection_defect(record) is not None:
+                continue
+            # Keep scanning: the LAST match in append order wins.
+            match = record
     return match
 
 

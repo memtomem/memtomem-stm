@@ -103,11 +103,14 @@ sampling may drop outright. A label the command could not confirm durable is
 reported as such rather than as a success or a failure, because its bytes are
 in the file either way.
 
-The command labels only records offline replay can load: a selection whose
-`schema_version` is unsupported, or which carries no `ranker_version` for the
-label to inherit, is refused by name (`unusable_record`) and skipped by
-`--last`, since a label joined to a record the reader discards is the same
-dead weight as one joined to no record at all.
+The command labels only rows it can label honestly. A selection whose
+`schema_version` is unsupported is one offline replay drops outright, so a
+label on it joins nothing; a selection carrying no `ranker_version` would have
+its label filed under a cohort the command invented. Both are refused by name
+(`unusable_record`) and skipped by `--last`. What counts as a line is what
+replay counts, too — strict decoding, the same maximum line length, the active
+file's unterminated tail ignored, and a repeated `selection_id` folded
+last-wins — so the two cannot disagree about which selections exist.
 
 Written by [`mms selection feedback`](cli.md#mms-selection-feedback--label-one-recorded-selection),
 the operator labelling command, and by nothing else. **Nothing on the proxy's

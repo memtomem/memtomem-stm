@@ -1976,10 +1976,7 @@ def test_adr_0001_cited_paths_and_call_site_claim_hold() -> None:
     # is about which code can cause a label to be written, so the pin is over
     # transitive reachability, not over one call edge.
     reaching = _functions_reaching(REPO_ROOT / "src", "log_feedback", base=REPO_ROOT)
-    assert reaching == {
-        ("src/memtomem_stm/cli/selection_cmd.py", "_write_label"),
-        ("src/memtomem_stm/cli/selection_cmd.py", "feedback_command"),
-    }, (
+    assert reaching == _EXPECTED_FEEDBACK_EMITTERS, (
         f"ADR 0001 states the operator labelling command is the only production code that "
         f"can emit a feedback record, but these functions reach log_feedback: {sorted(reaching)}. "
         "Update the ADR's matrix note alongside this pin, and if a new emitter is on the "
@@ -1987,41 +1984,70 @@ def test_adr_0001_cited_paths_and_call_site_claim_hold() -> None:
     )
 
 
+# The labelling command, its append helper, and nothing else. Written out
+# rather than computed so the pin is a statement about the code, not a
+# restatement of whatever the walk happens to return.
+_EXPECTED_FEEDBACK_EMITTERS = {
+    ("src/memtomem_stm/cli/selection_cmd.py", "_write_label"),
+    ("src/memtomem_stm/cli/selection_cmd.py", "feedback_command"),
+}
+
+
 def _functions_reaching(
     root: Path, target: str, *, base: Path | None = None
 ) -> set[tuple[str, str]]:
-    """Every function under *root* that can reach a call to *target*.
+    """Every scope under *root* that can reach *target*.
 
-    Reported as ``(path relative to *base*, function name)``; *base* defaults
-    to *root* so a synthetic tree can be walked by the same code.
+    Reported as ``(path relative to *base*, scope name)``, where a scope is a
+    function or the module body itself (``"<module>"``); *base* defaults to
+    *root* so a synthetic tree can be walked by the same code.
 
-    Matched on called NAME (``x.log_feedback(...)`` and ``log_feedback(...)``
-    alike), with no import or type resolution — an over-approximation, which is
-    the safe direction for a guard: an unrelated same-named helper makes this
-    fail and get read, while a missed edge would let the ADR's claim age into
-    being false. Fixed-point over the call graph, so a wrapper chain of any
-    depth is still reported.
+    Matched on any MENTION of the name — ``x.log_feedback(...)``,
+    ``log_feedback(...)``, and the bare reference in ``emit = x.log_feedback``
+    alike — rather than on call syntax. Calling through an alias is a real
+    emitter that a callee-name walk reports as nothing at all, so the guard
+    fails closed on the reference instead. That over-approximates (an unrelated
+    same-named helper trips it), which is the safe direction: a tripped guard
+    gets read, while a missed edge lets the ADR's claim age into being false.
+    Module bodies are scopes of their own because code outside any function
+    runs at import; lambdas and nested definitions are attributed to the scope
+    that encloses them. Fixed point over the resulting graph, so a wrapper
+    chain of any depth is still reported.
     """
-    calls: dict[tuple[str, str], set[str]] = {}
+    mentions: dict[tuple[str, str], set[str]] = {}
     for path in sorted(root.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         relative = str(path.relative_to(base or root))
+
+        def names_in(node: ast.AST) -> set[str]:
+            found: set[str] = set()
+            for child in ast.walk(node):
+                if isinstance(child, ast.Attribute):
+                    found.add(child.attr)
+                elif isinstance(child, ast.Name):
+                    found.add(child.id)
+            return found
+
+        module_scope = mentions.setdefault((relative, "<module>"), set())
+        for statement in tree.body:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # The decorators run at import even though the body does not.
+                for decorator in statement.decorator_list:
+                    module_scope |= names_in(decorator)
+            else:
+                module_scope |= names_in(statement)
         for scope in ast.walk(tree):
             if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            called = calls.setdefault((relative, scope.name), set())
-            for node in ast.walk(scope):
-                if not isinstance(node, ast.Call):
-                    continue
-                func = node.func
-                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-                if isinstance(name, str):
-                    called.add(name)
+            mentions.setdefault((relative, scope.name), set())
+            mentions[(relative, scope.name)] |= names_in(scope) - {scope.name}
     reaching: set[tuple[str, str]] = set()
     frontier = {target}
     while frontier:
         found = {
-            scope for scope, called in calls.items() if scope not in reaching and called & frontier
+            scope
+            for scope, mentioned in mentions.items()
+            if scope not in reaching and mentioned & frontier
         }
         if not found:
             break
@@ -2177,4 +2203,20 @@ def test_adr_0001_call_site_pin_rejects_a_second_emitter(tmp_path) -> None:
     reaching = _functions_reaching(src, "log_feedback")
     assert ("proxy_path.py", "call_tool") in reaching, (
         "a wrapper-hop emitter must be reported; a direct-call pin misses it"
+    )
+
+    # (c) an emitter that never CALLS the name — it binds it and calls the
+    # binding. A walk over callee names sees `emit(...)` and reports nothing.
+    (src / "aliased.py").write_text(
+        "def emit_by_alias(log):\n    emit = log.log_feedback\n    return emit(selection_id='c')\n",
+        encoding="utf-8",
+    )
+    assert ("aliased.py", "emit_by_alias") in _functions_reaching(src, "log_feedback"), (
+        "an aliased emitter must be reported; the guard fails closed on the reference"
+    )
+
+    # (d) an emitter at module level, outside any function.
+    (src / "at_import.py").write_text("log.log_feedback(selection_id='d')\n", encoding="utf-8")
+    assert ("at_import.py", "<module>") in _functions_reaching(src, "log_feedback"), (
+        "a module-level emitter runs at import and must be reported"
     )

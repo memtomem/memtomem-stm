@@ -1193,6 +1193,246 @@ def _short_write_on(log_path: Path, *, first_only: bool = True, drop_only_newlin
     return patched
 
 
+class TestResolverAgreesWithReplay:
+    """A selection the resolver sees and replay does not is one whose label
+    joins nothing. Each case is paired with a positive control, since the
+    layouts differ only by the property under test."""
+
+    def test_an_oversized_line_is_skipped_by_both(self, tmp_path):
+        from memtomem_stm.proxy.selection_eval import MAX_LINE_BYTES
+
+        log_path = tmp_path / "log.jsonl"
+        padding = "x" * MAX_LINE_BYTES
+        _write_lines(
+            log_path,
+            [_sel(selection_id="older"), _sel(selection_id="huge", selected_tool=padding)],
+        )
+        assert _run_feedback(tmp_path, log_path, "--last", "--user-corrected").exit_code == 0
+        assert [record["selection_id"] for record in _feedback_records(log_path)] == ["older"]
+
+        control = tmp_path / "control.jsonl"
+        _write_lines(control, [_sel(selection_id="older"), _sel(selection_id="huge")])
+        assert _run_feedback(tmp_path, control, "--last", "--user-corrected").exit_code == 0
+        assert [record["selection_id"] for record in _feedback_records(control)] == ["huge"]
+
+    def test_the_active_files_unterminated_tail_is_not_a_selection_yet(self, tmp_path):
+        """A trailing fragment is a record still being written.
+
+        Replay skips it for that reason; labelling it would name a selection
+        the reader never loads.
+        """
+        log_path = tmp_path / "log.jsonl"
+        _write_lines(log_path, [_sel(selection_id="older")])
+        with log_path.open("ab") as fh:
+            fh.write(json.dumps(_sel(selection_id="half")).encode("utf-8"))  # no newline
+
+        assert _run_feedback(tmp_path, log_path, "--last", "--user-corrected").exit_code == 0
+        labels = [record["selection_id"] for record in _feedback_records(log_path)]
+        assert labels == ["older"]
+
+        # Same bytes, terminated: now it IS a record, and it wins.
+        control = tmp_path / "control.jsonl"
+        _write_lines(control, [_sel(selection_id="older"), _sel(selection_id="half")])
+        assert _run_feedback(tmp_path, control, "--last", "--user-corrected").exit_code == 0
+        assert [record["selection_id"] for record in _feedback_records(control)] == ["half"]
+
+    def test_a_rotated_backups_unterminated_tail_is_still_a_record(self, tmp_path):
+        """Only the ACTIVE file has a tail that is still being written.
+
+        A backup is closed history; a missing final newline there is a
+        hand-edit, and dropping its last record would hide selections replay
+        loads.
+        """
+        backup = tmp_path / "log.jsonl.1"
+        _write_lines(backup, [_sel(selection_id="rotated")])
+        backup.write_bytes(backup.read_bytes().rstrip(b"\n"))
+        log_path = tmp_path / "log.jsonl"
+        _write_lines(log_path, [])
+
+        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output)["selection_id"] == "rotated"
+
+    def test_a_label_after_a_crashed_tail_is_readable_on_its_own_line(self, tmp_path):
+        """The append must not fuse itself onto an unterminated last line.
+
+        Skipping that tail at resolution is only half the contract: if the
+        write then lands ON it, the label is reported written while every
+        reader rejects the line it is part of — the fused-line failure the
+        short-write repair already exists to prevent, arriving by the other
+        door.
+        """
+        log_path = tmp_path / "log.jsonl"
+        _write_lines(log_path, [_sel(selection_id="good")])
+        with log_path.open("ab") as fh:
+            fh.write(b'{"event": "selection", "selection_id": "half')  # crashed mid-record
+
+        result = _run_feedback(
+            tmp_path, log_path, "--selection-id", "good", "--user-corrected", "--json"
+        )
+        assert result.exit_code == 0, result.output
+
+        lines = log_path.read_bytes().splitlines()
+        parsed = []
+        for raw_line in lines:
+            try:
+                parsed.append(json.loads(raw_line))
+            except ValueError:
+                parsed.append(None)
+        # Three lines: the intact selection, the crashed fragment (still one
+        # unreadable line, not two records fused into one), and the label.
+        assert len(lines) == 3
+        assert parsed[1] is None
+        assert parsed[2]["event"] == "feedback"
+        assert parsed[2]["selection_id"] == "good"
+
+    def test_a_repeated_id_resolves_to_the_last_one(self, tmp_path):
+        """Readers fold duplicates last-wins, so the cohort the label inherits
+        must come from the record they keep."""
+        log_path = tmp_path / "log.jsonl"
+        _write_lines(
+            log_path,
+            [
+                _sel(selection_id="dup", ranker_version="v0-passthrough"),
+                _sel(selection_id="dup", ranker_version="v1-bm25-tool-relevance"),
+            ],
+        )
+        result = _run_feedback(
+            tmp_path, log_path, "--selection-id", "dup", "--user-corrected", "--json"
+        )
+        assert result.exit_code == 0, result.output
+        labels = _feedback_records(log_path)
+        assert [record["ranker_version"] for record in labels] == ["v1-bm25-tool-relevance"]
+
+
+class TestCleanupFailuresDoNotOverruleACompleteWrite:
+    """Once the record's bytes are complete, no cleanup fault may report
+    ``failed`` — that is the one answer that sends an operator to write the
+    same label a second time."""
+
+    def test_a_failed_fsync_and_a_failed_close_together_are_unconfirmed(
+        self, tmp_path, monkeypatch
+    ):
+        log_path = tmp_path / "log.jsonl"
+        log = SelectionTelemetryLog(log_path)
+        log.initialize()
+        real_close = os.close
+        log_inode = log_path.stat().st_ino
+
+        def failing_fsync(fd):
+            raise OSError(5, "I/O error")
+
+        def failing_close(fd):
+            try:
+                is_log = os.fstat(fd).st_ino == log_inode
+            except OSError:  # pragma: no cover - defensive
+                is_log = False
+            real_close(fd)
+            if is_log:
+                raise OSError(5, "I/O error on close")
+
+        monkeypatch.setattr(selection_log_module.os, "fsync", failing_fsync)
+        monkeypatch.setattr(selection_log_module.os, "close", failing_close)
+        status = log.log_feedback(selection_id="a", user_corrected=True)
+        monkeypatch.undo()
+
+        assert status == "unconfirmed"
+        assert [record["selection_id"] for record in _feedback_records(log_path)] == ["a"]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX directory descriptors")
+    def test_a_directory_descriptor_that_will_not_close_is_still_unconfirmed(
+        self, tmp_path, monkeypatch
+    ):
+        """The directory sync has the same exposure as the append's own close:
+        raising out of its cleanup would be re-read as a failed write."""
+        log_path = tmp_path / "log.jsonl"
+        log = SelectionTelemetryLog(log_path)
+        real_close = os.close
+        import stat as stat_module
+
+        def failing_close(fd):
+            try:
+                is_dir = stat_module.S_ISDIR(os.fstat(fd).st_mode)
+            except OSError:  # pragma: no cover - defensive
+                is_dir = False
+            real_close(fd)
+            if is_dir:
+                raise OSError(5, "I/O error on close")
+
+        monkeypatch.setattr(selection_log_module.os, "close", failing_close)
+        status = log.log_feedback(selection_id="a", user_corrected=True)
+        monkeypatch.undo()
+
+        # The directory WAS synced; only its descriptor misbehaved on close, so
+        # the write stands as written rather than being downgraded — and above
+        # all it is not "failed".
+        assert status in ("written", "unconfirmed")
+        assert [record["selection_id"] for record in _feedback_records(log_path)] == ["a"]
+
+
+class TestEnvOverlayThatWasIgnoredEntirely:
+    """A bare ``MEMTOMEM_STM_PROXY`` the overlay could not honor resolves to
+    the same empty fragment as an unset environment — and the command would
+    then label whichever log the DEFAULTS name. The server refuses to start on
+    that environment; a writing command must not quietly proceed on it."""
+
+    @pytest.mark.parametrize("payload", ["{", "[]", '"a string"'])
+    def test_an_undecodable_bare_overlay_refuses_the_write(self, tmp_path, monkeypatch, payload):
+        from memtomem_stm.cli.proxy import cli
+
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY", payload)
+        # No --log: the config is what would decide the target, which is the
+        # whole hazard. --last needs no id from the log for this to be reached.
+        result = CliRunner().invoke(
+            cli,
+            [
+                "selection",
+                "feedback",
+                "--config",
+                str(tmp_path / "absent-proxy.json"),
+                "--last",
+                "--user-corrected",
+                "--yes",
+                "--json",
+            ],
+        )
+        payload_out = json.loads(result.output)
+        assert result.exit_code == 1
+        assert payload_out["error"] == "config_invalid"
+        assert "MEMTOMEM_STM_PROXY" in payload_out["message"]
+        assert _feedback_records(log_path) == []
+
+    def test_a_null_bare_overlay_is_consistent_and_proceeds(self, tmp_path, monkeypatch):
+        """The positive control: ``null`` resolves to the field defaults, which
+        is exactly what an empty overlay expresses, so it is not a rejection —
+        without this the test above would pass for a command that refuses on
+        any environment at all."""
+        from memtomem_stm.cli.proxy import cli
+
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY", "null")
+        result = CliRunner().invoke(
+            cli,
+            [
+                "selection",
+                "feedback",
+                "--config",
+                str(tmp_path / "absent-proxy.json"),
+                "--log",
+                str(log_path),
+                "--last",
+                "--user-corrected",
+                "--yes",
+                "--json",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert len(_feedback_records(log_path)) == 1
+
+
 class TestUnlabellableSelections:
     """Resolution must not accept a record offline replay will discard.
 
@@ -1604,8 +1844,13 @@ class TestSelectionFeedbackRobustness:
         assert result.exit_code == 1
         assert _feedback_records(log_path) == []
 
-    def test_non_tty_does_not_prompt(self, tmp_path):
-        """A script must not hang waiting for a confirmation nobody can give."""
+    def test_explicit_consent_writes_without_prompting(self, tmp_path):
+        """With ``--yes`` there is nothing left to ask.
+
+        Named for what it runs: the helper supplies ``--yes``, so this is the
+        consent-given path, not the refusal one — that contract is pinned by
+        the ``--yes``-less tests above, and a name promising it here would
+        report a pass for a path this test never enters."""
         log_path = tmp_path / "log.jsonl"
         _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
         result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected")

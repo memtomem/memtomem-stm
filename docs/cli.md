@@ -731,8 +731,7 @@ exit 1 and emit `{"action": "selection-feedback", "ok": false, "error":
 | --- | --- |
 | `no_log` | no log segment exists in the selected scope — with `--active-only` that is the active file alone, otherwise the active file and every rotated backup |
 | `not_found` / `no_match` | the selector resolved to nothing, checked *before* writing, so a typo never appends a label that joins to no selection |
-| `malformed_record` | the matched record carries no `selection_id` (reachable only on a hand-edited log) |
-| `unusable_record` | the record was found but cannot carry a label — an unsupported `schema_version`, or no `ranker_version` for the label to inherit. Offline replay discards exactly these records, so a label on one would join nothing; `--last` skips them rather than inferring one |
+| `unusable_record` | the record was found but cannot carry a label: an unsupported `schema_version` (offline replay drops those records outright, so a label on one joins nothing), no `ranker_version` for the label to inherit (replay would load the selection, but under a cohort this command would have had to invent), or — only reachable on a hand-edited log — no `selection_id`. `--last` skips such rows rather than inferring one |
 | `log_rotated` | the resolved selection left the log between resolution and append; nothing was written |
 | `log_busy` | the rotation lock is held (by a rotating writer or another labelling run) and could not be taken; nothing was written — re-run |
 | `lock_failed` | the rotation lock file beside the log could not be created (e.g. a writable log in a directory this user cannot write); nothing was written |

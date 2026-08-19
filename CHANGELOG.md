@@ -42,11 +42,19 @@ changes inline only. See the deprecation policy in
   operator was told exists. When that flush or the following `close` fails,
   the record's bytes are already complete in the file, so the command reports
   `write_unconfirmed` (exit 1) and says a re-run is safe rather than picking
-  one of two verdicts it cannot support. Only records offline replay can load
-  are labellable: an unsupported `schema_version` or a missing `ranker_version`
-  exits 1 (`unusable_record`) and is skipped by `--last`, and the resolver
-  decodes the log strictly, so a record truncated mid-character is skipped
-  rather than repaired into a different string than the one replay reads. Resolution
+  one of two verdicts it cannot support. Only rows the command can label
+  honestly are labellable: an unsupported `schema_version` (offline replay
+  drops those records outright) or a missing `ranker_version` (the label would
+  be filed under a cohort the command invented) exits 1 (`unusable_record`) and
+  is skipped by `--last`. Resolution otherwise counts lines exactly as the
+  replay loader does — strict decoding, so a record truncated mid-character is
+  skipped rather than repaired into a different string than the one replay
+  reads; the same maximum line length; the active file's unterminated tail
+  ignored, since that is a record still being written; and a repeated
+  `selection_id` folded last-wins — so the two cannot disagree about which
+  selections exist. An append that finds an unterminated last line now writes
+  its own leading newline, so a crash mid-record cannot fuse the next record
+  onto the fragment and have it reported as written. Resolution
   runs under an advisory rotation lock and the target is re-verified under it
   after confirmation, so a rotation can neither rename segments mid-scan nor
   evict the agreed selection before the write (`log_rotated` / `log_busy`,
@@ -63,6 +71,19 @@ changes inline only. See the deprecation policy in
   enumerated, so a future request-path emitter fails CI until the ADR is
   rewritten — including one that routes through the labelling command's own
   append helper rather than naming the emitter.
+
+- **A proxy environment that was ignored entirely no longer reads as an unset
+  one** (#853). `collect_proxy_env_overrides` drops a bare
+  `MEMTOMEM_STM_PROXY` payload that is not valid JSON, or that decodes to
+  something other than an object — the server refuses to start on exactly that
+  environment — but the resulting overlay was indistinguishable from "the
+  operator set nothing", so `mms selection feedback` could fall back to the
+  default log and label a file nobody chose. `EnvOverlayResult` now records
+  those variables (`rejected`) and `load_from_file_with_status` reports them as
+  `env_error`, whether or not a config file exists, so the command refuses with
+  `config_invalid` and names the variable (never its value). A bare `null`
+  payload is unchanged: it resolves to the field defaults, which is what an
+  empty overlay already expresses.
 
 - **Selection telemetry records the tool-graph's per-candidate facts, not just
   the risk score they produce** (#852, part of #469). Each entry in

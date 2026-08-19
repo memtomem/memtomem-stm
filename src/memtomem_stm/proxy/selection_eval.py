@@ -26,7 +26,11 @@ from memtomem_stm.proxy.config import (
 )
 from memtomem_stm.proxy.manager import ProxyToolInfo
 from memtomem_stm.proxy.privacy import contains_sensitive_content
-from memtomem_stm.proxy.selection_log import SCHEMA_VERSION, discover_log_files
+from memtomem_stm.proxy.selection_log import (
+    MAX_LINE_BYTES,
+    SCHEMA_VERSION,
+    discover_log_files,
+)
 from memtomem_stm.proxy.tool_eligibility import ExposureCandidate, filter_tools
 from memtomem_stm.utils import json_out
 from memtomem_stm.proxy.tool_relevance import (
@@ -41,7 +45,6 @@ from memtomem_stm.proxy.tool_relevance import (
 REPORT_SCHEMA_VERSION = 1
 DATASET_SCHEMA_VERSION = 1
 EVALUATOR_VERSION = "v1"
-MAX_LINE_BYTES = 1_048_576
 GRID_REVIEW = (0.0, 0.25, 0.5, 0.75, 1.0)
 GRID_GRAPH = (0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0)
 PARITY_RANKER_VERSIONS = frozenset(

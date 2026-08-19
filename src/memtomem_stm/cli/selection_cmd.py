@@ -335,26 +335,25 @@ def feedback_command(
             "no_match",
             f"no selection record matches{' ' + scope if scope else ''}",
         )
+    # A row can be present and still not be labellable: an unsupported schema
+    # version, which offline replay drops outright, or no cohort stamp for the
+    # label to inherit, which would file the operator's judgement under a
+    # ranker this process guessed at. A label on either is the dead weight a
+    # mistyped id would have produced. Reported by name rather than as "not
+    # found", because the record IS there and an operator can go look at it.
+    #
+    # A missing ``selection_id`` is one of these defects rather than a code of
+    # its own: an exact-id lookup can only return the row whose id equals the
+    # (non-empty) argument, and ``--last`` skips defective rows, so a separate
+    # "matched record has no id" branch had no way to fire.
     resolved_id = record.get("selection_id")
-    if not isinstance(resolved_id, str) or not resolved_id:
-        # Only reachable on a hand-edited log; its own code so an operator is
-        # not told "not found" about a record that was in fact found.
-        _feedback_failure(
-            as_json, "malformed_record", "matched selection record carries no selection_id"
-        )
-    # A row can be present and still not be labellable — an unsupported schema
-    # version, or no cohort stamp to inherit. The replay harness discards those
-    # records, so a label pointing at one is the same dead weight a mistyped id
-    # would have produced, and the label would be filed under a cohort this
-    # process invented. Reported by name rather than as "not found", because
-    # the record IS there and an operator can go look at it.
     defect = selection_defect(record)
-    if defect is not None:
+    if defect is not None or not isinstance(resolved_id, str):
         _feedback_failure(
             as_json,
             "unusable_record",
-            f"selection {resolved_id} cannot be labelled ({defect}); "
-            "offline replay would discard this record",
+            f"the matched selection cannot be labelled ({defect or 'no selection_id'}); "
+            "label it by id against a record offline replay can load",
         )
 
     # Identify the row BEFORE writing, and — when a human is at the terminal —
