@@ -548,8 +548,9 @@ def parse_graph_facts(verdict: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
 
     Lenient and never raising, for the same reason as
     :func:`parse_risk_scores`: a malformed payload yields an empty map and the
-    caller degrades to logging no facts. A later row wins on a duplicated ref
-    (last-write, matching ``parse_risk_scores``).
+    caller degrades to logging no facts. A later row wins on a duplicated ref,
+    which is where these two views deliberately diverge — the penalty map keeps
+    the last POSITIVE score instead. See :func:`parse_graph_features`.
     """
     return parse_graph_features(verdict)[0]
 
@@ -589,27 +590,6 @@ def parse_graph_features(
         if score is not None and score > 0.0:
             scores[ref] = score
     return facts, scores
-
-
-def risk_scores_from_facts(facts: Mapping[str, Mapping[str, Any]]) -> dict[str, float]:
-    """Project already-deduplicated facts onto the sparse penalty map.
-
-    Only *positive* scores survive: a missing ref means "no penalty", which is
-    exactly the ranker's default, so recording ``0.0`` rows here would grow the
-    map without changing a single score.
-
-    For a LIVE payload use :func:`parse_risk_scores`, which sees the rows and
-    therefore the duplicate-ref rule. This function has one row per ref by
-    construction — it exists for facts read back from the consult cache, which
-    stores the penalty map beside them precisely so a warm start cannot
-    re-derive a different one.
-    """
-    scores: dict[str, float] = {}
-    for ref, row in facts.items():
-        score = row.get("risk_score")
-        if isinstance(score, float) and score > 0.0:
-            scores[ref] = score
-    return scores
 
 
 def parse_risk_scores(verdict: Mapping[str, Any]) -> dict[str, float]:

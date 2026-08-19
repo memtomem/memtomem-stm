@@ -59,8 +59,8 @@ from memtomem_stm.proxy.tool_eligibility import (
     filter_tools,
     interpret_verdict,
     parse_graph_facts,
+    parse_graph_features,
     parse_risk_scores,
-    risk_scores_from_facts,
     sanitize_graph_facts_row,
     toolgraph_reject_code,
 )
@@ -1089,12 +1089,12 @@ class TestParseGraphFacts:
         assert parse_graph_facts(v)["s::a"]["risk_score"] == 1.0
         assert parse_risk_scores(v) == {"s::a": 1.0}
 
-    def test_risk_scores_are_derived_from_the_same_walk(self):
+    def test_both_views_come_from_one_traversal(self):
         """One response, one traversal — the two views cannot disagree.
 
-        Pinned because the old implementation walked the payload twice; a
-        divergence there is a silent mismatch between what got penalized and
-        what got logged.
+        Asserted against the pair-returning parser the consult actually calls,
+        not by comparing two separate parses: equal outputs from two walks
+        would prove agreement on this input, not that there is one walk.
         """
         v = {
             "features": [
@@ -1103,8 +1103,13 @@ class TestParseGraphFacts:
                 {"candidate": "s::c", "risk_score": 0.0},
             ]
         }
-        assert parse_risk_scores(v) == risk_scores_from_facts(parse_graph_facts(v))
-        assert parse_risk_scores(v) == {"s::a": 0.4}
+        facts, scores = parse_graph_features(v)
+        assert scores == {"s::a": 0.4}
+        assert set(facts) == {"s::a", "s::b", "s::c"}
+        assert facts["s::b"]["risk_score"] is None
+        # The single-product wrappers are that pair, projected.
+        assert parse_graph_facts(v) == facts
+        assert parse_risk_scores(v) == scores
 
 
 # ── filter_tools external_rejects + withhold_all (#465) ─────────────────────
