@@ -257,36 +257,45 @@ changes inline only. See the deprecation policy in
   from hand-edited logs, an older producer, or a future ranker that widens the
   field.
 
-  **Behavior change**, grouped by what an operator observes.
+  **Behavior change.** One fact governs the rest: a rank was only ever coerced
+  or recorded on the entry naming `selected_tool`, so a malformed rank
+  anywhere else was already just a counted violation — and still is. Grouped
+  by what an operator observes:
 
   *A traceback becomes a report* (exit 1 via the existing `invalid` status,
-  rather than a stack trace): a `ranked_candidates[].rank` that is absent
-  (`KeyError`), `null` (`TypeError`), a non-numeric string (`ValueError`),
-  `0` (`ZeroDivisionError` in the MRR mean), or an oversized integer
-  (`OverflowError`); and a `candidate_tools` element that is not hashable
-  (`TypeError`).
+  rather than a stack trace) — on the selected tool's entry, a
+  `ranked_candidates[].rank` that is absent (`KeyError`), `null`
+  (`TypeError`), a non-numeric string (`ValueError`), `0` (`ZeroDivisionError`
+  in the MRR mean), or an oversized integer (`OverflowError`); and a
+  non-hashable `candidate_tools` element (`TypeError`), when `candidate_count`
+  matches the list length — a mismatch short-circuited the old condition
+  before `set()`.
 
   *A previously clean report becomes `invalid`*, so the command now exits 1
   where it exited 0 — but only for inputs no other invariant already caught:
   a `rank` that is not an integer yet compares equal to the expected one
-  (`true`, since `True == 1`, and `1.0`), and a hashable non-string
-  `candidate_tools` element such as `42`, which was accepted in silence.
+  (`true`, since `True == 1`, and `1.0`) on any entry, and a hashable
+  non-string `candidate_tools` element such as `42`, which was accepted in
+  silence.
 
   *An already-`invalid` report keeps its status and exit code while its
-  coverage and alignment numbers move*: an entry whose shape the check
-  rejects no longer contributes its rank, where before it was counted as a
-  violation *and* recorded. This drops `selected_rank_known` and the
-  `mrr` denominator, and reads as an alignment miss rather than a shrunken
-  `at_k` denominator. It applies to each condition the entry check tests — a
-  rank that does not match the entry's position (including one that used to be
-  coerced, such as `"1"` or `1.5`), a non-string `tool`, a `tool` repeated
-  within the list, and a `tool` absent from `candidate_tools`. So a duplicate
-  entry for the selected tool no longer overwrites the first, valid rank, and
-  a `selected_tool` outside `candidate_tools` scores as a miss.
+  numbers move.* When the rejected entry is the selected tool's, it no longer
+  contributes its rank, where before it was counted as a violation *and*
+  recorded: `selected_rank_known` and the `mrr` denominator drop, and the
+  record reads as an alignment miss rather than a shrunken `at_k` denominator.
+  That covers each condition the entry check tests — a rank not matching the
+  entry's position (including one that used to be coerced, such as `"1"` or
+  `1.5`), a non-string `tool`, a `tool` repeated within the list, and a `tool`
+  absent from `candidate_tools` — so a duplicate entry for the selected tool
+  no longer overwrites the first, valid rank, and a `selected_tool` outside
+  `candidate_tools` scores as a miss. When the rejected entry is *not* the
+  selected one, only `invariant_violations` rises.
 
-  *Unchanged*: the containers around those entries keep their own paths — a
-  `ranked_candidates` that is not a list still contributes nothing and counts
-  no violation, and a non-dict entry still counts one and stops the list.
+  *Unchanged*: a malformed rank on a non-selected entry that already counted;
+  a non-hashable `candidate_tools` element behind a `candidate_count`
+  mismatch; and the containers around the entries — a `ranked_candidates` that
+  is not a list still contributes nothing and counts no violation, and a
+  non-dict entry still counts one and stops the list.
 
   This does not close the whole class: the six numeric fields an admitted
   record can still overflow or serialize as `NaN` through

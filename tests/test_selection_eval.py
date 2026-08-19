@@ -311,6 +311,21 @@ def test_unusable_rank_on_a_non_selected_entry_is_still_counted(tmp_path: Path) 
     assert report["production"]["selected_tool_alignment"]["mrr"]["value"] == 1.0
 
 
+def test_unhashable_candidate_with_a_count_mismatch_is_counted_once(tmp_path: Path) -> None:
+    """A count mismatch short-circuits before `set()`, so this never crashed."""
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    # candidate_count stays 2 while the list grows to 3.
+    selection["candidate_tools"] = ["demo__search", "demo__write", {"x": 1}]
+    _write_jsonl(log, [selection, _execution()])
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["status"] == "invalid"
+    assert report["data_quality"]["invariant_violations"] == 1
+    assert report["production"]["coverage"]["selected_rank_known"] == 1
+
+
 def test_container_shape_violations_are_unchanged_by_the_entry_gate(tmp_path: Path) -> None:
     """`entry_ok` governs entries; the containers around them keep their own paths."""
     not_a_dict = _selection()
