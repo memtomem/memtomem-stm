@@ -480,21 +480,24 @@ def feedback_command(
         # for. It binds cooperating writers only, the lock being advisory.
         if status == APPEND_UNCONFIRMED:
             # The bytes are complete in the file, but something about them was
-            # not established — that they survive a crash, that a rotation did
-            # not orphan the file they went into, or that a repaired short
-            # write was not fused with a concurrent append. Deliberately not
-            # named apart here: the operator's move is the same for all three,
-            # and naming a cause this process did not verify would be the
-            # overstatement the status exists to avoid. Say that a re-run is
-            # safe: repeating the same label for the same selection is the
-            # accumulate-and-supersede case the schema already defines, not a
-            # second, conflicting judgement.
+            # not established — that they survive a crash, or that a rotation
+            # did not orphan the file they went into. Deliberately not named
+            # apart here: the operator's move is the same for both, and naming
+            # a cause this process did not verify would be the overstatement
+            # the status exists to avoid.
+            #
+            # The advice is to RE-RUN, not to go and look: after a failed flush
+            # the record is visible and still not durable, so seeing it proves
+            # nothing about what was unconfirmed. Repeating the same label for
+            # the same selection is the accumulate-and-supersede case the
+            # schema already defines, not a second, conflicting judgement, so
+            # the retry is always safe.
             _feedback_failure(
                 as_json,
                 f"write_{status}",
                 f"the label's bytes reached {telemetry_path} but the record could not be "
-                f"confirmed there; check the log, and if it is not there re-run with "
-                f"--selection-id {resolved_id}",
+                f"confirmed there; re-run with --selection-id {resolved_id} until it "
+                f"reports success",
                 extra={"selection_id": resolved_id},
             )
         if status != APPEND_WRITTEN:

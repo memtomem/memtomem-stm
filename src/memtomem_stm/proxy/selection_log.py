@@ -112,12 +112,14 @@ APPEND_WRITTEN = "written"
 APPEND_REDACTED = "redacted"
 APPEND_FAILED = "failed"
 # The record's bytes are complete in the file, but something about them could
-# not be established. Three causes, deliberately sharing one status because the
-# caller's move is identical for all of them: a durable append whose ``fsync``
-# or ``close`` failed (bytes may not survive a crash), a reachability probe
-# that could not run (unknown whether a rotation orphaned them), and a short
-# write repaired by a second ``os.write`` (another writer may have appended
-# between the two, fusing the lines). Distinct from ``failed`` because the two
+# not be established. Two causes, deliberately sharing one status because the
+# caller's move is identical for both: a durable append whose ``fsync`` or
+# ``close`` failed (the bytes may not survive a crash), and a reachability
+# probe that could not run (unknown whether a rotation orphaned them). Note
+# what is NOT here — a short write repaired by a second ``os.write`` reports
+# ``written``, because every record self-frames and a foreign append landing
+# between the two writes closes this record with its own leading newline.
+# Distinct from ``failed`` because the two
 # need opposite handling: a failure means "write it again", while an
 # unconfirmed append may already be on disk, so the caller must be told what is
 # and is not known rather than being handed a verdict the process cannot
@@ -222,36 +224,6 @@ def _still_reachable(fd: int) -> bool | None:
     except OSError:
         logger.debug("Could not probe whether the selection log is still linked", exc_info=True)
         return None
-
-
-def _needs_leading_newline(path: Path) -> bool:
-    """Whether an append to *path* must open a line of its own first.
-
-    True when the file's last byte is not a newline — a crash mid-append, or a
-    hand edit — because an append landing there is swallowed into that line and
-    the writer would be told its record survived while readers reject the fused
-    line.
-
-    Probed through its own read handle rather than the append descriptor: a
-    read-modify sequence on an ``O_APPEND`` descriptor would need a separate
-    argument about what each platform guarantees, and this needs none — the
-    append itself is unchanged. A missing or empty file needs nothing (there is
-    no line to fuse with); any other failure answers **True**, because the
-    unknown case is the one where a wrong guess costs a record. A stray blank
-    line, which is what that guess costs when the file was in fact terminated,
-    is skipped by every reader of this log.
-    """
-    try:
-        with path.open("rb") as fh:
-            if fh.seek(0, os.SEEK_END) == 0:
-                return False
-            fh.seek(-1, os.SEEK_END)
-            return fh.read(1) != b"\n"
-    except FileNotFoundError:
-        return False
-    except OSError:
-        logger.debug("Could not probe the selection log's tail", exc_info=True)
-        return True
 
 
 def _canonical_args(arguments: dict[str, Any] | None) -> str:
@@ -405,12 +377,15 @@ class SelectionTelemetryLog:
                 "args_chars": len(canonical),
             }
         )
-        # A write failure means the selection never reached disk — report
-        # ``None`` so the caller skips the paired execution event rather
-        # than persisting an orphan half (a transient failure could let the
-        # execution write succeed). An intentional redaction drop still
-        # returns the id: that is the documented left-outer case.
-        return selection_id if appended != APPEND_FAILED else None
+        # Only a confirmed append pairs. A failure means the selection never
+        # reached disk, and ``unconfirmed`` means something about it could not
+        # be established — including, for a reachability probe that could not
+        # run, whether a rotation orphaned it. Pairing an execution to either
+        # persists exactly the orphan half this contract exists to prevent, and
+        # a transient fault could let the execution write succeed where the
+        # selection did not. An intentional redaction drop still returns the
+        # id: that is the documented left-outer case.
+        return selection_id if appended in (APPEND_WRITTEN, APPEND_REDACTED) else None
 
     def log_execution(
         self,
@@ -575,10 +550,22 @@ class SelectionTelemetryLog:
                 # the open, so at most a concurrent external creator makes it
                 # conservative (one extra directory sync), never optimistic.
                 created = durable and not self._path.exists()
-                # Probed before the open, through a read handle of its own, so
-                # the append descriptor keeps the plain write-only append it
-                # has always had.
-                payload = b"\n" + data if _needs_leading_newline(self._path) else data
+                # Self-framing, unconditionally. Whether a leading newline is
+                # NEEDED can only be answered by looking at the file, and any
+                # such look is a time-of-check that another lock-free appender
+                # can invalidate before this write: it leaves a fragment, and
+                # this record fuses onto it while the caller is told it was
+                # written. Emitting the newline as part of the same
+                # ``O_APPEND`` write makes the record frame itself atomically,
+                # whatever preceded it — and symmetrically, the NEXT writer's
+                # leading newline closes any fragment this one might leave.
+                #
+                # The cost is a blank line whenever the previous record was
+                # already terminated, and one at the head of a fresh log. Both
+                # readers skip blank lines and neither counts them, so the cost
+                # is a byte per record, paid to remove a race that costs whole
+                # records.
+                payload = b"\n" + data
                 fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
                 closed = False
                 try:
@@ -598,21 +585,18 @@ class SelectionTelemetryLog:
                         # duplicates the label.
                         repaired = self._terminate_fragment(fd, payload, written)
                         if repaired and written == len(payload) - 1:
-                            # Every byte of the record is now on disk — but it
-                            # took two writes to get there, with no
-                            # cross-process lock between them. Another writer's
-                            # append can land in that gap, and this newline
-                            # then closes THEIR line while ours is fused onto
-                            # it. Complete or corrupt, and this process cannot
-                            # tell which apart without reading the file back:
-                            # exactly the "may already be on disk, do not
-                            # simply retry" case ``unconfirmed`` names.
-                            self.write_errors += 1
-                            logger.warning(
-                                "Selection telemetry record needed a newline repair; another "
-                                "writer may have appended between the two writes"
-                            )
-                            return APPEND_UNCONFIRMED
+                            # The only missing byte was the terminator, and it
+                            # is now there: the record's bytes are exactly the
+                            # intended ones. Safe to call written even though
+                            # the repair is a second write with no lock across
+                            # the gap, because every record self-frames — a
+                            # foreign append landing in that gap begins with
+                            # its own newline, which closes this record, and
+                            # the repair newline then costs a blank line rather
+                            # than a fused pair. Reporting a failure here would
+                            # be false, and would invite a retry that
+                            # duplicates the label.
+                            written = len(payload)
                     if written != len(payload):
                         # No record is on disk, and a caller waiting to hear
                         # that its label exists must not be told otherwise.

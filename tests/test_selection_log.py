@@ -216,7 +216,11 @@ class TestSchemaStability:
     def test_lines_are_sorted_key_compact_json(self, tmp_path):
         log = _make_log(tmp_path)
         _log_pair(log)
-        first = log.path.read_text(encoding="utf-8").splitlines()[0]
+        # First non-blank line: every record self-frames with a leading
+        # newline, so the physical first line of a fresh log is blank.
+        first = next(
+            line for line in log.path.read_text(encoding="utf-8").splitlines() if line.strip()
+        )
         assert first == json.dumps(
             json.loads(first), sort_keys=True, ensure_ascii=False, separators=(",", ":")
         )
@@ -2606,7 +2610,13 @@ class TestSelectionFeedbackRobustness:
         target, so there is no inference to confirm."""
         log_path = tmp_path / "log.jsonl"
         _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
-        sid = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])["selection_id"]
+        sid = json.loads(
+            next(
+                line
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            )
+        )["selection_id"]
         result = _run_feedback(
             tmp_path, log_path, "--selection-id", sid, "--user-corrected", yes=False
         )
@@ -2809,19 +2819,14 @@ class TestSelectionFeedbackRobustness:
         assert result.exit_code == 1
         assert json.loads(result.output)["error"] == "log_unreadable"
 
-    def test_a_repaired_newline_only_short_write_is_unconfirmed_not_written(
-        self, tmp_path, monkeypatch
-    ):
-        """The repair completes the bytes, but not the knowledge about them.
+    def test_a_repaired_newline_only_short_write_is_a_success(self, tmp_path, monkeypatch):
+        """When the ONLY missing byte was the newline, the repair restores the
+        exact intended bytes, so calling it a failure would be false — and
+        would invite a retry that duplicates the label.
 
-        Restoring the missing newline takes a SECOND ``os.write``, and this
-        writer holds no cross-process lock between the two. Another writer's
-        append can land in that gap, in which case the repair newline closes
-        that record's line and this one is fused onto it. So the bytes are all
-        on disk and may still be unreadable, which is neither ``written`` nor
-        ``failed``: reporting failure would invite a retry that duplicates a
-        label that exists, and reporting success would claim a parse this
-        process never checked.
+        Safe despite being a second write with no lock across the gap, because
+        every record self-frames: see the interleaving test below, which runs a
+        foreign append through that exact gap.
         """
         log_path = tmp_path / "log.jsonl"
         log = SelectionTelemetryLog(log_path)
@@ -2829,13 +2834,50 @@ class TestSelectionFeedbackRobustness:
         monkeypatch.setattr(
             selection_log_module.os, "write", _short_write_on(log_path, drop_only_newline=True)
         )
-        assert log.log_feedback(selection_id="a", user_corrected=True) == "unconfirmed"
+        assert log.log_feedback(selection_id="a", user_corrected=True) == "written"
+        monkeypatch.undo()
+        assert [record["selection_id"] for record in _feedback_records(log_path)] == ["a"]
+
+    def test_a_foreign_append_between_the_short_write_and_its_repair_is_survivable(
+        self, tmp_path, monkeypatch
+    ):
+        """The gap the repair opens, with a second writer driven through it.
+
+        Both records must come back from the reader the log actually has. This
+        is what licenses reporting the repair as written: the repair newline
+        lands after the interloper and costs a blank line, while the
+        interloper's OWN leading newline is what closed this record.
+        """
+        log_path = tmp_path / "log.jsonl"
+        log = SelectionTelemetryLog(log_path)
+        log.initialize()
+        real_write = selection_log_module.os.write
+        phase = {"n": 0}
+
+        def short_then_interleave(fd, data):
+            if phase["n"] == 0 and b"label-a" in data:
+                phase["n"] = 1
+                return real_write(fd, data[:-1])
+            if phase["n"] == 1 and data == b"\n":
+                phase["n"] = 2
+                with open(log_path, "ab") as handle:
+                    handle.write(
+                        b'\n{"event":"selection","schema_version":1,'
+                        b'"ranker_version":"v0-passthrough","selection_id":"other","ts":1.0}\n'
+                    )
+            return real_write(fd, data)
+
+        monkeypatch.setattr(selection_log_module.os, "write", short_then_interleave)
+        status = log.log_feedback(selection_id="label-a", user_corrected=True)
         monkeypatch.undo()
 
-        # Uncontended, the repair really does restore the exact intended bytes
-        # — which is why the answer is "unknown" rather than "lost".
-        assert [record["selection_id"] for record in _feedback_records(log_path)] == ["a"]
-        assert log.write_errors == 1
+        assert phase["n"] == 2, "the interleaving never happened; the test proved nothing"
+        assert status == "written"
+        reader = selection_log_module.TelemetryReader(log_path)
+        seen = [(r.get("event"), r.get("selection_id")) for r in reader.records()]
+        assert ("feedback", "label-a") in seen
+        assert ("selection", "other") in seen
+        assert reader.quality["malformed_lines"] == 0
 
     def test_a_short_write_does_not_corrupt_the_next_record(self, tmp_path, monkeypatch):
         """The follow-up append must stay readable and honestly reported.
@@ -3069,6 +3111,50 @@ class TestSelectionFeedbackRobustness:
         assert [record["selection_id"] for record in _feedback_records(log_path)] == ["a"]
         assert log.write_errors == 1
 
+    def test_a_record_frames_itself_against_a_fragment_that_lands_before_the_write(
+        self, tmp_path, monkeypatch
+    ):
+        """Framing cannot be decided by looking at the file first.
+
+        Any probe of "does this file end mid-line?" is a time-of-check another
+        lock-free appender invalidates before the write lands — it leaves a
+        fragment in between, and the record fuses onto it while the caller is
+        told it was written. The newline goes out in the SAME write instead, so
+        the record frames itself whatever preceded it.
+        """
+        log_path = tmp_path / "log.jsonl"
+        log = SelectionTelemetryLog(log_path)
+        log.initialize()
+        log_path.write_text(
+            '{"event":"selection","schema_version":1,"ranker_version":"v0-passthrough",'
+            '"selection_id":"s1","ts":1.0}\n',
+            encoding="utf-8",
+        )
+
+        real_open = selection_log_module.os.open
+        fired = {"n": 0}
+
+        def leave_a_fragment_then_open(path, *args, **kwargs):
+            # Runs after any framing decision could have been made, and before
+            # this append's own write.
+            if fired["n"] == 0 and str(path) == str(log_path):
+                fired["n"] = 1
+                with open(log_path, "ab") as handle:
+                    handle.write(b'{"event":"execution","partial":')
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(selection_log_module.os, "open", leave_a_fragment_then_open)
+        status = log.log_feedback(selection_id="label-a", user_corrected=True)
+        monkeypatch.undo()
+
+        assert fired["n"] == 1, "the fragment never landed; the test proved nothing"
+        assert status == "written"
+        reader = selection_log_module.TelemetryReader(log_path)
+        labelled = [r.get("selection_id") for r in reader.records() if r.get("event") == "feedback"]
+        assert labelled == ["label-a"], (
+            "a record reported as written must not have fused onto a foreign fragment"
+        )
+
     def test_a_record_the_readers_would_drop_is_refused_rather_than_written(self, tmp_path):
         """The writer must not emit a line its own readers discard.
 
@@ -3091,18 +3177,85 @@ class TestSelectionFeedbackRobustness:
         assert [record for record in reader.records() if record.get("event") == "feedback"] == []
         assert reader.quality["oversized_lines"] == 0
 
-    def test_a_record_just_under_the_cut_is_still_written(self, tmp_path):
-        """The positive control: the refusal is the length, not the shape."""
+    @staticmethod
+    def _feedback_line_bytes(tmp_path, selection_id: str) -> int:
+        """Encoded length of the line this id produces — measured, not modelled.
+
+        Re-deriving the serialization here would make the boundary test agree
+        with a copy of the writer rather than with the writer.
+        """
+        probe_path = tmp_path / f"probe-{len(selection_id)}.jsonl"
+        probe = SelectionTelemetryLog(probe_path)
+        probe.initialize()
+        assert probe.log_feedback(selection_id=selection_id, user_corrected=True) == "written"
+        line = next(
+            candidate
+            for candidate in probe_path.read_text(encoding="utf-8").splitlines()
+            if candidate.strip()
+        )
+        return len(line.encode("utf-8"))
+
+    @pytest.fixture
+    def _fixed_clock(self, monkeypatch):
+        """A timestamp of stable length.
+
+        ``time.time()`` renders to a different number of characters from call
+        to call, which moves the serialized line by a byte or two — enough to
+        make an exact-boundary assertion agree with itself only sometimes.
+        """
+        monkeypatch.setattr(selection_log_module.time, "time", lambda: 1787000000.5)
+
+    @pytest.mark.parametrize("over", [False, True])
+    def test_the_writer_cuts_where_the_reader_cuts(self, tmp_path, over, _fixed_clock):
+        """The boundary itself, from both sides.
+
+        A record whose serialized line is exactly ``MAX_LINE_BYTES`` is one the
+        reader admits, so the writer must write it; one byte more is one the
+        reader drops, so the writer must refuse it. An off-by-one here is
+        invisible at every length except this one.
+        """
         log_path = tmp_path / "log.jsonl"
         log = SelectionTelemetryLog(log_path)
         log.initialize()
-        assert log.log_feedback(selection_id="a", user_corrected=True) == "written"
+        limit = selection_log_module.MAX_LINE_BYTES
+
+        # The line grows one byte per ASCII id character, so one measurement
+        # fixes the constant part.
+        overhead = self._feedback_line_bytes(tmp_path, "x") - 1
+        selection_id = "x" * (limit - overhead + (1 if over else 0))
+        assert self._feedback_line_bytes(tmp_path, "x" * (limit - overhead)) == limit, (
+            "the id length that lands exactly on the limit was mis-derived"
+        )
+
+        status = log.log_feedback(selection_id=selection_id, user_corrected=True)
         reader = selection_log_module.TelemetryReader(log_path)
-        assert [
-            record["selection_id"]
-            for record in reader.records()
-            if record.get("event") == "feedback"
-        ] == ["a"]
+        seen = [r.get("selection_id") for r in reader.records() if r.get("event") == "feedback"]
+
+        if over:
+            assert status == "failed"
+            assert seen == [], "a refused record must leave nothing behind"
+            assert reader.quality["oversized_lines"] == 0
+        else:
+            assert status == "written"
+            assert seen == [selection_id], "a record the reader admits must be written"
+
+    def test_the_cut_counts_bytes_not_characters(self, tmp_path):
+        """A multi-byte id must be measured the way the reader measures it.
+
+        ``len()`` on the string would pass a record that is three times over
+        the limit once encoded — and the reader, which counts bytes, would drop
+        every one of them.
+        """
+        log_path = tmp_path / "log.jsonl"
+        log = SelectionTelemetryLog(log_path)
+        log.initialize()
+        # Each character is 3 bytes in UTF-8, so this is under the limit by
+        # character count and well over it by byte count.
+        selection_id = "한" * (selection_log_module.MAX_LINE_BYTES // 2)
+        assert len(selection_id) < selection_log_module.MAX_LINE_BYTES
+        assert log.log_feedback(selection_id=selection_id, user_corrected=True) == "failed"
+        reader = selection_log_module.TelemetryReader(log_path)
+        assert [r for r in reader.records() if r.get("event") == "feedback"] == []
 
     def test_a_reported_success_holds_the_lock_that_makes_it_true(self, tmp_path):
         """The command's success must not be evictable the instant it is made.

@@ -101,11 +101,14 @@ the append created the log, before the command reports success. The call-path
 emitters deliberately are not: their records are one sample among many that
 sampling may drop outright. A label the command could not confirm is reported as
 such rather than as a success or a failure, because its bytes are in the file
-either way. Three things can be unconfirmable — that the bytes survive a crash,
-that a rotation did not orphan the file they went into, and that a repaired
-short write was not fused with a concurrent append — and they share one status
-because the operator's move is the same for all three: look at the log, and
-re-run by `--selection-id` if the label is not there.
+either way. Two things can be unconfirmable — that the bytes survive a crash,
+and that a rotation did not orphan the file they went into — and they share one
+status because the operator's move is the same for both: re-run by
+`--selection-id` until it reports success. Not "check whether the label is
+there": after a failed flush the record is visible and still not durable, so
+seeing it proves nothing about the thing that was unconfirmed. Repeating the
+label for one selection is the accumulate-and-supersede case above, so the
+retry is always safe.
 
 The command labels only rows it can label honestly. A selection whose
 `schema_version` is unsupported is one offline replay drops outright, so a
