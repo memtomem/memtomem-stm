@@ -281,8 +281,8 @@ changes inline only. See the deprecation policy in
   silence.
 
   *An already-`invalid` report keeps its status and exit code while its
-  numbers move.* A rejected entry no longer contributes its rank, where before
-  it was counted as a violation *and* recorded. That covers each condition the
+  numbers move.* A rejected entry naming `selected_tool` no longer contributes
+  its rank, where before it was counted as a violation *and* recorded. That covers each condition the
   entry check tests — a rank not matching the entry's position (including one
   that used to be coerced, such as `"1"` or `1.5`), a non-string `tool`, a
   `tool` repeated within the list, and a `tool` absent from `candidate_tools`
@@ -294,7 +294,7 @@ changes inline only. See the deprecation policy in
   duplicate* entry for the selected tool is the rejected one, the earlier
   valid rank stands instead of being overwritten, so the counters hold and the
   numbers improve — a duplicate at rank 3 behind a valid rank 1 moves `mrr`
-  from `0.33` to `1.0` and turns an `at_1` miss into a hit. When the rejected
+  from `0.333333` to `1.0` and turns an `at_1` miss into a hit. When the rejected
   entry belongs to neither, only `invariant_violations` rises.
 
   *Unchanged*: a malformed rank on a non-selected entry that already counted;
