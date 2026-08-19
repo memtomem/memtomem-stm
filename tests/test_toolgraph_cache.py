@@ -277,6 +277,60 @@ class TestRoundTrip:
         assert row["had_risk_scores"] is False
 
 
+class TestWriteScoreValidation:
+    """``put`` must hold a score to the same rule the parser and read do."""
+
+    @pytest.mark.parametrize(
+        "value",
+        [True, 10**400, float("inf"), float("nan"), "0.5", None],
+        ids=["bool", "oversized", "inf", "nan", "string", "none"],
+    )
+    def test_an_unrecordable_score_refuses_the_write(self, cache, value):
+        """Converting before validating accepted values the parser refuses
+        (``True`` became ``1.0``) and raised on ones it merely drops — out of a
+        method whose contract is to no-op rather than fail its caller."""
+        cache.put(
+            _PROV,
+            _AGENT,
+            _PROFILE,
+            "hashA",
+            11,
+            rejects={},
+            tool_not_found_refs=[],
+            graph_facts={},
+            risk_scores={"s::a": value},
+            had_risk_scores=True,
+        )
+        assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is None
+        assert cache._db.execute("SELECT COUNT(*) FROM toolgraph_consult").fetchone()[0] == 0
+
+    def test_one_bad_score_refuses_the_whole_row(self, cache):
+        """Not filtered: a penalty dropped on the way to disk would make a warm
+        start rank differently from the consult that wrote it, which is the
+        divergence storing this map exists to prevent."""
+        _put(cache, risk={"s::good": 0.5})
+        assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is not None  # control
+        cache.put(
+            _PROV,
+            _AGENT,
+            _PROFILE,
+            "hashB",
+            11,
+            rejects={},
+            tool_not_found_refs=[],
+            graph_facts={},
+            risk_scores={"s::good": 0.5, "s::bad": float("inf")},
+            had_risk_scores=True,
+        )
+        assert cache.get(_PROV, _AGENT, _PROFILE, "hashB", 11) is None
+
+    def test_an_int_score_is_stored_as_a_float(self, cache):
+        _put(cache, risk={"s::a": 1})
+        row = cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11)
+        assert row["risk_scores"] == {"s::a": 1.0}
+        assert isinstance(row["risk_scores"]["s::a"], float)
+
+
 class TestMisses:
     def test_generation_mismatch_misses(self, cache):
         _put(cache, generation=11)

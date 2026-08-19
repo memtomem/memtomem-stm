@@ -151,7 +151,7 @@ query signal and recorded in `candidate_features`:
   | `permitted` | the agent holds a grant for it |
   | `verdict` | `ALLOW` / `DENY` / `NOT_GRANTED` / `TOOL_NOT_FOUND` / `AMBIGUOUS_TOOL`, or `other` for a value this STM version does not know |
   | `classification` | worst-case DENY-path class: `violation` / `authorized_but_governed` / `other` |
-  | `deny_path_count` | how many DENY evidence paths the graph reported (`0` = reported none, `null` = reported no list at all) |
+  | `deny_path_count` | how many DENY evidence paths the graph reported. `0` means it reported none; `null` means the count is unknown — no list was reported, the value was malformed, or it exceeded the recorded maximum (10,000), above which a count is treated as corrupt rather than clamped to a number nothing can use |
   | `is_drifted` / `is_unmapped` / `has_unbacked_edges` | the drift, mapping and evidence-coverage facts behind the score |
   | `read_only_hint` / `destructive_hint` / `idempotent_hint` / `open_world_hint` | the tool's four annotation self-claims |
   | `risk_score` | the graph's rule-based risk in `[0,1]`, or `null` when the candidate did not resolve, or when the reported value was not a finite number (`NaN`/`Infinity` are not JSON, and an oversized integer has no float) |

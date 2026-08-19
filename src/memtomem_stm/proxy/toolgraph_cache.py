@@ -40,8 +40,10 @@ from memtomem_stm.utils.digest import framed_digest
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
+from collections.abc import Mapping
+
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Iterable
 
     from memtomem_stm.proxy.config import ToolgraphConfig
 
@@ -142,6 +144,23 @@ def _scope_key(
             str(generation),
         )
     )
+
+
+def _normalized_scores(scores: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Scores as finite floats, or ``None`` if any value is not recordable.
+
+    ``None`` rather than a filtered map: a penalty silently dropped on the way
+    to disk would make a warm start rank differently from the consult that
+    wrote it, which is the divergence storing this map exists to prevent. The
+    caller refuses the whole write instead.
+    """
+    normalized: dict[str, Any] = {}
+    for ref, score in scores.items():
+        value = finite_risk_score(score)
+        if value is None:
+            return None
+        normalized[ref] = value
+    return normalized
 
 
 class GraphConsultCache:
@@ -396,9 +415,15 @@ class GraphConsultCache:
             # the live parser applies a duplicate-ref rule the deduplicated map
             # cannot express, so a warm start that re-derived would compute a
             # different penalty than the cold start that filled this row.
-            "risk_scores": {ref: float(score) for ref, score in risk_scores.items()},
+            #
+            # Normalized through the SAME validator the read path and the live
+            # parser use, before any ``float()``. Converting first accepted
+            # values the parser refuses (``True`` became ``1.0``) and raised on
+            # ones it merely drops (an integer with no float), out of a method
+            # whose contract is to no-op rather than fail its caller.
+            "risk_scores": _normalized_scores(risk_scores),
         }
-        if not self._row_shape_ok(raw_facts):
+        if raw_facts["risk_scores"] is None or not self._row_shape_ok(raw_facts):
             logger.warning(
                 "Tool-graph consult cache write refused malformed or unencodable "
                 "identifier facts — consult not cached"
