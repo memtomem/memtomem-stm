@@ -35,6 +35,8 @@ from memtomem_stm.proxy.metrics import CallMetrics, ErrorCategory, TokenTracker
 from memtomem_stm.proxy.metrics_store import MetricsStore
 from memtomem_stm.proxy.selection_log import SelectionTelemetryLog
 from memtomem_stm.proxy.tool_eligibility import (
+    GRAPH_FACT_KEYS,
+    GRAPH_VALUE_UNRECOGNIZED,
     REASON_CONFIG_HIDDEN,
     REASON_DUPLICATE_NAME,
     REASON_NAME_OVERFLOW,
@@ -55,7 +57,10 @@ from memtomem_stm.proxy.tool_eligibility import (
     compute_health_flags,
     filter_tools,
     interpret_verdict,
+    parse_graph_facts,
     parse_risk_scores,
+    risk_scores_from_facts,
+    sanitize_graph_facts_row,
     toolgraph_reject_code,
 )
 from memtomem_stm.proxy.tool_relevance import (
@@ -858,6 +863,159 @@ class TestParseRiskScores:
     def test_agent_not_found_has_no_features(self):
         v = {"agent_found": False, "features": [], "graph_generation": 11}
         assert parse_risk_scores(v) == {}
+
+
+# ── parse_graph_facts / sanitize_graph_facts_row (#469 feature logging) ────
+
+
+_REAL_ROW = {
+    "candidate": "s::risky",
+    "tool_key": "s::risky",
+    "found": True,
+    "ambiguous": False,
+    "permitted": True,
+    "verdict": "ALLOW",
+    "classification": None,
+    "deny_paths": [],
+    "is_drifted": False,
+    "is_unmapped": False,
+    "has_unbacked_edges": True,
+    "read_only_hint": False,
+    "destructive_hint": True,
+    "idempotent_hint": False,
+    "open_world_hint": None,
+    "risk_score": 0.4,
+}
+
+
+class TestSanitizeGraphFactsRow:
+    def test_copies_the_recordable_facts_verbatim(self):
+        row = sanitize_graph_facts_row(_REAL_ROW)
+        assert row["found"] is True
+        assert row["permitted"] is True
+        assert row["has_unbacked_edges"] is True
+        assert row["destructive_hint"] is True
+        assert row["open_world_hint"] is None
+        assert row["verdict"] == "ALLOW"
+        assert row["risk_score"] == 0.4
+
+    def test_drops_identifiers_and_evidence_paths(self):
+        """The redaction line: what the selection log may never carry.
+
+        ``tool_key`` and ``deny_paths`` are graph-authored text — a
+        server-qualified identifier and the policy-evidence chain behind a
+        DENY. The selection log's redaction is structural, so these are
+        dropped at the parser rather than screened downstream; ``deny_paths``
+        survives only as a count.
+        """
+        row = sanitize_graph_facts_row(
+            {**_REAL_ROW, "deny_paths": [["Agent", "READS", "Secret"], ["x"]], "candidates": ["a"]}
+        )
+        assert set(row) == set(GRAPH_FACT_KEYS)
+        assert "tool_key" not in row
+        assert "deny_paths" not in row
+        assert "candidates" not in row
+        assert row["deny_path_count"] == 2
+
+    def test_missing_deny_paths_is_unknown_not_zero(self):
+        # "the row reported no list" and "the row reported an empty list" are
+        # different facts; a count of 0 must mean the latter.
+        assert sanitize_graph_facts_row({})["deny_path_count"] is None
+        assert sanitize_graph_facts_row({"deny_paths": []})["deny_path_count"] == 0
+
+    def test_unknown_enum_becomes_the_sentinel(self):
+        """An upstream that grows a verdict stays visible without leaking it.
+
+        Recording the raw string would put upstream-authored free text in the
+        telemetry file; dropping the row would hide a fact the graph did
+        report. The sentinel does neither.
+        """
+        row = sanitize_graph_facts_row({**_REAL_ROW, "verdict": "QUARANTINED"})
+        assert row["verdict"] == GRAPH_VALUE_UNRECOGNIZED
+        row = sanitize_graph_facts_row({**_REAL_ROW, "classification": "brand-new-thing"})
+        assert row["classification"] == GRAPH_VALUE_UNRECOGNIZED
+
+    def test_known_classification_survives(self):
+        row = sanitize_graph_facts_row({**_REAL_ROW, "classification": "violation"})
+        assert row["classification"] == "violation"
+
+    def test_wrong_types_degrade_to_none_never_raise(self):
+        row = sanitize_graph_facts_row(
+            {
+                "found": "yes",
+                "permitted": 1,  # int, not bool
+                "verdict": 7,
+                "deny_paths": "path",
+                "risk_score": "0.4",
+            }
+        )
+        assert set(row) == set(GRAPH_FACT_KEYS)
+        assert all(row[key] is None for key in ("found", "permitted", "verdict", "risk_score"))
+        assert row["deny_path_count"] is None
+
+    def test_key_set_is_always_complete(self):
+        # Dense by construction: a reader never has to tell "field absent"
+        # from "fact unknown".
+        assert set(sanitize_graph_facts_row({})) == set(GRAPH_FACT_KEYS)
+
+
+class TestParseGraphFacts:
+    def test_keeps_clean_and_unresolved_rows(self):
+        """The gap this closes: the sparse penalty map renders both as absent.
+
+        A ranker trained on these needs "the graph looked and found nothing
+        wrong" (0.0) to be a different example from "the graph could not look"
+        (None).
+        """
+        v = {
+            "agent_found": True,
+            "features": [
+                {"candidate": "s::clean", "found": True, "risk_score": 0.0},
+                {"candidate": "s::risky", "found": True, "risk_score": 0.4},
+                {"candidate": "s::unresolved", "found": False, "risk_score": None},
+            ],
+        }
+        facts = parse_graph_facts(v)
+        assert set(facts) == {"s::clean", "s::risky", "s::unresolved"}
+        assert facts["s::clean"]["risk_score"] == 0.0
+        assert facts["s::unresolved"]["risk_score"] is None
+        assert facts["s::unresolved"]["found"] is False
+        # And the same payload still yields the sparse penalty map.
+        assert parse_risk_scores(v) == {"s::risky": 0.4}
+
+    def test_lenient_on_malformed_payload(self):
+        assert parse_graph_facts({}) == {}
+        assert parse_graph_facts({"features": "nope"}) == {}
+        assert parse_graph_facts({"features": [None, 42, "x"]}) == {}
+        assert parse_graph_facts({"features": [{"risk_score": 0.4}]}) == {}
+        assert parse_graph_facts({"features": [{"candidate": 5}]}) == {}
+
+    def test_last_row_wins_on_a_duplicated_ref(self):
+        v = {
+            "features": [
+                {"candidate": "s::a", "risk_score": 0.4},
+                {"candidate": "s::a", "risk_score": 1.0},
+            ]
+        }
+        assert parse_graph_facts(v)["s::a"]["risk_score"] == 1.0
+        assert parse_risk_scores(v) == {"s::a": 1.0}
+
+    def test_risk_scores_are_derived_from_the_same_walk(self):
+        """One response, one traversal — the two views cannot disagree.
+
+        Pinned because the old implementation walked the payload twice; a
+        divergence there is a silent mismatch between what got penalized and
+        what got logged.
+        """
+        v = {
+            "features": [
+                {"candidate": "s::a", "risk_score": 0.4},
+                {"candidate": "s::b", "risk_score": True},  # bool → not a score
+                {"candidate": "s::c", "risk_score": 0.0},
+            ]
+        }
+        assert parse_risk_scores(v) == risk_scores_from_facts(parse_graph_facts(v))
+        assert parse_risk_scores(v) == {"s::a": 0.4}
 
 
 # ── filter_tools external_rejects + withhold_all (#465) ─────────────────────

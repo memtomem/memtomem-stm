@@ -46,6 +46,7 @@ RANKED_ENTRY_KEYS = {
     "risk_penalty",
     "risk_penalty_source",
     "final_score",
+    "graph_facts",
 }
 
 
@@ -134,6 +135,9 @@ class TestRanker:
             assert entry["risk_penalty"] == 0.0
             assert entry["risk_penalty_source"] == PENALTY_SOURCE_NONE
             assert entry["final_score"] == entry["relevance_score"]
+            # No graph facts passed = the graph said nothing about this tool,
+            # which is a recorded fact of its own, not an omitted key.
+            assert entry["graph_facts"] is None
 
     def test_empty_candidates(self):
         assert ToolRelevanceRanker().rank("anything", []) == []

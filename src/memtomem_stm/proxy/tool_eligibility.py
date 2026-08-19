@@ -399,6 +399,144 @@ def interpret_verdict(verdict: Mapping[str, Any]) -> InterpretedVerdict:
     )
 
 
+# ── rank_features per-candidate facts (#469 data readiness) ────────────────
+#
+# ``parse_risk_scores`` folds a whole ``rank_features`` row into one scalar and
+# drops the ``0.0``/``None`` rows, which is right for a ranking PENALTY (a
+# missing ref means "no demotion") but leaves telemetry unable to tell a clean
+# ALLOW from an unresolved candidate, and loses every fact the score was
+# derived from. #469 needs those facts logged per ELIGIBLE candidate, so the
+# functions below keep a dense, sanitized view of the same response.
+
+# The graph's own verdict vocabulary (toolgraph ``selector.rank_features``).
+# Recorded verbatim only when it is one of these; see
+# ``GRAPH_VALUE_UNRECOGNIZED``.
+GRAPH_VERDICTS: frozenset[str] = frozenset(
+    {"ALLOW", "DENY", "NOT_GRANTED", "TOOL_NOT_FOUND", "AMBIGUOUS_TOOL"}
+)
+
+# Worst-case DENY-path classification, same source.
+GRAPH_CLASSIFICATIONS: frozenset[str] = frozenset({"violation", "authorized_but_governed"})
+
+# Stand-in for a verdict/classification string this STM version does not know.
+# Forward-compatible in both directions that matter: an upstream that adds a
+# member stays *visible* as a fact (the row is not silently dropped), and no
+# upstream-authored string ever reaches the telemetry file — the selection
+# log's redaction contract is structural, so a free-form value must not ride
+# in on an enum-shaped field. Same posture as ``toolgraph_reject_code``'s
+# generic fallback.
+GRAPH_VALUE_UNRECOGNIZED = "other"
+
+# Boolean facts copied through as-is. ``None`` (upstream's own "not knowable
+# for this row") is preserved and distinguished from ``False``.
+_GRAPH_FACT_FLAGS: tuple[str, ...] = (
+    "found",
+    "ambiguous",
+    "permitted",
+    "is_drifted",
+    "is_unmapped",
+    "has_unbacked_edges",
+    "read_only_hint",
+    "destructive_hint",
+    "idempotent_hint",
+    "open_world_hint",
+)
+
+# Every sanitized row carries exactly these keys, always, so a replay reader
+# never has to distinguish "field absent" from "fact unknown" (the latter is
+# an explicit ``None``).
+GRAPH_FACT_KEYS: tuple[str, ...] = (
+    *_GRAPH_FACT_FLAGS,
+    "verdict",
+    "classification",
+    "deny_path_count",
+    "risk_score",
+)
+
+
+def _graph_enum(value: Any, allowed: frozenset[str]) -> str | None:
+    """Closed-vocabulary passthrough: member, sentinel, or ``None``."""
+    if not isinstance(value, str):
+        return None
+    return value if value in allowed else GRAPH_VALUE_UNRECOGNIZED
+
+
+def sanitize_graph_facts_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Reduce one ``rank_features`` row to the facts telemetry may persist.
+
+    The upstream row also carries ``tool_key``, ``deny_paths`` and (when
+    ambiguous) ``candidates``: graph-authored identifiers and policy-evidence
+    paths, i.e. exactly the free-form text the selection log's structural
+    redaction forbids. They are dropped here rather than screened later —
+    ``deny_paths`` survives only as ``deny_path_count`` (``None`` when the row
+    reported no list at all, ``0`` when it reported an empty one). The
+    candidate ref itself is not part of the row: callers key by it and the log
+    records STM's own prefixed name.
+
+    Lenient by construction — a wrong-typed field becomes ``None``, never an
+    exception — because these facts are ranking telemetry, never exposure.
+    """
+    facts: dict[str, Any] = {}
+    for flag in _GRAPH_FACT_FLAGS:
+        value = row.get(flag)
+        facts[flag] = value if isinstance(value, bool) else None
+    facts["verdict"] = _graph_enum(row.get("verdict"), GRAPH_VERDICTS)
+    facts["classification"] = _graph_enum(row.get("classification"), GRAPH_CLASSIFICATIONS)
+    deny_paths = row.get("deny_paths")
+    facts["deny_path_count"] = len(deny_paths) if isinstance(deny_paths, list) else None
+    score = row.get("risk_score")
+    # ``bool`` is an ``int`` subclass but never a valid risk score — the same
+    # rejection ``parse_risk_scores`` makes, kept here because that function
+    # now derives from this one.
+    facts["risk_score"] = (
+        float(score) if isinstance(score, (int, float)) and not isinstance(score, bool) else None
+    )
+    return facts
+
+
+def parse_graph_facts(verdict: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Extract per-candidate facts from a ``rank_features`` verdict (#469).
+
+    Returns ``{candidate_ref: sanitized_row}`` for **every** row naming a
+    candidate — including the clean (``risk_score`` ``0.0``) and unresolved
+    (``None``) rows :func:`parse_risk_scores` omits, which is the whole point:
+    a ranker trained on these needs "the graph looked and found nothing wrong"
+    to be distinguishable from "the graph could not look".
+
+    Lenient and never raising, for the same reason as
+    :func:`parse_risk_scores`: a malformed payload yields an empty map and the
+    caller degrades to logging no facts. A later row wins on a duplicated ref
+    (last-write, matching ``parse_risk_scores``).
+    """
+    rows = verdict.get("features")
+    if not isinstance(rows, list):
+        return {}
+    facts: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        ref = row.get("candidate")
+        if not isinstance(ref, str):
+            continue
+        facts[ref] = sanitize_graph_facts_row(row)
+    return facts
+
+
+def risk_scores_from_facts(facts: Mapping[str, Mapping[str, Any]]) -> dict[str, float]:
+    """Project sanitized facts onto the sparse ranking-penalty map.
+
+    Only *positive* scores survive: a missing ref means "no penalty", which is
+    exactly the ranker's default, so recording ``0.0`` rows here would grow the
+    map without changing a single score.
+    """
+    scores: dict[str, float] = {}
+    for ref, row in facts.items():
+        score = row.get("risk_score")
+        if isinstance(score, float) and score > 0.0:
+            scores[ref] = score
+    return scores
+
+
 def parse_risk_scores(verdict: Mapping[str, Any]) -> dict[str, float]:
     """Extract per-candidate ``risk_score`` from a ``rank_features`` verdict (#493).
 
@@ -413,25 +551,13 @@ def parse_risk_scores(verdict: Mapping[str, Any]) -> dict[str, float]:
     an exposure input, so a malformed payload yields an empty map (the caller
     degrades to no penalties) rather than a contract failure. ``bool`` is
     rejected as a score — it is an ``int`` subclass but never a valid risk.
+
+    Derived from :func:`parse_graph_facts` (#469) rather than re-walking the
+    payload: the penalty map and the logged facts are two views of one
+    response, and two independent walks would be free to disagree about which
+    rows count.
     """
-    rows = verdict.get("features")
-    if not isinstance(rows, list):
-        return {}
-    scores: dict[str, float] = {}
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        ref = row.get("candidate")
-        score = row.get("risk_score")
-        if (
-            not isinstance(ref, str)
-            or isinstance(score, bool)
-            or not isinstance(score, (int, float))
-        ):
-            continue
-        if score > 0.0:
-            scores[ref] = float(score)
-    return scores
+    return risk_scores_from_facts(parse_graph_facts(verdict))
 
 
 def filter_tools(

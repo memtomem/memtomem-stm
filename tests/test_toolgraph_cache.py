@@ -9,6 +9,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from memtomem_stm.proxy.tool_eligibility import (
+    GRAPH_VALUE_UNRECOGNIZED,
+    sanitize_graph_facts_row,
+)
 from memtomem_stm.proxy.toolgraph_cache import IDENTITY_POLICY, GraphConsultCache
 
 _PROV = "prov-fp"
@@ -24,6 +28,11 @@ def cache(tmp_path):
     c.close()
 
 
+def _facts(risk):
+    """Fact rows for ``{ref: risk_score}``, the shape a consult hands ``put``."""
+    return {ref: sanitize_graph_facts_row({"risk_score": score}) for ref, score in risk.items()}
+
+
 def _put(cache, *, generation=11, cand="hashA", rejects=None, tnf=None, risk=None, had_risk=True):
     cache.put(
         _PROV,
@@ -33,7 +42,7 @@ def _put(cache, *, generation=11, cand="hashA", rejects=None, tnf=None, risk=Non
         generation,
         rejects=rejects or {},
         tool_not_found_refs=tnf or [],
-        risk_scores=risk or {},
+        graph_facts=_facts(risk or {}),
         had_risk_scores=had_risk,
     )
 
@@ -86,7 +95,7 @@ class TestScopeKeyIsFramed:
             1,
             rejects={"s::first": "TOOLGRAPH_NOT_GRANTED"},
             tool_not_found_refs=[],
-            risk_scores={},
+            graph_facts={},
             had_risk_scores=True,
         )
         cache.put(
@@ -97,7 +106,7 @@ class TestScopeKeyIsFramed:
             1,
             rejects={"s::second": "TOOLGRAPH_NOT_GRANTED"},
             tool_not_found_refs=[],
-            risk_scores={},
+            graph_facts={},
             had_risk_scores=True,
         )
 
@@ -199,7 +208,7 @@ class TestRoundTrip:
         assert row is not None
         assert row["rejects"] == {"s::a": "TOOLGRAPH_NOT_GRANTED"}
         assert row["tool_not_found_refs"] == ["s::b"]
-        assert row["risk_scores"] == {"s::c": 0.5}
+        assert row["graph_facts"]["s::c"]["risk_score"] == 0.5
         assert row["had_risk_scores"] is True
 
     def test_had_risk_scores_false_round_trips(self, cache):
@@ -281,7 +290,7 @@ class TestUninitialized:
             11,
             rejects={},
             tool_not_found_refs=[],
-            risk_scores={},
+            graph_facts={},
             had_risk_scores=True,
         )
         assert c.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is None
@@ -368,14 +377,13 @@ class TestCorruptRow:
         "verdict_json",
         [
             # Right containers, wrong LEAF types — would crash the caller's on-hit
-            # float()/frozenset()/dict() reconstruction if returned (it runs outside
+            # frozenset()/dict() reconstruction if returned (it runs outside
             # the on_* knob try). Each must be dropped as a miss, not raised.
-            '{"rejects":{},"tool_not_found_refs":[],"risk_scores":{"s::a":"not-a-float"}}',
-            '{"rejects":{},"tool_not_found_refs":[123],"risk_scores":{}}',
-            '{"rejects":{"s::a":7},"tool_not_found_refs":[],"risk_scores":{}}',
-            '{"rejects":{},"tool_not_found_refs":[],"risk_scores":{"s::a":true}}',
+            '{"rejects":{},"tool_not_found_refs":[123],"graph_facts":{}}',
+            '{"rejects":{"s::a":7},"tool_not_found_refs":[],"graph_facts":{}}',
+            '{"rejects":{},"tool_not_found_refs":[],"graph_facts":{"s::a":0.5}}',
         ],
-        ids=["nonfloat_risk", "nonstr_tnf", "nonstr_reject", "bool_risk"],
+        ids=["nonstr_tnf", "nonstr_reject", "nonmapping_facts"],
     )
     def test_wrong_leaf_type_row_is_dropped_as_miss(self, cache, verdict_json):
         _put(cache)
@@ -390,7 +398,50 @@ class TestCorruptRow:
         _put(cache, rejects={"s::a": "X"}, tnf=["s::b"], risk={"s::c": 1, "s::d": 0.5})
         row = cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11)
         assert row is not None
-        assert row["risk_scores"] == {"s::c": 1.0, "s::d": 0.5}
+        assert row["graph_facts"]["s::c"]["risk_score"] == 1.0
+        assert row["graph_facts"]["s::d"]["risk_score"] == 0.5
+
+    def test_corrupt_fact_leaf_is_sanitized_rather_than_dropped(self, cache):
+        """Inside a fact ROW the leaf rule is sanitize, not reject (#469).
+
+        The row is a bag of best-effort telemetry facts, so a corrupted leaf
+        must degrade to ``None`` — the same value a graph that could not answer
+        produces — rather than cost the whole consult a cache hit. What still
+        drops the row is a corrupted *identifier* or container, pinned above.
+        """
+        _put(cache)
+        cache._db.execute(
+            "UPDATE toolgraph_consult SET verdict_json = ?",
+            (
+                json.dumps(
+                    {
+                        "identity_policy": IDENTITY_POLICY,
+                        "rejects": {},
+                        "tool_not_found_refs": [],
+                        "graph_facts": {
+                            "s::a": {
+                                "risk_score": "not-a-float",
+                                "is_drifted": "yes",
+                                "verdict": "MADE_UP",
+                                "deny_paths": ["a->b"],
+                            }
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+        cache._db.commit()
+        row = cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11)
+        assert row is not None
+        facts = row["graph_facts"]["s::a"]
+        assert facts["risk_score"] is None
+        assert facts["is_drifted"] is None
+        # An unknown verdict stays visible as "not one of ours" and never as
+        # the upstream string itself.
+        assert facts["verdict"] == GRAPH_VALUE_UNRECOGNIZED
+        # Evidence paths are dropped on read too, not just on write.
+        assert "deny_paths" not in facts
 
     @pytest.mark.parametrize(
         "facts",
@@ -398,20 +449,20 @@ class TestCorruptRow:
             {
                 "rejects": {"s::bad\ud800": "NOT_GRANTED"},
                 "tool_not_found_refs": [],
-                "risk_scores": {},
+                "graph_facts": {},
             },
             {
                 "rejects": {},
                 "tool_not_found_refs": ["s::bad\udbff"],
-                "risk_scores": {},
+                "graph_facts": {},
             },
             {
                 "rejects": {},
                 "tool_not_found_refs": [],
-                "risk_scores": {"s::bad\udfff": 0.5},
+                "graph_facts": {"s::bad\udfff": {"risk_score": 0.5}},
             },
         ],
-        ids=["reject", "tool_not_found", "risk"],
+        ids=["reject", "tool_not_found", "facts"],
     )
     def test_legacy_unencodable_identifier_row_is_dropped(self, cache, facts):
         """The stored identifier itself is what must fail the shape check.
@@ -431,7 +482,7 @@ class TestCorruptRow:
 
     @pytest.mark.parametrize("stamp", [None, 0, "1", IDENTITY_POLICY + 1])
     def test_row_written_under_another_identity_policy_is_dropped(self, cache, stamp):
-        """A warm hit reconstructs only rejects/refs/risk_scores, so the response
+        """A warm hit reconstructs only rejects/refs/graph_facts, so the response
         fields the provider validates (agent, profile, eligible, tool_key) are
         not in the row and cannot be revalidated after upgrade. A pre-policy row
         could have been minted by a verdict today's policy refuses, and serving
@@ -441,7 +492,7 @@ class TestCorruptRow:
             "graph_generation": 11,
             "rejects": {"s::c": "NOT_GRANTED"},
             "tool_not_found_refs": [],
-            "risk_scores": {},
+            "graph_facts": {},
         }
         if stamp is not None:
             facts["identity_policy"] = stamp
@@ -485,7 +536,7 @@ class TestIdentifierWriteBoundary:
             11,
             rejects={},
             tool_not_found_refs=[],
-            risk_scores={},
+            graph_facts={},
             had_risk_scores=True,
         )
         assert cache.get(_PROV, "agent\ud800", _PROFILE, "hashA", 11) is None

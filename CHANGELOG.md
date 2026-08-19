@@ -13,6 +13,34 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- **Selection telemetry records the tool-graph's per-candidate facts, not just
+  the risk score they produce** (#852, part of #469). Each entry in
+  `candidate_features.ranked_candidates` gained a `graph_facts` object
+  carrying the external graph's `rank_features` row for that tool —
+  resolution (`found` / `ambiguous`), grant (`permitted`), `verdict`,
+  DENY `classification` and `deny_path_count`, the `is_drifted` /
+  `is_unmapped` / `has_unbacked_edges` facts, the four annotation hints, and
+  the `risk_score` itself — or `null` when the graph said nothing about that
+  tool. Previously only a positive `risk_score` survived, folded into one
+  scalar penalty, so a clean candidate and an unresolved one were both simply
+  absent; the learning stage needs those apart. Graph-authored text stays out
+  of the log by construction: `tool_key` and the DENY evidence `deny_paths`
+  are dropped at the parser (the paths survive as a count), and an unfamiliar
+  `verdict` / `classification` value records as `other` rather than the
+  upstream string. **Behavior change**: with `toolgraph` enabled, the
+  best-effort `rank_features` startup query now also runs when
+  `risk_penalty_scale` is `0` and `selection_telemetry.enabled` is set — that
+  one response carries both products, and gating the facts on the penalty
+  knob would lose them for anyone who turned penalties off. With both off it
+  is still skipped. The #494 consult cache stores the facts instead of the
+  score map, so the first start after upgrading re-runs one full consult
+  (rows written by earlier versions cannot have the dropped rows recovered).
+  In portable-bundle mode only `risk_score` is populated: a compiled bundle
+  carries the decision, not the row behind it. `stm_proxy_health` gained a
+  `N with recorded graph facts` count on the active line, since with penalties
+  scaled to `0` the existing penalty count cannot distinguish an enrichment
+  that ran and found everything clean from one that never ran.
+
 - **`mms doctor` gained an `env overrides` check, and a failing bare
   `STMConfig()` now says so instead of degrading in silence** (#850). Several
   construction sites read only the `surfacing` or `hook` subtree, but a

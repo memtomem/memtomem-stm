@@ -102,7 +102,8 @@ query signal and recorded in `candidate_features`:
   "query_chars": 42,
   "ranked_candidates": [
     {"tool": "gh__create_issue", "rank": 1, "relevance_score": 2.41,
-     "risk_penalty": 0.0, "risk_penalty_source": "none", "final_score": 2.41}
+     "risk_penalty": 0.0, "risk_penalty_source": "none", "final_score": 2.41,
+     "graph_facts": null}
   ]
 }
 ```
@@ -136,6 +137,32 @@ query signal and recorded in `candidate_features`:
   self-describing across sessions. A graph-derived penalty stamps the pair
   `"v3-bm25-graph-risk-penalty"`; a native-review-only penalty stamps
   `"v2-bm25-risk-penalty"`.
+- `graph_facts` carries the external tool-graph's per-candidate
+  `rank_features` row for that tool (#469) — the facts the `risk_score` was
+  derived from, as ranker *input features* for the learning stage. `null`
+  means the graph said nothing about this tool: the provider is off, the
+  consult degraded, the enrichment failed, or the ref was not in the batch.
+  When present the object always carries the full key set, so an unknown fact
+  is an explicit `null` and never a missing key:
+
+  | key | meaning |
+  | --- | --- |
+  | `found` / `ambiguous` | did the ref resolve to exactly one tool |
+  | `permitted` | the agent holds a grant for it |
+  | `verdict` | `ALLOW` / `DENY` / `NOT_GRANTED` / `TOOL_NOT_FOUND` / `AMBIGUOUS_TOOL`, or `other` for a value this STM version does not know |
+  | `classification` | worst-case DENY-path class: `violation` / `authorized_but_governed` / `other` |
+  | `deny_path_count` | how many DENY evidence paths the graph reported (`0` = reported none, `null` = reported no list at all) |
+  | `is_drifted` / `is_unmapped` / `has_unbacked_edges` | the drift, mapping and evidence-coverage facts behind the score |
+  | `read_only_hint` / `destructive_hint` / `idempotent_hint` / `open_world_hint` | the tool's four annotation self-claims |
+  | `risk_score` | the graph's rule-based risk in `[0,1]`, or `null` when the candidate did not resolve |
+
+  **These are the graph's facts, not STM's judgement** — `risk_score` `0.0`
+  says the graph looked and found nothing wrong, which is a different record
+  from `null`. Only the facts above are recorded: the graph's `tool_key` and
+  its DENY evidence `deny_paths` are graph-authored text and never enter the
+  log, which is why the paths appear only as a count. A **portable policy
+  bundle** carries the compiled decision, not the row behind it, so in bundle
+  mode only `risk_score` is populated and every other fact is `null`.
 - `top_n` (default 20) bounds `ranked_candidates`; the full advertised set
   is already in `candidate_tools`.
 
