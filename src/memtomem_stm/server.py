@@ -1075,6 +1075,9 @@ def _toolgraph_health_lines(status: dict | None) -> list[str]:
         risk_count = status.get("risk_penalty_count", 0)
         if risk_count:
             line += f"; {risk_count} carry a graph risk penalty"
+        facts_count = status.get("graph_facts_count", 0)
+        if facts_count:
+            line += f"; {facts_count} with recorded graph facts"
         lines.append(line + ")")
         if status.get("source") == "bundle":
             lines.append(

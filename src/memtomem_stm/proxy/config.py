@@ -1801,7 +1801,11 @@ class ToolgraphConfig(BaseModel):
     query in the same startup session; a failure there degrades to no penalties
     (logged, never a startup gate). The penalty composes with the native
     ``review_risk_penalty`` via a complement-product when both apply. ``0``
-    (or a disabled ``toolgraph`` block) skips the enrichment entirely."""
+    zeroes every penalty, but it no longer skips the enrichment on its own:
+    that same query also produces the per-candidate facts selection telemetry
+    records (#469), so it still runs when ``selection_telemetry.enabled`` is
+    set. With both off — or a disabled ``toolgraph`` block — nothing consumes
+    the enrichment and it is skipped entirely."""
     timeout_seconds: float = Field(default=5.0, gt=0.0)
     """Per-consult timeout for the startup batch query."""
     consult_cache_enabled: bool = True

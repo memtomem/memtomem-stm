@@ -40,6 +40,7 @@ from memtomem_stm.proxy.manager import (
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.proxy.selection_log import SelectionTelemetryLog
 from memtomem_stm.proxy.tool_eligibility import (
+    GRAPH_FACT_KEYS,
     REASON_TOOLGRAPH_AGENT_NOT_FOUND,
     REASON_TOOLGRAPH_NOT_GRANTED,
     REASON_TOOLGRAPH_PROTOCOL_ERROR,
@@ -459,6 +460,7 @@ class TestToolgraphStartupWiring:
                 "from_cache": False,
                 "external_reject_count": 0,
                 "risk_penalty_count": 0,
+                "graph_facts_count": 0,
             }
         finally:
             await mgr.stop()
@@ -644,6 +646,7 @@ class TestToolgraphConsultWiring:
                 11,  # the fake graph's generation, as the sibling tests assert
                 rejects={},
                 tool_not_found_refs=[],
+                graph_facts={},
                 risk_scores={},
                 had_risk_scores=True,
             )
@@ -737,13 +740,38 @@ class TestToolgraphConsultWiring:
         assert mgr._advertised_risk_penalties == {"srv__risky_tool": 0.2}
 
     async def test_risk_penalty_scale_zero_disables_the_signal(self, tmp_path):
-        # scale 0 skips the rank_features consult entirely → no penalties.
+        # scale 0 zeroes every penalty. Since #469 the rank_features consult
+        # still RUNS when a selection log exists (the facts are a second
+        # product of that call), so this pins the penalty half specifically:
+        # the map stays empty rather than filling with 0.0 entries that the
+        # status count would then report as demotions.
         mgr, _ = _tg_manager(tmp_path, servers={"srv": ["risky_tool"]}, risk_penalty_scale=0.0)
         await mgr._consult_toolgraph()
         assert mgr._toolgraph_risk_penalties == {}
         mgr.get_proxy_tools()
         assert mgr._advertised_risk_penalties == {}
         assert mgr.get_toolgraph_status()["risk_penalty_count"] == 0
+        # Positive control for the pair below: the facts DID arrive, so the
+        # empty penalty map above is the scale doing its job and not the
+        # enrichment having been skipped.
+        assert mgr._advertised_graph_facts["srv__risky_tool"]["risk_score"] == 0.4
+
+    async def test_scale_zero_without_a_selection_log_skips_the_enrichment(self, tmp_path):
+        """Neither consumer wants it → the extra consult must not happen (#469).
+
+        The gate is "either the penalty scale or the feature sink", so with
+        both off the ``rank_features`` call is still skipped — which is what
+        keeps #469 from imposing a second startup round-trip on operators who
+        run the graph with telemetry disabled.
+        """
+        mgr, _ = _tg_manager(tmp_path, servers={"srv": ["risky_tool"]}, risk_penalty_scale=0.0)
+        mgr._selection_log = None
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_graph_facts == {}
+        assert mgr._toolgraph_risk_penalties == {}
+        # The eligibility verdict itself is unaffected — only the enrichment
+        # was skipped.
+        assert [i.prefixed_name for i in mgr.get_proxy_tools()] == ["srv__risky_tool"]
 
     async def test_review_reject_and_graph_risk_compose_to_both(self, tmp_path):
         # "riskyblocked" is rejected by eligible_tools (→ native review demote)
@@ -760,6 +788,44 @@ class TestToolgraphConsultWiring:
         # 1 - (1 - 0.5)(1 - 0.4) = 0.7  (review_risk_penalty default 0.5)
         assert mgr._advertised_risk_penalties["srv__riskyblocked_tool"] == 0.7
         assert mgr._advertised_risk_penalty_sources["srv__riskyblocked_tool"] == PENALTY_SOURCE_BOTH
+
+    async def test_graph_facts_reach_the_selection_record(self, tmp_path):
+        """The #469 payload: per-candidate facts on every ELIGIBLE candidate.
+
+        ``risky_tool`` scores 0.4 and ``read_file`` scores 0.0 — the clean row
+        the sparse penalty map drops. Both must be present and distinguishable,
+        because "the graph looked and found nothing wrong" is the negative
+        example a ranker trains on.
+        """
+        mgr, log = _tg_manager(tmp_path, servers={"srv": ["read_file", "risky_tool"]})
+        await mgr._consult_toolgraph()
+        mgr.get_proxy_tools()
+        await mgr.call_tool("srv", "risky_tool", {"task": "do the risky thing now"})
+        selection, _ = _events(log)
+        ranked = {
+            r["tool"]: r["graph_facts"]
+            for r in selection["candidate_features"]["ranked_candidates"]
+        }
+        assert ranked["srv__risky_tool"]["risk_score"] == 0.4
+        assert ranked["srv__risky_tool"]["verdict"] == "ALLOW"
+        assert ranked["srv__risky_tool"]["found"] is True
+        # The clean candidate: a recorded 0.0, not an absent row.
+        assert ranked["srv__read_file"]["risk_score"] == 0.0
+        assert ranked["srv__read_file"]["is_drifted"] is False
+        # Graph-authored identifiers and evidence paths never ride along.
+        assert set(ranked["srv__read_file"]) == set(GRAPH_FACT_KEYS)
+
+    async def test_rank_features_failure_degrades_to_no_facts(self, tmp_path):
+        """A failed enrichment records ``None``, not a fabricated clean row."""
+        mgr, log = _tg_manager(
+            tmp_path, servers={"srv": ["read_file", "risky_tool"]}, agent_id="rankboom"
+        )
+        await mgr._consult_toolgraph()
+        mgr.get_proxy_tools()
+        await mgr.call_tool("srv", "risky_tool", {"task": "do the risky thing now"})
+        selection, _ = _events(log)
+        for entry in selection["candidate_features"]["ranked_candidates"]:
+            assert entry["graph_facts"] is None
 
     async def test_rank_features_failure_degrades_to_no_penalties(self, tmp_path, caplog):
         # rank_features fails (agent rankboom raises) but eligible_tools for the
@@ -1295,8 +1361,10 @@ class TestToolgraphHealthRendering:
         assert "active" in body
         assert "11" in body
         assert "2 tool(s) rejected" in body
-        # zero risk penalties → no suffix, line closes cleanly.
+        # zero risk penalties / no recorded facts → no suffix, line closes
+        # cleanly.
         assert "carry a graph risk penalty" not in body
+        assert "recorded graph facts" not in body
         assert body.rstrip().endswith(")")
 
     def test_active_shows_risk_penalty_count(self):
@@ -1315,6 +1383,30 @@ class TestToolgraphHealthRendering:
         assert "2 tool(s) rejected" in body
         assert "3 carry a graph risk penalty" in body
         assert body.rstrip().endswith(")")  # suffix sits inside the closing paren
+
+    def test_active_shows_recorded_graph_facts(self):
+        """Facts captured with every penalty zeroed still show as enrichment.
+
+        ``risk_penalty_scale: 0`` with telemetry on is exactly the state where
+        the penalty count reads ``0`` while the enrichment did run (#469), so
+        the health line has to distinguish it from a skipped consult.
+        """
+        lines = _toolgraph_health_lines(
+            {
+                "enabled": True,
+                "degraded": False,
+                "degraded_reason": None,
+                "withholding_all": None,
+                "graph_generation": 11,
+                "external_reject_count": 0,
+                "risk_penalty_count": 0,
+                "graph_facts_count": 5,
+            }
+        )
+        body = "\n".join(lines)
+        assert "carry a graph risk penalty" not in body
+        assert "5 with recorded graph facts" in body
+        assert body.rstrip().endswith(")")
 
     def test_degraded_is_loud(self):
         lines = _toolgraph_health_lines(

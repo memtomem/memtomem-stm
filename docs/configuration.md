@@ -606,7 +606,9 @@ session — so it is surfaced loudly: a startup WARNING and a `DEGRADED` line in
 `stm_proxy_health`, so a one-time `open` cannot silently become a permanent
 enforcement blind spot. `stm_proxy_health` also reports a `WITHHOLDING ALL`
 posture (a `closed` knob fired) and, on success, the active graph generation,
-the count of graph-rejected tools, and the count carrying a graph risk penalty.
+the count of graph-rejected tools, the count carrying a graph risk penalty, and
+the count with a recorded `rank_features` row (which distinguishes an
+enrichment that ran and found everything clean from one that never ran).
 
 The startup eligibility verdict is disk-cached when `consult_cache_enabled`
 (default `true`) at `consult_cache_path` (default
@@ -632,7 +634,11 @@ Set `consult_cache_enabled` to `false` to force a full consult each start.
   (logged, never a startup gate). The penalty composes with the native
   `review_risk_penalty` (review profile) via a complement-product, and a
   graph-derived penalty stamps the `v3-bm25-graph-risk-penalty` ranker cohort
-  (see [Selection telemetry](selection-telemetry.md)). `0` disables the signal.
+  (see [Selection telemetry](selection-telemetry.md)). `0` disables the
+  *penalty*; the `rank_features` query itself still runs when
+  `selection_telemetry.enabled` is set, because the same response carries the
+  per-candidate `graph_facts` that telemetry records. With both off, the
+  enrichment is skipped entirely.
 
 `server_name_map` translates an STM upstream connection key to the
 tool-graph's *crawled* server name. In the example, `docs-langchain` is the key

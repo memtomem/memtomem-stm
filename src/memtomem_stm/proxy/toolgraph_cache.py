@@ -13,7 +13,9 @@ Correctness model (Model A, strictly-fresh): the cache is only ever read after a
 A degraded / agent-not-found verdict is never written.
 
 Stored data is STM/graph-derived only — server-qualified tool refs
-(``"server::tool"``), reason codes, and risk floats. No upstream payloads or
+(``"server::tool"``), reason codes, and the sanitized per-candidate fact rows
+(booleans, closed-vocabulary verdicts, counts, risk floats — see
+``tool_eligibility.sanitize_graph_facts_row``). No upstream payloads or
 secrets, so (unlike ``ProxyCache``) there is no privacy scan.
 
 Like the sibling stores, every method does synchronous sqlite I/O on the asyncio
@@ -32,13 +34,16 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from memtomem_stm.proxy.tool_eligibility import finite_risk_score, sanitize_graph_facts_row
 from memtomem_stm.utils.json_out import has_lone_surrogate
 from memtomem_stm.utils.digest import framed_digest
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
+from collections.abc import Mapping
+
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Iterable
 
     from memtomem_stm.proxy.config import ToolgraphConfig
 
@@ -80,11 +85,11 @@ CREATE TABLE IF NOT EXISTS toolgraph_meta (
 
 _SCOPE_KEY_VERSION_KEY = "scope_key_version"
 
-IDENTITY_POLICY = 1
+IDENTITY_POLICY = 2
 """Version of the identity-validation policy the stored facts were written under.
 
-A hit reconstructs only ``rejects`` / ``tool_not_found_refs`` / ``risk_scores``,
-so the response fields ``_validate_verdict_identifiers`` checks — ``agent``,
+A hit reconstructs only ``rejects`` / ``tool_not_found_refs`` / ``graph_facts``
+/ ``risk_scores``, so the response fields ``_validate_verdict_identifiers`` checks — ``agent``,
 ``profile``, ``eligible``, ``tool_key``, auxiliary ``candidates`` — are not in
 the row and cannot be revalidated after an upgrade. A pre-#783 row could
 therefore be minted by a verdict that today's policy refuses, and then serve a
@@ -95,6 +100,12 @@ consult after upgrade, which re-derives the verdict under current rules.
 
 Bump this whenever the set of refused identifier fields changes, for the same
 reason: a row written under a laxer policy is not evidence for a stricter one.
+
+v2 (#469): rows carry ``graph_facts`` beside ``risk_scores``. A v1 row holds
+no facts and cannot have them back-derived (the sparse score map dropped every
+clean and unresolved row), so serving one would look like a successful
+enrichment that recorded nothing. Rejecting it costs one full consult after
+upgrade, exactly like every other policy bump.
 """
 
 
@@ -133,6 +144,23 @@ def _scope_key(
             str(generation),
         )
     )
+
+
+def _normalized_scores(scores: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Scores as finite floats, or ``None`` if any value is not recordable.
+
+    ``None`` rather than a filtered map: a penalty silently dropped on the way
+    to disk would make a warm start rank differently from the consult that
+    wrote it, which is the divergence storing this map exists to prevent. The
+    caller refuses the whole write instead.
+    """
+    normalized: dict[str, Any] = {}
+    for ref, score in scores.items():
+        value = finite_risk_score(score)
+        if value is None:
+            return None
+        normalized[ref] = value
+    return normalized
 
 
 class GraphConsultCache:
@@ -213,8 +241,14 @@ class GraphConsultCache:
         """Return the cached raw facts for an exact scope+generation, or ``None``.
 
         The returned dict carries ``rejects`` / ``tool_not_found_refs`` /
-        ``risk_scores`` (the raw graph facts) plus ``had_risk_scores`` (whether
-        risk enrichment succeeded when the row was written).
+        ``graph_facts`` / ``risk_scores`` (the raw graph facts and the penalty
+        map derived from them at write time) plus ``had_risk_scores`` (whether
+        the ``rank_features`` enrichment succeeded when the row was written).
+
+        Fact rows are re-sanitized on read, so a hit and a live consult hand the
+        caller the same key set and the same closed vocabularies even when the
+        file was written by a different version of this package — a stored row
+        is data from disk, not a value this process produced.
         """
         if self._db is None:
             return None
@@ -262,6 +296,14 @@ class GraphConsultCache:
             )
             self._delete_scope(key)
             return None
+        verdict["graph_facts"] = {
+            ref: sanitize_graph_facts_row(facts) for ref, facts in verdict["graph_facts"].items()
+        }
+        # Non-raising by construction: ``_row_shape_ok`` has already refused
+        # every value ``finite_risk_score`` cannot convert.
+        verdict["risk_scores"] = {
+            ref: float(score) for ref, score in verdict["risk_scores"].items()
+        }
         verdict["had_risk_scores"] = bool(row[1])
         return verdict
 
@@ -270,12 +312,16 @@ class GraphConsultCache:
         """True only if ``verdict`` matches exactly what :meth:`put` writes.
 
         Validates **leaf** value types, not just the containers — the caller's
-        on-hit reconstruction does ``dict(rejects)`` / ``frozenset(refs)`` /
-        ``float(score)`` outside the ``on_*``-knob ``try``, so a row that passed a
-        containers-only check but carried e.g. a non-numeric ``risk_score`` would
-        raise ``ValueError`` and crash startup. Matching ``put``'s shape
-        (``rejects: {str: str}``, ``tool_not_found_refs: [str]``, ``risk_scores:
-        {str: number}``) guarantees the reconstruction can never raise on a hit.
+        on-hit reconstruction does ``dict(rejects)`` / ``frozenset(refs)``
+        outside the ``on_*``-knob ``try``, so a row that passed a
+        containers-only check would crash startup. Matching ``put``'s shape
+        (``rejects: {str: str}``, ``tool_not_found_refs: [str]``,
+        ``graph_facts: {str: object}``, ``risk_scores: {str: finite number}``)
+        guarantees the reconstruction can never raise on a hit. The fact rows
+        themselves need no leaf check here:
+        ``get`` runs each one through ``sanitize_graph_facts_row``, which is
+        total over any mapping, so a corrupted leaf becomes ``None`` rather
+        than an exception.
         """
         if not isinstance(verdict, dict):
             return False
@@ -287,9 +333,23 @@ class GraphConsultCache:
             return False
         rejects = verdict.get("rejects")
         refs = verdict.get("tool_not_found_refs")
+        graph_facts = verdict.get("graph_facts")
         risk_scores = verdict.get("risk_scores")
         if not (
-            isinstance(rejects, dict) and isinstance(refs, list) and isinstance(risk_scores, dict)
+            isinstance(rejects, dict)
+            and isinstance(refs, list)
+            and isinstance(graph_facts, dict)
+            and isinstance(risk_scores, dict)
+        ):
+            return False
+        # Held to the same rule a LIVE consult applies, via the same function:
+        # a stored ``10**400`` is a valid JSON integer and a valid Python one,
+        # but it has no float — and ``get`` floats these outside the caller's
+        # exception barrier, so a "shape ok" verdict here would turn a corrupt
+        # row into a startup crash instead of the documented miss.
+        if not all(
+            isinstance(k, str) and not has_lone_surrogate(k) and finite_risk_score(v) is not None
+            for k, v in risk_scores.items()
         ):
             return False
         if not all(
@@ -302,13 +362,12 @@ class GraphConsultCache:
             return False
         if not all(isinstance(ref, str) and not has_lone_surrogate(ref) for ref in refs):
             return False
-        # ``bool`` is an ``int`` subclass but never a valid risk score.
+        # Fact rows are keyed by candidate ref — an identifier, held to the same
+        # encodability rule as every other one here. The row itself only has to
+        # be a mapping; ``sanitize_graph_facts_row`` handles its contents.
         return all(
-            isinstance(k, str)
-            and not has_lone_surrogate(k)
-            and isinstance(v, (int, float))
-            and not isinstance(v, bool)
-            for k, v in risk_scores.items()
+            isinstance(k, str) and not has_lone_surrogate(k) and isinstance(v, dict)
+            for k, v in graph_facts.items()
         )
 
     def _delete_scope(self, scope_key: str) -> None:
@@ -332,6 +391,7 @@ class GraphConsultCache:
         *,
         rejects: Mapping[str, str],
         tool_not_found_refs: Iterable[str],
+        graph_facts: Mapping[str, Mapping[str, Any]],
         risk_scores: Mapping[str, float],
         had_risk_scores: bool,
     ) -> None:
@@ -345,17 +405,30 @@ class GraphConsultCache:
             "identity_policy": IDENTITY_POLICY,
             "rejects": dict(rejects),
             "tool_not_found_refs": list(tool_not_found_refs),
-            "risk_scores": dict(risk_scores),
+            # Sanitized on write as well as on read: what lands on disk is then
+            # exactly what a live consult produces, so a hit can never widen the
+            # fact vocabulary a fresh consult would have narrowed. The sanitizer
+            # is idempotent, so a row that arrives already sanitized survives
+            # both passes unchanged.
+            "graph_facts": {ref: sanitize_graph_facts_row(row) for ref, row in graph_facts.items()},
+            # Stored beside the facts rather than re-derived from them on a hit:
+            # the live parser applies a duplicate-ref rule the deduplicated map
+            # cannot express, so a warm start that re-derived would compute a
+            # different penalty than the cold start that filled this row.
+            #
+            # Normalized through the SAME validator the read path and the live
+            # parser use, before any ``float()``. Converting first accepted
+            # values the parser refuses (``True`` became ``1.0``) and raised on
+            # ones it merely drops (an integer with no float), out of a method
+            # whose contract is to no-op rather than fail its caller.
+            "risk_scores": _normalized_scores(risk_scores),
         }
-        if not self._row_shape_ok(raw_facts):
+        if raw_facts["risk_scores"] is None or not self._row_shape_ok(raw_facts):
             logger.warning(
                 "Tool-graph consult cache write refused malformed or unencodable "
                 "identifier facts — consult not cached"
             )
             return
-        raw_facts["risk_scores"] = {
-            key: float(value) for key, value in raw_facts["risk_scores"].items()
-        }
         key = _scope_key(provider_fp, agent_id, profile, candidate_hash, generation)
         verdict_json = json.dumps(
             {

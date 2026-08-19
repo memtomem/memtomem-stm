@@ -146,6 +146,25 @@ def _manager(tmp_path: Path, *, profile: ExposureProfile = ExposureProfile.STRIC
     return manager, bundle_path, live_tool
 
 
+def test_scale_zero_records_no_bundle_penalty(tmp_path: Path):
+    """``risk_penalty_scale: 0`` turns demotion off, so the map must stay empty.
+
+    A stored ``0.0`` changes no score, but ``risk_penalty_count`` would then
+    report demotions in the exact configuration that disabled them. The stdio
+    consult already filtered these; the bundle path did not.
+    """
+    manager, bundle_path, live_tool = _manager(tmp_path)
+    manager._config.toolgraph.risk_penalty_scale = 0.0
+    bundle_path.write_text(json.dumps(_bundle(live_tool)), encoding="utf-8")
+    manager._refresh_toolgraph_bundle(startup=True)
+    assert manager._toolgraph_risk_penalties == {}
+    assert manager.get_toolgraph_status()["risk_penalty_count"] == 0
+    # Positive control: the same bundle DOES penalize at the default scale.
+    manager._config.toolgraph.risk_penalty_scale = 1.0
+    manager._apply_toolgraph_policy_snapshot(manager._toolgraph_policy_snapshot)
+    assert manager._toolgraph_risk_penalties == {("srv", live_tool.name): 0.8}
+
+
 def test_parser_accepts_additive_fields_and_pins_exact_bytes():
     doc = _bundle(_tool())
     doc["future"] = {"safe": True}

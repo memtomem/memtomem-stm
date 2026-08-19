@@ -27,11 +27,14 @@ Input-driven behaviors (so one fixture covers every adapter path):
   whose tool part starts with ``"missing"`` comes back as a ``TOOL_NOT_FOUND``
   rejected row (the graph's blind spot); all others are eligible, in input
   order.
-* ``rank_features`` mirrors that resolution and stamps a ``risk_score`` per the
-  real fixed table (``selector._risk_score``): a tool part starting with
-  ``"risky"`` scores ``0.4`` (eligible-but-risky — the case PR #493 demotes),
-  ``"missing*"`` scores ``None`` (unresolved), and everything else — including
-  ``"::blocked"`` (NOT_GRANTED is grant-only, data-flow clean) — scores ``0.0``.
+* ``rank_features`` mirrors that resolution and returns the full real row —
+  resolution, grant, verdict, classification, drift/mapping/evidence facts, the
+  four annotation hints — with a ``risk_score`` per the real fixed table
+  (``selector._risk_score``): a tool part starting with ``"risky"`` carries an
+  unbacked load-bearing edge and so scores ``0.4`` (eligible-but-risky — the
+  case PR #493 demotes), ``"missing*"`` scores ``None`` (unresolved, every other
+  fact unknowable), and everything else — including ``"::blocked"``
+  (NOT_GRANTED is grant-only, data-flow clean) — scores ``0.0``.
   ``"riskyblocked*"`` therefore lands in BOTH (rejected by ``eligible_tools``
   AND scored ``0.4``): under ``review`` it earns a native demote stacked with
   the graph penalty — the ``review+graph`` provenance.
@@ -144,12 +147,40 @@ async def eligible_tools(agent: str, candidates: list[str], profile: str = "stri
     }
 
 
+def _unresolved_feature(candidate: str) -> dict:
+    """A row for a ref the graph could not resolve to exactly one tool."""
+    return {
+        "candidate": candidate,
+        "tool_key": None,
+        "found": False,
+        "ambiguous": False,
+        "permitted": None,
+        "verdict": "TOOL_NOT_FOUND",
+        "classification": None,
+        "deny_paths": [],
+        "is_drifted": None,
+        "is_unmapped": None,
+        "has_unbacked_edges": None,
+        "read_only_hint": None,
+        "destructive_hint": None,
+        "idempotent_hint": None,
+        "open_world_hint": None,
+        "risk_score": None,
+    }
+
+
 @mcp.tool()
 async def rank_features(agent: str, candidates: list[str]) -> Any:
     """Canned ``rank_features`` consult mirroring the real per-candidate shape.
 
-    Only the fields STM's ``parse_risk_scores`` reads are populated faithfully
-    (``candidate`` + ``risk_score``); the rest of the real row is summarized.
+    Every field of the real row is populated (``selector.rank_features``), not
+    just ``risk_score``: since #469 STM logs the whole row per eligible
+    candidate, so a fixture that summarized the rest would let a fact reach
+    production telemetry having never been exercised here. The values follow
+    the same fixed table the real ``_risk_score`` implements — ``risky*``
+    scores 0.4 *because* it carries an unbacked load-bearing edge, rather than
+    carrying a score with no fact behind it.
+
     ``agent == "rankboom"`` raises (``isError``) so the best-effort enrichment
     degrade path is exercisable while ``eligible_tools`` still succeeds for the
     same agent.
@@ -161,8 +192,9 @@ async def rank_features(agent: str, candidates: list[str]) -> Any:
         return _backend_unavailable()
     if agent == "rankmalformed":
         # A non-error response MISSING the 'features' list — the malformed-but-
-        # successful enrichment shape. parse_risk_scores leniently yields no
-        # penalties, but #494 must not cache this as a successful capture.
+        # successful enrichment shape. parse_graph_features leniently yields no
+        # penalties and no facts, but #494 must not cache this as a successful
+        # capture.
         return {"agent": agent, "agent_found": True, "graph_generation": _generation()}
     if agent == "ghost":
         return {
@@ -176,12 +208,36 @@ async def rank_features(agent: str, candidates: list[str]) -> Any:
     for candidate in candidates:  # input order is part of the upstream contract
         tool_part = candidate.split("::", 1)[-1]
         if tool_part.startswith("missing"):
-            score: float | None = None  # unresolved → no facts to score
-        elif tool_part.startswith("risky"):
-            score = 0.4  # eligible-but-risky (e.g. an unbacked-evidence edge)
-        else:
-            score = 0.0  # clean ALLOW / grant-only reject — data-flow clean
-        features.append({"candidate": candidate, "tool_key": candidate, "risk_score": score})
+            # Unresolved: nothing but the resolution facts is knowable, and the
+            # score is None rather than 0.0 — the distinction #469 exists for.
+            features.append(_unresolved_feature(candidate))
+            continue
+        # "riskyblocked*" is BOTH: not granted (so eligible_tools rejects it)
+        # AND carrying an unbacked edge (so it still scores 0.4).
+        granted = not (candidate.endswith("::blocked") or tool_part.startswith("riskyblocked"))
+        unbacked = tool_part.startswith("risky")
+        features.append(
+            {
+                "candidate": candidate,
+                "tool_key": candidate,
+                "found": True,
+                "ambiguous": False,
+                "permitted": granted,
+                "verdict": "ALLOW" if granted else "NOT_GRANTED",
+                "classification": None,  # no DENY path in this fixture
+                "deny_paths": [],
+                "is_drifted": False,
+                "is_unmapped": False,
+                "has_unbacked_edges": unbacked,
+                "read_only_hint": tool_part.startswith("read"),
+                "destructive_hint": False,
+                "idempotent_hint": True,
+                "open_world_hint": False,
+                # The fixed table, top-down: unbacked edge → 0.4, otherwise
+                # clean → 0.0. A grant-only reject is data-flow clean.
+                "risk_score": 0.4 if unbacked else 0.0,
+            }
+        )
 
     return {
         "agent": agent,

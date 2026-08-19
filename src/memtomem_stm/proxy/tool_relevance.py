@@ -38,6 +38,14 @@ across sessions (each candidate carries the penalty and source that shaped
 its score). A hard-rejected tool never reaches this module at all — ranking
 runs over the filter's output, so it can never resurrect a reject.
 
+Each record also carries ``graph_facts`` (#469): the sanitized per-candidate
+tool-graph row the ``risk_score`` was derived from, or ``null`` when the graph
+had nothing to say about that tool. These are recorded as ranker INPUT
+features for the learning stage — they do not participate in ``final_score``,
+so adding them changes no ordering and no cohort stamp. Sanitization
+(``tool_eligibility.sanitize_graph_facts_row``) is what keeps the graph's
+identifiers and policy-evidence paths out of the record.
+
 Privacy: the derived query is used in memory for scoring only — callers
 persist its sha256/length/source via ``build_candidate_features``, never the
 text, matching the selection log's structural-redaction contract.
@@ -173,6 +181,20 @@ def _candidate_document(info: ProxyToolInfo) -> tuple[str, str]:
     return info.prefixed_name, f"{info.description} {schema_text[:_MAX_SCHEMA_CHARS]}"
 
 
+def _graph_facts_for(
+    facts: Mapping[str, Mapping[str, Any]], prefixed_name: str
+) -> dict[str, Any] | None:
+    """Per-record copy of one candidate's graph facts, or ``None`` if absent.
+
+    Copied rather than shared so a record can never alias the manager's
+    session-lived map — the selection log serializes on the event loop, but
+    the map outlives the call and a shared reference would make the record
+    retroactively mutable.
+    """
+    row = facts.get(prefixed_name)
+    return dict(row) if row is not None else None
+
+
 class ToolRelevanceRanker:
     """Rank advertised tools against a query, deterministically.
 
@@ -192,6 +214,7 @@ class ToolRelevanceRanker:
         candidates: list[ProxyToolInfo],
         risk_penalties: Mapping[str, float] | None = None,
         risk_penalty_sources: Mapping[str, str] | None = None,
+        graph_facts: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """Rank *candidates* against *query*; order follows ``final_score``.
 
@@ -202,11 +225,21 @@ class ToolRelevanceRanker:
         the same names to the provenance tag (:func:`penalty_source`) echoed
         into each record for #468 replay attribution; absent tools record
         :data:`PENALTY_SOURCE_NONE`.
+
+        *graph_facts* maps the same names to the sanitized per-candidate
+        tool-graph facts (#469, ``tool_eligibility.parse_graph_facts``) the
+        risk score was derived from. Recorded, never scored: nothing here
+        touches ``final_score`` — a learned ranker needs the facts as INPUT
+        features, and folding them into the score now would be the very
+        heuristic #469 exists to replace. Absent tools record ``None``, which
+        says "no facts for this tool" (provider off, degraded, or the ref
+        missing from the batch) and is not the same as a fact-bearing row.
         """
         if not candidates:
             return []
         penalties = risk_penalties or {}
         sources = risk_penalty_sources or {}
+        facts = graph_facts or {}
         sections = [_candidate_document(c) for c in candidates]
         scores = self._scorer.score_sections(query, sections)
         finals = [
@@ -227,6 +260,7 @@ class ToolRelevanceRanker:
                     candidates[i].prefixed_name, PENALTY_SOURCE_NONE
                 ),
                 "final_score": round(finals[i], 6),
+                "graph_facts": _graph_facts_for(facts, candidates[i].prefixed_name),
             }
             for rank, i in enumerate(order[: self._top_n], start=1)
         ]

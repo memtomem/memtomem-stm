@@ -9,6 +9,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from memtomem_stm.proxy.tool_eligibility import (
+    GRAPH_VALUE_UNRECOGNIZED,
+    sanitize_graph_facts_row,
+)
 from memtomem_stm.proxy.toolgraph_cache import IDENTITY_POLICY, GraphConsultCache
 
 _PROV = "prov-fp"
@@ -24,6 +28,26 @@ def cache(tmp_path):
     c.close()
 
 
+def _facts(risk):
+    """Fact rows for ``{ref: risk_score}``, the shape a consult hands ``put``."""
+    return {ref: sanitize_graph_facts_row({"risk_score": score}) for ref, score in risk.items()}
+
+
+def _valid_row(**over):
+    """A complete, currently-valid stored row — the base every corruption
+    fixture mutates, so a fixture can only fail for the reason it names."""
+    row = {
+        "identity_policy": IDENTITY_POLICY,
+        "graph_generation": 11,
+        "rejects": {"s::a": "TOOLGRAPH_NOT_GRANTED"},
+        "tool_not_found_refs": ["s::b"],
+        "graph_facts": {"s::c": sanitize_graph_facts_row({"risk_score": 0.5})},
+        "risk_scores": {"s::c": 0.5},
+    }
+    row.update(over)
+    return row
+
+
 def _put(cache, *, generation=11, cand="hashA", rejects=None, tnf=None, risk=None, had_risk=True):
     cache.put(
         _PROV,
@@ -33,7 +57,8 @@ def _put(cache, *, generation=11, cand="hashA", rejects=None, tnf=None, risk=Non
         generation,
         rejects=rejects or {},
         tool_not_found_refs=tnf or [],
-        risk_scores=risk or {},
+        graph_facts=_facts(risk or {}),
+        risk_scores={ref: score for ref, score in (risk or {}).items() if score > 0},
         had_risk_scores=had_risk,
     )
 
@@ -86,6 +111,7 @@ class TestScopeKeyIsFramed:
             1,
             rejects={"s::first": "TOOLGRAPH_NOT_GRANTED"},
             tool_not_found_refs=[],
+            graph_facts={},
             risk_scores={},
             had_risk_scores=True,
         )
@@ -97,6 +123,7 @@ class TestScopeKeyIsFramed:
             1,
             rejects={"s::second": "TOOLGRAPH_NOT_GRANTED"},
             tool_not_found_refs=[],
+            graph_facts={},
             risk_scores={},
             had_risk_scores=True,
         )
@@ -199,14 +226,109 @@ class TestRoundTrip:
         assert row is not None
         assert row["rejects"] == {"s::a": "TOOLGRAPH_NOT_GRANTED"}
         assert row["tool_not_found_refs"] == ["s::b"]
-        assert row["risk_scores"] == {"s::c": 0.5}
+        assert row["graph_facts"]["s::c"]["risk_score"] == 0.5
         assert row["had_risk_scores"] is True
+
+    def test_a_nonzero_deny_path_count_survives_the_round_trip(self, cache):
+        """Sanitizing happens on write and again on read, so the fact must
+        survive being sanitized twice — otherwise a warm start reports facts
+        the cold start that filled the row did not."""
+        cache.put(
+            _PROV,
+            _AGENT,
+            _PROFILE,
+            "hashA",
+            11,
+            rejects={},
+            tool_not_found_refs=[],
+            graph_facts={"s::a": sanitize_graph_facts_row({"deny_paths": [["x"], ["y"]]})},
+            risk_scores={},
+            had_risk_scores=True,
+        )
+        row = cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11)
+        assert row["graph_facts"]["s::a"]["deny_path_count"] == 2
+
+    def test_the_penalty_map_is_stored_not_re_derived(self, cache):
+        """The live parser keeps the last POSITIVE score for a repeated ref,
+        which a deduplicated facts map cannot express — so the map travels with
+        the facts rather than being recomputed on a hit."""
+        cache.put(
+            _PROV,
+            _AGENT,
+            _PROFILE,
+            "hashA",
+            11,
+            rejects={},
+            tool_not_found_refs=[],
+            # The facts say 0.0 (the last row); the penalty says 0.4 (the last
+            # positive one). A hit must reproduce both.
+            graph_facts={"s::a": sanitize_graph_facts_row({"risk_score": 0.0})},
+            risk_scores={"s::a": 0.4},
+            had_risk_scores=True,
+        )
+        row = cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11)
+        assert row["graph_facts"]["s::a"]["risk_score"] == 0.0
+        assert row["risk_scores"] == {"s::a": 0.4}
 
     def test_had_risk_scores_false_round_trips(self, cache):
         _put(cache, had_risk=False)
         row = cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11)
         assert row is not None
         assert row["had_risk_scores"] is False
+
+
+class TestWriteScoreValidation:
+    """``put`` must hold a score to the same rule the parser and read do."""
+
+    @pytest.mark.parametrize(
+        "value",
+        [True, 10**400, float("inf"), float("nan"), "0.5", None],
+        ids=["bool", "oversized", "inf", "nan", "string", "none"],
+    )
+    def test_an_unrecordable_score_refuses_the_write(self, cache, value):
+        """Converting before validating accepted values the parser refuses
+        (``True`` became ``1.0``) and raised on ones it merely drops — out of a
+        method whose contract is to no-op rather than fail its caller."""
+        cache.put(
+            _PROV,
+            _AGENT,
+            _PROFILE,
+            "hashA",
+            11,
+            rejects={},
+            tool_not_found_refs=[],
+            graph_facts={},
+            risk_scores={"s::a": value},
+            had_risk_scores=True,
+        )
+        assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is None
+        assert cache._db.execute("SELECT COUNT(*) FROM toolgraph_consult").fetchone()[0] == 0
+
+    def test_one_bad_score_refuses_the_whole_row(self, cache):
+        """Not filtered: a penalty dropped on the way to disk would make a warm
+        start rank differently from the consult that wrote it, which is the
+        divergence storing this map exists to prevent."""
+        _put(cache, risk={"s::good": 0.5})
+        assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is not None  # control
+        cache.put(
+            _PROV,
+            _AGENT,
+            _PROFILE,
+            "hashB",
+            11,
+            rejects={},
+            tool_not_found_refs=[],
+            graph_facts={},
+            risk_scores={"s::good": 0.5, "s::bad": float("inf")},
+            had_risk_scores=True,
+        )
+        assert cache.get(_PROV, _AGENT, _PROFILE, "hashB", 11) is None
+
+    def test_an_int_score_is_stored_as_a_float(self, cache):
+        _put(cache, risk={"s::a": 1})
+        row = cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11)
+        assert row["risk_scores"] == {"s::a": 1.0}
+        assert isinstance(row["risk_scores"]["s::a"], float)
 
 
 class TestMisses:
@@ -281,6 +403,7 @@ class TestUninitialized:
             11,
             rejects={},
             tool_not_found_refs=[],
+            graph_facts={},
             risk_scores={},
             had_risk_scores=True,
         )
@@ -365,21 +488,43 @@ class TestCorruptRow:
         assert cache._db.execute("SELECT COUNT(*) FROM toolgraph_consult").fetchone()[0] == 0
 
     @pytest.mark.parametrize(
-        "verdict_json",
+        "field,value",
         [
             # Right containers, wrong LEAF types — would crash the caller's on-hit
-            # float()/frozenset()/dict() reconstruction if returned (it runs outside
-            # the on_* knob try). Each must be dropped as a miss, not raised.
-            '{"rejects":{},"tool_not_found_refs":[],"risk_scores":{"s::a":"not-a-float"}}',
-            '{"rejects":{},"tool_not_found_refs":[123],"risk_scores":{}}',
-            '{"rejects":{"s::a":7},"tool_not_found_refs":[],"risk_scores":{}}',
-            '{"rejects":{},"tool_not_found_refs":[],"risk_scores":{"s::a":true}}',
+            # frozenset()/dict()/float() reconstruction if returned (it runs
+            # outside the on_* knob try). Each must be dropped as a miss.
+            ("tool_not_found_refs", [123]),
+            ("rejects", {"s::a": 7}),
+            ("graph_facts", {"s::a": 0.5}),
+            ("risk_scores", {"s::a": "not-a-number"}),
+            ("risk_scores", {"s::a": True}),
+            # No float exists for this integer, and ``get`` floats these.
+            ("risk_scores", {"s::a": 10**400}),
+            ("risk_scores", {"s::a": float("inf")}),
         ],
-        ids=["nonfloat_risk", "nonstr_tnf", "nonstr_reject", "bool_risk"],
+        ids=[
+            "nonstr_tnf",
+            "nonstr_reject",
+            "nonmapping_facts",
+            "nonnumeric_score",
+            "bool_score",
+            "oversized_score",
+            "nonfinite_score",
+        ],
     )
-    def test_wrong_leaf_type_row_is_dropped_as_miss(self, cache, verdict_json):
+    def test_wrong_leaf_type_row_is_dropped_as_miss(self, cache, field, value):
+        """Each fixture starts from a COMPLETE valid row and mutates one field.
+
+        A hand-written partial row is rejected for being partial, so it would
+        never reach the leaf rule it is named for — the test would pass while
+        proving nothing (codex round 2).
+        """
         _put(cache)
-        cache._db.execute("UPDATE toolgraph_consult SET verdict_json = ?", (verdict_json,))
+        assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is not None  # control
+        cache._db.execute(
+            "UPDATE toolgraph_consult SET verdict_json = ?",
+            (json.dumps({**_valid_row(), field: value}),),
+        )
         cache._db.commit()
         assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is None
         assert cache._db.execute("SELECT COUNT(*) FROM toolgraph_consult").fetchone()[0] == 0
@@ -390,28 +535,61 @@ class TestCorruptRow:
         _put(cache, rejects={"s::a": "X"}, tnf=["s::b"], risk={"s::c": 1, "s::d": 0.5})
         row = cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11)
         assert row is not None
-        assert row["risk_scores"] == {"s::c": 1.0, "s::d": 0.5}
+        assert row["graph_facts"]["s::c"]["risk_score"] == 1.0
+        assert row["graph_facts"]["s::d"]["risk_score"] == 0.5
+
+    def test_corrupt_fact_leaf_is_sanitized_rather_than_dropped(self, cache):
+        """Inside a fact ROW the leaf rule is sanitize, not reject (#469).
+
+        The row is a bag of best-effort telemetry facts, so a corrupted leaf
+        must degrade to ``None`` — the same value a graph that could not answer
+        produces — rather than cost the whole consult a cache hit. What still
+        drops the row is a corrupted *identifier* or container, pinned above.
+        """
+        _put(cache)
+        cache._db.execute(
+            "UPDATE toolgraph_consult SET verdict_json = ?",
+            (
+                json.dumps(
+                    {
+                        "identity_policy": IDENTITY_POLICY,
+                        "rejects": {},
+                        "tool_not_found_refs": [],
+                        "risk_scores": {},
+                        "graph_facts": {
+                            "s::a": {
+                                "risk_score": "not-a-float",
+                                "is_drifted": "yes",
+                                "verdict": "MADE_UP",
+                                "deny_paths": ["a->b"],
+                            }
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+        cache._db.commit()
+        row = cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11)
+        assert row is not None
+        facts = row["graph_facts"]["s::a"]
+        assert facts["risk_score"] is None
+        assert facts["is_drifted"] is None
+        # An unknown verdict stays visible as "not one of ours" and never as
+        # the upstream string itself.
+        assert facts["verdict"] == GRAPH_VALUE_UNRECOGNIZED
+        # Evidence paths are dropped on read too, not just on write.
+        assert "deny_paths" not in facts
 
     @pytest.mark.parametrize(
         "facts",
         [
-            {
-                "rejects": {"s::bad\ud800": "NOT_GRANTED"},
-                "tool_not_found_refs": [],
-                "risk_scores": {},
-            },
-            {
-                "rejects": {},
-                "tool_not_found_refs": ["s::bad\udbff"],
-                "risk_scores": {},
-            },
-            {
-                "rejects": {},
-                "tool_not_found_refs": [],
-                "risk_scores": {"s::bad\udfff": 0.5},
-            },
+            {"rejects": {"s::bad\ud800": "NOT_GRANTED"}},
+            {"tool_not_found_refs": ["s::bad\udbff"]},
+            {"graph_facts": {"s::bad\udfff": {"risk_score": 0.5}}},
+            {"risk_scores": {"s::bad\udfff": 0.5}},
         ],
-        ids=["reject", "tool_not_found", "risk"],
+        ids=["reject", "tool_not_found", "facts", "risk_scores"],
     )
     def test_legacy_unencodable_identifier_row_is_dropped(self, cache, facts):
         """The stored identifier itself is what must fail the shape check.
@@ -423,7 +601,7 @@ class TestCorruptRow:
         _put(cache)
         cache._db.execute(
             "UPDATE toolgraph_consult SET verdict_json = ?",
-            (json.dumps({"identity_policy": IDENTITY_POLICY, **facts}, separators=(",", ":")),),
+            (json.dumps(_valid_row(**facts), separators=(",", ":")),),
         )
         cache._db.commit()
         assert cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is None
@@ -431,18 +609,14 @@ class TestCorruptRow:
 
     @pytest.mark.parametrize("stamp", [None, 0, "1", IDENTITY_POLICY + 1])
     def test_row_written_under_another_identity_policy_is_dropped(self, cache, stamp):
-        """A warm hit reconstructs only rejects/refs/risk_scores, so the response
+        """A warm hit reconstructs only rejects/refs/graph_facts, so the response
         fields the provider validates (agent, profile, eligible, tool_key) are
         not in the row and cannot be revalidated after upgrade. A pre-policy row
         could have been minted by a verdict today's policy refuses, and serving
         it would let a warm start come up clean where cold fail_starts."""
         _put(cache)
-        facts = {
-            "graph_generation": 11,
-            "rejects": {"s::c": "NOT_GRANTED"},
-            "tool_not_found_refs": [],
-            "risk_scores": {},
-        }
+        facts = _valid_row()
+        facts.pop("identity_policy")
         if stamp is not None:
             facts["identity_policy"] = stamp
         cache._db.execute(
@@ -485,6 +659,7 @@ class TestIdentifierWriteBoundary:
             11,
             rejects={},
             tool_not_found_refs=[],
+            graph_facts={},
             risk_scores={},
             had_risk_scores=True,
         )
