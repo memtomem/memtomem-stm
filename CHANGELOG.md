@@ -257,10 +257,12 @@ changes inline only. See the deprecation policy in
   from hand-edited logs, an older producer, or a future ranker that widens the
   field.
 
-  **Behavior change.** One fact governs the rest: a rank was only ever coerced
-  or recorded on the entry naming `selected_tool`, so a malformed rank
-  anywhere else was already just a counted violation — and still is. Grouped
-  by what an operator observes:
+  **Behavior change.** Two facts about the old code govern the rest. A rank
+  was only ever coerced or recorded on the entry naming `selected_tool`, so a
+  malformed rank elsewhere never reached the coercion. And whether such a rank
+  was counted at all came down to an equality check against the entry's
+  position, which some non-integers passed (`true`, and any integral float).
+  Grouped by what an operator observes:
 
   *A traceback becomes a report* (exit 1 via the existing `invalid` status,
   rather than a stack trace) — on the selected tool's entry, a
@@ -279,17 +281,21 @@ changes inline only. See the deprecation policy in
   silence.
 
   *An already-`invalid` report keeps its status and exit code while its
-  numbers move.* When the rejected entry is the selected tool's, it no longer
-  contributes its rank, where before it was counted as a violation *and*
-  recorded: `selected_rank_known` and the `mrr` denominator drop, and the
-  record reads as an alignment miss rather than a shrunken `at_k` denominator.
-  That covers each condition the entry check tests — a rank not matching the
-  entry's position (including one that used to be coerced, such as `"1"` or
-  `1.5`), a non-string `tool`, a `tool` repeated within the list, and a `tool`
-  absent from `candidate_tools` — so a duplicate entry for the selected tool
-  no longer overwrites the first, valid rank, and a `selected_tool` outside
-  `candidate_tools` scores as a miss. When the rejected entry is *not* the
-  selected one, only `invariant_violations` rises.
+  numbers move.* A rejected entry no longer contributes its rank, where before
+  it was counted as a violation *and* recorded. That covers each condition the
+  entry check tests — a rank not matching the entry's position (including one
+  that used to be coerced, such as `"1"` or `1.5`), a non-string `tool`, a
+  `tool` repeated within the list, and a `tool` absent from `candidate_tools`
+  — and which numbers move depends on what else the record holds. If the
+  selected tool's only entry is the rejected one, its rank is withheld:
+  `selected_rank_known` and the `mrr` denominator drop, and the record reads
+  as an alignment miss rather than a shrunken `at_k` denominator, so a
+  `selected_tool` outside `candidate_tools` now scores as a miss. If a *later,
+  duplicate* entry for the selected tool is the rejected one, the earlier
+  valid rank stands instead of being overwritten, so the counters hold and the
+  numbers improve — a duplicate at rank 3 behind a valid rank 1 moves `mrr`
+  from `0.33` to `1.0` and turns an `at_1` miss into a hit. When the rejected
+  entry belongs to neither, only `invariant_violations` rises.
 
   *Unchanged*: a malformed rank on a non-selected entry that already counted;
   a non-hashable `candidate_tools` element behind a `candidate_count`

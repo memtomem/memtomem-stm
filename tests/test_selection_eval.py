@@ -262,7 +262,12 @@ def test_duplicate_selected_tool_entry_does_not_overwrite_the_first_rank(
     report = evaluate_selection(telemetry_path=log).data
 
     assert report["data_quality"]["invariant_violations"] == 1
-    assert report["production"]["selected_tool_alignment"]["mrr"]["value"] == 1.0
+    # The first, valid rank stands, so the numbers improve rather than drop:
+    # main recorded the duplicate's rank 3 (MRR 0.33, at_1 a miss).
+    alignment = report["production"]["selected_tool_alignment"]
+    assert alignment["mrr"] == {"value": 1.0, "denominator": 1}
+    assert alignment["at_1"]["numerator"] == 1
+    assert report["production"]["coverage"]["selected_rank_known"] == 1
 
 
 def test_malformed_sibling_entry_does_not_erase_a_valid_selected_rank(
