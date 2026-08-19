@@ -3165,9 +3165,14 @@ class TestSelectionFeedbackRobustness:
         for index in range(5):
             log.log_feedback(selection_id=f"s{index}", user_corrected=True)
 
-        raw = log_path.read_bytes()
-        assert raw.startswith(b"\n"), "records self-frame, so the file opens with a blank line"
-        assert len(raw.splitlines()) == 10, "five records, each preceded by a blank line"
+        # Asserted as LINES, not as bytes: ``os.open`` without ``O_BINARY`` is
+        # text mode on Windows, so the terminator this writer emits reaches
+        # disk as CRLF there. Every reader here frames with ``splitlines``,
+        # which treats both the same, so the framing property is the one to
+        # state — a byte-level assertion would only be pinning the platform.
+        physical = log_path.read_bytes().splitlines()
+        assert physical[0] == b"", "records self-frame, so the file opens with a blank line"
+        assert len(physical) == 10, "five records, each preceded by a blank line"
 
         reader = selection_log_module.TelemetryReader(log_path)
         assert len(list(reader.records())) == 5
