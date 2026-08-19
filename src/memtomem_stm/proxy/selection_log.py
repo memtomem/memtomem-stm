@@ -84,7 +84,7 @@ import uuid
 from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import IO, TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -859,10 +859,18 @@ _CONFLICT_REASON = (
     "and marks the run invalid"
 )
 
-_EXHAUSTED_REASON = (
-    f"the {_MAX_FALLTHROUGH} most recent matching selections are all unlabellable; "
-    "name one with --selection-id"
-)
+
+def _exhausted_reason(count: int) -> str:
+    """Why a search that had candidates returned none.
+
+    Counts what was actually examined: claiming sixty-four when one defective
+    row was all there was sends an operator looking for sixty-three selections
+    that do not exist.
+    """
+    subject = (
+        "matching selection is" if count == 1 else f"{count} most recent matching selections are"
+    )
+    return f"the {subject} unlabellable; name one with --selection-id"
 
 
 class TelemetryReader:
@@ -915,7 +923,19 @@ class TelemetryReader:
         pending: bytes | None = None
         try:
             with log_path.open("rb") as handle:
+                # The scan reads the segment as it was when it started, not as
+                # it keeps becoming: the proxy appends to the active file while
+                # this runs, and a reader that followed the writer would report
+                # a digest, a line count and an ordering for a file no one ever
+                # saw whole — and could be walked forward indefinitely by a
+                # busy one.
+                budget = self._segment_size(handle)
                 for chunk in handle:
+                    if budget <= 0:
+                        break
+                    if len(chunk) > budget:
+                        chunk = chunk[:budget]
+                    budget -= len(chunk)
                     digest.update(chunk)
                     if pending is not None:
                         admitted, line_no = self._consume(pending, index, line_no)
@@ -936,6 +956,24 @@ class TelemetryReader:
         except OSError as exc:
             raise SelectionLogUnreadable(log_path.name, exc) from exc
         self.files.append({"name": log_path.name, "sha256": digest.hexdigest(), "lines": line_no})
+
+    @staticmethod
+    def _segment_size(handle: IO[bytes]) -> int:
+        """Bytes to read from this segment: its size when the scan reached it.
+
+        ``os.fstat`` on the open descriptor rather than a path ``stat``, so the
+        number describes the file this handle holds even if the name is renamed
+        by rotation a moment later.
+        """
+        fileno = getattr(handle, "fileno", None)
+        if fileno is None:
+            return sys.maxsize
+        try:
+            return os.fstat(fileno()).st_size
+        except (OSError, ValueError):
+            # Not seekable, or not a real file (a pipe, a test double): read
+            # what there is rather than refusing to read at all.
+            return sys.maxsize
 
     def _consume(
         self, chunk: bytes, index: int, line_no: int, *, drop_last: bool = False
@@ -1105,6 +1143,12 @@ def resolve_selection(
     # exhaustion this reports, and dropping them here would report it as
     # "nothing matched".
     candidates: dict[str, dict[str, Any]] = {}
+    # Every matching id ever seen, not only the ones still in the window: an id
+    # that fell out of it is not a NEW selection when a duplicate of it turns
+    # up later, and re-admitting it would date the selection by its copy. Ids
+    # only — the records themselves stay bounded by the window, and the reader
+    # this feeds materializes every record anyway.
+    seen: set[str] = set()
     for record in _iter_selection_records(path, include_rotated=include_rotated):
         if not _supported(record):
             continue
@@ -1113,8 +1157,9 @@ def resolve_selection(
         if tool is not None and record.get("selected_tool") != tool:
             continue
         record_id = record.get("selection_id")
-        if not isinstance(record_id, str) or not record_id or record_id in candidates:
+        if not isinstance(record_id, str) or not record_id or record_id in seen:
             continue
+        seen.add(record_id)
         candidates[record_id] = record
         if len(candidates) > _MAX_FALLTHROUGH:
             del candidates[next(iter(candidates))]
@@ -1141,7 +1186,7 @@ def resolve_selection(
         if selection_defect(record) is not None:
             continue
         return record, None
-    return None, _EXHAUSTED_REASON
+    return None, _exhausted_reason(len(candidates))
 
 
 def find_selection(
@@ -1239,53 +1284,59 @@ def aggregate_selection_log(path: Path | str, *, top_n: int = 10) -> dict[str, A
         # out of an observability path this function promises never to raise
         # from. ``_read_telemetry`` already treats those bytes as malformed.
         with path.open("rb") as fh:
-            for raw_line in fh:
-                if not raw_line.strip():
-                    continue
-                result["total_lines"] += 1
-                try:
-                    rec = json.loads(raw_line.decode("utf-8"))
-                except (ValueError, TypeError, UnicodeDecodeError):
-                    result["malformed"] += 1
-                    continue
-                if not isinstance(rec, dict):
-                    result["malformed"] += 1
-                    continue
-                event = rec.get("event")
-                if event == "selection":
-                    result["events"]["selection"] += 1
-                    rankers[str(rec.get("ranker_version"))] += 1
-                    if rec.get("server") is not None:
-                        servers[str(rec["server"])] += 1
-                    if rec.get("selected_tool") is not None:
-                        tools[str(rec["selected_tool"])] += 1
-                    rr = rec.get("reject_reasons")
-                    if isinstance(rr, dict):
-                        for reason in rr.values():
-                            reject_reasons[str(reason)] += 1
-                elif event == "execution":
-                    result["events"]["execution"] += 1
-                    if rec.get("ok"):
-                        ok += 1
+            # ``splitlines`` per chunk, not one line per ``\n``: a bare carriage
+            # return ends a line for every other reader of this log
+            # (``TelemetryReader``, which frames the same way), and a stats
+            # view that fused two records into one malformed line would report
+            # a corruption the readers do not see.
+            for chunk in fh:
+                for raw_line in chunk.splitlines():
+                    if not raw_line.strip():
+                        continue
+                    result["total_lines"] += 1
+                    try:
+                        rec = json.loads(raw_line.decode("utf-8"))
+                    except (ValueError, TypeError, UnicodeDecodeError):
+                        result["malformed"] += 1
+                        continue
+                    if not isinstance(rec, dict):
+                        result["malformed"] += 1
+                        continue
+                    event = rec.get("event")
+                    if event == "selection":
+                        result["events"]["selection"] += 1
+                        rankers[str(rec.get("ranker_version"))] += 1
+                        if rec.get("server") is not None:
+                            servers[str(rec["server"])] += 1
+                        if rec.get("selected_tool") is not None:
+                            tools[str(rec["selected_tool"])] += 1
+                        rr = rec.get("reject_reasons")
+                        if isinstance(rr, dict):
+                            for reason in rr.values():
+                                reject_reasons[str(reason)] += 1
+                    elif event == "execution":
+                        result["events"]["execution"] += 1
+                        if rec.get("ok"):
+                            ok += 1
+                        else:
+                            err += 1
+                        etype = rec.get("error_type")
+                        if etype is not None:
+                            error_types[str(etype)] += 1
+                        ch = rec.get("cache_hit")
+                        if ch is True:
+                            cache_hit += 1
+                        elif ch is False:
+                            cache_miss += 1
+                        else:
+                            cache_unknown += 1
+                        lat = rec.get("latency_ms")
+                        if isinstance(lat, (int, float)) and not isinstance(lat, bool):
+                            latencies.append(float(lat))
+                    elif event == "feedback":
+                        result["events"]["feedback"] += 1
                     else:
-                        err += 1
-                    etype = rec.get("error_type")
-                    if etype is not None:
-                        error_types[str(etype)] += 1
-                    ch = rec.get("cache_hit")
-                    if ch is True:
-                        cache_hit += 1
-                    elif ch is False:
-                        cache_miss += 1
-                    else:
-                        cache_unknown += 1
-                    lat = rec.get("latency_ms")
-                    if isinstance(lat, (int, float)) and not isinstance(lat, bool):
-                        latencies.append(float(lat))
-                elif event == "feedback":
-                    result["events"]["feedback"] += 1
-                else:
-                    result["malformed"] += 1
+                        result["malformed"] += 1
     except OSError:
         # Treat an unreadable file like an absent one rather than raising
         # out of an observability path — the tool reports what it could read.

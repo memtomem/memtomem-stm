@@ -2023,33 +2023,64 @@ def _functions_reaching(
         for path in sorted(root.rglob("*.py"))
     ]
 
-    # ``from m import x as y`` / ``import m as y``: a mention of the local name
-    # is a mention of the original. Collected across the whole tree and kept as
-    # a SET per name — never replaced, and never scoped. Scoping an alias table
-    # correctly means modelling function, lambda, class, comprehension and
-    # ``global`` boundaries, and every shape missed there UNREPORTS a real
-    # emitter; a union only ever adds names, so the guard can gain a false
-    # positive (which gets read) but cannot lose one. Whole-tree because
-    # aliases chain across modules: ``x as emit`` here, ``emit as callit``
-    # there.
-    aliases: dict[str, set[str]] = {}
-    for _, tree in trees:
+    # ``from m import x as y`` / ``import m as y``: within the importing FILE, a
+    # mention of the local name is a mention of the original. Per file, and
+    # module-qualified: a table keyed by local spelling alone would make every
+    # `run` in the tree resolve to whatever one unrelated module imported under
+    # that name, and the guard would fail on code that has nothing to do with
+    # the emitter. Kept as a SET per name and only ever added to, because
+    # scoping WITHIN a file means modelling function, lambda, class,
+    # comprehension and ``global`` boundaries, and every shape missed there
+    # unreports a real emitter; a union can only add a false positive, which
+    # gets read.
+    modules = {
+        relative[:-3].replace("/", ".").replace("\\", "."): relative for relative, _ in trees
+    }
+
+    def module_file(name: str | None) -> str | None:
+        if not name:
+            return None
+        for dotted, relative in modules.items():
+            if dotted == name or dotted.endswith("." + name):
+                return relative
+        return None
+
+    imports: list[tuple[str, str, str | None, str]] = []
+    for relative, tree in trees:
         for node in ast.walk(tree):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
+            if isinstance(node, ast.ImportFrom):
                 for alias in node.names:
                     if alias.asname:
-                        aliases.setdefault(alias.asname, set()).add(alias.name.split(".")[-1])
+                        imports.append((relative, alias.asname, node.module, alias.name))
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.asname:
+                        imports.append((relative, alias.asname, None, alias.name.split(".")[-1]))
 
-    def resolve(found: set[str]) -> set[str]:
-        # To a fixed point: a single hop would report the middle name of a
-        # chain while the function that actually calls the emitter went
-        # missing.
+    aliases: dict[str, dict[str, set[str]]] = {relative: {} for relative, _ in trees}
+    changed = True
+    while changed:
+        # To a fixed point, because aliases chain across modules: `x as emit`
+        # here, `emit as callit` there. One hop would report the middle name
+        # while the function that actually calls the emitter went missing.
+        changed = False
+        for relative, local, module, name in imports:
+            origins = {name}
+            source = module_file(module)
+            if source is not None:
+                origins |= aliases[source].get(name, set())
+            current = aliases[relative].setdefault(local, set())
+            if not origins <= current:
+                current |= origins
+                changed = True
+
+    def resolve(found: set[str], table: dict[str, set[str]]) -> set[str]:
         resolved = set(found)
         frontier = set(found)
         while frontier:
             grown: set[str] = set()
             for name in frontier:
-                grown |= aliases.get(name, set()) - resolved
+                grown |= table.get(name, set()) - resolved
             resolved |= grown
             frontier = grown
         return resolved
@@ -2071,14 +2102,16 @@ def _functions_reaching(
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 # The decorators run at import even though the body does not.
                 for decorator in statement.decorator_list:
-                    module_scope |= resolve(names_in(decorator))
+                    module_scope |= resolve(names_in(decorator), aliases[relative])
             else:
-                module_scope |= resolve(names_in(statement))
+                module_scope |= resolve(names_in(statement), aliases[relative])
         for scope in ast.walk(tree):
             if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             mentions.setdefault((relative, scope.name), set())
-            mentions[(relative, scope.name)] |= resolve(names_in(scope)) - {scope.name}
+            mentions[(relative, scope.name)] |= resolve(names_in(scope), aliases[relative]) - {
+                scope.name
+            }
     reaching: set[tuple[str, str]] = set()
     frontier = {target}
     while frontier:
@@ -2303,6 +2336,22 @@ def test_adr_0001_call_site_pin_rejects_a_second_emitter(tmp_path) -> None:
     )
     assert ("hop_two.py", "chained") in _functions_reaching(src, "log_feedback"), (
         "an alias of an alias must still be reported"
+    )
+
+    # (c5) the negative: another module binding an unrelated symbol to a name
+    # this file also uses. A table keyed by local spelling alone would make
+    # THIS `run` resolve to the approved command and report a function that
+    # never touches it — a guard that fails CI on unrelated code stops being
+    # read.
+    (src / "elsewhere.py").write_text(
+        "from third_party import feedback_command as run\n", encoding="utf-8"
+    )
+    (src / "unrelated.py").write_text(
+        "def helper(x):\n    return run(x)\n", encoding="utf-8"
+    )
+    reaching_now = _functions_reaching(src, "log_feedback")
+    assert ("unrelated.py", "helper") not in reaching_now, (
+        "an alias bound in another module must not travel by spelling alone"
     )
 
     # (d) an emitter at module level, outside any function.

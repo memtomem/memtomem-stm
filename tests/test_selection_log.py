@@ -1404,6 +1404,114 @@ class TestResolverAgreesWithReplay:
         assert result.exit_code == 0, result.output
         assert json.loads(result.output)["selection_id"] == "b"
 
+    def test_a_duplicate_of_an_evicted_id_is_not_a_new_selection(self, tmp_path, monkeypatch):
+        """`A, B, C, A` with room for two.
+
+        A left the window, but it is not a NEW selection when its copy turns up
+        again — replay dates it by its first line, where it is the oldest of
+        the three. Re-admitting it would label the oldest selection while
+        calling it the most recent.
+        """
+        monkeypatch.setattr(selection_log_module, "_MAX_FALLTHROUGH", 2)
+        log_path = tmp_path / "log.jsonl"
+        first = _sel(selection_id="a", selected_tool="srv__a")
+        _write_lines(
+            log_path,
+            [
+                first,
+                _sel(selection_id="b", selected_tool="srv__b"),
+                _sel(selection_id="c", selected_tool="srv__c"),
+                dict(first),
+            ],
+        )
+        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output)["selection_id"] == "c"
+
+    def test_a_scan_reads_the_segment_it_started_with(self, tmp_path, monkeypatch):
+        """The proxy appends while this runs.
+
+        A reader that followed the writer would resolve against a file nobody
+        ever saw whole — and could be walked forward for as long as the writer
+        keeps going. The scan stops at the size the segment had when it opened
+        it.
+        """
+        log_path = tmp_path / "log.jsonl"
+        _write_lines(log_path, [_sel(selection_id="present")])
+        real_open = Path.open
+
+        class AppendsWhileRead:
+            """Grows the file once the scan has started reading it — the shape
+            a live proxy append has, and the one a size snapshot taken at open
+            is there to survive."""
+
+            def __init__(self, wrapped, target):
+                self._wrapped = wrapped
+                self._target = target
+                self._grown = False
+
+            def __enter__(self):
+                self._wrapped.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return self._wrapped.__exit__(*exc)
+
+            def fileno(self):
+                return self._wrapped.fileno()
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if not self._grown:
+                    self._grown = True
+                    with real_open(self._target, "ab") as writer:
+                        writer.write(
+                            json.dumps(_sel(selection_id="arrived-later")).encode() + b"\n"
+                        )
+                return next(self._wrapped)
+
+        def appending_open(self, *args, **kwargs):
+            handle = real_open(self, *args, **kwargs)
+            if self == log_path and args and args[0] == "rb":
+                return AppendsWhileRead(handle, self)
+            return handle
+
+        monkeypatch.setattr(Path, "open", appending_open)
+        record, defect = selection_log_module.resolve_selection(log_path)
+        monkeypatch.undo()
+
+        assert defect is None
+        assert record is not None and record["selection_id"] == "present"
+        # The row really is in the file — the scan declined to read it, rather
+        # than the write having failed.
+        assert b"arrived-later" in log_path.read_bytes()
+
+    def test_a_bare_carriage_return_frames_the_same_line_for_every_reader(self, tmp_path):
+        """Stats, replay and resolution frame lines identically.
+
+        A reader splitting only on newlines fuses two carriage-return-separated
+        records into one line and reports a corruption the others do not see.
+        """
+        from memtomem_stm.proxy import selection_eval
+
+        log_path = tmp_path / "log.jsonl"
+        payload = (
+            json.dumps(_sel(selection_id="one")).encode()
+            + b"\r"
+            + json.dumps(_sel(selection_id="two")).encode()
+            + b"\n"
+        )
+        log_path.write_bytes(payload)
+
+        summary = aggregate_selection_log(log_path)
+        assert summary["events"]["selection"] == 2 and summary["malformed"] == 0
+        records, _ = selection_eval._read_telemetry(log_path, include_rotated=False)
+        assert [record["selection_id"] for record in records] == ["one", "two"]
+        record, _ = selection_log_module.resolve_selection(log_path)
+        assert record is not None and record["selection_id"] == "two"
+
     def test_a_third_copy_does_not_resurrect_a_conflicting_id(self, tmp_path):
         """A/B/A: the third copy is one more claim about a contradictory
         history, not a casting vote. Both the resolver and replay must keep the
@@ -1550,6 +1658,11 @@ class TestResolverAgreesWithReplay:
         assert result.exit_code == 1
         assert payload["error"] == "unusable_record"
         assert "--selection-id" in payload["message"]
+        # It counts what it actually examined: with the window at one, claiming
+        # sixty-four would send an operator looking for selections that do not
+        # exist.
+        assert "1 most recent" not in payload["message"]
+        assert "64" not in payload["message"]
         assert _feedback_records(log_path) == []
 
     def test_last_falls_through_a_conflicting_selection(self, tmp_path):

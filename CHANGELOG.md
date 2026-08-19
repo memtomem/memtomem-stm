@@ -48,8 +48,9 @@ changes inline only. See the deprecation policy in
   honestly are labellable: an unsupported `schema_version` (offline replay
   drops those records outright) or a missing `ranker_version` (the label would
   be filed under a cohort the command invented) exits 1 (`unusable_record`) and
-  is skipped by `--last`. Both readers now load the log through one
-  `TelemetryReader` — segment discovery, line framing, the size cut, decoding,
+  is skipped by `--last`. `mms selection stats` frames lines the same way too, so a bare carriage
+  return no longer fuses two records into one line for it alone. Both readers
+  now load the log through one `TelemetryReader` — segment discovery, line framing, the size cut, decoding,
   schema and event admission, and append-order stamping live there rather than
   being re-derived on each side, after four review rounds in which the two
   parted company over exactly those rules. Resolution therefore counts records
