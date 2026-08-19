@@ -9,8 +9,12 @@ metrics stores, or any source MCP-client config.
 from __future__ import annotations
 
 import sys
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 import click
 
@@ -254,7 +258,7 @@ def feedback_command(
     # file it already passed — or resolve one the same rotation evicts. The
     # writer takes this lock only when it has already decided to rotate and
     # defers instead of waiting, so holding it here cannot stall a proxied call.
-    with rotation_lock(telemetry_path, attempts=_LOCK_ATTEMPTS) as acquired:
+    with _rotation_guard(telemetry_path, as_json) as acquired:
         if not acquired:
             _feedback_failure(
                 as_json,
@@ -327,7 +331,7 @@ def feedback_command(
     # agreed to — so the target is re-checked while rotation is excluded,
     # rather than trusting a resolve that is now arbitrarily old.
     log = SelectionTelemetryLog(telemetry_path, max_bytes=_NEVER_ROTATE)
-    with rotation_lock(telemetry_path, attempts=_LOCK_ATTEMPTS) as acquired:
+    with _rotation_guard(telemetry_path, as_json) as acquired:
         if not acquired:
             _feedback_failure(
                 as_json,
@@ -382,6 +386,31 @@ def feedback_command(
     for field in ("user_corrected", "operator_override"):
         if result[field] is not None:
             click.echo(f"  {field}: {str(result[field]).lower()}")
+
+
+@contextmanager
+def _rotation_guard(path: Path, as_json: bool) -> Iterator[bool]:
+    """``rotation_lock`` whose *setup* failure is a reported error.
+
+    The lock lives in a sidecar file, so taking it can fail for reasons that
+    have nothing to do with contention — a writable log inside a directory this
+    user cannot create files in, most plainly. Letting that ``OSError`` escape
+    replaces the command's stable error document with a traceback and an empty
+    stdout, which is exactly what a scripted caller cannot handle.
+    """
+    try:
+        manager = rotation_lock(path, attempts=_LOCK_ATTEMPTS)
+        entered = manager.__enter__()
+    except OSError as exc:
+        _feedback_failure(
+            as_json,
+            "lock_failed",
+            f"cannot create the rotation lock beside {path}: {exc}",
+        )
+    try:
+        yield entered
+    finally:
+        manager.__exit__(None, None, None)
 
 
 def _write_label(log: SelectionTelemetryLog, **fields: Any) -> str:

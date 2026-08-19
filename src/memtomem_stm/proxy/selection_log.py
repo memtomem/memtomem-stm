@@ -432,20 +432,24 @@ class SelectionTelemetryLog:
                     # inode about to be unlinked. Report the failure instead of
                     # counting a record that may not survive.
                     self.write_errors += 1
-                    logger.warning(
-                        "Selection telemetry write skipped: another writer is rotating the log"
-                    )
+                    logger.warning("Selection telemetry write skipped: the rotation lock is held")
                     return APPEND_FAILED
                 fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
                 try:
                     written = os.write(fd, data)
+                    if written != len(data):
+                        # Close the fragment's LINE while the descriptor is
+                        # still open. Without a newline the next append is
+                        # concatenated onto it, and THAT caller — whose own
+                        # write succeeded — would be told its record survived
+                        # while readers reject the fused line. One byte turns a
+                        # cascading corruption into a single skipped line.
+                        self._terminate_fragment(fd, data, written)
                 finally:
                     os.close(fd)
                 if written != len(data):
-                    # A short write leaves a truncated line. Readers skip
-                    # malformed lines, so the damage is contained — but the
-                    # record is NOT on disk, and a caller waiting to hear that
-                    # its label exists must not be told otherwise. Never
+                    # The record is NOT on disk, and a caller waiting to hear
+                    # that its label exists must not be told otherwise. Never
                     # retried: appending the remainder would duplicate the
                     # prefix into a second partial record.
                     self.write_errors += 1
@@ -468,6 +472,20 @@ class SelectionTelemetryLog:
                     logger.debug("Selection telemetry write failed", exc_info=True)
                 return APPEND_FAILED
         return APPEND_WRITTEN
+
+    @staticmethod
+    def _terminate_fragment(fd: int, data: bytes, written: int) -> None:
+        """Best-effort newline after a short write, to restore JSONL framing.
+
+        Failing here costs what the missing newline would have cost anyway, so
+        it must never mask the short write that caused it.
+        """
+        if written <= 0 or data[:written].endswith(b"\n"):
+            return
+        try:
+            os.write(fd, b"\n")
+        except OSError:
+            logger.debug("Could not terminate a short-written telemetry record", exc_info=True)
 
     def _rotate_if_needed_locked(self) -> bool:
         """Size-based rotation; returns whether the caller may now append.

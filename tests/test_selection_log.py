@@ -1360,12 +1360,7 @@ class TestSelectionFeedbackRobustness:
         assert len(_feedback_records(log_path)) == 1
 
     def test_resolution_reports_a_busy_log(self, tmp_path):
-        """Proves the command's FIRST lock hold exists.
-
-        ``flock`` is per open file description, so a lock taken here really does
-        block the command's own acquire — remove the ``with rotation_lock`` from
-        the resolve and this test goes green, which is what makes it evidence.
-        """
+        """A held lock refuses the command rather than letting it scan."""
         log_path = tmp_path / "log.jsonl"
         _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
         with selection_log_module.rotation_lock(log_path) as acquired:
@@ -1375,13 +1370,51 @@ class TestSelectionFeedbackRobustness:
         assert json.loads(result.output)["error"] == "log_busy"
         assert _feedback_records(log_path) == []
 
-    def test_verification_after_confirming_reports_a_busy_log(self, tmp_path, monkeypatch):
-        """Proves the SECOND lock hold exists, around verify+append.
+    def test_each_critical_operation_runs_while_holding_the_lock(self, tmp_path, monkeypatch):
+        """Ownership probed at each operation, not inferred from one refusal.
 
-        The lock is taken *during* the confirmation — precisely the window the
-        second hold covers — so a command that locked only its resolve would
-        sail past it and write. Runs in human mode because the prompt only
-        exists there; ``--yes`` would skip the very seam under test.
+        An external lock held for the whole run proves nothing about *which*
+        hold refused — with only the second one present the command reports the
+        same ``log_busy``. So instead the command runs unimpeded and each
+        critical operation asks: can a competing acquire succeed right now? It
+        must not, at the resolve, at the post-confirmation verify, and at the
+        append. ``flock`` is per open file description, so a competing acquire
+        from this same process is a real test of the command's hold.
+        """
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        competing: list[tuple[str, bool]] = []
+
+        def probe(label: str) -> None:
+            with selection_log_module.rotation_lock(log_path) as got:
+                competing.append((label, got))
+
+        real_find = selection_log_module.find_selection
+
+        def probing_find(*args, **kwargs):
+            probe("verify" if kwargs.get("selection_id") else "resolve")
+            return real_find(*args, **kwargs)
+
+        real_write = selection_cmd._write_label
+
+        def probing_write(log, **fields):
+            probe("append")
+            return real_write(log, **fields)
+
+        monkeypatch.setattr(selection_cmd, "find_selection", probing_find)
+        monkeypatch.setattr(selection_cmd, "_write_label", probing_write)
+        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected")
+        assert result.exit_code == 0, result.output
+        assert [label for label, _ in competing] == ["resolve", "verify", "append"]
+        assert all(not got for _, got in competing), (
+            f"an operation ran outside the rotation lock: {competing}"
+        )
+
+    def test_verification_after_confirming_reports_a_busy_log(self, tmp_path, monkeypatch):
+        """The second hold specifically: the lock is taken *during* the prompt.
+
+        That is the window the second hold exists for, and a command that
+        locked only its resolve would sail past it and write.
         """
         from memtomem_stm.cli.proxy import cli
 
@@ -1413,11 +1446,27 @@ class TestSelectionFeedbackRobustness:
             )
         finally:
             for ctx in held:
-                ctx.__exit__(None, None, None)  # type: ignore[attr-defined]
+                ctx.__exit__(None, None, None)
         assert held, "the confirmation never ran"
         assert result.exit_code == 1
         assert "being rotated" in result.output
         assert _feedback_records(log_path) == []
+
+    def test_an_uncreatable_lock_is_a_stable_error(self, tmp_path):
+        """The lock is a sidecar FILE, so taking it can fail for reasons that
+        are not contention. A traceback with empty stdout is not something a
+        scripted caller can handle."""
+        log_dir = tmp_path / "ro"
+        log_dir.mkdir()
+        log_path = log_dir / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        log_dir.chmod(0o555)
+        try:
+            result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
+        finally:
+            log_dir.chmod(0o755)
+        assert result.exit_code == 1
+        assert json.loads(result.output)["error"] == "lock_failed"
 
     def test_a_short_write_is_not_reported_as_recorded(self, tmp_path, monkeypatch):
         """``os.write`` may write fewer bytes; the record is then truncated and
@@ -1433,6 +1482,43 @@ class TestSelectionFeedbackRobustness:
         result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
         assert result.exit_code == 1
         assert json.loads(result.output)["error"] == "write_failed"
+
+    def test_a_short_write_does_not_corrupt_the_next_record(self, tmp_path, monkeypatch):
+        """The follow-up append must stay readable and honestly reported.
+
+        A fragment with no newline swallows the next record into its line: that
+        caller's own write succeeded, so it is told the record survived while
+        every reader rejects the fused line — one fault becoming a cascade.
+        """
+        log_path = tmp_path / "log.jsonl"
+        log = SelectionTelemetryLog(log_path)
+        log.initialize()
+        real_write = os.write
+        calls = {"n": 0}
+
+        def short_first(fd, data):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_write(fd, data[: len(data) // 2])
+            return real_write(fd, data)
+
+        monkeypatch.setattr(selection_log_module.os, "write", short_first)
+        assert log.log_feedback(selection_id="a", user_corrected=True) == "failed"
+        assert log.log_feedback(selection_id="b", user_corrected=True) == "written"
+        monkeypatch.undo()
+
+        lines = [line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        parsed = []
+        for line in lines:
+            try:
+                parsed.append(json.loads(line))
+            except ValueError:
+                pass
+        # Two lines: the unreadable fragment, and the intact follow-up.
+        assert len(lines) == 2
+        assert [record["selection_id"] for record in parsed] == ["b"]
+        assert log.events_written == 1
+        assert log.write_errors == 1
 
     def test_a_rotating_writer_does_not_silently_lose_a_contender(self, tmp_path):
         """Two writers, ``max_backups=0``: the loser must not claim success.

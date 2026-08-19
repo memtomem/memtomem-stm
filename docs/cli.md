@@ -732,6 +732,7 @@ exit 1 and emit `{"action": "selection-feedback", "ok": false, "error":
 | `malformed_record` | the matched record carries no `selection_id` (reachable only on a hand-edited log) |
 | `log_rotated` | the resolved selection was rotated out of the log while it was being confirmed; nothing was written |
 | `log_busy` | the log was being rotated and the lock could not be taken; nothing was written — re-run |
+| `lock_failed` | the rotation lock file beside the log could not be created (e.g. a writable log in a directory this user cannot write); nothing was written |
 | `confirmation_required` | `--last` used non-interactively (or with `--json`) without `--yes`; exit 2, matching the CLI-wide rule that a formatting flag must not authorize a write |
 | `write_failed` / `write_redacted` | the label did not reach disk — the sink swallows write faults so a telemetry problem cannot break a proxied call, so the command checks the append outcome instead of assuming it |
 
