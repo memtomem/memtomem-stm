@@ -33,6 +33,7 @@ from memtomem_stm.proxy.selection_log import (
 )
 from memtomem_stm.proxy.tool_eligibility import ExposureCandidate, filter_tools
 from memtomem_stm.utils import json_out
+from memtomem_stm.utils.numeric import finite_number
 from memtomem_stm.proxy.tool_relevance import (
     RANKER_VERSION_BM25,
     RANKER_VERSION_BM25_GRAPH_RISK,
@@ -670,20 +671,17 @@ def _observed_telemetry(records: list[dict[str, Any]], quality: dict[str, Any]) 
                         invariant_violations += 1
                     seen_tools.add(str(tool))
                     expected_rank += 1
-                    relevance = entry.get("relevance_score")
-                    penalty = entry.get("risk_penalty", 0.0)
-                    final = entry.get("final_score")
+                    relevance = finite_number(entry.get("relevance_score"))
+                    penalty = finite_number(entry.get("risk_penalty", 0.0))
+                    final = finite_number(entry.get("final_score"))
                     if (
                         ranker in PARITY_RANKER_VERSIONS
-                        and isinstance(relevance, (int, float))
-                        and not isinstance(relevance, bool)
-                        and isinstance(penalty, (int, float))
-                        and not isinstance(penalty, bool)
-                        and isinstance(final, (int, float))
-                        and not isinstance(final, bool)
+                        and relevance is not None
+                        and penalty is not None
+                        and final is not None
                     ):
-                        expected = round(float(relevance) * (1.0 - float(penalty)), 6)
-                        if abs(expected - float(final)) > 1e-6:
+                        expected = round(relevance * (1.0 - penalty), 6)
+                        if abs(expected - final) > 1e-6:
                             parity_mismatches += 1
                     if entry_ok and tool == selection.get("selected_tool"):
                         selected_rank = rank
@@ -702,9 +700,9 @@ def _observed_telemetry(records: list[dict[str, Any]], quality: dict[str, Any]) 
                 ok += 1
             else:
                 errors += 1
-            latency = execution.get("latency_ms")
-            if isinstance(latency, (int, float)) and not isinstance(latency, bool):
-                latencies.append(float(latency))
+            latency = finite_number(execution.get("latency_ms"))
+            if latency is not None:
+                latencies.append(latency)
             cache = execution.get("cache_hit")
             if cache is True:
                 cache_hit += 1
@@ -712,12 +710,12 @@ def _observed_telemetry(records: list[dict[str, Any]], quality: dict[str, Any]) 
                 cache_miss += 1
             else:
                 cache_unknown += 1
-            retry = execution.get("retry_count")
-            cost = execution.get("cost")
-            if isinstance(retry, (int, float)) and not isinstance(retry, bool):
-                retry_values.append(float(retry))
-            if isinstance(cost, (int, float)) and not isinstance(cost, bool):
-                cost_values.append(float(cost))
+            retry = finite_number(execution.get("retry_count"))
+            cost = finite_number(execution.get("cost"))
+            if retry is not None:
+                retry_values.append(retry)
+            if cost is not None:
+                cost_values.append(cost)
         folded: dict[str, Any] = {}
         for row in sorted(feedback.get(sid, []), key=lambda item: item["_order"]):
             for field in ("user_corrected", "operator_override"):

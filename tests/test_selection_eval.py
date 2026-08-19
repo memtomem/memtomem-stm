@@ -388,6 +388,61 @@ def test_non_string_tool_matching_selected_tool_yields_no_rank(tmp_path: Path) -
     assert report["production"]["selected_tool_alignment"]["mrr"]["denominator"] == 0
 
 
+_SCORE_FIELDS = ("relevance_score", "risk_penalty", "final_score")
+_EXECUTION_FIELDS = ("latency_ms", "retry_count", "cost")
+# A JSON integer literal is unbounded, so an admitted record can hold one no
+# float can represent; `json.loads` also accepts the `NaN` literal (#856).
+_UNUSABLE = ((10**400, "oversized int"), (float("nan"), "NaN"))
+
+
+@pytest.mark.parametrize("field", _SCORE_FIELDS)
+@pytest.mark.parametrize(("value", "case"), _UNUSABLE)
+def test_unusable_score_field_skips_parity_without_raising(
+    tmp_path: Path, field: str, value: object, case: str
+) -> None:
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    selection["candidate_features"]["ranked_candidates"][0][field] = value
+    _write_jsonl(log, [selection, _execution()])
+
+    report = evaluate_selection(telemetry_path=log)
+
+    assert json.loads(report.to_json())["status"] == "ok", case
+    # The value is unusable, so parity is not checked — not silently passed.
+    assert report.data["data_quality"]["parity_mismatches"] == 0
+    # The entry is otherwise well-formed, so it still ranks.
+    assert report.data["production"]["coverage"]["rankable_selections"] == 1
+    assert report.data["production"]["coverage"]["selected_rank_known"] == 1
+
+
+@pytest.mark.parametrize("field", _EXECUTION_FIELDS)
+@pytest.mark.parametrize(("value", "case"), _UNUSABLE)
+def test_unusable_execution_field_is_dropped_from_its_sample(
+    tmp_path: Path, field: str, value: object, case: str
+) -> None:
+    log = tmp_path / "selection.jsonl"
+    execution = _execution()
+    # `cost` defaults to None, which would make its count 0 either way.
+    execution["cost"] = 0.02
+    execution[field] = value
+    _write_jsonl(log, [_selection(), execution])
+
+    report = evaluate_selection(telemetry_path=log)
+
+    # A non-finite value used to build a report that then failed to serialize.
+    assert json.loads(report.to_json())["status"] == "ok", case
+    production = report.data["production"]
+    assert production["execution"]["success_rate"]["numerator"] == 1
+    counts = {
+        "latency_ms": production["execution"]["latency_ms"]["count"],
+        "retry_count": production["coverage"]["retry_count_executions"],
+        "cost": production["coverage"]["cost_executions"],
+    }
+    # Dropped from its own sample only; the other two are unaffected.
+    assert counts[field] == 0
+    assert [name for name, count in counts.items() if count == 0] == [field]
+
+
 def test_unknown_future_ranker_skips_v1_score_parity(tmp_path: Path) -> None:
     log = tmp_path / "selection.jsonl"
     selection = _selection()

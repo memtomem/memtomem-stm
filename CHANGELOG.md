@@ -245,6 +245,41 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **`mms selection replay` no longer crashes on an oversized or non-finite
+  number** (#857, closes #856). Six fields on an admitted record were guarded
+  by a type check and then coerced with `float()`, which the type does not
+  make safe: `relevance_score`, `risk_penalty` and `final_score` in the parity
+  block, and `latency_ms`, `retry_count` and `cost` on the execution record.
+  A JSON integer literal is unbounded, so a large enough one raised
+  `OverflowError`; and `json.loads` accepts the `NaN` literal, so a non-finite
+  value passed the type check, entered the sample, and only failed at the end
+  when the report was serialized. All six now go through one predicate,
+  `finite_number`, which is the definition `finite_risk_score` (#852) already
+  used for graph scores, lifted to `utils.numeric` and shared. An unusable
+  value is skipped exactly as an absent one always was — the sibling fields,
+  the surrounding records, and the rest of the report are unaffected.
+
+  **Behavior change**, as measured against the previous release. *A traceback
+  becomes a report*: an oversized integer in any of the six fields. *A report
+  that could not be serialized now serializes*: a `NaN` in `latency_ms`,
+  `retry_count` or `cost` used to build a report whose `--json` output failed
+  with `Out of range float values are not JSON compliant`, and whose plain-text
+  mean was non-finite; the value is now dropped from its own sample, so that
+  field's count falls by one and its mean is computed from the usable values.
+  *Unchanged*: a `NaN` in one of the three score fields, where the parity
+  comparison already declined to flag it and nothing was stored.
+
+  Also fixes `safe_float`, the sibling helper this shares a module with: it
+  documented itself as defending against untrusted external JSON while an
+  oversized integer literal raised straight through its `except`. It now
+  returns the caller's default, as it already did for every other
+  unconvertible input — reachable from LLM output parsing and from surfacing's
+  MCP client and daemon adapter.
+
+  Not reachable from STM's own writer, which rounds real floats and records
+  measured values; reachable from a hand-edited log, an older or third-party
+  producer, or a future field that widens the range.
+
 - **`mms selection replay` no longer crashes on a malformed `rank` or
   `candidate_tools`** (#855, closes #854). The evaluator counts a record whose
   shape does not hold in `invariant_violations` and keeps scanning, so one bad

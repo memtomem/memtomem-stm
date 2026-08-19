@@ -1,10 +1,12 @@
-"""Unit tests for ``memtomem_stm.utils.numeric.safe_float``."""
+"""Unit tests for ``memtomem_stm.utils.numeric`` coercion helpers."""
 
 from __future__ import annotations
 
 import math
 
-from memtomem_stm.utils.numeric import safe_float
+import pytest
+
+from memtomem_stm.utils.numeric import finite_number, safe_float
 
 
 class TestSafeFloatFinite:
@@ -63,3 +65,46 @@ class TestSafeFloatNonFiniteRejection:
 
         result = safe_float("inf", 0.5, reject_nonfinite=False)
         assert math.isinf(result)
+
+
+class TestSafeFloatOversizedInteger:
+    """A JSON integer literal is unbounded; ``float()`` is not (#856)."""
+
+    def test_oversized_int_returns_default(self):
+        assert safe_float(10**400, 0.5) == 0.5
+
+    def test_oversized_negative_int_returns_default(self):
+        assert safe_float(-(10**400), 0.5) == 0.5
+
+    def test_oversized_int_returns_default_when_nonfinite_allowed(self):
+        # `reject_nonfinite=False` opts into inf, not into a crash.
+        assert safe_float(10**400, 0.5, reject_nonfinite=False) == 0.5
+
+
+class TestFiniteNumber:
+    @pytest.mark.parametrize("value", [1.5, 3, 0, -0.25, 1e-3])
+    def test_real_numbers_pass_through(self, value):
+        assert finite_number(value) == float(value)
+
+    @pytest.mark.parametrize(
+        ("value", "why"),
+        [
+            (True, "bool is an int subclass but never a measurement"),
+            (False, "bool is an int subclass but never a measurement"),
+            ("2.5", "a numeric string is not a number a producer wrote"),
+            (None, "absent"),
+            ([1.0], "not a scalar"),
+            (10**400, "too large for float()"),
+            (-(10**400), "too large for float()"),
+            (float("nan"), "poisons aggregates and fails strict JSON"),
+            (float("inf"), "poisons aggregates and fails strict JSON"),
+            (float("-inf"), "poisons aggregates and fails strict JSON"),
+        ],
+    )
+    def test_unusable_values_are_none(self, value, why):
+        assert finite_number(value) is None, why
+
+    def test_zero_is_a_value_not_an_absence(self):
+        # The whole point of returning None rather than a default.
+        assert finite_number(0) == 0.0
+        assert finite_number(0) is not None

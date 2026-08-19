@@ -103,7 +103,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -118,6 +117,7 @@ from memtomem_stm.proxy.config import (
 from memtomem_stm.proxy.metrics import ErrorCategory
 from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS, contains_sensitive_content
 from memtomem_stm.proxy.toolgraph_provider import ToolgraphProtocolError
+from memtomem_stm.utils.numeric import finite_number
 
 if TYPE_CHECKING:
     from memtomem_stm.proxy.manager import ProxyToolInfo
@@ -527,14 +527,12 @@ def finite_risk_score(score: Any) -> float | None:
     Out-of-range but finite values are kept: the graph's ``[0, 1]`` promise is
     the graph's to keep, and a fact it reported is worth recording as reported.
     The penalty path clamps and filters separately.
+
+    The predicate itself is :func:`~memtomem_stm.utils.numeric.finite_number`,
+    shared with every other reader of an externally authored number; this name
+    is the risk-score domain's use of it.
     """
-    if isinstance(score, bool) or not isinstance(score, (int, float)):
-        return None
-    try:
-        value = float(score)
-    except (OverflowError, ValueError):
-        return None
-    return value if math.isfinite(value) else None
+    return finite_number(score)
 
 
 def parse_graph_facts(verdict: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
