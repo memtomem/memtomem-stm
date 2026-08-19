@@ -660,8 +660,12 @@ def _write_lines(path: Path, lines: list) -> None:
 
 
 def _sel(**kw) -> dict:
+    # ``schema_version`` is part of every record the writer emits, and
+    # ``find_selection`` refuses to label one without a supported value — a
+    # fixture missing it would be a shape production never produces.
     base = {
         "event": "selection",
+        "schema_version": SCHEMA_VERSION,
         "ranker_version": RANKER_VERSION,
         "server": "srv",
         "selected_tool": "srv__a",
@@ -672,7 +676,13 @@ def _sel(**kw) -> dict:
 
 
 def _exec(**kw) -> dict:
-    base = {"event": "execution", "ok": True, "latency_ms": 10.0, "error_type": None}
+    base = {
+        "event": "execution",
+        "schema_version": SCHEMA_VERSION,
+        "ok": True,
+        "latency_ms": 10.0,
+        "error_type": None,
+    }
     base.update(kw)
     return base
 
@@ -1181,6 +1191,309 @@ def _short_write_on(log_path: Path, *, first_only: bool = True, drop_only_newlin
         return real_write(fd, data[:-1] if drop_only_newline else data[: len(data) // 2])
 
     return patched
+
+
+class TestUnlabellableSelections:
+    """Resolution must not accept a record offline replay will discard.
+
+    ``selection_eval._read_telemetry`` drops records whose ``schema_version``
+    it does not support and marks a run invalid when ``selection_id`` is
+    missing; a label written against one of those joins nothing on the only
+    reader that exists. ``ranker_version`` matters for the same reason in the
+    other direction: the label INHERITS it, so a selection with no stamp would
+    have its label filed under a cohort this command invented.
+    """
+
+    def test_an_unsupported_schema_is_refused_by_id_and_named(self, tmp_path):
+        log_path = tmp_path / "log.jsonl"
+        _write_lines(
+            log_path,
+            [_sel(selection_id="good"), _sel(selection_id="future", schema_version=99)],
+        )
+        result = _run_feedback(
+            tmp_path, log_path, "--selection-id", "future", "--user-corrected", "--json"
+        )
+        payload = json.loads(result.output)
+        assert result.exit_code == 1
+        # Not "not_found": the row IS in the file and an operator can go read
+        # it — the command's job here is to say what is wrong with it.
+        assert payload["error"] == "unusable_record"
+        assert "schema_version" in payload["message"]
+        assert _feedback_records(log_path) == []
+
+    def test_a_selection_with_no_cohort_stamp_is_refused(self, tmp_path):
+        log_path = tmp_path / "log.jsonl"
+        _write_lines(log_path, [_sel(selection_id="unstamped", ranker_version=None)])
+        result = _run_feedback(
+            tmp_path, log_path, "--selection-id", "unstamped", "--user-corrected", "--json"
+        )
+        payload = json.loads(result.output)
+        assert result.exit_code == 1
+        assert payload["error"] == "unusable_record"
+        assert "ranker_version" in payload["message"]
+        assert _feedback_records(log_path) == []
+
+    def test_last_skips_a_record_it_could_not_label(self, tmp_path):
+        """An inferred target that cannot be labelled is not the answer.
+
+        The positive control matters here: the defective row is the newest, so
+        a run that picks the older one only proves anything if the SAME layout
+        with a valid newest row picks the newest.
+        """
+        log_path = tmp_path / "log.jsonl"
+        _write_lines(
+            log_path,
+            [_sel(selection_id="older"), _sel(selection_id="newest", schema_version=99)],
+        )
+        assert _run_feedback(tmp_path, log_path, "--last", "--user-corrected").exit_code == 0
+        assert [record["selection_id"] for record in _feedback_records(log_path)] == ["older"]
+
+        control = tmp_path / "control.jsonl"
+        _write_lines(control, [_sel(selection_id="older"), _sel(selection_id="newest")])
+        assert _run_feedback(tmp_path, control, "--last", "--user-corrected").exit_code == 0
+        assert [record["selection_id"] for record in _feedback_records(control)] == ["newest"]
+
+    def test_a_line_truncated_mid_character_is_skipped_not_repaired(self, tmp_path):
+        """Strict decoding, so the resolver and replay agree on what exists.
+
+        ``errors="replace"`` turns a record truncated mid-character into a
+        *different*, parseable string — labelling a selection whose id no
+        reader of the same bytes agrees with.
+        """
+        log_path = tmp_path / "log.jsonl"
+        _write_lines(log_path, [_sel(selection_id="older")])
+        # The bad byte sits INSIDE the id string, which is what makes the two
+        # decodings disagree instead of both rejecting the line: strictly it is
+        # undecodable, while ``errors="replace"`` yields a perfectly parseable
+        # record naming a selection ("newest\ufffd") that nothing else agrees
+        # exists.
+        with log_path.open("ab") as fh:
+            line = json.dumps(_sel(selection_id="newestX")).encode("utf-8")
+            fh.write(line.replace(b"newestX", b"newest\xed") + b"\n")
+
+        assert _run_feedback(tmp_path, log_path, "--last", "--user-corrected").exit_code == 0
+        # Read tolerantly: the undecodable line is still in the file, and the
+        # point of the test is which record the LABEL names.
+        labels = [
+            record["selection_id"]
+            for record in _tolerant_feedback_records(log_path)
+        ]
+        assert labels == ["older"]
+
+        control = tmp_path / "control.jsonl"
+        _write_lines(control, [_sel(selection_id="older"), _sel(selection_id="newest")])
+        assert _run_feedback(tmp_path, control, "--last", "--user-corrected").exit_code == 0
+        assert [record["selection_id"] for record in _feedback_records(control)] == ["newest"]
+
+
+def _tolerant_feedback_records(path: Path) -> list[dict]:
+    """``_feedback_records`` for a log that holds undecodable bytes."""
+    records = []
+    for raw_line in path.read_bytes().splitlines():
+        try:
+            record = json.loads(raw_line.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if isinstance(record, dict) and record.get("event") == "feedback":
+            records.append(record)
+    return records
+
+
+class TestUnconfirmedWriteIsReported:
+    def test_an_unflushed_label_is_neither_success_nor_a_clean_failure(
+        self, tmp_path, monkeypatch
+    ):
+        """The operator is told what is and is not known.
+
+        Reporting success would promise durability nothing proved; reporting a
+        plain failure would invite a re-write while the label may already be
+        there. The message must say which, and that a re-run is safe.
+        """
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+
+        def failing_fsync(fd):
+            raise OSError(5, "I/O error")
+
+        monkeypatch.setattr(selection_log_module.os, "fsync", failing_fsync)
+        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
+        monkeypatch.undo()
+
+        payload = json.loads(result.output)
+        assert result.exit_code == 1
+        assert payload["error"] == "write_unconfirmed"
+        assert "re-running" in payload["message"]
+        # The message says the label reached the log; it must be true.
+        assert len(_feedback_records(log_path)) == 1
+
+
+def _fsync_recorder(monkeypatch):
+    """Record what ``_append`` flushes, by kind. Returns the list of modes."""
+    import stat as stat_module
+
+    real_fsync = os.fsync
+    kinds: list[str] = []
+
+    def patched(fd):
+        try:
+            mode = os.fstat(fd).st_mode
+            kinds.append("dir" if stat_module.S_ISDIR(mode) else "file")
+        except OSError:  # pragma: no cover - defensive
+            kinds.append("unknown")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(selection_log_module.os, "fsync", patched)
+    return kinds
+
+
+class TestLabelDurability:
+    """A label exists nowhere else, so "written" must mean it survives a crash.
+
+    The call-path emitters deliberately do NOT pay this: their records are one
+    sample among many that sampling may drop outright, and a device flush in
+    front of every proxied call would be charged to the call it only accounts
+    for.
+    """
+
+    def test_a_label_is_flushed_before_it_is_reported_written(self, tmp_path, monkeypatch):
+        log_path = tmp_path / "log.jsonl"
+        log = SelectionTelemetryLog(log_path)
+        log.initialize()
+        kinds = _fsync_recorder(monkeypatch)
+
+        assert log.log_feedback(selection_id="a", user_corrected=True) == "written"
+        assert "file" in kinds, "the label was reported written without being flushed"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="no directory fsync on Windows")
+    def test_the_creating_append_also_syncs_the_directory_entry(self, tmp_path, monkeypatch):
+        """Flushing the descriptor does not make a NEW name durable.
+
+        With the log absent (the first label after a crash that lost the active
+        file, say) the record's bytes can be on disk under a filename the
+        directory does not yet record.
+        """
+        log_path = tmp_path / "log.jsonl"
+        log = SelectionTelemetryLog(log_path)
+        assert not log_path.exists()
+        kinds = _fsync_recorder(monkeypatch)
+
+        assert log.log_feedback(selection_id="a", user_corrected=True) == "written"
+        assert kinds.count("dir") == 1
+
+        # The second label lands in a file whose name is already durable, so it
+        # pays for the contents only — otherwise every append would sync the
+        # directory and this test would pass without the ``created`` guard.
+        kinds.clear()
+        assert log.log_feedback(selection_id="b", user_corrected=True) == "written"
+        assert kinds.count("dir") == 0
+
+    def test_the_call_path_emitters_do_not_pay_for_durability(self, tmp_path, monkeypatch):
+        log_path = tmp_path / "log.jsonl"
+        log = SelectionTelemetryLog(log_path)
+        log.initialize()
+        kinds = _fsync_recorder(monkeypatch)
+
+        selection_id = log.log_selection(
+            server="gh",
+            selected_tool="gh__a",
+            candidate_tools=["gh__a"],
+            arguments={"q": "x"},
+            trace_id="t",
+        )
+        log.log_execution(
+            selection_id=str(selection_id),
+            trace_id="t",
+            server="gh",
+            selected_tool="gh__a",
+            ok=True,
+            latency_ms=1.0,
+        )
+        assert kinds == []
+
+    def test_a_failed_flush_is_unconfirmed_rather_than_written_or_failed(
+        self, tmp_path, monkeypatch
+    ):
+        """Neither verdict is available: the bytes ARE in the file.
+
+        "written" would promise durability nothing proved; "failed" would send
+        an operator to write the same label again on a claim this process
+        cannot make.
+        """
+        log_path = tmp_path / "log.jsonl"
+        log = SelectionTelemetryLog(log_path)
+        log.initialize()
+
+        def failing_fsync(fd):
+            raise OSError(5, "I/O error")
+
+        monkeypatch.setattr(selection_log_module.os, "fsync", failing_fsync)
+        assert log.log_feedback(selection_id="a", user_corrected=True) == "unconfirmed"
+        monkeypatch.undo()
+
+        assert [record["selection_id"] for record in _feedback_records(log_path)] == ["a"]
+        assert log.events_written == 0
+        assert log.write_errors == 1
+
+    def test_a_failed_close_after_a_complete_write_is_unconfirmed(self, tmp_path, monkeypatch):
+        log_path = tmp_path / "log.jsonl"
+        log = SelectionTelemetryLog(log_path)
+        log.initialize()
+        real_close = os.close
+        log_inode = log_path.stat().st_ino
+
+        def patched_close(fd):
+            try:
+                is_log = os.fstat(fd).st_ino == log_inode
+            except OSError:  # pragma: no cover - defensive
+                is_log = False
+            real_close(fd)
+            if is_log:
+                raise OSError(5, "I/O error on close")
+
+        monkeypatch.setattr(selection_log_module.os, "close", patched_close)
+        assert log.log_feedback(selection_id="a", user_corrected=True) == "unconfirmed"
+        monkeypatch.undo()
+
+        # The record is intact: this is exactly the case that must not read as
+        # a failure, since a retry would duplicate a label that is already here.
+        assert [record["selection_id"] for record in _feedback_records(log_path)] == ["a"]
+        assert log.events_written == 0
+        assert log.write_errors == 1
+
+    def test_a_directory_that_cannot_be_synced_is_unconfirmed(self, tmp_path, monkeypatch):
+        log_path = tmp_path / "log.jsonl"
+        log = SelectionTelemetryLog(log_path)
+        monkeypatch.setattr(selection_log_module, "_sync_parent_dir", lambda path: False)
+
+        assert log.log_feedback(selection_id="a", user_corrected=True) == "unconfirmed"
+        assert [record["selection_id"] for record in _feedback_records(log_path)] == ["a"]
+        assert log.write_errors == 1
+
+    def test_a_short_write_leaves_no_record_even_though_a_fragment_remains(
+        self, tmp_path, monkeypatch
+    ):
+        """What ``"failed"`` promises, stated exactly.
+
+        Not "the file is unchanged" — a short write's fragment stays, because
+        truncating it back would rewind a file other processes append to. What
+        it promises is that no RECORD was written: nothing parses, so nothing
+        joins a selection or lands in a cohort.
+        """
+        log_path = tmp_path / "log.jsonl"
+        log = SelectionTelemetryLog(log_path)
+        log.initialize()
+        monkeypatch.setattr(selection_log_module.os, "write", _short_write_on(log_path))
+
+        assert log.log_feedback(selection_id="a", user_corrected=True) == "failed"
+        monkeypatch.undo()
+
+        raw = log_path.read_bytes()
+        assert raw, "the fragment is expected to remain; only records are promised absent"
+        # Read the way a reader does — tolerantly — because the fragment is by
+        # construction unparseable and ``_feedback_records`` would raise on it.
+        summary = aggregate_selection_log(log_path)
+        assert summary["events"]["feedback"] == 0
+        assert summary["malformed"] == 1
 
 
 class TestSelectionFeedbackRobustness:

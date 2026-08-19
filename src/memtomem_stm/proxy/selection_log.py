@@ -77,6 +77,7 @@ import json
 import logging
 import os
 import random
+import sys
 import threading
 import time
 import uuid
@@ -103,7 +104,14 @@ SCHEMA_VERSION = 1
 APPEND_WRITTEN = "written"
 APPEND_REDACTED = "redacted"
 APPEND_FAILED = "failed"
-APPEND_STATUSES = (APPEND_WRITTEN, APPEND_REDACTED, APPEND_FAILED)
+# The record's bytes are complete in the file, but the write could not be
+# confirmed to survive a crash — a durable append whose ``fsync`` or ``close``
+# failed. Distinct from ``failed`` because the two need opposite handling: a
+# failure means "write it again", while an unconfirmed append may already be on
+# disk, so the caller must be told what is and is not known rather than being
+# handed a verdict the process cannot support.
+APPEND_UNCONFIRMED = "unconfirmed"
+APPEND_STATUSES = (APPEND_WRITTEN, APPEND_REDACTED, APPEND_FAILED, APPEND_UNCONFIRMED)
 
 
 def rotation_lock_path(log_path: Path | str) -> Path:
@@ -153,6 +161,36 @@ def rotation_lock(
 # halves of the pair via the ``ranker_version`` parameter, letting replay
 # split cohorts on this field alone.
 RANKER_VERSION = "v0-passthrough"
+
+
+def _sync_parent_dir(path: Path) -> bool:
+    """``fsync`` the directory holding *path*; ``True`` if it is now durable.
+
+    An ``fsync`` on the file descriptor flushes the file's contents, not the
+    directory entry that names it — so a log created by this very append can
+    have durable bytes under a name that a crash undoes. Only the append that
+    creates the file pays this.
+
+    Windows has no directory descriptor to sync and no API that promises this
+    separately, so there the file flush IS the whole guarantee available and
+    this reports success rather than downgrading every first label on the
+    platform to "unconfirmed".
+    """
+    if sys.platform == "win32":  # pragma: no cover - POSIX-only durability step
+        return True
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+    except OSError:
+        logger.debug("Could not open the selection log's directory to sync it", exc_info=True)
+        return False
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        logger.debug("Could not sync the selection log's directory", exc_info=True)
+        return False
+    finally:
+        os.close(dir_fd)
+    return True
 
 
 def _canonical_args(arguments: dict[str, Any] | None) -> str:
@@ -361,6 +399,13 @@ class SelectionTelemetryLog:
         failure here would tell an operator their judgement was recorded when
         nothing was written.
 
+        The append is *durable*: unlike the call-path emitters, whose records
+        are one sample among many, this one is a human's judgement that exists
+        nowhere else, so the write is flushed to the storage device — and the
+        directory entry with it when this append created the file — before the
+        status says it exists. ``"unconfirmed"`` is the honest answer when that
+        flush could not be completed.
+
         ``ranker_version`` must be the stamp of the selection being labelled,
         not this process's: every record is self-describing, and a label that
         claims the unranked baseline while pointing at a ranked selection would
@@ -377,7 +422,8 @@ class SelectionTelemetryLog:
                 "trace_id": trace_id,
                 "user_corrected": user_corrected,
                 "operator_override": operator_override,
-            }
+            },
+            durable=True,
         )
 
     # ── internals ────────────────────────────────────────────────────────
@@ -389,16 +435,34 @@ class SelectionTelemetryLog:
             return False
         return self._rng.random() < self._sample_rate
 
-    def _append(self, record: dict[str, Any]) -> str:
+    def _append(self, record: dict[str, Any], *, durable: bool = False) -> str:
         """Persist one record; returns one of :data:`APPEND_STATUSES`.
 
-        Three outcomes, not two, because only two of them look alike to *some*
+        Four outcomes, not two, because they do not all look alike to *some*
         callers: ``"redacted"`` means the record was consumed but wrote
         nothing, which ``log_selection`` treats like a success (keeping the
         documented left-outer pairing semantics) and an operator-facing caller
         must not — a label that never reached disk is not a recorded label.
-        ``"failed"`` means the write itself failed; ``"written"`` is the only
-        outcome where the record is on disk.
+        ``"failed"`` means no complete record was written. ``"unconfirmed"``
+        means the record's bytes are complete but the flush that would prove
+        they survive a crash did not complete. ``"written"`` is the only
+        outcome where the record is on disk and durable.
+
+        With *durable*, the descriptor (and, when this append created the file,
+        its parent directory) is ``fsync``-ed before reporting success. Paid
+        only by the operator labelling path: on the proxied call path it would
+        put a device flush in front of every upstream call to insure a record
+        that sampling is entitled to drop outright.
+
+        **What "failed" does and does not promise.** No *record* is written —
+        nothing a reader will parse, join, or count. It does not promise the
+        file is byte-identical to before: a write that lands short leaves that
+        fragment behind, newline-terminated so it cannot swallow the next
+        record (see :meth:`_terminate_fragment`). Rolling it back would mean
+        truncating a file other processes append to concurrently, which would
+        destroy *their* records to tidy up this one. Readers count the fragment
+        as one malformed line; it carries no ``selection_id``, so it joins
+        nothing and inflates no cohort.
         """
         # The ``.encode`` below sits outside this method's write-failure
         # handling, so an unencodable record would raise past the caller's
@@ -434,7 +498,15 @@ class SelectionTelemetryLog:
                     self.write_errors += 1
                     logger.warning("Selection telemetry write skipped: the rotation lock is held")
                     return APPEND_FAILED
+                # Whether THIS append creates the file decides if the
+                # directory entry also needs syncing: an fsync on the
+                # descriptor alone does not promise a newly created name
+                # survives a crash. Checked under the lock, immediately before
+                # the open, so at most a concurrent external creator makes it
+                # conservative (one extra directory sync), never optimistic.
+                created = durable and not self._path.exists()
                 fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                closed = False
                 try:
                     written = os.write(fd, data)
                     if written != len(data):
@@ -453,20 +525,56 @@ class SelectionTelemetryLog:
                         repaired = self._terminate_fragment(fd, data, written)
                         if repaired and written == len(data) - 1:
                             written = len(data)
+                    if written != len(data):
+                        # No record is on disk, and a caller waiting to hear
+                        # that its label exists must not be told otherwise.
+                        # Never retried at this level: appending the remainder
+                        # would duplicate the prefix into a second fragment.
+                        # The terminated fragment stays (see the method
+                        # docstring) — truncating it back would mean rewinding
+                        # a file other processes append to concurrently.
+                        self.write_errors += 1
+                        logger.warning(
+                            "Selection telemetry write was short (%d of %d bytes)",
+                            written,
+                            len(data),
+                        )
+                        return APPEND_FAILED
+                    # From here the record's bytes are complete in the file, so
+                    # nothing below may report ``failed``: that would send an
+                    # operator to write the same label a second time on the
+                    # strength of a claim this process cannot make. What can
+                    # still be unknown is whether the bytes SURVIVE, which is
+                    # what ``unconfirmed`` says.
+                    try:
+                        if durable:
+                            os.fsync(fd)
+                    except OSError:
+                        self.write_errors += 1
+                        logger.warning(
+                            "Selection telemetry write could not be flushed to disk",
+                            exc_info=True,
+                        )
+                        return APPEND_UNCONFIRMED
+                    # Marked closed before the call: a failed ``close`` still
+                    # consumes the descriptor, so retrying it in ``finally``
+                    # could close an unrelated file this process later opens.
+                    closed = True
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        self.write_errors += 1
+                        logger.warning(
+                            "Selection telemetry descriptor failed to close after a complete write",
+                            exc_info=True,
+                        )
+                        return APPEND_UNCONFIRMED
+                    if created and not _sync_parent_dir(self._path):
+                        self.write_errors += 1
+                        return APPEND_UNCONFIRMED
                 finally:
-                    os.close(fd)
-                if written != len(data):
-                    # The record is NOT on disk, and a caller waiting to hear
-                    # that its label exists must not be told otherwise. Never
-                    # retried: appending the remainder would duplicate the
-                    # prefix into a second partial record.
-                    self.write_errors += 1
-                    logger.warning(
-                        "Selection telemetry write was short (%d of %d bytes)",
-                        written,
-                        len(data),
-                    )
-                    return APPEND_FAILED
+                    if not closed:
+                        os.close(fd)
                 self.events_written += 1
             except OSError:
                 self.write_errors += 1
@@ -581,6 +689,35 @@ def discover_log_files(path: Path | str, *, include_rotated: bool = True) -> lis
     return ordered
 
 
+def selection_defect(record: dict[str, Any]) -> str | None:
+    """Why *record* cannot carry a label, or ``None`` if it can.
+
+    A label is only ever as good as the join it feeds, and the replay harness
+    is the reader on the other end: it drops records whose ``schema_version``
+    it does not support (``selection_eval._read_telemetry``) and marks a run
+    invalid when a ``selection_id`` is missing. Resolving against a laxer bar
+    than that would let ``mms selection feedback`` write a label that joins a
+    selection replay refuses to load — the same dead record the command
+    already refuses to create for a mistyped id.
+
+    ``ranker_version`` is checked because the label *inherits* it: a selection
+    with no usable stamp would have its label filed under the emitter's guess
+    at a cohort, which is the defect the stamp was made self-describing to
+    avoid.
+
+    Reason codes, not prose, so the CLI can render one and a test can pin it.
+    """
+    if record.get("schema_version") != SCHEMA_VERSION:
+        return f"unsupported schema_version {record.get('schema_version')!r}"
+    selection_id = record.get("selection_id")
+    if not isinstance(selection_id, str) or not selection_id:
+        return "no selection_id"
+    ranker_version = record.get("ranker_version")
+    if not isinstance(ranker_version, str) or not ranker_version:
+        return "no ranker_version"
+    return None
+
+
 def find_selection(
     path: Path | str,
     *,
@@ -591,15 +728,27 @@ def find_selection(
 ) -> dict[str, Any] | None:
     """Locate one ``selection`` record, or ``None``.
 
-    With *selection_id*, returns that exact record. Otherwise returns the most
-    recent selection matching the optional *server* / *tool* filters, where
-    "most recent" is **append order** (see :func:`discover_log_files`) rather
-    than the ``ts`` field: ``ts`` is wall clock and a clock step backwards
-    would reorder history, while append order is what actually happened.
+    With *selection_id*, returns that exact record — including a defective one,
+    so a caller can say *what is wrong with the row you named* rather than
+    "not found" about a record that is plainly in the file. Callers that are
+    about to write must screen it with :func:`selection_defect`.
+
+    Otherwise returns the most recent selection matching the optional *server*
+    / *tool* filters, where "most recent" is **append order** (see
+    :func:`discover_log_files`) rather than the ``ts`` field: ``ts`` is wall
+    clock and a clock step backwards would reorder history, while append order
+    is what actually happened. Defective records are skipped by that search:
+    an inferred target that cannot be labelled is not the most recent
+    labellable selection, and silently picking it would put the operator's
+    judgement on a row the replay harness discards.
 
     Malformed lines are skipped, not raised on — the same posture as
     :func:`aggregate_selection_log`, because a hand-edited or half-written log
-    must not make labelling impossible.
+    must not make labelling impossible. Read as bytes and decoded strictly, so
+    a record truncated mid-character is skipped rather than silently repaired
+    into a different string by ``errors="replace"``: replay would count that
+    same line as malformed, and the two must not disagree about which
+    selections exist.
 
     *tool* matches ``selected_tool``, the prefixed name the client called, so
     it uses the same vocabulary an operator reads out of a report.
@@ -607,13 +756,13 @@ def find_selection(
     match: dict[str, Any] | None = None
     for log_path in discover_log_files(path, include_rotated=include_rotated):
         try:
-            with log_path.open("r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    if not line.strip():
+            with log_path.open("rb") as fh:
+                for raw_line in fh:
+                    if not raw_line.strip():
                         continue
                     try:
-                        record = json.loads(line)
-                    except (ValueError, TypeError):
+                        record = json.loads(raw_line.decode("utf-8"))
+                    except (ValueError, TypeError, UnicodeDecodeError):
                         continue
                     if not isinstance(record, dict) or record.get("event") != "selection":
                         continue
@@ -624,6 +773,8 @@ def find_selection(
                     if server is not None and record.get("server") != server:
                         continue
                     if tool is not None and record.get("selected_tool") != tool:
+                        continue
+                    if selection_defect(record) is not None:
                         continue
                     # Keep scanning: the LAST match in append order wins.
                     match = record

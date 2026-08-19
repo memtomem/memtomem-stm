@@ -704,7 +704,9 @@ only, never per-call identifiers), so it is read out of the JSONL itself.
 `--last` resolves the most recent selection in append order, narrowed by
 `--server` / `--tool`, prints which selection it resolved to, and asks for
 confirmation before writing, so the inference is checked by the person making
-the judgement. Because that check is the only thing standing behind an
+the judgement. That echo is the human surface: under `--json` the resolved
+target appears only in the result document, after the write, so a scripted
+`--last` passes `--yes` and reads back what it got. Because that check is the only thing standing behind an
 inferred target, a non-interactive `--last` (a pipe, CI, or `--json`) is
 **refused** without `--yes` — exit 2, `confirmation_required` — rather than
 prompting where nobody can answer or writing unasked. `--selection-id` names
@@ -730,13 +732,21 @@ exit 1 and emit `{"action": "selection-feedback", "ok": false, "error":
 | `no_log` | no log segment exists in the selected scope — with `--active-only` that is the active file alone, otherwise the active file and every rotated backup |
 | `not_found` / `no_match` | the selector resolved to nothing, checked *before* writing, so a typo never appends a label that joins to no selection |
 | `malformed_record` | the matched record carries no `selection_id` (reachable only on a hand-edited log) |
+| `unusable_record` | the record was found but cannot carry a label — an unsupported `schema_version`, or no `ranker_version` for the label to inherit. Offline replay discards exactly these records, so a label on one would join nothing; `--last` skips them rather than inferring one |
 | `log_rotated` | the resolved selection left the log between resolution and append; nothing was written |
 | `log_busy` | the rotation lock is held (by a rotating writer or another labelling run) and could not be taken; nothing was written — re-run |
 | `lock_failed` | the rotation lock file beside the log could not be created (e.g. a writable log in a directory this user cannot write); nothing was written |
 | `log_unreadable` | the log directory could not be listed, or a segment could not be opened — reported instead of `no_match`, since "I could not look there" is not "no such selection" |
-| `config_invalid` | the config file exists but does not parse, so the configured log path is unknown; the command refuses rather than labelling the default log |
+| `config_invalid` | the configured log path is unknown, by either route: the config file exists but does not parse, or there is no file and the `MEMTOMEM_STM_PROXY__*` overlay the operator did set fails to validate. Both refuse rather than labelling whichever log the defaults name |
 | `confirmation_required` | `--last` used non-interactively (or with `--json`) without `--yes`; exit 2, matching the CLI-wide rule that a formatting flag must not authorize a write |
-| `write_failed` / `write_redacted` | the label did not reach disk — the sink swallows write faults so a telemetry problem cannot break a proxied call, so the command checks the append outcome instead of assuming it |
+| `write_failed` / `write_redacted` | no label record was written — the sink swallows write faults so a telemetry problem cannot break a proxied call, so the command checks the append outcome instead of assuming it. A write that landed short leaves an unparseable fragment behind (rolling it back would mean rewinding a file the proxy appends to concurrently); readers count it as one malformed line and it joins nothing |
+| `write_unconfirmed` | the label's bytes reached the log but the flush proving they survive a crash did not complete. Neither "written" nor "not written" is available, so the command says so; re-running with the same flags is safe, since repeating a label for one selection is the accumulate-and-supersede case above |
+
+Unlike the proxy's call-path emitters, the label is flushed to the storage
+device — and its directory entry with it when the append created the log —
+before the command reports success. The call path does not pay that: its
+records are one sample among many, and a device flush there would be charged
+to the proxied call it only accounts for.
 
 Rotation renames every segment at once, so a scan that straddles one can miss
 the newest selections — they move into a file it already passed — or resolve

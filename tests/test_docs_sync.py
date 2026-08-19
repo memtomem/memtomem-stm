@@ -1968,32 +1968,66 @@ def test_adr_0001_cited_paths_and_call_site_claim_hold() -> None:
     from memtomem_stm.proxy.selection_log import SelectionTelemetryLog
 
     assert callable(SelectionTelemetryLog.log_feedback)
-    callers: list[tuple[str, str]] = []
-    for path in sorted((REPO_ROOT / "src").rglob("*.py")):
+    # ``_write_label`` is the labelling command's own append helper, split out
+    # so a test can observe when the write runs. Pinning only the DIRECT
+    # callers of ``log_feedback`` would therefore pin one name and leave the
+    # loophole open: a request-path function calling ``_write_label`` emits
+    # feedback while the direct-call list is unchanged. The claim the ADR makes
+    # is about which code can cause a label to be written, so the pin is over
+    # transitive reachability, not over one call edge.
+    reaching = _functions_reaching(REPO_ROOT / "src", "log_feedback", base=REPO_ROOT)
+    assert reaching == {
+        ("src/memtomem_stm/cli/selection_cmd.py", "_write_label"),
+        ("src/memtomem_stm/cli/selection_cmd.py", "feedback_command"),
+    }, (
+        f"ADR 0001 states the operator labelling command is the only production code that "
+        f"can emit a feedback record, but these functions reach log_feedback: {sorted(reaching)}. "
+        "Update the ADR's matrix note alongside this pin, and if a new emitter is on the "
+        "request path, say so explicitly, because that changes what the stream is."
+    )
+
+
+def _functions_reaching(
+    root: Path, target: str, *, base: Path | None = None
+) -> set[tuple[str, str]]:
+    """Every function under *root* that can reach a call to *target*.
+
+    Reported as ``(path relative to *base*, function name)``; *base* defaults
+    to *root* so a synthetic tree can be walked by the same code.
+
+    Matched on called NAME (``x.log_feedback(...)`` and ``log_feedback(...)``
+    alike), with no import or type resolution — an over-approximation, which is
+    the safe direction for a guard: an unrelated same-named helper makes this
+    fail and get read, while a missed edge would let the ADR's claim age into
+    being false. Fixed-point over the call graph, so a wrapper chain of any
+    depth is still reported.
+    """
+    calls: dict[tuple[str, str], set[str]] = {}
+    for path in sorted(root.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        # Enclosing-function lookup: walk each function body once and attribute
-        # every ``log_feedback`` call inside it, so a call that moves to another
-        # function in the same file is a different pin value.
+        relative = str(path.relative_to(base or root))
         for scope in ast.walk(tree):
             if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
+            called = calls.setdefault((relative, scope.name), set())
             for node in ast.walk(scope):
                 if not isinstance(node, ast.Call):
                     continue
                 func = node.func
                 name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-                if name == "log_feedback":
-                    callers.append((str(path.relative_to(REPO_ROOT)), scope.name))
-    # ``_write_label`` is the labelling command's own append helper, split out
-    # so a test can observe when the write runs; the pin names it rather than
-    # the command so that moving the call to any OTHER function is still a
-    # change this guard reports.
-    assert callers == [("src/memtomem_stm/cli/selection_cmd.py", "_write_label")], (
-        f"ADR 0001 states log_feedback has exactly one production call site — the "
-        f"operator labelling command — but found {callers}. Update the ADR's matrix "
-        "note alongside this pin, and if a new emitter is on the request path, say "
-        "so explicitly, because that changes what the stream is."
-    )
+                if isinstance(name, str):
+                    called.add(name)
+    reaching: set[tuple[str, str]] = set()
+    frontier = {target}
+    while frontier:
+        found = {
+            scope for scope, called in calls.items() if scope not in reaching and called & frontier
+        }
+        if not found:
+            break
+        reaching |= found
+        frontier = {name for _, name in found}
+    return reaching
 
 
 def test_cli_md_freshness_preset_table_matches_init_mapping() -> None:
@@ -2096,33 +2130,51 @@ def test_uninstall_runbook_puts_hook_backups_where_the_writer_puts_them() -> Non
 
 
 def test_adr_0001_call_site_pin_rejects_a_second_emitter(tmp_path) -> None:
-    """The pin must fail on a second emitter, including one in the SAME file.
+    """The pin must fail on a second emitter — including one that never names
+    ``log_feedback`` at all.
 
-    A file-level pin passed for that case, which is how the previous version
-    of this guard could have aged into agreeing with a false ADR. Re-runs the
+    Two shapes, because the guard has been wrong about each in turn: a
+    file-level pin passed for a second emitter in the SAME file, and a
+    direct-call pin passed for a request-path function that reaches the emitter
+    through the approved ``_write_label`` wrapper. Both are run through the
     guard's own walk over a synthetic tree rather than trusting the shape of
     the assertion.
     """
-    module = tmp_path / "selection_cmd.py"
-    module.write_text(
-        "def feedback_command():\n"
-        "    log.log_feedback(selection_id='a')\n"
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "selection_cmd.py").write_text(
+        "def _write_label(log):\n"
+        "    return log.log_feedback(selection_id='a')\n"
         "\n"
-        "def sneaky_second_emitter():\n"
-        "    log.log_feedback(selection_id='b')\n",
+        "def feedback_command(log):\n"
+        "    return _write_label(log)\n",
         encoding="utf-8",
     )
-    callers: list[tuple[str, str]] = []
-    tree = ast.parse(module.read_text(encoding="utf-8"))
-    for scope in ast.walk(tree):
-        if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        for node in ast.walk(scope):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-            if name == "log_feedback":
-                callers.append((module.name, scope.name))
-    assert len(callers) == 2
-    assert {scope for _, scope in callers} == {"feedback_command", "sneaky_second_emitter"}
+    baseline = _functions_reaching(src, "log_feedback")
+    assert baseline == {
+        ("selection_cmd.py", "_write_label"),
+        ("selection_cmd.py", "feedback_command"),
+    }
+
+    # (a) a second direct emitter in the same file.
+    (src / "selection_cmd.py").write_text(
+        (src / "selection_cmd.py").read_text(encoding="utf-8")
+        + "\ndef sneaky_second_emitter(log):\n    return log.log_feedback(selection_id='b')\n",
+        encoding="utf-8",
+    )
+    assert ("selection_cmd.py", "sneaky_second_emitter") in _functions_reaching(src, "log_feedback")
+
+    # (b) a request-path emitter that only calls the approved wrapper — the
+    # case a direct-call pin cannot see, since the ``log_feedback`` call sites
+    # are still exactly the one.
+    (src / "proxy_path.py").write_text(
+        "from selection_cmd import _write_label\n"
+        "\n"
+        "async def call_tool(log):\n"
+        "    return _write_label(log)\n",
+        encoding="utf-8",
+    )
+    reaching = _functions_reaching(src, "log_feedback")
+    assert ("proxy_path.py", "call_tool") in reaching, (
+        "a wrapper-hop emitter must be reported; a direct-call pin misses it"
+    )

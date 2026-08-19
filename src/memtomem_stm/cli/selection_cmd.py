@@ -27,11 +27,13 @@ from memtomem_stm.proxy.selection_eval import (
 )
 from memtomem_stm.cli._display import _disp
 from memtomem_stm.proxy.selection_log import (
+    APPEND_UNCONFIRMED,
     APPEND_WRITTEN,
     SelectionTelemetryLog,
     discover_log_files,
     find_selection,
     rotation_lock,
+    selection_defect,
 )
 from memtomem_stm.utils import json_out
 from memtomem_stm.utils.fileio import atomic_write_text
@@ -208,7 +210,9 @@ def feedback_command(
     Pass exactly one selector. --selection-id names the row and never prompts.
     --last resolves the most recent selection in append order, narrowed by
     --server / --tool, prints which selection it resolved to, and asks for
-    confirmation before writing. Because that check is all that stands behind
+    confirmation before writing. That echo is part of the human surface: under
+    --json the target is reported only in the result document, after the
+    write, so a scripted --last must pass --yes and check what came back. Because that check is all that stands behind
     an inferred target, --last off a terminal (a pipe, CI, or --json) is
     refused without --yes rather than prompting where nobody can answer.
 
@@ -338,6 +342,20 @@ def feedback_command(
         _feedback_failure(
             as_json, "malformed_record", "matched selection record carries no selection_id"
         )
+    # A row can be present and still not be labellable — an unsupported schema
+    # version, or no cohort stamp to inherit. The replay harness discards those
+    # records, so a label pointing at one is the same dead weight a mistyped id
+    # would have produced, and the label would be filed under a cohort this
+    # process invented. Reported by name rather than as "not found", because
+    # the record IS there and an operator can go look at it.
+    defect = selection_defect(record)
+    if defect is not None:
+        _feedback_failure(
+            as_json,
+            "unusable_record",
+            f"selection {resolved_id} cannot be labelled ({defect}); "
+            "offline replay would discard this record",
+        )
 
     # Identify the row BEFORE writing, and — when a human is at the terminal —
     # let them stop it. ``--last`` is an inference; the operator is the check on
@@ -404,11 +422,24 @@ def feedback_command(
     # break a proxied call — but this caller is a person waiting to hear that
     # their label exists. Reporting success for a record that never reached
     # disk is worse than the failure itself.
+    if status == APPEND_UNCONFIRMED:
+        # The bytes are complete in the file but the flush proving they survive
+        # a crash did not complete, so neither "written" nor "not written" is a
+        # statement this process can make. Say which it is, and say that a
+        # re-run is safe: repeating the same label for the same selection is
+        # the accumulate-and-supersede case the schema already defines, not a
+        # second, conflicting judgement.
+        _feedback_failure(
+            as_json,
+            f"write_{status}",
+            f"the label reached {telemetry_path} but could not be confirmed durable; "
+            "check the log, and re-running with the same flags is safe",
+        )
     if status != APPEND_WRITTEN:
         _feedback_failure(
             as_json,
             f"write_{status}",
-            f"the label was not written to {telemetry_path} (append status: {status})",
+            f"no label was written to {telemetry_path} (append status: {status})",
         )
     result = {
         "action": "selection-feedback",

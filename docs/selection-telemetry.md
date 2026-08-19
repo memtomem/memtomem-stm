@@ -95,6 +95,20 @@ as much as the negative case — while `null` records nothing for that field.
 Several records may accumulate for one selection; a reader folds them per
 field, later non-null values superseding earlier ones.
 
+A label is a human judgement that exists nowhere else, so its append is
+*durable* — flushed to the storage device, and the directory entry with it when
+the append created the log, before the command reports success. The call-path
+emitters deliberately are not: their records are one sample among many that
+sampling may drop outright. A label the command could not confirm durable is
+reported as such rather than as a success or a failure, because its bytes are
+in the file either way.
+
+The command labels only records offline replay can load: a selection whose
+`schema_version` is unsupported, or which carries no `ranker_version` for the
+label to inherit, is refused by name (`unusable_record`) and skipped by
+`--last`, since a label joined to a record the reader discards is the same
+dead weight as one joined to no record at all.
+
 Written by [`mms selection feedback`](cli.md#mms-selection-feedback--label-one-recorded-selection),
 the operator labelling command, and by nothing else. **Nothing on the proxy's
 call path emits this event**, and that is structural rather than pending: the

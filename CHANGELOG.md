@@ -32,9 +32,21 @@ changes inline only. See the deprecation policy in
   actually reached disk — the sink swallows write faults so a telemetry problem
   cannot break a proxied call, so a failed or redacted append exits 1
   (`write_failed` / `write_redacted`) instead of claiming success — including
-  a short `os.write`, which leaves a truncated record, and an append racing
-  another writer's `max_backups: 0` rotation, which can land in an inode about
-  to be unlinked. Resolution
+  a short `os.write`, which writes no record (the unparseable fragment it
+  leaves stays put: rolling it back would rewind a file the proxy appends to
+  concurrently), and an append racing another writer's `max_backups: 0`
+  rotation, which can land in an inode about to be unlinked. The label's
+  append is durable, unlike the call-path emitters': the descriptor — and the
+  directory entry too when the append created the log — is `fsync`-ed before
+  success is reported, so an unclean shutdown cannot swallow a judgement the
+  operator was told exists. When that flush or the following `close` fails,
+  the record's bytes are already complete in the file, so the command reports
+  `write_unconfirmed` (exit 1) and says a re-run is safe rather than picking
+  one of two verdicts it cannot support. Only records offline replay can load
+  are labellable: an unsupported `schema_version` or a missing `ranker_version`
+  exits 1 (`unusable_record`) and is skipped by `--last`, and the resolver
+  decodes the log strictly, so a record truncated mid-character is skipped
+  rather than repaired into a different string than the one replay reads. Resolution
   runs under an advisory rotation lock and the target is re-verified under it
   after confirmation, so a rotation can neither rename segments mid-scan nor
   evict the agreed selection before the write (`log_rotated` / `log_busy`,
@@ -46,9 +58,11 @@ changes inline only. See the deprecation policy in
   than the emitter's. Nothing on the proxy's call path emits this event and
   nothing is planned to: the client model never sees a `selection_id`, so the
   stream carries operator judgement at operator volume — ADR 0001 states that
-  and `tests/test_docs_sync.py` pins the exact call site (file plus enclosing
-  function) and its count, so a future
-  request-path emitter fails CI until the ADR is rewritten.
+  and `tests/test_docs_sync.py` pins it by *reachability*: every function in
+  `src/` that can reach `log_feedback` through any chain of calls is
+  enumerated, so a future request-path emitter fails CI until the ADR is
+  rewritten — including one that routes through the labelling command's own
+  append helper rather than naming the emitter.
 
 - **Selection telemetry records the tool-graph's per-candidate facts, not just
   the risk score they produce** (#852, part of #469). Each entry in
