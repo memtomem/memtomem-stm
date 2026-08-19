@@ -29,6 +29,7 @@ from memtomem_stm.cli._display import _disp
 from memtomem_stm.proxy.selection_log import (
     APPEND_UNCONFIRMED,
     APPEND_WRITTEN,
+    SelectionLogUnreadable,
     SelectionTelemetryLog,
     discover_log_files,
     resolve_selection,
@@ -160,7 +161,7 @@ _LOCK_ATTEMPTS = 20
 @click.option(
     "--last",
     is_flag=True,
-    help="Label the most recent selection (optionally filtered by --server/--tool).",
+    help="Label the most recent labellable selection (see --server/--tool).",
 )
 @click.option("--server", help="With --last: only consider selections from this upstream.")
 @click.option("--tool", help="With --last: only consider this prefixed tool name.")
@@ -207,8 +208,10 @@ def feedback_command(
     records are never edited, and this command never rotates the log.
 
     Pass exactly one selector. --selection-id names the row and never prompts.
-    --last resolves the most recent selection in append order, narrowed by
-    --server / --tool, prints which selection it resolved to, and asks for
+    --last resolves the most recent LABELLABLE selection in append order,
+    narrowed by --server / --tool — a row offline replay would discard is
+    skipped rather than chosen, so the answer can be older than the newest
+    line in the log — prints which selection it resolved to, and asks for
     confirmation before writing. That echo is part of the human surface: under
     --json the target is reported only in the result document, after the
     write, so a scripted --last must pass --yes and check what came back. Because that check is all that stands behind
@@ -310,13 +313,20 @@ def feedback_command(
                 "log_busy",
                 "the selection log's rotation lock is held; nothing was written — re-run",
             )
-        record, defect = resolve_selection(
-            telemetry_path,
-            selection_id=selection_id,
-            server=server,
-            tool=tool,
-            include_rotated=include_rotated,
-        )
+        try:
+            record, defect = resolve_selection(
+                telemetry_path,
+                selection_id=selection_id,
+                server=server,
+                tool=tool,
+                include_rotated=include_rotated,
+            )
+        except SelectionLogUnreadable as exc:
+            # The preflight above proves each segment can be OPENED; a read
+            # that fails afterwards would otherwise be skipped, and skipping
+            # the newest segment silently promotes an older row to "most
+            # recent" — a label on a selection the operator never chose.
+            _feedback_failure(as_json, "log_unreadable", str(exc))
     # Resolve before writing: an id that matches nothing would append a label
     # that joins to no selection — silently useless to every reader, and
     # indistinguishable from a selection whose own record was dropped by the
@@ -391,9 +401,23 @@ def feedback_command(
                 "log_busy",
                 "the selection log's rotation lock is held; nothing was written — re-run",
             )
-        verified, _ = resolve_selection(
-            telemetry_path, selection_id=resolved_id, include_rotated=include_rotated
-        )
+        try:
+            verified, verify_defect = resolve_selection(
+                telemetry_path, selection_id=resolved_id, include_rotated=include_rotated
+            )
+        except SelectionLogUnreadable as exc:
+            _feedback_failure(as_json, "log_unreadable", str(exc))
+        if verified is None and verify_defect is not None:
+            # Present but no longer labellable — a conflicting copy landing in
+            # the confirmation window is the reachable case. That is the row
+            # changing under the operator, not the log rotating out from under
+            # it, and the two send them to different places.
+            _feedback_failure(
+                as_json,
+                "selection_changed",
+                f"selection {resolved_id} changed between confirmation and append "
+                f"({verify_defect}); nothing was written — re-run to see the current record",
+            )
         if verified is None:
             _feedback_failure(
                 as_json,

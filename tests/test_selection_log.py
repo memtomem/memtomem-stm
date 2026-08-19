@@ -1340,6 +1340,58 @@ class TestResolverAgreesWithReplay:
         assert quality["conflicting_records"] == 1
         assert quality["status"] == "invalid"
 
+    def test_numerically_equal_copies_are_one_record_not_a_conflict(self, tmp_path):
+        """``1`` and ``1.0`` are one value to the reader, so they must be one
+        record here. Comparing serialized forms would call these a conflict and
+        refuse a selection replay is perfectly happy to load."""
+        from memtomem_stm.proxy import selection_eval
+
+        log_path = tmp_path / "log.jsonl"
+        _write_lines(
+            log_path,
+            [
+                _sel(selection_id="dup", candidate_count=1, graph_generation=0.0),
+                _sel(selection_id="dup", candidate_count=1.0, graph_generation=-0.0),
+            ],
+        )
+        result = _run_feedback(
+            tmp_path, log_path, "--selection-id", "dup", "--user-corrected", "--json"
+        )
+        assert result.exit_code == 0, result.output
+
+        records, quality = selection_eval._read_telemetry(log_path, include_rotated=False)
+        selection_eval._observed_telemetry(records, quality)
+        assert quality["conflicting_records"] == 0 and quality["duplicate_records"] == 1
+
+    def test_a_third_copy_does_not_resurrect_a_conflicting_id(self, tmp_path):
+        """A/B/A: the third copy is one more claim about a contradictory
+        history, not a casting vote. Both the resolver and replay must keep the
+        id poisoned — otherwise the label lands on a selection replay counts as
+        conflicting."""
+        from memtomem_stm.proxy import selection_eval
+
+        first = _sel(selection_id="dup", ranker_version=RANKER_VERSION)
+        second = _sel(selection_id="dup", ranker_version="v1-bm25-tool-relevance")
+        log_path = tmp_path / "log.jsonl"
+        # Split across a rotated backup and the active file, since that is
+        # where the two readers could most easily part company.
+        _write_lines(tmp_path / "log.jsonl.1", [dict(first), dict(second)])
+        _write_lines(log_path, [dict(first)])
+
+        result = _run_feedback(
+            tmp_path, log_path, "--selection-id", "dup", "--user-corrected", "--json"
+        )
+        assert result.exit_code == 1
+        assert json.loads(result.output)["error"] == "unusable_record"
+        assert _feedback_records(log_path) == []
+
+        records, quality = selection_eval._read_telemetry(log_path, include_rotated=True)
+        selection_eval._observed_telemetry(records, quality)
+        assert quality["status"] == "invalid"
+        # Two conflicts, not one: the third copy is counted rather than
+        # reinstating the selection an earlier disagreement removed.
+        assert quality["conflicting_records"] == 2
+
     def test_last_falls_through_a_conflicting_selection(self, tmp_path):
         """A conflicting id is not a labellable target, so ``--last`` resolves
         to the newest one that is — with the control that the same layout
@@ -1422,6 +1474,45 @@ class TestTailProbeFailsClosed:
         # swallow it.
         assert parsed[-1] is not None
         assert parsed[-1]["event"] == "feedback"
+
+
+class TestUnreadableSegmentIsNotAnAbsentOne:
+    """"I could not look there" is not "no such selection".
+
+    The command opens every segment before resolving, but a read that fails
+    AFTER that preflight would silently drop a whole segment — and dropping the
+    newest one promotes an older row to "most recent", which is a label on a
+    selection the operator never chose.
+    """
+
+    def test_a_segment_that_fails_to_read_refuses_rather_than_resolving_older(
+        self, tmp_path, monkeypatch
+    ):
+        log_path = tmp_path / "log.jsonl"
+        _write_lines(tmp_path / "log.jsonl.1", [_sel(selection_id="older")])
+        _write_lines(log_path, [_sel(selection_id="newest")])
+
+        real_read_bytes = Path.read_bytes
+
+        def failing_read_bytes(self):
+            if self == log_path:
+                raise OSError(5, "I/O error")
+            return real_read_bytes(self)
+
+        monkeypatch.setattr(Path, "read_bytes", failing_read_bytes)
+        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
+        monkeypatch.undo()
+
+        payload = json.loads(result.output)
+        assert result.exit_code == 1
+        assert payload["error"] == "log_unreadable"
+        assert "log.jsonl" in payload["message"]
+        assert _feedback_records(log_path) == []
+
+        # Control: the same two segments, readable, resolve to the newest —
+        # so the refusal above is the read failure and not the layout.
+        assert _run_feedback(tmp_path, log_path, "--last", "--user-corrected").exit_code == 0
+        assert [record["selection_id"] for record in _feedback_records(log_path)] == ["newest"]
 
 
 class TestCleanupFailuresDoNotOverruleACompleteWrite:
@@ -2031,10 +2122,42 @@ class TestSelectionFeedbackRobustness:
     def test_a_row_that_changes_under_the_confirmation_is_refused(self, tmp_path, monkeypatch):
         """Still present is not the same as still the row that was agreed to.
 
-        A copy of the id can land while the operator reads the prompt, and the
-        label would then carry the cohort and trace of a record they never
-        saw. The verify pass compares identity, not mere existence.
+        A copy of the id can be APPENDED while the operator reads the prompt —
+        by a replay ingest, or a second hand — and the two then disagree, which
+        is exactly what replay refuses to load. The verify pass must catch that
+        rather than seeing "the id is still there" and writing.
         """
+        log_path = tmp_path / "log.jsonl"
+        _write_lines(log_path, [_sel(selection_id="a", ranker_version=RANKER_VERSION)])
+        real_resolve = selection_log_module.resolve_selection
+        state = {"appended": False}
+
+        def append_then_resolve(*args, **kwargs):
+            if kwargs.get("selection_id") and not state["appended"]:
+                state["appended"] = True
+                with log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(
+                        json.dumps(_sel(selection_id="a", ranker_version="v1-bm25-tool-relevance"))
+                        + "\n"
+                    )
+            return real_resolve(*args, **kwargs)
+
+        def must_not_write(log, **fields):  # pragma: no cover - asserts absence
+            raise AssertionError("wrote a label for a record the operator never saw")
+
+        monkeypatch.setattr(selection_cmd, "resolve_selection", append_then_resolve)
+        monkeypatch.setattr(selection_cmd, "_write_label", must_not_write)
+        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
+        payload = json.loads(result.output)
+        assert result.exit_code == 1
+        assert payload["error"] == "selection_changed"
+        assert "disagree" in payload["message"]
+        assert _feedback_records(log_path) == []
+
+    def test_a_row_replaced_under_the_confirmation_is_refused(self, tmp_path, monkeypatch):
+        """The other shape: the id survives but its content is different — no
+        conflict for replay to see, and the label would carry a cohort and
+        trace the operator was never shown."""
         log_path = tmp_path / "log.jsonl"
         _write_lines(log_path, [_sel(selection_id="a", ranker_version=RANKER_VERSION)])
         real_resolve = selection_log_module.resolve_selection
@@ -2043,11 +2166,8 @@ class TestSelectionFeedbackRobustness:
         def swap_then_resolve(*args, **kwargs):
             if kwargs.get("selection_id") and not state["swapped"]:
                 state["swapped"] = True
-                # The same id, a different cohort: the operator confirmed the
-                # first, and replay would fold neither in its favour.
                 _write_lines(
-                    log_path,
-                    [_sel(selection_id="a", ranker_version="v1-bm25-tool-relevance")],
+                    log_path, [_sel(selection_id="a", ranker_version="v1-bm25-tool-relevance")]
                 )
             return real_resolve(*args, **kwargs)
 

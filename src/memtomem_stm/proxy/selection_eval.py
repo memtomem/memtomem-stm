@@ -30,6 +30,7 @@ from memtomem_stm.proxy.selection_log import (
     MAX_LINE_BYTES,
     SCHEMA_VERSION,
     discover_log_files,
+    records_conflict,
 )
 from memtomem_stm.proxy.tool_eligibility import ExposureCandidate, filter_tools
 from memtomem_stm.utils import json_out
@@ -610,6 +611,7 @@ def _observed_telemetry(records: list[dict[str, Any]], quality: dict[str, Any]) 
     executions: dict[str, dict[str, Any]] = {}
     feedback: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
     duplicate_bytes = conflicting = 0
+    poisoned: set[tuple[str, str]] = set()
     events: Counter[str] = Counter()
     for record in records:
         event = str(record["event"])
@@ -623,16 +625,23 @@ def _observed_telemetry(records: list[dict[str, Any]], quality: dict[str, Any]) 
             feedback[sid].append(record)
             continue
         bucket = selections if event == "selection" else executions
+        if (event, sid) in poisoned:
+            # Once two copies disagreed the id is unusable, and a THIRD copy
+            # does not settle the vote — it is one more claim about a record
+            # whose history is already contradictory. Tracked monotonically so
+            # a later copy cannot resurrect the selection, which is also what
+            # `mms selection feedback` refuses to label (`records_conflict`).
+            conflicting += 1
+            continue
         existing = bucket.get(sid)
         if existing is None:
             bucket[sid] = record
             continue
-        left = {k: v for k, v in existing.items() if k != "_order"}
-        right = {k: v for k, v in record.items() if k != "_order"}
-        if left == right:
+        if not records_conflict(existing, record):
             duplicate_bytes += 1
         else:
             conflicting += 1
+            poisoned.add((event, sid))
             bucket.pop(sid, None)
     if conflicting:
         quality["status"] = "invalid"

@@ -56,7 +56,10 @@ changes inline only. See the deprecation policy in
   and marks the run invalid — so the two cannot disagree about which selections
   exist. The target is re-verified by identity, not mere presence, after the
   confirmation: a copy landing in that window exits 1 (`selection_changed`)
-  rather than labelling a record the operator never saw. An append that finds
+  rather than labelling a record the operator never saw. A segment that cannot
+  be *read* — not merely opened — refuses (`log_unreadable`) instead of being
+  skipped, since skipping the newest one would promote an older row to "most
+  recent". An append that finds
   an unterminated last line now writes its own leading newline, so a crash
   mid-record cannot fuse the next record onto the fragment and have it reported
   as written. `--last` refuses without `--yes` when *either* stream is not a
@@ -78,6 +81,17 @@ changes inline only. See the deprecation policy in
   enumerated, so a future request-path emitter fails CI until the ADR is
   rewritten — including one that routes through the labelling command's own
   append helper rather than naming the emitter.
+
+- **`mms selection replay` keeps a conflicting `selection_id` out for good**
+  (#853). Two copies of one id that disagree removed the selection and marked
+  the run invalid, but a *third* copy found an empty slot and reinstated it —
+  so a contradictory history could still be counted as one selection, with
+  whichever copy happened to arrive last standing for it. The id is now
+  poisoned monotonically, and every further copy is counted as a conflict.
+  `mms selection feedback` refuses to label the same ids, through the one
+  shared duplicate test (`records_conflict`) rather than a second opinion about
+  what a duplicate is — which also means numerically equal copies (`1` and
+  `1.0`) are one record to both, as they are in JSON.
 
 - **A proxy environment that was ignored entirely no longer reads as an unset
   one** (#853). `collect_proxy_env_overrides` drops a bare

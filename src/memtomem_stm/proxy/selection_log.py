@@ -81,7 +81,7 @@ import sys
 import threading
 import time
 import uuid
-from collections import Counter
+from collections import Counter, deque
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -780,6 +780,101 @@ def selection_defect(record: dict[str, Any]) -> str | None:
     return None
 
 
+class SelectionLogUnreadable(OSError):
+    """A segment of the log could not be read while resolving.
+
+    Raised rather than skipped: "I could not look there" is not "no such
+    selection", and the difference decides whether an operator's label lands on
+    the row they meant. Read-side reporting (``aggregate_selection_log``)
+    stays tolerant — it summarizes what it could read — but a resolve that
+    feeds a WRITE cannot, because a missed segment silently promotes an older
+    row to "most recent".
+    """
+
+
+# Replay stamps this on every record it loads to order them; it is not part of
+# the record and never participates in comparing two copies.
+_ORDER_KEY = "_order"
+
+
+def records_conflict(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """Whether two copies of one ``selection_id`` are the SAME record.
+
+    The one definition, shared with ``selection_eval._observed_telemetry``, so
+    the labelling command and the reader it writes for cannot disagree about
+    what a duplicate is. Equality is over the parsed records — ``1`` and
+    ``1.0`` are one value in JSON as they are in Python — which a comparison of
+    serialized forms would get wrong in exactly the cases nobody looks at.
+    """
+    return {k: v for k, v in left.items() if k != _ORDER_KEY} != {
+        k: v for k, v in right.items() if k != _ORDER_KEY
+    }
+
+
+# How far ``--last`` will fall through conflicting candidates before giving
+# up. Fallthrough exists for the rare hand-edited or double-ingested id; a log
+# where dozens of the most recent selections are all poisoned is a broken log,
+# and scanning it to the end would cost one full pass per candidate.
+_MAX_FALLTHROUGH = 64
+
+_CONFLICT_REASON = (
+    "copies of this selection_id disagree; offline replay drops the selection "
+    "and marks the run invalid"
+)
+
+
+def _iter_selection_records(path: Path, *, include_rotated: bool) -> Iterator[dict[str, Any]]:
+    """Yield every ``selection`` record of the log, in append order.
+
+    What counts as a record is what the replay harness counts, because the
+    label is written FOR that reader (``selection_eval._read_telemetry``):
+    lines parsed from raw bytes, so an encoding the two would read differently
+    is skipped by both; lines over :data:`MAX_LINE_BYTES` dropped; and the
+    active file's unterminated tail — a record still being written — ignored.
+
+    Raises :class:`SelectionLogUnreadable` for a segment it cannot read.
+    """
+    for log_path in discover_log_files(path, include_rotated=include_rotated):
+        try:
+            data = log_path.read_bytes()
+        except OSError as exc:
+            raise SelectionLogUnreadable(f"cannot read log segment {log_path.name}: {exc}") from exc
+        lines = data.splitlines()
+        if lines and log_path == path and not data.endswith(b"\n"):
+            lines = lines[:-1]
+        for raw_line in lines:
+            if not raw_line.strip():
+                continue
+            if len(raw_line) > MAX_LINE_BYTES:
+                continue
+            try:
+                record = json.loads(raw_line)
+            except (ValueError, TypeError, UnicodeDecodeError):
+                continue
+            if isinstance(record, dict) and record.get("event") == "selection":
+                yield record
+
+
+def _first_copy(
+    path: Path, selection_id: str, *, include_rotated: bool
+) -> tuple[dict[str, Any] | None, bool]:
+    """``(the record replay keeps for this id, whether its copies conflict)``.
+
+    Replay keeps the FIRST copy of a repeated id and discards the selection
+    outright once two copies disagree, so this returns the first and reports
+    the disagreement. One record held at a time, whatever the log's size.
+    """
+    kept: dict[str, Any] | None = None
+    for record in _iter_selection_records(path, include_rotated=include_rotated):
+        if record.get("selection_id") != selection_id:
+            continue
+        if kept is None:
+            kept = record
+        elif records_conflict(kept, record):
+            return kept, True
+    return kept, False
+
+
 def resolve_selection(
     path: Path | str,
     *,
@@ -795,117 +890,61 @@ def resolve_selection(
     the row rather than "not found" about one an operator can plainly see.
 
     With *selection_id*, resolves that exact row. Otherwise the most recent
-    selection matching the optional *server* / *tool* filters, where "most
-    recent" is **append order** (see :func:`discover_log_files`) rather than
-    the ``ts`` field: ``ts`` is wall clock and a clock step backwards would
-    reorder history, while append order is what actually happened. Defective
-    rows are skipped by that search — an inferred target that cannot be
-    labelled is not the most recent labellable selection.
+    **labellable** selection matching the optional *server* / *tool* filters,
+    where "most recent" is **append order** (see :func:`discover_log_files`)
+    rather than the ``ts`` field: ``ts`` is wall clock and a clock step
+    backwards would reorder history, while append order is what actually
+    happened. A row that cannot carry a label is not the answer to "the most
+    recent one I can label", so the search falls through it — up to
+    :data:`_MAX_FALLTHROUGH` of them — and ``--last`` prints what it resolved
+    so the operator sees which row that was.
 
-    Malformed lines are skipped, not raised on — the same posture as
-    :func:`aggregate_selection_log`, because a hand-edited or half-written log
-    must not make labelling impossible.
+    Duplicates follow replay's policy, via the shared :func:`records_conflict`:
+    byte-equal copies of one ``selection_id`` are one record and the first is
+    kept, while copies that DISAGREE poison the id — replay discards that
+    selection and marks the run invalid, so a label on it would join nothing.
 
-    What counts as a record here is what the replay harness counts, because
-    the label is written FOR that reader (``selection_eval._read_telemetry``
-    and ``_observed_telemetry``): lines parsed from raw bytes, so an encoding
-    the two would read differently is skipped by both; lines over
-    :data:`MAX_LINE_BYTES` dropped; the active file's unterminated tail — a
-    record still being written — ignored; identical duplicates of one
-    ``selection_id`` folded to the first; and a ``selection_id`` whose copies
-    DISAGREE refused outright, because replay drops that selection entirely
-    and marks the run invalid. A selection the two disagree about is one whose
-    label joins nothing.
+    Malformed lines are skipped, not raised on, because a hand-edited or
+    half-written log must not make labelling impossible. A segment that cannot
+    be READ is different and raises :class:`SelectionLogUnreadable`: skipping
+    it would silently promote an older row to "most recent".
 
     *tool* matches ``selected_tool``, the prefixed name the client called, so
     it uses the same vocabulary an operator reads out of a report.
     """
     path = Path(path).expanduser()
-    # ``selection_id`` -> canonical bytes of the first copy seen, so a repeat
-    # can be classified without holding every record. Conflicts are tracked
-    # for EVERY id, not just matching ones: a copy that fails the --server
-    # filter still conflicts, and replay drops the selection for it.
-    first_seen: dict[str, str] = {}
-    conflicting: set[str] = set()
-    matches: list[dict[str, Any]] = []
-    for log_path in discover_log_files(path, include_rotated=include_rotated):
-        try:
-            data = log_path.read_bytes()
-        except OSError:
-            # An unreadable segment is skipped rather than fatal — the active
-            # file is usually the one being labelled, and a stale backup whose
-            # permissions changed must not block that.
+    if selection_id is not None:
+        kept, conflicts = _first_copy(path, selection_id, include_rotated=include_rotated)
+        if kept is None:
+            return None, None
+        if conflicts:
+            return None, _CONFLICT_REASON
+        defect = selection_defect(kept)
+        return (None, defect) if defect is not None else (kept, None)
+
+    # Only the newest few candidates can be the answer, so the scan holds that
+    # many rather than every match in a log that can reach tens of millions of
+    # records.
+    candidates: deque[dict[str, Any]] = deque(maxlen=_MAX_FALLTHROUGH)
+    for record in _iter_selection_records(path, include_rotated=include_rotated):
+        if server is not None and record.get("server") != server:
             continue
-        lines = data.splitlines()
-        if lines and log_path == path and not data.endswith(b"\n"):
-            # The active file's unterminated tail is a half-written record:
-            # the writer appends line-at-a-time, so a trailing fragment is one
-            # that has not landed. Replay drops it for the same reason, and a
-            # label on a selection replay never loads joins nothing.
-            lines = lines[:-1]
-        for raw_line in lines:
-            if not raw_line.strip():
-                continue
-            if len(raw_line) > MAX_LINE_BYTES:
-                continue
-            try:
-                # Parsed from the bytes, exactly as replay parses them: a str
-                # decoded here first would disagree with it about a BOM, and
-                # would need its own strictness argument. ``json`` decodes
-                # UTF-8 strictly, so a record truncated mid-character raises
-                # rather than being repaired into a different string.
-                record = json.loads(raw_line)
-            except (ValueError, TypeError, UnicodeDecodeError):
-                continue
-            if not isinstance(record, dict) or record.get("event") != "selection":
-                continue
-            record_id = record.get("selection_id")
-            if isinstance(record_id, str) and record_id:
-                canonical = json_out.dumps(record, sort_keys=True, ensure_ascii=False, default=str)
-                previous = first_seen.get(record_id)
-                if previous is None:
-                    first_seen[record_id] = canonical
-                elif previous != canonical:
-                    conflicting.add(record_id)
-                    continue
-                else:
-                    # A byte-identical repeat: replay counts it and keeps the
-                    # first, so there is nothing new to match on.
-                    continue
-            if selection_id is not None:
-                if record_id == selection_id:
-                    matches.append(record)
-                continue
-            if server is not None and record.get("server") != server:
-                continue
-            if tool is not None and record.get("selected_tool") != tool:
-                continue
-            if selection_defect(record) is not None:
-                continue
-            matches.append(record)
-    # Newest first, so a conflicting or defective candidate falls through to
-    # the next-most-recent one rather than failing the whole resolve.
-    for record in reversed(matches):
-        record_id = record.get("selection_id")
-        if isinstance(record_id, str) and record_id in conflicting:
-            if selection_id is not None:
-                return None, (
-                    "copies of this selection_id disagree; offline replay drops the "
-                    "selection and marks the run invalid"
-                )
+        if tool is not None and record.get("selected_tool") != tool:
             continue
-        defect = selection_defect(record)
-        if defect is not None:
-            if selection_id is not None:
-                return None, defect
+        if selection_defect(record) is not None:
             continue
-        return record, None
-    if selection_id is not None and selection_id in conflicting:
-        # Every copy was consumed as a conflict, so ``matches`` never saw one.
-        return None, (
-            "copies of this selection_id disagree; offline replay drops the "
-            "selection and marks the run invalid"
-        )
+        candidates.append(record)
+    for record in reversed(candidates):
+        candidate_id = record.get("selection_id")
+        if not isinstance(candidate_id, str) or not candidate_id:  # pragma: no cover - screened
+            continue
+        # Checked per candidate rather than by tracking every id seen: the
+        # conflict is a property of one id, and a whole-log map of them is the
+        # memory this scan is bounded to avoid.
+        kept, conflicts = _first_copy(path, candidate_id, include_rotated=include_rotated)
+        if conflicts or kept is None:
+            continue
+        return kept, None
     return None, None
 
 
@@ -921,7 +960,9 @@ def find_selection(
 
     Thin wrapper for readers that only need the row; a caller about to WRITE
     wants the defect string too, since "no such selection" and "that selection
-    cannot carry a label" send an operator to different places.
+    cannot carry a label" send an operator to different places — and wants the
+    :class:`SelectionLogUnreadable` this one lets through, since a segment it
+    could not read is not a segment without a match.
     """
     return resolve_selection(
         path,

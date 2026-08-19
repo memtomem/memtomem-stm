@@ -701,10 +701,12 @@ by id; it never edits or rewrites existing records, and never rotates the log
 Pass exactly one selector. `--selection-id` names the row — `selection_id` is
 not printed by any reporting command (`mms selection replay` emits aggregates
 only, never per-call identifiers), so it is read out of the JSONL itself.
-`--last` resolves the most recent selection in append order, narrowed by
-`--server` / `--tool`, prints which selection it resolved to, and asks for
-confirmation before writing, so the inference is checked by the person making
-the judgement. That echo is the human surface: under `--json` the resolved
+`--last` resolves the most recent **labellable** selection in append order,
+narrowed by `--server` / `--tool` — a row the command would refuse by id (see
+`unusable_record` below) is skipped rather than chosen, so the answer can be
+older than the newest line in the log — prints which selection it resolved to,
+and asks for confirmation before writing, so both the inference and that
+fallthrough are checked by the person making the judgement. That echo is the human surface: under `--json` the resolved
 target appears only in the result document, after the write, so a scripted
 `--last` passes `--yes` and reads back what it got. Because that check is the only thing standing behind an
 inferred target, a non-interactive `--last` (a pipe, CI, or `--json`) is
@@ -739,8 +741,8 @@ exit 1 and emit `{"action": "selection-feedback", "ok": false, "error":
 | `selection_changed` | the selection is still there but is no longer the record that was confirmed — a copy carrying a different `ranker_version` / `trace_id` / server / tool landed during the confirmation. Refused rather than reconciled: which of the two the judgement was about is not something the command can decide |
 | `log_busy` | the rotation lock is held (by a rotating writer or another labelling run) and could not be taken; nothing was written — re-run |
 | `lock_failed` | the rotation lock file beside the log could not be created (e.g. a writable log in a directory this user cannot write); nothing was written |
-| `log_unreadable` | the log directory could not be listed, or a segment could not be opened — reported instead of `no_match`, since "I could not look there" is not "no such selection" |
-| `config_invalid` | the configured log path is unknown, by either route: the config file exists but does not parse, or there is no file and the `MEMTOMEM_STM_PROXY__*` overlay the operator did set fails to validate. Both refuse rather than labelling whichever log the defaults name |
+| `log_unreadable` | the log directory could not be listed, or a segment could not be opened or read — reported instead of `no_match`, since "I could not look there" is not "no such selection", and a segment silently skipped would promote an older row to "most recent" |
+| `config_invalid` | the configured log path is unknown, by any of three routes: the config file exists but does not parse; there is no file and the `MEMTOMEM_STM_PROXY__*` overlay the operator did set fails to validate; or a bare `MEMTOMEM_STM_PROXY` was dropped entirely because it is not valid JSON or does not decode to an object — that last one is reported with a config file present too, since the file then decides a path the environment was meant to override. All refuse rather than labelling whichever log is left over |
 | `confirmation_required` | `--last` used non-interactively (or with `--json`) without `--yes`; exit 2, matching the CLI-wide rule that a formatting flag must not authorize a write |
 | `write_failed` / `write_redacted` | no label record was written — the sink swallows write faults so a telemetry problem cannot break a proxied call, so the command checks the append outcome instead of assuming it. A write that landed short leaves an unparseable fragment behind (rolling it back would mean rewinding a file the proxy appends to concurrently); readers count it as one malformed line and it joins nothing |
 | `write_unconfirmed` | the label's bytes reached the log but the flush proving they survive a crash did not complete. Neither "written" nor "not written" is available, so the command says so; re-running with the same flags is safe, since repeating a label for one selection is the accumulate-and-supersede case above |
