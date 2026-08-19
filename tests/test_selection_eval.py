@@ -165,6 +165,51 @@ def test_bad_schema_marks_report_invalid(tmp_path: Path) -> None:
     assert report["data_quality"]["unsupported_schema_records"] == 1
 
 
+def _malformed_plus_good(malformed: dict) -> list[dict]:
+    """The bad row plus a well-formed pair, to pin that the scan continues (#854)."""
+    return [malformed, _execution(), _selection("sel-2"), _execution("sel-2")]
+
+
+@pytest.mark.parametrize(
+    ("bad_rank", "case"),
+    [("first", "non-numeric"), (None, "missing"), (True, "bool")],
+)
+def test_admitted_record_with_non_integer_rank_is_counted_not_raised(
+    tmp_path: Path, bad_rank: object, case: str
+) -> None:
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    selection["candidate_features"]["ranked_candidates"][0]["rank"] = bad_rank
+    _write_jsonl(log, _malformed_plus_good(selection))
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["status"] == "invalid", case
+    assert report["data_quality"]["invariant_violations"] == 1
+    # The bad row still ranks, but contributes no selected rank; sel-2 does.
+    assert report["production"]["coverage"]["rankable_selections"] == 2
+    assert report["production"]["coverage"]["selected_rank_known"] == 1
+    assert report["production"]["coverage"]["paired_selections"] == 2
+
+
+def test_admitted_record_with_unhashable_candidate_tools_is_counted_not_raised(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    # Both real tools stay listed so the only violation is the non-str element.
+    selection["candidate_tools"] = ["demo__search", "demo__write", {"nested": 1}]
+    selection["candidate_count"] = 3
+    _write_jsonl(log, _malformed_plus_good(selection))
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["status"] == "invalid"
+    assert report["data_quality"]["invariant_violations"] == 1
+    assert report["production"]["coverage"]["rankable_selections"] == 2
+    assert report["production"]["coverage"]["paired_selections"] == 2
+
+
 def test_unknown_future_ranker_skips_v1_score_parity(tmp_path: Path) -> None:
     log = tmp_path / "selection.jsonl"
     selection = _selection()
