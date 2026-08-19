@@ -402,7 +402,7 @@ class SelectionTelemetryLog:
         """
         # The ``.encode`` below sits outside this method's write-failure
         # handling, so an unencodable record would raise past the caller's
-        # "nothing reached disk" contract rather than returning False (#757).
+        # "nothing reached disk" contract rather than returning APPEND_FAILED (#757).
         line = json_out.dumps(record, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
         # Structural redaction means no payload text should ever be here;
         # this screen is the storage-gating backstop (full DEFAULT_PATTERNS

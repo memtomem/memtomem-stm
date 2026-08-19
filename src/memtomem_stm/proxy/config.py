@@ -2031,6 +2031,16 @@ class ConfigLoadResult:
     config: ProxyConfig | None
     error: str | None
     unknown_keys: tuple[str, ...] = ()
+    env_error: str | None = None
+    """Set when there is no config FILE and the env-only overlay failed to
+    validate, so ``config`` is a defaults rebuild that matches neither the
+    environment nor any file.
+
+    Separate from ``error`` because the two call for different handling: a
+    running server tolerates this and starts on defaults (the historical
+    behavior ``error`` drives), while a command that WRITES somewhere the
+    config names must not act on a path the operator did not choose.
+    """
 
 
 class ProxyConfig(BaseModel):
@@ -2253,6 +2263,13 @@ class ProxyConfig(BaseModel):
                         "Env-only proxy config failed validation: %s%s — using defaults",
                         exc,
                         _env_override_hint(exc, overlay),
+                    )
+                    # Reported, not raised: the defaults rebuild stays the
+                    # result so every existing caller behaves as before, while
+                    # a caller that cannot safely accept "some other config"
+                    # can see that this one is not the operator's.
+                    return ConfigLoadResult(
+                        config=ProxyConfig(), error=None, env_error=_sanitized_load_error(exc)
                     )
             return ConfigLoadResult(config=ProxyConfig(), error=None)
         # Warn if config is group/world-readable (may contain API keys)

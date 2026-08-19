@@ -727,7 +727,7 @@ exit 1 and emit `{"action": "selection-feedback", "ok": false, "error":
 
 | code | meaning |
 | --- | --- |
-| `no_log` | no readable log segment at the resolved path — the active file *and* every rotated backup are absent |
+| `no_log` | no log segment exists in the selected scope — with `--active-only` that is the active file alone, otherwise the active file and every rotated backup |
 | `not_found` / `no_match` | the selector resolved to nothing, checked *before* writing, so a typo never appends a label that joins to no selection |
 | `malformed_record` | the matched record carries no `selection_id` (reachable only on a hand-edited log) |
 | `log_rotated` | the resolved selection left the log between resolution and append; nothing was written |

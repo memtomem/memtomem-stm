@@ -1156,6 +1156,33 @@ class TestSelectionFeedbackCommand:
         )
 
 
+def _short_write_on(log_path: Path, *, first_only: bool = True, drop_only_newline: bool = False):
+    """An ``os.write`` stand-in that shortens writes to the LOG file only.
+
+    Narrowed by inode rather than patched blanket, because ``open_lock_fd``
+    writes one byte to the lock sidecar on Windows: a global patch would
+    shorten THAT instead, and the test would exercise lock failure while
+    claiming to cover short writes.
+    """
+    real_write = os.write
+    state = {"n": 0}
+    log_inode = log_path.stat().st_ino
+
+    def patched(fd, data):
+        try:
+            is_log = os.fstat(fd).st_ino == log_inode
+        except OSError:  # pragma: no cover - defensive
+            is_log = False
+        if not is_log:
+            return real_write(fd, data)
+        state["n"] += 1
+        if first_only and state["n"] != 1:
+            return real_write(fd, data)
+        return real_write(fd, data[:-1] if drop_only_newline else data[: len(data) // 2])
+
+    return patched
+
+
 class TestSelectionFeedbackRobustness:
     """The failure modes a first-round review found (codex, PR #853)."""
 
@@ -1509,8 +1536,33 @@ class TestSelectionFeedbackRobustness:
         assert result.exit_code == 1
         assert json.loads(result.output)["error"] == "config_invalid"
 
-    def test_an_unreadable_segment_is_not_reported_as_no_match(self, tmp_path):
-        """ "I could not look there" must not read as "no such selection"."""
+    def test_an_unreadable_segment_is_not_reported_as_no_match(self, tmp_path, monkeypatch):
+        """ "I could not look there" must not read as "no such selection".
+
+        The failure is injected: Windows is a required CI target and its
+        ``chmod`` cannot express "unreadable", so a permissions-based version
+        asserts nothing there. The POSIX companion below keeps this honest.
+        """
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(tmp_path / "log.jsonl.1", rows=[{"server": "gh", "tool": "gh__rot"}])
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        real_open = Path.open
+
+        def refuse_backup(self, *args, **kwargs):
+            if self.name.endswith(".1"):
+                raise PermissionError(13, "Permission denied")
+            return real_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", refuse_backup)
+        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
+        assert result.exit_code == 1
+        assert json.loads(result.output)["error"] == "log_unreadable"
+        assert _feedback_records(log_path) == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file permissions")
+    def test_an_unreadable_segment_is_not_reported_as_no_match_for_real(self, tmp_path):
+        """The same contract against real permissions, so the injected test
+        above cannot drift from what the OS actually does."""
         log_path = tmp_path / "log.jsonl"
         _seed_log(tmp_path / "log.jsonl.1", rows=[{"server": "gh", "tool": "gh__rot"}])
         _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
@@ -1522,22 +1574,6 @@ class TestSelectionFeedbackRobustness:
             backup.chmod(0o644)
         assert result.exit_code == 1
         assert json.loads(result.output)["error"] == "log_unreadable"
-        assert _feedback_records(log_path) == []
-
-    def test_a_short_write_is_not_reported_as_recorded(self, tmp_path, monkeypatch):
-        """``os.write`` may write fewer bytes; the record is then truncated and
-        not on disk, so the status must not say otherwise."""
-        log_path = tmp_path / "log.jsonl"
-        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
-        real_write = os.write
-
-        def short_write(fd, data):
-            return real_write(fd, data[: len(data) // 2])
-
-        monkeypatch.setattr(selection_log_module.os, "write", short_write)
-        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
-        assert result.exit_code == 1
-        assert json.loads(result.output)["error"] == "write_failed"
 
     def test_a_repaired_newline_only_short_write_is_a_success(self, tmp_path, monkeypatch):
         """When the ONLY missing byte was the newline, the repair restores the
@@ -1547,16 +1583,9 @@ class TestSelectionFeedbackRobustness:
         log_path = tmp_path / "log.jsonl"
         log = SelectionTelemetryLog(log_path)
         log.initialize()
-        real_write = os.write
-        calls = {"n": 0}
-
-        def drop_final_newline(fd, data):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return real_write(fd, data[:-1])
-            return real_write(fd, data)
-
-        monkeypatch.setattr(selection_log_module.os, "write", drop_final_newline)
+        monkeypatch.setattr(
+            selection_log_module.os, "write", _short_write_on(log_path, drop_only_newline=True)
+        )
         assert log.log_feedback(selection_id="a", user_corrected=True) == "written"
         monkeypatch.undo()
 
@@ -1575,16 +1604,7 @@ class TestSelectionFeedbackRobustness:
         log_path = tmp_path / "log.jsonl"
         log = SelectionTelemetryLog(log_path)
         log.initialize()
-        real_write = os.write
-        calls = {"n": 0}
-
-        def short_first(fd, data):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return real_write(fd, data[: len(data) // 2])
-            return real_write(fd, data)
-
-        monkeypatch.setattr(selection_log_module.os, "write", short_first)
+        monkeypatch.setattr(selection_log_module.os, "write", _short_write_on(log_path))
         assert log.log_feedback(selection_id="a", user_corrected=True) == "failed"
         assert log.log_feedback(selection_id="b", user_corrected=True) == "written"
         monkeypatch.undo()

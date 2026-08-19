@@ -257,6 +257,15 @@ def feedback_command(
                 "config_invalid",
                 f"cannot read {cfg_path}: {loaded.error}",
             )
+        if loaded.env_error is not None:
+            # Same hazard by the other route: no file, and the environment the
+            # operator DID set failed to validate, so the defaults rebuild
+            # names a log nobody chose.
+            _feedback_failure(
+                as_json,
+                "config_invalid",
+                f"the MEMTOMEM_STM_PROXY environment is invalid: {loaded.env_error}",
+            )
         cfg = loaded.config or ProxyConfig(config_path=cfg_path)
         telemetry_path = cfg.selection_telemetry.path.expanduser()
     # Presence is decided by the whole log, not the active file alone: a crash
