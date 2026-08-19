@@ -464,49 +464,55 @@ def feedback_command(
             operator_override=overridden,
             ranker_version=ranker_version if isinstance(ranker_version, str) else None,
         )
-    # The sink swallows write failures by design — a telemetry fault must never
-    # break a proxied call — but this caller is a person waiting to hear that
-    # their label exists. Reporting success for a record that never reached
-    # disk is worse than the failure itself.
-    if status == APPEND_UNCONFIRMED:
-        # The bytes are complete in the file but the flush proving they survive
-        # a crash did not complete, so neither "written" nor "not written" is a
-        # statement this process can make. Say which it is, and say that a
-        # re-run is safe: repeating the same label for the same selection is
-        # the accumulate-and-supersede case the schema already defines, not a
-        # second, conflicting judgement.
-        _feedback_failure(
-            as_json,
-            f"write_{status}",
-            f"the label reached {telemetry_path} but could not be confirmed durable; "
-            f"check the log, and if it is not there re-run with "
-            f"--selection-id {resolved_id}",
-            extra={"selection_id": resolved_id},
-        )
-    if status != APPEND_WRITTEN:
-        _feedback_failure(
-            as_json,
-            f"write_{status}",
-            f"no label was written to {telemetry_path} (append status: {status})",
-        )
-    result = {
-        "action": "selection-feedback",
-        "ok": True,
-        "selection_id": resolved_id,
-        "trace_id": trace_id if isinstance(trace_id, str) else None,
-        "server": record.get("server"),
-        "selected_tool": record.get("selected_tool"),
-        "user_corrected": corrected,
-        "operator_override": overridden,
-        "log": str(telemetry_path),
-    }
-    if as_json:
-        click.echo(json_out.dumps(result, sort_keys=True, ensure_ascii=False))
-        return
-    click.echo(f"Labelled selection {_disp(resolved_id)}")
-    for field in ("user_corrected", "operator_override"):
-        if result[field] is not None:
-            click.echo(f"  {field}: {str(result[field]).lower()}")
+        # The sink swallows write failures by design — a telemetry fault must
+        # never break a proxied call — but this caller is a person waiting to
+        # hear that their label exists. Reporting success for a record that
+        # never reached disk is worse than the failure itself.
+        #
+        # Both the check and the report stay INSIDE the rotation guard. The
+        # sink's own reachability probe can only describe an instant that has
+        # already passed; the lock is what gives this command a linearization
+        # point, so "written" means the label is in the log as the command
+        # returns, rather than that it was there at some earlier moment.
+        if status == APPEND_UNCONFIRMED:
+            # The bytes are complete in the file but the flush proving they survive
+            # a crash did not complete, so neither "written" nor "not written" is a
+            # statement this process can make. Say which it is, and say that a
+            # re-run is safe: repeating the same label for the same selection is
+            # the accumulate-and-supersede case the schema already defines, not a
+            # second, conflicting judgement.
+            _feedback_failure(
+                as_json,
+                f"write_{status}",
+                f"the label reached {telemetry_path} but could not be confirmed durable; "
+                f"check the log, and if it is not there re-run with "
+                f"--selection-id {resolved_id}",
+                extra={"selection_id": resolved_id},
+            )
+        if status != APPEND_WRITTEN:
+            _feedback_failure(
+                as_json,
+                f"write_{status}",
+                f"no label was written to {telemetry_path} (append status: {status})",
+            )
+        result = {
+            "action": "selection-feedback",
+            "ok": True,
+            "selection_id": resolved_id,
+            "trace_id": trace_id if isinstance(trace_id, str) else None,
+            "server": record.get("server"),
+            "selected_tool": record.get("selected_tool"),
+            "user_corrected": corrected,
+            "operator_override": overridden,
+            "log": str(telemetry_path),
+        }
+        if as_json:
+            click.echo(json_out.dumps(result, sort_keys=True, ensure_ascii=False))
+            return
+        click.echo(f"Labelled selection {_disp(resolved_id)}")
+        for field in ("user_corrected", "operator_override"):
+            if result[field] is not None:
+                click.echo(f"  {field}: {str(result[field]).lower()}")
 
 
 @contextmanager

@@ -92,9 +92,14 @@ changes inline only. See the deprecation policy in
   unlinks that inode outright while every other setting evicts it once
   `max_backups + 1` rotations have shifted it past the last backup slot. The
   append now checks that its descriptor's inode still has a name before
-  reporting success and exits 1 (`write_failed`) if it does not, so the
-  guarantee is uniform across configurations — **a record reported as written
-  is reachable by name** — while the per-record path stays lock-free.
+  reporting success, exiting 1 with `write_failed` when it does not and
+  `write_unconfirmed` when the probe could not run. On the call path that is a
+  detector rather than a guarantee — it describes the instant it ran — and it
+  turns a silent loss into a counted one for the price of one `fstat` and no
+  lock. The labelling command gets the stronger statement instead: its append,
+  its status check and its success report now all happen inside the rotation
+  guard it already took, so a reported success means the label is in the log as
+  the command returns.
   `stm_selection_stats`' `rotated_backups` no longer counts either lock file
   (or any non-numeric sibling) as a backup. The label inherits the labelled selection's
   `ranker_version` and `trace_id`, so it lands in that call's cohort rather

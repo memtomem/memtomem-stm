@@ -1797,10 +1797,12 @@ class TestTailProbeFailsClosed:
 class TestUnreadableSegmentIsNotAnAbsentOne:
     """"I could not look there" is not "no such selection".
 
-    The command opens every segment before resolving, but a read that fails
-    AFTER that preflight would silently drop a whole segment — and dropping the
-    newest one promotes an older row to "most recent", which is a label on a
-    selection the operator never chose.
+    A segment the reader cannot read is refused, not skipped: dropping one
+    silently promotes an older row to "most recent", which is a label on a
+    selection the operator never chose. Enforced by the reader itself — it
+    wraps every read failure, the open included — rather than by a preflight,
+    which could only re-check names a rotation may rename before the guarded
+    read reaches them.
     """
 
     def test_a_segment_that_fails_to_read_refuses_rather_than_resolving_older(
@@ -3025,6 +3027,81 @@ class TestSelectionFeedbackRobustness:
         assert result.exit_code == 1
         assert json.loads(result.output)["error"] == "log_unreadable"
         assert _feedback_records(log_path) == []
+
+    def test_a_reachability_probe_that_cannot_run_is_unconfirmed_not_written(
+        self, tmp_path, monkeypatch
+    ):
+        """"I could not tell" is not "it is there".
+
+        The probe answering an optimistic ``True`` on its own failure would put
+        the overstatement back one level down: the append would report
+        ``written`` on the strength of a check that never ran. ``unconfirmed``
+        already exists to say exactly this, and it is the status that tells the
+        operator a re-run is safe rather than that nothing happened.
+        """
+        log_path = tmp_path / "log.jsonl"
+        log = SelectionTelemetryLog(log_path)
+        log.initialize()
+
+        def refuse(fd):
+            raise OSError(5, "Input/output error")
+
+        monkeypatch.setattr(selection_log_module.os, "fstat", refuse)
+        assert log.log_feedback(selection_id="a", user_corrected=True) == "unconfirmed"
+        monkeypatch.undo()
+
+        # The bytes ARE there — which is why the answer is "unknown", not
+        # "failed": telling the operator nothing was written would invite a
+        # duplicate label for a record that exists.
+        assert [record["selection_id"] for record in _feedback_records(log_path)] == ["a"]
+        assert log.write_errors == 1
+
+    def test_a_reported_success_holds_the_lock_that_makes_it_true(self, tmp_path):
+        """The command's success must not be evictable the instant it is made.
+
+        The sink's own reachability probe can only describe an instant that has
+        already passed, so a rotation landing between the append and the report
+        would let this command print ``ok`` for a label already gone. The
+        rotation lock is what supplies the missing linearization point — but
+        only if it is still held when the claim is made, which is a property of
+        WHERE the guard closes and nothing else.
+
+        Pinned by executing the window: a writer that respects the lock is run
+        at the moment the status is being interpreted, and must not be able to
+        rotate. Then the label is confirmed present by the reader the log
+        actually has.
+        """
+        import click
+
+        from memtomem_stm.cli import selection_cmd as selection_cmd_module
+
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+
+        # A writer that always wants to rotate, and unlinks when it does.
+        rotator = SelectionTelemetryLog(log_path, max_bytes=1, max_backups=0)
+        attempts: list[bool] = []
+        real_echo = click.echo
+
+        def rotate_during_the_report(*args, **kwargs):
+            # Runs while the command is emitting its verdict. If the guard has
+            # already closed, this rotation succeeds and evicts the label.
+            with selection_log_module.rotation_lock(log_path) as acquired:
+                attempts.append(acquired)
+                if acquired:
+                    rotator._rotate_locked()
+            return real_echo(*args, **kwargs)
+
+        with mock.patch.object(selection_cmd_module.click, "echo", rotate_during_the_report):
+            result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
+
+        assert result.exit_code == 0, result.output
+        assert attempts and not any(attempts), (
+            "a rotation was able to take the lock while the command reported success"
+        )
+        assert [record["selection_id"] for record in _feedback_records(log_path)] != [], (
+            "the label the command reported must still be in the log it named"
+        )
 
     def test_the_lock_file_is_not_counted_as_a_rotated_backup(self, tmp_path):
         log_path = tmp_path / "log.jsonl"

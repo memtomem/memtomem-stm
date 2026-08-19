@@ -780,14 +780,22 @@ last backup slot — a rename orphans an append just as thoroughly as an unlink,
 it only takes more of them. The write then succeeds into storage no reader can
 open.
 
-The appender detects this rather than locking against it: after the write it
-checks that the descriptor's inode still has a name (`st_nlink`), and reports
-`write_failed` if it does not. A lock would have to be taken on every append,
-and could not cover the case anyway — the settings that decide whether rotation
-unlinks belong to whichever process is rotating, which may not be this one. So
-the per-record append path stays lock-free, and the guarantee it offers is the
-one that matters to a caller: **a record reported as written is reachable by
-name**. The lock file is not counted as a rotated backup.
+The sink detects this rather than locking against it: after the write it checks
+that the descriptor's inode still has a name (`st_nlink`), reporting
+`write_failed` when it does not and `write_unconfirmed` when the probe itself
+could not run. That is a *detector*, not a guarantee — it describes the instant
+it ran, a rotation landing immediately afterwards can still evict the record,
+and `st_nlink` counts any hard link rather than a name readers scan. What it
+buys is that the common silent loss becomes a counted, reported one, at the cost
+of one `fstat` and no lock, which is the right trade for the call path: those
+records are one sample among many.
+
+`mms selection feedback` needs the stronger statement and pays for it with the
+lock it already holds. Its append, the status check, and the success report all
+happen inside the rotation guard, so no rotation can run between the write and
+the claim about it. For that command — and only for it — a reported success
+means the label is in the log as the command returns. The lock file is not
+counted as a rotated backup.
 
 ## `mms hook` — built-in tool bridge + per-host registration
 

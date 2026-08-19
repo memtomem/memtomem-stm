@@ -179,26 +179,36 @@ def rotation_lock(
 RANKER_VERSION = "v0-passthrough"
 
 
-def _still_reachable(fd: int) -> bool:
-    """Whether anything still NAMES the file this descriptor just wrote to.
+def _still_reachable(fd: int) -> bool | None:
+    """Whether anything still names the file this descriptor wrote to.
+
+    ``True`` reachable, ``False`` orphaned, ``None`` could not be established.
 
     Rotation can destroy the directory entry while an append already holds the
-    inode open, and the append then succeeds into storage no reader can ever
-    open. Two ways in, and the second is why holding a lock for one
-    configuration was not enough: ``max_backups == 0`` unlinks outright, and
-    every other setting evicts the same inode once ``max_backups + 1``
-    rotations have shifted it past the last backup slot — a rename orphans an
-    append just as thoroughly as an unlink, it only takes more of them.
+    inode open, and the append then succeeds into storage no reader can open.
+    Two ways in: ``max_backups == 0`` unlinks outright, and every other setting
+    evicts the same inode once ``max_backups + 1`` rotations have shifted it
+    past the last backup slot — a rename orphans an append just as thoroughly
+    as an unlink, it only takes more of them.
 
-    ``st_nlink == 0`` is exactly that state. Checked after the write rather
-    than prevented before it, because prevention costs a lock on every append
-    while the hazard is a race that a lock for one configuration cannot even
-    cover: the rotator's settings belong to another process.
+    What this is NOT is a guarantee, and the difference matters enough to name.
+    It describes the instant it ran: a rotation landing immediately afterwards
+    can still evict the record, and ``st_nlink`` counts *any* link, so an
+    operator's hard link to the log would report reachable while no reader
+    scans that name. It is a detector that turns the common silent loss into a
+    counted, reported one. A caller that needs the stronger statement — the
+    label emitter — takes the rotation lock across its append and its report,
+    which is what actually excludes a concurrent rotation.
 
-    Windows has no unlink-while-open to detect — an open descriptor blocks the
-    rename, so the rotation fails instead and the question never arises. Any
-    failure to ask answers **True**: a probe that could not run must not
-    manufacture a failure for a write that landed.
+    ``None`` rather than an optimistic ``True`` when the probe itself fails:
+    "I could not tell" is what ``unconfirmed`` exists to say, and answering
+    ``written`` there would be the same overstatement in miniature.
+
+    Windows is exempt: an open descriptor blocks the rename, so rotation fails
+    rather than orphaning the append. That is the documented behaviour of
+    ``os.open`` without ``FILE_SHARE_DELETE`` on local volumes — the same
+    property ``utils.fileio._replace_with_windows_retry`` exists to ride out —
+    and is not claimed for network shares.
     """
     if sys.platform == "win32":  # pragma: no cover - POSIX-only rotation hazard
         return True
@@ -206,7 +216,7 @@ def _still_reachable(fd: int) -> bool:
         return os.fstat(fd).st_nlink > 0
     except OSError:
         logger.debug("Could not probe whether the selection log is still linked", exc_info=True)
-        return True
+        return None
 
 
 def _needs_leading_newline(path: Path) -> bool:
@@ -585,7 +595,8 @@ class SelectionTelemetryLog:
                             len(payload),
                         )
                         return APPEND_FAILED
-                    if not _still_reachable(fd):
+                    reachable = _still_reachable(fd)
+                    if reachable is False:
                         # The bytes are complete, and in an inode a rotation
                         # unlinked while this append held it open — durable,
                         # perhaps, and named by nothing. No reader will ever
@@ -597,12 +608,22 @@ class SelectionTelemetryLog:
                             "rotated away before the write completed"
                         )
                         return APPEND_FAILED
+                    if reachable is None:
+                        # The probe itself failed, so whether a reader can
+                        # reach this record is unknown — not established, and
+                        # therefore not something to report as written.
+                        self.write_errors += 1
+                        logger.warning(
+                            "Selection telemetry write could not be confirmed reachable",
+                        )
+                        return APPEND_UNCONFIRMED
                     # From here the record's bytes are complete in a file that
-                    # still has a name, so nothing below may report ``failed``:
-                    # that would send an operator to write the same label a
-                    # second time on the strength of a claim this process
-                    # cannot make. What can still be unknown is whether the
-                    # bytes SURVIVE, which is what ``unconfirmed`` says.
+                    # still had a name a moment ago, so nothing below may
+                    # report ``failed``: that would send an operator to write
+                    # the same label a second time on the strength of a claim
+                    # this process cannot make. What can still be unknown is
+                    # whether the bytes SURVIVE, which is what ``unconfirmed``
+                    # says.
                     try:
                         if durable:
                             os.fsync(fd)
@@ -685,17 +706,20 @@ class SelectionTelemetryLog:
             return False
 
     def _rotate_if_needed_locked(self) -> None:
-        """Size-based rotation. The caller holds the destructive-rotation guard.
+        """Size-based rotation. The caller holds no lock on entry.
 
         ``log → log.1 → … → log.N``, oldest dropped. Renames preserve the 0600
         mode; the fresh file is recreated 0600 by the ``os.open`` in
         ``_append``. With ``max_backups == 0`` the file is simply truncated by
         deletion (append recreates it).
 
-        Does not decide whether the append may proceed — the guard the caller
-        already holds is what makes it safe, rather than a guess at who holds a
-        lock and why. Rotation itself is never urgent: a deferred one fires
-        again on the next append, since the size trigger is still true.
+        Does not decide whether the append may proceed. An append that this or
+        another process's rotation orphans is detected afterwards by
+        ``_still_reachable`` rather than excluded beforehand, because the
+        settings deciding whether rotation unlinks belong to whichever process
+        rotates — which may not be this one. Rotation itself is never urgent: a
+        deferred one fires again on the next append, since the size trigger is
+        still true.
         """
         try:
             size = self._path.stat().st_size
