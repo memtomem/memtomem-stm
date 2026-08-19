@@ -2809,24 +2809,33 @@ class TestSelectionFeedbackRobustness:
         assert result.exit_code == 1
         assert json.loads(result.output)["error"] == "log_unreadable"
 
-    def test_a_repaired_newline_only_short_write_is_a_success(self, tmp_path, monkeypatch):
-        """When the ONLY missing byte was the newline, the repair restores the
-        exact intended bytes — the record is complete and readable, so calling
-        it a failure would be false, and would invite a retry that duplicates
-        the label."""
+    def test_a_repaired_newline_only_short_write_is_unconfirmed_not_written(
+        self, tmp_path, monkeypatch
+    ):
+        """The repair completes the bytes, but not the knowledge about them.
+
+        Restoring the missing newline takes a SECOND ``os.write``, and this
+        writer holds no cross-process lock between the two. Another writer's
+        append can land in that gap, in which case the repair newline closes
+        that record's line and this one is fused onto it. So the bytes are all
+        on disk and may still be unreadable, which is neither ``written`` nor
+        ``failed``: reporting failure would invite a retry that duplicates a
+        label that exists, and reporting success would claim a parse this
+        process never checked.
+        """
         log_path = tmp_path / "log.jsonl"
         log = SelectionTelemetryLog(log_path)
         log.initialize()
         monkeypatch.setattr(
             selection_log_module.os, "write", _short_write_on(log_path, drop_only_newline=True)
         )
-        assert log.log_feedback(selection_id="a", user_corrected=True) == "written"
+        assert log.log_feedback(selection_id="a", user_corrected=True) == "unconfirmed"
         monkeypatch.undo()
 
-        lines = [line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        assert [json.loads(line)["selection_id"] for line in lines] == ["a"]
-        assert log.events_written == 1
-        assert log.write_errors == 0
+        # Uncontended, the repair really does restore the exact intended bytes
+        # — which is why the answer is "unknown" rather than "lost".
+        assert [record["selection_id"] for record in _feedback_records(log_path)] == ["a"]
+        assert log.write_errors == 1
 
     def test_a_short_write_does_not_corrupt_the_next_record(self, tmp_path, monkeypatch):
         """The follow-up append must stay readable and honestly reported.
@@ -3028,6 +3037,10 @@ class TestSelectionFeedbackRobustness:
         assert json.loads(result.output)["error"] == "log_unreadable"
         assert _feedback_records(log_path) == []
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="_still_reachable short-circuits on win32, so os.fstat is never reached",
+    )
     def test_a_reachability_probe_that_cannot_run_is_unconfirmed_not_written(
         self, tmp_path, monkeypatch
     ):
@@ -3055,6 +3068,41 @@ class TestSelectionFeedbackRobustness:
         # duplicate label for a record that exists.
         assert [record["selection_id"] for record in _feedback_records(log_path)] == ["a"]
         assert log.write_errors == 1
+
+    def test_a_record_the_readers_would_drop_is_refused_rather_than_written(self, tmp_path):
+        """The writer must not emit a line its own readers discard.
+
+        ``MAX_LINE_BYTES`` was defined for both sides precisely so a line one
+        reader parses and another drops cannot exist — but it was enforced only
+        in ``TelemetryReader``. A record over the cut would land on disk, be
+        skipped as oversized by every consumer, and the caller told it was
+        written: a record that exists for nobody.
+        """
+        log_path = tmp_path / "log.jsonl"
+        log = SelectionTelemetryLog(log_path)
+        log.initialize()
+
+        oversized = "x" * (selection_log_module.MAX_LINE_BYTES + 1)
+        assert log.log_feedback(selection_id=oversized, user_corrected=True) == "failed"
+        assert log.write_errors == 1
+
+        # Nothing was written, so the readers and the writer still agree.
+        reader = selection_log_module.TelemetryReader(log_path)
+        assert [record for record in reader.records() if record.get("event") == "feedback"] == []
+        assert reader.quality["oversized_lines"] == 0
+
+    def test_a_record_just_under_the_cut_is_still_written(self, tmp_path):
+        """The positive control: the refusal is the length, not the shape."""
+        log_path = tmp_path / "log.jsonl"
+        log = SelectionTelemetryLog(log_path)
+        log.initialize()
+        assert log.log_feedback(selection_id="a", user_corrected=True) == "written"
+        reader = selection_log_module.TelemetryReader(log_path)
+        assert [
+            record["selection_id"]
+            for record in reader.records()
+            if record.get("event") == "feedback"
+        ] == ["a"]
 
     def test_a_reported_success_holds_the_lock_that_makes_it_true(self, tmp_path):
         """The command's success must not be evictable the instant it is made.
@@ -3099,8 +3147,18 @@ class TestSelectionFeedbackRobustness:
         assert attempts and not any(attempts), (
             "a rotation was able to take the lock while the command reported success"
         )
-        assert [record["selection_id"] for record in _feedback_records(log_path)] != [], (
-            "the label the command reported must still be in the log it named"
+        # Verified through TelemetryReader, not a bare json.loads: the claim is
+        # that the label is in the log its READERS see, and they apply framing,
+        # segment admission and the line-length cut that a direct parse skips.
+        reader = selection_log_module.TelemetryReader(log_path)
+        labelled = [
+            record.get("selection_id")
+            for record in reader.records()
+            if record.get("event") == "feedback"
+        ]
+        reported = json.loads(result.output)["selection_id"]
+        assert labelled == [reported], (
+            f"the reader finds {labelled}, but the command reported {reported}"
         )
 
     def test_the_lock_file_is_not_counted_as_a_rotated_backup(self, tmp_path):

@@ -96,21 +96,25 @@ changes inline only. See the deprecation policy in
   `write_unconfirmed` when the probe could not run. On the call path that is a
   detector rather than a guarantee — it describes the instant it ran — and it
   turns a silent loss into a counted one for the price of one `fstat` and no
-  lock. The labelling command gets the stronger statement instead: its append,
-  its status check and its success report now all happen inside the rotation
-  guard it already took, so a reported success means the label is in the log as
-  the command returns.
+  lock. The labelling command gets a stronger statement instead: its
+  append, its status check and its success report now all happen inside the
+  rotation guard it already took, giving a linearization point at the moment
+  success is emitted — when it prints `ok`, the label is in the log and no
+  rotation has intervened since the write. Not a promise about any later
+  instant, and scoped to writers that respect the advisory lock.
   `stm_selection_stats`' `rotated_backups` no longer counts either lock file
   (or any non-numeric sibling) as a backup. The label inherits the labelled selection's
   `ranker_version` and `trace_id`, so it lands in that call's cohort rather
   than the emitter's. Nothing on the proxy's call path emits this event and
   nothing is planned to: the client model never sees a `selection_id`, so the
   stream carries operator judgement at operator volume — ADR 0001 states that
-  and `tests/test_docs_sync.py` pins it by *reachability*: every function in
-  `src/` that can reach `log_feedback` through any chain of calls is
-  enumerated, so a future request-path emitter fails CI until the ADR is
+  and `tests/test_docs_sync.py` pins it by *reachability*: every scope in
+  `src/` that reaches `log_feedback` through any chain of identifier mentions
+  is enumerated, so a future request-path emitter fails CI until the ADR is
   rewritten — including one that routes through the labelling command's own
-  append helper rather than naming the emitter.
+  append helper rather than naming the emitter. A name-and-alias walk, not call
+  or data flow: it over-approximates rather than under-approximates, and does
+  not see reflection.
 
 - **`mms selection replay` keeps a conflicting `selection_id` out for good**
   (#853). Two copies of one id that disagree removed the selection and marked

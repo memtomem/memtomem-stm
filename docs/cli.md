@@ -744,7 +744,7 @@ exit 1 and emit `{"action": "selection-feedback", "ok": false, "error":
 | `config_invalid` | the configured log path is unknown, by any of three routes: the config file exists but does not parse; there is no file and the `MEMTOMEM_STM_PROXY__*` overlay the operator did set fails to validate; or a bare `MEMTOMEM_STM_PROXY` was dropped entirely because it is not valid JSON or decodes to a non-null value that is not an object — that last one is reported with a config file present too, since the file then decides a path the environment was meant to override. All refuse rather than labelling whichever log is left over |
 | `confirmation_required` | `--last` used non-interactively (or with `--json`) without `--yes`; exit 2, matching the CLI-wide rule that a formatting flag must not authorize a write |
 | `write_failed` / `write_redacted` | no label record was written — the sink swallows write faults so a telemetry problem cannot break a proxied call, so the command checks the append outcome instead of assuming it. A write that landed short and could not be repaired leaves an unparseable fragment behind (rolling it back would mean rewinding a file the proxy appends to concurrently); readers count it as one malformed line and it joins nothing. A short write missing only its trailing newline is repaired instead and reported as a success, since the record is then complete and readable |
-| `write_unconfirmed` | the label's bytes reached the log but the flush proving they survive a crash did not complete. Neither "written" nor "not written" is available, so the command says so — and names the row: the `--json` document carries `selection_id`, and the retry to run is `--selection-id <id>`, never another `--last`, which by then could infer a *different* selection. Repeating the label for the same selection is the accumulate-and-supersede case above |
+| `write_unconfirmed` | the label's bytes reached the log but the record could not be confirmed there — the flush proving the bytes survive a crash did not complete, the probe for whether a rotation orphaned the file could not run, or a short write was repaired by a second write another appender may have interleaved with. One status for all three, since the operator's move is identical. Neither "written" nor "not written" is available, so the command says so — and names the row: the `--json` document carries `selection_id`, and the retry to run is `--selection-id <id>`, never another `--last`, which by then could infer a *different* selection. Repeating the label for the same selection is the accumulate-and-supersede case above |
 
 Unlike the proxy's call-path emitters, the label is flushed to the storage
 device — and its directory entry with it when the append created the log —
@@ -790,12 +790,19 @@ buys is that the common silent loss becomes a counted, reported one, at the cost
 of one `fstat` and no lock, which is the right trade for the call path: those
 records are one sample among many.
 
-`mms selection feedback` needs the stronger statement and pays for it with the
+`mms selection feedback` needs a stronger statement and pays for it with the
 lock it already holds. Its append, the status check, and the success report all
 happen inside the rotation guard, so no rotation can run between the write and
-the claim about it. For that command — and only for it — a reported success
-means the label is in the log as the command returns. The lock file is not
-counted as a rotated backup.
+the claim about it. What that buys is a **linearization point at the moment
+success is emitted**: when the command prints `ok`, the label is in the log and
+no rotation has intervened since it was written.
+
+It is not a promise about any later instant — the guard is released as the
+command returns, and a rotation immediately afterwards can evict the label like
+any other record, which is what rotation is for. Nor does it bind a writer that
+ignores the advisory lock; the guarantee is scoped to processes that cooperate
+with it, which is every writer STM ships. The lock file is not counted as a
+rotated backup.
 
 ## `mms hook` — built-in tool bridge + per-host registration
 

@@ -99,9 +99,13 @@ A label is a human judgement that exists nowhere else, so its append is
 *durable* — flushed to the storage device, and the directory entry with it when
 the append created the log, before the command reports success. The call-path
 emitters deliberately are not: their records are one sample among many that
-sampling may drop outright. A label the command could not confirm durable is
-reported as such rather than as a success or a failure, because its bytes are
-in the file either way.
+sampling may drop outright. A label the command could not confirm is reported as
+such rather than as a success or a failure, because its bytes are in the file
+either way. Three things can be unconfirmable — that the bytes survive a crash,
+that a rotation did not orphan the file they went into, and that a repaired
+short write was not fused with a concurrent append — and they share one status
+because the operator's move is the same for all three: look at the log, and
+re-run by `--selection-id` if the label is not there.
 
 The command labels only rows it can label honestly. A selection whose
 `schema_version` is unsupported is one offline replay drops outright, so a

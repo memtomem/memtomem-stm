@@ -111,12 +111,17 @@ MAX_LINE_BYTES = 1_048_576
 APPEND_WRITTEN = "written"
 APPEND_REDACTED = "redacted"
 APPEND_FAILED = "failed"
-# The record's bytes are complete in the file, but the write could not be
-# confirmed to survive a crash — a durable append whose ``fsync`` or ``close``
-# failed. Distinct from ``failed`` because the two need opposite handling: a
-# failure means "write it again", while an unconfirmed append may already be on
-# disk, so the caller must be told what is and is not known rather than being
-# handed a verdict the process cannot support.
+# The record's bytes are complete in the file, but something about them could
+# not be established. Three causes, deliberately sharing one status because the
+# caller's move is identical for all of them: a durable append whose ``fsync``
+# or ``close`` failed (bytes may not survive a crash), a reachability probe
+# that could not run (unknown whether a rotation orphaned them), and a short
+# write repaired by a second ``os.write`` (another writer may have appended
+# between the two, fusing the lines). Distinct from ``failed`` because the two
+# need opposite handling: a failure means "write it again", while an
+# unconfirmed append may already be on disk, so the caller must be told what is
+# and is not known rather than being handed a verdict the process cannot
+# support.
 APPEND_UNCONFIRMED = "unconfirmed"
 APPEND_STATUSES = (APPEND_WRITTEN, APPEND_REDACTED, APPEND_FAILED, APPEND_UNCONFIRMED)
 
@@ -539,6 +544,20 @@ class SelectionTelemetryLog:
             )
             return APPEND_REDACTED
         data = (line + "\n").encode("utf-8")
+        if len(data) - 1 > MAX_LINE_BYTES:
+            # Every reader of this log drops a line longer than this
+            # (``TelemetryReader._admit``), so writing one would put bytes on
+            # disk that each consumer counts as oversized and skips — a record
+            # that exists for nobody. Refused here so the writer and the
+            # readers cannot disagree about what a record is.
+            with self._lock:
+                self.write_errors += 1
+            logger.warning(
+                "Selection telemetry record refused: %d bytes exceeds the %d-byte line limit",
+                len(data) - 1,
+                MAX_LINE_BYTES,
+            )
+            return APPEND_FAILED
         # Synchronous file append on the asyncio event loop: while it runs,
         # every runnable coroutine stalls — other in-flight proxied calls
         # included. Accepted for the current local single-MCP-client
@@ -579,7 +598,21 @@ class SelectionTelemetryLog:
                         # duplicates the label.
                         repaired = self._terminate_fragment(fd, payload, written)
                         if repaired and written == len(payload) - 1:
-                            written = len(payload)
+                            # Every byte of the record is now on disk — but it
+                            # took two writes to get there, with no
+                            # cross-process lock between them. Another writer's
+                            # append can land in that gap, and this newline
+                            # then closes THEIR line while ours is fused onto
+                            # it. Complete or corrupt, and this process cannot
+                            # tell which apart without reading the file back:
+                            # exactly the "may already be on disk, do not
+                            # simply retry" case ``unconfirmed`` names.
+                            self.write_errors += 1
+                            logger.warning(
+                                "Selection telemetry record needed a newline repair; another "
+                                "writer may have appended between the two writes"
+                            )
+                            return APPEND_UNCONFIRMED
                     if written != len(payload):
                         # No record is on disk, and a caller waiting to hear
                         # that its label exists must not be told otherwise.

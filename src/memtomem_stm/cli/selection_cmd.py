@@ -472,20 +472,28 @@ def feedback_command(
         # Both the check and the report stay INSIDE the rotation guard. The
         # sink's own reachability probe can only describe an instant that has
         # already passed; the lock is what gives this command a linearization
-        # point, so "written" means the label is in the log as the command
-        # returns, rather than that it was there at some earlier moment.
+        # point, and the point is the EMISSION: when ``ok`` is printed, the
+        # label is in the log and no rotation has intervened since the write.
+        # Deliberately not a claim about any later instant — the guard is
+        # released as this function returns, and a rotation right afterwards
+        # evicts the label like any other record, which is what rotation is
+        # for. It binds cooperating writers only, the lock being advisory.
         if status == APPEND_UNCONFIRMED:
-            # The bytes are complete in the file but the flush proving they survive
-            # a crash did not complete, so neither "written" nor "not written" is a
-            # statement this process can make. Say which it is, and say that a
-            # re-run is safe: repeating the same label for the same selection is
-            # the accumulate-and-supersede case the schema already defines, not a
+            # The bytes are complete in the file, but something about them was
+            # not established — that they survive a crash, that a rotation did
+            # not orphan the file they went into, or that a repaired short
+            # write was not fused with a concurrent append. Deliberately not
+            # named apart here: the operator's move is the same for all three,
+            # and naming a cause this process did not verify would be the
+            # overstatement the status exists to avoid. Say that a re-run is
+            # safe: repeating the same label for the same selection is the
+            # accumulate-and-supersede case the schema already defines, not a
             # second, conflicting judgement.
             _feedback_failure(
                 as_json,
                 f"write_{status}",
-                f"the label reached {telemetry_path} but could not be confirmed durable; "
-                f"check the log, and if it is not there re-run with "
+                f"the label's bytes reached {telemetry_path} but the record could not be "
+                f"confirmed there; check the log, and if it is not there re-run with "
                 f"--selection-id {resolved_id}",
                 extra={"selection_id": resolved_id},
             )

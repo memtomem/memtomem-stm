@@ -160,12 +160,18 @@ Two statements the matrix makes explicit:
 - The source paths this ADR names, and its claim about what can emit
   `log_feedback`, are pinned by `tests/test_docs_sync.py`, so the cheapest
   kinds of drift fail CI rather than aging in prose. The pin is over
-  *reachability*, not over one call edge: it enumerates every function in
-  `src/` that can reach the emitter through any chain of calls, so routing a
-  new emitter through the labelling command's own append helper does not slip
-  past it. A second emitter appearing — in particular one on the request path,
-  which would change the nature of the signal — fails until this paragraph is
-  rewritten.
+  *reachability*, not over one call edge: it enumerates every scope in `src/`
+  that mentions the emitter through any chain of mentions, so routing a new
+  emitter through the labelling command's own append helper does not slip past
+  it. A second emitter appearing — in particular one on the request path, which
+  would change the nature of the signal — fails until this paragraph is
+  rewritten. The walk matches on identifier names and import aliases, not on
+  call or data flow, so it over-approximates (an unrelated same-named helper
+  trips it) in the direction that gets read, and a caller reaching the emitter
+  purely through indirection it cannot see — `getattr` on a computed name, a
+  callable stored in a container — would evade it. That is the guard's
+  boundary: it catches the drift a maintainer writes, not one deliberately
+  hidden from it.
 
 ## References
 
