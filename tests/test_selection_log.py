@@ -1392,6 +1392,119 @@ class TestResolverAgreesWithReplay:
         # reinstating the selection an earlier disagreement removed.
         assert quality["conflicting_records"] == 2
 
+    def test_a_row_replaced_between_the_two_passes_is_not_returned(self, tmp_path, monkeypatch):
+        """Resolution reads the log twice — candidates, then the copy replay
+        keeps — and the file can change in between. The second pass's record is
+        re-screened rather than trusted, so a row rewritten out of the filter
+        cannot come back as the answer to a filtered question."""
+        log_path = tmp_path / "log.jsonl"
+        _write_lines(log_path, [_sel(selection_id="a", server="gh", selected_tool="gh__x")])
+        real_iter = selection_log_module._iter_selection_records
+        state = {"passes": 0}
+
+        def rewriting_iter(*args, **kwargs):
+            state["passes"] += 1
+            if state["passes"] == 2:
+                # Same id, a server the operator did not ask for.
+                _write_lines(
+                    log_path, [_sel(selection_id="a", server="fs", selected_tool="fs__read")]
+                )
+            yield from real_iter(*args, **kwargs)
+
+        monkeypatch.setattr(selection_log_module, "_iter_selection_records", rewriting_iter)
+        record, defect = selection_log_module.resolve_selection(log_path, server="gh")
+        monkeypatch.undo()
+
+        assert record is None, f"returned a record outside the requested filter: {record}"
+        assert defect is not None
+
+    def test_an_unsupported_copy_does_not_poison_a_supported_row(self, tmp_path):
+        """Replay drops an unsupported ``schema_version`` before it can be a
+        copy of anything, so it is not a disagreement — refusing the supported
+        row would refuse a selection replay loads. An id with ONLY unsupported
+        copies still reports the schema, not "no such selection"."""
+        log_path = tmp_path / "log.jsonl"
+        _write_lines(
+            log_path,
+            [
+                _sel(selection_id="a"),
+                _sel(selection_id="a", schema_version=99, server="other"),
+                _sel(selection_id="future-only", schema_version=99),
+            ],
+        )
+        result = _run_feedback(
+            tmp_path, log_path, "--selection-id", "a", "--user-corrected", "--json"
+        )
+        assert result.exit_code == 0, result.output
+        assert len(_feedback_records(log_path)) == 1
+
+        result = _run_feedback(
+            tmp_path, log_path, "--selection-id", "future-only", "--user-corrected", "--json"
+        )
+        payload = json.loads(result.output)
+        assert result.exit_code == 1
+        assert payload["error"] == "unusable_record"
+        assert "schema_version" in payload["message"]
+
+    def test_a_boolean_and_a_number_are_not_the_same_value(self, tmp_path):
+        """``true`` and ``1`` are one value to Python's ``==`` and two to JSON.
+        Two records that disagree about a boolean field are two records, and
+        the id they share is poisoned."""
+        log_path = tmp_path / "log.jsonl"
+        _write_lines(
+            log_path,
+            [
+                _sel(selection_id="dup", graph_generation=True),
+                _sel(selection_id="dup", graph_generation=1),
+            ],
+        )
+        result = _run_feedback(
+            tmp_path, log_path, "--selection-id", "dup", "--user-corrected", "--json"
+        )
+        payload = json.loads(result.output)
+        assert result.exit_code == 1
+        assert payload["error"] == "unusable_record"
+        assert _feedback_records(log_path) == []
+
+    def test_copies_of_one_poisoned_id_do_not_crowd_out_an_older_row(self, tmp_path, monkeypatch):
+        """The fallthrough budget counts distinct selections, not lines. A
+        handful of copies of ONE bad id must not push the labellable row out of
+        the window."""
+        monkeypatch.setattr(selection_log_module, "_MAX_FALLTHROUGH", 2)
+        log_path = tmp_path / "log.jsonl"
+        _write_lines(
+            log_path,
+            [
+                _sel(selection_id="older"),
+                _sel(selection_id="bad", server="gh"),
+                _sel(selection_id="bad", server="fs"),
+                _sel(selection_id="bad", server="s3"),
+            ],
+        )
+        assert _run_feedback(tmp_path, log_path, "--last", "--user-corrected").exit_code == 0
+        assert [record["selection_id"] for record in _feedback_records(log_path)] == ["older"]
+
+    def test_an_exhausted_fallthrough_says_so_rather_than_no_match(self, tmp_path, monkeypatch):
+        """Beyond the budget the answer is "these are all unlabellable", which
+        sends an operator to `--selection-id` — "nothing matches" would send
+        them looking for a selection that is right there."""
+        monkeypatch.setattr(selection_log_module, "_MAX_FALLTHROUGH", 1)
+        log_path = tmp_path / "log.jsonl"
+        _write_lines(
+            log_path,
+            [
+                _sel(selection_id="older"),
+                _sel(selection_id="bad", server="gh"),
+                _sel(selection_id="bad", server="fs"),
+            ],
+        )
+        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
+        payload = json.loads(result.output)
+        assert result.exit_code == 1
+        assert payload["error"] == "unusable_record"
+        assert "--selection-id" in payload["message"]
+        assert _feedback_records(log_path) == []
+
     def test_last_falls_through_a_conflicting_selection(self, tmp_path):
         """A conflicting id is not a labellable target, so ``--last`` resolves
         to the newest one that is — with the control that the same layout
@@ -1492,14 +1605,34 @@ class TestUnreadableSegmentIsNotAnAbsentOne:
         _write_lines(tmp_path / "log.jsonl.1", [_sel(selection_id="older")])
         _write_lines(log_path, [_sel(selection_id="newest")])
 
-        real_read_bytes = Path.read_bytes
+        real_open = Path.open
 
-        def failing_read_bytes(self):
-            if self == log_path:
+        class FailsMidRead:
+            """Opens fine, fails on the first read — the case the command's
+            open-only preflight cannot catch."""
+
+            def __init__(self, wrapped):
+                self._wrapped = wrapped
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return self._wrapped.__exit__(*exc)
+
+            def __iter__(self):
                 raise OSError(5, "I/O error")
-            return real_read_bytes(self)
 
-        monkeypatch.setattr(Path, "read_bytes", failing_read_bytes)
+            def read(self, *args):
+                raise OSError(5, "I/O error")
+
+        def failing_open(self, *args, **kwargs):
+            handle = real_open(self, *args, **kwargs)
+            if self == log_path and args and args[0] == "rb":
+                return FailsMidRead(handle)
+            return handle
+
+        monkeypatch.setattr(Path, "open", failing_open)
         result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
         monkeypatch.undo()
 
@@ -1513,6 +1646,33 @@ class TestUnreadableSegmentIsNotAnAbsentOne:
         # so the refusal above is the read failure and not the layout.
         assert _run_feedback(tmp_path, log_path, "--last", "--user-corrected").exit_code == 0
         assert [record["selection_id"] for record in _feedback_records(log_path)] == ["newest"]
+
+    def test_an_exact_id_reports_a_read_failure_it_meets_after_a_conflict(
+        self, tmp_path, monkeypatch
+    ):
+        """Resolving by id scans to the end rather than stopping at the first
+        disagreement. Stopping early would answer "this id conflicts" while a
+        later segment — the one that might have held the deciding copy — was
+        never opened at all."""
+        backup = tmp_path / "log.jsonl.1"
+        _write_lines(
+            backup,
+            [_sel(selection_id="dup", server="gh"), _sel(selection_id="dup", server="fs")],
+        )
+        log_path = tmp_path / "log.jsonl"
+        _write_lines(log_path, [_sel(selection_id="other")])
+
+        real_open = Path.open
+
+        def failing_open(self, *args, **kwargs):
+            if self == log_path and args and args[0] == "rb":
+                raise OSError(5, "I/O error")
+            return real_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", failing_open)
+        with pytest.raises(selection_log_module.SelectionLogUnreadable):
+            selection_log_module.resolve_selection(log_path, selection_id="dup")
+        monkeypatch.undo()
 
 
 class TestCleanupFailuresDoNotOverruleACompleteWrite:
@@ -1587,21 +1747,32 @@ class TestEnvOverlayThatWasIgnoredEntirely:
     that environment; a writing command must not quietly proceed on it."""
 
     @pytest.mark.parametrize("payload", ["{", "[]", '"a string"'])
-    def test_an_undecodable_bare_overlay_refuses_the_write(self, tmp_path, monkeypatch, payload):
+    @pytest.mark.parametrize("config_present", [False, True])
+    def test_an_undecodable_bare_overlay_refuses_the_write(
+        self, tmp_path, monkeypatch, payload, config_present
+    ):
         from memtomem_stm.cli.proxy import cli
 
         log_path = tmp_path / "log.jsonl"
         _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        # Both routes: with no file the defaults would name the log, and with a
+        # file the FILE would — either way it is not the environment the
+        # operator set, which is the whole hazard.
+        config = tmp_path / "proxy.json"
+        if config_present:
+            config.write_text(
+                json.dumps({"selection_telemetry": {"path": str(log_path)}}), encoding="utf-8"
+            )
+        else:
+            config = tmp_path / "absent-proxy.json"
         monkeypatch.setenv("MEMTOMEM_STM_PROXY", payload)
-        # No --log: the config is what would decide the target, which is the
-        # whole hazard. --last needs no id from the log for this to be reached.
         result = CliRunner().invoke(
             cli,
             [
                 "selection",
                 "feedback",
                 "--config",
-                str(tmp_path / "absent-proxy.json"),
+                str(config),
                 "--last",
                 "--user-corrected",
                 "--yes",

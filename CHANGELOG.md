@@ -18,8 +18,10 @@ changes inline only. See the deprecation policy in
   with nothing to produce it, so the learning stage had only the implicit
   "which advertised tool did the model call" signal. This is its first
   emitter: `mms selection feedback --selection-id <id>` labels a named row,
-  `--last [--server X] [--tool Y]` resolves the most recent selection in append
-  order and prints which one it resolved to before writing. Both labels are
+  `--last [--server X] [--tool Y]` resolves the most recent *labellable*
+  selection in append order — a row it would refuse by id is skipped, so the
+  answer can be older than the newest line — and prints which one it resolved
+  to before writing. Both labels are
   three-valued — `--no-user-corrected` records that the selection was *right*,
   which offline evaluation needs as much as the negative case, while omitting
   both forms records nothing for that field, and passing both is a usage error
@@ -51,7 +53,8 @@ changes inline only. See the deprecation policy in
   mid-character is skipped rather than repaired into a different string than
   the one replay reads; the same maximum line length; the active file's
   unterminated tail ignored, since that is a record still being written;
-  byte-identical duplicates folded; and a `selection_id` whose copies disagree
+  equal duplicates folded — equal as *records*, so `1` and `1.0` are one value
+  while `true` and `1` are not; and a `selection_id` whose copies disagree
   refused (`unusable_record`), because replay discards that selection outright
   and marks the run invalid — so the two cannot disagree about which selections
   exist. The target is re-verified by identity, not mere presence, after the

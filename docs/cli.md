@@ -676,7 +676,7 @@ Options:
   --log FILE                      Selection JSONL path; overrides
                                   selection_telemetry.path.
   --selection-id TEXT             Label this exact selection.
-  --last                          Label the most recent selection (optionally
+  --last                          Label the most recent labellable selection
                                   filtered by --server/--tool).
   --server TEXT                   With --last: only consider selections from
                                   this upstream.
@@ -736,7 +736,7 @@ exit 1 and emit `{"action": "selection-feedback", "ok": false, "error":
 | --- | --- |
 | `no_log` | no log segment exists in the selected scope — with `--active-only` that is the active file alone, otherwise the active file and every rotated backup |
 | `not_found` / `no_match` | the selector resolved to nothing, checked *before* writing, so a typo never appends a label that joins to no selection |
-| `unusable_record` | the record was found but cannot carry a label: an unsupported `schema_version` (offline replay drops those records outright, so a label on one joins nothing), no `ranker_version` for the label to inherit (replay would load the selection, but under a cohort this command would have had to invent), or two copies of the `selection_id` that disagree (replay discards that selection entirely and marks the run invalid; byte-identical copies are fine and fold to one). `--last` skips such rows and resolves to the next-most-recent labellable one |
+| `unusable_record` | the record was found but cannot carry a label: an unsupported `schema_version` (offline replay drops those records outright, so a label on one joins nothing), no `ranker_version` for the label to inherit (replay would load the selection, but under a cohort this command would have had to invent), or two copies of the `selection_id` that disagree (replay discards that selection entirely and marks the run invalid; equal copies are fine and fold to one — equal as *records*, so `1` and `1.0` are one value while `true` and `1` are not). `--last` skips such rows and resolves to the next-most-recent labellable one; if the 64 most recent matching selections are all unlabellable it reports that here, rather than as "nothing matched" |
 | `log_rotated` | the resolved selection left the log between resolution and append; nothing was written |
 | `selection_changed` | the selection is still there but is no longer the record that was confirmed — a copy carrying a different `ranker_version` / `trace_id` / server / tool landed during the confirmation. Refused rather than reconciled: which of the two the judgement was about is not something the command can decide |
 | `log_busy` | the rotation lock is held (by a rotating writer or another labelling run) and could not be taken; nothing was written — re-run |
@@ -752,6 +752,16 @@ device — and its directory entry with it when the append created the log —
 before the command reports success. The call path does not pay that: its
 records are one sample among many, and a device flush there would be charged
 to the proxied call it only accounts for.
+
+**What the second check does and does not cover.** The window it closes is
+human time: the seconds or minutes between the resolved selection being printed
+and the operator answering, during which a rotation or a new copy of the id can
+land. It is not a lock against the proxy's own appends, which are deliberately
+lock-free — a per-record lock on the call path would be paid by every proxied
+call to insure a rare event. A copy of the id landing in the moment between
+that check and the append leaves a label on a selection replay then discards as
+conflicting: dead weight the run reports as invalid, not a label attached to
+the wrong selection.
 
 Rotation renames every segment at once, so a scan that straddles one can miss
 the newest selections — they move into a file it already passed — or resolve

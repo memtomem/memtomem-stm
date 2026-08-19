@@ -110,7 +110,8 @@ its label filed under a cohort the command invented. Both are refused by name
 (`unusable_record`) and skipped by `--last`. What counts as a record is what
 replay counts, too — parsed from raw bytes, the same maximum line length, the
 active file's unterminated tail ignored as a record still being written,
-byte-identical duplicates folded, and a `selection_id` whose copies disagree
+equal duplicates folded — equal as *records*, so `1` and `1.0` are one value
+while `true` and `1` are not — and a `selection_id` whose copies disagree
 refused, since replay discards that selection outright — so the two cannot
 disagree about which selections exist.
 

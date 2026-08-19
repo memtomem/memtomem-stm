@@ -2032,56 +2032,39 @@ def _functions_reaching(
                     found.add(child.id)
             return found
 
-        def aliases_in(node: ast.AST, *, nested: bool) -> dict[str, str]:
-            """``from m import x as y`` / ``import m as y`` bindings in *node*.
+        # ``from m import x as y`` / ``import m as y``: a mention of the local
+        # name is a mention of the original. Collected file-wide and kept as a
+        # SET per name — never replaced. Scoping an alias table correctly means
+        # modelling function, lambda, class, comprehension and ``global``
+        # boundaries, and every shape missed there UNREPORTS a real emitter; a
+        # union only ever adds names, so the guard can gain a false positive
+        # (which gets read) but cannot lose an emitter.
+        aliases: dict[str, set[str]] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    if alias.asname:
+                        aliases.setdefault(alias.asname, set()).add(alias.name.split(".")[-1])
 
-            An import inside a function binds only in that function, so the
-            tables are built per scope: a file-global table lets a later
-            function's unrelated ``import ... as emit`` overwrite the entry
-            an earlier emitter depends on, and that emitter then vanishes from
-            the graph. Nested function bodies are excluded from the module
-            table for the same reason.
-            """
-            table: dict[str, str] = {}
-            for child in ast.walk(node):
-                if (
-                    not nested
-                    and child is not node
-                    and isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
-                ):
-                    continue
-                if isinstance(child, (ast.Import, ast.ImportFrom)):
-                    for alias in child.names:
-                        if alias.asname:
-                            table[alias.asname] = alias.name.split(".")[-1]
-            return table
-
-        module_aliases = {}
-        for statement in tree.body:
-            if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                module_aliases.update(aliases_in(statement, nested=True))
-
-        def resolve(found: set[str], table: dict[str, str]) -> set[str]:
-            return found | {table[name] for name in found if name in table}
+        def resolve(found: set[str]) -> set[str]:
+            resolved = set(found)
+            for name in found:
+                resolved |= aliases.get(name, set())
+            return resolved
 
         module_scope = mentions.setdefault((relative, "<module>"), set())
         for statement in tree.body:
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 # The decorators run at import even though the body does not.
                 for decorator in statement.decorator_list:
-                    module_scope |= resolve(names_in(decorator), module_aliases)
+                    module_scope |= resolve(names_in(decorator))
             else:
-                module_scope |= resolve(names_in(statement), module_aliases)
+                module_scope |= resolve(names_in(statement))
         for scope in ast.walk(tree):
             if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             mentions.setdefault((relative, scope.name), set())
-            # The module's bindings, plus this function's own — which shadow
-            # them, exactly as they do at runtime.
-            scope_aliases = {**module_aliases, **aliases_in(scope, nested=True)}
-            mentions[(relative, scope.name)] |= resolve(names_in(scope), scope_aliases) - {
-                scope.name
-            }
+            mentions[(relative, scope.name)] |= resolve(names_in(scope)) - {scope.name}
     reaching: set[tuple[str, str]] = set()
     frontier = {target}
     while frontier:
@@ -2271,18 +2254,27 @@ def test_adr_0001_call_site_pin_rejects_a_second_emitter(tmp_path) -> None:
         "an import-aliased emitter must be reported"
     )
 
-    # (c3) a LATER function importing something unrelated under the same
-    # local name. A file-global alias table would let that entry overwrite the
-    # emitter's, and (c2) would disappear from the graph — a guard that stops
-    # reporting a real emitter because of code somewhere else in the file.
+    # (c3) other code in the same file binding that local name to something
+    # else — a sibling function, a nested function, and a class body. Each is a
+    # scope this walk does not model; a table that let any of them REPLACE the
+    # emitter's alias would stop reporting (c2), which is the guard going quiet
+    # because of code somewhere else in the file.
     (src / "imported_alias.py").write_text(
         (src / "imported_alias.py").read_text(encoding="utf-8") + "\ndef unrelated(log):\n"
         "    from json import dumps as emit\n"
-        "    return emit(log)\n",
+        "    return emit(log)\n"
+        "\ndef outer(log):\n"
+        "    def inner():\n"
+        "        from json import loads as emit\n"
+        "        return emit('{}')\n"
+        "    return inner()\n"
+        "\nclass Holder:\n"
+        "    from json import dump as emit\n",
         encoding="utf-8",
     )
     assert ("imported_alias.py", "request_path") in _functions_reaching(src, "log_feedback"), (
-        "a shadowing function-local alias must not unreport the real emitter"
+        "another binding of the same local name — sibling function, nested function, or "
+        "class body — must not unreport the real emitter"
     )
 
     # (d) an emitter at module level, outside any function.
