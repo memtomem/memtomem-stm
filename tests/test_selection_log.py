@@ -2982,12 +2982,25 @@ class TestSelectionFeedbackRobustness:
         assert "error" not in worker, f"the rotating writer raised: {worker.get('error')!r}"
         assert worker.get("started") is True, "the rotator never observed the stalled append"
         assert worker.get("handshake") is True, "the append was not held across the rotations"
-        assert worker.get("statuses") == ["written"] * (max_backups + 1), worker.get("statuses")
 
         reachable = any(
             "racer" in segment.read_text(encoding="utf-8", errors="replace")
             for segment in selection_log_module.discover_log_files(log_path)
         )
+        if sys.platform == "win32":
+            # This is the Windows exemption in ``_still_reachable`` stated as
+            # an assertion instead of a claim: an open descriptor blocks the
+            # rename, so the ROTATOR is the one that fails and the append it
+            # could not orphan is reported written. Asserted rather than
+            # skipped, because the exemption is why no reachability probe runs
+            # on this platform, and an untested premise there is how the
+            # earlier rounds of this PR went wrong.
+            assert worker.get("statuses") == ["failed"] * (max_backups + 1), worker.get("statuses")
+            assert status == "written", status
+            assert reachable, "rotation cannot orphan an append it was unable to perform"
+            return
+
+        assert worker.get("statuses") == ["written"] * (max_backups + 1), worker.get("statuses")
         if status == "written":
             assert reachable, "a record reported as written must be reachable by name"
         else:
