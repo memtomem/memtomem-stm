@@ -245,29 +245,35 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
-- **`mms selection replay` no longer crashes on a malformed row it admits**
-  (#855, closes #854). Three schema-v1 selection records reached the operator
-  as a traceback instead of a report: a `ranked_candidates[].rank` that is a
-  string or `null` hit `int()`, and a `candidate_tools` list holding a
-  non-string element hit `set()`. The evaluator already counts a record whose
-  shape does not hold in `invariant_violations` and keeps scanning; these
-  three coerced before validating and escaped that path, and the CLI catches
-  only `SelectionEvaluationError`. Both sites now validate first, so one
-  unreadable row is a line in the report rather than the end of the run — the
-  record still counts toward `rankable_selections` but not
-  `selected_rank_known`, so an unusable rank reads as an alignment miss rather
-  than a shrunken denominator. A `rank` now feeds the metrics only when the
-  whole entry holds, which also closes `rank: 0` (division by zero in MRR),
-  `rank: -1` (scored as a rank-1 hit), and an oversized integer rank
-  (`float()` overflow). **Behavior change**: a rank the invariant check
-  rejects is no longer recorded at all, and the check itself is stricter —
-  `rank: true` previously passed it (`True == 1`) and `rank: 1.0` was cast to
-  `1`; both are now violations. A log carrying one reports `status: invalid`
-  and the command exits 1 where it previously exited 0. Not reachable from
-  STM's own writer, which always stamps an integer rank; reachable from
-  hand-edited logs and other producers. Other numeric fields on an admitted
-  record (`relevance_score`, `latency_ms`, `retry_count`, `cost`) can still
-  overflow or serialize as `NaN`; that is tracked separately in #856.
+- **`mms selection replay` no longer crashes on a malformed `rank` or
+  `candidate_tools`** (#855, closes #854). Three schema-v1 selection records
+  reached the operator as a traceback instead of a report: a
+  `ranked_candidates[].rank` that is a string or `null` hit `int()`, and a
+  `candidate_tools` list holding a non-string element hit `set()`. The
+  evaluator already counts a record whose shape does not hold in
+  `invariant_violations` and keeps scanning; these three coerced before
+  validating and escaped that path, and the CLI catches only
+  `SelectionEvaluationError`. Both sites now validate first, so one unreadable
+  row is a line in the report rather than the end of the run — the record
+  still counts toward `rankable_selections` but not `selected_rank_known`, so
+  an unusable rank reads as an alignment miss rather than a shrunken
+  denominator. A `rank` now feeds the metrics only when the whole entry holds,
+  which also closes `rank: 0` (division by zero in MRR), `rank: -1` (scored as
+  a rank-1 hit), and an oversized integer rank (`float()` overflow).
+  **Behavior change**: a rank the invariant check rejects is no longer
+  recorded at all, and the check itself is stricter — `rank: true` previously
+  passed it (`True == 1`) and `rank: 1.0` was cast to `1`; both are now
+  violations. Because that check covers the whole entry, two tool-shape cases
+  change with it: a `selected_tool` absent from `candidate_tools` now scores
+  as an alignment miss instead of contributing its rank, and a duplicate entry
+  for the selected tool no longer overwrites the first, valid rank. A log
+  carrying any of these reports `status: invalid` and the command exits 1
+  where it previously exited 0. Not reachable from STM's own writer, which
+  always stamps an integer rank; reachable from hand-edited logs and other
+  producers. This does not close the whole class: the six numeric fields an
+  admitted record can still overflow or serialize as `NaN` through
+  (`relevance_score`, `risk_penalty`, `final_score`, `latency_ms`,
+  `retry_count`, `cost`) are tracked separately in #856.
 
 - **An untyped `--config` now honors `MEMTOMEM_STM_PROXY__CONFIG_PATH`**
   (#849, closes #848). Every `--config` option defaulted to the literal

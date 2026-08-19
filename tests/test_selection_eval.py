@@ -182,7 +182,7 @@ def _malformed_plus_good(malformed: dict) -> list[dict]:
         (10**400, "oversized — would overflow float()"),
     ],
 )
-def test_admitted_record_with_non_integer_rank_is_counted_not_raised(
+def test_admitted_record_with_unusable_rank_is_counted_not_raised(
     tmp_path: Path, bad_rank: object, case: str
 ) -> None:
     log = tmp_path / "selection.jsonl"
@@ -221,6 +221,62 @@ def test_admitted_record_with_unhashable_candidate_tools_is_counted_not_raised(
     assert report["data_quality"]["invariant_violations"] == 1
     assert report["production"]["coverage"]["rankable_selections"] == 2
     assert report["production"]["coverage"]["paired_selections"] == 2
+
+
+def test_selected_tool_outside_candidate_tools_scores_as_an_alignment_miss(
+    tmp_path: Path,
+) -> None:
+    """A rank for a tool the record never offered is not a rank we can trust."""
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    selection["candidate_tools"] = ["demo__write", "demo__other"]
+    _write_jsonl(log, _malformed_plus_good(selection))
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["status"] == "invalid"
+    assert report["production"]["coverage"]["rankable_selections"] == 2
+    assert report["production"]["coverage"]["selected_rank_known"] == 1
+    assert report["production"]["selected_tool_alignment"]["mrr"]["denominator"] == 1
+
+
+def test_duplicate_selected_tool_entry_does_not_overwrite_the_first_rank(
+    tmp_path: Path,
+) -> None:
+    """The duplicate is itself a violation, so its rank must not win."""
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    selection["candidate_features"]["ranked_candidates"].append(
+        {
+            "tool": "demo__search",
+            "rank": 3,
+            "relevance_score": 0.1,
+            "risk_penalty": 0.0,
+            "final_score": 0.1,
+        }
+    )
+    _write_jsonl(log, [selection, _execution()])
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["data_quality"]["invariant_violations"] == 1
+    assert report["production"]["selected_tool_alignment"]["mrr"]["value"] == 1.0
+
+
+def test_malformed_sibling_entry_does_not_erase_a_valid_selected_rank(
+    tmp_path: Path,
+) -> None:
+    """Only the selected tool's own entry decides its rank."""
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    selection["candidate_features"]["ranked_candidates"][1]["rank"] = "two"
+    _write_jsonl(log, [selection, _execution()])
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["data_quality"]["invariant_violations"] == 1
+    assert report["production"]["coverage"]["selected_rank_known"] == 1
+    assert report["production"]["selected_tool_alignment"]["mrr"]["value"] == 1.0
 
 
 def test_unknown_future_ranker_skips_v1_score_parity(tmp_path: Path) -> None:
