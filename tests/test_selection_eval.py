@@ -165,6 +165,229 @@ def test_bad_schema_marks_report_invalid(tmp_path: Path) -> None:
     assert report["data_quality"]["unsupported_schema_records"] == 1
 
 
+def _malformed_plus_good(malformed: dict) -> list[dict]:
+    """The bad row plus a well-formed pair, to pin that the scan continues (#854)."""
+    return [malformed, _execution(), _selection("sel-2"), _execution("sel-2")]
+
+
+@pytest.mark.parametrize(
+    ("bad_rank", "case"),
+    [
+        ("first", "non-numeric string"),
+        (None, "null"),
+        (True, "bool — used to pass as True == 1"),
+        (1.0, "integral float — used to be cast to 1"),
+        ("1", "numeric string — used to be cast to 1"),
+        (1.5, "fractional float — used to be truncated to 1"),
+        (0, "zero — would divide by zero in MRR"),
+        (-1, "negative — would score as a rank-1 hit"),
+        (10**400, "oversized — would overflow float()"),
+    ],
+)
+def test_admitted_record_with_unusable_rank_is_counted_not_raised(
+    tmp_path: Path, bad_rank: object, case: str
+) -> None:
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    selection["candidate_features"]["ranked_candidates"][0]["rank"] = bad_rank
+    _write_jsonl(log, _malformed_plus_good(selection))
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["status"] == "invalid", case
+    assert report["data_quality"]["invariant_violations"] == 1
+    # The bad row still ranks, but contributes no selected rank; sel-2 does.
+    assert report["production"]["coverage"]["rankable_selections"] == 2
+    assert report["production"]["coverage"]["selected_rank_known"] == 1
+    assert report["production"]["coverage"]["paired_selections"] == 2
+    # An unusable rank is an alignment miss, not a dropped denominator, and it
+    # never reaches the 1/rank mean.
+    alignment = report["production"]["selected_tool_alignment"]
+    assert alignment["at_1"] == {"value": 0.5, "numerator": 1, "denominator": 2}
+    assert alignment["mrr"] == {"value": 1.0, "denominator": 1}
+
+
+def test_admitted_record_with_unhashable_candidate_tools_is_counted_not_raised(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    # Both real tools stay listed so the only violation is the non-str element.
+    selection["candidate_tools"] = ["demo__search", "demo__write", {"nested": 1}]
+    selection["candidate_count"] = 3
+    _write_jsonl(log, _malformed_plus_good(selection))
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["status"] == "invalid"
+    assert report["data_quality"]["invariant_violations"] == 1
+    assert report["production"]["coverage"]["rankable_selections"] == 2
+    assert report["production"]["coverage"]["paired_selections"] == 2
+
+
+def test_selected_tool_outside_candidate_tools_scores_as_an_alignment_miss(
+    tmp_path: Path,
+) -> None:
+    """A rank for a tool the record never offered is not a rank we can trust."""
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    selection["candidate_tools"] = ["demo__write", "demo__other"]
+    _write_jsonl(log, _malformed_plus_good(selection))
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["status"] == "invalid"
+    assert report["production"]["coverage"]["rankable_selections"] == 2
+    assert report["production"]["coverage"]["selected_rank_known"] == 1
+    assert report["production"]["selected_tool_alignment"]["mrr"]["denominator"] == 1
+
+
+def test_duplicate_selected_tool_entry_does_not_overwrite_the_first_rank(
+    tmp_path: Path,
+) -> None:
+    """The duplicate is itself a violation, so its rank must not win."""
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    selection["candidate_features"]["ranked_candidates"].append(
+        {
+            "tool": "demo__search",
+            "rank": 3,
+            "relevance_score": 0.1,
+            "risk_penalty": 0.0,
+            "final_score": 0.1,
+        }
+    )
+    _write_jsonl(log, [selection, _execution()])
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["data_quality"]["invariant_violations"] == 1
+    # The first, valid rank stands, so the numbers improve rather than drop:
+    # main recorded the duplicate's rank 3 (MRR 0.33, at_1 a miss).
+    alignment = report["production"]["selected_tool_alignment"]
+    assert alignment["mrr"] == {"value": 1.0, "denominator": 1}
+    assert alignment["at_1"]["numerator"] == 1
+    assert report["production"]["coverage"]["selected_rank_known"] == 1
+
+
+def test_malformed_sibling_entry_does_not_erase_a_valid_selected_rank(
+    tmp_path: Path,
+) -> None:
+    """Only the selected tool's own entry decides its rank."""
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    selection["candidate_features"]["ranked_candidates"][1]["rank"] = "two"
+    _write_jsonl(log, [selection, _execution()])
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["data_quality"]["invariant_violations"] == 1
+    assert report["production"]["coverage"]["selected_rank_known"] == 1
+    assert report["production"]["selected_tool_alignment"]["mrr"]["value"] == 1.0
+
+
+def test_absent_rank_key_is_counted_not_raised(tmp_path: Path) -> None:
+    """An absent key is a distinct input class from a null value: it hit KeyError."""
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    del selection["candidate_features"]["ranked_candidates"][0]["rank"]
+    _write_jsonl(log, _malformed_plus_good(selection))
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["status"] == "invalid"
+    assert report["data_quality"]["invariant_violations"] == 1
+    assert report["production"]["coverage"]["selected_rank_known"] == 1
+
+
+def test_unusable_rank_on_a_non_selected_entry_is_still_counted(tmp_path: Path) -> None:
+    """The violation does not depend on the entry being the selected one."""
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    selection["candidate_features"]["ranked_candidates"][1]["rank"] = 2.0
+    _write_jsonl(log, [selection, _execution()])
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["status"] == "invalid"
+    assert report["data_quality"]["invariant_violations"] == 1
+    # The selected entry is untouched, so its rank still reaches the metrics.
+    assert report["production"]["coverage"]["selected_rank_known"] == 1
+    assert report["production"]["selected_tool_alignment"]["mrr"]["value"] == 1.0
+
+
+def test_unhashable_candidate_with_a_count_mismatch_is_counted_once(tmp_path: Path) -> None:
+    """A count mismatch short-circuits before `set()`, so this never crashed."""
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    # candidate_count stays 2 while the list grows to 3.
+    selection["candidate_tools"] = ["demo__search", "demo__write", {"x": 1}]
+    _write_jsonl(log, [selection, _execution()])
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["status"] == "invalid"
+    assert report["data_quality"]["invariant_violations"] == 1
+    assert report["production"]["coverage"]["selected_rank_known"] == 1
+
+
+def test_container_shape_violations_are_unchanged_by_the_entry_gate(tmp_path: Path) -> None:
+    """`entry_ok` governs entries; the containers around them keep their own paths."""
+    not_a_dict = _selection()
+    not_a_dict["candidate_features"]["ranked_candidates"][0] = "not-a-dict"
+    log = tmp_path / "entry.jsonl"
+    _write_jsonl(log, [not_a_dict, _execution()])
+    entry_report = evaluate_selection(telemetry_path=log).data
+
+    not_a_list = _selection()
+    not_a_list["candidate_features"]["ranked_candidates"] = "not-a-list"
+    other = tmp_path / "container.jsonl"
+    _write_jsonl(other, [not_a_list, _execution()])
+    container_report = evaluate_selection(telemetry_path=other).data
+
+    assert entry_report["data_quality"]["invariant_violations"] == 1
+    assert entry_report["production"]["coverage"]["rankable_selections"] == 1
+    # A non-list container never reaches the entry loop at all: no violation.
+    assert container_report["status"] == "ok"
+    assert container_report["data_quality"]["invariant_violations"] == 0
+    assert container_report["production"]["coverage"]["rankable_selections"] == 0
+
+
+def test_hashable_non_string_candidate_tool_is_counted(tmp_path: Path) -> None:
+    """A non-string element is a violation whether or not set() chokes on it."""
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    # Hashable, so this never crashed — it was silently accepted (status "ok").
+    selection["candidate_tools"] = ["demo__search", "demo__write", 42]
+    selection["candidate_count"] = 3
+    _write_jsonl(log, [selection, _execution()])
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["status"] == "invalid"
+    assert report["data_quality"]["invariant_violations"] == 1
+
+
+def test_non_string_tool_matching_selected_tool_yields_no_rank(tmp_path: Path) -> None:
+    """Equality with `selected_tool` does not make a non-string tool rankable."""
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    selection["selected_tool"] = 42
+    selection["candidate_tools"] = ["demo__search", "demo__write", 42]
+    selection["candidate_count"] = 3
+    selection["candidate_features"]["ranked_candidates"][0]["tool"] = 42
+    _write_jsonl(log, [selection, _execution()])
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["status"] == "invalid"
+    # Two gates fire: the non-string candidate element and the non-string tool.
+    assert report["data_quality"]["invariant_violations"] == 2
+    assert report["production"]["coverage"]["rankable_selections"] == 1
+    assert report["production"]["coverage"]["selected_rank_known"] == 0
+    assert report["production"]["selected_tool_alignment"]["mrr"]["denominator"] == 0
+
+
 def test_unknown_future_ranker_skips_v1_score_parity(tmp_path: Path) -> None:
     log = tmp_path / "selection.jsonl"
     selection = _selection()

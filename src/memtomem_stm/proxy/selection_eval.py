@@ -633,8 +633,10 @@ def _observed_telemetry(records: list[dict[str, Any]], quality: dict[str, Any]) 
         if not isinstance(candidate_tools, list) or not isinstance(reject, dict):
             invariant_violations += 1
             continue
-        if selection.get("candidate_count") != len(candidate_tools) or set(candidate_tools) & set(
-            reject
+        if (
+            any(not isinstance(name, str) for name in candidate_tools)
+            or selection.get("candidate_count") != len(candidate_tools)
+            or set(candidate_tools) & set(reject)
         ):
             invariant_violations += 1
         for reason in reject.values():
@@ -652,12 +654,19 @@ def _observed_telemetry(records: list[dict[str, Any]], quality: dict[str, Any]) 
                         invariant_violations += 1
                         break
                     tool = entry.get("tool")
-                    if (
-                        not isinstance(tool, str)
-                        or tool in seen_tools
-                        or tool not in candidate_tools
-                        or entry.get("rank") != expected_rank
-                    ):
+                    rank = entry.get("rank")
+                    # An entry only earns a place in the alignment metrics when its
+                    # whole shape holds: `rank` feeds 1/rank, so a rank we have just
+                    # declared untrustworthy must not reach it (#854).
+                    entry_ok = (
+                        isinstance(tool, str)
+                        and tool not in seen_tools
+                        and tool in candidate_tools
+                        and isinstance(rank, int)
+                        and not isinstance(rank, bool)
+                        and rank == expected_rank
+                    )
+                    if not entry_ok:
                         invariant_violations += 1
                     seen_tools.add(str(tool))
                     expected_rank += 1
@@ -676,8 +685,8 @@ def _observed_telemetry(records: list[dict[str, Any]], quality: dict[str, Any]) 
                         expected = round(float(relevance) * (1.0 - float(penalty)), 6)
                         if abs(expected - float(final)) > 1e-6:
                             parity_mismatches += 1
-                    if tool == selection.get("selected_tool"):
-                        selected_rank = int(entry["rank"])
+                    if entry_ok and tool == selection.get("selected_tool"):
+                        selected_rank = rank
                 rankable += 1
                 if selected_rank is not None:
                     selected_ranks.append(selected_rank)
