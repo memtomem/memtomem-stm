@@ -66,7 +66,7 @@ Commands:
   prune      Remove direct registrations for STM upstreams that are...
   register   Register memtomem-stm with an MCP client.
   remove     Remove an upstream MCP server from the proxy configuration.
-  selection  Replay and evaluate tool-selection telemetry.
+  selection  Replay, evaluate, and label tool-selection telemetry.
   stats      Show proxy compression and surfacing stats from the...
   status     Show proxy gateway config summary (path, enabled flag,...
   surfacing  Toggle proactive memory surfacing for an upstream server.
@@ -665,6 +665,60 @@ sanitized 30-case corpus, evaluates all 35 combinations of the two existing
 risk-penalty weights, and emits a safety-first configuration preview. It never
 applies that preview. See [Offline Tool-Selection Evaluation](selection-evaluation.md)
 for metric, split, privacy, and CI-golden details.
+
+## `mms selection feedback` — label one recorded selection
+
+```text
+Usage: mms selection feedback [OPTIONS]
+
+Options:
+  --config TEXT                   [default: (~/.memtomem/stm_proxy.json)]
+  --log FILE                      Selection JSONL path; overrides
+                                  selection_telemetry.path.
+  --selection-id TEXT             Label this exact selection.
+  --last                          Label the most recent selection (optionally
+                                  filtered by --server/--tool).
+  --server TEXT                   With --last: only consider selections from
+                                  this upstream.
+  --tool TEXT                     With --last: only consider this prefixed
+                                  tool name.
+  --user-corrected / --no-user-corrected
+                                  Record that the selection was (or was not)
+                                  corrected by the user.
+  --operator-override / --no-operator-override
+                                  Record that an operator overrode (or
+                                  accepted) the selection.
+  --active-only                   Resolve against the active log only,
+                                  excluding numeric rotated backups.
+  --json                          Output stable JSON for scripting.
+```
+
+The one writing command in this group, and the only producer of the selection
+log's `feedback` event. It appends a label that joins an existing `selection`
+by id; it never edits or rewrites existing records, and never rotates the log
+(the proxy owns rotation).
+
+Pass exactly one selector. `--selection-id` names the row — the id printed by
+`mms selection replay` or read out of the JSONL. `--last` resolves the most
+recent selection in append order, narrowed by `--server` / `--tool`, and prints
+which selection it resolved to before writing, so a wrong guess is caught by
+the person making the judgement.
+
+Both labels are three-valued. `--no-user-corrected` records that the selection
+was **right** — a positive example, which offline evaluation needs as much as
+the negative one — while omitting the flag records nothing for that field. At
+least one label is required. Several labels may accumulate for one selection;
+per field, a later non-null value supersedes an earlier one.
+
+With `--json`, stdout carries `{"action": "selection-feedback", "ok": true,
+"selection_id": ..., "trace_id": ..., "server": ..., "selected_tool": ...,
+"user_corrected": ..., "operator_override": ..., "log": ...}`. Failures keep
+exit 1 and emit `{"action": "selection-feedback", "ok": false, "error":
+"<code>", "message": ...}`, where `<code>` is `no_log` (no telemetry log at the
+resolved path), `not_found` / `no_match` (the selector resolved to nothing —
+checked *before* writing, so a typo never appends a label that joins to no
+selection), or `malformed_record` (the matched record carries no
+`selection_id`, reachable only on a hand-edited log).
 
 ## `mms hook` — built-in tool bridge + per-host registration
 

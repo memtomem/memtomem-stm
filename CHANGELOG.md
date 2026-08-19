@@ -13,6 +13,25 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- **`mms selection feedback` labels a recorded tool selection** (#853, part of
+  #469). The selection log's `feedback` event has been schema-pinned since #467
+  with nothing to produce it, so the learning stage had only the implicit
+  "which advertised tool did the model call" signal. This is its first
+  emitter: `mms selection feedback --selection-id <id>` labels a named row,
+  `--last [--server X] [--tool Y]` resolves the most recent selection in append
+  order and prints which one it resolved to before writing. Both labels are
+  three-valued — `--no-user-corrected` records that the selection was *right*,
+  which offline evaluation needs as much as the negative case, while omitting
+  the flag records nothing for that field. Resolution happens before the write,
+  so a mistyped id exits 1 (`not_found`) instead of appending a label that
+  joins to no selection. The label inherits the labelled selection's
+  `ranker_version` and `trace_id`, so it lands in that call's cohort rather
+  than the emitter's. Nothing on the proxy's call path emits this event and
+  nothing is planned to: the client model never sees a `selection_id`, so the
+  stream carries operator judgement at operator volume — ADR 0001 states that
+  and `tests/test_docs_sync.py` pins the emitter set by file, so a future
+  request-path emitter fails CI until the ADR is rewritten.
+
 - **Selection telemetry records the tool-graph's per-candidate facts, not just
   the risk score they produce** (#852, part of #469). Each entry in
   `candidate_features.ranked_candidates` gained a `graph_facts` object

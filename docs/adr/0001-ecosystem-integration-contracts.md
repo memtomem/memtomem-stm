@@ -120,10 +120,14 @@ Two statements the matrix makes explicit:
   parentage or linkage, and tracegraph rejects synthesized causality. An
   outbound-telemetry integration emits real spans; it does not repackage
   this log.
-- The selection log's `feedback` event is schema-pinned but has **no
-  production call site** (`SelectionTelemetryLog.log_feedback` exists and is
-  exercised by tests only). Any export built on this stream must state that
-  limitation rather than implying a complete learning signal.
+- The selection log's `feedback` event has exactly **one production call
+  site**, and it is not on the proxy's call path: `mms selection feedback`
+  (`src/memtomem_stm/cli/selection_cmd.py`), an operator labelling one
+  recorded selection by hand. Nothing in the request path can emit it — the
+  client model never sees a `selection_id` to reference — so the stream
+  carries operator judgement at operator volume, not a continuous user
+  signal. Any export built on it must state that, rather than implying a
+  complete learning signal.
 
 ## Deferral gates
 
@@ -152,9 +156,12 @@ Two statements the matrix makes explicit:
 - Peer-owned unversioned surfaces are visible as such in the matrix instead
   of being silently tolerated; versioning pressure on a peer (agent-guard)
   is an explicit gate criterion rather than an STM-side workaround.
-- The source paths this ADR names, and its "no production call site" claim
-  about `log_feedback`, are pinned by `tests/test_docs_sync.py`, so the
-  cheapest kinds of drift fail CI rather than aging in prose.
+- The source paths this ADR names, and its claim about which call sites emit
+  `log_feedback`, are pinned by `tests/test_docs_sync.py`, so the cheapest
+  kinds of drift fail CI rather than aging in prose. The pin enumerates the
+  emitters exactly: a second one appearing — in particular one on the request
+  path, which would change the nature of the signal — fails until this
+  paragraph is rewritten.
 
 ## References
 

@@ -26,7 +26,7 @@ from memtomem_stm.proxy.config import (
 )
 from memtomem_stm.proxy.manager import ProxyToolInfo
 from memtomem_stm.proxy.privacy import contains_sensitive_content
-from memtomem_stm.proxy.selection_log import SCHEMA_VERSION
+from memtomem_stm.proxy.selection_log import SCHEMA_VERSION, discover_log_files
 from memtomem_stm.proxy.tool_eligibility import ExposureCandidate, filter_tools
 from memtomem_stm.utils import json_out
 from memtomem_stm.proxy.tool_relevance import (
@@ -532,20 +532,10 @@ def _recommend_variant(
 
 
 def _discover_log_files(path: Path, include_rotated: bool) -> list[Path]:
-    if not include_rotated:
-        return [path] if path.exists() else []
-    backups: list[tuple[int, Path]] = []
-    if path.parent.exists():
-        prefix = path.name + "."
-        for candidate in path.parent.iterdir():
-            if candidate.name.startswith(prefix):
-                suffix = candidate.name[len(prefix) :]
-                if suffix.isdigit() and candidate.is_file():
-                    backups.append((int(suffix), candidate))
-    ordered = [candidate for _, candidate in sorted(backups, reverse=True)]
-    if path.exists():
-        ordered.append(path)
-    return ordered
+    """Which files make up the log — owned by ``selection_log`` since the
+    labelling command needs the same answer, and two copies of "oldest first"
+    would be free to drift."""
+    return discover_log_files(path, include_rotated=include_rotated)
 
 
 def _read_telemetry(

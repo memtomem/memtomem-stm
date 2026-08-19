@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from click.testing import CliRunner
 
 from memtomem_stm.proxy.config import (
     CompressionStrategy,
@@ -28,6 +29,8 @@ from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.proxy.selection_log import (
     RANKER_VERSION,
+    discover_log_files,
+    find_selection,
     SCHEMA_VERSION,
     SelectionTelemetryLog,
     _canonical_args,
@@ -810,3 +813,334 @@ class TestAggregateSelectionLog:
         _write_lines(p, [_sel()])
         agg = aggregate_selection_log(p)
         assert agg["cache"] == {"hit": 0, "miss": 0, "unknown": 0, "hit_rate": 0.0}
+
+
+# ── find_selection / discover_log_files (#469 labelling) ───────────────────
+
+
+class TestDiscoverLogFiles:
+    def test_orders_backups_oldest_first_then_active(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        for name in ("log.jsonl", "log.jsonl.1", "log.jsonl.2"):
+            (tmp_path / name).write_text("", encoding="utf-8")
+        assert [f.name for f in discover_log_files(p)] == [
+            "log.jsonl.2",
+            "log.jsonl.1",
+            "log.jsonl",
+        ]
+
+    def test_ignores_non_numeric_siblings(self, tmp_path):
+        # The numeric suffix space belongs to rotation; an operator's backup
+        # copy is not part of the log and must not be labelled through.
+        p = tmp_path / "log.jsonl"
+        p.write_text("", encoding="utf-8")
+        (tmp_path / "log.jsonl.bak").write_text("", encoding="utf-8")
+        (tmp_path / "log.jsonl.1").write_text("", encoding="utf-8")
+        assert [f.name for f in discover_log_files(p)] == ["log.jsonl.1", "log.jsonl"]
+
+    def test_active_only_excludes_backups(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        p.write_text("", encoding="utf-8")
+        (tmp_path / "log.jsonl.1").write_text("", encoding="utf-8")
+        assert discover_log_files(p, include_rotated=False) == [p]
+
+    def test_absent_active_file_is_not_returned(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        (tmp_path / "log.jsonl.1").write_text("", encoding="utf-8")
+        assert [f.name for f in discover_log_files(p)] == ["log.jsonl.1"]
+        assert discover_log_files(p, include_rotated=False) == []
+
+
+class TestFindSelection:
+    def test_by_id_finds_an_exact_record(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        _write_lines(p, [_sel(selection_id="a"), _sel(selection_id="b")])
+        assert find_selection(p, selection_id="b")["selection_id"] == "b"
+
+    def test_by_id_misses_return_none(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        _write_lines(p, [_sel(selection_id="a")])
+        assert find_selection(p, selection_id="zz") is None
+
+    def test_last_match_wins_in_append_order(self, tmp_path):
+        """Append order, not ``ts``: wall clock can step backwards.
+
+        The records below carry a ``ts`` that decreases down the file, so a
+        ts-ordered implementation would pick the FIRST one and label the wrong
+        selection.
+        """
+        p = tmp_path / "log.jsonl"
+        _write_lines(
+            p,
+            [
+                _sel(selection_id="old", ts=500.0),
+                _sel(selection_id="new", ts=100.0),
+            ],
+        )
+        assert find_selection(p)["selection_id"] == "new"
+
+    def test_filters_by_server_and_tool(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        _write_lines(
+            p,
+            [
+                _sel(selection_id="a", server="gh", selected_tool="gh__create"),
+                _sel(selection_id="b", server="gh", selected_tool="gh__list"),
+                _sel(selection_id="c", server="fs", selected_tool="fs__read"),
+            ],
+        )
+        assert find_selection(p, tool="gh__create")["selection_id"] == "a"
+        assert find_selection(p, server="gh")["selection_id"] == "b"
+        assert find_selection(p, server="fs")["selection_id"] == "c"
+        assert find_selection(p, server="gh", tool="fs__read") is None
+
+    def test_rotated_backups_are_searched_oldest_first(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        _write_lines(tmp_path / "log.jsonl.1", [_sel(selection_id="rotated")])
+        _write_lines(p, [_sel(selection_id="active")])
+        assert find_selection(p)["selection_id"] == "active"
+        assert find_selection(p, selection_id="rotated")["selection_id"] == "rotated"
+        # --active-only narrows to the live file: the rotated row is then
+        # unreachable rather than silently resolved.
+        assert find_selection(p, selection_id="rotated", include_rotated=False) is None
+
+    def test_skips_malformed_and_other_events(self, tmp_path):
+        p = tmp_path / "log.jsonl"
+        _write_lines(
+            p,
+            [
+                _sel(selection_id="good"),
+                "{ not json",
+                "[1,2,3]",
+                _exec(selection_id="exec-not-a-selection"),
+                {"event": "feedback", "selection_id": "fb"},
+            ],
+        )
+        assert find_selection(p)["selection_id"] == "good"
+
+    def test_absent_log_returns_none(self, tmp_path):
+        assert find_selection(tmp_path / "nope.jsonl") is None
+
+
+class TestFeedbackRecord:
+    def test_ranker_version_mirrors_the_labelled_selection(self, tmp_path):
+        """A label belongs to the cohort of the call it labels.
+
+        Stamping the emitter's own baseline would file every label under
+        ``v0-passthrough`` the moment replay splits feedback by this field —
+        a claim about a ranker that never ran for that call.
+        """
+        log = SelectionTelemetryLog(tmp_path / "log.jsonl")
+        log.initialize()
+        log.log_feedback(selection_id="s1", ranker_version="v3-bm25-graph-risk-penalty")
+        record = json.loads((tmp_path / "log.jsonl").read_text(encoding="utf-8").strip())
+        assert record["ranker_version"] == "v3-bm25-graph-risk-penalty"
+
+    def test_ranker_version_defaults_to_the_baseline(self, tmp_path):
+        log = SelectionTelemetryLog(tmp_path / "log.jsonl")
+        log.initialize()
+        log.log_feedback(selection_id="s1", user_corrected=True)
+        record = json.loads((tmp_path / "log.jsonl").read_text(encoding="utf-8").strip())
+        assert record["ranker_version"] == RANKER_VERSION
+
+
+# ── ``mms selection feedback`` (the log's one production emitter, #469) ────
+
+
+def _seed_log(path: Path, *, rows: list[dict]) -> None:
+    log = SelectionTelemetryLog(path)
+    log.initialize()
+    for row in rows:
+        log.log_selection(
+            server=row["server"],
+            selected_tool=row["tool"],
+            candidate_tools=[row["tool"]],
+            arguments={"q": "x"},
+            trace_id=row.get("trace_id"),
+            ranker_version=row.get("ranker_version"),
+        )
+
+
+def _feedback_records(path: Path) -> list[dict]:
+    return [
+        record
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+        for record in [json.loads(line)]
+        if record.get("event") == "feedback"
+    ]
+
+
+def _run_feedback(tmp_path: Path, log_path: Path, *args: str):
+    from memtomem_stm.cli.proxy import cli
+
+    return CliRunner().invoke(
+        cli,
+        [
+            "selection",
+            "feedback",
+            "--log",
+            str(log_path),
+            "--config",
+            str(tmp_path / "absent-proxy.json"),
+            *args,
+        ],
+    )
+
+
+class TestSelectionFeedbackCommand:
+    def test_last_labels_the_most_recent_selection(self, tmp_path):
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(
+            log_path,
+            rows=[
+                {"server": "gh", "tool": "gh__a", "trace_id": "t1"},
+                {"server": "gh", "tool": "gh__b", "trace_id": "t2"},
+            ],
+        )
+        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected")
+        assert result.exit_code == 0, result.output
+        records = _feedback_records(log_path)
+        assert len(records) == 1
+        assert records[0]["user_corrected"] is True
+        assert records[0]["operator_override"] is None
+        assert records[0]["trace_id"] == "t2"
+        # The resolved selection is echoed, so a wrong guess is visible to the
+        # person making the judgement instead of landing silently.
+        assert "gh__b" in result.output
+
+    def test_filters_narrow_which_selection_is_labelled(self, tmp_path):
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(
+            log_path,
+            rows=[
+                {"server": "gh", "tool": "gh__a"},
+                {"server": "fs", "tool": "fs__read"},
+            ],
+        )
+        result = _run_feedback(
+            tmp_path, log_path, "--last", "--tool", "gh__a", "--operator-override"
+        )
+        assert result.exit_code == 0, result.output
+        assert "gh__a" in result.output
+        assert _feedback_records(log_path)[0]["operator_override"] is True
+
+    def test_false_label_is_recorded_not_omitted(self, tmp_path):
+        """``--no-user-corrected`` is a positive example, not a missing one."""
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        result = _run_feedback(tmp_path, log_path, "--last", "--no-user-corrected")
+        assert result.exit_code == 0, result.output
+        assert _feedback_records(log_path)[0]["user_corrected"] is False
+
+    def test_label_inherits_the_selection_cohort(self, tmp_path):
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(
+            log_path,
+            rows=[{"server": "gh", "tool": "gh__a", "ranker_version": "v1-bm25-tool-relevance"}],
+        )
+        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected")
+        assert result.exit_code == 0, result.output
+        assert _feedback_records(log_path)[0]["ranker_version"] == "v1-bm25-tool-relevance"
+
+    def test_unknown_id_writes_nothing(self, tmp_path):
+        """Resolution precedes the write: a typo must not append a dead label.
+
+        A feedback record joining no selection is indistinguishable from one
+        whose selection the redaction screen dropped, so it would corrupt the
+        very join it exists to feed.
+        """
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        result = _run_feedback(
+            tmp_path, log_path, "--selection-id", "deadbeef", "--user-corrected", "--json"
+        )
+        assert result.exit_code == 1
+        assert json.loads(result.output)["error"] == "not_found"
+        assert _feedback_records(log_path) == []
+
+    def test_no_match_for_filters_writes_nothing(self, tmp_path):
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        result = _run_feedback(
+            tmp_path, log_path, "--last", "--server", "nope", "--user-corrected", "--json"
+        )
+        assert result.exit_code == 1
+        assert json.loads(result.output)["error"] == "no_match"
+        assert _feedback_records(log_path) == []
+
+    def test_absent_log_is_a_stable_error_code(self, tmp_path):
+        result = _run_feedback(
+            tmp_path, tmp_path / "nope.jsonl", "--last", "--user-corrected", "--json"
+        )
+        assert result.exit_code == 1
+        assert json.loads(result.output)["error"] == "no_log"
+
+    def test_json_result_document(self, tmp_path):
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a", "trace_id": "t9"}])
+        result = _run_feedback(
+            tmp_path, log_path, "--last", "--user-corrected", "--no-operator-override", "--json"
+        )
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["action"] == "selection-feedback"
+        assert payload["ok"] is True
+        assert payload["server"] == "gh"
+        assert payload["selected_tool"] == "gh__a"
+        assert payload["trace_id"] == "t9"
+        assert payload["user_corrected"] is True
+        assert payload["operator_override"] is False
+        assert payload["selection_id"] == _feedback_records(log_path)[0]["selection_id"]
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["--last", "--selection-id", "x", "--user-corrected"],
+            ["--user-corrected"],
+            ["--last"],
+            ["--selection-id", "x", "--server", "gh", "--user-corrected"],
+        ],
+        ids=["both_selectors", "no_selector", "no_label", "filter_without_last"],
+    )
+    def test_usage_errors(self, tmp_path, args):
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        result = _run_feedback(tmp_path, log_path, *args)
+        assert result.exit_code == 2, result.output
+        assert _feedback_records(log_path) == []
+
+    def test_labels_accumulate_for_one_selection(self, tmp_path):
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        assert _run_feedback(tmp_path, log_path, "--last", "--user-corrected").exit_code == 0
+        assert _run_feedback(tmp_path, log_path, "--last", "--operator-override").exit_code == 0
+        records = _feedback_records(log_path)
+        assert len(records) == 2
+        # Same selection, one field each — the reader folds them.
+        assert records[0]["selection_id"] == records[1]["selection_id"]
+
+    def test_active_only_cannot_reach_a_rotated_selection(self, tmp_path):
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(tmp_path / "log.jsonl.1", rows=[{"server": "gh", "tool": "gh__rotated"}])
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__active"}])
+        result = _run_feedback(
+            tmp_path,
+            log_path,
+            "--last",
+            "--tool",
+            "gh__rotated",
+            "--user-corrected",
+            "--active-only",
+            "--json",
+        )
+        assert result.exit_code == 1
+        assert json.loads(result.output)["error"] == "no_match"
+        # Positive control: without --active-only the same row resolves, so the
+        # miss above is the flag doing its job and not a broken filter.
+        assert (
+            _run_feedback(
+                tmp_path, log_path, "--last", "--tool", "gh__rotated", "--user-corrected"
+            ).exit_code
+            == 0
+        )

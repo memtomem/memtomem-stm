@@ -39,9 +39,15 @@ sorted, so a replay harness can stream-parse and diff runs:
 
 ``feedback``
     ``selection_id`` (+ optional ``trace_id``), ``user_corrected``,
-    ``operator_override``, ``ts``. Schema is pinned here and by tests,
-    but nothing in the proxy emits it yet — emitters arrive with their
-    signal sources (e.g. an operator-facing rating tool).
+    ``operator_override``, ``ts``. Both label fields are three-valued:
+    ``false`` records that the selection was RIGHT (a positive example),
+    ``null`` records nothing for that field. ``ranker_version`` mirrors the
+    labelled selection's stamp, not the emitter's. Written by
+    ``mms selection feedback`` (#469), the operator-facing labelling command;
+    nothing on the proxy's call path emits it, because the client model never
+    sees a ``selection_id`` to reference. Labels join their selection
+    left-outer, like executions, and several may accumulate for one
+    selection — a later non-null value supersedes an earlier one per field.
 
 Redaction policy is structural, not filter-based: no field ever carries
 raw arguments, results, prompts, resource URIs, or error message strings —
@@ -292,11 +298,20 @@ class SelectionTelemetryLog:
         trace_id: str | None = None,
         user_corrected: bool | None = None,
         operator_override: bool | None = None,
+        ranker_version: str | None = None,
     ) -> None:
+        """Record a label for one selection.
+
+        ``ranker_version`` must be the stamp of the selection being labelled,
+        not this process's: every record is self-describing, and a label that
+        claims the unranked baseline while pointing at a ranked selection would
+        put itself in the wrong cohort the moment replay splits feedback by
+        this field. The emitter reads it off the record it resolved.
+        """
         self._append(
             {
                 "schema_version": SCHEMA_VERSION,
-                "ranker_version": RANKER_VERSION,
+                "ranker_version": ranker_version or RANKER_VERSION,
                 "event": "feedback",
                 "ts": time.time(),
                 "selection_id": selection_id,
@@ -390,6 +405,90 @@ class SelectionTelemetryLog:
             if src.exists():
                 src.replace(self._path.with_name(f"{self._path.name}.{i + 1}"))
         self._path.replace(self._path.with_name(f"{self._path.name}.1"))
+
+
+def discover_log_files(path: Path | str, *, include_rotated: bool = True) -> list[Path]:
+    """The files that make up one selection log, oldest first.
+
+    Rotation names backups ``<log>.1`` … ``<log>.N`` with ``.1`` the *newest*
+    backup, so ordering by descending numeric suffix and appending the active
+    file yields append order across the whole history — which is what "the most
+    recent selection" means to a reader. Non-numeric siblings are ignored: the
+    suffix space belongs to rotation, and an operator's ``.bak`` copy is not
+    part of the log.
+
+    Shared by the replay harness and ``mms selection feedback`` so the two
+    cannot disagree about which files are the log.
+    """
+    path = Path(path).expanduser()
+    if not include_rotated:
+        return [path] if path.exists() else []
+    backups: list[tuple[int, Path]] = []
+    if path.parent.exists():
+        prefix = path.name + "."
+        for candidate in path.parent.iterdir():
+            if candidate.name.startswith(prefix):
+                suffix = candidate.name[len(prefix) :]
+                if suffix.isdigit() and candidate.is_file():
+                    backups.append((int(suffix), candidate))
+    ordered = [candidate for _, candidate in sorted(backups, reverse=True)]
+    if path.exists():
+        ordered.append(path)
+    return ordered
+
+
+def find_selection(
+    path: Path | str,
+    *,
+    selection_id: str | None = None,
+    server: str | None = None,
+    tool: str | None = None,
+    include_rotated: bool = True,
+) -> dict[str, Any] | None:
+    """Locate one ``selection`` record, or ``None``.
+
+    With *selection_id*, returns that exact record. Otherwise returns the most
+    recent selection matching the optional *server* / *tool* filters, where
+    "most recent" is **append order** (see :func:`discover_log_files`) rather
+    than the ``ts`` field: ``ts`` is wall clock and a clock step backwards
+    would reorder history, while append order is what actually happened.
+
+    Malformed lines are skipped, not raised on — the same posture as
+    :func:`aggregate_selection_log`, because a hand-edited or half-written log
+    must not make labelling impossible.
+
+    *tool* matches ``selected_tool``, the prefixed name the client called, so
+    it uses the same vocabulary an operator reads out of a report.
+    """
+    match: dict[str, Any] | None = None
+    for log_path in discover_log_files(path, include_rotated=include_rotated):
+        try:
+            with log_path.open("r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(record, dict) or record.get("event") != "selection":
+                        continue
+                    if selection_id is not None:
+                        if record.get("selection_id") == selection_id:
+                            return record
+                        continue
+                    if server is not None and record.get("server") != server:
+                        continue
+                    if tool is not None and record.get("selected_tool") != tool:
+                        continue
+                    # Keep scanning: the LAST match in append order wins.
+                    match = record
+        except OSError:
+            # An unreadable segment is skipped rather than fatal — the active
+            # file is usually the one being labelled, and a stale backup whose
+            # permissions changed must not block that.
+            continue
+    return match
 
 
 def _top(counter: Counter[str], n: int) -> list[list[Any]]:

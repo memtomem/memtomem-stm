@@ -82,11 +82,27 @@ stamp.
 | `cache_hit` | `true` when the result was served from the proxy response cache, `false` on a live upstream call, `null` when a raise escaped before the hit/miss was attributable |
 | `retry_count`, `cost` | reserved `null` |
 
-### `feedback` — schema pinned, no emitter yet
+### `feedback` — operator labels
 
-`selection_id`, optional `trace_id`, `user_corrected`, `operator_override`.
-Nothing in the proxy produces this signal today; emitters arrive with their
-signal sources (e.g. an operator-facing rating tool).
+`selection_id`, optional `trace_id`, `user_corrected`, `operator_override`,
+plus the labelled selection's own `ranker_version` (a label belongs to the
+cohort of the call it labels, not to whatever ranker the emitter was built
+against).
+
+Both label fields are three-valued: `true` and `false` are both *labels* —
+`false` records that the selection was right, which offline evaluation needs
+as much as the negative case — while `null` records nothing for that field.
+Several records may accumulate for one selection; a reader folds them per
+field, later non-null values superseding earlier ones.
+
+Written by [`mms selection feedback`](cli.md#mms-selection-feedback--label-one-recorded-selection),
+the operator labelling command, and by nothing else. **Nothing on the proxy's
+call path emits this event**, and that is structural rather than pending: the
+client model never sees a `selection_id` to reference, and surfacing one would
+mean appending an identifier to every proxied response — paid on every call for
+an event that is rare, and served stale out of the response cache on a hit. So
+this stream carries operator judgement at operator volume; anything built on it
+must not read it as a continuous user signal.
 
 ## Tool-relevance ranking (#466 v0)
 

@@ -1923,11 +1923,17 @@ def test_otlp_export_doc_matches_the_shipped_span_vocabulary() -> None:
 def test_adr_0001_cited_paths_and_call_site_claim_hold() -> None:
     """ADR 0001's cited repo paths exist and its ``log_feedback`` claim is true.
 
-    The ADR names concrete repo paths and asserts the selection log's
-    ``feedback`` event has no production call site. Both statements rot
-    silently when code moves; pin them here so the ADR fails CI instead of
-    aging in prose. The explicit expected set below makes a regex miss loud:
-    coverage cannot silently shrink to an easier subset of citations.
+    The ADR names concrete repo paths and states exactly which call sites emit
+    the selection log's ``feedback`` event — since #469, the operator labelling
+    command and nothing else. Both statements rot silently when code moves;
+    pin them here so the ADR fails CI instead of aging in prose. The explicit
+    expected set below makes a regex miss loud: coverage cannot silently shrink
+    to an easier subset of citations.
+
+    The emitter set is pinned by FILE rather than by count, because the claim
+    the ADR makes is about *where* the signal comes from: an emitter added on
+    the proxy's request path would change the stream from operator judgement to
+    a continuous signal, which is the thing an export must not misrepresent.
     """
     body = _read("docs/adr/0001-ecosystem-integration-contracts.md")
 
@@ -1938,6 +1944,7 @@ def test_adr_0001_cited_paths_and_call_site_claim_hold() -> None:
     }
     expected = {
         "CLAUDE.md",
+        "src/memtomem_stm/cli/selection_cmd.py",
         "src/memtomem_stm/data/policy-bundle.schema.json",
         "src/memtomem_stm/data/toolgraph-contract-v1/",
         "src/memtomem_stm/observability/otlp.py",
@@ -1968,9 +1975,12 @@ def test_adr_0001_cited_paths_and_call_site_claim_hold() -> None:
             name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
             if name == "log_feedback":
                 callers.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}")
-    assert callers == [], (
-        f"ADR 0001 claims log_feedback has no production call site, found {callers}; "
-        "update the ADR's matrix note alongside this pin"
+    emitting_files = {caller.rsplit(":", 1)[0] for caller in callers}
+    assert emitting_files == {"src/memtomem_stm/cli/selection_cmd.py"}, (
+        f"ADR 0001 states log_feedback is emitted only by the operator labelling "
+        f"command; found emitters in {sorted(emitting_files)} (call sites: {callers}). "
+        "Update the ADR's matrix note alongside this pin — and if the new emitter "
+        "is on the request path, say so, because that changes what the stream is."
     )
 
 
