@@ -245,6 +245,23 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **`mms selection replay` no longer crashes on a malformed row it admits**
+  (#855, closes #854). Three schema-v1 selection records reached the operator
+  as a traceback instead of a report: a `ranked_candidates[].rank` that is a
+  string or `null` hit `int()`, and a `candidate_tools` list holding a
+  non-string element hit `set()`. The evaluator already counts a record whose
+  shape does not hold in `invariant_violations` and keeps scanning; these
+  three coerced before validating and escaped that path, and the CLI catches
+  only `SelectionEvaluationError`. Both sites now validate first, so one
+  unreadable row is a line in the report rather than the end of the run — the
+  record still counts toward `rankable_selections` but not
+  `selected_rank_known`. **Behavior change**: `rank: true` previously passed
+  the invariant check (`True == 1`) and was recorded as rank 1; it is now
+  counted as a violation, so a log carrying one reports `status: invalid` and
+  the command exits 1 where it previously exited 0. Not reachable from STM's
+  own writer, which always stamps an integer rank; reachable from hand-edited
+  logs and other producers.
+
 - **An untyped `--config` now honors `MEMTOMEM_STM_PROXY__CONFIG_PATH`**
   (#849, closes #848). Every `--config` option defaulted to the literal
   `~/.memtomem/stm_proxy.json`, so with the env var exported and no flag typed
