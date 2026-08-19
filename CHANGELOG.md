@@ -13,6 +13,133 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- **`mms selection feedback` labels a recorded tool selection** (#853, part of
+  #469). The selection log's `feedback` event has been schema-pinned since #467
+  with nothing to produce it, so the learning stage had only the implicit
+  "which advertised tool did the model call" signal. This is its first
+  emitter: `mms selection feedback --selection-id <id>` labels a named row,
+  `--last [--server X] [--tool Y]` resolves the most recent *labellable*
+  selection in append order — a row it would refuse by id is skipped, so the
+  answer can be older than the newest line — and prints which one it resolved
+  to before writing. Both labels are
+  three-valued — `--no-user-corrected` records that the selection was *right*,
+  which offline evaluation needs as much as the negative case, while omitting
+  both forms records nothing for that field, and passing both is a usage error
+  rather than last-flag-wins. Resolution happens before the write, so a
+  mistyped id exits 1 (`not_found`) instead of appending a label that joins to
+  no selection; `--last` additionally prints the resolved selection and asks
+  for confirmation, and refuses non-interactively — a pipe, CI, or `--json` —
+  without `--yes` (exit 2, `confirmation_required`) rather than prompting where
+  nobody can answer or writing unasked. The command reports whether the label
+  actually reached disk — the sink swallows write faults so a telemetry problem
+  cannot break a proxied call, so a failed or redacted append exits 1
+  (`write_failed` / `write_redacted`) instead of claiming success — including
+  a short `os.write` that could not be repaired, which writes no record (the
+  unparseable fragment it leaves stays put: rolling it back would rewind a file
+  the proxy appends to concurrently). A short write missing *only* its trailing
+  newline is the exception: the byte is restored, the record is complete and
+  readable, and reporting a failure would invite a retry that duplicates the
+  label. Refused too is an append whose file was rotated away
+  underneath it, which is detected rather than prevented (see below). The label's
+  append is durable, unlike the call-path emitters': the descriptor — and the
+  directory entry too when the append created the log — is `fsync`-ed before
+  success is reported, so an unclean shutdown cannot swallow a judgement the
+  operator was told exists. When that flush or the following `close` fails,
+  the record's bytes are already complete in the file, so the command reports
+  `write_unconfirmed` (exit 1) and says a re-run is safe rather than picking
+  one of two verdicts it cannot support. Only rows the command can label
+  honestly are labellable: an unsupported `schema_version` (offline replay
+  drops those records outright) or a missing `ranker_version` (the label would
+  be filed under a cohort the command invented) exits 1 (`unusable_record`) and
+  is skipped by `--last`. The `stm_selection_stats` aggregate frames lines the
+  same way too, reading raw bytes rather than decoded text, so a record
+  truncated mid-character is counted as malformed and skipped instead of
+  raising `UnicodeDecodeError` — which is not an `OSError`, and so escaped the
+  one guard that observability path had. Both readers
+  now load the log through one `TelemetryReader` — segment discovery, line framing, the size cut, decoding,
+  schema and event admission, and append-order stamping live there rather than
+  being re-derived on each side, after four review rounds in which the two
+  parted company over exactly those rules. Resolution therefore counts records
+  exactly as the replay loader does — parsed from raw bytes, so a record truncated
+  mid-character is skipped rather than repaired into a different string than
+  the one replay reads; the same maximum line length; the active file's
+  unterminated tail ignored, since that is a record still being written;
+  equal duplicates folded — equal as *records*, so `1` and `1.0` are one value
+  while `true` and `1` are not; and a `selection_id` whose copies disagree
+  refused (`unusable_record`), because replay discards that selection outright
+  and marks the run invalid — so the two cannot disagree about which selections
+  exist. The target is re-verified by identity, not mere presence, after the
+  confirmation: a copy landing in that window exits 1 (`selection_changed`)
+  rather than labelling a record the operator never saw. A segment that cannot
+  be *read* — not merely opened — refuses (`log_unreadable`) instead of being
+  skipped, since skipping the newest one would promote an older row to "most
+  recent". An append that finds
+  an unterminated last line now writes its own leading newline, so a crash
+  mid-record cannot fuse the next record onto the fragment and have it reported
+  as written. `--last` refuses without `--yes` when *either* stream is not a
+  terminal: with stdout piped the prompt and the resolved selection go into the
+  pipe while the command waits on an answer nobody was shown. Resolution
+  runs under an advisory rotation lock and the target is re-verified under it
+  after confirmation, so a rotation can neither rename segments mid-scan nor
+  evict the agreed selection before the write (`log_rotated` / `log_busy`,
+  nothing written). The writer takes that lock only when it has already decided
+  to rotate and defers instead of waiting, leaving the per-record append path
+  lock-free. A labelling session's hold on that lock — a whole
+  multi-segment scan, during which it destroys nothing — no longer makes an
+  over-threshold writer refuse every append for its duration. Separately, an
+  append can no longer be reported as written after rotation destroyed the file
+  it was writing to: the appender holds a descriptor, and `max_backups: 0`
+  unlinks that inode outright while every other setting evicts it once
+  `max_backups + 1` rotations have shifted it past the last backup slot. The
+  append now checks that its descriptor's inode still has a name before
+  reporting success, exiting 1 with `write_failed` when it does not and
+  `write_unconfirmed` when the probe could not run. On the call path that is a
+  detector rather than a guarantee — it describes the instant it ran — and it
+  turns a silent loss into a counted one for the price of one `fstat` and no
+  lock. The labelling command gets a stronger statement instead: its
+  append, its status check and its success report now all happen inside the
+  rotation guard it already took, giving a linearization point at the moment
+  success is emitted — when it prints `ok`, the label is in the log and no
+  rotation has intervened since the write. Not a promise about any later
+  instant, and scoped to writers that respect the advisory lock.
+  `stm_selection_stats`' `rotated_backups` no longer counts either lock file
+  (or any non-numeric sibling) as a backup. The label inherits the labelled selection's
+  `ranker_version` and `trace_id`, so it lands in that call's cohort rather
+  than the emitter's. Nothing on the proxy's call path emits this event and
+  nothing is planned to: the client model never sees a `selection_id`, so the
+  stream carries operator judgement at operator volume — ADR 0001 states that
+  and `tests/test_docs_sync.py` pins it by *reachability*: every scope in
+  `src/` that reaches `log_feedback` through any chain of identifier mentions
+  is enumerated, so a future request-path emitter fails CI until the ADR is
+  rewritten — including one that routes through the labelling command's own
+  append helper rather than naming the emitter. A name-and-alias walk, not call
+  or data flow: it over-approximates rather than under-approximates, and does
+  not see reflection.
+
+- **`mms selection replay` keeps a conflicting `selection_id` out for good**
+  (#853). Two copies of one id that disagree removed the selection and marked
+  the run invalid, but a *third* copy found an empty slot and reinstated it —
+  so a contradictory history could still be counted as one selection, with
+  whichever copy happened to arrive last standing for it. The id is now
+  poisoned monotonically, and every further copy is counted as a conflict.
+  `mms selection feedback` refuses to label the same ids, through the one
+  shared duplicate test (`records_conflict`) rather than a second opinion about
+  what a duplicate is — which also means numerically equal copies (`1` and
+  `1.0`) are one record to both, as they are in JSON.
+
+- **A proxy environment that was ignored entirely no longer reads as an unset
+  one** (#853). `collect_proxy_env_overrides` drops a bare
+  `MEMTOMEM_STM_PROXY` payload that is not valid JSON, or that decodes to
+  something other than an object — the server refuses to start on exactly that
+  environment — but the resulting overlay was indistinguishable from "the
+  operator set nothing", so `mms selection feedback` could fall back to the
+  default log and label a file nobody chose. `EnvOverlayResult` now records
+  those variables (`rejected`) and `load_from_file_with_status` reports them as
+  `env_error`, whether or not a config file exists, so the command refuses with
+  `config_invalid` and names the variable (never its value). A bare `null`
+  payload is unchanged: it resolves to the field defaults, which is what an
+  empty overlay already expresses.
+
 - **Selection telemetry records the tool-graph's per-candidate facts, not just
   the risk score they produce** (#852, part of #469). Each entry in
   `candidate_features.ranked_candidates` gained a `graph_facts` object

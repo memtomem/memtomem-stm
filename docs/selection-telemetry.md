@@ -36,10 +36,29 @@ file mode alone guards the content). When the log reaches `max_bytes` it
 rotates (`log → log.1 → … → log.N`, oldest dropped; `max_backups: 0`
 truncates instead). `sample_rate` keeps the given fraction of calls and
 applies to the selection+execution pair atomically — and a selection whose
-write failed also skips its execution event — so neither sampling nor write
-failures produce orphan halves.
+write was not confirmed also skips its execution event — so neither sampling
+nor write faults produce an **execution-only** record. That is the direction
+that matters: an execution referencing a selection no reader can find joins
+nothing. The reverse is possible and harmless — a selection whose append could
+not be confirmed leaves a selection with no execution, which is also what an
+in-flight call or a redacted execution produces, and replay already joins
+left-outer.
 
 ## Schema v1
+
+Every record is preceded by a blank line: the writer emits the newline in the
+same append as the record, so a record frames itself atomically whatever
+preceded it — including a fragment left by a crashed or short write, which the
+next record's leading newline closes. Blank lines carry no meaning; both
+built-in readers skip them, and a consumer parsing the file itself must do the
+same.
+
+Skipped is not the same as uncounted, and the two counts reported here mean
+different things. `stm_selection_stats`' `total_lines` counts *admitted* lines,
+so a log of five records reports five. The per-file `lines` in a replay report
+counts *physical* lines, blank ones included, because it numbers records for
+ordering — the same log reports ten. Each record therefore costs one extra byte
+on disk, which also brings `max_bytes` rotation forward by that much.
 
 One JSON object per line, keys sorted, every record self-describing via
 `schema_version` (bumped on any shape change — the exact key sets are pinned
@@ -82,11 +101,54 @@ stamp.
 | `cache_hit` | `true` when the result was served from the proxy response cache, `false` on a live upstream call, `null` when a raise escaped before the hit/miss was attributable |
 | `retry_count`, `cost` | reserved `null` |
 
-### `feedback` — schema pinned, no emitter yet
+### `feedback` — operator labels
 
-`selection_id`, optional `trace_id`, `user_corrected`, `operator_override`.
-Nothing in the proxy produces this signal today; emitters arrive with their
-signal sources (e.g. an operator-facing rating tool).
+`selection_id`, optional `trace_id`, `user_corrected`, `operator_override`,
+plus the labelled selection's own `ranker_version` (a label belongs to the
+cohort of the call it labels, not to whatever ranker the emitter was built
+against).
+
+Both label fields are three-valued: `true` and `false` are both *labels* —
+`false` records that the selection was right, which offline evaluation needs
+as much as the negative case — while `null` records nothing for that field.
+Several records may accumulate for one selection; a reader folds them per
+field, later non-null values superseding earlier ones.
+
+A label is a human judgement that exists nowhere else, so its append is
+*durable* — flushed to the storage device, and the directory entry with it when
+the append created the log, before the command reports success. The call-path
+emitters deliberately are not: their records are one sample among many that
+sampling may drop outright. A label the command could not confirm is reported as
+such rather than as a success or a failure, because its bytes are in the file
+either way. Two things can be unconfirmable — that the bytes survive a crash,
+and that a rotation did not orphan the file they went into — and they share one
+status because the operator's move is the same for both: re-run by
+`--selection-id`. Not "check whether the label is
+there": after a failed flush the record is visible and still not durable, so
+seeing it proves nothing about the thing that was unconfirmed. Repeating the
+label for one selection is the accumulate-and-supersede case above, so the
+retry is always safe.
+
+The command labels only rows it can label honestly. A selection whose
+`schema_version` is unsupported is one offline replay drops outright, so a
+label on it joins nothing; a selection carrying no `ranker_version` would have
+its label filed under a cohort the command invented. Both are refused by name
+(`unusable_record`) and skipped by `--last`. What counts as a record is what
+replay counts, too — parsed from raw bytes, the same maximum line length, the
+active file's unterminated tail ignored as a record still being written,
+equal duplicates folded — equal as *records*, so `1` and `1.0` are one value
+while `true` and `1` are not — and a `selection_id` whose copies disagree
+refused, since replay discards that selection outright — so the two cannot
+disagree about which selections exist.
+
+Written by [`mms selection feedback`](cli.md#mms-selection-feedback--label-one-recorded-selection),
+the operator labelling command, and by nothing else. **Nothing on the proxy's
+call path emits this event**, and that is structural rather than pending: the
+client model never sees a `selection_id` to reference, and surfacing one would
+mean appending an identifier to every proxied response — paid on every call for
+an event that is rare, and served stale out of the response cache on a hit. So
+this stream carries operator judgement at operator volume; anything built on it
+must not read it as a continuous user signal.
 
 ## Tool-relevance ranking (#466 v0)
 
@@ -249,7 +311,8 @@ it reports two views:
 
 Rotated backups (`log.1` …) are noted but not parsed — the summary covers the
 active log only. For the full history, or any join against `proxy_metrics.db`,
-stream the JSONL directly (see [Replay joins](#replay-joins)).
+stream the JSONL directly (see [Replay joins](#replay-joins)) — **skipping
+blank lines**, as both built-in readers do.
 
 For deterministic corpus replay, rotated-log joins, data-quality checks, and
 risk-weight evaluation, use [`mms selection replay`](selection-evaluation.md).

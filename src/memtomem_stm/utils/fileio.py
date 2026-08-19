@@ -7,6 +7,7 @@ pattern keeps the third re-implementation of it from showing up.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import tempfile
@@ -20,6 +21,8 @@ from pathlib import Path
 # than a hard SLA.
 _WIN_REPLACE_ATTEMPTS = 10
 _WIN_REPLACE_BACKOFF_S = 0.005
+
+logger = logging.getLogger(__name__)
 
 
 def atomic_write_text(
@@ -92,30 +95,47 @@ def atomic_write_text(
                 pass
         _replace_with_windows_retry(tmp, resolved)
         if durable:
-            _fsync_dir(resolved.parent)
+            fsync_dir(resolved.parent)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
 
 
-def _fsync_dir(directory: Path) -> None:
-    """Best-effort fsync of ``directory`` so a rename into it is durable
-    (POSIX). No-op on platforms without directory fds (Windows) or when the
-    open/fsync fails — durability is a best-effort hardening, not a hard
-    guarantee, and a failure here must not fail the write that already
-    landed via ``os.replace``."""
-    if sys.platform == "win32":
-        return
+def fsync_dir(directory: Path) -> bool:
+    """``fsync`` ``directory`` so a name created or renamed in it is durable.
+
+    An ``fsync`` on a file descriptor flushes that file's contents, not the
+    directory entry naming it — so bytes can be durable under a name a crash
+    undoes. Returns whether the directory is now known to be durable.
+
+    Windows has no directory descriptor to sync and no API promising this
+    separately, so there the file flush IS the whole guarantee available and
+    this reports success rather than calling every such write unconfirmed on
+    the platform.
+
+    Never raises. Callers differ in what they do with the answer: an atomic
+    replace has already landed and only hardens with this, while an append
+    that a human is waiting on reports "unconfirmed" rather than success.
+    """
+    if sys.platform == "win32":  # pragma: no cover - POSIX-only durability step
+        return True
     try:
         dir_fd = os.open(str(directory), os.O_RDONLY)
     except OSError:
-        return
+        logger.debug("failed to open directory for fsync", exc_info=True)
+        return False
+    durable = True
     try:
         os.fsync(dir_fd)
     except OSError:
-        pass
+        logger.debug("failed to fsync directory", exc_info=True)
+        durable = False
     finally:
-        os.close(dir_fd)
+        try:
+            os.close(dir_fd)
+        except OSError:
+            logger.debug("failed to close directory fd", exc_info=True)
+    return durable
 
 
 def _replace_with_windows_retry(src: Path, dst: Path) -> None:

@@ -66,7 +66,7 @@ Commands:
   prune      Remove direct registrations for STM upstreams that are...
   register   Register memtomem-stm with an MCP client.
   remove     Remove an upstream MCP server from the proxy configuration.
-  selection  Replay and evaluate tool-selection telemetry.
+  selection  Replay, evaluate, and label tool-selection telemetry.
   stats      Show proxy compression and surfacing stats from the...
   status     Show proxy gateway config summary (path, enabled flag,...
   surfacing  Toggle proactive memory surfacing for an upstream server.
@@ -665,6 +665,144 @@ sanitized 30-case corpus, evaluates all 35 combinations of the two existing
 risk-penalty weights, and emits a safety-first configuration preview. It never
 applies that preview. See [Offline Tool-Selection Evaluation](selection-evaluation.md)
 for metric, split, privacy, and CI-golden details.
+
+## `mms selection feedback` — label one recorded selection
+
+```text
+Usage: mms selection feedback [OPTIONS]
+
+Options:
+  --config TEXT           [default: (~/.memtomem/stm_proxy.json)]
+  --log FILE              Selection JSONL path; overrides
+                          selection_telemetry.path.
+  --selection-id TEXT     Label this exact selection.
+  --last                  Label the most recent labellable selection (see
+                          --server/--tool).
+  --server TEXT           With --last: only consider selections from this
+                          upstream.
+  --tool TEXT             With --last: only consider this prefixed tool name.
+  --user-corrected        The user corrected this selection.
+  --no-user-corrected     The user did NOT correct this selection.
+  --operator-override     An operator overrode this selection.
+  --no-operator-override  An operator did NOT override this selection.
+  -y, --yes               Confirm the --last target without prompting
+                          (required off a TTY).
+  --active-only           Resolve against the active log only, excluding
+                          numeric rotated backups.
+  --json                  Output stable JSON for scripting.
+```
+
+The one writing command in this group, and the only producer of the selection
+log's `feedback` event. It appends a label that joins an existing `selection`
+by id; it never edits or rewrites existing records, and never rotates the log
+(the proxy owns rotation).
+
+Pass exactly one selector. `--selection-id` names the row — `selection_id` is
+not printed by any reporting command (`mms selection replay` emits aggregates
+only, never per-call identifiers), so it is read out of the JSONL itself.
+`--last` resolves the most recent **labellable** selection in append order,
+narrowed by `--server` / `--tool` — a row the command would refuse by id (see
+`unusable_record` below) is skipped rather than chosen, so the answer can be
+older than the newest line in the log — prints which selection it resolved to,
+and asks for confirmation before writing, so both the inference and that
+fallthrough are checked by the person making the judgement. That echo is the human surface: under `--json` the resolved
+target appears only in the result document, after the write, so a scripted
+`--last` passes `--yes` and reads back what it got. Because that check is the only thing standing behind an
+inferred target, a non-interactive `--last` (a pipe, CI, or `--json`) is
+**refused** without `--yes` — exit 2, `confirmation_required` — rather than
+prompting where nobody can answer or writing unasked. Both streams decide
+that: with stdout piped (`mms selection feedback --last … | jq`) stdin can
+still be a terminal, while the resolved selection and the question itself
+disappear into the pipe. `--selection-id` names
+its target explicitly and never prompts. Values shown at the confirmation are
+escaped for display: `selected_tool` is upstream-controlled, and an ANSI or
+bidi sequence in it could otherwise forge the very target being confirmed.
+
+Both labels are three-valued. `--no-user-corrected` records that the selection
+was **right** — a positive example, which offline evaluation needs as much as
+the negative one — while omitting both forms records nothing for that field. At
+least one label is required, and passing both forms of the same label is a
+usage error rather than last-flag-wins. Several labels may accumulate for one
+selection; per field, a later non-null value supersedes an earlier one.
+
+With `--json`, stdout carries `{"action": "selection-feedback", "ok": true,
+"selection_id": ..., "trace_id": ..., "server": ..., "selected_tool": ...,
+"user_corrected": ..., "operator_override": ..., "log": ...}`. Failures keep
+exit 1 and emit `{"action": "selection-feedback", "ok": false, "error":
+"<code>", "message": ...}`, where `<code>` is one of:
+
+| code | meaning |
+| --- | --- |
+| `no_log` | no log segment exists in the selected scope — with `--active-only` that is the active file alone, otherwise the active file and every rotated backup |
+| `not_found` / `no_match` | the selector resolved to nothing, checked *before* writing, so a typo never appends a label that joins to no selection |
+| `unusable_record` | the record was found but cannot carry a label: an unsupported `schema_version` (offline replay drops those records outright, so a label on one joins nothing), no `ranker_version` for the label to inherit (replay would load the selection, but under a cohort this command would have had to invent), or two copies of the `selection_id` that disagree (replay discards that selection entirely and marks the run invalid; equal copies are fine and fold to one — equal as *records*, so `1` and `1.0` are one value while `true` and `1` are not). `--last` skips such rows and resolves to the next-most-recent labellable one; if the 64 most recent matching selections are all unlabellable for the latter two reasons it reports that here, rather than as "nothing matched". A record whose `schema_version` is unsupported is dropped by the shared reader before the window is built — the same rule replay applies — so a scope containing nothing else reports `no_match` |
+| `log_rotated` | the resolved selection left the log between resolution and append; nothing was written |
+| `selection_changed` | the selection is still there but is no longer the record that was confirmed — a copy carrying a different `ranker_version` / `trace_id` / server / tool landed during the confirmation. Refused rather than reconciled: which of the two the judgement was about is not something the command can decide |
+| `log_busy` | the rotation lock is held (by a rotating writer or another labelling run) and could not be taken; nothing was written — re-run |
+| `lock_failed` | the rotation lock file beside the log could not be created (e.g. a writable log in a directory this user cannot write); nothing was written |
+| `log_unreadable` | the log directory could not be listed, or a segment could not be opened or read — reported instead of `no_match`, since "I could not look there" is not "no such selection", and a segment silently skipped would promote an older row to "most recent" |
+| `config_invalid` | the configured log path is unknown, by any of three routes: the config file exists but does not parse; there is no file and the `MEMTOMEM_STM_PROXY__*` overlay the operator did set fails to validate; or a bare `MEMTOMEM_STM_PROXY` was dropped entirely because it is not valid JSON or decodes to a non-null value that is not an object — that last one is reported with a config file present too, since the file then decides a path the environment was meant to override. All refuse rather than labelling whichever log is left over |
+| `confirmation_required` | `--last` used non-interactively (or with `--json`) without `--yes`; exit 2, matching the CLI-wide rule that a formatting flag must not authorize a write |
+| `write_failed` / `write_redacted` | no label record was written — the sink swallows write faults so a telemetry problem cannot break a proxied call, so the command checks the append outcome instead of assuming it. A write that landed short and could not be repaired leaves an unparseable fragment behind (rolling it back would mean rewinding a file the proxy appends to concurrently); readers count it as one malformed line and it joins nothing. A short write missing only its trailing newline is repaired instead and reported as a success, since the record is then complete and readable |
+| `write_unconfirmed` | the label's bytes reached the log but the record could not be confirmed there — the flush proving the bytes survive a crash did not complete, or the probe for whether a rotation orphaned the file could not run. One status for both, since the operator's move is identical. Neither "written" nor "not written" is available, so the command says so — and names the row: the `--json` document carries `selection_id`, and the retry to run is `--selection-id <id>`, never another `--last`, which by then could infer a *different* selection. Re-run rather than looking to see whether the label is there — after a failed flush it is visible and still not durable. Bounded, though: each attempt appends another label, so a *persistent* storage fault turns retrying into a way to fill the log. If a second attempt does not report success, fix the fault before trying again. Repeating the label for the same selection is the accumulate-and-supersede case above |
+
+Unlike the proxy's call-path emitters, the label is flushed to the storage
+device — and its directory entry with it when the append created the log —
+before the command reports success. The call path does not pay that: its
+records are one sample among many, and a device flush there would be charged
+to the proxied call it only accounts for.
+
+**What the second check does and does not cover.** The window it closes is
+human time: the seconds or minutes between the resolved selection being printed
+and the operator answering, during which a rotation or a new copy of the id can
+land. It is not a lock against the proxy's own appends, which are deliberately
+lock-free — a per-record lock on the call path would be paid by every proxied
+call to insure a rare event. A copy of the id landing in the moment between
+that check and the append leaves a label on a selection replay then discards as
+conflicting: dead weight the run reports as invalid, not a label attached to
+the wrong selection.
+
+Rotation renames every segment at once, so a scan that straddles one can miss
+the newest selections — they move into a file it already passed — or resolve
+one the same rotation evicts. Resolution therefore runs while holding an
+advisory rotation lock (`<log>.rotate.lock`), and the target is re-checked
+under it again after confirmation, since a human pause is exactly when a
+rotation can land. The writer takes that lock **only when it has already
+decided to rotate**, and defers rotation to its next append rather than
+waiting — so the proxy's per-record append path stays lock-free and a labelling
+session can never stall a proxied call.
+
+Rotation can also destroy the file an append is *already writing to*: the
+appender holds a descriptor, and rotation renames or unlinks the name it was
+opened under. `max_backups: 0` unlinks immediately, and every other setting
+evicts the same inode once `max_backups + 1` rotations have shifted it past the
+last backup slot — a rename orphans an append just as thoroughly as an unlink,
+it only takes more of them. The write then succeeds into storage no reader can
+open.
+
+The sink detects this rather than locking against it: after the write it checks
+that the descriptor's inode still has a name (`st_nlink`), reporting
+`write_failed` when it does not and `write_unconfirmed` when the probe itself
+could not run. That is a *detector*, not a guarantee — it describes the instant
+it ran, a rotation landing immediately afterwards can still evict the record,
+and `st_nlink` counts any hard link rather than a name readers scan. What it
+buys is that the common silent loss becomes a counted, reported one, at the cost
+of one `fstat` and no lock, which is the right trade for the call path: those
+records are one sample among many.
+
+`mms selection feedback` needs a stronger statement and pays for it with the
+lock it already holds. Its append, the status check, and the success report all
+happen inside the rotation guard, so no rotation can run between the write and
+the claim about it. What that buys is a **linearization point at the moment
+success is emitted**: when the command prints `ok`, the label is in the log and
+no rotation has intervened since it was written.
+
+It is not a promise about any later instant — the guard is released as the
+command returns, and a rotation immediately afterwards can evict the label like
+any other record, which is what rotation is for. Nor does it bind a writer that
+ignores the advisory lock; the guarantee is scoped to processes that cooperate
+with it, which is every writer STM ships. The lock file is not counted as a
+rotated backup.
 
 ## `mms hook` — built-in tool bridge + per-host registration
 

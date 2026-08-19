@@ -55,12 +55,23 @@ class EnvOverlayResult:
     render a variable the operator can actually find on a case-sensitive
     system. ``malformed`` records the names settings refuses to decode — a
     per-variable fact, computed once so per-trial rebuilds need not re-probe.
+
+    ``rejected`` records the variables whose payload the overlay dropped
+    ENTIRELY rather than carrying into the fragment: a bare
+    ``MEMTOMEM_STM_PROXY`` that is not valid JSON, or that decodes to
+    something other than an object. Those resolve to an empty fragment, so
+    without this field they are indistinguishable from "the operator set
+    nothing" — while the server refuses to start on exactly that environment.
+    A caller that must not act on a config the operator did not choose reads
+    this; ``__bool__`` deliberately stays fragment-only, since the fragment is
+    still what merges.
     """
 
     fragment: dict[str, Any]
     scoped: dict[str, str]
     names: dict[str, str]
     malformed: frozenset[str]
+    rejected: frozenset[str] = frozenset()
 
     def __bool__(self) -> bool:
         return bool(self.fragment)
@@ -252,6 +263,7 @@ def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> EnvOve
     if not scoped:
         return EnvOverlayResult(fragment={}, scoped={}, names={}, malformed=frozenset())
 
+    rejected: frozenset[str] = frozenset()
     try:
         fragment = _settings_proxy_fragment(scoped)
         malformed: frozenset[str] = frozenset()
@@ -270,6 +282,7 @@ def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> EnvOve
                     names[bare],
                     type(decoded_bare).__name__,
                 )
+                rejected = frozenset({names[bare]})
     except SettingsError:
         malformed = frozenset(name for name in scoped if _fails_to_decode(name, scoped[name]))
         if bare in malformed and any(name == bare for name, _ in _live_var_paths(scoped)):
@@ -282,8 +295,32 @@ def collect_proxy_env_overrides(environ: dict[str, str] | None = None) -> EnvOve
                 "itself rejects this environment at startup",
                 names[bare],
             )
+            rejected = frozenset({names[bare]})
         fragment = _fragment_for(scoped, malformed)
-    return EnvOverlayResult(fragment=fragment, scoped=scoped, names=names, malformed=malformed)
+    return EnvOverlayResult(
+        fragment=fragment, scoped=scoped, names=names, malformed=malformed, rejected=rejected
+    )
+
+
+def _rejected_env_error(overlay: EnvOverlayResult | None) -> str | None:
+    """Why a caller must not act on this overlay, or ``None``.
+
+    An overlay that dropped the operator's whole proxy block resolves to the
+    same empty fragment as an unset environment, and every load then returns a
+    config built from the file and the defaults — one the operator did not
+    choose. The server refuses to start on that environment, so a command that
+    is about to WRITE somewhere the config names has to see it too.
+
+    Names only, never values: this string reaches an operator's terminal and a
+    ``--json`` document, and the payload it describes is the kind of place a
+    credential gets pasted.
+    """
+    if overlay is None or not overlay.rejected:
+        return None
+    return (
+        f"{', '.join(sorted(overlay.rejected))} could not be decoded as a proxy "
+        "config object and was ignored entirely"
+    )
 
 
 def _fails_to_decode(name: str, value: str) -> bool:
@@ -1650,7 +1687,7 @@ class SelectionTelemetryConfig(BaseModel):
     path: Path = Path("~/.memtomem/stm_selection_log.jsonl")
     sample_rate: float = Field(default=1.0, ge=0.0, le=1.0)
     """Fraction of calls recorded; applies to the selection+execution pair
-    atomically so the log never contains orphan halves."""
+    atomically so the log never contains an execution without its selection."""
     max_bytes: int = Field(default=50_000_000, gt=0)
     """Rotate the log when it reaches this size."""
     max_backups: int = Field(default=3, ge=0)
@@ -2031,6 +2068,25 @@ class ConfigLoadResult:
     config: ProxyConfig | None
     error: str | None
     unknown_keys: tuple[str, ...] = ()
+    env_error: str | None = None
+    """Set when the ``MEMTOMEM_STM_PROXY`` environment is not the one
+    ``config`` reflects. Two shapes, and the second is independent of whether a
+    file exists:
+
+    * there is no config FILE and the env-only overlay failed to validate, so
+      ``config`` is a defaults rebuild matching neither the environment nor
+      any file;
+    * the overlay dropped a bare payload entirely — malformed JSON, or a
+      decoded non-object (see ``EnvOverlayResult.rejected``) — which resolves
+      to an empty fragment indistinguishable from an unset environment. That
+      one is reported with a file present too: the file then decides a config
+      the operator's environment was meant to override.
+
+    Separate from ``error`` because the two call for different handling: a
+    running server tolerates this and starts on defaults (the historical
+    behavior ``error`` drives), while a command that WRITES somewhere the
+    config names must not act on a path the operator did not choose.
+    """
 
 
 class ProxyConfig(BaseModel):
@@ -2228,6 +2284,10 @@ class ProxyConfig(BaseModel):
         resolved = path.expanduser().resolve()
         overlay = _as_overlay(env_overrides)
         env_data = overlay.fragment if overlay is not None else None
+        # Independent of whether the surviving fragment is empty: a dropped
+        # bare block leaves nothing behind to validate, which is exactly why
+        # the fragment cannot be the thing that decides this.
+        env_rejected = _rejected_env_error(overlay)
         if not resolved.exists():
             logger.debug("Proxy config file not found: %s", resolved)
             if not missing_ok:
@@ -2247,14 +2307,21 @@ class ProxyConfig(BaseModel):
                             resolved,
                             logger_=logger,
                         )
-                    return ConfigLoadResult(config=env_config, error=None)
+                    return ConfigLoadResult(config=env_config, error=None, env_error=env_rejected)
                 except Exception as exc:
                     logger.warning(
                         "Env-only proxy config failed validation: %s%s — using defaults",
                         exc,
                         _env_override_hint(exc, overlay),
                     )
-            return ConfigLoadResult(config=ProxyConfig(), error=None)
+                    # Reported, not raised: the defaults rebuild stays the
+                    # result so every existing caller behaves as before, while
+                    # a caller that cannot safely accept "some other config"
+                    # can see that this one is not the operator's.
+                    return ConfigLoadResult(
+                        config=ProxyConfig(), error=None, env_error=_sanitized_load_error(exc)
+                    )
+            return ConfigLoadResult(config=ProxyConfig(), error=None, env_error=env_rejected)
         # Warn if config is group/world-readable (may contain API keys)
         mode = _permissive_mode(resolved)
         if mode is not None and log_warnings:
@@ -2310,7 +2377,9 @@ class ProxyConfig(BaseModel):
                     resolved,
                     logger_=logger,
                 )
-            return ConfigLoadResult(config=config, error=None, unknown_keys=unknown_keys)
+            return ConfigLoadResult(
+                config=config, error=None, unknown_keys=unknown_keys, env_error=env_rejected
+            )
         except (json.JSONDecodeError, Exception) as exc:
             # The parse-failure warning dominates; the unknown-keys warning is
             # suppressed here but the paths stay in the result for `mms

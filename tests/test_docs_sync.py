@@ -1788,7 +1788,7 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
         "uv tool install 'memtomem[all]>=0.4,<0.5'",
         "uv tool install 'memtomem-stm>=0.2,<0.3'",
         "uv tool install --reinstall 'memtomem[all]>=0.4,<0.5'",
-        'export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS='
+        "export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS="
         '\'["--from","memtomem>=0.4,<0.5","memtomem-server"]\'',
     ):
         assert command in guide, f"reviewed-memory-resume guide lost {command!r}"
@@ -1923,11 +1923,20 @@ def test_otlp_export_doc_matches_the_shipped_span_vocabulary() -> None:
 def test_adr_0001_cited_paths_and_call_site_claim_hold() -> None:
     """ADR 0001's cited repo paths exist and its ``log_feedback`` claim is true.
 
-    The ADR names concrete repo paths and asserts the selection log's
-    ``feedback`` event has no production call site. Both statements rot
-    silently when code moves; pin them here so the ADR fails CI instead of
-    aging in prose. The explicit expected set below makes a regex miss loud:
-    coverage cannot silently shrink to an easier subset of citations.
+    The ADR names concrete repo paths and states exactly which call sites emit
+    the selection log's ``feedback`` event — since #469, the operator labelling
+    command and nothing else. Both statements rot silently when code moves;
+    pin them here so the ADR fails CI instead of aging in prose. The explicit
+    expected set below makes a regex miss loud: coverage cannot silently shrink
+    to an easier subset of citations.
+
+    The emitter is pinned as an exact (file, enclosing function) pair, and the
+    call count with it. The ADR claims *one* production call site in the
+    operator labelling command: a file-only pin would pass while a second
+    emitter sat in the same module, and a count-only pin would pass while the
+    emitter moved onto the proxy's request path — which is the change that
+    would turn the stream from operator judgement into a continuous signal, the
+    thing an export must not misrepresent.
     """
     body = _read("docs/adr/0001-ecosystem-integration-contracts.md")
 
@@ -1938,6 +1947,7 @@ def test_adr_0001_cited_paths_and_call_site_claim_hold() -> None:
     }
     expected = {
         "CLAUDE.md",
+        "src/memtomem_stm/cli/selection_cmd.py",
         "src/memtomem_stm/data/policy-bundle.schema.json",
         "src/memtomem_stm/data/toolgraph-contract-v1/",
         "src/memtomem_stm/observability/otlp.py",
@@ -1958,20 +1968,164 @@ def test_adr_0001_cited_paths_and_call_site_claim_hold() -> None:
     from memtomem_stm.proxy.selection_log import SelectionTelemetryLog
 
     assert callable(SelectionTelemetryLog.log_feedback)
-    callers: list[str] = []
-    for path in sorted((REPO_ROOT / "src").rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-            if name == "log_feedback":
-                callers.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}")
-    assert callers == [], (
-        f"ADR 0001 claims log_feedback has no production call site, found {callers}; "
-        "update the ADR's matrix note alongside this pin"
+    # ``_write_label`` is the labelling command's own append helper, split out
+    # so a test can observe when the write runs. Pinning only the DIRECT
+    # callers of ``log_feedback`` would therefore pin one name and leave the
+    # loophole open: a request-path function calling ``_write_label`` emits
+    # feedback while the direct-call list is unchanged. The claim the ADR makes
+    # is about which code can cause a label to be written, so the pin is over
+    # transitive reachability, not over one call edge.
+    reaching = _functions_reaching(REPO_ROOT / "src", "log_feedback", base=REPO_ROOT)
+    assert reaching == _EXPECTED_FEEDBACK_EMITTERS, (
+        f"ADR 0001 states the operator labelling command is the only production code that "
+        f"can emit a feedback record, but these functions reach log_feedback: {sorted(reaching)}. "
+        "Update the ADR's matrix note alongside this pin, and if a new emitter is on the "
+        "request path, say so explicitly, because that changes what the stream is."
     )
+
+
+# The labelling command, its append helper, and nothing else. Written out
+# rather than computed so the pin is a statement about the code, not a
+# restatement of whatever the walk happens to return.
+_EXPECTED_FEEDBACK_EMITTERS = {
+    ("src/memtomem_stm/cli/selection_cmd.py", "_write_label"),
+    ("src/memtomem_stm/cli/selection_cmd.py", "feedback_command"),
+}
+
+
+def _functions_reaching(
+    root: Path, target: str, *, base: Path | None = None
+) -> set[tuple[str, str]]:
+    """Every scope under *root* that can reach *target*.
+
+    Reported as ``(path relative to *base*, scope name)``, where a scope is a
+    function or the module body itself (``"<module>"``); *base* defaults to
+    *root* so a synthetic tree can be walked by the same code.
+
+    Matched on any MENTION of the name — ``x.log_feedback(...)``,
+    ``log_feedback(...)``, and the bare reference in ``emit = x.log_feedback``
+    alike — rather than on call syntax. An ``import ... as`` alias is followed
+    too: ``from selection_cmd import _write_label as emit`` makes every
+    mention of ``emit`` in that file count as a mention of ``_write_label``,
+    which is the one shape a name-only walk would otherwise let through
+    silently. Calling through an alias is a real
+    emitter that a callee-name walk reports as nothing at all, so the guard
+    fails closed on the reference instead. That over-approximates (an unrelated
+    same-named helper trips it), which is the safe direction: a tripped guard
+    gets read, while a missed edge lets the ADR's claim age into being false.
+    Module bodies are scopes of their own because code outside any function
+    runs at import; lambdas and nested definitions are attributed to the scope
+    that encloses them. Fixed point over the resulting graph, so a wrapper
+    chain of any depth is still reported.
+    """
+    # ``as_posix``, not ``str``: these keys are what callers compare against
+    # written-out path literals, and ``str`` spells them with backslashes on
+    # Windows, where every such comparison would fail for the separator alone.
+    trees: list[tuple[str, ast.Module]] = [
+        (path.relative_to(base or root).as_posix(), ast.parse(path.read_text(encoding="utf-8")))
+        for path in sorted(root.rglob("*.py"))
+    ]
+
+    # ``from m import x as y`` / ``import m as y``: within the importing FILE, a
+    # mention of the local name is a mention of the original. Per file, and
+    # module-qualified: a table keyed by local spelling alone would make every
+    # `run` in the tree resolve to whatever one unrelated module imported under
+    # that name, and the guard would fail on code that has nothing to do with
+    # the emitter. Kept as a SET per name and only ever added to, because
+    # scoping WITHIN a file means modelling function, lambda, class,
+    # comprehension and ``global`` boundaries, and every shape missed there
+    # unreports a real emitter; a union can only add a false positive, which
+    # gets read.
+    modules = {relative[:-3].replace("/", "."): relative for relative, _ in trees}
+
+    def module_file(name: str | None) -> str | None:
+        if not name:
+            return None
+        for dotted, relative in modules.items():
+            if dotted == name or dotted.endswith("." + name):
+                return relative
+        return None
+
+    imports: list[tuple[str, str, str | None, str]] = []
+    for relative, tree in trees:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.asname:
+                        imports.append((relative, alias.asname, node.module, alias.name))
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.asname:
+                        imports.append((relative, alias.asname, None, alias.name.split(".")[-1]))
+
+    aliases: dict[str, dict[str, set[str]]] = {relative: {} for relative, _ in trees}
+    changed = True
+    while changed:
+        # To a fixed point, because aliases chain across modules: `x as emit`
+        # here, `emit as callit` there. One hop would report the middle name
+        # while the function that actually calls the emitter went missing.
+        changed = False
+        for relative, local, module, name in imports:
+            origins = {name}
+            source = module_file(module)
+            if source is not None:
+                origins |= aliases[source].get(name, set())
+            current = aliases[relative].setdefault(local, set())
+            if not origins <= current:
+                current |= origins
+                changed = True
+
+    def resolve(found: set[str], table: dict[str, set[str]]) -> set[str]:
+        resolved = set(found)
+        frontier = set(found)
+        while frontier:
+            grown: set[str] = set()
+            for name in frontier:
+                grown |= table.get(name, set()) - resolved
+            resolved |= grown
+            frontier = grown
+        return resolved
+
+    mentions: dict[tuple[str, str], set[str]] = {}
+    for relative, tree in trees:
+
+        def names_in(node: ast.AST) -> set[str]:
+            found: set[str] = set()
+            for child in ast.walk(node):
+                if isinstance(child, ast.Attribute):
+                    found.add(child.attr)
+                elif isinstance(child, ast.Name):
+                    found.add(child.id)
+            return found
+
+        module_scope = mentions.setdefault((relative, "<module>"), set())
+        for statement in tree.body:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # The decorators run at import even though the body does not.
+                for decorator in statement.decorator_list:
+                    module_scope |= resolve(names_in(decorator), aliases[relative])
+            else:
+                module_scope |= resolve(names_in(statement), aliases[relative])
+        for scope in ast.walk(tree):
+            if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            mentions.setdefault((relative, scope.name), set())
+            mentions[(relative, scope.name)] |= resolve(names_in(scope), aliases[relative]) - {
+                scope.name
+            }
+    reaching: set[tuple[str, str]] = set()
+    frontier = {target}
+    while frontier:
+        found = {
+            scope
+            for scope, mentioned in mentions.items()
+            if scope not in reaching and mentioned & frontier
+        }
+        if not found:
+            break
+        reaching |= found
+        frontier = {name for _, name in found}
+    return reaching
 
 
 def test_cli_md_freshness_preset_table_matches_init_mapping() -> None:
@@ -1982,9 +2136,7 @@ def test_cli_md_freshness_preset_table_matches_init_mapping() -> None:
     from memtomem_stm.proxy.config import CacheConfig
 
     cli_md = (REPO_ROOT / "docs" / "cli.md").read_text(encoding="utf-8")
-    table = re.search(
-        r"`--freshness` picks.*?see \[caching\]\(caching\.md\)", cli_md, re.DOTALL
-    )
+    table = re.search(r"`--freshness` picks.*?see \[caching\]\(caching\.md\)", cli_md, re.DOTALL)
     assert table, "docs/cli.md lost the --freshness preset table"
     text = table.group(0)
 
@@ -2073,3 +2225,158 @@ def test_uninstall_runbook_puts_hook_backups_where_the_writer_puts_them() -> Non
     assert not re.search(r"rm -rf[^\n]*\n[^\n]*hook[^\n]*\.bak", body), (
         "the runbook implies `rm -rf` removes hook backups; it does not"
     )
+
+
+def test_adr_0001_call_site_pin_rejects_a_second_emitter(tmp_path) -> None:
+    """The pin must fail on a second emitter — including one that never names
+    ``log_feedback`` at all.
+
+    Two shapes, because the guard has been wrong about each in turn: a
+    file-level pin passed for a second emitter in the SAME file, and a
+    direct-call pin passed for a request-path function that reaches the emitter
+    through the approved ``_write_label`` wrapper. Both are run through the
+    guard's own walk over a synthetic tree rather than trusting the shape of
+    the assertion.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "selection_cmd.py").write_text(
+        "def _write_label(log):\n"
+        "    return log.log_feedback(selection_id='a')\n"
+        "\n"
+        "def feedback_command(log):\n"
+        "    return _write_label(log)\n",
+        encoding="utf-8",
+    )
+    baseline = _functions_reaching(src, "log_feedback")
+    assert baseline == {
+        ("selection_cmd.py", "_write_label"),
+        ("selection_cmd.py", "feedback_command"),
+    }
+
+    # (a) a second direct emitter in the same file.
+    (src / "selection_cmd.py").write_text(
+        (src / "selection_cmd.py").read_text(encoding="utf-8")
+        + "\ndef sneaky_second_emitter(log):\n    return log.log_feedback(selection_id='b')\n",
+        encoding="utf-8",
+    )
+    assert ("selection_cmd.py", "sneaky_second_emitter") in _functions_reaching(src, "log_feedback")
+
+    # (b) a request-path emitter that only calls the approved wrapper — the
+    # case a direct-call pin cannot see, since the ``log_feedback`` call sites
+    # are still exactly the one.
+    (src / "proxy_path.py").write_text(
+        "from selection_cmd import _write_label\n"
+        "\n"
+        "async def call_tool(log):\n"
+        "    return _write_label(log)\n",
+        encoding="utf-8",
+    )
+    reaching = _functions_reaching(src, "log_feedback")
+    assert ("proxy_path.py", "call_tool") in reaching, (
+        "a wrapper-hop emitter must be reported; a direct-call pin misses it"
+    )
+
+    # (c) an emitter that never CALLS the name — it binds it and calls the
+    # binding. A walk over callee names sees `emit(...)` and reports nothing.
+    (src / "aliased.py").write_text(
+        "def emit_by_alias(log):\n    emit = log.log_feedback\n    return emit(selection_id='c')\n",
+        encoding="utf-8",
+    )
+    assert ("aliased.py", "emit_by_alias") in _functions_reaching(src, "log_feedback"), (
+        "an aliased emitter must be reported; the guard fails closed on the reference"
+    )
+
+    # (c2) the same hop through an IMPORT alias, which is how a real
+    # request-path module would reach the helper — and the shape a name-only
+    # walk reports as nothing, since neither `log_feedback` nor `_write_label`
+    # is ever spelled at the call.
+    (src / "imported_alias.py").write_text(
+        "from selection_cmd import _write_label as emit\n"
+        "\n"
+        "def request_path(log):\n"
+        "    return emit(log)\n",
+        encoding="utf-8",
+    )
+    assert ("imported_alias.py", "request_path") in _functions_reaching(src, "log_feedback"), (
+        "an import-aliased emitter must be reported"
+    )
+
+    # (c3) other code in the same file binding that local name to something
+    # else — a sibling function, a nested function, and a class body. Each is a
+    # scope this walk does not model; a table that let any of them REPLACE the
+    # emitter's alias would stop reporting (c2), which is the guard going quiet
+    # because of code somewhere else in the file.
+    (src / "imported_alias.py").write_text(
+        (src / "imported_alias.py").read_text(encoding="utf-8") + "\ndef unrelated(log):\n"
+        "    from json import dumps as emit\n"
+        "    return emit(log)\n"
+        "\ndef outer(log):\n"
+        "    def inner():\n"
+        "        from json import loads as emit\n"
+        "        return emit('{}')\n"
+        "    return inner()\n"
+        "\nclass Holder:\n"
+        "    from json import dump as emit\n",
+        encoding="utf-8",
+    )
+    assert ("imported_alias.py", "request_path") in _functions_reaching(src, "log_feedback"), (
+        "another binding of the same local name — sibling function, nested function, or "
+        "class body — must not unreport the real emitter"
+    )
+
+    # (c4) a two-hop chain: one module aliases the helper, the next aliases
+    # THAT alias. Neither `log_feedback` nor `_write_label` is spelled at the
+    # call, and a single-hop resolution reports only the middle name.
+    (src / "hop_one.py").write_text(
+        "from selection_cmd import _write_label as emit\n", encoding="utf-8"
+    )
+    (src / "hop_two.py").write_text(
+        "from hop_one import emit as callit\n\ndef chained(log):\n    return callit(log)\n",
+        encoding="utf-8",
+    )
+    assert ("hop_two.py", "chained") in _functions_reaching(src, "log_feedback"), (
+        "an alias of an alias must still be reported"
+    )
+
+    # (c5) the negative: another module binding an unrelated symbol to a name
+    # this file also uses. A table keyed by local spelling alone would make
+    # THIS `run` resolve to the approved command and report a function that
+    # never touches it — a guard that fails CI on unrelated code stops being
+    # read.
+    (src / "elsewhere.py").write_text(
+        "from third_party import feedback_command as run\n", encoding="utf-8"
+    )
+    (src / "unrelated.py").write_text(
+        "def helper(x):\n    return run(x)\n", encoding="utf-8"
+    )
+    reaching_now = _functions_reaching(src, "log_feedback")
+    assert ("unrelated.py", "helper") not in reaching_now, (
+        "an alias bound in another module must not travel by spelling alone"
+    )
+
+    # (d) an emitter at module level, outside any function.
+    (src / "at_import.py").write_text("log.log_feedback(selection_id='d')\n", encoding="utf-8")
+    assert ("at_import.py", "<module>") in _functions_reaching(src, "log_feedback"), (
+        "a module-level emitter runs at import and must be reported"
+    )
+
+
+def test_functions_reaching_reports_posix_separated_keys(tmp_path) -> None:
+    """Keys are compared against written-out literals, so their separator is
+    part of the contract.
+
+    ``_EXPECTED_FEEDBACK_EMITTERS`` spells its paths with forward slashes; a
+    key built by ``str(Path)`` spells them with backslashes on Windows, so the
+    ADR pin would fail there for the separator alone — on every run, on a
+    platform whose CI gates merge. Exercised through a NESTED file, because a
+    top-level one has no separator to get wrong.
+    """
+    src = tmp_path / "src"
+    (src / "cli").mkdir(parents=True)
+    (src / "cli" / "selection_cmd.py").write_text(
+        "def _write_label(log):\n    return log.log_feedback(selection_id='a')\n",
+        encoding="utf-8",
+    )
+    reaching = _functions_reaching(src, "log_feedback")
+    assert reaching == {("cli/selection_cmd.py", "_write_label")}

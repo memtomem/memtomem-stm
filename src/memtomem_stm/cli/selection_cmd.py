@@ -1,8 +1,20 @@
-"""Read-only ``mms selection`` commands for offline evaluation (#468)."""
+"""``mms selection`` commands: offline evaluation (#468) and labelling (#469).
+
+``replay`` is read-only. ``feedback`` is the group's one writer, and it writes
+only to the selection telemetry log — appending a ``feedback`` record that
+joins an existing ``selection`` by id. It never touches the proxy config, the
+metrics stores, or any source MCP-client config.
+"""
 
 from __future__ import annotations
 
+import sys
+from contextlib import contextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, NoReturn
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 import click
 
@@ -13,6 +25,17 @@ from memtomem_stm.proxy.selection_eval import (
     evaluate_selection,
     format_selection_report,
 )
+from memtomem_stm.cli._display import _disp
+from memtomem_stm.proxy.selection_log import (
+    APPEND_UNCONFIRMED,
+    APPEND_WRITTEN,
+    SelectionLogUnreadable,
+    SelectionTelemetryLog,
+    discover_log_files,
+    resolve_selection,
+    rotation_lock,
+)
+from memtomem_stm.utils import json_out
 from memtomem_stm.utils.fileio import atomic_write_text
 
 _DEFAULT_CONFIG = DEFAULT_PROXY_CONFIG
@@ -20,7 +43,7 @@ _DEFAULT_CONFIG = DEFAULT_PROXY_CONFIG
 
 @click.group(name="selection")
 def selection_group() -> None:
-    """Replay and evaluate tool-selection telemetry."""
+    """Replay, evaluate, and label tool-selection telemetry."""
 
 
 @selection_group.command(name="replay")
@@ -111,3 +134,510 @@ def replay_command(
         click.echo(summary, nl=False)
     if report.data["status"] == "invalid":
         raise click.exceptions.Exit(1)
+
+
+# ``feedback`` never rotates. Rotation renames files, and this command runs in a
+# process that does not own the log — a concurrent rename from the proxy and
+# from here can interleave into a lost segment. A ceiling no log can reach makes
+# ``_rotate_if_needed_locked`` a no-op here; the proxy still rotates on its own
+# next write, and one appended label cannot meaningfully grow the file anyway.
+_NEVER_ROTATE = sys.maxsize
+
+# The writer's hold on the rotation lock is a handful of renames, so a brief
+# retry outlasts it; failing after that reports a busy log rather than blocking
+# an operator behind a stuck holder.
+_LOCK_ATTEMPTS = 20
+
+
+@selection_group.command(name="feedback")
+@click.option("--config", "config_path", default=None, show_default=str(_DEFAULT_CONFIG))
+@click.option(
+    "--log",
+    "log_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    help="Selection JSONL path; overrides selection_telemetry.path.",
+)
+@click.option("--selection-id", "selection_id", help="Label this exact selection.")
+@click.option(
+    "--last",
+    is_flag=True,
+    help="Label the most recent labellable selection (see --server/--tool).",
+)
+@click.option("--server", help="With --last: only consider selections from this upstream.")
+@click.option("--tool", help="With --last: only consider this prefixed tool name.")
+# Opposing labels are separate flags, not a Click ``--x/--no-x`` pair: a pair
+# silently lets the LAST of two contradictory flags win, which inverts a
+# training label instead of refusing an incoherent command.
+@click.option("--user-corrected", is_flag=True, help="The user corrected this selection.")
+@click.option("--no-user-corrected", is_flag=True, help="The user did NOT correct this selection.")
+@click.option("--operator-override", is_flag=True, help="An operator overrode this selection.")
+@click.option(
+    "--no-operator-override", is_flag=True, help="An operator did NOT override this selection."
+)
+@click.option(
+    "--yes",
+    "-y",
+    "assume_yes",
+    is_flag=True,
+    help="Confirm the --last target without prompting (required off a TTY).",
+)
+@click.option(
+    "--active-only",
+    is_flag=True,
+    help="Resolve against the active log only, excluding numeric rotated backups.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Output stable JSON for scripting.")
+def feedback_command(
+    config_path: str | None,
+    log_path: Path | None,
+    selection_id: str | None,
+    last: bool,
+    server: str | None,
+    tool: str | None,
+    user_corrected: bool,
+    no_user_corrected: bool,
+    operator_override: bool,
+    no_operator_override: bool,
+    assume_yes: bool,
+    active_only: bool,
+    as_json: bool,
+) -> None:
+    """Attach a label to one recorded tool selection.
+
+    Appends a feedback record that joins an existing selection by id. Existing
+    records are never edited, and this command never rotates the log.
+
+    Pass exactly one selector. --selection-id names the row and never prompts.
+    --last resolves the most recent LABELLABLE selection in append order,
+    narrowed by --server / --tool — a row offline replay would discard is
+    skipped rather than chosen, so the answer can be older than the newest
+    line in the log — prints which selection it resolved to, and asks for
+    confirmation before writing. That echo is part of the human surface: under
+    --json the target is reported only in the result document, after the
+    write, so a scripted --last must pass --yes and check what came back. Because that check is all that stands behind
+    an inferred target, --last off a terminal (a pipe, CI, or --json) is
+    refused without --yes rather than prompting where nobody can answer.
+
+    Both labels are three-valued: --no-user-corrected records that the
+    selection was RIGHT, which offline evaluation needs as much as the
+    negative case, while omitting both forms records nothing for that field.
+    At least one label is required, and opposing forms of the same label are
+    a usage error rather than last-flag-wins.
+    """
+    # Docstring note (not for --help): this is the selection log's first and
+    # only producer of the ``feedback`` event, schema-pinned since #467 with
+    # nothing to write it. Because it is operator-driven, the stream carries
+    # judgement at operator volume — the client model never sees a
+    # ``selection_id``, so nothing on the request path can emit one. ADR 0001
+    # states that, and ``tests/test_docs_sync.py`` pins the emitter set.
+    if bool(selection_id) == last:
+        raise click.UsageError("pass exactly one of --selection-id or --last")
+    if (server or tool) and not last:
+        raise click.UsageError("--server/--tool only apply to --last")
+    corrected = _tri_state(user_corrected, no_user_corrected, "user-corrected")
+    overridden = _tri_state(operator_override, no_operator_override, "operator-override")
+    if corrected is None and overridden is None:
+        raise click.UsageError(
+            "nothing to record: pass --user-corrected/--no-user-corrected "
+            "and/or --operator-override/--no-operator-override"
+        )
+
+    if log_path is not None:
+        # An explicit path decides the target outright, so the config is not
+        # consulted — and cannot fail the command for a file it would not have
+        # read anything from.
+        telemetry_path = log_path.expanduser()
+    else:
+        cfg_path = Path(resolve_cli_config_path(config_path).path)
+        loaded = ProxyConfig.load_from_file_with_status(
+            cfg_path,
+            env_overrides=collect_proxy_env_overrides(),
+            missing_ok=True,
+        )
+        if loaded.error is not None:
+            # Falling back to defaults here would silently label a DIFFERENT
+            # log than the operator configured — a writing command must not
+            # guess which file it is annotating.
+            _feedback_failure(
+                as_json,
+                "config_invalid",
+                f"cannot read {cfg_path}: {loaded.error}",
+            )
+        if loaded.env_error is not None:
+            # Same hazard by the other route: no file, and the environment the
+            # operator DID set failed to validate, so the defaults rebuild
+            # names a log nobody chose.
+            _feedback_failure(
+                as_json,
+                "config_invalid",
+                f"the MEMTOMEM_STM_PROXY environment is invalid: {loaded.env_error}",
+            )
+        # Not ``or ProxyConfig(...)``: with ``missing_ok=True`` the loader
+        # returns no config only when it also set one of the errors screened
+        # above, both of which exit. A defaults fallback here would therefore
+        # be unreachable, and reachable or not it is the exact guess the two
+        # refusals above exist to prevent.
+        assert loaded.config is not None
+        cfg = loaded.config
+        telemetry_path = cfg.selection_telemetry.path.expanduser()
+    # Presence is decided by the whole log, not the active file alone: a crash
+    # between ``active → .1`` and the next append leaves the history entirely in
+    # backups, and refusing to label it would contradict the default search.
+    include_rotated = not active_only
+    try:
+        segments = discover_log_files(telemetry_path, include_rotated=include_rotated)
+    except OSError as exc:
+        # Listing the directory can fail on its own; "not found" would be the
+        # wrong diagnosis, and a traceback is not something a scripted caller
+        # can branch on.
+        _feedback_failure(
+            as_json, "log_unreadable", f"cannot list the log directory for {telemetry_path}: {exc}"
+        )
+    if not segments:
+        _feedback_failure(as_json, "no_log", f"selection log not found: {telemetry_path}")
+    # No open-each-segment preflight here: the resolve below already refuses an
+    # unreadable segment (``TelemetryReader`` wraps every read failure, the open
+    # included, as ``SelectionLogUnreadable``) and both resolve sites map that to
+    # this same ``log_unreadable`` failure. A preflight would also be checking
+    # names that rotation may rename before the locked resolve reaches them, so
+    # it could only ever restate an answer the guarded read gives properly.
+
+    # Resolve under the rotation lock. Rotation renames every segment at once,
+    # so an unguarded scan can miss the newest selections — they move into a
+    # file it already passed — or resolve one the same rotation evicts. The
+    # writer takes this lock only when it has already decided to rotate and
+    # defers instead of waiting, so holding it here cannot stall a proxied call.
+    with _rotation_guard(telemetry_path, as_json) as acquired:
+        if not acquired:
+            _feedback_failure(
+                as_json,
+                "log_busy",
+                "the selection log's rotation lock is held; nothing was written — re-run",
+            )
+        try:
+            record, defect = resolve_selection(
+                telemetry_path,
+                selection_id=selection_id,
+                server=server,
+                tool=tool,
+                include_rotated=include_rotated,
+            )
+        except SelectionLogUnreadable as exc:
+            # A segment that cannot be read is refused rather than skipped:
+            # skipping the newest one silently promotes an older row to "most
+            # recent" — a label on a selection the operator never chose.
+            _feedback_failure(as_json, "log_unreadable", str(exc))
+        except OSError as exc:
+            # Discovery lists the directory again, under the lock this time, so
+            # it can fail here even though the listing above succeeded. Caught
+            # for the same reason that one is: a traceback is not something a
+            # scripted caller can branch on, and under ``--json`` it would be
+            # the whole of stdout.
+            _feedback_failure(
+                as_json,
+                "log_unreadable",
+                f"cannot list the log directory for {telemetry_path}: {exc}",
+            )
+    # Resolve before writing: an id that matches nothing would append a label
+    # that joins to no selection — silently useless to every reader, and
+    # indistinguishable from a selection whose own record was dropped by the
+    # redaction screen.
+    if record is None and defect is not None:
+        # The row IS in the log and an operator can go look at it; it just
+        # cannot carry a label — an unsupported schema version (offline replay
+        # drops those records outright), no cohort stamp for the label to
+        # inherit, or copies of one id that disagree, which replay resolves by
+        # discarding the selection and marking the run invalid. Each would make
+        # the label the dead weight a mistyped id produces, so each is reported
+        # by name rather than as "not found".
+        _feedback_failure(
+            as_json,
+            "unusable_record",
+            f"the matched selection cannot be labelled ({defect})",
+        )
+    if record is None:
+        if selection_id is not None:
+            _feedback_failure(as_json, "not_found", f"no selection record with id {selection_id}")
+        scope = ", ".join(
+            part
+            for part in (f"server={server}" if server else "", f"tool={tool}" if tool else "")
+            if part
+        )
+        _feedback_failure(
+            as_json,
+            "no_match",
+            f"no selection record matches{' ' + scope if scope else ''}",
+        )
+    resolved_id = record.get("selection_id")
+    assert isinstance(resolved_id, str) and resolved_id  # resolve_selection screens this
+
+    # Identify the row BEFORE writing, and — when a human is at the terminal —
+    # let them stop it. ``--last`` is an inference; the operator is the check on
+    # it, which they cannot be if the label is already on disk. Values are
+    # escaped for display: ``selected_tool`` is upstream-controlled, and an ANSI
+    # or bidi sequence in it could forge the very target being confirmed.
+    if last and not assume_yes and (as_json or not _human_at_the_terminal()):
+        # A formatting flag must not authorize a write, and a script cannot
+        # answer a prompt — the repo-wide rule for a prompting action.
+        _feedback_failure(
+            as_json,
+            "confirmation_required",
+            "--last infers its target; pass --yes to confirm non-interactively",
+            exit_code=2,
+        )
+    if not as_json:
+        click.echo(
+            f"Selection {_disp(resolved_id)} "
+            f"({_disp(str(record.get('server')))} / {_disp(str(record.get('selected_tool')))})"
+        )
+    if last and not assume_yes:
+        click.confirm("Label this selection?", default=False, abort=True)
+
+    # Carry the selection's own trace_id onto the label so the feedback record
+    # joins the metrics store the same way its selection does.
+    trace_id = record.get("trace_id")
+    # The label inherits the labelled selection's cohort stamp — see
+    # ``log_feedback``. A stamp this process invented would be a claim about a
+    # ranker that never ran for this call.
+    ranker_version = record.get("ranker_version")
+    # Second lock hold, around verify+append. The confirmation above is human
+    # time, and a rotation landing in it can evict the very selection just
+    # agreed to — so the target is re-checked while rotation is excluded,
+    # rather than trusting a resolve that is now arbitrarily old.
+    log = SelectionTelemetryLog(telemetry_path, max_bytes=_NEVER_ROTATE)
+    with _rotation_guard(telemetry_path, as_json) as acquired:
+        if not acquired:
+            _feedback_failure(
+                as_json,
+                "log_busy",
+                "the selection log's rotation lock is held; nothing was written — re-run",
+            )
+        try:
+            verified, verify_defect = resolve_selection(
+                telemetry_path, selection_id=resolved_id, include_rotated=include_rotated
+            )
+        except SelectionLogUnreadable as exc:
+            _feedback_failure(as_json, "log_unreadable", str(exc))
+        except OSError as exc:
+            # Same directory listing, and the confirmation window is exactly
+            # when its permissions can change underneath the command.
+            _feedback_failure(
+                as_json,
+                "log_unreadable",
+                f"cannot list the log directory for {telemetry_path}: {exc}",
+            )
+        if verified is None and verify_defect is not None:
+            # Present but no longer labellable — a conflicting copy landing in
+            # the confirmation window is the reachable case. That is the row
+            # changing under the operator, not the log rotating out from under
+            # it, and the two send them to different places.
+            _feedback_failure(
+                as_json,
+                "selection_changed",
+                f"selection {resolved_id} changed between confirmation and append "
+                f"({verify_defect}); nothing was written — re-run to see the current record",
+            )
+        if verified is None:
+            _feedback_failure(
+                as_json,
+                "log_rotated",
+                f"selection {resolved_id} is no longer in the log (rotated out between "
+                "resolution and append); nothing was written",
+            )
+        if _label_identity(verified) != _label_identity(record):
+            # Still present, but no longer the row that was confirmed: a copy
+            # of this id can land during the confirmation, and the label would
+            # then carry the cohort and trace of a record the operator never
+            # saw. Refused rather than reconciled — which of the two the
+            # judgement was about is not something this command can decide.
+            _feedback_failure(
+                as_json,
+                "selection_changed",
+                f"selection {resolved_id} changed between confirmation and append; "
+                "nothing was written — re-run to see the current record",
+            )
+        status = _write_label(
+            log,
+            selection_id=resolved_id,
+            trace_id=trace_id if isinstance(trace_id, str) else None,
+            user_corrected=corrected,
+            operator_override=overridden,
+            ranker_version=ranker_version if isinstance(ranker_version, str) else None,
+        )
+        # The sink swallows write failures by design — a telemetry fault must
+        # never break a proxied call — but this caller is a person waiting to
+        # hear that their label exists. Reporting success for a record that
+        # never reached disk is worse than the failure itself.
+        #
+        # Both the check and the report stay INSIDE the rotation guard. The
+        # sink's own reachability probe can only describe an instant that has
+        # already passed; the lock is what gives this command a linearization
+        # point, and the point is the EMISSION: when ``ok`` is printed, the
+        # label is in the log and no rotation has intervened since the write.
+        # Deliberately not a claim about any later instant — the guard is
+        # released as this function returns, and a rotation right afterwards
+        # evicts the label like any other record, which is what rotation is
+        # for. It binds cooperating writers only, the lock being advisory.
+        if status == APPEND_UNCONFIRMED:
+            # The bytes are complete in the file, but something about them was
+            # not established — that they survive a crash, or that a rotation
+            # did not orphan the file they went into. Deliberately not named
+            # apart here: the operator's move is the same for both, and naming
+            # a cause this process did not verify would be the overstatement
+            # the status exists to avoid.
+            #
+            # The advice is to RE-RUN, not to go and look: after a failed flush
+            # the record is visible and still not durable, so seeing it proves
+            # nothing about what was unconfirmed. Repeating the same label for
+            # the same selection is the accumulate-and-supersede case the
+            # schema already defines, not a second, conflicting judgement — so
+            # a retry costs correctness nothing. It is not free operationally:
+            # each attempt appends, so a persistent fault would fill the log
+            # one label at a time. Bounded advice, not a loop.
+            _feedback_failure(
+                as_json,
+                f"write_{status}",
+                f"the label's bytes reached {telemetry_path} but the record could not be "
+                f"confirmed there; re-run with --selection-id {resolved_id}, and if that "
+                f"does not report success, resolve the storage fault before retrying again",
+                extra={"selection_id": resolved_id},
+            )
+        if status != APPEND_WRITTEN:
+            _feedback_failure(
+                as_json,
+                f"write_{status}",
+                f"no label was written to {telemetry_path} (append status: {status})",
+            )
+        result = {
+            "action": "selection-feedback",
+            "ok": True,
+            "selection_id": resolved_id,
+            "trace_id": trace_id if isinstance(trace_id, str) else None,
+            "server": record.get("server"),
+            "selected_tool": record.get("selected_tool"),
+            "user_corrected": corrected,
+            "operator_override": overridden,
+            "log": str(telemetry_path),
+        }
+        if as_json:
+            click.echo(json_out.dumps(result, sort_keys=True, ensure_ascii=False))
+            return
+        click.echo(f"Labelled selection {_disp(resolved_id)}")
+        for field in ("user_corrected", "operator_override"):
+            if result[field] is not None:
+                click.echo(f"  {field}: {str(result[field]).lower()}")
+
+
+@contextmanager
+def _rotation_guard(path: Path, as_json: bool) -> Iterator[bool]:
+    """``rotation_lock`` whose *setup* failure is a reported error.
+
+    The lock lives in a sidecar file, so taking it can fail for reasons that
+    have nothing to do with contention — a writable log inside a directory this
+    user cannot create files in, most plainly. Letting that ``OSError`` escape
+    replaces the command's stable error document with a traceback and an empty
+    stdout, which is exactly what a scripted caller cannot handle.
+    """
+    try:
+        manager = rotation_lock(path, attempts=_LOCK_ATTEMPTS)
+        entered = manager.__enter__()
+    except OSError as exc:
+        _feedback_failure(
+            as_json,
+            "lock_failed",
+            f"cannot create the rotation lock beside {path}: {exc}",
+        )
+    try:
+        yield entered
+    finally:
+        manager.__exit__(None, None, None)
+
+
+def _write_label(log: SelectionTelemetryLog, **fields: Any) -> str:
+    """Append the label. Split out so a test can observe when the write runs
+    relative to the confirmation output, which output ordering alone cannot
+    prove."""
+    return log.log_feedback(**fields)
+
+
+def _label_identity(record: dict[str, Any]) -> tuple[Any, ...]:
+    """The fields of a selection a label is answerable to.
+
+    ``ranker_version`` and ``trace_id`` because the label copies them, and
+    ``server`` / ``selected_tool`` because they are what the operator was shown
+    and agreed to. ``ts`` is deliberately out: two byte-identical resolves are
+    the same row, and a differing timestamp alone would already have made the
+    copies conflict.
+    """
+    return (
+        record.get("ranker_version"),
+        record.get("trace_id"),
+        record.get("server"),
+        record.get("selected_tool"),
+    )
+
+
+def _human_at_the_terminal() -> bool:
+    """Whether anyone can answer a prompt — and see what it asks about.
+
+    Both streams, not just stdin: with stdout piped (``mms ... | jq``) the
+    resolved selection and the question itself vanish into the pipe while the
+    command blocks on an answer nobody was shown. A confirmation the operator
+    cannot read is not the check that ``--last`` leans on, so that case takes
+    the same ``--yes``-or-refuse path as a non-interactive stdin.
+    """
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _tri_state(positive: bool, negative: bool, name: str) -> bool | None:
+    """Fold two opposing flags into one three-valued label.
+
+    Both set is a usage error, not a precedence question: the two flags assert
+    contradictory facts about the same selection, and picking one would record
+    a label the operator did not mean.
+    """
+    if positive and negative:
+        raise click.UsageError(f"--{name} and --no-{name} contradict each other")
+    if positive:
+        return True
+    if negative:
+        return False
+    return None
+
+
+def _feedback_failure(
+    as_json: bool,
+    code: str,
+    message: str,
+    exit_code: int = 1,
+    *,
+    extra: dict[str, Any] | None = None,
+) -> NoReturn:
+    """Exit with a stable error code, in the caller's chosen format.
+
+    Exit 1 is an operational failure; exit 2 is missing consent, matching the
+    ``--json``-without-``--yes`` precedent elsewhere in the CLI.
+
+    *extra* adds fields a caller cannot recover for itself — the resolved
+    ``selection_id`` behind a ``--last`` that got as far as writing, without
+    which the retry the message advises would have to infer its target again,
+    and could infer a different one.
+    """
+    if as_json:
+        click.echo(
+            json_out.dumps(
+                {
+                    "action": "selection-feedback",
+                    "ok": False,
+                    "error": code,
+                    "message": message,
+                    **(extra or {}),
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+        )
+        raise click.exceptions.Exit(exit_code)
+    if exit_code == 2:
+        raise click.UsageError(message)
+    raise click.ClickException(message)

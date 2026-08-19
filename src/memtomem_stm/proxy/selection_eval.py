@@ -26,7 +26,11 @@ from memtomem_stm.proxy.config import (
 )
 from memtomem_stm.proxy.manager import ProxyToolInfo
 from memtomem_stm.proxy.privacy import contains_sensitive_content
-from memtomem_stm.proxy.selection_log import SCHEMA_VERSION
+from memtomem_stm.proxy.selection_log import (
+    SelectionLogUnreadable,
+    TelemetryReader,
+    records_conflict,
+)
 from memtomem_stm.proxy.tool_eligibility import ExposureCandidate, filter_tools
 from memtomem_stm.utils import json_out
 from memtomem_stm.proxy.tool_relevance import (
@@ -41,7 +45,6 @@ from memtomem_stm.proxy.tool_relevance import (
 REPORT_SCHEMA_VERSION = 1
 DATASET_SCHEMA_VERSION = 1
 EVALUATOR_VERSION = "v1"
-MAX_LINE_BYTES = 1_048_576
 GRID_REVIEW = (0.0, 0.25, 0.5, 0.75, 1.0)
 GRID_GRAPH = (0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0)
 PARITY_RANKER_VERSIONS = frozenset(
@@ -531,76 +534,24 @@ def _recommend_variant(
     }
 
 
-def _discover_log_files(path: Path, include_rotated: bool) -> list[Path]:
-    if not include_rotated:
-        return [path] if path.exists() else []
-    backups: list[tuple[int, Path]] = []
-    if path.parent.exists():
-        prefix = path.name + "."
-        for candidate in path.parent.iterdir():
-            if candidate.name.startswith(prefix):
-                suffix = candidate.name[len(prefix) :]
-                if suffix.isdigit() and candidate.is_file():
-                    backups.append((int(suffix), candidate))
-    ordered = [candidate for _, candidate in sorted(backups, reverse=True)]
-    if path.exists():
-        ordered.append(path)
-    return ordered
-
-
 def _read_telemetry(
     path: Path, include_rotated: bool
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    files_report: list[dict[str, Any]] = []
-    quality: Counter[str] = Counter()
-    warnings: list[str] = []
-    files_to_read = _discover_log_files(path, include_rotated)
-    for log_path in files_to_read:
-        try:
-            size = log_path.stat().st_size
-            with log_path.open("rb") as fh:
-                data = fh.read(size)
-        except OSError as exc:
-            raise SelectionEvaluationError(
-                f"cannot read telemetry: {log_path.name}: {exc}"
-            ) from exc
-        is_active = log_path == path
-        partial_tail = bool(data and not data.endswith(b"\n"))
-        lines = data.splitlines()
-        if partial_tail and is_active:
-            lines = lines[:-1]
-            quality["truncated_tail_lines"] += 1
-            warnings.append("active log ended with an incomplete line; tail skipped")
-        files_report.append(
-            {
-                "name": log_path.name,
-                "sha256": hashlib.sha256(data).hexdigest(),
-                "lines": len(lines),
-            }
-        )
-        for line_no, raw_line in enumerate(lines, start=1):
-            if not raw_line.strip():
-                continue
-            if len(raw_line) > MAX_LINE_BYTES:
-                quality["oversized_lines"] += 1
-                continue
-            try:
-                record = json.loads(raw_line)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                quality["malformed_lines"] += 1
-                continue
-            if not isinstance(record, dict):
-                quality["malformed_lines"] += 1
-                continue
-            if record.get("schema_version") != SCHEMA_VERSION:
-                quality["unsupported_schema_records"] += 1
-                continue
-            if record.get("event") not in ("selection", "execution", "feedback"):
-                quality["unknown_event_records"] += 1
-                continue
-            record["_order"] = (len(files_report) - 1, line_no)
-            records.append(record)
+    """Load the log through the shared reader and report on the read.
+
+    Framing, the size cut, decoding, schema/event admission and append-order
+    stamping live in ``selection_log.TelemetryReader`` so this harness and the
+    labelling command cannot part company about which records exist; what stays
+    here is the evaluation-side reporting built on top of them.
+    """
+    reader = TelemetryReader(path, include_rotated=include_rotated)
+    try:
+        records = list(reader.records())
+    except SelectionLogUnreadable as exc:
+        raise SelectionEvaluationError(
+            f"cannot read telemetry: {exc.segment}: {exc.error}"
+        ) from exc
+    quality = reader.quality
     invalid = sum(
         quality[name]
         for name in (
@@ -611,10 +562,10 @@ def _read_telemetry(
         )
     )
     return records, {
-        "files": files_report,
-        "exists": bool(files_to_read),
+        "files": reader.files,
+        "exists": bool(reader.segments),
         "status": "invalid" if invalid else "ok",
-        "warnings": sorted(set(warnings)),
+        "warnings": sorted(set(reader.warnings)),
         **{name: quality[name] for name in sorted(quality)},
     }
 
@@ -624,6 +575,7 @@ def _observed_telemetry(records: list[dict[str, Any]], quality: dict[str, Any]) 
     executions: dict[str, dict[str, Any]] = {}
     feedback: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
     duplicate_bytes = conflicting = 0
+    poisoned: set[tuple[str, str]] = set()
     events: Counter[str] = Counter()
     for record in records:
         event = str(record["event"])
@@ -637,16 +589,23 @@ def _observed_telemetry(records: list[dict[str, Any]], quality: dict[str, Any]) 
             feedback[sid].append(record)
             continue
         bucket = selections if event == "selection" else executions
+        if (event, sid) in poisoned:
+            # Once two copies disagreed the id is unusable, and a THIRD copy
+            # does not settle the vote — it is one more claim about a record
+            # whose history is already contradictory. Tracked monotonically so
+            # a later copy cannot resurrect the selection, which is also what
+            # `mms selection feedback` refuses to label (`records_conflict`).
+            conflicting += 1
+            continue
         existing = bucket.get(sid)
         if existing is None:
             bucket[sid] = record
             continue
-        left = {k: v for k, v in existing.items() if k != "_order"}
-        right = {k: v for k, v in record.items() if k != "_order"}
-        if left == right:
+        if not records_conflict(existing, record):
             duplicate_bytes += 1
         else:
             conflicting += 1
+            poisoned.add((event, sid))
             bucket.pop(sid, None)
     if conflicting:
         quality["status"] = "invalid"
