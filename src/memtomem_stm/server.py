@@ -1889,7 +1889,12 @@ def _format_selection_stats_sections(agg: dict, live: dict[str, int]) -> list[st
     is ``SelectionTelemetryLog.snapshot`` (this process only).
     """
     lines: list[str] = [f"\nLog: {agg['path']}"]
-    if agg["rotated_backups"]:
+    if agg.get("rotated_backups_unknown"):
+        # Not "0 backups": the directory could not be listed, so history may
+        # exist that nothing below accounts for. Saying nothing here would read
+        # as "this file is all there is".
+        lines.append("  (rotated backups could not be counted — the log directory is unlistable)")
+    elif agg["rotated_backups"]:
         lines.append(f"  ({agg['rotated_backups']} rotated backup(s) present — not included below)")
 
     lines.append("\nLive counters (this process):")

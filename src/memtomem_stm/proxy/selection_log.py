@@ -185,14 +185,19 @@ def rotation_lock(
 
 
 @contextmanager
-def rotation_active_lock(log_path: Path | str) -> Iterator[bool]:
-    """Claim "a rotation is running here" for the block; never retries.
+def rotation_active_lock(
+    log_path: Path | str, *, attempts: int = 1, delay: float = 0.02
+) -> Iterator[bool]:
+    """Claim "no unlinking rotation may run here" for the block.
 
-    Failure to claim it is the answer the caller wants (someone else is
-    rotating), not a condition to wait out.
+    Held by a writer around a destructive rotation, and by an append that such
+    a rotation could destroy — the two must not interleave, so they take the
+    same lock. Brief either way (a couple of renames, or one small write), so a
+    caller that cannot afford to be refused may retry rather than fail on the
+    first miss.
     """
-    with _hold_lock(rotation_active_lock_path(log_path), attempts=1, delay=0.0) as acquired:
-        yield acquired
+    with _hold_lock(rotation_active_lock_path(log_path), attempts=attempts, delay=delay) as ok:
+        yield ok
 
 
 # Per-record default when no ranking informed the call — the client model
@@ -531,16 +536,18 @@ class SelectionTelemetryLog:
         # O_APPEND write is far cheaper than the upstream call it accounts
         # for. Multi-client serving is the reopen trigger to move this
         # off-loop; writers already serialize on ``self._lock``.
-        with self._lock:
+        with self._lock, self._destructive_rotation_guard() as may_append:
+            if not may_append:
+                # Another writer is unlinking the file this append would land
+                # in. Report the failure instead of counting a record that may
+                # not survive.
+                self.write_errors += 1
+                logger.warning(
+                    "Selection telemetry write skipped: a destructive rotation is in progress"
+                )
+                return APPEND_FAILED
             try:
-                if not self._rotate_if_needed_locked():
-                    # Another writer is rotating and this configuration deletes
-                    # the file it is rotating, so an append now may land in an
-                    # inode about to be unlinked. Report the failure instead of
-                    # counting a record that may not survive.
-                    self.write_errors += 1
-                    logger.warning("Selection telemetry write skipped: the rotation lock is held")
-                    return APPEND_FAILED
+                self._rotate_if_needed_locked()
                 # Whether THIS append creates the file decides if the
                 # directory entry also needs syncing: an fsync on the
                 # descriptor alone does not promise a newly created name
@@ -674,58 +681,73 @@ class SelectionTelemetryLog:
             logger.debug("Could not terminate a short-written telemetry record", exc_info=True)
             return False
 
-    def _rotate_if_needed_locked(self) -> bool:
-        """Size-based rotation; returns whether the caller may now append.
+    @contextmanager
+    def _destructive_rotation_guard(self) -> Iterator[bool]:
+        """Exclude an unlinking rotation for the whole append; yields whether
+        the append may proceed.
+
+        Only ``max_backups == 0`` rotates by destroying the file. Every other
+        setting renames, and a rename cannot orphan an append: the record lands
+        either in the file that becomes ``.1`` or in the fresh active, and both
+        are read back. So only that one configuration pays a lock per record,
+        and the default append path stays lock-free.
+
+        Held across the ``open`` and the ``write``, not merely around the
+        rotation decision. A check that ends before the descriptor is opened
+        leaves exactly the window the guard exists to close: the file is
+        unlinked in between, and the append then writes into an inode no name
+        points at — reported as written, readable by nobody.
+
+        A *reader* is not this case. ``mms selection feedback`` holds the
+        rotation lock across a whole multi-segment scan while destroying
+        nothing, so it does not take this one, and an append during its scan
+        proceeds normally.
+
+        Cross-process caveat: the hazard is created by the ROTATOR's setting,
+        which this process cannot see. A writer configured with backups does
+        not take this lock, so it can still race an unlinking rotator running a
+        different configuration against the same log. Mixed-configuration
+        writers on one log are outside what a per-process setting can detect;
+        the supported deployment is a single writing proxy.
+        """
+        if self._max_backups > 0:
+            yield True
+            return
+        # Retried rather than refused on the first miss: the competing hold is
+        # a couple of renames or one small write, and a refusal here costs a
+        # record that had nothing wrong with it.
+        with rotation_active_lock(self._path, attempts=3, delay=0.02) as claimed:
+            yield claimed
+
+    def _rotate_if_needed_locked(self) -> None:
+        """Size-based rotation. The caller holds the destructive-rotation guard.
 
         ``log → log.1 → … → log.N``, oldest dropped. Renames preserve the 0600
         mode; the fresh file is recreated 0600 by the ``os.open`` in
         ``_append``. With ``max_backups == 0`` the file is simply truncated by
         deletion (append recreates it).
 
-        Returns ``False`` only when another *writer* is mid-rotation while
-        ``max_backups == 0``: that configuration rotates by unlinking, so an
-        append could be written into an inode about to disappear. With at least
-        one backup the record survives either ordering — it lands in the file
-        that becomes ``.1``, or in the fresh active — so the append proceeds.
-
-        A *reader* holding the rotation lock is not that case, which is why the
-        two are distinguished rather than both read as "busy": readers
-        (``mms selection feedback``) hold it across a whole multi-segment scan
-        and rotate nothing, so treating their hold as a rotation in flight
-        would drop every record appended for the length of that scan.
+        Does not decide whether the append may proceed — the guard the caller
+        already holds is what makes it safe, rather than a guess at who holds a
+        lock and why. Rotation itself is never urgent: a deferred one fires
+        again on the next append, since the size trigger is still true.
         """
         try:
             size = self._path.stat().st_size
         except OSError:
-            return True
+            return
         if size < self._max_bytes:
-            return True
-        # Both locks are taken here and nowhere else on the write path: the
-        # size check above has already passed, so this costs one open+flock per
-        # actual rotation, not per record.
-        #
-        # The rotation claim is made BEFORE the rotation lock, so it covers the
-        # whole attempt rather than only the renames. That errs toward a
-        # writer's brief claim being read as a rotation by a second writer —
-        # conservative in the direction this file takes everywhere else, since
-        # the cost is a reported refusal rather than a record quietly written
-        # into a doomed inode.
-        with rotation_active_lock(self._path) as claimed:
-            if not claimed:
-                logger.debug("Deferring selection-log rotation: another writer is rotating")
-                return self._max_backups > 0
-            # A reader (``mms selection feedback``) holding the rotation lock
-            # means a resolve/append is in flight against these exact
-            # filenames; deferring the rotation to the next append is harmless,
-            # while renaming underneath that reader is not. The append is safe
-            # either way, because no rotation can begin while that reader
-            # holds the lock.
-            with rotation_lock(self._path) as acquired:
-                if not acquired:
-                    logger.debug("Deferring selection-log rotation: a reader holds the log")
-                    return True
-                self._rotate_locked()
-        return True
+            return
+        # Taken here and nowhere else on the write path: the size check above
+        # has already passed, so this costs one open+flock per actual rotation,
+        # not per record. A reader (``mms selection feedback``) holding it
+        # means a resolve/append is in flight against these exact filenames;
+        # deferring is harmless, while renaming underneath that reader is not.
+        with rotation_lock(self._path) as acquired:
+            if not acquired:
+                logger.debug("Deferring selection-log rotation: the log is locked")
+                return
+            self._rotate_locked()
 
     def _rotate_locked(self) -> None:
         """Perform the renames. Caller holds both locks."""
@@ -1266,17 +1288,23 @@ def aggregate_selection_log(path: Path | str, *, top_n: int = 10) -> dict[str, A
     # Listing the directory is the one step here that can fail on its own —
     # ``discover_log_files`` iterates it, and an unreadable directory raises
     # where the ``glob`` this replaced swallowed the error. Counting backups is
-    # a decoration on the summary, so a failure here reports zero rather than
-    # taking down a stats call that this function's contract says cannot break.
+    # a decoration on the summary, so a failure degrades rather than taking
+    # down a stats call this function's contract says cannot break. Reported as
+    # UNKNOWN rather than as zero: a directory can deny enumeration while still
+    # permitting the active file to be opened, and "no history beyond this
+    # file" is a different claim from "I could not look".
+    rotated_unknown = False
     try:
         rotated = len([segment for segment in discover_log_files(path) if segment != path])
     except OSError:
         logger.debug("Could not list the selection log's directory to count backups", exc_info=True)
         rotated = 0
+        rotated_unknown = True
     result: dict[str, Any] = {
         "path": str(path),
         "exists": path.exists(),
         "rotated_backups": rotated,
+        "rotated_backups_unknown": rotated_unknown,
         "total_lines": 0,
         "malformed": 0,
         "events": {"selection": 0, "execution": 0, "feedback": 0},

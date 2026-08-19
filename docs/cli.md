@@ -743,7 +743,7 @@ exit 1 and emit `{"action": "selection-feedback", "ok": false, "error":
 | `log_unreadable` | the log directory could not be listed, or a segment could not be opened or read — reported instead of `no_match`, since "I could not look there" is not "no such selection", and a segment silently skipped would promote an older row to "most recent" |
 | `config_invalid` | the configured log path is unknown, by any of three routes: the config file exists but does not parse; there is no file and the `MEMTOMEM_STM_PROXY__*` overlay the operator did set fails to validate; or a bare `MEMTOMEM_STM_PROXY` was dropped entirely because it is not valid JSON or does not decode to an object — that last one is reported with a config file present too, since the file then decides a path the environment was meant to override. All refuse rather than labelling whichever log is left over |
 | `confirmation_required` | `--last` used non-interactively (or with `--json`) without `--yes`; exit 2, matching the CLI-wide rule that a formatting flag must not authorize a write |
-| `write_failed` / `write_redacted` | no label record was written — the sink swallows write faults so a telemetry problem cannot break a proxied call, so the command checks the append outcome instead of assuming it. A write that landed short leaves an unparseable fragment behind (rolling it back would mean rewinding a file the proxy appends to concurrently); readers count it as one malformed line and it joins nothing |
+| `write_failed` / `write_redacted` | no label record was written — the sink swallows write faults so a telemetry problem cannot break a proxied call, so the command checks the append outcome instead of assuming it. A write that landed short and could not be repaired leaves an unparseable fragment behind (rolling it back would mean rewinding a file the proxy appends to concurrently); readers count it as one malformed line and it joins nothing. A short write missing only its trailing newline is repaired instead and reported as a success, since the record is then complete and readable |
 | `write_unconfirmed` | the label's bytes reached the log but the flush proving they survive a crash did not complete. Neither "written" nor "not written" is available, so the command says so — and names the row: the `--json` document carries `selection_id`, and the retry to run is `--selection-id <id>`, never another `--last`, which by then could infer a *different* selection. Repeating the label for the same selection is the accumulate-and-supersede case above |
 
 Unlike the proxy's call-path emitters, the label is flushed to the storage
@@ -772,13 +772,23 @@ decided to rotate**, and defers rotation to its next append rather than
 waiting — so the proxy's per-record append path stays lock-free and a labelling
 session can never stall a proxied call.
 
-A rotating writer additionally claims `<log>.rotating.lock`, which is what
-separates "a reader is looking" from "a rotation is running". Only the second
-makes an append unsafe, and only under `max_backups: 0`, which rotates by
-unlinking: without the distinction a writer past its size threshold would drop
-every record for as long as a labelling session held the rotation lock — a full
-multi-segment scan — even though that session renames nothing. Neither lock file
-is counted as a rotated backup.
+Under `max_backups: 0` — the one setting that rotates by *unlinking* rather
+than renaming — a second lock, `<log>.rotating.lock`, is held by the rotation
+and by each append for the length of its `open` and `write`. Only an unlink can
+make a completed append unreachable, and only if the two interleave: a rename
+leaves the record in the file that becomes `.1` or in the fresh active, and both
+are read back. So every other setting keeps the per-record append path
+lock-free, and a labelling session's hold on the rotation lock — a whole
+multi-segment scan, during which it destroys nothing — never costs a record.
+An append that cannot take the lock is refused (`write_failed`) rather than
+written into an inode about to disappear. Neither lock file is counted as a
+rotated backup.
+
+The hazard is created by the *rotator's* setting, which another process cannot
+see, so a writer configured with backups does not take that lock and can still
+race an unlinking rotator running a different configuration against the same
+log. Mixed-configuration writers on one log are outside what a per-process
+setting can detect; the supported deployment is a single writing proxy.
 
 ## `mms hook` — built-in tool bridge + per-host registration
 

@@ -34,10 +34,13 @@ changes inline only. See the deprecation policy in
   actually reached disk — the sink swallows write faults so a telemetry problem
   cannot break a proxied call, so a failed or redacted append exits 1
   (`write_failed` / `write_redacted`) instead of claiming success — including
-  a short `os.write`, which writes no record (the unparseable fragment it
-  leaves stays put: rolling it back would rewind a file the proxy appends to
-  concurrently), and an append racing another writer's `max_backups: 0`
-  rotation, which can land in an inode about to be unlinked. The label's
+  a short `os.write` that could not be repaired, which writes no record (the
+  unparseable fragment it leaves stays put: rolling it back would rewind a file
+  the proxy appends to concurrently). A short write missing *only* its trailing
+  newline is the exception: the byte is restored, the record is complete and
+  readable, and reporting a failure would invite a retry that duplicates the
+  label. Refused too is an append that cannot be serialized against another
+  writer's `max_backups: 0` rotation, which unlinks the inode it would land in. The label's
   append is durable, unlike the call-path emitters': the descriptor — and the
   directory entry too when the append created the log — is `fsync`-ed before
   success is reported, so an unclean shutdown cannot swallow a judgement the
@@ -81,11 +84,13 @@ changes inline only. See the deprecation policy in
   evict the agreed selection before the write (`log_rotated` / `log_busy`,
   nothing written). The writer takes that lock only when it has already decided
   to rotate and defers instead of waiting, leaving the per-record append path
-  lock-free. A writer that is actually rotating claims a second lock
-  (`<log>.rotating.lock`) so an appender can tell it from a reader: only a
-  rotation in flight can cost a record, and only under `max_backups: 0`, so a
-  labelling session's lock hold — a whole multi-segment scan — no longer makes
-  an over-threshold writer refuse every append for its duration.
+  lock-free. Under `max_backups: 0`, the one setting that rotates by
+  unlinking, a second lock (`<log>.rotating.lock`) is held by the rotation and
+  by each append across its `open` and `write`, so the two cannot interleave;
+  every other setting renames, which cannot orphan an append, and keeps the
+  per-record path lock-free. A labelling session's hold on the rotation lock —
+  a whole multi-segment scan, destroying nothing — therefore no longer makes an
+  over-threshold writer refuse every append for its duration.
   `stm_selection_stats`' `rotated_backups` no longer counts either lock file
   (or any non-numeric sibling) as a backup. The label inherits the labelled selection's
   `ranker_version` and `trace_id`, so it lands in that call's cohort rather

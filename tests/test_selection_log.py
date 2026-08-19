@@ -14,6 +14,7 @@ import json
 import os
 import random
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -849,8 +850,30 @@ class TestAggregateSelectionLog:
         with mock.patch.object(selection_log_module, "discover_log_files", refuse):
             out = aggregate_selection_log(log_path)
         assert out["rotated_backups"] == 0
+        assert out["rotated_backups_unknown"] is True, (
+            "'I could not look' must not be reported as 'there is no history'"
+        )
         assert out["total_lines"] >= 1, "the records it CAN read are still reported"
         assert out["events"]["selection"] >= 1
+
+        # And the rendered view says so, rather than leaving the reader to
+        # infer that the active file is the whole log.
+        from memtomem_stm.server import _format_selection_stats_sections
+
+        live = dict.fromkeys(
+            ("events_written", "events_sampled_out", "redaction_drops", "write_errors"), 0
+        )
+        rendered = "\n".join(_format_selection_stats_sections(out, live))
+        assert "could not be counted" in rendered
+
+    def test_a_listable_directory_reports_the_count_as_known(self, tmp_path):
+        """The positive control: the flag is off when the listing worked, so
+        the assertion above is about the failure and not about the key
+        existing."""
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        out = aggregate_selection_log(log_path)
+        assert out["rotated_backups_unknown"] is False
 
 
 class TestDiscoverLogFiles:
@@ -2869,6 +2892,49 @@ class TestSelectionFeedbackRobustness:
         assert contender.events_written == 0
         assert contender.write_errors == 1
 
+    def test_an_append_is_never_reported_written_into_an_unlinked_inode(self, tmp_path):
+        """The window the guard exists to close, driven through the real path.
+
+        ``max_backups=0`` rotates by unlinking, and rotation happens inside an
+        append. Hold one appender between its ``open`` and its ``write`` and
+        run the rotating append in that window: without a guard spanning both
+        syscalls the record goes into an inode no name points at, and the
+        writer is told it was written. Whoever loses here must lose *loudly* —
+        what is forbidden is a ``"written"`` whose record is gone.
+        """
+        log_path = tmp_path / "log.jsonl"
+        appender = SelectionTelemetryLog(log_path, max_bytes=10**9, max_backups=0)
+        appender.initialize()
+        rotator = SelectionTelemetryLog(log_path, max_bytes=1, max_backups=0)
+        log_path.write_text('{"seed": 1}\n', encoding="utf-8")
+
+        opened = threading.Event()
+        rotated = threading.Event()
+        real_write = os.write
+
+        def slow_write(fd, data):
+            if b"racer" in data:
+                opened.set()
+                rotated.wait(3.0)
+            return real_write(fd, data)
+
+        def rotate():
+            opened.wait(3.0)
+            rotator.log_feedback(selection_id="rotator", user_corrected=True)
+            rotated.set()
+
+        worker = threading.Thread(target=rotate)
+        worker.start()
+        with mock.patch.object(selection_log_module.os, "write", slow_write):
+            status = appender.log_feedback(selection_id="racer", user_corrected=True)
+        worker.join()
+
+        on_disk = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+        if status == "written":
+            assert "racer" in on_disk, "a record reported as written must be on disk"
+        else:
+            assert status == "failed", status
+
     def test_a_reader_holding_the_lock_does_not_cost_the_writer_its_record(self, tmp_path):
         """The reader's hold is not a rotation, and must not be read as one.
 
@@ -2916,6 +2982,42 @@ class TestSelectionFeedbackRobustness:
         assert result.exit_code == 1
         payload = json.loads(result.output)
         assert payload["error"] == "log_unreadable"
+        assert _feedback_records(log_path) == []
+
+    def test_a_listing_that_fails_only_after_confirmation_is_also_reported(
+        self, tmp_path, monkeypatch
+    ):
+        """The second locked resolve has its own guard, and its own reason.
+
+        The command resolves twice: once to identify the row, and again under
+        the lock after confirmation, because a human pause is exactly when the
+        log can change. The companion test above aborts in the FIRST resolve,
+        so it says nothing about the second — and the second is the one whose
+        window is human-length, which is when a directory's permissions
+        realistically change underneath it.
+        """
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+
+        from memtomem_stm.cli import selection_cmd as selection_cmd_module
+
+        real = selection_cmd_module.resolve_selection
+        calls = {"n": 0}
+
+        def fail_on_the_second_resolve(*args, **kwargs):
+            # Counted per RESOLVE, not per directory listing: one resolve lists
+            # the directory more than once, so counting listings would trip
+            # inside the first resolve and pin the other arm instead.
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise PermissionError(13, "Permission denied")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(selection_cmd_module, "resolve_selection", fail_on_the_second_resolve)
+        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
+        assert calls["n"] == 2, "the post-confirmation resolve must have been reached"
+        assert result.exit_code == 1
+        assert json.loads(result.output)["error"] == "log_unreadable"
         assert _feedback_records(log_path) == []
 
     def test_the_lock_file_is_not_counted_as_a_rotated_backup(self, tmp_path):
