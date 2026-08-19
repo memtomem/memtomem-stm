@@ -172,7 +172,15 @@ def _malformed_plus_good(malformed: dict) -> list[dict]:
 
 @pytest.mark.parametrize(
     ("bad_rank", "case"),
-    [("first", "non-numeric"), (None, "missing"), (True, "bool")],
+    [
+        ("first", "non-numeric"),
+        (None, "missing"),
+        (True, "bool"),
+        (1.0, "float"),
+        (0, "zero — would divide by zero in MRR"),
+        (-1, "negative — would score as a rank-1 hit"),
+        (10**400, "oversized — would overflow float()"),
+    ],
 )
 def test_admitted_record_with_non_integer_rank_is_counted_not_raised(
     tmp_path: Path, bad_rank: object, case: str
@@ -190,6 +198,11 @@ def test_admitted_record_with_non_integer_rank_is_counted_not_raised(
     assert report["production"]["coverage"]["rankable_selections"] == 2
     assert report["production"]["coverage"]["selected_rank_known"] == 1
     assert report["production"]["coverage"]["paired_selections"] == 2
+    # An unusable rank is an alignment miss, not a dropped denominator, and it
+    # never reaches the 1/rank mean.
+    alignment = report["production"]["selected_tool_alignment"]
+    assert alignment["at_1"] == {"value": 0.5, "numerator": 1, "denominator": 2}
+    assert alignment["mrr"] == {"value": 1.0, "denominator": 1}
 
 
 def test_admitted_record_with_unhashable_candidate_tools_is_counted_not_raised(

@@ -255,12 +255,19 @@ changes inline only. See the deprecation policy in
   only `SelectionEvaluationError`. Both sites now validate first, so one
   unreadable row is a line in the report rather than the end of the run — the
   record still counts toward `rankable_selections` but not
-  `selected_rank_known`. **Behavior change**: `rank: true` previously passed
-  the invariant check (`True == 1`) and was recorded as rank 1; it is now
-  counted as a violation, so a log carrying one reports `status: invalid` and
-  the command exits 1 where it previously exited 0. Not reachable from STM's
-  own writer, which always stamps an integer rank; reachable from hand-edited
-  logs and other producers.
+  `selected_rank_known`, so an unusable rank reads as an alignment miss rather
+  than a shrunken denominator. A `rank` now feeds the metrics only when the
+  whole entry holds, which also closes `rank: 0` (division by zero in MRR),
+  `rank: -1` (scored as a rank-1 hit), and an oversized integer rank
+  (`float()` overflow). **Behavior change**: a rank the invariant check
+  rejects is no longer recorded at all, and the check itself is stricter —
+  `rank: true` previously passed it (`True == 1`) and `rank: 1.0` was cast to
+  `1`; both are now violations. A log carrying one reports `status: invalid`
+  and the command exits 1 where it previously exited 0. Not reachable from
+  STM's own writer, which always stamps an integer rank; reachable from
+  hand-edited logs and other producers. Other numeric fields on an admitted
+  record (`relevance_score`, `latency_ms`, `retry_count`, `cost`) can still
+  overflow or serialize as `NaN`; that is tracked separately in #856.
 
 - **An untyped `--config` now honors `MEMTOMEM_STM_PROXY__CONFIG_PATH`**
   (#849, closes #848). Every `--config` option defaulted to the literal
