@@ -741,7 +741,7 @@ exit 1 and emit `{"action": "selection-feedback", "ok": false, "error":
 | `log_busy` | the rotation lock is held (by a rotating writer or another labelling run) and could not be taken; nothing was written — re-run |
 | `lock_failed` | the rotation lock file beside the log could not be created (e.g. a writable log in a directory this user cannot write); nothing was written |
 | `log_unreadable` | the log directory could not be listed, or a segment could not be opened or read — reported instead of `no_match`, since "I could not look there" is not "no such selection", and a segment silently skipped would promote an older row to "most recent" |
-| `config_invalid` | the configured log path is unknown, by any of three routes: the config file exists but does not parse; there is no file and the `MEMTOMEM_STM_PROXY__*` overlay the operator did set fails to validate; or a bare `MEMTOMEM_STM_PROXY` was dropped entirely because it is not valid JSON or does not decode to an object — that last one is reported with a config file present too, since the file then decides a path the environment was meant to override. All refuse rather than labelling whichever log is left over |
+| `config_invalid` | the configured log path is unknown, by any of three routes: the config file exists but does not parse; there is no file and the `MEMTOMEM_STM_PROXY__*` overlay the operator did set fails to validate; or a bare `MEMTOMEM_STM_PROXY` was dropped entirely because it is not valid JSON or decodes to a non-null value that is not an object — that last one is reported with a config file present too, since the file then decides a path the environment was meant to override. All refuse rather than labelling whichever log is left over |
 | `confirmation_required` | `--last` used non-interactively (or with `--json`) without `--yes`; exit 2, matching the CLI-wide rule that a formatting flag must not authorize a write |
 | `write_failed` / `write_redacted` | no label record was written — the sink swallows write faults so a telemetry problem cannot break a proxied call, so the command checks the append outcome instead of assuming it. A write that landed short and could not be repaired leaves an unparseable fragment behind (rolling it back would mean rewinding a file the proxy appends to concurrently); readers count it as one malformed line and it joins nothing. A short write missing only its trailing newline is repaired instead and reported as a success, since the record is then complete and readable |
 | `write_unconfirmed` | the label's bytes reached the log but the flush proving they survive a crash did not complete. Neither "written" nor "not written" is available, so the command says so — and names the row: the `--json` document carries `selection_id`, and the retry to run is `--selection-id <id>`, never another `--last`, which by then could infer a *different* selection. Repeating the label for the same selection is the accumulate-and-supersede case above |
@@ -772,23 +772,22 @@ decided to rotate**, and defers rotation to its next append rather than
 waiting — so the proxy's per-record append path stays lock-free and a labelling
 session can never stall a proxied call.
 
-Under `max_backups: 0` — the one setting that rotates by *unlinking* rather
-than renaming — a second lock, `<log>.rotating.lock`, is held by the rotation
-and by each append for the length of its `open` and `write`. Only an unlink can
-make a completed append unreachable, and only if the two interleave: a rename
-leaves the record in the file that becomes `.1` or in the fresh active, and both
-are read back. So every other setting keeps the per-record append path
-lock-free, and a labelling session's hold on the rotation lock — a whole
-multi-segment scan, during which it destroys nothing — never costs a record.
-An append that cannot take the lock is refused (`write_failed`) rather than
-written into an inode about to disappear. Neither lock file is counted as a
-rotated backup.
+Rotation can also destroy the file an append is *already writing to*: the
+appender holds a descriptor, and rotation renames or unlinks the name it was
+opened under. `max_backups: 0` unlinks immediately, and every other setting
+evicts the same inode once `max_backups + 1` rotations have shifted it past the
+last backup slot — a rename orphans an append just as thoroughly as an unlink,
+it only takes more of them. The write then succeeds into storage no reader can
+open.
 
-The hazard is created by the *rotator's* setting, which another process cannot
-see, so a writer configured with backups does not take that lock and can still
-race an unlinking rotator running a different configuration against the same
-log. Mixed-configuration writers on one log are outside what a per-process
-setting can detect; the supported deployment is a single writing proxy.
+The appender detects this rather than locking against it: after the write it
+checks that the descriptor's inode still has a name (`st_nlink`), and reports
+`write_failed` if it does not. A lock would have to be taken on every append,
+and could not cover the case anyway — the settings that decide whether rotation
+unlinks belong to whichever process is rotating, which may not be this one. So
+the per-record append path stays lock-free, and the guarantee it offers is the
+one that matters to a caller: **a record reported as written is reachable by
+name**. The lock file is not counted as a rotated backup.
 
 ## `mms hook` — built-in tool bridge + per-host registration
 

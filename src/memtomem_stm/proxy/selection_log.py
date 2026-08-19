@@ -125,30 +125,16 @@ def rotation_lock_path(log_path: Path | str) -> Path:
     """Advisory lock guarding the log's file *identities*, not its contents.
 
     Appends need no lock — ``O_APPEND`` is atomic for small writes, which is
-    why the writer takes none per record. Rotation is different: it renames
-    every segment at once, so a reader holding a filename can end up scanning
-    a file that is no longer what it thought, and with ``max_backups == 0``
-    the oldest content is unlinked outright. This lock exists only for that
-    window.
+    why the writer takes none per record, and why an append that a rotation
+    orphans is *detected* afterwards rather than excluded beforehand (see
+    ``_still_reachable``). Rotation is different: it renames every segment at
+    once, so a READER holding a filename can end up scanning a file that is no
+    longer what it thought, and with ``max_backups == 0`` the oldest content is
+    unlinked outright. This lock exists only for that window, and only readers
+    and the rotation itself take it.
     """
     log_path = Path(log_path).expanduser()
     return log_path.with_name(log_path.name + ".rotate.lock")
-
-
-def rotation_active_lock_path(log_path: Path | str) -> Path:
-    """Advisory lock a writer holds while it is *performing* a rotation.
-
-    Separate from :func:`rotation_lock_path` because the two answer different
-    questions, and only one of them makes an append unsafe. Readers take the
-    rotation lock to keep the filenames still for a whole scan — seconds, on a
-    large log — while rotating nothing; a writer takes THIS one only around the
-    renames themselves. An appender that cannot rotate therefore reads this
-    lock to tell "a reader is looking" (safe: no rotation can start while it
-    holds the other lock) from "a writer is rotating" (unsafe under
-    ``max_backups == 0``, which rotates by unlinking).
-    """
-    log_path = Path(log_path).expanduser()
-    return log_path.with_name(log_path.name + ".rotating.lock")
 
 
 @contextmanager
@@ -184,22 +170,6 @@ def rotation_lock(
         yield acquired
 
 
-@contextmanager
-def rotation_active_lock(
-    log_path: Path | str, *, attempts: int = 1, delay: float = 0.02
-) -> Iterator[bool]:
-    """Claim "no unlinking rotation may run here" for the block.
-
-    Held by a writer around a destructive rotation, and by an append that such
-    a rotation could destroy — the two must not interleave, so they take the
-    same lock. Brief either way (a couple of renames, or one small write), so a
-    caller that cannot afford to be refused may retry rather than fail on the
-    first miss.
-    """
-    with _hold_lock(rotation_active_lock_path(log_path), attempts=attempts, delay=delay) as ok:
-        yield ok
-
-
 # Per-record default when no ranking informed the call — the client model
 # picked from the full advertised set unaided — so replay tooling can treat
 # this version as the unranked baseline. Calls where a ranker ran stamp
@@ -207,6 +177,36 @@ def rotation_active_lock(
 # halves of the pair via the ``ranker_version`` parameter, letting replay
 # split cohorts on this field alone.
 RANKER_VERSION = "v0-passthrough"
+
+
+def _still_reachable(fd: int) -> bool:
+    """Whether anything still NAMES the file this descriptor just wrote to.
+
+    Rotation can destroy the directory entry while an append already holds the
+    inode open, and the append then succeeds into storage no reader can ever
+    open. Two ways in, and the second is why holding a lock for one
+    configuration was not enough: ``max_backups == 0`` unlinks outright, and
+    every other setting evicts the same inode once ``max_backups + 1``
+    rotations have shifted it past the last backup slot — a rename orphans an
+    append just as thoroughly as an unlink, it only takes more of them.
+
+    ``st_nlink == 0`` is exactly that state. Checked after the write rather
+    than prevented before it, because prevention costs a lock on every append
+    while the hazard is a race that a lock for one configuration cannot even
+    cover: the rotator's settings belong to another process.
+
+    Windows has no unlink-while-open to detect — an open descriptor blocks the
+    rename, so the rotation fails instead and the question never arises. Any
+    failure to ask answers **True**: a probe that could not run must not
+    manufacture a failure for a write that landed.
+    """
+    if sys.platform == "win32":  # pragma: no cover - POSIX-only rotation hazard
+        return True
+    try:
+        return os.fstat(fd).st_nlink > 0
+    except OSError:
+        logger.debug("Could not probe whether the selection log is still linked", exc_info=True)
+        return True
 
 
 def _needs_leading_newline(path: Path) -> bool:
@@ -536,16 +536,7 @@ class SelectionTelemetryLog:
         # O_APPEND write is far cheaper than the upstream call it accounts
         # for. Multi-client serving is the reopen trigger to move this
         # off-loop; writers already serialize on ``self._lock``.
-        with self._lock, self._destructive_rotation_guard() as may_append:
-            if not may_append:
-                # Another writer is unlinking the file this append would land
-                # in. Report the failure instead of counting a record that may
-                # not survive.
-                self.write_errors += 1
-                logger.warning(
-                    "Selection telemetry write skipped: a destructive rotation is in progress"
-                )
-                return APPEND_FAILED
+        with self._lock:
             try:
                 self._rotate_if_needed_locked()
                 # Whether THIS append creates the file decides if the
@@ -594,12 +585,24 @@ class SelectionTelemetryLog:
                             len(payload),
                         )
                         return APPEND_FAILED
-                    # From here the record's bytes are complete in the file, so
-                    # nothing below may report ``failed``: that would send an
-                    # operator to write the same label a second time on the
-                    # strength of a claim this process cannot make. What can
-                    # still be unknown is whether the bytes SURVIVE, which is
-                    # what ``unconfirmed`` says.
+                    if not _still_reachable(fd):
+                        # The bytes are complete, and in an inode a rotation
+                        # unlinked while this append held it open — durable,
+                        # perhaps, and named by nothing. No reader will ever
+                        # see this record, so the one verdict that must not be
+                        # returned is the one that says it exists.
+                        self.write_errors += 1
+                        logger.warning(
+                            "Selection telemetry write landed in a log segment that was "
+                            "rotated away before the write completed"
+                        )
+                        return APPEND_FAILED
+                    # From here the record's bytes are complete in a file that
+                    # still has a name, so nothing below may report ``failed``:
+                    # that would send an operator to write the same label a
+                    # second time on the strength of a claim this process
+                    # cannot make. What can still be unknown is whether the
+                    # bytes SURVIVE, which is what ``unconfirmed`` says.
                     try:
                         if durable:
                             os.fsync(fd)
@@ -681,44 +684,6 @@ class SelectionTelemetryLog:
             logger.debug("Could not terminate a short-written telemetry record", exc_info=True)
             return False
 
-    @contextmanager
-    def _destructive_rotation_guard(self) -> Iterator[bool]:
-        """Exclude an unlinking rotation for the whole append; yields whether
-        the append may proceed.
-
-        Only ``max_backups == 0`` rotates by destroying the file. Every other
-        setting renames, and a rename cannot orphan an append: the record lands
-        either in the file that becomes ``.1`` or in the fresh active, and both
-        are read back. So only that one configuration pays a lock per record,
-        and the default append path stays lock-free.
-
-        Held across the ``open`` and the ``write``, not merely around the
-        rotation decision. A check that ends before the descriptor is opened
-        leaves exactly the window the guard exists to close: the file is
-        unlinked in between, and the append then writes into an inode no name
-        points at — reported as written, readable by nobody.
-
-        A *reader* is not this case. ``mms selection feedback`` holds the
-        rotation lock across a whole multi-segment scan while destroying
-        nothing, so it does not take this one, and an append during its scan
-        proceeds normally.
-
-        Cross-process caveat: the hazard is created by the ROTATOR's setting,
-        which this process cannot see. A writer configured with backups does
-        not take this lock, so it can still race an unlinking rotator running a
-        different configuration against the same log. Mixed-configuration
-        writers on one log are outside what a per-process setting can detect;
-        the supported deployment is a single writing proxy.
-        """
-        if self._max_backups > 0:
-            yield True
-            return
-        # Retried rather than refused on the first miss: the competing hold is
-        # a couple of renames or one small write, and a refusal here costs a
-        # record that had nothing wrong with it.
-        with rotation_active_lock(self._path, attempts=3, delay=0.02) as claimed:
-            yield claimed
-
     def _rotate_if_needed_locked(self) -> None:
         """Size-based rotation. The caller holds the destructive-rotation guard.
 
@@ -750,7 +715,16 @@ class SelectionTelemetryLog:
             self._rotate_locked()
 
     def _rotate_locked(self) -> None:
-        """Perform the renames. Caller holds both locks."""
+        """Perform the renames. The caller holds the rotation lock.
+
+        Note what this does NOT coordinate with: an append already holding a
+        descriptor. Renaming the inode it writes to is harmless once, but the
+        same inode is evicted after ``max_backups + 1`` rotations, and
+        ``max_backups == 0`` unlinks it immediately. The appender detects that
+        for itself (``_still_reachable``) rather than being excluded here,
+        because the rotator whose settings decide the hazard may be another
+        process entirely.
+        """
         if self._max_backups <= 0:
             self._path.unlink(missing_ok=True)
             return

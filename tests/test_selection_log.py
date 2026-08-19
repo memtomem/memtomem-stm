@@ -15,6 +15,7 @@ import os
 import random
 import sys
 import threading
+from typing import Any
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -2867,73 +2868,78 @@ class TestSelectionFeedbackRobustness:
         )
         return rotator, SelectionTelemetryLog(log_path, max_bytes=1, max_backups=0)
 
-    def test_a_rotating_writer_does_not_silently_lose_a_contender(self, tmp_path):
-        """Two writers, ``max_backups=0``: the loser must not claim success.
+    @pytest.mark.parametrize("max_backups", [0, 1, 3])
+    def test_an_append_is_never_reported_written_into_an_orphaned_inode(
+        self, tmp_path, max_backups
+    ):
+        """A record reported as written must be reachable by SOME name.
 
-        That configuration rotates by unlinking, so an append racing it can be
-        written into an inode about to disappear. Reported as a failure rather
-        than counted — a lost record that was announced as written is worse
-        than a refused one.
+        Rotation can destroy the directory entry while an append already holds
+        the inode open. Two ways in, and the second is why guarding one
+        configuration was not enough: ``max_backups=0`` unlinks outright, and
+        every other setting evicts the same inode once ``max_backups + 1``
+        rotations have shifted it past the last slot. Parametrised over both
+        shapes because a fix that only understood the unlink passed the
+        ``0`` case and lost records for every other setting.
 
-        The rotating writer is simulated by holding BOTH locks, which is what
-        one holds: the rotation lock keeps the filenames still, and the
-        rotation-active lock is the claim that a rotation is running. Holding
-        only the first is a *reader*, and the companion test below pins that
-        those two are not the same answer.
+        The appender is stalled between its ``open`` and its ``write`` while a
+        second writer rotates that many times. Whoever loses may lose — what is
+        forbidden is a ``"written"`` for a record no reader can reach.
         """
         log_path = tmp_path / "log.jsonl"
-        _, contender = self._over_size_pair(log_path)
-        with selection_log_module.rotation_active_lock(log_path) as claimed:
-            assert claimed
-            with selection_log_module.rotation_lock(log_path) as acquired:
-                assert acquired
-                status = contender.log_feedback(selection_id="x", user_corrected=True)
-        assert status == "failed"
-        assert contender.events_written == 0
-        assert contender.write_errors == 1
-
-    def test_an_append_is_never_reported_written_into_an_unlinked_inode(self, tmp_path):
-        """The window the guard exists to close, driven through the real path.
-
-        ``max_backups=0`` rotates by unlinking, and rotation happens inside an
-        append. Hold one appender between its ``open`` and its ``write`` and
-        run the rotating append in that window: without a guard spanning both
-        syscalls the record goes into an inode no name points at, and the
-        writer is told it was written. Whoever loses here must lose *loudly* —
-        what is forbidden is a ``"written"`` whose record is gone.
-        """
-        log_path = tmp_path / "log.jsonl"
-        appender = SelectionTelemetryLog(log_path, max_bytes=10**9, max_backups=0)
+        appender = SelectionTelemetryLog(log_path, max_bytes=10**9, max_backups=max_backups)
         appender.initialize()
-        rotator = SelectionTelemetryLog(log_path, max_bytes=1, max_backups=0)
+        rotator = SelectionTelemetryLog(log_path, max_bytes=1, max_backups=max_backups)
         log_path.write_text('{"seed": 1}\n', encoding="utf-8")
 
         opened = threading.Event()
         rotated = threading.Event()
         real_write = os.write
+        worker: dict[str, Any] = {}
 
         def slow_write(fd, data):
             if b"racer" in data:
                 opened.set()
-                rotated.wait(3.0)
+                # Asserted below: a timeout here would let the append complete
+                # unraced and the test would prove nothing.
+                worker["handshake"] = rotated.wait(10.0)
             return real_write(fd, data)
 
         def rotate():
-            opened.wait(3.0)
-            rotator.log_feedback(selection_id="rotator", user_corrected=True)
-            rotated.set()
+            try:
+                worker["started"] = opened.wait(10.0)
+                # ``max_backups + 1`` rotations: one to rename the held inode
+                # into the backups, the rest to push it off the end.
+                worker["statuses"] = [
+                    rotator.log_feedback(selection_id=f"rot{i}", user_corrected=True)
+                    for i in range(max_backups + 1)
+                ]
+            except BaseException as exc:  # surfaced below rather than swallowed
+                worker["error"] = exc
+            finally:
+                rotated.set()
 
-        worker = threading.Thread(target=rotate)
-        worker.start()
+        thread = threading.Thread(target=rotate)
+        thread.start()
         with mock.patch.object(selection_log_module.os, "write", slow_write):
             status = appender.log_feedback(selection_id="racer", user_corrected=True)
-        worker.join()
+        thread.join(15.0)
 
-        on_disk = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+        assert not thread.is_alive(), "the rotating writer never finished"
+        assert "error" not in worker, f"the rotating writer raised: {worker.get('error')!r}"
+        assert worker.get("started") is True, "the rotator never observed the stalled append"
+        assert worker.get("handshake") is True, "the append was not held across the rotations"
+        assert worker.get("statuses") == ["written"] * (max_backups + 1), worker.get("statuses")
+
+        reachable = any(
+            "racer" in segment.read_text(encoding="utf-8", errors="replace")
+            for segment in selection_log_module.discover_log_files(log_path)
+        )
         if status == "written":
-            assert "racer" in on_disk, "a record reported as written must be on disk"
+            assert reachable, "a record reported as written must be reachable by name"
         else:
             assert status == "failed", status
+            assert appender.write_errors == 1
 
     def test_a_reader_holding_the_lock_does_not_cost_the_writer_its_record(self, tmp_path):
         """The reader's hold is not a rotation, and must not be read as one.

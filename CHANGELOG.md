@@ -39,8 +39,8 @@ changes inline only. See the deprecation policy in
   the proxy appends to concurrently). A short write missing *only* its trailing
   newline is the exception: the byte is restored, the record is complete and
   readable, and reporting a failure would invite a retry that duplicates the
-  label. Refused too is an append that cannot be serialized against another
-  writer's `max_backups: 0` rotation, which unlinks the inode it would land in. The label's
+  label. Refused too is an append whose file was rotated away
+  underneath it, which is detected rather than prevented (see below). The label's
   append is durable, unlike the call-path emitters': the descriptor — and the
   directory entry too when the append created the log — is `fsync`-ed before
   success is reported, so an unclean shutdown cannot swallow a judgement the
@@ -84,13 +84,17 @@ changes inline only. See the deprecation policy in
   evict the agreed selection before the write (`log_rotated` / `log_busy`,
   nothing written). The writer takes that lock only when it has already decided
   to rotate and defers instead of waiting, leaving the per-record append path
-  lock-free. Under `max_backups: 0`, the one setting that rotates by
-  unlinking, a second lock (`<log>.rotating.lock`) is held by the rotation and
-  by each append across its `open` and `write`, so the two cannot interleave;
-  every other setting renames, which cannot orphan an append, and keeps the
-  per-record path lock-free. A labelling session's hold on the rotation lock —
-  a whole multi-segment scan, destroying nothing — therefore no longer makes an
-  over-threshold writer refuse every append for its duration.
+  lock-free. A labelling session's hold on that lock — a whole
+  multi-segment scan, during which it destroys nothing — no longer makes an
+  over-threshold writer refuse every append for its duration. Separately, an
+  append can no longer be reported as written after rotation destroyed the file
+  it was writing to: the appender holds a descriptor, and `max_backups: 0`
+  unlinks that inode outright while every other setting evicts it once
+  `max_backups + 1` rotations have shifted it past the last backup slot. The
+  append now checks that its descriptor's inode still has a name before
+  reporting success and exits 1 (`write_failed`) if it does not, so the
+  guarantee is uniform across configurations — **a record reported as written
+  is reachable by name** — while the per-record path stays lock-free.
   `stm_selection_stats`' `rotated_backups` no longer counts either lock file
   (or any non-numeric sibling) as a backup. The label inherits the labelled selection's
   `ranker_version` and `trace_id`, so it lands in that call's cohort rather
