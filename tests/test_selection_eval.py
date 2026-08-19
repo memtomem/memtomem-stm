@@ -279,6 +279,39 @@ def test_malformed_sibling_entry_does_not_erase_a_valid_selected_rank(
     assert report["production"]["selected_tool_alignment"]["mrr"]["value"] == 1.0
 
 
+def test_hashable_non_string_candidate_tool_is_counted(tmp_path: Path) -> None:
+    """A non-string element is a violation whether or not set() chokes on it."""
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    # Hashable, so this never crashed — it was silently accepted (status "ok").
+    selection["candidate_tools"] = ["demo__search", "demo__write", 42]
+    selection["candidate_count"] = 3
+    _write_jsonl(log, [selection, _execution()])
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["status"] == "invalid"
+    assert report["data_quality"]["invariant_violations"] == 1
+
+
+def test_non_string_tool_matching_selected_tool_yields_no_rank(tmp_path: Path) -> None:
+    """Equality with `selected_tool` does not make a non-string tool rankable."""
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    selection["selected_tool"] = 42
+    selection["candidate_tools"] = ["demo__search", "demo__write", 42]
+    selection["candidate_count"] = 3
+    selection["candidate_features"]["ranked_candidates"][0]["tool"] = 42
+    _write_jsonl(log, [selection, _execution()])
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["status"] == "invalid"
+    assert report["production"]["coverage"]["rankable_selections"] == 1
+    assert report["production"]["coverage"]["selected_rank_known"] == 0
+    assert report["production"]["selected_tool_alignment"]["mrr"]["denominator"] == 0
+
+
 def test_unknown_future_ranker_skips_v1_score_parity(tmp_path: Path) -> None:
     log = tmp_path / "selection.jsonl"
     selection = _selection()

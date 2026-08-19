@@ -260,15 +260,22 @@ changes inline only. See the deprecation policy in
   denominator. A `rank` now feeds the metrics only when the whole entry holds,
   which also closes `rank: 0` (division by zero in MRR), `rank: -1` (scored as
   a rank-1 hit), and an oversized integer rank (`float()` overflow).
-  **Behavior change**: a rank the invariant check rejects is no longer
-  recorded at all, and the check itself is stricter — `rank: true` previously
-  passed it (`True == 1`) and `rank: 1.0` was cast to `1`; both are now
-  violations. Because that check covers the whole entry, two tool-shape cases
-  change with it: a `selected_tool` absent from `candidate_tools` now scores
-  as an alignment miss instead of contributing its rank, and a duplicate entry
-  for the selected tool no longer overwrites the first, valid rank. A log
-  carrying any of these reports `status: invalid` and the command exits 1
-  where it previously exited 0. Not reachable from STM's own writer, which
+  **Behavior change**, in two kinds. *Newly counted as violations* — these
+  turn a `status: ok` report into `status: invalid` and exit 1 where the
+  command previously exited 0: a `candidate_tools` element that is not a
+  string (previously accepted in silence unless it was also unhashable, which
+  crashed), and a `rank` that is not an integer, which now includes
+  `rank: true` (it passed as `True == 1`) and `rank: 1.0` (it was cast to
+  `1`). *Already counted, now also withholding the rank* — status and exit
+  code are unchanged and only the alignment metrics move: **every**
+  entry-shape violation now stops that entry's rank from reaching
+  `selected_rank`, where before the rank was recorded anyway. That covers each
+  condition the check tests — a rank that does not match the entry's position,
+  a `tool` that is not a string, a `tool` repeated within the list, and a
+  `tool` absent from `candidate_tools` — so, for example, a duplicate entry
+  for the selected tool no longer overwrites the first, valid rank, and a
+  `selected_tool` outside `candidate_tools` scores as an alignment miss
+  instead of contributing its rank. Not reachable from STM's own writer, which
   always stamps an integer rank; reachable from hand-edited logs and other
   producers. This does not close the whole class: the six numeric fields an
   admitted record can still overflow or serialize as `NaN` through
