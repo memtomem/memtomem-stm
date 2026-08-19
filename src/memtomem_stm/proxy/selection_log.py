@@ -92,6 +92,7 @@ if TYPE_CHECKING:
 from memtomem_stm.proxy.metrics import _percentile
 from memtomem_stm.proxy.privacy import contains_sensitive_content
 from memtomem_stm.utils import json_out
+from memtomem_stm.utils.fileio import fsync_dir
 from memtomem_stm.utils.locking import open_lock_fd, release_lock, try_lock
 
 logger = logging.getLogger(__name__)
@@ -134,6 +135,39 @@ def rotation_lock_path(log_path: Path | str) -> Path:
     return log_path.with_name(log_path.name + ".rotate.lock")
 
 
+def rotation_active_lock_path(log_path: Path | str) -> Path:
+    """Advisory lock a writer holds while it is *performing* a rotation.
+
+    Separate from :func:`rotation_lock_path` because the two answer different
+    questions, and only one of them makes an append unsafe. Readers take the
+    rotation lock to keep the filenames still for a whole scan — seconds, on a
+    large log — while rotating nothing; a writer takes THIS one only around the
+    renames themselves. An appender that cannot rotate therefore reads this
+    lock to tell "a reader is looking" (safe: no rotation can start while it
+    holds the other lock) from "a writer is rotating" (unsafe under
+    ``max_backups == 0``, which rotates by unlinking).
+    """
+    log_path = Path(log_path).expanduser()
+    return log_path.with_name(log_path.name + ".rotating.lock")
+
+
+@contextmanager
+def _hold_lock(lock_path: Path, *, attempts: int, delay: float) -> Iterator[bool]:
+    """Hold *lock_path* for the block; yield whether it was acquired."""
+    fd = open_lock_fd(lock_path)
+    acquired = False
+    try:
+        for attempt in range(max(1, attempts)):
+            if try_lock(fd):
+                acquired = True
+                break
+            if attempt + 1 < max(1, attempts):
+                time.sleep(delay)
+        yield acquired
+    finally:
+        release_lock(fd)
+
+
 @contextmanager
 def rotation_lock(
     log_path: Path | str, *, attempts: int = 1, delay: float = 0.05
@@ -146,18 +180,19 @@ def rotation_lock(
     the lock can never stall a proxied call. Readers may retry briefly, since
     the writer's hold is a handful of renames.
     """
-    fd = open_lock_fd(rotation_lock_path(log_path))
-    acquired = False
-    try:
-        for attempt in range(max(1, attempts)):
-            if try_lock(fd):
-                acquired = True
-                break
-            if attempt + 1 < max(1, attempts):
-                time.sleep(delay)
+    with _hold_lock(rotation_lock_path(log_path), attempts=attempts, delay=delay) as acquired:
         yield acquired
-    finally:
-        release_lock(fd)
+
+
+@contextmanager
+def rotation_active_lock(log_path: Path | str) -> Iterator[bool]:
+    """Claim "a rotation is running here" for the block; never retries.
+
+    Failure to claim it is the answer the caller wants (someone else is
+    rotating), not a condition to wait out.
+    """
+    with _hold_lock(rotation_active_lock_path(log_path), attempts=1, delay=0.0) as acquired:
+        yield acquired
 
 
 # Per-record default when no ranking informed the call — the client model
@@ -197,42 +232,6 @@ def _needs_leading_newline(path: Path) -> bool:
     except OSError:
         logger.debug("Could not probe the selection log's tail", exc_info=True)
         return True
-
-
-def _sync_parent_dir(path: Path) -> bool:
-    """``fsync`` the directory holding *path*; ``True`` if it is now durable.
-
-    An ``fsync`` on the file descriptor flushes the file's contents, not the
-    directory entry that names it — so a log created by this very append can
-    have durable bytes under a name that a crash undoes. Only the append that
-    creates the file pays this.
-
-    Windows has no directory descriptor to sync and no API that promises this
-    separately, so there the file flush IS the whole guarantee available and
-    this reports success rather than downgrading every first label on the
-    platform to "unconfirmed".
-    """
-    if sys.platform == "win32":  # pragma: no cover - POSIX-only durability step
-        return True
-    try:
-        dir_fd = os.open(str(path.parent), os.O_RDONLY)
-    except OSError:
-        logger.debug("Could not open the selection log's directory to sync it", exc_info=True)
-        return False
-    try:
-        os.fsync(dir_fd)
-    except OSError:
-        logger.debug("Could not sync the selection log's directory", exc_info=True)
-        return False
-    finally:
-        try:
-            os.close(dir_fd)
-        except OSError:
-            # Same reason as the append's own cleanup close: this runs after
-            # the record is complete, and raising here would be re-read as a
-            # failed write.
-            logger.debug("Could not close the selection log's directory", exc_info=True)
-    return True
 
 
 def _canonical_args(arguments: dict[str, Any] | None) -> str:
@@ -617,7 +616,7 @@ class SelectionTelemetryLog:
                             exc_info=True,
                         )
                         return APPEND_UNCONFIRMED
-                    if created and not _sync_parent_dir(self._path):
+                    if created and not fsync_dir(self._path.parent):
                         self.write_errors += 1
                         return APPEND_UNCONFIRMED
                 finally:
@@ -683,12 +682,17 @@ class SelectionTelemetryLog:
         ``_append``. With ``max_backups == 0`` the file is simply truncated by
         deletion (append recreates it).
 
-        Returns ``False`` only when the lock is held while ``max_backups == 0``:
-        the holder may be another *writer* mid-rotation, and that configuration
-        rotates by unlinking, so an append could be written into an inode that
-        is about to disappear. With at least one backup the record survives
-        either ordering — it lands in the file that becomes ``.1``, or in the
-        fresh active — so the append proceeds.
+        Returns ``False`` only when another *writer* is mid-rotation while
+        ``max_backups == 0``: that configuration rotates by unlinking, so an
+        append could be written into an inode about to disappear. With at least
+        one backup the record survives either ordering — it lands in the file
+        that becomes ``.1``, or in the fresh active — so the append proceeds.
+
+        A *reader* holding the rotation lock is not that case, which is why the
+        two are distinguished rather than both read as "busy": readers
+        (``mms selection feedback``) hold it across a whole multi-segment scan
+        and rotate nothing, so treating their hold as a rotation in flight
+        would drop every record appended for the length of that scan.
         """
         try:
             size = self._path.stat().st_size
@@ -696,17 +700,31 @@ class SelectionTelemetryLog:
             return True
         if size < self._max_bytes:
             return True
-        # The lock is taken here and nowhere else on the write path: the size
-        # check above has already passed, so this costs one open+flock per
-        # actual rotation, not per record. A reader (``mms selection feedback``)
-        # holding it means a resolve/append is in flight against these exact
-        # filenames; deferring the rotation to the next append is harmless,
-        # while renaming underneath that reader is not.
-        with rotation_lock(self._path) as acquired:
-            if not acquired:
-                logger.debug("Deferring selection-log rotation: the log is locked")
+        # Both locks are taken here and nowhere else on the write path: the
+        # size check above has already passed, so this costs one open+flock per
+        # actual rotation, not per record.
+        #
+        # The rotation claim is made BEFORE the rotation lock, so it covers the
+        # whole attempt rather than only the renames. That errs toward a
+        # writer's brief claim being read as a rotation by a second writer —
+        # conservative in the direction this file takes everywhere else, since
+        # the cost is a reported refusal rather than a record quietly written
+        # into a doomed inode.
+        with rotation_active_lock(self._path) as claimed:
+            if not claimed:
+                logger.debug("Deferring selection-log rotation: another writer is rotating")
                 return self._max_backups > 0
-            self._rotate_locked()
+            # A reader (``mms selection feedback``) holding the rotation lock
+            # means a resolve/append is in flight against these exact
+            # filenames; deferring the rotation to the next append is harmless,
+            # while renaming underneath that reader is not. The append is safe
+            # either way, because no rotation can begin while that reader
+            # holds the lock.
+            with rotation_lock(self._path) as acquired:
+                if not acquired:
+                    logger.debug("Deferring selection-log rotation: a reader holds the log")
+                    return True
+                self._rotate_locked()
         return True
 
     def _rotate_locked(self) -> None:
@@ -1244,7 +1262,17 @@ def aggregate_selection_log(path: Path | str, *, top_n: int = 10) -> dict[str, A
     # Numeric suffixes only — the same rule ``discover_log_files`` applies. A
     # bare ``<log>.*`` glob also matches the rotation lock file and any operator
     # copy, reporting backups that rotation never made.
-    rotated = len([segment for segment in discover_log_files(path) if segment != path])
+    #
+    # Listing the directory is the one step here that can fail on its own —
+    # ``discover_log_files`` iterates it, and an unreadable directory raises
+    # where the ``glob`` this replaced swallowed the error. Counting backups is
+    # a decoration on the summary, so a failure here reports zero rather than
+    # taking down a stats call that this function's contract says cannot break.
+    try:
+        rotated = len([segment for segment in discover_log_files(path) if segment != path])
+    except OSError:
+        logger.debug("Could not list the selection log's directory to count backups", exc_info=True)
+        rotated = 0
     result: dict[str, Any] = {
         "path": str(path),
         "exists": path.exists(),

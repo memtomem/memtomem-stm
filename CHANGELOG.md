@@ -48,8 +48,11 @@ changes inline only. See the deprecation policy in
   honestly are labellable: an unsupported `schema_version` (offline replay
   drops those records outright) or a missing `ranker_version` (the label would
   be filed under a cohort the command invented) exits 1 (`unusable_record`) and
-  is skipped by `--last`. `mms selection stats` frames lines the same way too, so a bare carriage
-  return no longer fuses two records into one line for it alone. Both readers
+  is skipped by `--last`. The `stm_selection_stats` aggregate frames lines the
+  same way too, reading raw bytes rather than decoded text, so a record
+  truncated mid-character is counted as malformed and skipped instead of
+  raising `UnicodeDecodeError` — which is not an `OSError`, and so escaped the
+  one guard that observability path had. Both readers
   now load the log through one `TelemetryReader` — segment discovery, line framing, the size cut, decoding,
   schema and event admission, and append-order stamping live there rather than
   being re-derived on each side, after four review rounds in which the two
@@ -78,8 +81,13 @@ changes inline only. See the deprecation policy in
   evict the agreed selection before the write (`log_rotated` / `log_busy`,
   nothing written). The writer takes that lock only when it has already decided
   to rotate and defers instead of waiting, leaving the per-record append path
-  lock-free. `stm_selection_stats`' `rotated_backups` no longer counts the
-  rotation lock file (or any non-numeric sibling) as a backup. The label inherits the labelled selection's
+  lock-free. A writer that is actually rotating claims a second lock
+  (`<log>.rotating.lock`) so an appender can tell it from a reader: only a
+  rotation in flight can cost a record, and only under `max_backups: 0`, so a
+  labelling session's lock hold — a whole multi-segment scan — no longer makes
+  an over-threshold writer refuse every append for its duration.
+  `stm_selection_stats`' `rotated_backups` no longer counts either lock file
+  (or any non-numeric sibling) as a backup. The label inherits the labelled selection's
   `ranker_version` and `trace_id`, so it lands in that call's cohort rather
   than the emitter's. Nothing on the proxy's call path emits this event and
   nothing is planned to: the client model never sees a `selection_id`, so the

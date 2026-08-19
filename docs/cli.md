@@ -772,6 +772,14 @@ decided to rotate**, and defers rotation to its next append rather than
 waiting — so the proxy's per-record append path stays lock-free and a labelling
 session can never stall a proxied call.
 
+A rotating writer additionally claims `<log>.rotating.lock`, which is what
+separates "a reader is looking" from "a rotation is running". Only the second
+makes an append unsafe, and only under `max_backups: 0`, which rotates by
+unlinking: without the distinction a writer past its size threshold would drop
+every record for as long as a labelling session held the rotation lock — a full
+multi-segment scan — even though that session renames nothing. Neither lock file
+is counted as a rotated backup.
+
 ## `mms hook` — built-in tool bridge + per-host registration
 
 ```

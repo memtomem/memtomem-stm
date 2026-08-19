@@ -832,6 +832,27 @@ class TestAggregateSelectionLog:
 # ── find_selection / discover_log_files (#469 labelling) ───────────────────
 
 
+    def test_a_directory_it_cannot_list_costs_the_backup_count_not_the_stats(self, tmp_path):
+        """The aggregate's own contract: it summarizes what it could read.
+
+        Counting rotated backups lists the directory, and that listing can fail
+        on its own — a mode change, an ACL lost on a mounted volume. It is a
+        decoration on the summary, so it degrades to zero; raising would take
+        down ``stm_selection_stats``, whose caller has no way to ask for less.
+        """
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+
+        def refuse(*args, **kwargs):
+            raise PermissionError(13, "Permission denied")
+
+        with mock.patch.object(selection_log_module, "discover_log_files", refuse):
+            out = aggregate_selection_log(log_path)
+        assert out["rotated_backups"] == 0
+        assert out["total_lines"] >= 1, "the records it CAN read are still reported"
+        assert out["events"]["selection"] >= 1
+
+
 class TestDiscoverLogFiles:
     def test_orders_backups_oldest_first_then_active(self, tmp_path):
         p = tmp_path / "log.jsonl"
@@ -2256,7 +2277,7 @@ class TestLabelDurability:
     def test_a_directory_that_cannot_be_synced_is_unconfirmed(self, tmp_path, monkeypatch):
         log_path = tmp_path / "log.jsonl"
         log = SelectionTelemetryLog(log_path)
-        monkeypatch.setattr(selection_log_module, "_sync_parent_dir", lambda path: False)
+        monkeypatch.setattr(selection_log_module, "fsync_dir", lambda directory: False)
 
         assert log.log_feedback(selection_id="a", user_corrected=True) == "unconfirmed"
         assert [record["selection_id"] for record in _feedback_records(log_path)] == ["a"]
@@ -2809,18 +2830,11 @@ class TestSelectionFeedbackRobustness:
         assert log.events_written == 1
         assert log.write_errors == 1
 
-    def test_a_rotating_writer_does_not_silently_lose_a_contender(self, tmp_path):
-        """Two writers, ``max_backups=0``: the loser must not claim success.
-
-        That configuration rotates by unlinking, so an append racing it can be
-        written into an inode about to disappear. Reported as a failure rather
-        than counted — a lost record that was announced as written is worse
-        than a refused one.
-        """
-        log_path = tmp_path / "log.jsonl"
+    @staticmethod
+    def _over_size_pair(log_path):
+        """A writer past its size threshold, plus a second writer on the log."""
         rotator = SelectionTelemetryLog(log_path, max_bytes=1, max_backups=0)
         rotator.initialize()
-        contender = SelectionTelemetryLog(log_path, max_bytes=1, max_backups=0)
         rotator.log_selection(
             server="gh",
             selected_tool="gh__a",
@@ -2828,12 +2842,81 @@ class TestSelectionFeedbackRobustness:
             arguments={"q": "x"},
             trace_id="t",
         )
-        with selection_log_module.rotation_lock(log_path) as acquired:  # the rotator
-            assert acquired
-            status = contender.log_feedback(selection_id="x", user_corrected=True)
+        return rotator, SelectionTelemetryLog(log_path, max_bytes=1, max_backups=0)
+
+    def test_a_rotating_writer_does_not_silently_lose_a_contender(self, tmp_path):
+        """Two writers, ``max_backups=0``: the loser must not claim success.
+
+        That configuration rotates by unlinking, so an append racing it can be
+        written into an inode about to disappear. Reported as a failure rather
+        than counted — a lost record that was announced as written is worse
+        than a refused one.
+
+        The rotating writer is simulated by holding BOTH locks, which is what
+        one holds: the rotation lock keeps the filenames still, and the
+        rotation-active lock is the claim that a rotation is running. Holding
+        only the first is a *reader*, and the companion test below pins that
+        those two are not the same answer.
+        """
+        log_path = tmp_path / "log.jsonl"
+        _, contender = self._over_size_pair(log_path)
+        with selection_log_module.rotation_active_lock(log_path) as claimed:
+            assert claimed
+            with selection_log_module.rotation_lock(log_path) as acquired:
+                assert acquired
+                status = contender.log_feedback(selection_id="x", user_corrected=True)
         assert status == "failed"
         assert contender.events_written == 0
         assert contender.write_errors == 1
+
+    def test_a_reader_holding_the_lock_does_not_cost_the_writer_its_record(self, tmp_path):
+        """The reader's hold is not a rotation, and must not be read as one.
+
+        ``mms selection feedback`` holds the rotation lock across its whole
+        scan — every segment, twice, on a log whose default ceiling is 50 MB —
+        while rotating nothing. Treating that hold as a rotation in flight
+        would drop every record appended for its duration, so an
+        over-threshold writer under ``max_backups=0`` must still append: no
+        rotation can begin while the reader holds the lock, so there is no
+        inode for the record to be lost in.
+        """
+        log_path = tmp_path / "log.jsonl"
+        _, contender = self._over_size_pair(log_path)
+        with selection_log_module.rotation_lock(log_path) as acquired:  # a reader
+            assert acquired
+            status = contender.log_feedback(selection_id="x", user_corrected=True)
+        assert status == "written"
+        assert contender.events_written == 1
+        assert contender.write_errors == 0
+        assert "x" in log_path.read_text(encoding="utf-8")
+
+    def test_a_listing_that_fails_under_the_lock_is_a_failure_not_a_traceback(
+        self, tmp_path, monkeypatch
+    ):
+        """Discovery runs twice, and only the second one is under the lock.
+
+        The command lists the log directory itself, then the reader lists it
+        again inside the rotation lock — so the second can fail where the first
+        succeeded, and that raise is a plain ``OSError``, not the
+        ``SelectionLogUnreadable`` a failed segment READ raises. Uncaught it
+        would leave a traceback and, under ``--json``, an empty document: the
+        exact outcome this command refuses everywhere else.
+
+        Patched on the reader's module binding only, which is what makes the
+        two listings independent here.
+        """
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+
+        def refuse(*args, **kwargs):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(selection_log_module, "discover_log_files", refuse)
+        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["error"] == "log_unreadable"
+        assert _feedback_records(log_path) == []
 
     def test_the_lock_file_is_not_counted_as_a_rotated_backup(self, tmp_path):
         log_path = tmp_path / "log.jsonl"

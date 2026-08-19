@@ -2018,8 +2018,11 @@ def _functions_reaching(
     that encloses them. Fixed point over the resulting graph, so a wrapper
     chain of any depth is still reported.
     """
+    # ``as_posix``, not ``str``: these keys are what callers compare against
+    # written-out path literals, and ``str`` spells them with backslashes on
+    # Windows, where every such comparison would fail for the separator alone.
     trees: list[tuple[str, ast.Module]] = [
-        (str(path.relative_to(base or root)), ast.parse(path.read_text(encoding="utf-8")))
+        (path.relative_to(base or root).as_posix(), ast.parse(path.read_text(encoding="utf-8")))
         for path in sorted(root.rglob("*.py"))
     ]
 
@@ -2033,9 +2036,7 @@ def _functions_reaching(
     # comprehension and ``global`` boundaries, and every shape missed there
     # unreports a real emitter; a union can only add a false positive, which
     # gets read.
-    modules = {
-        relative[:-3].replace("/", ".").replace("\\", "."): relative for relative, _ in trees
-    }
+    modules = {relative[:-3].replace("/", "."): relative for relative, _ in trees}
 
     def module_file(name: str | None) -> str | None:
         if not name:
@@ -2359,3 +2360,23 @@ def test_adr_0001_call_site_pin_rejects_a_second_emitter(tmp_path) -> None:
     assert ("at_import.py", "<module>") in _functions_reaching(src, "log_feedback"), (
         "a module-level emitter runs at import and must be reported"
     )
+
+
+def test_functions_reaching_reports_posix_separated_keys(tmp_path) -> None:
+    """Keys are compared against written-out literals, so their separator is
+    part of the contract.
+
+    ``_EXPECTED_FEEDBACK_EMITTERS`` spells its paths with forward slashes; a
+    key built by ``str(Path)`` spells them with backslashes on Windows, so the
+    ADR pin would fail there for the separator alone — on every run, on a
+    platform whose CI gates merge. Exercised through a NESTED file, because a
+    top-level one has no separator to get wrong.
+    """
+    src = tmp_path / "src"
+    (src / "cli").mkdir(parents=True)
+    (src / "cli" / "selection_cmd.py").write_text(
+        "def _write_label(log):\n    return log.log_feedback(selection_id='a')\n",
+        encoding="utf-8",
+    )
+    reaching = _functions_reaching(src, "log_feedback")
+    assert reaching == {("cli/selection_cmd.py", "_write_label")}

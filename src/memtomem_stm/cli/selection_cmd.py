@@ -272,7 +272,13 @@ def feedback_command(
                 "config_invalid",
                 f"the MEMTOMEM_STM_PROXY environment is invalid: {loaded.env_error}",
             )
-        cfg = loaded.config or ProxyConfig(config_path=cfg_path)
+        # Not ``or ProxyConfig(...)``: with ``missing_ok=True`` the loader
+        # returns no config only when it also set one of the errors screened
+        # above, both of which exit. A defaults fallback here would therefore
+        # be unreachable, and reachable or not it is the exact guess the two
+        # refusals above exist to prevent.
+        assert loaded.config is not None
+        cfg = loaded.config
         telemetry_path = cfg.selection_telemetry.path.expanduser()
     # Presence is decided by the whole log, not the active file alone: a crash
     # between ``active → .1`` and the next append leaves the history entirely in
@@ -289,17 +295,12 @@ def feedback_command(
         )
     if not segments:
         _feedback_failure(as_json, "no_log", f"selection log not found: {telemetry_path}")
-    # A segment this process cannot read would be skipped by the scan, turning
-    # "I could not look there" into "no such selection" — a wrong answer that
-    # reads like a right one.
-    for segment in segments:
-        try:
-            with segment.open("rb"):
-                pass
-        except OSError as exc:
-            _feedback_failure(
-                as_json, "log_unreadable", f"cannot read log segment {segment.name}: {exc}"
-            )
+    # No open-each-segment preflight here: the resolve below already refuses an
+    # unreadable segment (``TelemetryReader`` wraps every read failure, the open
+    # included, as ``SelectionLogUnreadable``) and both resolve sites map that to
+    # this same ``log_unreadable`` failure. A preflight would also be checking
+    # names that rotation may rename before the locked resolve reaches them, so
+    # it could only ever restate an answer the guarded read gives properly.
 
     # Resolve under the rotation lock. Rotation renames every segment at once,
     # so an unguarded scan can miss the newest selections — they move into a
@@ -322,11 +323,21 @@ def feedback_command(
                 include_rotated=include_rotated,
             )
         except SelectionLogUnreadable as exc:
-            # The preflight above proves each segment can be OPENED; a read
-            # that fails afterwards would otherwise be skipped, and skipping
-            # the newest segment silently promotes an older row to "most
+            # A segment that cannot be read is refused rather than skipped:
+            # skipping the newest one silently promotes an older row to "most
             # recent" — a label on a selection the operator never chose.
             _feedback_failure(as_json, "log_unreadable", str(exc))
+        except OSError as exc:
+            # Discovery lists the directory again, under the lock this time, so
+            # it can fail here even though the listing above succeeded. Caught
+            # for the same reason that one is: a traceback is not something a
+            # scripted caller can branch on, and under ``--json`` it would be
+            # the whole of stdout.
+            _feedback_failure(
+                as_json,
+                "log_unreadable",
+                f"cannot list the log directory for {telemetry_path}: {exc}",
+            )
     # Resolve before writing: an id that matches nothing would append a label
     # that joins to no selection — silently useless to every reader, and
     # indistinguishable from a selection whose own record was dropped by the
@@ -407,6 +418,14 @@ def feedback_command(
             )
         except SelectionLogUnreadable as exc:
             _feedback_failure(as_json, "log_unreadable", str(exc))
+        except OSError as exc:
+            # Same directory listing, and the confirmation window is exactly
+            # when its permissions can change underneath the command.
+            _feedback_failure(
+                as_json,
+                "log_unreadable",
+                f"cannot list the log directory for {telemetry_path}: {exc}",
+            )
         if verified is None and verify_defect is not None:
             # Present but no longer labellable — a conflicting copy landing in
             # the confirmation window is the reachable case. That is the row
