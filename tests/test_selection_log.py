@@ -1736,66 +1736,35 @@ class TestResolverAgreesWithReplay:
         assert [record["selection_id"] for record in _feedback_records(control)] == ["newest"]
 
 
-class TestTailProbeFailsClosed:
-    """The probe answers "does this file end on a record boundary". When it
-    cannot answer, the append must assume it does not: the cost of guessing
-    wrong that way is a blank line every reader skips, while the other guess
-    fuses the record into an unreadable line and reports it written."""
+class TestRecordsFrameThemselves:
+    """An append must not fuse onto whatever the file happens to end with.
 
-    @pytest.mark.parametrize("failing", ["seek", "read"])
-    def test_a_probe_that_cannot_answer_still_opens_a_new_line(
-        self, tmp_path, monkeypatch, failing
-    ):
+    This was once a probe — read the last byte, prepend a newline if it is not
+    one — and the probe was the check half of a race: another appender could
+    leave a fragment between the read and the write. The newline now ships in
+    the same write as the record, so the property holds without asking the file
+    anything, which is why this no longer injects probe failures. There is no
+    probe left to blind.
+    """
+
+    def test_a_pre_existing_unterminated_tail_does_not_swallow_the_record(self, tmp_path):
         log_path = tmp_path / "log.jsonl"
         _write_lines(log_path, [_sel(selection_id="good")])
-        # An unterminated tail: without the leading newline the label fuses
-        # onto it.
+        # An unterminated tail, as a crash or a short write leaves behind.
         with log_path.open("ab") as fh:
             fh.write(b'{"event": "selection", "selection_id": "half')
 
-        real_open = Path.open
-
-        class Blinded:
-            def __init__(self, wrapped):
-                self._wrapped = wrapped
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return self._wrapped.__exit__(*exc)
-
-            def seek(self, *args):
-                if failing == "seek":
-                    raise OSError(5, "I/O error")
-                return self._wrapped.seek(*args)
-
-            def read(self, *args):
-                if failing == "read":
-                    raise OSError(5, "I/O error")
-                return self._wrapped.read(*args)
-
-        def blinded_open(self, *args, **kwargs):
-            handle = real_open(self, *args, **kwargs)
-            if self == log_path and args and args[0] == "rb":
-                return Blinded(handle)
-            return handle
-
-        monkeypatch.setattr(Path, "open", blinded_open)
         log = SelectionTelemetryLog(log_path)
         assert log.log_feedback(selection_id="good", user_corrected=True) == "written"
-        monkeypatch.undo()
 
-        parsed = []
-        for raw_line in log_path.read_bytes().splitlines():
-            try:
-                parsed.append(json.loads(raw_line))
-            except ValueError:
-                parsed.append(None)
-        # The label is a line of its own and readable — the fragment did not
-        # swallow it.
-        assert parsed[-1] is not None
-        assert parsed[-1]["event"] == "feedback"
+        reader = selection_log_module.TelemetryReader(log_path)
+        labelled = [
+            record.get("selection_id")
+            for record in reader.records()
+            if record.get("event") == "feedback"
+        ]
+        assert labelled == ["good"], "the fragment must not have swallowed the label"
+        assert reader.quality["malformed_lines"] == 1, "the fragment is the malformed line"
 
 
 class TestUnreadableSegmentIsNotAnAbsentOne:
@@ -2819,24 +2788,35 @@ class TestSelectionFeedbackRobustness:
         assert result.exit_code == 1
         assert json.loads(result.output)["error"] == "log_unreadable"
 
-    def test_a_repaired_newline_only_short_write_is_a_success(self, tmp_path, monkeypatch):
-        """When the ONLY missing byte was the newline, the repair restores the
-        exact intended bytes, so calling it a failure would be false — and
-        would invite a retry that duplicates the label.
+    @pytest.mark.parametrize("repair_lands", [True, False])
+    def test_a_write_short_by_its_terminator_is_unconfirmed(
+        self, tmp_path, monkeypatch, repair_lands
+    ):
+        """Complete bytes, unknown readability — neither written nor failed.
 
-        Safe despite being a second write with no lock across the gap, because
-        every record self-frames: see the interleaving test below, which runs a
-        foreign append through that exact gap.
+        Self-framing makes the repair safe against a writer running THIS code,
+        whose leading newline would close this record. It says nothing about an
+        older build appending without one, and a rolling upgrade — or this
+        repo's installed ``mms`` beside a checkout — is exactly when two builds
+        share one log. Parametrised over whether the repair write itself lands,
+        because it does not change the answer: unterminated, the record is
+        still resurrected by the next writer's leading newline, so ``failed``
+        would deny a record that later shows up.
         """
         log_path = tmp_path / "log.jsonl"
         log = SelectionTelemetryLog(log_path)
         log.initialize()
-        monkeypatch.setattr(
-            selection_log_module.os, "write", _short_write_on(log_path, drop_only_newline=True)
-        )
-        assert log.log_feedback(selection_id="a", user_corrected=True) == "written"
+        short = _short_write_on(log_path, drop_only_newline=True)
+
+        def write(fd, data):
+            if data == b"\n" and not repair_lands:
+                return 0
+            return short(fd, data)
+
+        monkeypatch.setattr(selection_log_module.os, "write", write)
+        assert log.log_feedback(selection_id="a", user_corrected=True) == "unconfirmed"
         monkeypatch.undo()
-        assert [record["selection_id"] for record in _feedback_records(log_path)] == ["a"]
+        assert log.write_errors == 1
 
     def test_a_foreign_append_between_the_short_write_and_its_repair_is_survivable(
         self, tmp_path, monkeypatch
@@ -2872,7 +2852,9 @@ class TestSelectionFeedbackRobustness:
         monkeypatch.undo()
 
         assert phase["n"] == 2, "the interleaving never happened; the test proved nothing"
-        assert status == "written"
+        # Unconfirmed either way — this process cannot know which build the
+        # interloper runs — but a CURRENT one must not corrupt anything.
+        assert status == "unconfirmed"
         reader = selection_log_module.TelemetryReader(log_path)
         seen = [(r.get("event"), r.get("selection_id")) for r in reader.records()]
         assert ("feedback", "label-a") in seen
@@ -3167,6 +3149,30 @@ class TestSelectionFeedbackRobustness:
         assert labelled == ["label-a"], (
             "a record reported as written must not have fused onto a foreign fragment"
         )
+
+    def test_the_two_line_counts_mean_different_things(self, tmp_path):
+        """Blank lines are skipped by both readers and counted by one.
+
+        Pinned because the difference was documented away as "neither counts
+        them" once already: ``total_lines`` is an ADMITTED count, while the
+        replay report's per-file ``lines`` is a PHYSICAL one, since it numbers
+        records for ordering. Prose that flattens the two is wrong about
+        whichever half it did not measure.
+        """
+        log_path = tmp_path / "log.jsonl"
+        log = SelectionTelemetryLog(log_path)
+        log.initialize()
+        for index in range(5):
+            log.log_feedback(selection_id=f"s{index}", user_corrected=True)
+
+        raw = log_path.read_bytes()
+        assert raw.startswith(b"\n"), "records self-frame, so the file opens with a blank line"
+        assert len(raw.splitlines()) == 10, "five records, each preceded by a blank line"
+
+        reader = selection_log_module.TelemetryReader(log_path)
+        assert len(list(reader.records())) == 5
+        assert reader.files[0]["lines"] == 10, "the per-file count is physical"
+        assert aggregate_selection_log(log_path)["total_lines"] == 5, "this one is admitted"
 
     def test_a_record_the_readers_would_drop_is_refused_rather_than_written(self, tmp_path):
         """The writer must not emit a line its own readers discard.

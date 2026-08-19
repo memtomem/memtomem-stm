@@ -36,17 +36,29 @@ file mode alone guards the content). When the log reaches `max_bytes` it
 rotates (`log → log.1 → … → log.N`, oldest dropped; `max_backups: 0`
 truncates instead). `sample_rate` keeps the given fraction of calls and
 applies to the selection+execution pair atomically — and a selection whose
-write failed also skips its execution event — so neither sampling nor write
-failures produce orphan halves.
+write was not confirmed also skips its execution event — so neither sampling
+nor write faults produce an **execution-only** record. That is the direction
+that matters: an execution referencing a selection no reader can find joins
+nothing. The reverse is possible and harmless — a selection whose append could
+not be confirmed leaves a selection with no execution, which is also what an
+in-flight call or a redacted execution produces, and replay already joins
+left-outer.
 
 ## Schema v1
 
 Every record is preceded by a blank line: the writer emits the newline in the
 same append as the record, so a record frames itself atomically whatever
 preceded it — including a fragment left by a crashed or short write, which the
-next record's leading newline closes. Blank lines carry no meaning and both
-built-in readers skip them without counting them; a consumer parsing the file
-itself must do the same.
+next record's leading newline closes. Blank lines carry no meaning; both
+built-in readers skip them, and a consumer parsing the file itself must do the
+same.
+
+Skipped is not the same as uncounted, and the two counts reported here mean
+different things. `stm_selection_stats`' `total_lines` counts *admitted* lines,
+so a log of five records reports five. The per-file `lines` in a replay report
+counts *physical* lines, blank ones included, because it numbers records for
+ordering — the same log reports ten. Each record therefore costs one extra byte
+on disk, which also brings `max_bytes` rotation forward by that much.
 
 One JSON object per line, keys sorted, every record self-describing via
 `schema_version` (bumped on any shape change — the exact key sets are pinned
@@ -111,7 +123,7 @@ such rather than as a success or a failure, because its bytes are in the file
 either way. Two things can be unconfirmable — that the bytes survive a crash,
 and that a rotation did not orphan the file they went into — and they share one
 status because the operator's move is the same for both: re-run by
-`--selection-id` until it reports success. Not "check whether the label is
+`--selection-id`. Not "check whether the label is
 there": after a failed flush the record is visible and still not durable, so
 seeing it proves nothing about the thing that was unconfirmed. Repeating the
 label for one selection is the accumulate-and-supersede case above, so the

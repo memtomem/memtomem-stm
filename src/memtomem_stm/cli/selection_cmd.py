@@ -490,14 +490,16 @@ def feedback_command(
             # the record is visible and still not durable, so seeing it proves
             # nothing about what was unconfirmed. Repeating the same label for
             # the same selection is the accumulate-and-supersede case the
-            # schema already defines, not a second, conflicting judgement, so
-            # the retry is always safe.
+            # schema already defines, not a second, conflicting judgement — so
+            # a retry costs correctness nothing. It is not free operationally:
+            # each attempt appends, so a persistent fault would fill the log
+            # one label at a time. Bounded advice, not a loop.
             _feedback_failure(
                 as_json,
                 f"write_{status}",
                 f"the label's bytes reached {telemetry_path} but the record could not be "
-                f"confirmed there; re-run with --selection-id {resolved_id} until it "
-                f"reports success",
+                f"confirmed there; re-run with --selection-id {resolved_id}, and if that "
+                f"does not report success, resolve the storage fault before retrying again",
                 extra={"selection_id": resolved_id},
             )
         if status != APPEND_WRITTEN:

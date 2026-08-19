@@ -1687,7 +1687,7 @@ class SelectionTelemetryConfig(BaseModel):
     path: Path = Path("~/.memtomem/stm_selection_log.jsonl")
     sample_rate: float = Field(default=1.0, ge=0.0, le=1.0)
     """Fraction of calls recorded; applies to the selection+execution pair
-    atomically so the log never contains orphan halves."""
+    atomically so the log never contains an execution without its selection."""
     max_bytes: int = Field(default=50_000_000, gt=0)
     """Rotate the log when it reaches this size."""
     max_backups: int = Field(default=3, ge=0)

@@ -12,8 +12,10 @@ Schema v1 — three event types, every record self-describing via
 ``schema_version`` + ``ranker_version``; one JSON object per line, keys
 sorted, so a replay harness can stream-parse and diff runs. Each record is
 preceded by a blank line — the newline ships in the same append as the record
-so it frames itself atomically — and blank lines are skipped, uncounted, by
-every reader here:
+so it frames itself atomically. Both readers skip blank lines, but they count
+differently on purpose: ``aggregate_selection_log``'s ``total_lines`` counts
+admitted lines, while ``TelemetryReader``'s per-file ``lines`` counts physical
+ones, because it numbers records for ordering:
 
 ``selection``
     ``selection_id`` (joins the paired ``execution`` row), ``trace_id``
@@ -64,10 +66,14 @@ pre-existing parent's mode is left untouched — the same posture as every
 other STM store (``MetricsStore``, ``memory_ops`` #456/#464): ``mkdir`` mode
 applies at creation time only, and the file mode alone guards the content.
 
-Sampling and write failures apply to the whole selection+execution pair at
+Sampling and write faults apply to the whole selection+execution pair at
 selection time — ``log_selection`` returning ``None`` means the call was
-sampled out or its record never reached disk, and the caller skips the
-execution event, so neither produces orphan halves. Redaction drops, by
+sampled out, or its record did not reach disk, or reaching disk could not be
+confirmed; the caller then skips the execution event. What that guarantees is
+one direction: no EXECUTION-only record, since an execution referencing a
+selection no reader can find joins nothing. A selection without its execution
+is possible and harmless — an in-flight call produces the same shape — and
+replay joins left-outer regardless. Redaction drops, by
 contrast, are per-record (never-persist beats pairing): an execution whose
 paired selection was dropped can appear alone, so replay tooling must treat
 ``selection_id`` joins as left-outer.
@@ -586,20 +592,35 @@ class SelectionTelemetryLog:
                         # is complete and readable, so reporting a failure
                         # would be false — and would invite a retry that
                         # duplicates the label.
-                        repaired = self._terminate_fragment(fd, payload, written)
-                        if repaired and written == len(payload) - 1:
-                            # The only missing byte was the terminator, and it
-                            # is now there: the record's bytes are exactly the
-                            # intended ones. Safe to call written even though
-                            # the repair is a second write with no lock across
-                            # the gap, because every record self-frames — a
-                            # foreign append landing in that gap begins with
-                            # its own newline, which closes this record, and
-                            # the repair newline then costs a blank line rather
-                            # than a fused pair. Reporting a failure here would
-                            # be false, and would invite a retry that
-                            # duplicates the label.
-                            written = len(payload)
+                        self._terminate_fragment(fd, payload, written)
+                        if written == len(payload) - 1:
+                            # The only missing byte was the terminator, so the
+                            # record's own bytes are all on disk — but whether
+                            # they READ as a record is not something this
+                            # process can state.
+                            #
+                            # Self-framing makes the repair safe against a
+                            # writer running THIS code, whose leading newline
+                            # would close this record for us. It says nothing
+                            # about a writer running an older build, which
+                            # appends without one and fuses onto this fragment
+                            # — and a rolling upgrade, or this repo's own
+                            # installed ``mms`` beside a checkout, is exactly
+                            # when two builds share a log. Whether the repair
+                            # write itself landed does not change the answer
+                            # either: unterminated, the record is still
+                            # resurrected by the next writer's leading newline
+                            # or by rotation closing the segment.
+                            #
+                            # Complete bytes, unknown readability: that is
+                            # ``unconfirmed``, and reporting ``failed`` here
+                            # would deny a record that later shows up.
+                            self.write_errors += 1
+                            logger.warning(
+                                "Selection telemetry record was short by its terminator; "
+                                "the record may or may not read back"
+                            )
+                            return APPEND_UNCONFIRMED
                     if written != len(payload):
                         # No record is on disk, and a caller waiting to hear
                         # that its label exists must not be told otherwise.
