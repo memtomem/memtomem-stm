@@ -99,9 +99,9 @@ consult after upgrade, which re-derives the verdict under current rules.
 Bump this whenever the set of refused identifier fields changes, for the same
 reason: a row written under a laxer policy is not evidence for a stricter one.
 
-v2 (#469): rows carry ``graph_facts`` instead of ``risk_scores``. A v1 row
-holds no facts and cannot have them back-derived (the sparse score map dropped
-every clean and unresolved row), so serving one would look like a successful
+v2 (#469): rows carry ``graph_facts`` beside ``risk_scores``. A v1 row holds
+no facts and cannot have them back-derived (the sparse score map dropped every
+clean and unresolved row), so serving one would look like a successful
 enrichment that recorded nothing. Rejecting it costs one full consult after
 upgrade, exactly like every other policy bump.
 """
@@ -222,7 +222,8 @@ class GraphConsultCache:
         """Return the cached raw facts for an exact scope+generation, or ``None``.
 
         The returned dict carries ``rejects`` / ``tool_not_found_refs`` /
-        ``graph_facts`` (the raw graph facts) plus ``had_risk_scores`` (whether
+        ``graph_facts`` / ``risk_scores`` (the raw graph facts and the penalty
+        map derived from them at write time) plus ``had_risk_scores`` (whether
         the ``rank_features`` enrichment succeeded when the row was written).
 
         Fact rows are re-sanitized on read, so a hit and a live consult hand the
@@ -279,6 +280,9 @@ class GraphConsultCache:
         verdict["graph_facts"] = {
             ref: sanitize_graph_facts_row(facts) for ref, facts in verdict["graph_facts"].items()
         }
+        verdict["risk_scores"] = {
+            ref: float(score) for ref, score in verdict["risk_scores"].items()
+        }
         verdict["had_risk_scores"] = bool(row[1])
         return verdict
 
@@ -308,8 +312,22 @@ class GraphConsultCache:
         rejects = verdict.get("rejects")
         refs = verdict.get("tool_not_found_refs")
         graph_facts = verdict.get("graph_facts")
+        risk_scores = verdict.get("risk_scores")
         if not (
-            isinstance(rejects, dict) and isinstance(refs, list) and isinstance(graph_facts, dict)
+            isinstance(rejects, dict)
+            and isinstance(refs, list)
+            and isinstance(graph_facts, dict)
+            and isinstance(risk_scores, dict)
+        ):
+            return False
+        # ``bool`` is an ``int`` subclass but never a valid risk score; the
+        # caller floats these outside its exception barrier.
+        if not all(
+            isinstance(k, str)
+            and not has_lone_surrogate(k)
+            and isinstance(v, (int, float))
+            and not isinstance(v, bool)
+            for k, v in risk_scores.items()
         ):
             return False
         if not all(
@@ -352,6 +370,7 @@ class GraphConsultCache:
         rejects: Mapping[str, str],
         tool_not_found_refs: Iterable[str],
         graph_facts: Mapping[str, Mapping[str, Any]],
+        risk_scores: Mapping[str, float],
         had_risk_scores: bool,
     ) -> None:
         """Persist the raw facts of a successful consult (scope-replacing)."""
@@ -366,8 +385,15 @@ class GraphConsultCache:
             "tool_not_found_refs": list(tool_not_found_refs),
             # Sanitized on write as well as on read: what lands on disk is then
             # exactly what a live consult produces, so a hit can never widen the
-            # fact vocabulary a fresh consult would have narrowed.
+            # fact vocabulary a fresh consult would have narrowed. The sanitizer
+            # is idempotent, so a row that arrives already sanitized survives
+            # both passes unchanged.
             "graph_facts": {ref: sanitize_graph_facts_row(row) for ref, row in graph_facts.items()},
+            # Stored beside the facts rather than re-derived from them on a hit:
+            # the live parser applies a duplicate-ref rule the deduplicated map
+            # cannot express, so a warm start that re-derived would compute a
+            # different penalty than the cold start that filled this row.
+            "risk_scores": {ref: float(score) for ref, score in risk_scores.items()},
         }
         if not self._row_shape_ok(raw_facts):
             logger.warning(

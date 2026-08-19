@@ -103,7 +103,7 @@ from memtomem_stm.proxy.tool_eligibility import (
     filter_tools,
     interpret_verdict,
     parse_graph_facts,
-    risk_scores_from_facts,
+    parse_risk_scores,
     sanitize_graph_facts_row,
 )
 from memtomem_stm.proxy.toolgraph_cache import GraphConsultCache
@@ -996,7 +996,13 @@ class ProxyManager:
                 if decision.reject_code is not None:
                     rejects[key] = decision.reject_code
                 if decision.risk_score is not None and decision.risk_score > 0:
-                    penalties[key] = min(decision.risk_score * cfg.risk_penalty_scale, 1.0)
+                    # ``> 0`` after scaling, like the stdio path: with
+                    # ``risk_penalty_scale: 0`` every penalty is 0.0, and
+                    # storing those would make ``risk_penalty_count`` report
+                    # demotions in the configuration that turned them off.
+                    penalty = min(decision.risk_score * cfg.risk_penalty_scale, 1.0)
+                    if penalty > 0:
+                        penalties[key] = penalty
                 # A portable bundle carries the compiled decision and its
                 # ``risk_score``, NOT the ``rank_features`` row behind it, so
                 # this path can only ever populate that one fact (#469). The
@@ -1137,6 +1143,7 @@ class ProxyManager:
 
         adapter = ToolgraphConsultAdapter(cfg)
         graph_facts: dict[str, dict[str, Any]] = {}
+        graph_scores: dict[str, float] = {}
         try:
             try:
                 # ``start()`` re-raises raw transport errors (caught below as
@@ -1149,7 +1156,7 @@ class ProxyManager:
                 # the on_* knobs below — the disk cache can never mask a degraded
                 # graph. Returns the same ``(interp, graph_facts)`` the rest of
                 # this method already expects.
-                interp, graph_facts = await self._run_consult(adapter, cfg, refs)
+                interp, graph_facts, graph_scores = await self._run_consult(adapter, cfg, refs)
             finally:
                 try:
                     await adapter.stop()
@@ -1205,7 +1212,7 @@ class ProxyManager:
         # not exist, in the exact configuration that turned them off.
         self._toolgraph_risk_penalties = {
             key: penalty
-            for ref, score in risk_scores_from_facts(graph_facts).items()
+            for ref, score in graph_scores.items()
             if (penalty := min(score * scale, 1.0)) > 0.0
             for key in ref_to_keys.get(ref, ())
         }
@@ -1283,8 +1290,13 @@ class ProxyManager:
 
     async def _run_consult(
         self, adapter: ToolgraphConsultAdapter, cfg: ToolgraphConfig, refs: list[str]
-    ) -> tuple[InterpretedVerdict, dict[str, dict[str, Any]]]:
-        """Probe-then-hit/miss consult (#494). Returns ``(interp, graph_facts)``.
+    ) -> tuple[InterpretedVerdict, dict[str, dict[str, Any]], dict[str, float]]:
+        """Probe-then-hit/miss consult (#494). Returns ``(interp, facts, scores)``.
+
+        The penalty map travels with the facts instead of being re-derived from
+        them: the live parser applies a duplicate-ref rule a deduplicated map
+        cannot express, so a warm start that re-derived could disagree with the
+        cold start whose row it is reading.
 
         Model A (strictly-fresh): with the cache enabled, a cheap
         ``eligible_tools([])`` probe reads the live ``graph_generation`` on EVERY
@@ -1319,15 +1331,16 @@ class ProxyManager:
             # Cache disabled / unavailable — the pre-#494 path, verbatim.
             interp = interpret_verdict(await adapter.eligible_tools(refs))
             facts: dict[str, dict[str, Any]] = {}
+            scores: dict[str, float] = {}
             if interp.agent_found and want_features:
-                facts, _ = await self._fetch_graph_facts(adapter, refs)
-            return interp, facts
+                facts, scores, _ = await self._fetch_graph_facts(adapter, refs)
+            return interp, facts, scores
 
         probe = interpret_verdict(await adapter.eligible_tools([]))
         if not probe.agent_found:
             # Agent unknown — no full consult; the caller maps this onto
             # ``on_agent_not_found`` exactly as the full-verdict abort would.
-            return probe, {}
+            return probe, {}, {}
 
         cand_hash = GraphConsultCache.candidate_hash(refs)
         prov_fp = GraphConsultCache.provider_fingerprint(cfg)
@@ -1344,13 +1357,14 @@ class ProxyManager:
             # live consult produce the same row shape and the same closed
             # vocabularies even if the file was written by another version.
             facts = dict(row["graph_facts"]) if want_features else {}
-            return interp, facts
+            scores = dict(row["risk_scores"]) if want_features else {}
+            return interp, facts, scores
 
         # Miss — full consult, then cache the raw facts on agent-found success.
         interp = interpret_verdict(await adapter.eligible_tools(refs))
-        facts, facts_ok = ({}, False)
+        facts, scores, facts_ok = ({}, {}, False)
         if interp.agent_found and want_features:
-            facts, facts_ok = await self._fetch_graph_facts(adapter, refs)
+            facts, scores, facts_ok = await self._fetch_graph_facts(adapter, refs)
         if interp.agent_found:
             cache.put(
                 prov_fp,
@@ -1361,14 +1375,15 @@ class ProxyManager:
                 rejects=interp.rejects,
                 tool_not_found_refs=interp.tool_not_found_refs,
                 graph_facts=facts,
+                risk_scores=scores,
                 had_risk_scores=facts_ok,
             )
-        return interp, facts
+        return interp, facts, scores
 
     async def _fetch_graph_facts(
         self, adapter: ToolgraphConsultAdapter, refs: list[str]
-    ) -> tuple[dict[str, dict[str, Any]], bool]:
-        """Best-effort ``rank_features`` enrichment: ``({ref: facts}, ok)``.
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, float], bool]:
+        """Best-effort ``rank_features`` enrichment: ``(facts, scores, ok)``.
 
         One call, two products: the #493 ``risk_score`` the ranker turns into a
         penalty, and the #469 per-candidate facts it was derived from. Both are
@@ -1377,7 +1392,7 @@ class ProxyManager:
         ``on_*`` knobs) any fault here degrades silently to "no facts, no
         penalties", logged once at WARNING.
 
-        Returns ``(facts, ok)`` where ``ok`` is ``False`` only on a consult
+        Returns ``(facts, scores, ok)`` where ``ok`` is ``False`` only on a consult
         error. The flag lets the #494 disk cache distinguish a *successful empty*
         enrichment (cacheable as "risk facts captured") from a *transient
         failure* (must not be cached as success, else a later same-generation
@@ -1392,7 +1407,7 @@ class ProxyManager:
                 "session.",
                 exc,
             )
-            return {}, False
+            return {}, {}, False
         # A non-error response whose ``features`` is not a list is a *malformed*
         # enrichment: ``parse_graph_facts`` leniently yields no facts, but it
         # must NOT be cached as a successful "no risk facts" capture (#494) — else
@@ -1405,8 +1420,8 @@ class ProxyManager:
                 "payload (no 'features' list) — ranking proceeds without graph risk "
                 "penalties or candidate facts this session."
             )
-            return {}, False
-        return parse_graph_facts(verdict), True
+            return {}, {}, False
+        return parse_graph_facts(verdict), parse_risk_scores(verdict), True
 
     def _tg_whole_call(self, knob: str, code: str, detail: str) -> None:
         """Apply a whole-call tool-graph failure per its ``on_*`` knob.

@@ -647,6 +647,7 @@ class TestToolgraphConsultWiring:
                 rejects={},
                 tool_not_found_refs=[],
                 graph_facts={},
+                risk_scores={},
                 had_risk_scores=True,
             )
         finally:

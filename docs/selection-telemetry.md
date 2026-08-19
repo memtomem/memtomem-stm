@@ -154,7 +154,7 @@ query signal and recorded in `candidate_features`:
   | `deny_path_count` | how many DENY evidence paths the graph reported (`0` = reported none, `null` = reported no list at all) |
   | `is_drifted` / `is_unmapped` / `has_unbacked_edges` | the drift, mapping and evidence-coverage facts behind the score |
   | `read_only_hint` / `destructive_hint` / `idempotent_hint` / `open_world_hint` | the tool's four annotation self-claims |
-  | `risk_score` | the graph's rule-based risk in `[0,1]`, or `null` when the candidate did not resolve |
+  | `risk_score` | the graph's rule-based risk in `[0,1]`, or `null` when the candidate did not resolve, or when the reported value was not a finite number (`NaN`/`Infinity` are not JSON, and an oversized integer has no float) |
 
   **These are the graph's facts, not STM's judgement** — `risk_score` `0.0`
   says the graph looked and found nothing wrong, which is a different record

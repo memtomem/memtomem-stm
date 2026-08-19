@@ -43,6 +43,7 @@ def _put(cache, *, generation=11, cand="hashA", rejects=None, tnf=None, risk=Non
         rejects=rejects or {},
         tool_not_found_refs=tnf or [],
         graph_facts=_facts(risk or {}),
+        risk_scores={ref: score for ref, score in (risk or {}).items() if score > 0},
         had_risk_scores=had_risk,
     )
 
@@ -96,6 +97,7 @@ class TestScopeKeyIsFramed:
             rejects={"s::first": "TOOLGRAPH_NOT_GRANTED"},
             tool_not_found_refs=[],
             graph_facts={},
+            risk_scores={},
             had_risk_scores=True,
         )
         cache.put(
@@ -107,6 +109,7 @@ class TestScopeKeyIsFramed:
             rejects={"s::second": "TOOLGRAPH_NOT_GRANTED"},
             tool_not_found_refs=[],
             graph_facts={},
+            risk_scores={},
             had_risk_scores=True,
         )
 
@@ -211,6 +214,47 @@ class TestRoundTrip:
         assert row["graph_facts"]["s::c"]["risk_score"] == 0.5
         assert row["had_risk_scores"] is True
 
+    def test_a_nonzero_deny_path_count_survives_the_round_trip(self, cache):
+        """Sanitizing happens on write and again on read, so the fact must
+        survive being sanitized twice — otherwise a warm start reports facts
+        the cold start that filled the row did not."""
+        cache.put(
+            _PROV,
+            _AGENT,
+            _PROFILE,
+            "hashA",
+            11,
+            rejects={},
+            tool_not_found_refs=[],
+            graph_facts={"s::a": sanitize_graph_facts_row({"deny_paths": [["x"], ["y"]]})},
+            risk_scores={},
+            had_risk_scores=True,
+        )
+        row = cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11)
+        assert row["graph_facts"]["s::a"]["deny_path_count"] == 2
+
+    def test_the_penalty_map_is_stored_not_re_derived(self, cache):
+        """The live parser keeps the last POSITIVE score for a repeated ref,
+        which a deduplicated facts map cannot express — so the map travels with
+        the facts rather than being recomputed on a hit."""
+        cache.put(
+            _PROV,
+            _AGENT,
+            _PROFILE,
+            "hashA",
+            11,
+            rejects={},
+            tool_not_found_refs=[],
+            # The facts say 0.0 (the last row); the penalty says 0.4 (the last
+            # positive one). A hit must reproduce both.
+            graph_facts={"s::a": sanitize_graph_facts_row({"risk_score": 0.0})},
+            risk_scores={"s::a": 0.4},
+            had_risk_scores=True,
+        )
+        row = cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11)
+        assert row["graph_facts"]["s::a"]["risk_score"] == 0.0
+        assert row["risk_scores"] == {"s::a": 0.4}
+
     def test_had_risk_scores_false_round_trips(self, cache):
         _put(cache, had_risk=False)
         row = cache.get(_PROV, _AGENT, _PROFILE, "hashA", 11)
@@ -291,6 +335,7 @@ class TestUninitialized:
             rejects={},
             tool_not_found_refs=[],
             graph_facts={},
+            risk_scores={},
             had_risk_scores=True,
         )
         assert c.get(_PROV, _AGENT, _PROFILE, "hashA", 11) is None
@@ -418,6 +463,7 @@ class TestCorruptRow:
                         "identity_policy": IDENTITY_POLICY,
                         "rejects": {},
                         "tool_not_found_refs": [],
+                        "risk_scores": {},
                         "graph_facts": {
                             "s::a": {
                                 "risk_score": "not-a-float",
@@ -537,6 +583,7 @@ class TestIdentifierWriteBoundary:
             rejects={},
             tool_not_found_refs=[],
             graph_facts={},
+            risk_scores={},
             had_risk_scores=True,
         )
         assert cache.get(_PROV, "agent\ud800", _PROFILE, "hashA", 11) is None

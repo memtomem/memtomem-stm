@@ -36,7 +36,13 @@ changes inline only. See the deprecation policy in
   score map, so the first start after upgrading re-runs one full consult
   (rows written by earlier versions cannot have the dropped rows recovered).
   In portable-bundle mode only `risk_score` is populated: a compiled bundle
-  carries the decision, not the row behind it. `stm_proxy_health` gained a
+  carries the decision, not the row behind it, and — like the live consult —
+  it now records a penalty only once scaling leaves one, so
+  `risk_penalty_count` cannot report demotions under `risk_penalty_scale: 0`.
+  A reported score that is not a finite number is recorded as `null` rather
+  than travelling into the log and the cache as a token strict JSON readers
+  reject; a repeated candidate ref (an upstream contract violation) keeps its
+  last *positive* penalty, as before, while its facts describe the last row. `stm_proxy_health` gained a
   `N with recorded graph facts` count on the active line, since with penalties
   scaled to `0` the existing penalty count cannot distinguish an enrichment
   that ran and found everything clean from one that never ran.

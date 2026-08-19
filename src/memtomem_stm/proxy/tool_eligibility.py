@@ -103,6 +103,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -482,16 +483,51 @@ def sanitize_graph_facts_row(row: Mapping[str, Any]) -> dict[str, Any]:
         facts[flag] = value if isinstance(value, bool) else None
     facts["verdict"] = _graph_enum(row.get("verdict"), GRAPH_VERDICTS)
     facts["classification"] = _graph_enum(row.get("classification"), GRAPH_CLASSIFICATIONS)
-    deny_paths = row.get("deny_paths")
-    facts["deny_path_count"] = len(deny_paths) if isinstance(deny_paths, list) else None
-    score = row.get("risk_score")
-    # ``bool`` is an ``int`` subclass but never a valid risk score — the same
-    # rejection ``parse_risk_scores`` makes, kept here because that function
-    # now derives from this one.
-    facts["risk_score"] = (
-        float(score) if isinstance(score, (int, float)) and not isinstance(score, bool) else None
-    )
+    facts["deny_path_count"] = _deny_path_count(row)
+    facts["risk_score"] = _risk_score(row.get("risk_score"))
     return facts
+
+
+def _deny_path_count(row: Mapping[str, Any]) -> int | None:
+    """DENY-evidence count from either an upstream row or a sanitized one.
+
+    Sanitized rows carry the count and NOT the paths it came from, so a
+    paths-only rule silently erased it whenever a row was sanitized twice —
+    which the consult cache does on every write and read, making a warm start
+    disagree with the cold one that filled it. Being idempotent is part of this
+    function's contract, not an optimization.
+    """
+    deny_paths = row.get("deny_paths")
+    if isinstance(deny_paths, list):
+        return len(deny_paths)
+    count = row.get("deny_path_count")
+    if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+        return count
+    return None
+
+
+def _risk_score(score: Any) -> float | None:
+    """A recordable risk score, or ``None``.
+
+    Total by construction. ``bool`` is an ``int`` subclass but never a valid
+    score. ``float()`` is not total either: a large enough JSON integer raises
+    ``OverflowError``, which would escape an enrichment path documented as
+    best-effort and abort startup. Non-finite values are refused as well —
+    ``NaN``/``Infinity`` are not JSON, so one would travel into the telemetry
+    file and the consult cache as a token strict readers reject, and as a
+    penalty ``inf`` makes every score ``-inf``.
+
+    Out-of-range but finite values are kept: the graph's ``[0, 1]`` promise is
+    the graph's to keep, and a fact it reported is worth recording as reported.
+    The penalty path clamps and filters separately.
+    """
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        return None
+    try:
+        value = float(score)
+    except (OverflowError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
 
 
 def parse_graph_facts(verdict: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
@@ -508,26 +544,54 @@ def parse_graph_facts(verdict: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     caller degrades to logging no facts. A later row wins on a duplicated ref
     (last-write, matching ``parse_risk_scores``).
     """
+    return _walk_features(verdict)[0]
+
+
+def _walk_features(
+    verdict: Mapping[str, Any],
+) -> tuple[dict[str, dict[str, Any]], dict[str, float]]:
+    """One pass, two products: per-candidate facts and the penalty map.
+
+    They differ on ONE point, and only for a payload that repeats a candidate
+    (an upstream contract violation): the facts follow the last row for that
+    ref, because "the row for this candidate" is what they are, while the
+    penalty keeps the last POSITIVE score. That asymmetry is inherited, not
+    invented — the pre-#469 parser assigned on a positive score and skipped
+    otherwise, so a later ``0.0``/``None``/malformed row never deleted an
+    existing penalty, and a candidate must not lose its demotion to a repeat
+    row the graph should not have sent.
+    """
     rows = verdict.get("features")
     if not isinstance(rows, list):
-        return {}
+        return {}, {}
     facts: dict[str, dict[str, Any]] = {}
+    scores: dict[str, float] = {}
     for row in rows:
         if not isinstance(row, dict):
             continue
         ref = row.get("candidate")
         if not isinstance(ref, str):
             continue
-        facts[ref] = sanitize_graph_facts_row(row)
-    return facts
+        sanitized = sanitize_graph_facts_row(row)
+        facts[ref] = sanitized
+        score = sanitized["risk_score"]
+        if score is not None and score > 0.0:
+            scores[ref] = score
+    return facts, scores
 
 
 def risk_scores_from_facts(facts: Mapping[str, Mapping[str, Any]]) -> dict[str, float]:
-    """Project sanitized facts onto the sparse ranking-penalty map.
+    """Project already-deduplicated facts onto the sparse penalty map.
 
     Only *positive* scores survive: a missing ref means "no penalty", which is
     exactly the ranker's default, so recording ``0.0`` rows here would grow the
     map without changing a single score.
+
+    For a LIVE payload use :func:`parse_risk_scores`, which sees the rows and
+    therefore the duplicate-ref rule. This function has one row per ref by
+    construction — it exists for facts read back from the consult cache, which
+    stores the penalty map beside them precisely so a warm start cannot
+    re-derive a different one.
     """
     scores: dict[str, float] = {}
     for ref, row in facts.items():
@@ -552,12 +616,13 @@ def parse_risk_scores(verdict: Mapping[str, Any]) -> dict[str, float]:
     degrades to no penalties) rather than a contract failure. ``bool`` is
     rejected as a score — it is an ``int`` subclass but never a valid risk.
 
-    Derived from :func:`parse_graph_facts` (#469) rather than re-walking the
-    payload: the penalty map and the logged facts are two views of one
+    Produced by the same walk as :func:`parse_graph_facts` (#469) rather than
+    a second pass: the penalty map and the logged facts are two views of one
     response, and two independent walks would be free to disagree about which
-    rows count.
+    rows count. See :func:`_walk_features` for the one place they deliberately
+    differ.
     """
-    return risk_scores_from_facts(parse_graph_facts(verdict))
+    return _walk_features(verdict)[1]
 
 
 def filter_tools(

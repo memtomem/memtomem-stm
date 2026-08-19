@@ -959,6 +959,75 @@ class TestSanitizeGraphFactsRow:
         assert set(sanitize_graph_facts_row({})) == set(GRAPH_FACT_KEYS)
 
 
+class TestGraphFactsEdgeCases:
+    """Inputs a malformed upstream can send (codex round 1, PR #852)."""
+
+    def test_an_oversized_integer_score_does_not_raise(self):
+        """``float()`` is not total. This enrichment is documented best-effort
+        and runs inside ``start()``, so an escaping ``OverflowError`` would
+        abort the proxy over a telemetry field."""
+        v = {"features": [{"candidate": "s::a", "risk_score": 10**400}]}
+        assert parse_graph_facts(v)["s::a"]["risk_score"] is None
+        assert parse_risk_scores(v) == {}
+
+    @pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+    def test_non_finite_scores_are_refused(self, value):
+        """``NaN``/``Infinity`` are not JSON: one would reach the telemetry file
+        and the consult cache as a token strict readers reject, and as a penalty
+        ``inf`` drives every final score to ``-inf``."""
+        v = {"features": [{"candidate": "s::a", "risk_score": value}]}
+        assert parse_graph_facts(v)["s::a"]["risk_score"] is None
+        assert parse_risk_scores(v) == {}
+
+    def test_out_of_range_but_finite_scores_are_recorded(self):
+        """Positive control for the two above: the refusals are about values
+        that cannot be represented or serialized, not about the graph's
+        ``[0,1]`` promise, which is the graph's to keep."""
+        v = {"features": [{"candidate": "s::a", "risk_score": 4.2}]}
+        assert parse_graph_facts(v)["s::a"]["risk_score"] == 4.2
+
+    def test_sanitizing_a_sanitized_row_is_a_no_op(self):
+        """The consult cache sanitizes on write AND on read, so a rule that
+        read ``deny_paths`` only would erase the count it had just derived —
+        making a warm start disagree with the cold start that filled it."""
+        once = sanitize_graph_facts_row({**_REAL_ROW, "deny_paths": [["a"], ["b"]]})
+        twice = sanitize_graph_facts_row(once)
+        assert once["deny_path_count"] == 2
+        assert twice == once
+
+    def test_a_bogus_stored_count_does_not_survive_sanitizing(self):
+        assert sanitize_graph_facts_row({"deny_path_count": -1})["deny_path_count"] is None
+        assert sanitize_graph_facts_row({"deny_path_count": "two"})["deny_path_count"] is None
+        assert sanitize_graph_facts_row({"deny_path_count": True})["deny_path_count"] is None
+
+    @pytest.mark.parametrize("later", [0.0, None, -1.0, "nope"])
+    def test_a_repeat_row_never_deletes_an_existing_penalty(self, later):
+        """Inherited semantics: the pre-#469 parser assigned on a positive
+        score and skipped otherwise, so a repeat row could not erase a
+        demotion. A candidate must not lose its penalty — and its cohort
+        stamp — to a duplicate the graph should not have sent.
+        """
+        v = {
+            "features": [
+                {"candidate": "s::a", "risk_score": 0.4},
+                {"candidate": "s::a", "risk_score": later},
+            ]
+        }
+        assert parse_risk_scores(v) == {"s::a": 0.4}
+        # The FACTS still follow the last row — they describe that row.
+        expected = later if isinstance(later, float) else None
+        assert parse_graph_facts(v)["s::a"]["risk_score"] == expected
+
+    def test_a_later_positive_row_wins(self):
+        v = {
+            "features": [
+                {"candidate": "s::a", "risk_score": 0.4},
+                {"candidate": "s::a", "risk_score": 0.9},
+            ]
+        }
+        assert parse_risk_scores(v) == {"s::a": 0.9}
+
+
 class TestParseGraphFacts:
     def test_keeps_clean_and_unresolved_rows(self):
         """The gap this closes: the sparse penalty map renders both as absent.
