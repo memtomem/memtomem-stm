@@ -169,19 +169,31 @@ def rotation_lock(
 RANKER_VERSION = "v0-passthrough"
 
 
-def _ends_with_newline(fd: int) -> bool:
-    """Whether the file behind *fd* ends on a record boundary.
+def _needs_leading_newline(path: Path) -> bool:
+    """Whether an append to *path* must open a line of its own first.
 
-    An empty file counts as terminated: there is no line to fuse with. A probe
-    that cannot run reports ``True``, which keeps the append unchanged — the
-    behavior before this check existed — rather than injecting a blank line on
-    every write because one ``lseek`` failed.
+    True when the file's last byte is not a newline — a crash mid-append, or a
+    hand edit — because an append landing there is swallowed into that line and
+    the writer would be told its record survived while readers reject the fused
+    line.
+
+    Probed through its own read handle rather than the append descriptor: a
+    read-modify sequence on an ``O_APPEND`` descriptor would need a separate
+    argument about what each platform guarantees, and this needs none — the
+    append itself is unchanged. A missing or empty file needs nothing (there is
+    no line to fuse with); any other failure answers **True**, because the
+    unknown case is the one where a wrong guess costs a record. A stray blank
+    line, which is what that guess costs when the file was in fact terminated,
+    is skipped by every reader of this log.
     """
     try:
-        if os.lseek(fd, 0, os.SEEK_END) == 0:
-            return True
-        os.lseek(fd, -1, os.SEEK_END)
-        return os.read(fd, 1) == b"\n"
+        with path.open("rb") as fh:
+            if fh.seek(0, os.SEEK_END) == 0:
+                return False
+            fh.seek(-1, os.SEEK_END)
+            return fh.read(1) != b"\n"
+    except FileNotFoundError:
+        return False
     except OSError:
         logger.debug("Could not probe the selection log's tail", exc_info=True)
         return True
@@ -476,7 +488,9 @@ class SelectionTelemetryLog:
         ``"failed"`` means no complete record was written. ``"unconfirmed"``
         means the record's bytes are complete but the flush that would prove
         they survive a crash did not complete. ``"written"`` is the only
-        outcome where the record is on disk and durable.
+        outcome where the append completed — and, when *durable* was asked for,
+        where the flush proving it survives a crash completed too. A call-path
+        append returns it without any flush, which is the point of asking.
 
         With *durable*, the descriptor (and, when this append created the file,
         its parent directory) is ``fsync``-ed before reporting success. Paid
@@ -535,21 +549,13 @@ class SelectionTelemetryLog:
                 # the open, so at most a concurrent external creator makes it
                 # conservative (one extra directory sync), never optimistic.
                 created = durable and not self._path.exists()
-                # O_RDWR rather than O_WRONLY so the tail can be probed below;
-                # O_APPEND still sends every write to the end regardless of the
-                # read offset.
-                fd = os.open(self._path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+                # Probed before the open, through a read handle of its own, so
+                # the append descriptor keeps the plain write-only append it
+                # has always had.
+                payload = b"\n" + data if _needs_leading_newline(self._path) else data
+                fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
                 closed = False
                 try:
-                    # A log whose last line has no newline — a crash mid-append,
-                    # or an operator's edit — would otherwise swallow this
-                    # record into that line, and THIS caller would be told its
-                    # record survived while every reader rejects the fused
-                    # line. Same repair as a short write of our own, one step
-                    # earlier: the writer that finds the damage is the one that
-                    # can still fix it. A blank line, if a concurrent writer
-                    # terminated the tail in between, is skipped by readers.
-                    payload = data if _ends_with_newline(fd) else b"\n" + data
                     written = os.write(fd, payload)
                     if written != len(payload):
                         # Close the fragment's LINE while the descriptor is
@@ -774,47 +780,54 @@ def selection_defect(record: dict[str, Any]) -> str | None:
     return None
 
 
-def find_selection(
+def resolve_selection(
     path: Path | str,
     *,
     selection_id: str | None = None,
     server: str | None = None,
     tool: str | None = None,
     include_rotated: bool = True,
-) -> dict[str, Any] | None:
-    """Locate one ``selection`` record, or ``None``.
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Locate one labellable ``selection``; returns ``(record, defect)``.
 
-    With *selection_id*, returns that exact record — including a defective one,
-    so a caller can say *what is wrong with the row you named* rather than
-    "not found" about a record that is plainly in the file. Callers that are
-    about to write must screen it with :func:`selection_defect`.
+    Exactly one of the two is ever set. A *defect* is the reason a record that
+    IS in the log cannot carry a label, so a caller can say what is wrong with
+    the row rather than "not found" about one an operator can plainly see.
 
-    Otherwise returns the most recent selection matching the optional *server*
-    / *tool* filters, where "most recent" is **append order** (see
-    :func:`discover_log_files`) rather than the ``ts`` field: ``ts`` is wall
-    clock and a clock step backwards would reorder history, while append order
-    is what actually happened. Defective records are skipped by that search:
-    an inferred target that cannot be labelled is not the most recent
-    labellable selection, and silently picking it would put the operator's
-    judgement on a row the replay harness discards.
+    With *selection_id*, resolves that exact row. Otherwise the most recent
+    selection matching the optional *server* / *tool* filters, where "most
+    recent" is **append order** (see :func:`discover_log_files`) rather than
+    the ``ts`` field: ``ts`` is wall clock and a clock step backwards would
+    reorder history, while append order is what actually happened. Defective
+    rows are skipped by that search — an inferred target that cannot be
+    labelled is not the most recent labellable selection.
 
     Malformed lines are skipped, not raised on — the same posture as
     :func:`aggregate_selection_log`, because a hand-edited or half-written log
     must not make labelling impossible.
 
-    What counts as a line here is what the replay harness counts, because the
-    label is written FOR that reader: bytes decoded strictly (a record
-    truncated mid-character is skipped, not repaired into a different string by
-    ``errors="replace"``), lines over :data:`MAX_LINE_BYTES` dropped, the
-    active file's unterminated tail — a record still being written — ignored,
-    and a repeated ``selection_id`` resolved last-wins the way replay folds it.
-    A selection the two disagree about is one whose label joins nothing.
+    What counts as a record here is what the replay harness counts, because
+    the label is written FOR that reader (``selection_eval._read_telemetry``
+    and ``_observed_telemetry``): lines parsed from raw bytes, so an encoding
+    the two would read differently is skipped by both; lines over
+    :data:`MAX_LINE_BYTES` dropped; the active file's unterminated tail — a
+    record still being written — ignored; identical duplicates of one
+    ``selection_id`` folded to the first; and a ``selection_id`` whose copies
+    DISAGREE refused outright, because replay drops that selection entirely
+    and marks the run invalid. A selection the two disagree about is one whose
+    label joins nothing.
 
     *tool* matches ``selected_tool``, the prefixed name the client called, so
     it uses the same vocabulary an operator reads out of a report.
     """
     path = Path(path).expanduser()
-    match: dict[str, Any] | None = None
+    # ``selection_id`` -> canonical bytes of the first copy seen, so a repeat
+    # can be classified without holding every record. Conflicts are tracked
+    # for EVERY id, not just matching ones: a copy that fails the --server
+    # filter still conflicts, and replay drops the selection for it.
+    first_seen: dict[str, str] = {}
+    conflicting: set[str] = set()
+    matches: list[dict[str, Any]] = []
     for log_path in discover_log_files(path, include_rotated=include_rotated):
         try:
             data = log_path.read_bytes()
@@ -836,19 +849,32 @@ def find_selection(
             if len(raw_line) > MAX_LINE_BYTES:
                 continue
             try:
-                record = json.loads(raw_line.decode("utf-8"))
+                # Parsed from the bytes, exactly as replay parses them: a str
+                # decoded here first would disagree with it about a BOM, and
+                # would need its own strictness argument. ``json`` decodes
+                # UTF-8 strictly, so a record truncated mid-character raises
+                # rather than being repaired into a different string.
+                record = json.loads(raw_line)
             except (ValueError, TypeError, UnicodeDecodeError):
                 continue
             if not isinstance(record, dict) or record.get("event") != "selection":
                 continue
+            record_id = record.get("selection_id")
+            if isinstance(record_id, str) and record_id:
+                canonical = json_out.dumps(record, sort_keys=True, ensure_ascii=False, default=str)
+                previous = first_seen.get(record_id)
+                if previous is None:
+                    first_seen[record_id] = canonical
+                elif previous != canonical:
+                    conflicting.add(record_id)
+                    continue
+                else:
+                    # A byte-identical repeat: replay counts it and keeps the
+                    # first, so there is nothing new to match on.
+                    continue
             if selection_id is not None:
-                if record.get("selection_id") == selection_id:
-                    # Keep scanning rather than returning: an id can repeat in
-                    # a hand-edited or replayed-into log, and the readers this
-                    # label is written for fold duplicates last-wins. Returning
-                    # the first would inherit a cohort stamp from a record they
-                    # discard.
-                    match = record
+                if record_id == selection_id:
+                    matches.append(record)
                 continue
             if server is not None and record.get("server") != server:
                 continue
@@ -856,9 +882,54 @@ def find_selection(
                 continue
             if selection_defect(record) is not None:
                 continue
-            # Keep scanning: the LAST match in append order wins.
-            match = record
-    return match
+            matches.append(record)
+    # Newest first, so a conflicting or defective candidate falls through to
+    # the next-most-recent one rather than failing the whole resolve.
+    for record in reversed(matches):
+        record_id = record.get("selection_id")
+        if isinstance(record_id, str) and record_id in conflicting:
+            if selection_id is not None:
+                return None, (
+                    "copies of this selection_id disagree; offline replay drops the "
+                    "selection and marks the run invalid"
+                )
+            continue
+        defect = selection_defect(record)
+        if defect is not None:
+            if selection_id is not None:
+                return None, defect
+            continue
+        return record, None
+    if selection_id is not None and selection_id in conflicting:
+        # Every copy was consumed as a conflict, so ``matches`` never saw one.
+        return None, (
+            "copies of this selection_id disagree; offline replay drops the "
+            "selection and marks the run invalid"
+        )
+    return None, None
+
+
+def find_selection(
+    path: Path | str,
+    *,
+    selection_id: str | None = None,
+    server: str | None = None,
+    tool: str | None = None,
+    include_rotated: bool = True,
+) -> dict[str, Any] | None:
+    """The labellable record :func:`resolve_selection` found, or ``None``.
+
+    Thin wrapper for readers that only need the row; a caller about to WRITE
+    wants the defect string too, since "no such selection" and "that selection
+    cannot carry a label" send an operator to different places.
+    """
+    return resolve_selection(
+        path,
+        selection_id=selection_id,
+        server=server,
+        tool=tool,
+        include_rotated=include_rotated,
+    )[0]
 
 
 def _top(counter: Counter[str], n: int) -> list[list[Any]]:

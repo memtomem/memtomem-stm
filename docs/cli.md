@@ -709,7 +709,10 @@ target appears only in the result document, after the write, so a scripted
 `--last` passes `--yes` and reads back what it got. Because that check is the only thing standing behind an
 inferred target, a non-interactive `--last` (a pipe, CI, or `--json`) is
 **refused** without `--yes` — exit 2, `confirmation_required` — rather than
-prompting where nobody can answer or writing unasked. `--selection-id` names
+prompting where nobody can answer or writing unasked. Both streams decide
+that: with stdout piped (`mms selection feedback --last … | jq`) stdin can
+still be a terminal, while the resolved selection and the question itself
+disappear into the pipe. `--selection-id` names
 its target explicitly and never prompts. Values shown at the confirmation are
 escaped for display: `selected_tool` is upstream-controlled, and an ANSI or
 bidi sequence in it could otherwise forge the very target being confirmed.
@@ -731,8 +734,9 @@ exit 1 and emit `{"action": "selection-feedback", "ok": false, "error":
 | --- | --- |
 | `no_log` | no log segment exists in the selected scope — with `--active-only` that is the active file alone, otherwise the active file and every rotated backup |
 | `not_found` / `no_match` | the selector resolved to nothing, checked *before* writing, so a typo never appends a label that joins to no selection |
-| `unusable_record` | the record was found but cannot carry a label: an unsupported `schema_version` (offline replay drops those records outright, so a label on one joins nothing), no `ranker_version` for the label to inherit (replay would load the selection, but under a cohort this command would have had to invent), or — only reachable on a hand-edited log — no `selection_id`. `--last` skips such rows rather than inferring one |
+| `unusable_record` | the record was found but cannot carry a label: an unsupported `schema_version` (offline replay drops those records outright, so a label on one joins nothing), no `ranker_version` for the label to inherit (replay would load the selection, but under a cohort this command would have had to invent), or two copies of the `selection_id` that disagree (replay discards that selection entirely and marks the run invalid; byte-identical copies are fine and fold to one). `--last` skips such rows and resolves to the next-most-recent labellable one |
 | `log_rotated` | the resolved selection left the log between resolution and append; nothing was written |
+| `selection_changed` | the selection is still there but is no longer the record that was confirmed — a copy carrying a different `ranker_version` / `trace_id` / server / tool landed during the confirmation. Refused rather than reconciled: which of the two the judgement was about is not something the command can decide |
 | `log_busy` | the rotation lock is held (by a rotating writer or another labelling run) and could not be taken; nothing was written — re-run |
 | `lock_failed` | the rotation lock file beside the log could not be created (e.g. a writable log in a directory this user cannot write); nothing was written |
 | `log_unreadable` | the log directory could not be listed, or a segment could not be opened — reported instead of `no_match`, since "I could not look there" is not "no such selection" |

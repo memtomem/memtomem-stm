@@ -1286,23 +1286,142 @@ class TestResolverAgreesWithReplay:
         assert parsed[2]["event"] == "feedback"
         assert parsed[2]["selection_id"] == "good"
 
-    def test_a_repeated_id_resolves_to_the_last_one(self, tmp_path):
-        """Readers fold duplicates last-wins, so the cohort the label inherits
-        must come from the record they keep."""
-        log_path = tmp_path / "log.jsonl"
+    def test_identical_duplicates_are_labellable_and_conflicting_ones_are_not(self, tmp_path):
+        """Replay's own duplicate policy, both halves.
+
+        ``_observed_telemetry`` folds byte-identical repeats (counting them)
+        and, when two copies of one id DISAGREE, drops the selection outright
+        and marks the run invalid. Labelling the second kind would attach a
+        judgement to a selection its only reader refuses to load, and the
+        cohort it inherited would come from whichever copy the resolver
+        happened to prefer.
+        """
+        from memtomem_stm.proxy import selection_eval
+
+        identical = tmp_path / "identical.jsonl"
+        row = _sel(selection_id="dup", trace_id="t")
+        _write_lines(identical, [row, dict(row)])
+        result = _run_feedback(
+            tmp_path, identical, "--selection-id", "dup", "--user-corrected", "--json"
+        )
+        assert result.exit_code == 0, result.output
+        assert [record["ranker_version"] for record in _feedback_records(identical)] == [
+            RANKER_VERSION
+        ]
+
+        conflicting = tmp_path / "conflicting.jsonl"
         _write_lines(
-            log_path,
+            conflicting,
             [
-                _sel(selection_id="dup", ranker_version="v0-passthrough"),
+                _sel(selection_id="dup", ranker_version=RANKER_VERSION),
                 _sel(selection_id="dup", ranker_version="v1-bm25-tool-relevance"),
             ],
         )
         result = _run_feedback(
-            tmp_path, log_path, "--selection-id", "dup", "--user-corrected", "--json"
+            tmp_path, conflicting, "--selection-id", "dup", "--user-corrected", "--json"
         )
-        assert result.exit_code == 0, result.output
-        labels = _feedback_records(log_path)
-        assert [record["ranker_version"] for record in labels] == ["v1-bm25-tool-relevance"]
+        payload = json.loads(result.output)
+        assert result.exit_code == 1
+        assert payload["error"] == "unusable_record"
+        assert "disagree" in payload["message"]
+        assert _feedback_records(conflicting) == []
+
+        # The premise, measured on the reader rather than asserted: replay
+        # keeps the identical case and discards the conflicting one.
+        records, quality = selection_eval._read_telemetry(identical, include_rotated=False)
+        selection_eval._observed_telemetry(records, quality)
+        # The identical pair is folded and counted, NOT treated as a conflict —
+        # (the fixture trips other quality counters, so the premise is read off
+        # these two fields rather than off the overall status).
+        assert quality["duplicate_records"] == 1 and quality["conflicting_records"] == 0
+
+        records, quality = selection_eval._read_telemetry(conflicting, include_rotated=False)
+        selection_eval._observed_telemetry(records, quality)
+        assert quality["conflicting_records"] == 1
+        assert quality["status"] == "invalid"
+
+    def test_last_falls_through_a_conflicting_selection(self, tmp_path):
+        """A conflicting id is not a labellable target, so ``--last`` resolves
+        to the newest one that is — with the control that the same layout
+        without the conflict picks the newer row."""
+        log_path = tmp_path / "log.jsonl"
+        _write_lines(
+            log_path,
+            [
+                _sel(selection_id="older"),
+                _sel(selection_id="newest", server="gh"),
+                _sel(selection_id="newest", server="fs"),
+            ],
+        )
+        assert _run_feedback(tmp_path, log_path, "--last", "--user-corrected").exit_code == 0
+        assert [record["selection_id"] for record in _feedback_records(log_path)] == ["older"]
+
+        control = tmp_path / "control.jsonl"
+        _write_lines(control, [_sel(selection_id="older"), _sel(selection_id="newest")])
+        assert _run_feedback(tmp_path, control, "--last", "--user-corrected").exit_code == 0
+        assert [record["selection_id"] for record in _feedback_records(control)] == ["newest"]
+
+
+class TestTailProbeFailsClosed:
+    """The probe answers "does this file end on a record boundary". When it
+    cannot answer, the append must assume it does not: the cost of guessing
+    wrong that way is a blank line every reader skips, while the other guess
+    fuses the record into an unreadable line and reports it written."""
+
+    @pytest.mark.parametrize("failing", ["seek", "read"])
+    def test_a_probe_that_cannot_answer_still_opens_a_new_line(
+        self, tmp_path, monkeypatch, failing
+    ):
+        log_path = tmp_path / "log.jsonl"
+        _write_lines(log_path, [_sel(selection_id="good")])
+        # An unterminated tail: without the leading newline the label fuses
+        # onto it.
+        with log_path.open("ab") as fh:
+            fh.write(b'{"event": "selection", "selection_id": "half')
+
+        real_open = Path.open
+
+        class Blinded:
+            def __init__(self, wrapped):
+                self._wrapped = wrapped
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return self._wrapped.__exit__(*exc)
+
+            def seek(self, *args):
+                if failing == "seek":
+                    raise OSError(5, "I/O error")
+                return self._wrapped.seek(*args)
+
+            def read(self, *args):
+                if failing == "read":
+                    raise OSError(5, "I/O error")
+                return self._wrapped.read(*args)
+
+        def blinded_open(self, *args, **kwargs):
+            handle = real_open(self, *args, **kwargs)
+            if self == log_path and args and args[0] == "rb":
+                return Blinded(handle)
+            return handle
+
+        monkeypatch.setattr(Path, "open", blinded_open)
+        log = SelectionTelemetryLog(log_path)
+        assert log.log_feedback(selection_id="good", user_corrected=True) == "written"
+        monkeypatch.undo()
+
+        parsed = []
+        for raw_line in log_path.read_bytes().splitlines():
+            try:
+                parsed.append(json.loads(raw_line))
+            except ValueError:
+                parsed.append(None)
+        # The label is a line of its own and readable — the fragment did not
+        # swallow it.
+        assert parsed[-1] is not None
+        assert parsed[-1]["event"] == "feedback"
 
 
 class TestCleanupFailuresDoNotOverruleACompleteWrite:
@@ -1408,11 +1527,19 @@ class TestEnvOverlayThatWasIgnoredEntirely:
         """The positive control: ``null`` resolves to the field defaults, which
         is exactly what an empty overlay expresses, so it is not a rejection —
         without this the test above would pass for a command that refuses on
-        any environment at all."""
+        any environment at all.
+
+        Routed through the CONFIG the way the refusal cases are (no ``--log``),
+        since a path handed in on the command line never consults the config
+        and would prove nothing about this."""
         from memtomem_stm.cli.proxy import cli
 
         log_path = tmp_path / "log.jsonl"
         _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        config = tmp_path / "proxy.json"
+        config.write_text(
+            json.dumps({"selection_telemetry": {"path": str(log_path)}}), encoding="utf-8"
+        )
         monkeypatch.setenv("MEMTOMEM_STM_PROXY", "null")
         result = CliRunner().invoke(
             cli,
@@ -1420,9 +1547,7 @@ class TestEnvOverlayThatWasIgnoredEntirely:
                 "selection",
                 "feedback",
                 "--config",
-                str(tmp_path / "absent-proxy.json"),
-                "--log",
-                str(log_path),
+                str(config),
                 "--last",
                 "--user-corrected",
                 "--yes",
@@ -1430,6 +1555,7 @@ class TestEnvOverlayThatWasIgnoredEntirely:
             ],
         )
         assert result.exit_code == 0, result.output
+        assert json.loads(result.output)["log"] == str(log_path)
         assert len(_feedback_records(log_path)) == 1
 
 
@@ -1879,10 +2005,10 @@ class TestSelectionFeedbackRobustness:
         """
         log_path = tmp_path / "log.jsonl"
         _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
-        real_find = selection_log_module.find_selection
+        real_resolve = selection_log_module.resolve_selection
         state = {"evicted": False}
 
-        def evict_then_find(*args, **kwargs):
+        def evict_then_resolve(*args, **kwargs):
             # The verify pass is the one that looks up an exact id.
             if kwargs.get("selection_id") and not state["evicted"]:
                 state["evicted"] = True
@@ -1890,16 +2016,63 @@ class TestSelectionFeedbackRobustness:
                 # taking the resolved selection with it.
                 log_path.unlink()
                 log_path.write_text("", encoding="utf-8")
-            return real_find(*args, **kwargs)
+            return real_resolve(*args, **kwargs)
 
         def must_not_write(log, **fields):  # pragma: no cover - asserts absence
             raise AssertionError("wrote a label for an evicted selection")
 
-        monkeypatch.setattr(selection_cmd, "find_selection", evict_then_find)
+        monkeypatch.setattr(selection_cmd, "resolve_selection", evict_then_resolve)
         monkeypatch.setattr(selection_cmd, "_write_label", must_not_write)
         result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
         assert result.exit_code == 1
         assert json.loads(result.output)["error"] == "log_rotated"
+        assert _feedback_records(log_path) == []
+
+    def test_a_row_that_changes_under_the_confirmation_is_refused(self, tmp_path, monkeypatch):
+        """Still present is not the same as still the row that was agreed to.
+
+        A copy of the id can land while the operator reads the prompt, and the
+        label would then carry the cohort and trace of a record they never
+        saw. The verify pass compares identity, not mere existence.
+        """
+        log_path = tmp_path / "log.jsonl"
+        _write_lines(log_path, [_sel(selection_id="a", ranker_version=RANKER_VERSION)])
+        real_resolve = selection_log_module.resolve_selection
+        state = {"swapped": False}
+
+        def swap_then_resolve(*args, **kwargs):
+            if kwargs.get("selection_id") and not state["swapped"]:
+                state["swapped"] = True
+                # The same id, a different cohort: the operator confirmed the
+                # first, and replay would fold neither in its favour.
+                _write_lines(
+                    log_path,
+                    [_sel(selection_id="a", ranker_version="v1-bm25-tool-relevance")],
+                )
+            return real_resolve(*args, **kwargs)
+
+        def must_not_write(log, **fields):  # pragma: no cover - asserts absence
+            raise AssertionError("wrote a label for a record the operator never saw")
+
+        monkeypatch.setattr(selection_cmd, "resolve_selection", swap_then_resolve)
+        monkeypatch.setattr(selection_cmd, "_write_label", must_not_write)
+        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
+        assert result.exit_code == 1
+        assert json.loads(result.output)["error"] == "selection_changed"
+        assert _feedback_records(log_path) == []
+
+    def test_a_piped_stdout_is_refused_like_a_piped_stdin(self, tmp_path, monkeypatch):
+        """``mms ... | jq`` leaves stdin a terminal while the prompt itself —
+        and the resolved selection above it — goes into the pipe. A
+        confirmation nobody can read is not the check ``--last`` leans on."""
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        monkeypatch.setattr(selection_cmd.sys.stdin, "isatty", lambda: True, raising=False)
+        assert selection_cmd._human_at_the_terminal() is False
+
+        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", yes=False)
+        assert result.exit_code == 2
+        assert "--yes" in result.output
         assert _feedback_records(log_path) == []
 
     def test_non_interactive_last_is_refused_without_yes(self, tmp_path):
@@ -1967,11 +2140,11 @@ class TestSelectionFeedbackRobustness:
             with selection_log_module.rotation_lock(log_path) as got:
                 competing.append((label, got))
 
-        real_find = selection_log_module.find_selection
+        real_resolve = selection_log_module.resolve_selection
 
-        def probing_find(*args, **kwargs):
+        def probing_resolve(*args, **kwargs):
             probe("verify" if kwargs.get("selection_id") else "resolve")
-            return real_find(*args, **kwargs)
+            return real_resolve(*args, **kwargs)
 
         real_write = selection_cmd._write_label
 
@@ -1979,7 +2152,7 @@ class TestSelectionFeedbackRobustness:
             probe("append")
             return real_write(log, **fields)
 
-        monkeypatch.setattr(selection_cmd, "find_selection", probing_find)
+        monkeypatch.setattr(selection_cmd, "resolve_selection", probing_resolve)
         monkeypatch.setattr(selection_cmd, "_write_label", probing_write)
         result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected")
         assert result.exit_code == 0, result.output

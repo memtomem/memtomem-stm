@@ -2004,7 +2004,11 @@ def _functions_reaching(
 
     Matched on any MENTION of the name — ``x.log_feedback(...)``,
     ``log_feedback(...)``, and the bare reference in ``emit = x.log_feedback``
-    alike — rather than on call syntax. Calling through an alias is a real
+    alike — rather than on call syntax. An ``import ... as`` alias is followed
+    too: ``from selection_cmd import _write_label as emit`` makes every
+    mention of ``emit`` in that file count as a mention of ``_write_label``,
+    which is the one shape a name-only walk would otherwise let through
+    silently. Calling through an alias is a real
     emitter that a callee-name walk reports as nothing at all, so the guard
     fails closed on the reference instead. That over-approximates (an unrelated
     same-named helper trips it), which is the safe direction: a tripped guard
@@ -2028,19 +2032,31 @@ def _functions_reaching(
                     found.add(child.id)
             return found
 
+        # ``from m import x as y`` / ``import m as y``: within this file, a
+        # mention of the local name is a mention of the original.
+        aliases: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    if alias.asname:
+                        aliases[alias.asname] = alias.name.split(".")[-1]
+
+        def resolve(found: set[str]) -> set[str]:
+            return found | {aliases[name] for name in found if name in aliases}
+
         module_scope = mentions.setdefault((relative, "<module>"), set())
         for statement in tree.body:
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 # The decorators run at import even though the body does not.
                 for decorator in statement.decorator_list:
-                    module_scope |= names_in(decorator)
+                    module_scope |= resolve(names_in(decorator))
             else:
-                module_scope |= names_in(statement)
+                module_scope |= resolve(names_in(statement))
         for scope in ast.walk(tree):
             if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             mentions.setdefault((relative, scope.name), set())
-            mentions[(relative, scope.name)] |= names_in(scope) - {scope.name}
+            mentions[(relative, scope.name)] |= resolve(names_in(scope)) - {scope.name}
     reaching: set[tuple[str, str]] = set()
     frontier = {target}
     while frontier:
@@ -2213,6 +2229,21 @@ def test_adr_0001_call_site_pin_rejects_a_second_emitter(tmp_path) -> None:
     )
     assert ("aliased.py", "emit_by_alias") in _functions_reaching(src, "log_feedback"), (
         "an aliased emitter must be reported; the guard fails closed on the reference"
+    )
+
+    # (c2) the same hop through an IMPORT alias, which is how a real
+    # request-path module would reach the helper — and the shape a name-only
+    # walk reports as nothing, since neither `log_feedback` nor `_write_label`
+    # is ever spelled at the call.
+    (src / "imported_alias.py").write_text(
+        "from selection_cmd import _write_label as emit\n"
+        "\n"
+        "def request_path(log):\n"
+        "    return emit(log)\n",
+        encoding="utf-8",
+    )
+    assert ("imported_alias.py", "request_path") in _functions_reaching(src, "log_feedback"), (
+        "an import-aliased emitter must be reported"
     )
 
     # (d) an emitter at module level, outside any function.

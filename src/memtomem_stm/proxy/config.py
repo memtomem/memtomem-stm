@@ -2069,9 +2069,18 @@ class ConfigLoadResult:
     error: str | None
     unknown_keys: tuple[str, ...] = ()
     env_error: str | None = None
-    """Set when there is no config FILE and the env-only overlay failed to
-    validate, so ``config`` is a defaults rebuild that matches neither the
-    environment nor any file.
+    """Set when the ``MEMTOMEM_STM_PROXY`` environment is not the one
+    ``config`` reflects. Two shapes, and the second is independent of whether a
+    file exists:
+
+    * there is no config FILE and the env-only overlay failed to validate, so
+      ``config`` is a defaults rebuild matching neither the environment nor
+      any file;
+    * the overlay dropped a bare payload entirely — malformed JSON, or a
+      decoded non-object (see ``EnvOverlayResult.rejected``) — which resolves
+      to an empty fragment indistinguishable from an unset environment. That
+      one is reported with a file present too: the file then decides a config
+      the operator's environment was meant to override.
 
     Separate from ``error`` because the two call for different handling: a
     running server tolerates this and starts on defaults (the historical

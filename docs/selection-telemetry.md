@@ -107,10 +107,12 @@ The command labels only rows it can label honestly. A selection whose
 `schema_version` is unsupported is one offline replay drops outright, so a
 label on it joins nothing; a selection carrying no `ranker_version` would have
 its label filed under a cohort the command invented. Both are refused by name
-(`unusable_record`) and skipped by `--last`. What counts as a line is what
-replay counts, too — strict decoding, the same maximum line length, the active
-file's unterminated tail ignored, and a repeated `selection_id` folded
-last-wins — so the two cannot disagree about which selections exist.
+(`unusable_record`) and skipped by `--last`. What counts as a record is what
+replay counts, too — parsed from raw bytes, the same maximum line length, the
+active file's unterminated tail ignored as a record still being written,
+byte-identical duplicates folded, and a `selection_id` whose copies disagree
+refused, since replay discards that selection outright — so the two cannot
+disagree about which selections exist.
 
 Written by [`mms selection feedback`](cli.md#mms-selection-feedback--label-one-recorded-selection),
 the operator labelling command, and by nothing else. **Nothing on the proxy's

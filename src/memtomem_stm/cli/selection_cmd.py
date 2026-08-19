@@ -31,9 +31,8 @@ from memtomem_stm.proxy.selection_log import (
     APPEND_WRITTEN,
     SelectionTelemetryLog,
     discover_log_files,
-    find_selection,
+    resolve_selection,
     rotation_lock,
-    selection_defect,
 )
 from memtomem_stm.utils import json_out
 from memtomem_stm.utils.fileio import atomic_write_text
@@ -311,7 +310,7 @@ def feedback_command(
                 "log_busy",
                 "the selection log's rotation lock is held; nothing was written — re-run",
             )
-        record = find_selection(
+        record, defect = resolve_selection(
             telemetry_path,
             selection_id=selection_id,
             server=server,
@@ -322,6 +321,19 @@ def feedback_command(
     # that joins to no selection — silently useless to every reader, and
     # indistinguishable from a selection whose own record was dropped by the
     # redaction screen.
+    if record is None and defect is not None:
+        # The row IS in the log and an operator can go look at it; it just
+        # cannot carry a label — an unsupported schema version (offline replay
+        # drops those records outright), no cohort stamp for the label to
+        # inherit, or copies of one id that disagree, which replay resolves by
+        # discarding the selection and marking the run invalid. Each would make
+        # the label the dead weight a mistyped id produces, so each is reported
+        # by name rather than as "not found".
+        _feedback_failure(
+            as_json,
+            "unusable_record",
+            f"the matched selection cannot be labelled ({defect})",
+        )
     if record is None:
         if selection_id is not None:
             _feedback_failure(as_json, "not_found", f"no selection record with id {selection_id}")
@@ -335,26 +347,8 @@ def feedback_command(
             "no_match",
             f"no selection record matches{' ' + scope if scope else ''}",
         )
-    # A row can be present and still not be labellable: an unsupported schema
-    # version, which offline replay drops outright, or no cohort stamp for the
-    # label to inherit, which would file the operator's judgement under a
-    # ranker this process guessed at. A label on either is the dead weight a
-    # mistyped id would have produced. Reported by name rather than as "not
-    # found", because the record IS there and an operator can go look at it.
-    #
-    # A missing ``selection_id`` is one of these defects rather than a code of
-    # its own: an exact-id lookup can only return the row whose id equals the
-    # (non-empty) argument, and ``--last`` skips defective rows, so a separate
-    # "matched record has no id" branch had no way to fire.
     resolved_id = record.get("selection_id")
-    defect = selection_defect(record)
-    if defect is not None or not isinstance(resolved_id, str):
-        _feedback_failure(
-            as_json,
-            "unusable_record",
-            f"the matched selection cannot be labelled ({defect or 'no selection_id'}); "
-            "label it by id against a record offline replay can load",
-        )
+    assert isinstance(resolved_id, str) and resolved_id  # resolve_selection screens this
 
     # Identify the row BEFORE writing, and — when a human is at the terminal —
     # let them stop it. ``--last`` is an inference; the operator is the check on
@@ -397,17 +391,27 @@ def feedback_command(
                 "log_busy",
                 "the selection log's rotation lock is held; nothing was written — re-run",
             )
-        if (
-            find_selection(
-                telemetry_path, selection_id=resolved_id, include_rotated=include_rotated
-            )
-            is None
-        ):
+        verified, _ = resolve_selection(
+            telemetry_path, selection_id=resolved_id, include_rotated=include_rotated
+        )
+        if verified is None:
             _feedback_failure(
                 as_json,
                 "log_rotated",
                 f"selection {resolved_id} is no longer in the log (rotated out between "
                 "resolution and append); nothing was written",
+            )
+        if _label_identity(verified) != _label_identity(record):
+            # Still present, but no longer the row that was confirmed: a copy
+            # of this id can land during the confirmation, and the label would
+            # then carry the cohort and trace of a record the operator never
+            # saw. Refused rather than reconciled — which of the two the
+            # judgement was about is not something this command can decide.
+            _feedback_failure(
+                as_json,
+                "selection_changed",
+                f"selection {resolved_id} changed between confirmation and append; "
+                "nothing was written — re-run to see the current record",
             )
         status = _write_label(
             log,
@@ -492,14 +496,33 @@ def _write_label(log: SelectionTelemetryLog, **fields: Any) -> str:
     return log.log_feedback(**fields)
 
 
-def _human_at_the_terminal() -> bool:
-    """Whether anyone can answer a prompt.
+def _label_identity(record: dict[str, Any]) -> tuple[Any, ...]:
+    """The fields of a selection a label is answerable to.
 
-    Named rather than inlined because it decides whether the confirmation
-    exists at all: in a pipe or CI there is nobody to ask, and prompting would
-    hang the caller instead of protecting it.
+    ``ranker_version`` and ``trace_id`` because the label copies them, and
+    ``server`` / ``selected_tool`` because they are what the operator was shown
+    and agreed to. ``ts`` is deliberately out: two byte-identical resolves are
+    the same row, and a differing timestamp alone would already have made the
+    copies conflict.
     """
-    return sys.stdin.isatty()
+    return (
+        record.get("ranker_version"),
+        record.get("trace_id"),
+        record.get("server"),
+        record.get("selected_tool"),
+    )
+
+
+def _human_at_the_terminal() -> bool:
+    """Whether anyone can answer a prompt — and see what it asks about.
+
+    Both streams, not just stdin: with stdout piped (``mms ... | jq``) the
+    resolved selection and the question itself vanish into the pipe while the
+    command blocks on an answer nobody was shown. A confirmation the operator
+    cannot read is not the check that ``--last`` leans on, so that case takes
+    the same ``--yes``-or-refuse path as a non-interactive stdin.
+    """
+    return sys.stdin.isatty() and sys.stdout.isatty()
 
 
 def _tri_state(positive: bool, negative: bool, name: str) -> bool | None:

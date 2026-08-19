@@ -46,15 +46,22 @@ changes inline only. See the deprecation policy in
   honestly are labellable: an unsupported `schema_version` (offline replay
   drops those records outright) or a missing `ranker_version` (the label would
   be filed under a cohort the command invented) exits 1 (`unusable_record`) and
-  is skipped by `--last`. Resolution otherwise counts lines exactly as the
-  replay loader does — strict decoding, so a record truncated mid-character is
-  skipped rather than repaired into a different string than the one replay
-  reads; the same maximum line length; the active file's unterminated tail
-  ignored, since that is a record still being written; and a repeated
-  `selection_id` folded last-wins — so the two cannot disagree about which
-  selections exist. An append that finds an unterminated last line now writes
-  its own leading newline, so a crash mid-record cannot fuse the next record
-  onto the fragment and have it reported as written. Resolution
+  is skipped by `--last`. Resolution otherwise counts records exactly as
+  the replay loader does — parsed from raw bytes, so a record truncated
+  mid-character is skipped rather than repaired into a different string than
+  the one replay reads; the same maximum line length; the active file's
+  unterminated tail ignored, since that is a record still being written;
+  byte-identical duplicates folded; and a `selection_id` whose copies disagree
+  refused (`unusable_record`), because replay discards that selection outright
+  and marks the run invalid — so the two cannot disagree about which selections
+  exist. The target is re-verified by identity, not mere presence, after the
+  confirmation: a copy landing in that window exits 1 (`selection_changed`)
+  rather than labelling a record the operator never saw. An append that finds
+  an unterminated last line now writes its own leading newline, so a crash
+  mid-record cannot fuse the next record onto the fragment and have it reported
+  as written. `--last` refuses without `--yes` when *either* stream is not a
+  terminal: with stdout piped the prompt and the resolved selection go into the
+  pipe while the command waits on an answer nobody was shown. Resolution
   runs under an advisory rotation lock and the target is re-verified under it
   after confirmation, so a rotation can neither rename segments mid-scan nor
   evict the agreed selection before the write (`log_rotated` / `log_busy`,
