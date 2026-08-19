@@ -236,22 +236,55 @@ def feedback_command(
             "and/or --operator-override/--no-operator-override"
         )
 
-    config_path = resolve_cli_config_path(config_path).path
-    cfg_path = Path(config_path)
-    cfg = ProxyConfig.load_from_file(
-        cfg_path,
-        env_overrides=collect_proxy_env_overrides(),
-        missing_ok=True,
-    ) or ProxyConfig(config_path=cfg_path)
-    telemetry_path = (
-        log_path.expanduser() if log_path is not None else cfg.selection_telemetry.path.expanduser()
-    )
+    if log_path is not None:
+        # An explicit path decides the target outright, so the config is not
+        # consulted — and cannot fail the command for a file it would not have
+        # read anything from.
+        telemetry_path = log_path.expanduser()
+    else:
+        cfg_path = Path(resolve_cli_config_path(config_path).path)
+        loaded = ProxyConfig.load_from_file_with_status(
+            cfg_path,
+            env_overrides=collect_proxy_env_overrides(),
+            missing_ok=True,
+        )
+        if loaded.error is not None:
+            # Falling back to defaults here would silently label a DIFFERENT
+            # log than the operator configured — a writing command must not
+            # guess which file it is annotating.
+            _feedback_failure(
+                as_json,
+                "config_invalid",
+                f"cannot read {cfg_path}: {loaded.error}",
+            )
+        cfg = loaded.config or ProxyConfig(config_path=cfg_path)
+        telemetry_path = cfg.selection_telemetry.path.expanduser()
     # Presence is decided by the whole log, not the active file alone: a crash
     # between ``active → .1`` and the next append leaves the history entirely in
     # backups, and refusing to label it would contradict the default search.
     include_rotated = not active_only
-    if not discover_log_files(telemetry_path, include_rotated=include_rotated):
+    try:
+        segments = discover_log_files(telemetry_path, include_rotated=include_rotated)
+    except OSError as exc:
+        # Listing the directory can fail on its own; "not found" would be the
+        # wrong diagnosis, and a traceback is not something a scripted caller
+        # can branch on.
+        _feedback_failure(
+            as_json, "log_unreadable", f"cannot list the log directory for {telemetry_path}: {exc}"
+        )
+    if not segments:
         _feedback_failure(as_json, "no_log", f"selection log not found: {telemetry_path}")
+    # A segment this process cannot read would be skipped by the scan, turning
+    # "I could not look there" into "no such selection" — a wrong answer that
+    # reads like a right one.
+    for segment in segments:
+        try:
+            with segment.open("rb"):
+                pass
+        except OSError as exc:
+            _feedback_failure(
+                as_json, "log_unreadable", f"cannot read log segment {segment.name}: {exc}"
+            )
 
     # Resolve under the rotation lock. Rotation renames every segment at once,
     # so an unguarded scan can miss the newest selections — they move into a
@@ -263,7 +296,7 @@ def feedback_command(
             _feedback_failure(
                 as_json,
                 "log_busy",
-                "the selection log is being rotated; nothing was written — re-run",
+                "the selection log's rotation lock is held; nothing was written — re-run",
             )
         record = find_selection(
             telemetry_path,
@@ -336,7 +369,7 @@ def feedback_command(
             _feedback_failure(
                 as_json,
                 "log_busy",
-                "the selection log is being rotated; nothing was written — re-run",
+                "the selection log's rotation lock is held; nothing was written — re-run",
             )
         if (
             find_selection(
@@ -347,8 +380,8 @@ def feedback_command(
             _feedback_failure(
                 as_json,
                 "log_rotated",
-                f"selection {resolved_id} is no longer in the log (rotated out while "
-                "confirming); nothing was written",
+                f"selection {resolved_id} is no longer in the log (rotated out between "
+                "resolution and append); nothing was written",
             )
         status = _write_label(
             log,

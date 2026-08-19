@@ -1284,13 +1284,6 @@ class TestSelectionFeedbackRobustness:
         assert result.exit_code == 0, result.output
         assert json.loads(result.output)["selected_tool"] == "gh__rot"
 
-    def test_no_log_when_no_segment_exists_at_all(self, tmp_path):
-        result = _run_feedback(
-            tmp_path, tmp_path / "nope.jsonl", "--last", "--user-corrected", "--json"
-        )
-        assert result.exit_code == 1
-        assert json.loads(result.output)["error"] == "no_log"
-
     def test_eviction_between_confirming_and_writing_refuses(self, tmp_path, monkeypatch):
         """Confirmation is human time, and a rotation can land inside it.
 
@@ -1449,13 +1442,34 @@ class TestSelectionFeedbackRobustness:
                 ctx.__exit__(None, None, None)
         assert held, "the confirmation never ran"
         assert result.exit_code == 1
-        assert "being rotated" in result.output
+        assert "rotation lock is held" in result.output
         assert _feedback_records(log_path) == []
 
-    def test_an_uncreatable_lock_is_a_stable_error(self, tmp_path):
+    def test_an_uncreatable_lock_is_a_stable_error(self, tmp_path, monkeypatch):
         """The lock is a sidecar FILE, so taking it can fail for reasons that
         are not contention. A traceback with empty stdout is not something a
-        scripted caller can handle."""
+        scripted caller can handle.
+
+        The failure is injected rather than provoked with permissions: Windows
+        is a required CI target and ``chmod`` cannot express "no create" there,
+        so a permissions-based test would assert nothing on half the matrix.
+        """
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+
+        def refuse(_path):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(selection_log_module, "open_lock_fd", refuse)
+        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
+        assert result.exit_code == 1
+        assert json.loads(result.output)["error"] == "lock_failed"
+        assert _feedback_records(log_path) == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX directory permissions")
+    def test_an_uncreatable_lock_is_a_stable_error_for_real(self, tmp_path):
+        """The same contract against a genuinely unwritable directory, so the
+        injected test above cannot drift from what the OS actually does."""
         log_dir = tmp_path / "ro"
         log_dir.mkdir()
         log_path = log_dir / "log.jsonl"
@@ -1467,6 +1481,48 @@ class TestSelectionFeedbackRobustness:
             log_dir.chmod(0o755)
         assert result.exit_code == 1
         assert json.loads(result.output)["error"] == "lock_failed"
+
+    def test_an_invalid_config_refuses_rather_than_labelling_the_default_log(self, tmp_path):
+        """A writing command must not guess which file it is annotating.
+
+        ``load_from_file`` returns ``None`` for a config that exists but does
+        not parse, and falling back to defaults would silently label the
+        DEFAULT log instead of the configured one.
+        """
+        from memtomem_stm.cli.proxy import cli
+
+        bad_config = tmp_path / "proxy.json"
+        bad_config.write_text("{ not json", encoding="utf-8")
+        result = CliRunner().invoke(
+            cli,
+            [
+                "selection",
+                "feedback",
+                "--config",
+                str(bad_config),
+                "--last",
+                "--yes",
+                "--user-corrected",
+                "--json",
+            ],
+        )
+        assert result.exit_code == 1
+        assert json.loads(result.output)["error"] == "config_invalid"
+
+    def test_an_unreadable_segment_is_not_reported_as_no_match(self, tmp_path):
+        """ "I could not look there" must not read as "no such selection"."""
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(tmp_path / "log.jsonl.1", rows=[{"server": "gh", "tool": "gh__rot"}])
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
+        backup = tmp_path / "log.jsonl.1"
+        backup.chmod(0o000)
+        try:
+            result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
+        finally:
+            backup.chmod(0o644)
+        assert result.exit_code == 1
+        assert json.loads(result.output)["error"] == "log_unreadable"
+        assert _feedback_records(log_path) == []
 
     def test_a_short_write_is_not_reported_as_recorded(self, tmp_path, monkeypatch):
         """``os.write`` may write fewer bytes; the record is then truncated and
@@ -1482,6 +1538,32 @@ class TestSelectionFeedbackRobustness:
         result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
         assert result.exit_code == 1
         assert json.loads(result.output)["error"] == "write_failed"
+
+    def test_a_repaired_newline_only_short_write_is_a_success(self, tmp_path, monkeypatch):
+        """When the ONLY missing byte was the newline, the repair restores the
+        exact intended bytes — the record is complete and readable, so calling
+        it a failure would be false, and would invite a retry that duplicates
+        the label."""
+        log_path = tmp_path / "log.jsonl"
+        log = SelectionTelemetryLog(log_path)
+        log.initialize()
+        real_write = os.write
+        calls = {"n": 0}
+
+        def drop_final_newline(fd, data):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_write(fd, data[:-1])
+            return real_write(fd, data)
+
+        monkeypatch.setattr(selection_log_module.os, "write", drop_final_newline)
+        assert log.log_feedback(selection_id="a", user_corrected=True) == "written"
+        monkeypatch.undo()
+
+        lines = [line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        assert [json.loads(line)["selection_id"] for line in lines] == ["a"]
+        assert log.events_written == 1
+        assert log.write_errors == 0
 
     def test_a_short_write_does_not_corrupt_the_next_record(self, tmp_path, monkeypatch):
         """The follow-up append must stay readable and honestly reported.

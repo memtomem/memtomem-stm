@@ -730,9 +730,11 @@ exit 1 and emit `{"action": "selection-feedback", "ok": false, "error":
 | `no_log` | no readable log segment at the resolved path — the active file *and* every rotated backup are absent |
 | `not_found` / `no_match` | the selector resolved to nothing, checked *before* writing, so a typo never appends a label that joins to no selection |
 | `malformed_record` | the matched record carries no `selection_id` (reachable only on a hand-edited log) |
-| `log_rotated` | the resolved selection was rotated out of the log while it was being confirmed; nothing was written |
-| `log_busy` | the log was being rotated and the lock could not be taken; nothing was written — re-run |
+| `log_rotated` | the resolved selection left the log between resolution and append; nothing was written |
+| `log_busy` | the rotation lock is held (by a rotating writer or another labelling run) and could not be taken; nothing was written — re-run |
 | `lock_failed` | the rotation lock file beside the log could not be created (e.g. a writable log in a directory this user cannot write); nothing was written |
+| `log_unreadable` | the log directory could not be listed, or a segment could not be opened — reported instead of `no_match`, since "I could not look there" is not "no such selection" |
+| `config_invalid` | the config file exists but does not parse, so the configured log path is unknown; the command refuses rather than labelling the default log |
 | `confirmation_required` | `--last` used non-interactively (or with `--json`) without `--yes`; exit 2, matching the CLI-wide rule that a formatting flag must not authorize a write |
 | `write_failed` / `write_redacted` | the label did not reach disk — the sink swallows write faults so a telemetry problem cannot break a proxied call, so the command checks the append outcome instead of assuming it |
 

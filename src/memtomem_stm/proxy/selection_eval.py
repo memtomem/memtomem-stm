@@ -531,13 +531,6 @@ def _recommend_variant(
     }
 
 
-def _discover_log_files(path: Path, include_rotated: bool) -> list[Path]:
-    """Which files make up the log — owned by ``selection_log`` since the
-    labelling command needs the same answer, and two copies of "oldest first"
-    would be free to drift."""
-    return discover_log_files(path, include_rotated=include_rotated)
-
-
 def _read_telemetry(
     path: Path, include_rotated: bool
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -545,7 +538,7 @@ def _read_telemetry(
     files_report: list[dict[str, Any]] = []
     quality: Counter[str] = Counter()
     warnings: list[str] = []
-    files_to_read = _discover_log_files(path, include_rotated)
+    files_to_read = discover_log_files(path, include_rotated=include_rotated)
     for log_path in files_to_read:
         try:
             size = log_path.stat().st_size

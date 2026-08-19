@@ -444,7 +444,15 @@ class SelectionTelemetryLog:
                         # write succeeded — would be told its record survived
                         # while readers reject the fused line. One byte turns a
                         # cascading corruption into a single skipped line.
-                        self._terminate_fragment(fd, data, written)
+                        #
+                        # When the ONLY missing byte was that newline, the
+                        # repair restores the exact intended bytes: the record
+                        # is complete and readable, so reporting a failure
+                        # would be false — and would invite a retry that
+                        # duplicates the label.
+                        repaired = self._terminate_fragment(fd, data, written)
+                        if repaired and written == len(data) - 1:
+                            written = len(data)
                 finally:
                     os.close(fd)
                 if written != len(data):
@@ -474,18 +482,28 @@ class SelectionTelemetryLog:
         return APPEND_WRITTEN
 
     @staticmethod
-    def _terminate_fragment(fd: int, data: bytes, written: int) -> None:
-        """Best-effort newline after a short write, to restore JSONL framing.
+    def _terminate_fragment(fd: int, data: bytes, written: int) -> bool:
+        """Best-effort newline after a short write; ``True`` if one was added.
 
         Failing here costs what the missing newline would have cost anyway, so
         it must never mask the short write that caused it.
+
+        This is a second write, and it is NOT serialized against other
+        processes appending to the same file. A concurrent writer landing
+        between the fragment and this newline fuses the two into one malformed
+        line — but that needs a short write and a second writer at the same
+        instant, and the alternative is a cross-process lock on every append,
+        paid by every proxied call to insure against an intersection of two
+        rare faults. Readers count the fused line as malformed rather than
+        misparsing it.
         """
         if written <= 0 or data[:written].endswith(b"\n"):
-            return
+            return False
         try:
-            os.write(fd, b"\n")
+            return os.write(fd, b"\n") == 1
         except OSError:
             logger.debug("Could not terminate a short-written telemetry record", exc_info=True)
+            return False
 
     def _rotate_if_needed_locked(self) -> bool:
         """Size-based rotation; returns whether the caller may now append.
@@ -681,14 +699,19 @@ def aggregate_selection_log(path: Path | str, *, top_n: int = 10) -> dict[str, A
     latencies: list[float] = []
 
     try:
-        with path.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                if not line.strip():
+        # Binary, decoded per line: a record truncated mid-character (a short
+        # write, or a crash) makes the STREAM undecodable, and a text-mode read
+        # would raise out of the iterator — past the per-line handler below and
+        # out of an observability path this function promises never to raise
+        # from. ``_read_telemetry`` already treats those bytes as malformed.
+        with path.open("rb") as fh:
+            for raw_line in fh:
+                if not raw_line.strip():
                     continue
                 result["total_lines"] += 1
                 try:
-                    rec = json.loads(line)
-                except (ValueError, TypeError):
+                    rec = json.loads(raw_line.decode("utf-8"))
+                except (ValueError, TypeError, UnicodeDecodeError):
                     result["malformed"] += 1
                     continue
                 if not isinstance(rec, dict):
