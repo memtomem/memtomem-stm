@@ -41,6 +41,13 @@ failures produce orphan halves.
 
 ## Schema v1
 
+Every record is preceded by a blank line: the writer emits the newline in the
+same append as the record, so a record frames itself atomically whatever
+preceded it — including a fragment left by a crashed or short write, which the
+next record's leading newline closes. Blank lines carry no meaning and both
+built-in readers skip them without counting them; a consumer parsing the file
+itself must do the same.
+
 One JSON object per line, keys sorted, every record self-describing via
 `schema_version` (bumped on any shape change — the exact key sets are pinned
 by `tests/test_selection_log.py`) and `ranker_version`, a per-call cohort
@@ -292,7 +299,8 @@ it reports two views:
 
 Rotated backups (`log.1` …) are noted but not parsed — the summary covers the
 active log only. For the full history, or any join against `proxy_metrics.db`,
-stream the JSONL directly (see [Replay joins](#replay-joins)).
+stream the JSONL directly (see [Replay joins](#replay-joins)) — **skipping
+blank lines**, as both built-in readers do.
 
 For deterministic corpus replay, rotated-log joins, data-quality checks, and
 risk-weight evaluation, use [`mms selection replay`](selection-evaluation.md).

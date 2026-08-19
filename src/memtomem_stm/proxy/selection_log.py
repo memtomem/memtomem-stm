@@ -10,7 +10,10 @@ the ones advertised.
 
 Schema v1 — three event types, every record self-describing via
 ``schema_version`` + ``ranker_version``; one JSON object per line, keys
-sorted, so a replay harness can stream-parse and diff runs:
+sorted, so a replay harness can stream-parse and diff runs. Each record is
+preceded by a blank line — the newline ships in the same append as the record
+so it frames itself atomically — and blank lines are skipped, uncounted, by
+every reader here:
 
 ``selection``
     ``selection_id`` (joins the paired ``execution`` row), ``trace_id``
