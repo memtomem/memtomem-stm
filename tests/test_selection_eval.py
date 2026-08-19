@@ -407,9 +407,13 @@ def test_unusable_score_field_skips_parity_without_raising(
 
     report = evaluate_selection(telemetry_path=log)
 
-    assert json.loads(report.to_json())["status"] == "ok", case
-    # The value is unusable, so parity is not checked — not silently passed.
-    assert report.data["data_quality"]["parity_mismatches"] == 0
+    assert json.loads(report.to_json())["status"] == "invalid", case
+    quality = report.data["data_quality"]
+    assert quality["unusable_numbers"] == 1
+    # Parity was not checked, and its denominator says so — `parity_mismatches:
+    # 0` must not read as a clean bill of health.
+    assert quality["parity_mismatches"] == 0
+    assert quality["parity_checked"] == 1
     # The entry is otherwise well-formed, so it still ranks.
     assert report.data["production"]["coverage"]["rankable_selections"] == 1
     assert report.data["production"]["coverage"]["selected_rank_known"] == 1
@@ -430,7 +434,8 @@ def test_unusable_execution_field_is_dropped_from_its_sample(
     report = evaluate_selection(telemetry_path=log)
 
     # A non-finite value used to build a report that then failed to serialize.
-    assert json.loads(report.to_json())["status"] == "ok", case
+    assert json.loads(report.to_json())["status"] == "invalid", case
+    assert report.data["data_quality"]["unusable_numbers"] == 1
     production = report.data["production"]
     assert production["execution"]["success_rate"]["numerator"] == 1
     counts = {
@@ -441,6 +446,40 @@ def test_unusable_execution_field_is_dropped_from_its_sample(
     # Dropped from its own sample only; the other two are unaffected.
     assert counts[field] == 0
     assert [name for name, count in counts.items() if count == 0] == [field]
+
+
+def test_finite_values_whose_aggregate_overflows_report_no_value(tmp_path: Path) -> None:
+    """Guarding the inputs does not bound the output (#856)."""
+    log = tmp_path / "selection.jsonl"
+    records: list[dict] = []
+    for sid in ("sel-1", "sel-2"):
+        execution = _execution(sid)
+        execution["cost"] = 1e308
+        execution["latency_ms"] = 1e308
+        records += [_selection(sid), execution]
+    _write_jsonl(log, records)
+
+    report = evaluate_selection(telemetry_path=log)
+
+    # Each value is finite and admitted; their sum is not.
+    payload = json.loads(report.to_json())
+    assert payload["status"] == "ok"
+    assert report.data["data_quality"]["unusable_numbers"] == 0
+    execution_metrics = report.data["production"]["execution"]
+    assert execution_metrics["cost_mean"] == {"value": None, "denominator": 2}
+    assert execution_metrics["latency_ms"]["count"] == 2
+    assert execution_metrics["latency_ms"]["p50"] == 1e308
+
+
+def test_oversized_graph_risk_score_in_a_dataset_is_a_clean_error(tmp_path: Path) -> None:
+    """The dataset path reports its own errors; it must not raise OverflowError."""
+    dataset = json.loads(builtin_dataset_path().read_text(encoding="utf-8"))
+    dataset["cases"][0]["candidates"][0].setdefault("signals", {})["graph_risk_score"] = 10**400
+    path = tmp_path / "dataset.json"
+    path.write_text(json.dumps(dataset), encoding="utf-8")
+
+    with pytest.raises(SelectionEvaluationError, match="graph_risk_score must be in"):
+        load_selection_dataset(path)
 
 
 def test_unknown_future_ranker_skips_v1_score_parity(tmp_path: Path) -> None:

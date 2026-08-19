@@ -6,7 +6,7 @@ import math
 
 
 def safe_float(value: object, default: float = 0.0, *, reject_nonfinite: bool = True) -> float:
-    """Coerce ``value`` to a finite float, falling back to ``default`` on failure.
+    """Coerce ``value`` to a float, falling back to ``default`` on failure.
 
     Defends against malformed LLM output and untrusted external JSON. Unlike
     raw ``float()``:
@@ -17,6 +17,10 @@ def safe_float(value: object, default: float = 0.0, *, reject_nonfinite: bool = 
     - Rejects ``nan``/``inf``/``-inf`` when ``reject_nonfinite=True`` (default),
       which plain ``float()`` accepts silently and propagates through
       comparison/sort logic as undefined behavior.
+
+    The result is not guaranteed finite: ``reject_nonfinite=False`` opts into
+    non-finite results, and ``default`` is returned verbatim — a caller may
+    pass ``nan`` deliberately as a "skip this item" sentinel it checks itself.
 
     Coerces permissively: a numeric string or a ``bool`` converts. Use
     :func:`finite_number` where the caller has already decided that only a real

@@ -245,29 +245,45 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
-- **`mms selection replay` no longer crashes on an oversized or non-finite
-  number** (#857, closes #856). Six fields on an admitted record were guarded
-  by a type check and then coerced with `float()`, which the type does not
-  make safe: `relevance_score`, `risk_penalty` and `final_score` in the parity
-  block, and `latency_ms`, `retry_count` and `cost` on the execution record.
-  A JSON integer literal is unbounded, so a large enough one raised
-  `OverflowError`; and `json.loads` accepts the `NaN` literal, so a non-finite
-  value passed the type check, entered the sample, and only failed at the end
-  when the report was serialized. All six now go through one predicate,
-  `finite_number`, which is the definition `finite_risk_score` (#852) already
-  used for graph scores, lifted to `utils.numeric` and shared. An unusable
-  value is skipped exactly as an absent one always was — the sibling fields,
-  the surrounding records, and the rest of the report are unaffected.
+- **`mms selection replay` no longer crashes on, or silently trusts, an
+  unreadable number** (#857, closes #856). Six fields on an admitted record
+  were guarded by a type check and then coerced with `float()`, which the type
+  does not make safe: `relevance_score`, `risk_penalty` and `final_score` in
+  the parity block, and `latency_ms`, `retry_count` and `cost` on the
+  execution record. A JSON integer literal is unbounded, so a large enough one
+  raised `OverflowError`; and `json.loads` accepts the `NaN` literal, so a
+  non-finite value passed the type check and travelled on. All six now go
+  through one predicate, `finite_number` — the definition `finite_risk_score`
+  (#852) already used for graph scores, lifted to `utils.numeric` and shared —
+  and every value it rejects is counted in a new `data_quality.unusable_numbers`.
 
-  **Behavior change**, as measured against the previous release. *A traceback
-  becomes a report*: an oversized integer in any of the six fields. *A report
-  that could not be serialized now serializes*: a `NaN` in `latency_ms`,
-  `retry_count` or `cost` used to build a report whose `--json` output failed
-  with `Out of range float values are not JSON compliant`, and whose plain-text
-  mean was non-finite; the value is now dropped from its own sample, so that
-  field's count falls by one and its mean is computed from the usable values.
-  *Unchanged*: a `NaN` in one of the three score fields, where the parity
-  comparison already declined to flag it and nothing was stored.
+  Two further gaps of the same shape are closed with it. Guarding the inputs
+  does not bound the outputs, so `_mean` and `_percentile` now report `None`
+  rather than a non-finite aggregate: two admitted values of `1e308` are each
+  finite and sum to `inf`. And `parity_mismatches` ships beside a new
+  `parity_checked` denominator, because `0` mismatches otherwise reads as a
+  clean bill of health even when nothing was checkable.
+
+  **Behavior change**, as measured against the previous release across
+  thirteen inputs. *A traceback becomes a report*: an oversized integer in any
+  of the six fields. *A silent or unserializable result becomes an `invalid`
+  report*, so the command exits 1 where it exited 0 — a `NaN` in one of the
+  three score fields used to leave a `status: ok` report whose
+  `parity_mismatches: 0` meant "never checked", and a `NaN` in one of the
+  three execution fields used to build a report whose aggregate was non-finite
+  and whose `--json` failed with `Out of range float values are not JSON
+  compliant`. *An aggregate that overflows finite inputs reports no value*:
+  the metric's `value` is `None` beside its unchanged denominator, and the
+  report stays `status: ok` — nothing was unreadable, only unrepresentable.
+
+  Two sibling readers are fixed with the same predicate. `mms selection stats`
+  (`aggregate_selection_log`) dropped its `latency_ms` sample through the
+  identical pattern, raising `OverflowError` out of a path documented to treat
+  an unreadable file like an absent one, and pooling `NaN` into its
+  percentiles. And a custom `--dataset` carrying an oversized
+  `graph_risk_score` raised `OverflowError` past the CLI's error boundary
+  instead of the `SelectionEvaluationError` every other invalid field in that
+  file produces.
 
   Also fixes `safe_float`, the sibling helper this shares a module with: it
   documented itself as defending against untrusted external JSON while an

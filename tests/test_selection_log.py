@@ -694,6 +694,22 @@ def _exec(**kw) -> dict:
 
 
 class TestAggregateSelectionLog:
+    @pytest.mark.parametrize(
+        ("latency", "case"),
+        [(10**400, "oversized int"), (float("nan"), "NaN"), (float("inf"), "inf")],
+    )
+    def test_unusable_latency_is_dropped_not_raised(self, tmp_path, latency, case):
+        """This is an observability path: a hand-edited file must not break it."""
+        p = tmp_path / "log.jsonl"
+        _write_lines(p, [_exec(latency_ms=latency), _exec(latency_ms=20.0)])
+
+        agg = aggregate_selection_log(p)
+
+        # Both rows still count as executions; only the sample drops one.
+        assert agg["events"]["execution"] == 2, case
+        assert agg["outcomes"]["ok"] == 2
+        assert agg["latency_ms"] == {"count": 1, "p50": 20.0, "p95": 20.0, "p99": 20.0}
+
     def test_absent_file_returns_zeroed_shape(self, tmp_path):
         agg = aggregate_selection_log(tmp_path / "nope.jsonl")
         assert agg["exists"] is False

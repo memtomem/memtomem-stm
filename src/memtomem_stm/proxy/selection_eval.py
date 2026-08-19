@@ -92,8 +92,20 @@ def _ratio(numerator: int, denominator: int) -> dict[str, int | float | None]:
     }
 
 
+def _finite(value: float) -> float | None:
+    """A rounded aggregate, or ``None`` when it is not finite.
+
+    Guarding the inputs does not bound the output: two admitted values of
+    ``1e308`` are each finite and sum to ``inf``, which would fail strict JSON
+    serialization exactly as an admitted ``NaN`` used to (#856). ``None`` is
+    the same answer the empty case already gives — no usable aggregate — and
+    the denominator beside it still reports how many samples there were.
+    """
+    return round(value, 6) if math.isfinite(value) else None
+
+
 def _mean(values: list[float]) -> float | None:
-    return round(sum(values) / len(values), 6) if values else None
+    return _finite(sum(values) / len(values)) if values else None
 
 
 def _percentile(values: list[float], percentile: float) -> float | None:
@@ -101,13 +113,13 @@ def _percentile(values: list[float], percentile: float) -> float | None:
         return None
     ordered = sorted(values)
     if len(ordered) == 1:
-        return round(ordered[0], 6)
+        return _finite(ordered[0])
     rank = (len(ordered) - 1) * percentile / 100.0
     low, high = math.floor(rank), math.ceil(rank)
     if low == high:
-        return round(ordered[low], 6)
+        return _finite(ordered[low])
     value = ordered[low] + (ordered[high] - ordered[low]) * (rank - low)
-    return round(value, 6)
+    return _finite(value)
 
 
 def _dataset_bytes(path: Path) -> bytes:
@@ -194,12 +206,8 @@ def load_selection_dataset(path: Path | str | None = None) -> dict[str, Any]:
                 raise SelectionEvaluationError(
                     f"{case_id}/{candidate_id}: task_success requires safe relevant allow"
                 )
-            graph_score = signals.get("graph_risk_score", 0.0)
-            if (
-                not isinstance(graph_score, (int, float))
-                or isinstance(graph_score, bool)
-                or not 0.0 <= float(graph_score) <= 1.0
-            ):
+            graph_score = finite_number(signals.get("graph_risk_score", 0.0))
+            if graph_score is None or not 0.0 <= graph_score <= 1.0:
                 raise SelectionEvaluationError(
                     f"{case_id}/{candidate_id}: graph_risk_score must be in [0,1]"
                 )
@@ -621,6 +629,7 @@ def _observed_telemetry(records: list[dict[str, Any]], quality: dict[str, Any]) 
     selected_ranks: list[int] = []
     rankable = selected_at_1 = selected_at_3 = selected_at_5 = 0
     parity_mismatches = invariant_violations = ranker_mismatches = 0
+    parity_checked = unusable_numbers = 0
     latencies: list[float] = []
     ok = errors = cache_hit = cache_miss = cache_unknown = 0
     retry_values: list[float] = []
@@ -674,12 +683,20 @@ def _observed_telemetry(records: list[dict[str, Any]], quality: dict[str, Any]) 
                     relevance = finite_number(entry.get("relevance_score"))
                     penalty = finite_number(entry.get("risk_penalty", 0.0))
                     final = finite_number(entry.get("final_score"))
+                    scores = (relevance, penalty, final)
+                    unusable_numbers += sum(
+                        score is None and entry.get(name) is not None
+                        for score, name in zip(
+                            scores, ("relevance_score", "risk_penalty", "final_score")
+                        )
+                    )
                     if (
                         ranker in PARITY_RANKER_VERSIONS
                         and relevance is not None
                         and penalty is not None
                         and final is not None
                     ):
+                        parity_checked += 1
                         expected = round(relevance * (1.0 - penalty), 6)
                         if abs(expected - final) > 1e-6:
                             parity_mismatches += 1
@@ -701,6 +718,7 @@ def _observed_telemetry(records: list[dict[str, Any]], quality: dict[str, Any]) 
             else:
                 errors += 1
             latency = finite_number(execution.get("latency_ms"))
+            unusable_numbers += latency is None and execution.get("latency_ms") is not None
             if latency is not None:
                 latencies.append(latency)
             cache = execution.get("cache_hit")
@@ -712,6 +730,8 @@ def _observed_telemetry(records: list[dict[str, Any]], quality: dict[str, Any]) 
                 cache_unknown += 1
             retry = finite_number(execution.get("retry_count"))
             cost = finite_number(execution.get("cost"))
+            unusable_numbers += retry is None and execution.get("retry_count") is not None
+            unusable_numbers += cost is None and execution.get("cost") is not None
             if retry is not None:
                 retry_values.append(retry)
             if cost is not None:
@@ -728,10 +748,14 @@ def _observed_telemetry(records: list[dict[str, Any]], quality: dict[str, Any]) 
             override_den += 1
             overrides += int(folded["operator_override"] is True)
 
-    if invariant_violations or parity_mismatches or ranker_mismatches:
+    if invariant_violations or parity_mismatches or ranker_mismatches or unusable_numbers:
         quality["status"] = "invalid"
     quality["invariant_violations"] = invariant_violations
     quality["parity_mismatches"] = parity_mismatches
+    # `parity_mismatches: 0` alone reads as a clean bill of health even when
+    # nothing was checkable, so the denominator ships beside it (#856).
+    quality["parity_checked"] = parity_checked
+    quality["unusable_numbers"] = unusable_numbers
     quality["ranker_mismatches"] = ranker_mismatches
     attributable_cache = cache_hit + cache_miss
     return {
