@@ -1199,7 +1199,7 @@ class TestResolverAgreesWithReplay:
     layouts differ only by the property under test."""
 
     def test_an_oversized_line_is_skipped_by_both(self, tmp_path):
-        from memtomem_stm.proxy.selection_eval import MAX_LINE_BYTES
+        from memtomem_stm.proxy.selection_log import MAX_LINE_BYTES
 
         log_path = tmp_path / "log.jsonl"
         padding = "x" * MAX_LINE_BYTES
@@ -1363,6 +1363,47 @@ class TestResolverAgreesWithReplay:
         selection_eval._observed_telemetry(records, quality)
         assert quality["conflicting_records"] == 0 and quality["duplicate_records"] == 1
 
+    def test_a_line_of_exactly_the_maximum_length_is_read_by_both(self, tmp_path):
+        """The cut is measured on the same bytes as replay measures.
+
+        Counting the newline on one side and not the other makes a record of
+        exactly the limit exist for one reader and not the other — the whole
+        class of divergence this shares a loader to prevent.
+        """
+        from memtomem_stm.proxy import selection_eval
+        from memtomem_stm.proxy.selection_log import MAX_LINE_BYTES
+
+        log_path = tmp_path / "log.jsonl"
+        row = _sel(selection_id="edge", pad="")
+        # Grow the padding until the line is exactly at the limit — computing
+        # it from the serialized length is one arithmetic slip away from
+        # testing a line that is merely near the boundary.
+        row["pad"] = "x" * (MAX_LINE_BYTES - len(json.dumps(row).encode("utf-8")))
+        line = json.dumps(row)
+        assert len(line.encode("utf-8")) == MAX_LINE_BYTES, len(line.encode("utf-8"))
+        log_path.write_bytes(line.encode("utf-8") + b"\n")
+
+        records, _ = selection_eval._read_telemetry(log_path, include_rotated=False)
+        assert [record["selection_id"] for record in records] == ["edge"]
+        assert _run_feedback(tmp_path, log_path, "--last", "--user-corrected").exit_code == 0
+        assert [record["selection_id"] for record in _feedback_records(log_path)] == ["edge"]
+
+    def test_a_repeated_copy_does_not_make_a_selection_look_newer(self, tmp_path):
+        """A, B, A — the third line is a duplicate of the first.
+
+        Replay keeps the FIRST copy of an id, so the newest selection is B; a
+        resolver that re-dated A by its duplicate would label a selection the
+        reader considers older than one it just passed over.
+        """
+        log_path = tmp_path / "log.jsonl"
+        first = _sel(selection_id="a", server="gh", selected_tool="gh__a")
+        second = _sel(selection_id="b", server="gh", selected_tool="gh__b")
+        _write_lines(log_path, [first, second, dict(first)])
+
+        result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output)["selection_id"] == "b"
+
     def test_a_third_copy_does_not_resurrect_a_conflicting_id(self, tmp_path):
         """A/B/A: the third copy is one more claim about a contradictory
         history, not a casting vote. Both the resolver and replay must keep the
@@ -1484,20 +1525,26 @@ class TestResolverAgreesWithReplay:
         assert _run_feedback(tmp_path, log_path, "--last", "--user-corrected").exit_code == 0
         assert [record["selection_id"] for record in _feedback_records(log_path)] == ["older"]
 
-    def test_an_exhausted_fallthrough_says_so_rather_than_no_match(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("kind", ["conflicting", "defective"])
+    def test_an_exhausted_fallthrough_says_so_rather_than_no_match(
+        self, tmp_path, monkeypatch, kind
+    ):
         """Beyond the budget the answer is "these are all unlabellable", which
         sends an operator to `--selection-id` — "nothing matches" would send
-        them looking for a selection that is right there."""
+        them looking for a selection that is right there.
+
+        Both reasons a row is unlabellable count toward the budget: screening
+        the defective ones out before counting would report exhaustion as a
+        miss for exactly the log the message is written for.
+        """
         monkeypatch.setattr(selection_log_module, "_MAX_FALLTHROUGH", 1)
         log_path = tmp_path / "log.jsonl"
-        _write_lines(
-            log_path,
-            [
-                _sel(selection_id="older"),
-                _sel(selection_id="bad", server="gh"),
-                _sel(selection_id="bad", server="fs"),
-            ],
+        newest = (
+            [_sel(selection_id="bad", server="gh"), _sel(selection_id="bad", server="fs")]
+            if kind == "conflicting"
+            else [_sel(selection_id="bad", ranker_version=None)]
         )
+        _write_lines(log_path, [_sel(selection_id="older"), *newest])
         result = _run_feedback(tmp_path, log_path, "--last", "--user-corrected", "--json")
         payload = json.loads(result.output)
         assert result.exit_code == 1
@@ -1950,9 +1997,14 @@ class TestUnconfirmedWriteIsReported:
         payload = json.loads(result.output)
         assert result.exit_code == 1
         assert payload["error"] == "write_unconfirmed"
-        assert "re-running" in payload["message"]
+        # The retry it advises names the row it resolved. Another ``--last``
+        # could infer a different selection by the time it runs, and the
+        # judgement would land on that one instead.
+        resolved = payload["selection_id"]
+        assert f"--selection-id {resolved}" in payload["message"]
         # The message says the label reached the log; it must be true.
-        assert len(_feedback_records(log_path)) == 1
+        records = _feedback_records(log_path)
+        assert [record["selection_id"] for record in records] == [resolved]
 
 
 def _fsync_recorder(monkeypatch):

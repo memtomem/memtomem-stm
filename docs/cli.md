@@ -672,25 +672,24 @@ for metric, split, privacy, and CI-golden details.
 Usage: mms selection feedback [OPTIONS]
 
 Options:
-  --config TEXT                   [default: (~/.memtomem/stm_proxy.json)]
-  --log FILE                      Selection JSONL path; overrides
-                                  selection_telemetry.path.
-  --selection-id TEXT             Label this exact selection.
-  --last                          Label the most recent labellable selection
-                                  filtered by --server/--tool).
-  --server TEXT                   With --last: only consider selections from
-                                  this upstream.
-  --tool TEXT                     With --last: only consider this prefixed
-                                  tool name.
-  --user-corrected                The user corrected this selection.
-  --no-user-corrected             The user did NOT correct this selection.
-  --operator-override             An operator overrode this selection.
-  --no-operator-override          An operator did NOT override this selection.
-  -y, --yes                       Confirm the --last target without prompting
-                                  (required off a TTY).
-  --active-only                   Resolve against the active log only,
-                                  excluding numeric rotated backups.
-  --json                          Output stable JSON for scripting.
+  --config TEXT           [default: (~/.memtomem/stm_proxy.json)]
+  --log FILE              Selection JSONL path; overrides
+                          selection_telemetry.path.
+  --selection-id TEXT     Label this exact selection.
+  --last                  Label the most recent labellable selection (see
+                          --server/--tool).
+  --server TEXT           With --last: only consider selections from this
+                          upstream.
+  --tool TEXT             With --last: only consider this prefixed tool name.
+  --user-corrected        The user corrected this selection.
+  --no-user-corrected     The user did NOT correct this selection.
+  --operator-override     An operator overrode this selection.
+  --no-operator-override  An operator did NOT override this selection.
+  -y, --yes               Confirm the --last target without prompting
+                          (required off a TTY).
+  --active-only           Resolve against the active log only, excluding
+                          numeric rotated backups.
+  --json                  Output stable JSON for scripting.
 ```
 
 The one writing command in this group, and the only producer of the selection
@@ -745,7 +744,7 @@ exit 1 and emit `{"action": "selection-feedback", "ok": false, "error":
 | `config_invalid` | the configured log path is unknown, by any of three routes: the config file exists but does not parse; there is no file and the `MEMTOMEM_STM_PROXY__*` overlay the operator did set fails to validate; or a bare `MEMTOMEM_STM_PROXY` was dropped entirely because it is not valid JSON or does not decode to an object — that last one is reported with a config file present too, since the file then decides a path the environment was meant to override. All refuse rather than labelling whichever log is left over |
 | `confirmation_required` | `--last` used non-interactively (or with `--json`) without `--yes`; exit 2, matching the CLI-wide rule that a formatting flag must not authorize a write |
 | `write_failed` / `write_redacted` | no label record was written — the sink swallows write faults so a telemetry problem cannot break a proxied call, so the command checks the append outcome instead of assuming it. A write that landed short leaves an unparseable fragment behind (rolling it back would mean rewinding a file the proxy appends to concurrently); readers count it as one malformed line and it joins nothing |
-| `write_unconfirmed` | the label's bytes reached the log but the flush proving they survive a crash did not complete. Neither "written" nor "not written" is available, so the command says so; re-running with the same flags is safe, since repeating a label for one selection is the accumulate-and-supersede case above |
+| `write_unconfirmed` | the label's bytes reached the log but the flush proving they survive a crash did not complete. Neither "written" nor "not written" is available, so the command says so — and names the row: the `--json` document carries `selection_id`, and the retry to run is `--selection-id <id>`, never another `--last`, which by then could infer a *different* selection. Repeating the label for the same selection is the accumulate-and-supersede case above |
 
 Unlike the proxy's call-path emitters, the label is flushed to the storage
 device — and its directory entry with it when the append created the log —

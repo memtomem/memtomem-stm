@@ -48,8 +48,12 @@ changes inline only. See the deprecation policy in
   honestly are labellable: an unsupported `schema_version` (offline replay
   drops those records outright) or a missing `ranker_version` (the label would
   be filed under a cohort the command invented) exits 1 (`unusable_record`) and
-  is skipped by `--last`. Resolution otherwise counts records exactly as
-  the replay loader does — parsed from raw bytes, so a record truncated
+  is skipped by `--last`. Both readers now load the log through one
+  `TelemetryReader` — segment discovery, line framing, the size cut, decoding,
+  schema and event admission, and append-order stamping live there rather than
+  being re-derived on each side, after four review rounds in which the two
+  parted company over exactly those rules. Resolution therefore counts records
+  exactly as the replay loader does — parsed from raw bytes, so a record truncated
   mid-character is skipped rather than repaired into a different string than
   the one replay reads; the same maximum line length; the active file's
   unterminated tail ignored, since that is a record still being written;

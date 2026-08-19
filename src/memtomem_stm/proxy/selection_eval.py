@@ -27,9 +27,8 @@ from memtomem_stm.proxy.config import (
 from memtomem_stm.proxy.manager import ProxyToolInfo
 from memtomem_stm.proxy.privacy import contains_sensitive_content
 from memtomem_stm.proxy.selection_log import (
-    MAX_LINE_BYTES,
-    SCHEMA_VERSION,
-    discover_log_files,
+    SelectionLogUnreadable,
+    TelemetryReader,
     records_conflict,
 )
 from memtomem_stm.proxy.tool_eligibility import ExposureCandidate, filter_tools
@@ -538,56 +537,21 @@ def _recommend_variant(
 def _read_telemetry(
     path: Path, include_rotated: bool
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    files_report: list[dict[str, Any]] = []
-    quality: Counter[str] = Counter()
-    warnings: list[str] = []
-    files_to_read = discover_log_files(path, include_rotated=include_rotated)
-    for log_path in files_to_read:
-        try:
-            size = log_path.stat().st_size
-            with log_path.open("rb") as fh:
-                data = fh.read(size)
-        except OSError as exc:
-            raise SelectionEvaluationError(
-                f"cannot read telemetry: {log_path.name}: {exc}"
-            ) from exc
-        is_active = log_path == path
-        partial_tail = bool(data and not data.endswith(b"\n"))
-        lines = data.splitlines()
-        if partial_tail and is_active:
-            lines = lines[:-1]
-            quality["truncated_tail_lines"] += 1
-            warnings.append("active log ended with an incomplete line; tail skipped")
-        files_report.append(
-            {
-                "name": log_path.name,
-                "sha256": hashlib.sha256(data).hexdigest(),
-                "lines": len(lines),
-            }
-        )
-        for line_no, raw_line in enumerate(lines, start=1):
-            if not raw_line.strip():
-                continue
-            if len(raw_line) > MAX_LINE_BYTES:
-                quality["oversized_lines"] += 1
-                continue
-            try:
-                record = json.loads(raw_line)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                quality["malformed_lines"] += 1
-                continue
-            if not isinstance(record, dict):
-                quality["malformed_lines"] += 1
-                continue
-            if record.get("schema_version") != SCHEMA_VERSION:
-                quality["unsupported_schema_records"] += 1
-                continue
-            if record.get("event") not in ("selection", "execution", "feedback"):
-                quality["unknown_event_records"] += 1
-                continue
-            record["_order"] = (len(files_report) - 1, line_no)
-            records.append(record)
+    """Load the log through the shared reader and report on the read.
+
+    Framing, the size cut, decoding, schema/event admission and append-order
+    stamping live in ``selection_log.TelemetryReader`` so this harness and the
+    labelling command cannot part company about which records exist; what stays
+    here is the evaluation-side reporting built on top of them.
+    """
+    reader = TelemetryReader(path, include_rotated=include_rotated)
+    try:
+        records = list(reader.records())
+    except SelectionLogUnreadable as exc:
+        raise SelectionEvaluationError(
+            f"cannot read telemetry: {exc.segment}: {exc.error}"
+        ) from exc
+    quality = reader.quality
     invalid = sum(
         quality[name]
         for name in (
@@ -598,10 +562,10 @@ def _read_telemetry(
         )
     )
     return records, {
-        "files": files_report,
-        "exists": bool(files_to_read),
+        "files": reader.files,
+        "exists": bool(reader.segments),
         "status": "invalid" if invalid else "ok",
-        "warnings": sorted(set(warnings)),
+        "warnings": sorted(set(reader.warnings)),
         **{name: quality[name] for name in sorted(quality)},
     }
 

@@ -2018,10 +2018,44 @@ def _functions_reaching(
     that encloses them. Fixed point over the resulting graph, so a wrapper
     chain of any depth is still reported.
     """
+    trees: list[tuple[str, ast.Module]] = [
+        (str(path.relative_to(base or root)), ast.parse(path.read_text(encoding="utf-8")))
+        for path in sorted(root.rglob("*.py"))
+    ]
+
+    # ``from m import x as y`` / ``import m as y``: a mention of the local name
+    # is a mention of the original. Collected across the whole tree and kept as
+    # a SET per name — never replaced, and never scoped. Scoping an alias table
+    # correctly means modelling function, lambda, class, comprehension and
+    # ``global`` boundaries, and every shape missed there UNREPORTS a real
+    # emitter; a union only ever adds names, so the guard can gain a false
+    # positive (which gets read) but cannot lose one. Whole-tree because
+    # aliases chain across modules: ``x as emit`` here, ``emit as callit``
+    # there.
+    aliases: dict[str, set[str]] = {}
+    for _, tree in trees:
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    if alias.asname:
+                        aliases.setdefault(alias.asname, set()).add(alias.name.split(".")[-1])
+
+    def resolve(found: set[str]) -> set[str]:
+        # To a fixed point: a single hop would report the middle name of a
+        # chain while the function that actually calls the emitter went
+        # missing.
+        resolved = set(found)
+        frontier = set(found)
+        while frontier:
+            grown: set[str] = set()
+            for name in frontier:
+                grown |= aliases.get(name, set()) - resolved
+            resolved |= grown
+            frontier = grown
+        return resolved
+
     mentions: dict[tuple[str, str], set[str]] = {}
-    for path in sorted(root.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        relative = str(path.relative_to(base or root))
+    for relative, tree in trees:
 
         def names_in(node: ast.AST) -> set[str]:
             found: set[str] = set()
@@ -2031,26 +2065,6 @@ def _functions_reaching(
                 elif isinstance(child, ast.Name):
                     found.add(child.id)
             return found
-
-        # ``from m import x as y`` / ``import m as y``: a mention of the local
-        # name is a mention of the original. Collected file-wide and kept as a
-        # SET per name — never replaced. Scoping an alias table correctly means
-        # modelling function, lambda, class, comprehension and ``global``
-        # boundaries, and every shape missed there UNREPORTS a real emitter; a
-        # union only ever adds names, so the guard can gain a false positive
-        # (which gets read) but cannot lose an emitter.
-        aliases: dict[str, set[str]] = {}
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                for alias in node.names:
-                    if alias.asname:
-                        aliases.setdefault(alias.asname, set()).add(alias.name.split(".")[-1])
-
-        def resolve(found: set[str]) -> set[str]:
-            resolved = set(found)
-            for name in found:
-                resolved |= aliases.get(name, set())
-            return resolved
 
         module_scope = mentions.setdefault((relative, "<module>"), set())
         for statement in tree.body:
@@ -2275,6 +2289,20 @@ def test_adr_0001_call_site_pin_rejects_a_second_emitter(tmp_path) -> None:
     assert ("imported_alias.py", "request_path") in _functions_reaching(src, "log_feedback"), (
         "another binding of the same local name — sibling function, nested function, or "
         "class body — must not unreport the real emitter"
+    )
+
+    # (c4) a two-hop chain: one module aliases the helper, the next aliases
+    # THAT alias. Neither `log_feedback` nor `_write_label` is spelled at the
+    # call, and a single-hop resolution reports only the middle name.
+    (src / "hop_one.py").write_text(
+        "from selection_cmd import _write_label as emit\n", encoding="utf-8"
+    )
+    (src / "hop_two.py").write_text(
+        "from hop_one import emit as callit\n\ndef chained(log):\n    return callit(log)\n",
+        encoding="utf-8",
+    )
+    assert ("hop_two.py", "chained") in _functions_reaching(src, "log_feedback"), (
+        "an alias of an alias must still be reported"
     )
 
     # (d) an emitter at module level, outside any function.

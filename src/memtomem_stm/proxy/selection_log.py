@@ -781,7 +781,7 @@ def selection_defect(record: dict[str, Any]) -> str | None:
 
 
 class SelectionLogUnreadable(OSError):
-    """A segment of the log could not be read while resolving.
+    """A segment of the log could not be read.
 
     Raised rather than skipped: "I could not look there" is not "no such
     selection", and the difference decides whether an operator's label lands on
@@ -789,7 +789,15 @@ class SelectionLogUnreadable(OSError):
     stays tolerant — it summarizes what it could read — but a resolve that
     feeds a WRITE cannot, because a missed segment silently promotes an older
     row to "most recent".
+
+    Carries the segment name and the underlying error so each caller can phrase
+    it in its own vocabulary without parsing the message back apart.
     """
+
+    def __init__(self, segment: str, error: OSError) -> None:
+        super().__init__(f"cannot read log segment {segment}: {error}")
+        self.segment = segment
+        self.error = error
 
 
 # Replay stamps this on every record it loads to order them; it is not part of
@@ -857,42 +865,135 @@ _EXHAUSTED_REASON = (
 )
 
 
-def _iter_selection_records(path: Path, *, include_rotated: bool) -> Iterator[dict[str, Any]]:
-    """Yield every ``selection`` record of the log, in append order.
+class TelemetryReader:
+    """The one definition of what this log *contains*.
 
-    What counts as a record is what the replay harness counts, because the
-    label is written FOR that reader (``selection_eval._read_telemetry``):
-    lines parsed from raw bytes, so an encoding the two would read differently
-    is skipped by both; lines over :data:`MAX_LINE_BYTES` dropped; and the
-    active file's unterminated tail — a record still being written — ignored,
-    while a rotated backup's is closed history and kept.
+    Four rounds of review found the labelling command and the replay harness
+    disagreeing about which records exist — over encodings, over the active
+    file's unterminated tail, over the line-length cut, over duplicate copies —
+    each time in a place where one of them had re-derived a rule the other
+    owned. So neither owns it now: segment discovery, framing, the size
+    admission, strict decoding, schema and event admission, and append-order
+    stamping happen here, and both callers read the same stream.
 
-    Read a line at a time rather than whole files: a segment is 50 MB by
-    default and the caller only ever needs one record at a time.
+    Reads a line at a time — a segment is 50 MB by default — while collecting
+    what the replay harness reports about the read: per-segment name, sha256
+    and line count in :attr:`files`, the skipped/rejected line counters in
+    :attr:`quality`, and :attr:`warnings`. Those are complete only once
+    :meth:`records` has been consumed.
 
-    Raises :class:`SelectionLogUnreadable` for a segment it cannot read.
+    ``keep_unsupported`` yields records of an unsupported ``schema_version``
+    (still counted) instead of dropping them. Replay must not see them at all;
+    the labelling command needs them to say *this row is of a schema I cannot
+    label* rather than "no such selection" about a row that is right there.
+
+    Raises :class:`SelectionLogUnreadable` for a segment it cannot read: "I
+    could not look there" is not "there is nothing there", and skipping a
+    segment silently promotes an older row to "most recent".
     """
-    for log_path in discover_log_files(path, include_rotated=include_rotated):
-        is_active = log_path == path
+
+    EVENTS = ("selection", "execution", "feedback")
+
+    def __init__(
+        self, path: Path | str, *, include_rotated: bool = True, keep_unsupported: bool = False
+    ) -> None:
+        self.path = Path(path).expanduser()
+        self.keep_unsupported = keep_unsupported
+        self.segments = discover_log_files(self.path, include_rotated=include_rotated)
+        self.quality: Counter[str] = Counter()
+        self.files: list[dict[str, Any]] = []
+        self.warnings: list[str] = []
+
+    def records(self) -> Iterator[dict[str, Any]]:
+        for index, log_path in enumerate(self.segments):
+            yield from self._segment_records(index, log_path)
+
+    def _segment_records(self, index: int, log_path: Path) -> Iterator[dict[str, Any]]:
+        is_active = log_path == self.path
+        digest = hashlib.sha256()
+        line_no = 0
+        pending: bytes | None = None
         try:
-            with log_path.open("rb") as fh:
-                for raw_line in fh:
-                    if is_active and not raw_line.endswith(b"\n"):
-                        # Only the active file has a line that is still being
-                        # written, and it can only be the last one.
-                        continue
-                    if not raw_line.strip():
-                        continue
-                    if len(raw_line) > MAX_LINE_BYTES:
-                        continue
-                    try:
-                        record = json.loads(raw_line)
-                    except (ValueError, TypeError, UnicodeDecodeError):
-                        continue
-                    if isinstance(record, dict) and record.get("event") == "selection":
-                        yield record
+            with log_path.open("rb") as handle:
+                for chunk in handle:
+                    digest.update(chunk)
+                    if pending is not None:
+                        admitted, line_no = self._consume(pending, index, line_no)
+                        yield from admitted
+                    pending = chunk
+                if pending is not None:
+                    # The active file's last line, when unterminated, is a
+                    # record still being written. A rotated backup's is closed
+                    # history and stays.
+                    tail = is_active and not pending.endswith(b"\n")
+                    admitted, line_no = self._consume(pending, index, line_no, drop_last=tail)
+                    yield from admitted
+                    if tail:
+                        self.quality["truncated_tail_lines"] += 1
+                        self.warnings.append(
+                            "active log ended with an incomplete line; tail skipped"
+                        )
         except OSError as exc:
-            raise SelectionLogUnreadable(f"cannot read log segment {log_path.name}: {exc}") from exc
+            raise SelectionLogUnreadable(log_path.name, exc) from exc
+        self.files.append({"name": log_path.name, "sha256": digest.hexdigest(), "lines": line_no})
+
+    def _consume(
+        self, chunk: bytes, index: int, line_no: int, *, drop_last: bool = False
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Split one read chunk the way a whole-file read would, and admit it.
+
+        ``splitlines`` rather than a newline strip, because that is what a
+        reader of the whole file does — a bare carriage return inside a record
+        ends a line for it, and a reader that disagreed would parse bytes the
+        other never sees. The line counter is returned rather than kept as
+        state so a piece nobody admitted still advances it.
+        """
+        pieces = chunk.splitlines()
+        if drop_last and pieces:
+            pieces = pieces[:-1]
+        admitted: list[dict[str, Any]] = []
+        for piece in pieces:
+            line_no += 1
+            record = self._admit(piece, index, line_no)
+            if record is not None:
+                admitted.append(record)
+        return admitted, line_no
+
+    def _admit(self, line: bytes, index: int, line_no: int) -> dict[str, Any] | None:
+        if not line.strip():
+            return None
+        if len(line) > MAX_LINE_BYTES:
+            self.quality["oversized_lines"] += 1
+            return None
+        try:
+            record = json.loads(line)
+        except (ValueError, TypeError, UnicodeDecodeError):
+            self.quality["malformed_lines"] += 1
+            return None
+        if not isinstance(record, dict):
+            self.quality["malformed_lines"] += 1
+            return None
+        if record.get("schema_version") != SCHEMA_VERSION:
+            self.quality["unsupported_schema_records"] += 1
+            if not self.keep_unsupported:
+                return None
+        elif record.get("event") not in self.EVENTS:
+            self.quality["unknown_event_records"] += 1
+            return None
+        record[_ORDER_KEY] = (index, line_no)
+        return record
+
+
+def _iter_selection_records(path: Path, *, include_rotated: bool) -> Iterator[dict[str, Any]]:
+    """Every ``selection`` record of the log, in append order.
+
+    Unsupported-schema rows are kept: :func:`resolve_selection` has to name
+    what is wrong with one an operator asked for by id.
+    """
+    reader = TelemetryReader(path, include_rotated=include_rotated, keep_unsupported=True)
+    for record in reader.records():
+        if record.get("event") == "selection":
+            yield record
 
 
 def _supported(record: dict[str, Any]) -> bool:
@@ -995,9 +1096,14 @@ def resolve_selection(
         defect = selection_defect(kept)
         return (None, defect) if defect is not None else (kept, None)
 
-    # Pass 1: the newest matching selections, one entry per id — sixty-four
-    # COPIES of one poisoned id must not crowd out the labellable row behind
-    # them.
+    # Pass 1: the matching selections, one entry per id, at the position of
+    # the id's FIRST copy — which is the copy replay keeps, so a later
+    # duplicate must not make the selection look newer than the reader thinks
+    # it is. Sixty-four COPIES of one id must not crowd out the labellable row
+    # behind them either, so the budget counts ids. Defects are screened in
+    # pass 2, not here: a run of sixty-four unlabellable matches is the
+    # exhaustion this reports, and dropping them here would report it as
+    # "nothing matched".
     candidates: dict[str, dict[str, Any]] = {}
     for record in _iter_selection_records(path, include_rotated=include_rotated):
         if not _supported(record):
@@ -1006,10 +1112,9 @@ def resolve_selection(
             continue
         if tool is not None and record.get("selected_tool") != tool:
             continue
-        if selection_defect(record) is not None:
+        record_id = record.get("selection_id")
+        if not isinstance(record_id, str) or not record_id or record_id in candidates:
             continue
-        record_id = record["selection_id"]
-        candidates.pop(record_id, None)
         candidates[record_id] = record
         if len(candidates) > _MAX_FALLTHROUGH:
             del candidates[next(iter(candidates))]

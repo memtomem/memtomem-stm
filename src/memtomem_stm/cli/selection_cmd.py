@@ -460,7 +460,9 @@ def feedback_command(
             as_json,
             f"write_{status}",
             f"the label reached {telemetry_path} but could not be confirmed durable; "
-            "check the log, and re-running with the same flags is safe",
+            f"check the log, and if it is not there re-run with "
+            f"--selection-id {resolved_id}",
+            extra={"selection_id": resolved_id},
         )
     if status != APPEND_WRITTEN:
         _feedback_failure(
@@ -565,16 +567,34 @@ def _tri_state(positive: bool, negative: bool, name: str) -> bool | None:
     return None
 
 
-def _feedback_failure(as_json: bool, code: str, message: str, exit_code: int = 1) -> NoReturn:
+def _feedback_failure(
+    as_json: bool,
+    code: str,
+    message: str,
+    exit_code: int = 1,
+    *,
+    extra: dict[str, Any] | None = None,
+) -> NoReturn:
     """Exit with a stable error code, in the caller's chosen format.
 
     Exit 1 is an operational failure; exit 2 is missing consent, matching the
     ``--json``-without-``--yes`` precedent elsewhere in the CLI.
+
+    *extra* adds fields a caller cannot recover for itself — the resolved
+    ``selection_id`` behind a ``--last`` that got as far as writing, without
+    which the retry the message advises would have to infer its target again,
+    and could infer a different one.
     """
     if as_json:
         click.echo(
             json_out.dumps(
-                {"action": "selection-feedback", "ok": False, "error": code, "message": message},
+                {
+                    "action": "selection-feedback",
+                    "ok": False,
+                    "error": code,
+                    "message": message,
+                    **(extra or {}),
+                },
                 sort_keys=True,
                 ensure_ascii=False,
             )
