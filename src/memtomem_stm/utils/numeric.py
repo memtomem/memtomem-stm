@@ -55,6 +55,8 @@ def finite_number(value: object) -> float | None:
         return None
     try:
         number = float(value)
-    except (OverflowError, ValueError):
+    except (OverflowError, ValueError, TypeError):
+        # `TypeError` only for an `int`/`float` subclass whose `__float__`
+        # refuses; JSON cannot produce one, but "total" has to mean total.
         return None
     return number if math.isfinite(number) else None

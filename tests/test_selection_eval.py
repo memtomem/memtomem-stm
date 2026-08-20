@@ -483,8 +483,8 @@ def test_absent_or_null_numeric_field_is_not_unusable(tmp_path: Path, field: str
         assert report["status"] == "ok"
 
 
-def test_finite_values_whose_aggregate_overflows_report_no_value(tmp_path: Path) -> None:
-    """Guarding the inputs does not bound the output (#856)."""
+def test_finite_values_whose_sum_overflows_still_report_their_mean(tmp_path: Path) -> None:
+    """Guarding the inputs does not bound the arithmetic (#856)."""
     log = tmp_path / "selection.jsonl"
     records: list[dict] = []
     for sid in ("sel-1", "sel-2"):
@@ -506,6 +506,74 @@ def test_finite_values_whose_aggregate_overflows_report_no_value(tmp_path: Path)
     assert execution_metrics["cost_mean"] == {"value": 1e308, "denominator": 2}
     assert execution_metrics["latency_ms"]["count"] == 2
     assert execution_metrics["latency_ms"]["p50"] == 1e308
+
+
+def test_unusable_numbers_survives_a_ranker_mismatch(tmp_path: Path) -> None:
+    """A cohort verdict abandons the record; the data-quality count must not."""
+    log = tmp_path / "selection.jsonl"
+    execution = _execution()
+    execution["ranker_version"] = "v9-some-future-ranker"
+    execution["latency_ms"] = float("nan")
+    execution["retry_count"] = "many"
+    execution["cost"] = 10**400
+    _write_jsonl(log, [_selection(), execution])
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["data_quality"]["ranker_mismatches"] == 1
+    assert report["data_quality"]["unusable_numbers"] == 3
+
+
+def test_unusable_numbers_survives_a_structural_violation(tmp_path: Path) -> None:
+    """Same for the `candidate_tools` gate, which abandons the record earlier."""
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    selection["candidate_tools"] = "not-a-list"
+    selection["candidate_features"]["ranked_candidates"][0]["final_score"] = float("nan")
+    execution = _execution()
+    execution["latency_ms"] = "fast"
+    _write_jsonl(log, [selection, execution])
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["data_quality"]["invariant_violations"] == 1
+    assert report["data_quality"]["unusable_numbers"] == 2
+
+
+def test_mean_of_three_maximum_floats_is_that_maximum(tmp_path: Path) -> None:
+    """Both the summing and the dividing form overflow here; the mean does not."""
+    log = tmp_path / "selection.jsonl"
+    records: list[dict] = []
+    for sid in ("sel-1", "sel-2", "sel-3"):
+        execution = _execution(sid)
+        execution["cost"] = sys.float_info.max
+        records += [_selection(sid), execution]
+    _write_jsonl(log, records)
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["production"]["execution"]["cost_mean"] == {
+        "value": sys.float_info.max,
+        "denominator": 3,
+    }
+
+
+def test_ordinary_means_are_unchanged_to_six_decimals(tmp_path: Path) -> None:
+    """The overflow path must not move the digits every ordinary report shows."""
+    log = tmp_path / "selection.jsonl"
+    costs = [1.0 / 3.0, 2.0 / 7.0, 1e-7, 123456.789]
+    records: list[dict] = []
+    for index, cost in enumerate(costs):
+        execution = _execution(f"sel-{index}")
+        execution["cost"] = cost
+        records += [_selection(f"sel-{index}"), execution]
+    _write_jsonl(log, records)
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["production"]["execution"]["cost_mean"]["value"] == round(
+        sum(costs) / len(costs), 6
+    )
 
 
 def test_opposite_sign_extremes_interpolate_to_a_finite_percentile(tmp_path: Path) -> None:

@@ -258,14 +258,15 @@ changes inline only. See the deprecation policy in
   and every value it rejects is counted in a new `data_quality.unusable_numbers`.
 
   Two further gaps of the same shape are closed with it. Guarding the inputs
-  does not bound the arithmetic, so the aggregates are now computed in forms
-  that cannot overflow finite samples — the mean divides before summing, and
-  percentiles interpolate as `low*(1-f) + high*f` rather than
-  `low + f*(high-low)`. Both answers were always representable: the mean of
-  two `1e308` values is `1e308`, and the median of `-1e308` and `1e308` is
-  `0`; the old forms reached `inf` on the way there. And `parity_mismatches`
-  ships beside a new `parity_checked` denominator, because `0` mismatches
-  otherwise reads as a clean bill of health even when nothing was checkable.
+  does not bound the arithmetic that follows: the mean of two `1e308` samples
+  is `1e308` and the median of `-1e308` and `1e308` is `0`, but summing and
+  subtracting reached `inf` on the way to both. Each aggregate now keeps its
+  accurate formula while that formula's intermediate value is finite — the
+  digits an ordinary report shows are unchanged — and falls back only on
+  overflow, the mean by normalizing on the largest magnitude and percentiles
+  by interpolating as `low*(1-f) + high*f`. And `parity_mismatches` ships
+  beside a new `parity_checked` denominator, because `0` mismatches otherwise
+  reads as a clean bill of health even when nothing was checkable.
 
   **Behavior change**, as measured against the previous release. *A traceback
   becomes a report*: an oversized integer in any of the six fields. *A silent
@@ -277,11 +278,14 @@ changes inline only. See the deprecation policy in
   `parity_mismatches: 0` meant "never checked", and a `NaN` in one of the
   three execution fields built a report whose aggregate was non-finite and
   whose `--json` failed with `Out of range float values are not JSON
-  compliant`. An **absent or `null`** field is not affected: nothing to read
-  is not the same as something unreadable, and `cost` is nullable in the
-  writer's own shape. *An aggregate no longer overflows*: two finite samples
-  whose sum or difference exceeds the float limit now yield the representable
-  answer instead of `inf`.
+  compliant`. The count is taken over every admitted record, independently of
+  whether some structural or cohort check abandoned that record first, so a
+  ranker-mismatched execution still reports the values it holds that cannot be
+  read. An **absent or `null`** field is not affected: nothing to read is not
+  the same as something unreadable, and `cost` is nullable in the writer's own
+  shape. *An aggregate no longer overflows*: finite samples whose sum or
+  difference exceeds the float limit now yield the representable answer
+  instead of `inf`.
 
   Three sibling readers are fixed alongside. `aggregate_selection_log`, behind
   the `stm_selection_stats` MCP tool, collected its `latency_ms` sample

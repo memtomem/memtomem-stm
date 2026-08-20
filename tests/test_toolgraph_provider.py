@@ -104,6 +104,19 @@ class TestToolgraphConfig:
             ToolgraphConfig(consult_cache_max_scopes=-1)
         ToolgraphConfig(consult_cache_max_scopes=1)  # minimum valid
 
+    @pytest.mark.parametrize(
+        "value", [float("nan"), float("inf"), float("-inf"), 10**400, -(10**400)]
+    )
+    def test_risk_penalty_scale_must_be_finite(self, value):
+        # `ge=0` alone admits `inf`, which multiplies into a penalty and then
+        # into a report that strict JSON refuses to serialize (#856).
+        with pytest.raises(ValidationError):
+            ToolgraphConfig(risk_penalty_scale=value)
+
+    def test_risk_penalty_scale_still_accepts_ordinary_values(self):
+        assert ToolgraphConfig(risk_penalty_scale=0.0).risk_penalty_scale == 0.0
+        assert ToolgraphConfig(risk_penalty_scale=2.5).risk_penalty_scale == 2.5
+
     def test_failure_knob_defaults(self):
         tg = ProxyConfig().toolgraph
         # whole-call classes that silently disabling enforcement would be a

@@ -105,17 +105,25 @@ def _finite(value: float) -> float | None:
 
 
 def _mean(values: list[float]) -> float | None:
-    """The arithmetic mean, dividing before summing.
+    """The arithmetic mean, summing first and dividing first only if it must.
 
-    ``sum(values) / len(values)`` overflows to ``inf`` on finite inputs whose
-    total exceeds the float limit — two admitted ``1e308`` values have a mean
-    of ``1e308``, which is perfectly representable, so reporting nothing there
-    would be losing an answer rather than refusing a bad one.
+    ``sum(values) / count`` is the accurate form and stays the answer whenever
+    its total is finite — it must not be traded away for an exotic input,
+    since it is what every ordinary sample's sixth decimal depends on. It
+    overflows on samples whose total exceeds the float limit even though their
+    mean does not: three copies of ``float_info.max`` have a mean of
+    ``float_info.max``. The fallback therefore normalizes by the largest
+    magnitude first, which bounds every term at 1 and cannot overflow, then
+    scales the result back (#856).
     """
     if not values:
         return None
     count = len(values)
-    return _finite(sum(value / count for value in values))
+    total = sum(values)
+    if math.isfinite(total):
+        return _finite(total / count)
+    scale = max(abs(value) for value in values)
+    return _finite(scale * (sum(value / scale for value in values) / count))
 
 
 def _percentile(values: list[float], percentile: float) -> float | None:
@@ -126,11 +134,14 @@ def _percentile(values: list[float], percentile: float) -> float | None:
         return _finite(ordered[0])
     rank = (len(ordered) - 1) * percentile / 100.0
     low, high = math.floor(rank), math.ceil(rank)
-    if low == high:
+    if low == high or ordered[low] == ordered[high]:
         return _finite(ordered[low])
-    # Weighted form, not `low + (high - low) * frac`: the difference overflows
-    # on finite samples of opposite sign, though the result lies between them.
     frac = rank - low
+    span = ordered[high] - ordered[low]
+    if math.isfinite(span):
+        return _finite(ordered[low] + span * frac)
+    # The span overflows on finite samples of opposite sign, though the result
+    # lies between them; the weighted form gets there without the difference.
     return _finite(ordered[low] * (1.0 - frac) + ordered[high] * frac)
 
 
@@ -591,6 +602,34 @@ def _read_telemetry(
     }
 
 
+def _unusable_numbers(record: dict[str, Any]) -> int:
+    """How many numeric fields on one admitted record hold no usable number.
+
+    A present value that is not a real number — a string, a boolean, a
+    container, ``NaN``/``Infinity``, or an integer too large for a float — is
+    unreadable whatever its type. Absent and ``null`` are not counted: nothing
+    to read is not the same as something unreadable, and ``cost`` is nullable
+    in the writer's own shape.
+    """
+    if record.get("event") == "execution":
+        holders: list[dict[str, Any]] = [record]
+        fields = ("latency_ms", "retry_count", "cost")
+    else:
+        features = record.get("candidate_features")
+        ranked = features.get("ranked_candidates") if isinstance(features, dict) else None
+        holders = (
+            [entry for entry in ranked if isinstance(entry, dict)]
+            if (isinstance(ranked, list))
+            else []
+        )
+        fields = ("relevance_score", "risk_penalty", "final_score")
+    return sum(
+        holder.get(field) is not None and finite_number(holder.get(field)) is None
+        for holder in holders
+        for field in fields
+    )
+
+
 def _observed_telemetry(records: list[dict[str, Any]], quality: dict[str, Any]) -> dict[str, Any]:
     selections: dict[str, dict[str, Any]] = {}
     executions: dict[str, dict[str, Any]] = {}
@@ -641,7 +680,16 @@ def _observed_telemetry(records: list[dict[str, Any]], quality: dict[str, Any]) 
     selected_ranks: list[int] = []
     rankable = selected_at_1 = selected_at_3 = selected_at_5 = 0
     parity_mismatches = invariant_violations = ranker_mismatches = 0
-    parity_checked = unusable_numbers = 0
+    parity_checked = 0
+    # Counted over every admitted record, not inside the loop below: that loop
+    # abandons a record on a structural or cohort verdict, and "this log holds
+    # values I cannot read" must not depend on whether some other check
+    # happened to fire first (#856).
+    unusable_numbers = sum(
+        _unusable_numbers(record)
+        for bucket in (selections, executions)
+        for record in bucket.values()
+    )
     latencies: list[float] = []
     ok = errors = cache_hit = cache_miss = cache_unknown = 0
     retry_values: list[float] = []
@@ -695,13 +743,6 @@ def _observed_telemetry(records: list[dict[str, Any]], quality: dict[str, Any]) 
                     relevance = finite_number(entry.get("relevance_score"))
                     penalty = finite_number(entry.get("risk_penalty", 0.0))
                     final = finite_number(entry.get("final_score"))
-                    scores = (relevance, penalty, final)
-                    unusable_numbers += sum(
-                        score is None and entry.get(name) is not None
-                        for score, name in zip(
-                            scores, ("relevance_score", "risk_penalty", "final_score")
-                        )
-                    )
                     if (
                         ranker in PARITY_RANKER_VERSIONS
                         and relevance is not None
@@ -730,7 +771,6 @@ def _observed_telemetry(records: list[dict[str, Any]], quality: dict[str, Any]) 
             else:
                 errors += 1
             latency = finite_number(execution.get("latency_ms"))
-            unusable_numbers += latency is None and execution.get("latency_ms") is not None
             if latency is not None:
                 latencies.append(latency)
             cache = execution.get("cache_hit")
@@ -742,8 +782,6 @@ def _observed_telemetry(records: list[dict[str, Any]], quality: dict[str, Any]) 
                 cache_unknown += 1
             retry = finite_number(execution.get("retry_count"))
             cost = finite_number(execution.get("cost"))
-            unusable_numbers += retry is None and execution.get("retry_count") is not None
-            unusable_numbers += cost is None and execution.get("cost") is not None
             if retry is not None:
                 retry_values.append(retry)
             if cost is not None:
