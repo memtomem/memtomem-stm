@@ -71,7 +71,9 @@ class TestBoundedCounterDict:
 
 class TestTokenTrackerBounds:
     def _metrics(self, server: str, tool: str = "t") -> CallMetrics:
-        return CallMetrics(server=server, tool=tool, original_chars=10, compressed_chars=5)
+        return CallMetrics(
+            server=server, tool=tool, original_chars=10, compressed_chars=5
+        )
 
     def test_by_server_respects_max_tracked_keys(self):
         tracker = TokenTracker(max_tracked_keys=5)

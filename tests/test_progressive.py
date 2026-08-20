@@ -300,11 +300,14 @@ class TestProgressiveContentIntegrity:
                 # footer). Canonical split must land on the footer, not the
                 # trailing content HR.
                 "content_ending_in_triple_dash_before_footer",
-                "".join(f"Line {i}: filler text here\n" for i in range(80)) + "\n---\n",
+                "".join(f"Line {i}: filler text here\n" for i in range(80))
+                + "\n---\n",
             ),
         ],
     )
-    def test_dangerous_content_reassembles_with_canonical_token(self, content_label, text):
+    def test_dangerous_content_reassembles_with_canonical_token(
+        self, content_label, text
+    ):
         """Content embedding ``\\n---\\n`` sequences (markdown HR, YAML
         frontmatter, lookalike brackets, trailing HR) must still round-trip
         byte-for-byte when agents split on :data:`PROGRESSIVE_FOOTER_TOKEN`.
@@ -341,7 +344,10 @@ class TestProgressiveContentIntegrity:
         noticing: on content containing a markdown horizontal rule, the
         legacy rule drops bytes while the canonical rule preserves them.
         """
-        text = "Intro paragraph.\n\n---\n\nContent after the rule.\n\n" + "x" * 500
+        text = (
+            "Intro paragraph.\n\n---\n\nContent after the rule.\n\n"
+            + "x" * 500
+        )
         chunker = ProgressiveChunker(chunk_size=4000)
         result = chunker.first_chunk(text, "key-legacy")
 
@@ -756,7 +762,9 @@ class TestProgressiveReadsTelemetry:
         try:
             text = "x" * 10000
             cfg = ProgressiveConfig(chunk_size=4000)
-            first = mgr._apply_progressive(text, cfg, server="srv", tool="tool_a", trace_id="t1")
+            first = mgr._apply_progressive(
+                text, cfg, server="srv", tool="tool_a", trace_id="t1"
+            )
             assert PROGRESSIVE_FOOTER_TOKEN in first
 
             stats = tracker.get_stats()
@@ -772,7 +780,9 @@ class TestProgressiveReadsTelemetry:
         try:
             text = "y" * 12000
             cfg = ProgressiveConfig(chunk_size=4000)
-            first = mgr._apply_progressive(text, cfg, server="srv", tool="tool_b", trace_id="t2")
+            first = mgr._apply_progressive(
+                text, cfg, server="srv", tool="tool_b", trace_id="t2"
+            )
 
             # Recover the key from the in-memory progressive store
             store = mgr._get_progressive_store()
@@ -836,7 +846,9 @@ class TestProgressiveReadsTelemetry:
         try:
             text = "u" * 5000
             cfg = ProgressiveConfig(chunk_size=4000)
-            mgr._apply_progressive(text, cfg, server="srv", tool="tool_c", trace_id="t3")
+            mgr._apply_progressive(
+                text, cfg, server="srv", tool="tool_c", trace_id="t3"
+            )
 
             store = mgr._get_progressive_store()
             key = next(iter(store._store._data))  # type: ignore[attr-defined]

@@ -98,7 +98,9 @@ class TestToolConfigResolution:
         cfg = UpstreamServerConfig(
             prefix="gh",
             max_result_chars=2000,
-            tool_overrides={"get_file": ToolOverrideConfig(max_result_chars=50000)},
+            tool_overrides={
+                "get_file": ToolOverrideConfig(max_result_chars=50000)
+            },
         )
         tc = _resolve(cfg, "get_file")
         assert tc.max_chars == 50000
@@ -117,7 +119,9 @@ class TestToolConfigResolution:
         cfg = UpstreamServerConfig(
             prefix="gh",
             auto_index=False,
-            tool_overrides={"search_code": ToolOverrideConfig(auto_index=True)},
+            tool_overrides={
+                "search_code": ToolOverrideConfig(auto_index=True)
+            },
         )
         tc_default = _resolve(cfg, "list_repos")
         tc_override = _resolve(cfg, "search_code")
@@ -193,7 +197,9 @@ class TestRetiredBundledIndexSurface:
         mgr = ProxyManager(config, TokenTracker())  # index_engine defaults to None
         with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"):
             await mgr.start()
-        assert not any("no index engine configured" in r.message for r in caplog.records)
+        assert not any(
+            "no index engine configured" in r.message for r in caplog.records
+        )
 
     @pytest.mark.asyncio
     async def test_no_global_extraction_missing_engine_warning(self, caplog, tmp_path):
@@ -206,7 +212,9 @@ class TestRetiredBundledIndexSurface:
         mgr = ProxyManager(config, TokenTracker())  # index_engine defaults to None
         with caplog.at_level(logging.WARNING, logger="memtomem_stm.proxy.manager"):
             await mgr.start()
-        assert not any("no index engine configured" in r.message for r in caplog.records)
+        assert not any(
+            "no index engine configured" in r.message for r in caplog.records
+        )
 
     @pytest.mark.asyncio
     async def test_no_per_server_auto_index_missing_engine_warning(self, caplog):
@@ -229,7 +237,9 @@ class TestRetiredBundledIndexSurface:
                 # "echo" upstream exits before completing the JSON-RPC
                 # handshake; the warning fires before that connect failure.
                 pass
-        assert not any("no index engine configured" in r.message for r in caplog.records)
+        assert not any(
+            "no index engine configured" in r.message for r in caplog.records
+        )
 
     @pytest.mark.asyncio
     async def test_no_per_tool_extraction_missing_engine_warning(self, caplog):
@@ -252,7 +262,9 @@ class TestRetiredBundledIndexSurface:
                 await mgr.start()
             except (Exception, asyncio.CancelledError):
                 pass
-        assert not any("no index engine configured" in r.message for r in caplog.records)
+        assert not any(
+            "no index engine configured" in r.message for r in caplog.records
+        )
 
     @pytest.mark.asyncio
     async def test_no_warning_when_compression_none(self, caplog):

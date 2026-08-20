@@ -95,21 +95,13 @@ def bootstrap_ci(
     n = len(values)
     if n == 0:
         return ConfidenceInterval(
-            mean=0.0,
-            ci_lower=0.0,
-            ci_upper=0.0,
-            ci_level=ci_level,
-            n_resamples=0,
-            n_samples=0,
+            mean=0.0, ci_lower=0.0, ci_upper=0.0,
+            ci_level=ci_level, n_resamples=0, n_samples=0,
         )
     if n == 1:
         return ConfidenceInterval(
-            mean=values[0],
-            ci_lower=values[0],
-            ci_upper=values[0],
-            ci_level=ci_level,
-            n_resamples=0,
-            n_samples=1,
+            mean=values[0], ci_lower=values[0], ci_upper=values[0],
+            ci_level=ci_level, n_resamples=0, n_samples=1,
         )
 
     rng = random.Random(seed)
@@ -362,7 +354,9 @@ def format_markdown_table(summary: BenchmarkSummary) -> str:
     lines.append(f"- **Tasks:** {o.n_tasks}")
     lines.append(f"- **Mean quality:** {o.mean_quality:.2f}/10 (±{o.std_quality:.2f})")
     if o.ci:
-        lines.append(f"- **{o.ci.ci_level:.0%} CI:** [{o.ci.ci_lower:.2f}, {o.ci.ci_upper:.2f}]")
+        lines.append(
+            f"- **{o.ci.ci_level:.0%} CI:** [{o.ci.ci_lower:.2f}, {o.ci.ci_upper:.2f}]"
+        )
     lines.append(f"- **Quality preservation:** {o.mean_preservation:.1f}%")
     lines.append("")
 
@@ -432,7 +426,8 @@ def format_latex_table(summary: BenchmarkSummary) -> str:
         w = summary.wilcoxon
         sig = "p < 0.05" if w.significant else f"p = {w.p_value:.3f}"
         lines.append(
-            f"\\\\\\footnotesize{{Wilcoxon signed-rank: $W={w.statistic:.0f}$, ${sig}$, $n={w.n}$}}"
+            f"\\\\\\footnotesize{{Wilcoxon signed-rank: $W={w.statistic:.0f}$, ${sig}$, "
+            f"$n={w.n}$}}"
         )
 
     lines.append(r"\end{table}")
@@ -495,7 +490,9 @@ def _strategy_table_latex(
     lines: list[str] = []
     lines.append(r"\begin{tabular}{" + col_spec + "}")
     lines.append(r"\hline")
-    lines.append(r"\textbf{Task} & " + " & ".join(f"\\textbf{{{s}}}" for s in strategies) + r" \\")
+    lines.append(
+        r"\textbf{Task} & " + " & ".join(f"\\textbf{{{s}}}" for s in strategies) + r" \\"
+    )
     lines.append(r"\hline")
 
     for task_id in sorted(matrix.keys()):

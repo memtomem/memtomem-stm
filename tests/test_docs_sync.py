@@ -2347,7 +2347,9 @@ def test_adr_0001_call_site_pin_rejects_a_second_emitter(tmp_path) -> None:
     (src / "elsewhere.py").write_text(
         "from third_party import feedback_command as run\n", encoding="utf-8"
     )
-    (src / "unrelated.py").write_text("def helper(x):\n    return run(x)\n", encoding="utf-8")
+    (src / "unrelated.py").write_text(
+        "def helper(x):\n    return run(x)\n", encoding="utf-8"
+    )
     reaching_now = _functions_reaching(src, "log_feedback")
     assert ("unrelated.py", "helper") not in reaching_now, (
         "an alias bound in another module must not travel by spelling alone"

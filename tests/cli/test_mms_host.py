@@ -1786,7 +1786,9 @@ class TestSyncForceConfirmation:
 
 
 class TestSyncForceCrossHostLockdown6:
-    def test_apply_force_does_not_re_stamp_cross_host_drift(self, runner, sandbox):
+    def test_apply_force_does_not_re_stamp_cross_host_drift(
+        self, runner, sandbox
+    ):
         """Lock-down 6 BLOCKER: baseline source = claude-code; only
         cursor has the entry now; ``--force`` MUST NOT adopt cursor's
         shape. The entry stays in the changed bucket; registry +
@@ -1868,14 +1870,18 @@ class TestSyncForceCrossHostLockdown6:
         # exercising the no-force path where skipped_changed has rows.
         for row in payload["plan"]["skipped_changed"]:
             for key in row:
-                assert not key.startswith("_"), f"render-only key {key!r} leaked into JSON: {row}"
+                assert not key.startswith("_"), (
+                    f"render-only key {key!r} leaked into JSON: {row}"
+                )
 
         res2 = _sync(runner, "--plan", "--json")
         payload2 = json.loads(res2.output)
         assert len(payload2["plan"]["skipped_changed"]) == 1
         for row in payload2["plan"]["skipped_changed"]:
             for key in row:
-                assert not key.startswith("_"), f"render-only key {key!r} leaked into JSON: {row}"
+                assert not key.startswith("_"), (
+                    f"render-only key {key!r} leaked into JSON: {row}"
+                )
         # Also assert the secret value didn't leak via any route.
         assert "secret" not in res.output
         assert "secret" not in res2.output
@@ -1967,7 +1973,9 @@ class TestSyncForceCrossHostLockdown6:
         # Pointer first (helps the in_place subset), sub-line after.
         assert res.output.index("differ in shape") < res.output.index("shape-relocated"), res.output
 
-    def test_apply_force_does_not_print_changed_footer_for_restamped(self, runner, sandbox):
+    def test_apply_force_does_not_print_changed_footer_for_restamped(
+        self, runner, sandbox
+    ):
         """Smoke-discovered fix: after ``--force --apply`` re-stamps an
         entry, the "differ in shape at host. Use --force to acknowledge."
         footer must NOT fire for it. The footer's ``--force`` pointer

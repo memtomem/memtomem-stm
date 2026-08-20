@@ -36,14 +36,7 @@ class TestRelevanceGateExclusions:
 
     def test_write_tool_heuristic(self):
         gate = _gate()
-        for tool in [
-            "write_file",
-            "create_issue",
-            "delete_branch",
-            "push_commit",
-            "send_message",
-            "remove_label",
-        ]:
+        for tool in ["write_file", "create_issue", "delete_branch", "push_commit", "send_message", "remove_label"]:
             assert not gate.should_surface("s", tool, "query text"), f"Should skip {tool}"
 
     def test_read_tool_passes(self):

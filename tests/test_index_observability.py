@@ -138,3 +138,5 @@ class TestIndexObservabilityCounters:
         _NOOP_INDEX_OBSERVABILITY.record_attempt("t", "extract")
         _NOOP_INDEX_OBSERVABILITY.record_attempt("t", "auto_index")
         _NOOP_INDEX_OBSERVABILITY.record_outcome("t", "stored")
+
+

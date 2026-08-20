@@ -23,14 +23,12 @@ from memtomem_stm.proxy.privacy import contains_sensitive_content
 class TestProxyConfigLoader:
     def test_load_from_file(self, tmp_path):
         cfg_file = tmp_path / "stm_proxy.json"
-        cfg_file.write_text(
-            json.dumps(
-                {
-                    "enabled": True,
-                    "upstream_servers": {"gh": {"prefix": "gh", "command": "gh-server"}},
-                }
-            )
-        )
+        cfg_file.write_text(json.dumps({
+            "enabled": True,
+            "upstream_servers": {
+                "gh": {"prefix": "gh", "command": "gh-server"}
+            },
+        }))
         loader = ProxyConfigLoader(cfg_file)
         config = loader.get()
         assert config.enabled is True
@@ -100,14 +98,10 @@ class TestProxyConfigLoader:
         reverting to defaults — a running proxy stays serving its last
         known-good upstreams instead of going dark."""
         cfg_file = tmp_path / "stm_proxy.json"
-        cfg_file.write_text(
-            json.dumps(
-                {
-                    "enabled": True,
-                    "upstream_servers": {"gh": {"prefix": "gh", "command": "gh-server"}},
-                }
-            )
-        )
+        cfg_file.write_text(json.dumps({
+            "enabled": True,
+            "upstream_servers": {"gh": {"prefix": "gh", "command": "gh-server"}},
+        }))
         loader = ProxyConfigLoader(cfg_file)
         good = loader.get()
         assert good.enabled is True
@@ -115,17 +109,13 @@ class TestProxyConfigLoader:
 
         # User edits the file, accidentally giving two upstreams the same prefix.
         time.sleep(0.05)
-        cfg_file.write_text(
-            json.dumps(
-                {
-                    "enabled": True,
-                    "upstream_servers": {
-                        "gh": {"prefix": "dup", "command": "gh-server"},
-                        "gh2": {"prefix": "dup", "command": "gh-server-2"},
-                    },
-                }
-            )
-        )
+        cfg_file.write_text(json.dumps({
+            "enabled": True,
+            "upstream_servers": {
+                "gh": {"prefix": "dup", "command": "gh-server"},
+                "gh2": {"prefix": "dup", "command": "gh-server-2"},
+            },
+        }))
 
         # Loader must keep the previous good config, not fall back to defaults.
         reloaded = loader.get()
@@ -158,17 +148,13 @@ class TestLoadFromFileWithStatus:
         # before validation must survive into the result for `mms config
         # validate` to report both.
         cfg_file = tmp_path / "stm_proxy.json"
-        cfg_file.write_text(
-            json.dumps(
-                {
-                    "bogus_key": 1,
-                    "upstream_servers": {
-                        "a": {"prefix": "dup", "command": "a"},
-                        "b": {"prefix": "dup", "command": "b"},
-                    },
-                }
-            )
-        )
+        cfg_file.write_text(json.dumps({
+            "bogus_key": 1,
+            "upstream_servers": {
+                "a": {"prefix": "dup", "command": "a"},
+                "b": {"prefix": "dup", "command": "b"},
+            },
+        }))
         result = ProxyConfig.load_from_file_with_status(cfg_file)
         assert result.config is None
         # loc + type, not the raw validator message (which embeds prefixes).
@@ -186,15 +172,11 @@ class TestLoadFromFileWithStatus:
         import logging
 
         cfg_file = tmp_path / "stm_proxy.json"
-        cfg_file.write_text(
-            json.dumps(
-                {
-                    "enabled": True,
-                    "max_result_char": 4000,
-                    "cache": {"ttl_secondz": 60},
-                }
-            )
-        )
+        cfg_file.write_text(json.dumps({
+            "enabled": True,
+            "max_result_char": 4000,
+            "cache": {"ttl_secondz": 60},
+        }))
         with caplog.at_level(logging.WARNING):
             result = ProxyConfig.load_from_file_with_status(cfg_file)
         assert result.config is not None
@@ -226,11 +208,11 @@ class TestLoadFromFileWithStatus:
         MCP client via stm_proxy_health. The error must carry location +
         message only."""
         cfg_file = tmp_path / "stm_proxy.json"
-        cfg_file.write_text(
-            json.dumps(
-                {"upstream_servers": {"gh": {"prefix": "gh", "headers": "Bearer SECRET_TOKEN_ABC"}}}
-            )
-        )
+        cfg_file.write_text(json.dumps({
+            "upstream_servers": {
+                "gh": {"prefix": "gh", "headers": "Bearer SECRET_TOKEN_ABC"}
+            }
+        }))
         result = ProxyConfig.load_from_file_with_status(cfg_file)
         assert result.config is None
         assert result.error is not None
@@ -244,16 +226,12 @@ class TestLoadFromFileWithStatus:
         typo'd into a `prefix` field must not reach ConfigLoadResult.error,
         which flows to the MCP client via stm_proxy_health."""
         cfg_file = tmp_path / "stm_proxy.json"
-        cfg_file.write_text(
-            json.dumps(
-                {
-                    "upstream_servers": {
-                        "a": {"prefix": "SECRET_TOKEN_ABC", "command": "a"},
-                        "b": {"prefix": "SECRET_TOKEN_ABC", "command": "b"},
-                    }
-                }
-            )
-        )
+        cfg_file.write_text(json.dumps({
+            "upstream_servers": {
+                "a": {"prefix": "SECRET_TOKEN_ABC", "command": "a"},
+                "b": {"prefix": "SECRET_TOKEN_ABC", "command": "b"},
+            }
+        }))
         result = ProxyConfig.load_from_file_with_status(cfg_file)
         assert result.config is None
         assert result.error is not None
@@ -347,10 +325,9 @@ class TestLoadFromFileWithStatus:
             with caplog.at_level(logging.WARNING):
                 result = ProxyConfig.load_from_file_with_status(cfg_file, overrides)
             assert result.config is not None
-            assert not [r for r in caplog.records if "present but inert" in r.getMessage()], (
-                data,
-                overrides,
-            )
+            assert not [
+                r for r in caplog.records if "present but inert" in r.getMessage()
+            ], (data, overrides)
 
     def test_missing_cache_policy_warns_with_migration_hint(self, tmp_path, caplog):
         """A legacy file that never sets cache.tool_annotation_policy keeps the
@@ -364,7 +341,9 @@ class TestLoadFromFileWithStatus:
             result = ProxyConfig.load_from_file_with_status(cfg_file)
         assert result.config is not None
         assert result.config.cache.tool_annotation_policy == "conservative"
-        advisories = [r for r in caplog.records if "tool_annotation_policy" in r.getMessage()]
+        advisories = [
+            r for r in caplog.records if "tool_annotation_policy" in r.getMessage()
+        ]
         assert len(advisories) == 1
         msg = advisories[0].getMessage()
         assert '"cache": {"tool_annotation_policy": "strict"}' in msg
@@ -390,9 +369,9 @@ class TestLoadFromFileWithStatus:
             with caplog.at_level(logging.WARNING):
                 result = ProxyConfig.load_from_file_with_status(cfg_file)
             assert result.config is not None
-            assert not [r for r in caplog.records if "tool_annotation_policy" in r.getMessage()], (
-                policy
-            )
+            assert not [
+                r for r in caplog.records if "tool_annotation_policy" in r.getMessage()
+            ], policy
 
     def test_env_override_policy_suppresses_missing_policy_warning(self, tmp_path, caplog):
         """The advisory checks the MERGED data: a policy supplied via
@@ -462,12 +441,8 @@ class TestMetricsStore:
     def test_record_and_query(self, tmp_path):
         store = MetricsStore(tmp_path / "metrics.db")
         store.initialize()
-        store.record(
-            CallMetrics(server="gh", tool="list", original_chars=1000, compressed_chars=500)
-        )
-        store.record(
-            CallMetrics(server="gh", tool="search", original_chars=2000, compressed_chars=800)
-        )
+        store.record(CallMetrics(server="gh", tool="list", original_chars=1000, compressed_chars=500))
+        store.record(CallMetrics(server="gh", tool="search", original_chars=2000, compressed_chars=800))
 
         history = store.get_history(limit=10)
         assert len(history) == 2
@@ -478,9 +453,7 @@ class TestMetricsStore:
         store = MetricsStore(tmp_path / "metrics.db", max_history=5)
         store.initialize()
         for i in range(10):
-            store.record(
-                CallMetrics(server="s", tool=f"t{i}", original_chars=100, compressed_chars=50)
-            )
+            store.record(CallMetrics(server="s", tool=f"t{i}", original_chars=100, compressed_chars=50))
 
         history = store.get_history(limit=100)
         assert len(history) == 5  # trimmed to max_history
@@ -499,12 +472,8 @@ class TestMetricsStore:
 class TestTokenTracker:
     def test_basic_recording(self):
         tracker = TokenTracker()
-        tracker.record(
-            CallMetrics(server="gh", tool="list", original_chars=1000, compressed_chars=500)
-        )
-        tracker.record(
-            CallMetrics(server="gh", tool="search", original_chars=2000, compressed_chars=800)
-        )
+        tracker.record(CallMetrics(server="gh", tool="list", original_chars=1000, compressed_chars=500))
+        tracker.record(CallMetrics(server="gh", tool="search", original_chars=2000, compressed_chars=800))
 
         summary = tracker.get_summary()
         assert summary["total_calls"] == 2
@@ -515,9 +484,7 @@ class TestTokenTracker:
     def test_by_server_aggregation(self):
         tracker = TokenTracker()
         tracker.record(CallMetrics(server="gh", tool="t1", original_chars=100, compressed_chars=50))
-        tracker.record(
-            CallMetrics(server="fs", tool="t2", original_chars=200, compressed_chars=100)
-        )
+        tracker.record(CallMetrics(server="fs", tool="t2", original_chars=200, compressed_chars=100))
 
         summary = tracker.get_summary()
         assert "gh" in summary["by_server"]
@@ -544,9 +511,7 @@ class TestTokenTracker:
         store = MetricsStore(tmp_path / "metrics.db")
         store.initialize()
         tracker = TokenTracker(metrics_store=store)
-        tracker.record(
-            CallMetrics(server="gh", tool="list", original_chars=100, compressed_chars=50)
-        )
+        tracker.record(CallMetrics(server="gh", tool="list", original_chars=100, compressed_chars=50))
 
         # Check both in-memory and persistent
         assert tracker.get_summary()["total_calls"] == 1

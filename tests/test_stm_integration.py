@@ -51,8 +51,7 @@ class TestFullPipeline:
         # Stage 1: HTML content from upstream
         raw = (
             "<div><h1>API Reference</h1>"
-            "<p>This is the authentication endpoint.</p>"
-            * 20
+            "<p>This is the authentication endpoint.</p>" * 20
             + "<script>alert('xss')</script>"
             + "<a href='http://example.com'>link</a>" * 50
             + "</div>"
@@ -88,8 +87,7 @@ class TestFullPipeline:
             ),
         )
         final = await engine.surface(
-            "api",
-            "read_file",
+            "api", "read_file",
             {"path": "/src/auth/jwt_handler.py", "_context_query": "authentication JWT handler"},
             compressed,
         )
@@ -118,7 +116,6 @@ class TestSelectiveTwoPhase:
 
         # Extract selection key from TOC JSON
         import json
-
         toc_data = json.loads(toc)
         key = toc_data["selection_key"]
         entry_names = [e.get("title") or e.get("name", "") for e in toc_data["entries"]]

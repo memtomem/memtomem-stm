@@ -115,13 +115,11 @@ class RuleBasedJudge:
             found = _fuzzy_contains(qa.answer, response)
             if found:
                 answerable += 1
-            details.append(
-                {
-                    "question": qa.question,
-                    "answerable": found,
-                    "source": qa.source,
-                }
-            )
+            details.append({
+                "question": qa.question,
+                "answerable": found,
+                "source": qa.source,
+            })
         total = len(task.qa_pairs)
         return {
             "answerable": answerable,
