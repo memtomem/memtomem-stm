@@ -216,9 +216,7 @@ class TestSurfacingWarmupConfig:
         monkeypatch.setenv("MEMTOMEM_STM_SURFACING__WARMUP_ENABLED", "false")
         assert STMConfig().surfacing.warmup_enabled is False
 
-    def test_shared_daemon_route_is_explicit_opt_in(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_shared_daemon_route_is_explicit_opt_in(self, monkeypatch: pytest.MonkeyPatch) -> None:
         assert SurfacingConfig().use_daemon is False
         monkeypatch.setenv("MEMTOMEM_STM_SURFACING__USE_DAEMON", "true")
         assert STMConfig().surfacing.use_daemon is True
@@ -286,15 +284,11 @@ class TestLLMExternalDestination:
         assert cfg.is_external_destination() is True
 
     def test_ollama_localhost_is_local(self) -> None:
-        cfg = LLMCompressorConfig(
-            provider=LLMProvider.OLLAMA, base_url="http://localhost:11434"
-        )
+        cfg = LLMCompressorConfig(provider=LLMProvider.OLLAMA, base_url="http://localhost:11434")
         assert cfg.is_external_destination() is False
 
     def test_ollama_loopback_ip_is_local(self) -> None:
-        cfg = LLMCompressorConfig(
-            provider=LLMProvider.OLLAMA, base_url="http://127.0.0.1:11434"
-        )
+        cfg = LLMCompressorConfig(provider=LLMProvider.OLLAMA, base_url="http://127.0.0.1:11434")
         assert cfg.is_external_destination() is False
 
     def test_ollama_empty_base_url_is_local(self) -> None:
@@ -302,9 +296,7 @@ class TestLLMExternalDestination:
         assert cfg.is_external_destination() is False
 
     def test_ollama_remote_host_is_external(self) -> None:
-        cfg = LLMCompressorConfig(
-            provider=LLMProvider.OLLAMA, base_url="http://192.168.1.5:11434"
-        )
+        cfg = LLMCompressorConfig(provider=LLMProvider.OLLAMA, base_url="http://192.168.1.5:11434")
         assert cfg.is_external_destination() is True
 
 
@@ -558,9 +550,7 @@ class TestProxyConfigNonemptyPrefix:
             )
         assert "spaces" in str(exc_info.value)
 
-    def test_multiple_empty_prefixes_listed_together(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_multiple_empty_prefixes_listed_together(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         with pytest.raises(ValidationError) as exc_info:

@@ -2217,9 +2217,7 @@ class TestApplyProxyFileConfig:
         assert config.proxy.enabled is True  # env wins over the file's False
         assert set(config.proxy.upstream_servers) == {"gh"}  # file fields survive
 
-    def test_env_only_inert_upstreams_warn_on_the_no_swap_path(
-        self, tmp_path, monkeypatch, caplog
-    ):
+    def test_env_only_inert_upstreams_warn_on_the_no_swap_path(self, tmp_path, monkeypatch, caplog):
         """The env-only startup has no file, and `missing_ok=False` means the
         loader returns before it can warn about anything — so the advisory
         (#831) has to come from here, against the pydantic-settings config

@@ -5,7 +5,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .harness import ComparisonReport, CurvePoint, StageBreakdown, StrategyResult, SurfacingValue
+    from .harness import (
+        ComparisonReport,
+        CurvePoint,
+        StageBreakdown,
+        StrategyResult,
+        SurfacingValue,
+    )
 
 
 def format_report(comparisons: list[ComparisonReport]) -> str:

@@ -48,9 +48,7 @@ def _make_manager(
     mgr = ProxyManager(proxy_cfg, tracker)
 
     session = AsyncMock()
-    conn = UpstreamConnection(
-        name="srv", config=server_cfg, session=session, tools=[]
-    )
+    conn = UpstreamConnection(name="srv", config=server_cfg, session=session, tools=[])
     mgr._connections["srv"] = conn
     return mgr
 
@@ -141,13 +139,16 @@ class TestAutoSkeleton:
         mgr = _make_manager(max_result_chars=500)
         sections = []
         for method, path in [
-            ("GET", "/users"), ("POST", "/users"), ("GET", "/users/{id}"),
-            ("PUT", "/users/{id}"), ("DELETE", "/users/{id}"),
+            ("GET", "/users"),
+            ("POST", "/users"),
+            ("GET", "/users/{id}"),
+            ("PUT", "/users/{id}"),
+            ("DELETE", "/users/{id}"),
         ]:
             sections.append(
                 f"## {method} {path}\n\nDescription of endpoint.\n\n"
                 f"### Parameters\n\n- `id`: string\n\n"
-                f"### Response\n\n```json\n{{\"status\": \"ok\"}}\n```\n"
+                f'### Response\n\n```json\n{{"status": "ok"}}\n```\n'
             )
         text = "# API Reference\n\n" + "\n".join(sections)
         _get_session(mgr).call_tool.return_value = _make_result(text)
@@ -166,8 +167,7 @@ class TestAutoHybrid:
         """Large markdown (5+ headings, 5KB+) → HYBRID."""
         mgr = _make_manager(max_result_chars=1000)
         sections = [
-            f"## Section {i}\n\n{'Detailed content about topic. ' * 50}\n"
-            for i in range(10)
+            f"## Section {i}\n\n{'Detailed content about topic. ' * 50}\n" for i in range(10)
         ]
         text = "# Documentation\n\n" + "\n".join(sections)
         assert len(text) > 5000

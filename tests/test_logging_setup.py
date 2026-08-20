@@ -188,9 +188,7 @@ class TestConfigureServerLogging:
             logging.getLogger().handlers[0].flush()
             assert active is None
             handlers = [
-                h
-                for h in logging.getLogger().handlers
-                if isinstance(h, PrivateRotatingFileHandler)
+                h for h in logging.getLogger().handlers if isinstance(h, PrivateRotatingFileHandler)
             ]
             assert handlers == []
             assert "continuing with stderr only" in capsys.readouterr().err

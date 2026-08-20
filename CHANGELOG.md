@@ -278,10 +278,12 @@ changes inline only. See the deprecation policy in
   `parity_mismatches: 0` meant "never checked", and a `NaN` in one of the
   three execution fields built a report whose aggregate was non-finite and
   whose `--json` failed with `Out of range float values are not JSON
-  compliant`. The count is taken over every admitted record, independently of
-  whether some structural or cohort check abandoned that record first, so a
-  ranker-mismatched execution still reports the values it holds that cannot be
-  read. An **absent or `null`** field is not affected: nothing to read is not
+  compliant`. The count is a physical property of the file: it is taken as
+  each record is read, before any join, deduplication or cohort check can
+  abandon one, so a ranker-mismatched execution, a record dropped for a
+  missing `selection_id`, and both halves of a conflicting pair all still
+  report the values they hold that cannot be read — and a duplicated line
+  reports them twice. An **absent or `null`** field is not affected: nothing to read is not
   the same as something unreadable, and `cost` is nullable in the writer's own
   shape. *An aggregate no longer overflows*: finite samples whose sum or
   difference exceeds the float limit now yield the representable answer

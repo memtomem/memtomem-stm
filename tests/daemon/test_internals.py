@@ -1451,9 +1451,7 @@ class TestBrokenConfigObservability:
     def _broken_proxy_env(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         for name in [n for n in os.environ if n.startswith("MEMTOMEM_STM_PROXY")]:
             monkeypatch.delenv(name, raising=False)
-        monkeypatch.setenv(
-            "MEMTOMEM_STM_PROXY__CONFIG_PATH", str(tmp_path / "absent.json")
-        )
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(tmp_path / "absent.json"))
         monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND", "x")
 
     def test_daemon_server_run_logs_before_raising(self, caplog):

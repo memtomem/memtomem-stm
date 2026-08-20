@@ -557,8 +557,7 @@ class TestParseScratchListColonInKey:
 
     def test_key_with_colon_and_expires(self):
         text = (
-            "Working memory: 1 entries\n\n"
-            "  db: host: localhost... (expires: 2026-04-10T12:00:00)"
+            "Working memory: 1 entries\n\n  db: host: localhost... (expires: 2026-04-10T12:00:00)"
         )
         entries = self._parse(text)
         assert len(entries) == 1

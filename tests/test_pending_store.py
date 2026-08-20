@@ -44,6 +44,7 @@ class TestInMemoryPendingStore:
 
         assert store.get("selective") is None
         assert store.get("progressive") is not None
+
     def test_put_and_get(self):
         store = InMemoryPendingStore()
         sel = _make_selection()

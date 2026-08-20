@@ -155,7 +155,8 @@ MEETING_NOTES = """# Sprint Planning — 2026-04-01
 """
 
 
-HTML_MIXED = """<div class="api-docs">
+HTML_MIXED = (
+    """<div class="api-docs">
 <h1>API Reference</h1>
 <p>This is the main API documentation.</p>
 <script>console.log("tracking");</script>
@@ -176,27 +177,30 @@ HTML_MIXED = """<div class="api-docs">
 <p>Deletes a user by ID. Requires admin role.</p>
 
 <p>For more details, see the full documentation:</p>
-""" + "\n".join(
-    f"- [Endpoint {i}](https://docs.example.com/api/endpoint/{i})"
-    for i in range(30)
-) + """
+"""
+    + "\n".join(f"- [Endpoint {i}](https://docs.example.com/api/endpoint/{i})" for i in range(30))
+    + """
 
 </div>
 <p>Contact support@example.com for questions.</p>
 """
+)
 
 
 SHORT_RESPONSE = "OK. File saved successfully."
 
 
-MARKDOWN_WITH_LINKS = """# Resource Collection
+MARKDOWN_WITH_LINKS = (
+    """# Resource Collection
 
 ## Official Documentation
 
-""" + "\n".join(
-    f"- [Resource {i}](https://example.com/resource/{i}) — Description of resource {i}"
-    for i in range(50)
-) + """
+"""
+    + "\n".join(
+        f"- [Resource {i}](https://example.com/resource/{i}) — Description of resource {i}"
+        for i in range(50)
+    )
+    + """
 
 ## Key Concepts
 
@@ -206,7 +210,9 @@ The API gateway handles routing and rate limiting.
 
 ## Important Links
 
-""" + "\n".join(f"- https://example.com/link/{i}" for i in range(20))
+"""
+    + "\n".join(f"- https://example.com/link/{i}" for i in range(20))
+)
 
 
 MULTILINGUAL_KR_EN = """# 프로젝트 아키텍처 결정 (Architecture Decisions)
@@ -518,7 +524,9 @@ def get_surfacing_tasks() -> list[BenchTask]:
             surfacing_memories=AUTH_MEMORIES,
             qa_pairs=[
                 QAPair("What does the login function return?", "access_token", "content"),
-                QAPair("What error is raised for bad credentials?", "Invalid credentials", "content"),
+                QAPair(
+                    "What error is raised for bad credentials?", "Invalid credentials", "content"
+                ),
                 QAPair("What algorithm do auth tokens use?", "HS256", "memory"),
                 QAPair("What is the access token TTL?", "1-hour", "memory"),
                 QAPair("What is the rate limit for regular users?", "100 requests", "memory"),
@@ -549,7 +557,9 @@ def get_surfacing_tasks() -> list[BenchTask]:
 # Needle-in-haystack — critical info buried in noise
 # ═══════════════════════════════════════════════════════════════════════════
 
-_FILLER = "This paragraph contains general background information about the system architecture. " * 8
+_FILLER = (
+    "This paragraph contains general background information about the system architecture. " * 8
+)
 
 NEEDLE_HAYSTACK_TEXT = (
     "# System Documentation\n\n"
@@ -558,29 +568,38 @@ NEEDLE_HAYSTACK_TEXT = (
     "## Database Settings\n\n"
     "CRITICAL: Production database is hosted at db-prod.internal:5432 "
     "with connection pool max_size=25 and statement_timeout=30s. "
-    "Failover endpoint: db-standby.internal:5432.\n\n"
-    + _FILLER + "\n\n"
+    "Failover endpoint: db-standby.internal:5432.\n\n" + _FILLER + "\n\n"
     "## Monitoring\n\n" + _FILLER + "\n\n"
     "## Security\n\n"
     "API keys are rotated every 90 days. Current rotation date: 2026-05-01. "
-    "Emergency revocation via: vault kv delete secret/api-keys.\n\n"
-    + _FILLER
+    "Emergency revocation via: vault kv delete secret/api-keys.\n\n" + _FILLER
 )
 
-NEEDLE_HAYSTACK_JSON = json.dumps({
-    "servers": [
-        {"name": f"web-{i}", "ip": f"10.0.1.{i}", "status": "healthy", "cpu": "12%"}
-        for i in range(30)
-    ] + [
-        {"name": "db-primary", "ip": "10.0.5.1", "status": "degraded",
-         "cpu": "89%", "alert": "HIGH_CPU_CRITICAL", "since": "2026-04-06T14:00Z"}
-    ] + [
-        {"name": f"cache-{i}", "ip": f"10.0.2.{i}", "status": "healthy", "cpu": "5%"}
-        for i in range(10)
-    ],
-    "total": 41,
-    "alerts_active": 1,
-}, indent=2)
+NEEDLE_HAYSTACK_JSON = json.dumps(
+    {
+        "servers": [
+            {"name": f"web-{i}", "ip": f"10.0.1.{i}", "status": "healthy", "cpu": "12%"}
+            for i in range(30)
+        ]
+        + [
+            {
+                "name": "db-primary",
+                "ip": "10.0.5.1",
+                "status": "degraded",
+                "cpu": "89%",
+                "alert": "HIGH_CPU_CRITICAL",
+                "since": "2026-04-06T14:00Z",
+            }
+        ]
+        + [
+            {"name": f"cache-{i}", "ip": f"10.0.2.{i}", "status": "healthy", "cpu": "5%"}
+            for i in range(10)
+        ],
+        "total": 41,
+        "alerts_active": 1,
+    },
+    indent=2,
+)
 
 
 def get_needle_tasks() -> list[BenchTask]:
@@ -739,8 +758,11 @@ def get_multihop_tasks() -> list[BenchTask]:
                 QAPair("Why was pool set to 10?", "load test from 2025-11", "memory"),
                 QAPair("What is the SLA for order-api?", "99.9%", "memory"),
                 # Multi-hop (needs both content + memory to reason)
-                QAPair("Was the pool fix (50) consistent with previous post-mortem?",
-                       "min 25", "memory"),
+                QAPair(
+                    "Was the pool fix (50) consistent with previous post-mortem?",
+                    "min 25",
+                    "memory",
+                ),
                 QAPair("Which Slack channel to contact?", "#team-alpha", "memory"),
             ],
         ),

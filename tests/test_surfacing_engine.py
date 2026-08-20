@@ -3907,9 +3907,7 @@ class TestScaleGatedMinScore:
                 chunk=FakeChunk(content="foreign scale"), score=0.001, score_scale="bm25"
             )
         ]
-        engine = self._engine(
-            results, tracker=tracker, min_score=0.02, scale_gated_min_score=False
-        )
+        engine = self._engine(results, tracker=tracker, min_score=0.02, scale_gated_min_score=False)
         out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
         assert out == LONG_RESPONSE
         tracker.record_diagnostic.assert_called_once_with("gh", "read_file", "score_scale_mismatch")
@@ -3942,7 +3940,10 @@ class TestScaleGatedMinScore:
         engine = self._engine(results, tracker=tracker, min_score=0.02)
         for i in range(5):
             out = await engine.surface(
-                "gh", "read_file", {"_context_query": f"unrecognized scale query {i}"}, LONG_RESPONSE
+                "gh",
+                "read_file",
+                {"_context_query": f"unrecognized scale query {i}"},
+                LONG_RESPONSE,
             )
             assert out == LONG_RESPONSE
         tracker.record_diagnostic.assert_called_once_with(
@@ -4115,9 +4116,7 @@ class TestScaleGatedMinScore:
 
     async def test_snapshot_reports_gate_disabled(self):
         results = [
-            FakeSearchResult(
-                chunk=FakeChunk(content="gate off"), score=0.5, score_scale="rerank"
-            )
+            FakeSearchResult(chunk=FakeChunk(content="gate off"), score=0.5, score_scale="rerank")
         ]
         engine = self._engine(results, min_score=0.02, scale_gated_min_score=False)
         await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)

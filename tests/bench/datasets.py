@@ -152,7 +152,14 @@ def json_tasks() -> list[BenchTask]:
             content=_JSON_API_RESPONSE,
             content_type="json",
             max_chars=400,
-            expected_keywords=["Alice Park", "Bob Chen", "Carla Ruiz", "admin", "developer", "designer"],
+            expected_keywords=[
+                "Alice Park",
+                "Bob Chen",
+                "Carla Ruiz",
+                "admin",
+                "developer",
+                "designer",
+            ],
             keyword_weights=[0.2, 0.2, 0.2, 0.1, 0.1, 0.1],
             qa_pairs=[
                 QAPair("What role does Alice Park have?", "admin"),
@@ -361,7 +368,15 @@ def markdown_tasks() -> list[BenchTask]:
             content=_MD_TECHNICAL_DOC,
             content_type="markdown",
             max_chars=800,
-            expected_keywords=["HNSW", "IVF", "Pinecone", "Weaviate", "Qdrant", "recall", "latency"],
+            expected_keywords=[
+                "HNSW",
+                "IVF",
+                "Pinecone",
+                "Weaviate",
+                "Qdrant",
+                "recall",
+                "latency",
+            ],
             expect_headings=4,
             qa_pairs=[
                 QAPair("Which engine has the highest QPS with HNSW?", "Qdrant"),
@@ -494,7 +509,7 @@ class UserActivityETL:
         return [self.run(datetime.utcnow() - timedelta(days=i + 1)) for i in range(days)]
 '''
 
-_CODE_TYPESCRIPT_HOOKS = '''// React custom hooks for data fetching with caching and retry
+_CODE_TYPESCRIPT_HOOKS = """// React custom hooks for data fetching with caching and retry
 import { useState, useEffect, useCallback, useRef } from "react";
 
 interface FetchOptions {
@@ -571,7 +586,7 @@ export function useDebounce<T>(value: T, delay: number): T {
   useEffect(() => { const t = setTimeout(() => setDebounced(value), delay); return () => clearTimeout(t); }, [value, delay]);
   return debounced;
 }
-'''
+"""
 
 
 def code_tasks() -> list[BenchTask]:
@@ -582,7 +597,14 @@ def code_tasks() -> list[BenchTask]:
             content=_CODE_PYTHON_ETL,
             content_type="code",
             max_chars=800,
-            expected_keywords=["ETLConfig", "UserActivityETL", "extract", "transform", "load", "backfill"],
+            expected_keywords=[
+                "ETLConfig",
+                "UserActivityETL",
+                "extract",
+                "transform",
+                "load",
+                "backfill",
+            ],
             expect_code_blocks=1,
             qa_pairs=[
                 QAPair("What is the default batch size?", "5000"),
@@ -695,7 +717,14 @@ def text_tasks() -> list[BenchTask]:
             content=_TEXT_INCIDENT_REPORT,
             content_type="text",
             max_chars=800,
-            expected_keywords=["INC-2025-0613", "payment-gateway", "schema migration", "ACCESS EXCLUSIVE", "Jordan", "Marcus"],
+            expected_keywords=[
+                "INC-2025-0613",
+                "payment-gateway",
+                "schema migration",
+                "ACCESS EXCLUSIVE",
+                "Jordan",
+                "Marcus",
+            ],
             qa_pairs=[
                 QAPair("How long was the incident?", "95 minutes"),
                 QAPair("How many customers were affected?", "14,200"),

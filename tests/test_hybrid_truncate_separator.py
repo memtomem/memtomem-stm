@@ -16,8 +16,10 @@ from memtomem_stm.proxy.config import TailMode
 # Plain prose tail (no headings/code/lists) so TruncateCompressor takes its
 # position-based fallback and appends the ``... (truncated, original: N chars)``
 # suffix — the marker the separator must not duplicate.
-_TEXT = "# Intro\n\n" + "Important head context here. " * 8 + (
-    "\n\nTail prose sentence number that keeps going on and on. " * 200
+_TEXT = (
+    "# Intro\n\n"
+    + "Important head context here. " * 8
+    + ("\n\nTail prose sentence number that keeps going on and on. " * 200)
 )
 
 

@@ -540,6 +540,57 @@ def test_unusable_numbers_survives_a_structural_violation(tmp_path: Path) -> Non
     assert report["data_quality"]["unusable_numbers"] == 2
 
 
+def test_unusable_numbers_counts_records_the_fold_discards(tmp_path: Path) -> None:
+    """The count is a property of the file, not of what survives the join."""
+    log = tmp_path / "selection.jsonl"
+    no_id = _execution()
+    no_id.pop("selection_id")
+    no_id["latency_ms"] = float("nan")
+    # A conflicting pair: neither copy survives, but both hold unreadable values.
+    left, right = _execution("sel-9"), _execution("sel-9")
+    left["latency_ms"] = float("nan")
+    right["latency_ms"] = "fast"
+    right["ok"] = False
+    _write_jsonl(log, [no_id, left, right])
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["data_quality"]["missing_selection_id"] == 1
+    assert report["data_quality"]["conflicting_records"] == 1
+    assert report["data_quality"]["unusable_numbers"] == 3
+
+
+def test_unusable_numbers_counts_a_duplicated_line_twice(tmp_path: Path) -> None:
+    """Physically, not logically — the file holds the value on both lines."""
+    log = tmp_path / "selection.jsonl"
+    execution = _execution()
+    execution["cost"] = float("inf")
+    _write_jsonl(log, [_selection(), execution, execution])
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["data_quality"]["duplicate_records"] == 1
+    assert report["data_quality"]["unusable_numbers"] == 2
+
+
+def test_feedback_records_contribute_no_unusable_numbers(tmp_path: Path) -> None:
+    """They carry none of the six fields; a stray numeric key is not one."""
+    log = tmp_path / "selection.jsonl"
+    feedback = {
+        "schema_version": 1,
+        "event": "feedback",
+        "selection_id": "sel-1",
+        "user_corrected": True,
+        "latency_ms": float("nan"),
+    }
+    _write_jsonl(log, [_selection(), _execution(), feedback])
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["production"]["coverage"]["feedback_selections"] == 1
+    assert report["data_quality"]["unusable_numbers"] == 0
+
+
 def test_mean_of_three_maximum_floats_is_that_maximum(tmp_path: Path) -> None:
     """Both the summing and the dividing form overflow here; the mean does not."""
     log = tmp_path / "selection.jsonl"

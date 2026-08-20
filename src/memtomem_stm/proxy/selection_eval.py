@@ -603,14 +603,22 @@ def _read_telemetry(
 
 
 def _unusable_numbers(record: dict[str, Any]) -> int:
-    """How many numeric fields on one admitted record hold no usable number.
+    """How many numeric fields on one record hold no usable number.
 
     A present value that is not a real number — a string, a boolean, a
     container, ``NaN``/``Infinity``, or an integer too large for a float — is
     unreadable whatever its type. Absent and ``null`` are not counted: nothing
     to read is not the same as something unreadable, and ``cost`` is nullable
     in the writer's own shape.
+
+    Counted per record as read, which makes the total a physical property of
+    the file: a record dropped for a missing id, or one of a conflicting pair
+    neither of which survives, still holds values nobody can read, and a
+    duplicated line holds them twice. ``feedback`` carries none of these
+    fields and always returns zero.
     """
+    if record.get("event") == "feedback":
+        return 0
     if record.get("event") == "execution":
         holders: list[dict[str, Any]] = [record]
         fields = ("latency_ms", "retry_count", "cost")
@@ -637,9 +645,11 @@ def _observed_telemetry(records: list[dict[str, Any]], quality: dict[str, Any]) 
     duplicate_bytes = conflicting = 0
     poisoned: set[tuple[str, str]] = set()
     events: Counter[str] = Counter()
+    unusable_numbers = 0
     for record in records:
         event = str(record["event"])
         events[event] += 1
+        unusable_numbers += _unusable_numbers(record)
         sid = record.get("selection_id")
         if not isinstance(sid, str) or not sid:
             quality["status"] = "invalid"
@@ -681,15 +691,6 @@ def _observed_telemetry(records: list[dict[str, Any]], quality: dict[str, Any]) 
     rankable = selected_at_1 = selected_at_3 = selected_at_5 = 0
     parity_mismatches = invariant_violations = ranker_mismatches = 0
     parity_checked = 0
-    # Counted over every admitted record, not inside the loop below: that loop
-    # abandons a record on a structural or cohort verdict, and "this log holds
-    # values I cannot read" must not depend on whether some other check
-    # happened to fire first (#856).
-    unusable_numbers = sum(
-        _unusable_numbers(record)
-        for bucket in (selections, executions)
-        for record in bucket.values()
-    )
     latencies: list[float] = []
     ok = errors = cache_hit = cache_miss = cache_unknown = 0
     retry_values: list[float] = []

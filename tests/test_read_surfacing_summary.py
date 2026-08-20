@@ -18,7 +18,9 @@ def _seed(db_path: Path) -> None:
     store = FeedbackStore(db_path)
     store.initialize()
     try:
-        store.record_surfacing("s1", "c7", "query-docs", "secret query text", ["m1", "m2"], [0.9, 0.5])
+        store.record_surfacing(
+            "s1", "c7", "query-docs", "secret query text", ["m1", "m2"], [0.9, 0.5]
+        )
         store.record_surfacing("s2", "lf", "search", "another query", ["m3"], [0.8])
         store.record_feedback("s1", "helpful", "m1")
         store.record_feedback("s2", "not_relevant", "m3")

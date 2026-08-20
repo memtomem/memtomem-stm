@@ -861,9 +861,7 @@ class TestAggregateSelectionLog:
         agg = aggregate_selection_log(p)
         assert agg["cache"] == {"hit": 0, "miss": 0, "unknown": 0, "hit_rate": 0.0}
 
-
-# ── find_selection / discover_log_files (#469 labelling) ───────────────────
-
+    # ── find_selection / discover_log_files (#469 labelling) ───────────────────
 
     def test_a_directory_it_cannot_list_costs_the_backup_count_not_the_stats(self, tmp_path):
         """The aggregate's own contract: it summarizes what it could read.
@@ -1795,7 +1793,7 @@ class TestRecordsFrameThemselves:
 
 
 class TestUnreadableSegmentIsNotAnAbsentOne:
-    """"I could not look there" is not "no such selection".
+    """ "I could not look there" is not "no such selection".
 
     A segment the reader cannot read is refused, not skipped: dropping one
     silently promotes an older row to "most recent", which is a label on a
@@ -2109,10 +2107,7 @@ class TestUnlabellableSelections:
         assert _run_feedback(tmp_path, log_path, "--last", "--user-corrected").exit_code == 0
         # Read tolerantly: the undecodable line is still in the file, and the
         # point of the test is which record the LABEL names.
-        labels = [
-            record["selection_id"]
-            for record in _tolerant_feedback_records(log_path)
-        ]
+        labels = [record["selection_id"] for record in _tolerant_feedback_records(log_path)]
         assert labels == ["older"]
 
         control = tmp_path / "control.jsonl"
@@ -2135,9 +2130,7 @@ def _tolerant_feedback_records(path: Path) -> list[dict]:
 
 
 class TestUnconfirmedWriteIsReported:
-    def test_an_unflushed_label_is_neither_success_nor_a_clean_failure(
-        self, tmp_path, monkeypatch
-    ):
+    def test_an_unflushed_label_is_neither_success_nor_a_clean_failure(self, tmp_path, monkeypatch):
         """The operator is told what is and is not known.
 
         Reporting success would promise durability nothing proved; reporting a
@@ -2607,11 +2600,7 @@ class TestSelectionFeedbackRobustness:
         log_path = tmp_path / "log.jsonl"
         _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a"}])
         sid = json.loads(
-            next(
-                line
-                for line in log_path.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            )
+            next(line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip())
         )["selection_id"]
         result = _run_feedback(
             tmp_path, log_path, "--selection-id", sid, "--user-corrected", yes=False
@@ -3108,7 +3097,7 @@ class TestSelectionFeedbackRobustness:
     def test_a_reachability_probe_that_cannot_run_is_unconfirmed_not_written(
         self, tmp_path, monkeypatch
     ):
-        """"I could not tell" is not "it is there".
+        """ "I could not tell" is not "it is there".
 
         The probe answering an optimistic ``True`` on its own failure would put
         the overstatement back one level down: the append would report

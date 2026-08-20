@@ -59,7 +59,9 @@ class TestBenchReport:
         print("\n" + "=" * 70)
         print("BENCHMARK REPORT — v0.1.0")
         print("=" * 70)
-        print(f"\nTasks: {len(comparisons)} ({len(compressed)} compressed, {len(passthrough)} passthrough)")
+        print(
+            f"\nTasks: {len(comparisons)} ({len(compressed)} compressed, {len(passthrough)} passthrough)"
+        )
         print(f"Overall quality:      {overall_avg:.2f}/10")
         print(f"Compressed-only:      {compressed_avg:.2f}/10")
         print(f"Compression savings:  {savings_pct:.1f}%")
@@ -81,11 +83,17 @@ class TestBenchReport:
         print(f"\n{'Category':<20} {'N':>4} {'Mean':>6} {'Std':>6}")
         print("-" * 40)
         for cat, stats in sorted(summary.by_category.items()):
-            print(f"  {cat:<18} {stats.n_tasks:>4} {stats.mean_quality:>6.2f} {stats.std_quality:>6.2f}")
-        print(f"  {'OVERALL':<18} {summary.overall.n_tasks:>4} {summary.overall.mean_quality:>6.2f} {summary.overall.std_quality:>6.2f}")
+            print(
+                f"  {cat:<18} {stats.n_tasks:>4} {stats.mean_quality:>6.2f} {stats.std_quality:>6.2f}"
+            )
+        print(
+            f"  {'OVERALL':<18} {summary.overall.n_tasks:>4} {summary.overall.mean_quality:>6.2f} {summary.overall.std_quality:>6.2f}"
+        )
         print("=" * 70)
 
         # Assertions
-        assert summary.overall.mean_quality >= 8.0, f"Overall quality {summary.overall.mean_quality:.2f} < 8.0"
+        assert summary.overall.mean_quality >= 8.0, (
+            f"Overall quality {summary.overall.mean_quality:.2f} < 8.0"
+        )
         assert len(low) == 0, f"{len(low)} tasks below 6.0: {low}"
         assert savings_pct > 50, f"Compression savings {savings_pct:.1f}% < 50%"

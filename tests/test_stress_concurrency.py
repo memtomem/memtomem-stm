@@ -50,9 +50,7 @@ def _make_manager(
     mgr = ProxyManager(proxy_cfg, tracker)
 
     session = AsyncMock()
-    conn = UpstreamConnection(
-        name="srv", config=server_cfg, session=session, tools=[]
-    )
+    conn = UpstreamConnection(name="srv", config=server_cfg, session=session, tools=[])
     mgr._connections["srv"] = conn
     return mgr
 
@@ -149,10 +147,7 @@ class TestConcurrentCalls:
 
         session.call_tool.side_effect = mock_call_tool
 
-        tasks = [
-            mgr.call_tool("srv", f"tool_{i}", {})
-            for i in range(20)
-        ]
+        tasks = [mgr.call_tool("srv", f"tool_{i}", {}) for i in range(20)]
         results = await asyncio.gather(*tasks)
 
         assert len(results) == 20
@@ -204,8 +199,7 @@ class TestConcurrentCalls:
         session = _get_session(mgr)
 
         md = "# Doc\n\n" + "\n".join(
-            f"## Section {i}\n\nParagraph with details about topic {i}.\n"
-            for i in range(50)
+            f"## Section {i}\n\nParagraph with details about topic {i}.\n" for i in range(50)
         )
         session.call_tool.return_value = _make_result(md)
 
@@ -219,12 +213,17 @@ class TestConcurrentCalls:
         """Different servers with different strategies called concurrently."""
         # Two servers with different compression
         srv1_cfg = UpstreamServerConfig(
-            prefix="s1", compression=CompressionStrategy.TRUNCATE,
-            max_result_chars=500, max_retries=0, reconnect_delay_seconds=0.0,
+            prefix="s1",
+            compression=CompressionStrategy.TRUNCATE,
+            max_result_chars=500,
+            max_retries=0,
+            reconnect_delay_seconds=0.0,
         )
         srv2_cfg = UpstreamServerConfig(
-            prefix="s2", compression=CompressionStrategy.NONE,
-            max_retries=0, reconnect_delay_seconds=0.0,
+            prefix="s2",
+            compression=CompressionStrategy.NONE,
+            max_retries=0,
+            reconnect_delay_seconds=0.0,
         )
         proxy_cfg = ProxyConfig(
             config_path=Path("/tmp/proxy.json"),
@@ -244,10 +243,9 @@ class TestConcurrentCalls:
             name="srv2", config=srv2_cfg, session=session2, tools=[]
         )
 
-        tasks = (
-            [mgr.call_tool("srv1", "tool", {}) for _ in range(5)]
-            + [mgr.call_tool("srv2", "tool", {}) for _ in range(5)]
-        )
+        tasks = [mgr.call_tool("srv1", "tool", {}) for _ in range(5)] + [
+            mgr.call_tool("srv2", "tool", {}) for _ in range(5)
+        ]
         results = await asyncio.gather(*tasks)
         assert len(results) == 10
         assert mgr.tracker.get_summary()["total_calls"] == 10
@@ -281,6 +279,7 @@ class TestSelectiveCompressorStress:
     def test_deeply_nested_json(self):
         """Compressor handles deeply nested JSON without recursion error."""
         import json
+
         data = {"level": 0}
         current = data
         for i in range(1, 50):
@@ -312,6 +311,7 @@ class TestTruncateCompressorStress:
 
     def test_large_json_array(self):
         import json
+
         comp = TruncateCompressor()
         data = [{"id": i, "value": f"item_{i}" * 20} for i in range(10000)]
         text = json.dumps(data)
@@ -374,12 +374,16 @@ class TestMetricsUnderLoad:
     async def test_by_server_breakdown(self):
         """Per-server metrics are correctly bucketed under concurrent load."""
         srv1_cfg = UpstreamServerConfig(
-            prefix="a", compression=CompressionStrategy.NONE,
-            max_retries=0, reconnect_delay_seconds=0.0,
+            prefix="a",
+            compression=CompressionStrategy.NONE,
+            max_retries=0,
+            reconnect_delay_seconds=0.0,
         )
         srv2_cfg = UpstreamServerConfig(
-            prefix="b", compression=CompressionStrategy.NONE,
-            max_retries=0, reconnect_delay_seconds=0.0,
+            prefix="b",
+            compression=CompressionStrategy.NONE,
+            max_retries=0,
+            reconnect_delay_seconds=0.0,
         )
         proxy_cfg = ProxyConfig(
             config_path=Path("/tmp/proxy.json"),
@@ -399,10 +403,9 @@ class TestMetricsUnderLoad:
             name="s2", config=srv2_cfg, session=s2_session, tools=[]
         )
 
-        tasks = (
-            [mgr.call_tool("s1", "t", {}) for _ in range(10)]
-            + [mgr.call_tool("s2", "t", {}) for _ in range(10)]
-        )
+        tasks = [mgr.call_tool("s1", "t", {}) for _ in range(10)] + [
+            mgr.call_tool("s2", "t", {}) for _ in range(10)
+        ]
         await asyncio.gather(*tasks)
 
         s = mgr.tracker.get_summary()

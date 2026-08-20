@@ -104,6 +104,15 @@ class TestFiniteNumber:
     def test_unusable_values_are_none(self, value, why):
         assert finite_number(value) is None, why
 
+    def test_int_subclass_refusing_float_is_none_not_a_crash(self):
+        # JSON cannot produce this, but "total by construction" has to hold
+        # for a programmatic caller too (#856).
+        class Refuses(int):
+            def __float__(self):
+                raise TypeError("no")
+
+        assert finite_number(Refuses(3)) is None
+
     def test_zero_is_a_value_not_an_absence(self):
         # The whole point of returning None rather than a default.
         assert finite_number(0) == 0.0

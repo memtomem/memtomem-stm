@@ -12,7 +12,6 @@ These tests verify that STM delivers actual value:
 from __future__ import annotations
 
 
-
 from memtomem_stm.proxy.cleaning import DefaultContentCleaner
 from memtomem_stm.proxy.compression import (
     FieldExtractCompressor,
@@ -43,7 +42,8 @@ class TestQueryExtractionQuality:
     def test_file_path_tokenized_into_query(self):
         """File paths are split into meaningful tokens for search."""
         query = self.extractor.extract_query(
-            "fs", "read_file",
+            "fs",
+            "read_file",
             {"path": "/src/auth/jwt_handler.py"},
             self.config,
         )
@@ -55,7 +55,8 @@ class TestQueryExtractionQuality:
     def test_explicit_context_query_preferred(self):
         """_context_query overrides heuristic extraction."""
         query = self.extractor.extract_query(
-            "fs", "read_file",
+            "fs",
+            "read_file",
             {"path": "/tmp/x.py", "_context_query": "authentication token refresh"},
             self.config,
         )
@@ -64,7 +65,8 @@ class TestQueryExtractionQuality:
     def test_uuid_excluded_from_query(self):
         """UUIDs should not appear in queries — they're not semantically useful."""
         query = self.extractor.extract_query(
-            "db", "get_record",
+            "db",
+            "get_record",
             {"id": "550e8400-e29b-41d4-a716-446655440000", "table": "users profile data"},
             self.config,
         )
@@ -74,7 +76,8 @@ class TestQueryExtractionQuality:
     def test_hex_string_excluded(self):
         """Long hex strings (commit hashes etc.) excluded."""
         query = self.extractor.extract_query(
-            "git", "show_commit",
+            "git",
+            "show_commit",
             {"hash": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", "repo": "memtomem project repo"},
             self.config,
         )
@@ -84,7 +87,9 @@ class TestQueryExtractionQuality:
     def test_short_query_rejected(self):
         """Queries with < 3 tokens are rejected (too vague to search)."""
         query = self.extractor.extract_query(
-            "fs", "stat", {"path": "/tmp"},
+            "fs",
+            "stat",
+            {"path": "/tmp"},
             self.config,
         )
         # /tmp alone is too short for a useful query
@@ -104,7 +109,8 @@ class TestQueryExtractionQuality:
             }
         )
         query = self.extractor.extract_query(
-            "gh", "search_code",
+            "gh",
+            "search_code",
             {"query": "authentication middleware", "language": "python"},
             config,
         )
@@ -115,7 +121,8 @@ class TestQueryExtractionQuality:
     def test_semantic_keys_prioritized(self):
         """Keys like 'query', 'search', 'topic' are preferred over generic keys."""
         query = self.extractor.extract_query(
-            "api", "fetch",
+            "api",
+            "fetch",
             {"url": "https://example.com/api", "query": "deployment configuration"},
             self.config,
         )
@@ -137,8 +144,12 @@ class TestGatingEffectiveness:
         """Writing/mutating tools should never trigger surfacing."""
         gate = RelevanceGate(SurfacingConfig())
         write_tools = [
-            "write_file", "create_issue", "delete_branch",
-            "push_changes", "send_message", "remove_label",
+            "write_file",
+            "create_issue",
+            "delete_branch",
+            "push_changes",
+            "send_message",
+            "remove_label",
         ]
         for tool in write_tools:
             assert not gate.should_surface("any", tool, "some query here"), (
@@ -149,8 +160,12 @@ class TestGatingEffectiveness:
         """Reading/querying tools should be allowed."""
         gate = RelevanceGate(SurfacingConfig(cooldown_seconds=0))
         read_tools = [
-            "read_file", "list_repos", "get_issue",
-            "search_code", "show_diff", "fetch_page",
+            "read_file",
+            "list_repos",
+            "get_issue",
+            "search_code",
+            "show_diff",
+            "fetch_page",
         ]
         for tool in read_tools:
             assert gate.should_surface("any", tool, f"query about {tool}"), (
@@ -159,10 +174,12 @@ class TestGatingEffectiveness:
 
     def test_rate_limit_prevents_spam(self):
         """Rate limiting prevents excessive surfacing."""
-        gate = RelevanceGate(SurfacingConfig(
-            max_surfacings_per_minute=3,
-            cooldown_seconds=0,
-        ))
+        gate = RelevanceGate(
+            SurfacingConfig(
+                max_surfacings_per_minute=3,
+                cooldown_seconds=0,
+            )
+        )
         # First 3 should pass
         for i in range(3):
             q = f"unique query number {i} here"
@@ -232,9 +249,7 @@ class TestCompressionEffectiveness:
         """Selective compression produces a TOC that preserves document structure."""
         import json
 
-        sections = "\n\n".join(
-            f"# Section {i}\n\n{'Detail for section. ' * 30}" for i in range(5)
-        )
+        sections = "\n\n".join(f"# Section {i}\n\n{'Detail for section. ' * 30}" for i in range(5))
         comp = SelectiveCompressor(min_section_chars=10)
         result = comp.compress(sections, max_chars=300)
         toc = json.loads(result)
@@ -419,8 +434,7 @@ class TestAutoStrategySelection:
 
         # Large markdown (5000+ chars, 5+ headings) → HYBRID
         sections = "\n\n".join(
-            f"## Section {i}\n\n" + f"Content for section {i}. " * 50
-            for i in range(6)
+            f"## Section {i}\n\n" + f"Content for section {i}. " * 50 for i in range(6)
         )
         text = f"# Title\n\n{sections}"
         assert auto_select_strategy(text) == CompressionStrategy.HYBRID

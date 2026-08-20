@@ -72,9 +72,7 @@ class TestResolveCliConfigPath:
         assert resolved.path == "/tmp/bare-block.json"
         assert resolved.source == "env"
 
-    def test_deeper_variable_beats_the_bare_payload(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_deeper_variable_beats_the_bare_payload(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Same precedence the settings overlay gives the server.
         monkeypatch.setenv("MEMTOMEM_STM_PROXY", '{"config_path": "/tmp/bare-block.json"}')
         monkeypatch.setenv(_CONFIG_PATH_ENV, "/tmp/deeper.json")
