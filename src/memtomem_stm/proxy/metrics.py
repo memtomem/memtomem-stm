@@ -106,7 +106,11 @@ class ErrorCategory(StrEnum):
 def _percentile(sorted_vals: list[float], p: float) -> float:
     """Compute the *p*-th percentile (0-100) from a pre-sorted list.
 
-    Uses linear interpolation between closest ranks (same as numpy 'linear').
+    Uses linear interpolation between closest ranks (same as numpy 'linear'),
+    in the weighted form ``lo*(1-frac) + hi*frac`` rather than
+    ``lo + frac*(hi-lo)``. The two agree mathematically, but the difference
+    form overflows to ``inf`` on finite inputs of opposite sign near the float
+    limit, and a percentile always lies between two samples (#856).
     """
     if not sorted_vals:
         return 0.0
@@ -117,7 +121,7 @@ def _percentile(sorted_vals: list[float], p: float) -> float:
     lo = int(math.floor(k))
     hi = min(lo + 1, n - 1)
     frac = k - lo
-    return sorted_vals[lo] + frac * (sorted_vals[hi] - sorted_vals[lo])
+    return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
 
 
 @dataclass

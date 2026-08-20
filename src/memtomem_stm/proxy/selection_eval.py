@@ -95,17 +95,27 @@ def _ratio(numerator: int, denominator: int) -> dict[str, int | float | None]:
 def _finite(value: float) -> float | None:
     """A rounded aggregate, or ``None`` when it is not finite.
 
-    Guarding the inputs does not bound the output: two admitted values of
-    ``1e308`` are each finite and sum to ``inf``, which would fail strict JSON
-    serialization exactly as an admitted ``NaN`` used to (#856). ``None`` is
-    the same answer the empty case already gives — no usable aggregate — and
-    the denominator beside it still reports how many samples there were.
+    A backstop, not the mechanism: the aggregates below are computed in forms
+    that cannot overflow finite inputs, because a mean and a percentile both
+    lie between the samples they summarize and so are always representable
+    (#856). This catches anything those forms miss rather than emitting a
+    value strict JSON refuses.
     """
     return round(value, 6) if math.isfinite(value) else None
 
 
 def _mean(values: list[float]) -> float | None:
-    return _finite(sum(values) / len(values)) if values else None
+    """The arithmetic mean, dividing before summing.
+
+    ``sum(values) / len(values)`` overflows to ``inf`` on finite inputs whose
+    total exceeds the float limit — two admitted ``1e308`` values have a mean
+    of ``1e308``, which is perfectly representable, so reporting nothing there
+    would be losing an answer rather than refusing a bad one.
+    """
+    if not values:
+        return None
+    count = len(values)
+    return _finite(sum(value / count for value in values))
 
 
 def _percentile(values: list[float], percentile: float) -> float | None:
@@ -118,8 +128,10 @@ def _percentile(values: list[float], percentile: float) -> float | None:
     low, high = math.floor(rank), math.ceil(rank)
     if low == high:
         return _finite(ordered[low])
-    value = ordered[low] + (ordered[high] - ordered[low]) * (rank - low)
-    return _finite(value)
+    # Weighted form, not `low + (high - low) * frac`: the difference overflows
+    # on finite samples of opposite sign, though the result lies between them.
+    frac = rank - low
+    return _finite(ordered[low] * (1.0 - frac) + ordered[high] * frac)
 
 
 def _dataset_bytes(path: Path) -> bytes:
@@ -817,15 +829,22 @@ def evaluate_selection(
     The function is pure with respect to its inputs: it never writes files or
     modifies runtime configuration.  ``telemetry_path=None`` runs corpus-only.
     """
-    if not 0.0 <= baseline_review_penalty <= 1.0 or baseline_graph_scale < 0.0:
+    # `float()` is not total and `ge=0` does not reject `inf`, so a baseline
+    # can be non-finite or unrepresentable before it reaches the report (#856).
+    baseline_review = finite_number(baseline_review_penalty)
+    baseline_scale = finite_number(baseline_graph_scale)
+    if (
+        baseline_review is None
+        or baseline_scale is None
+        or not 0.0 <= baseline_review <= 1.0
+        or baseline_scale < 0.0
+    ):
         raise SelectionEvaluationError("invalid baseline penalty values")
     dataset = load_selection_dataset(dataset_path)
     grid = {(review, graph) for review in GRID_REVIEW for graph in GRID_GRAPH}
-    grid.add((float(baseline_review_penalty), float(baseline_graph_scale)))
+    grid.add((baseline_review, baseline_scale))
     variants = [_evaluate_variant(dataset, review, graph) for review, graph in sorted(grid)]
-    recommendation = _recommend_variant(
-        variants, float(baseline_review_penalty), float(baseline_graph_scale)
-    )
+    recommendation = _recommend_variant(variants, baseline_review, baseline_scale)
     if telemetry_path is None:
         quality: dict[str, Any] = {
             "status": "ok",

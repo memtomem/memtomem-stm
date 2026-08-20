@@ -258,32 +258,43 @@ changes inline only. See the deprecation policy in
   and every value it rejects is counted in a new `data_quality.unusable_numbers`.
 
   Two further gaps of the same shape are closed with it. Guarding the inputs
-  does not bound the outputs, so `_mean` and `_percentile` now report `None`
-  rather than a non-finite aggregate: two admitted values of `1e308` are each
-  finite and sum to `inf`. And `parity_mismatches` ships beside a new
-  `parity_checked` denominator, because `0` mismatches otherwise reads as a
-  clean bill of health even when nothing was checkable.
+  does not bound the arithmetic, so the aggregates are now computed in forms
+  that cannot overflow finite samples — the mean divides before summing, and
+  percentiles interpolate as `low*(1-f) + high*f` rather than
+  `low + f*(high-low)`. Both answers were always representable: the mean of
+  two `1e308` values is `1e308`, and the median of `-1e308` and `1e308` is
+  `0`; the old forms reached `inf` on the way there. And `parity_mismatches`
+  ships beside a new `parity_checked` denominator, because `0` mismatches
+  otherwise reads as a clean bill of health even when nothing was checkable.
 
-  **Behavior change**, as measured against the previous release across
-  thirteen inputs. *A traceback becomes a report*: an oversized integer in any
-  of the six fields. *A silent or unserializable result becomes an `invalid`
-  report*, so the command exits 1 where it exited 0 — a `NaN` in one of the
-  three score fields used to leave a `status: ok` report whose
+  **Behavior change**, as measured against the previous release. *A traceback
+  becomes a report*: an oversized integer in any of the six fields. *A silent
+  or unserializable result becomes an `invalid` report*, so the command exits
+  1 where it exited 0. That covers every value in those fields that is not a
+  real number — `NaN` and `Infinity`, and also a string, a boolean, an array
+  or an object, which were previously ignored without a trace. Before, a
+  `NaN` in one of the three score fields left a `status: ok` report whose
   `parity_mismatches: 0` meant "never checked", and a `NaN` in one of the
-  three execution fields used to build a report whose aggregate was non-finite
-  and whose `--json` failed with `Out of range float values are not JSON
-  compliant`. *An aggregate that overflows finite inputs reports no value*:
-  the metric's `value` is `None` beside its unchanged denominator, and the
-  report stays `status: ok` — nothing was unreadable, only unrepresentable.
+  three execution fields built a report whose aggregate was non-finite and
+  whose `--json` failed with `Out of range float values are not JSON
+  compliant`. An **absent or `null`** field is not affected: nothing to read
+  is not the same as something unreadable, and `cost` is nullable in the
+  writer's own shape. *An aggregate no longer overflows*: two finite samples
+  whose sum or difference exceeds the float limit now yield the representable
+  answer instead of `inf`.
 
-  Two sibling readers are fixed with the same predicate. `mms selection stats`
-  (`aggregate_selection_log`) dropped its `latency_ms` sample through the
-  identical pattern, raising `OverflowError` out of a path documented to treat
-  an unreadable file like an absent one, and pooling `NaN` into its
-  percentiles. And a custom `--dataset` carrying an oversized
+  Three sibling readers are fixed alongside. `aggregate_selection_log`, behind
+  the `stm_selection_stats` MCP tool, collected its `latency_ms` sample
+  through the identical pattern — raising `OverflowError` out of a path
+  documented to treat an unreadable file like an absent one, and pooling
+  `NaN` into its percentiles. A custom `--dataset` carrying an oversized
   `graph_risk_score` raised `OverflowError` past the CLI's error boundary
   instead of the `SelectionEvaluationError` every other invalid field in that
-  file produces.
+  file produces. And a baseline penalty could be non-finite: `ge=0` does not
+  reject `Infinity`, so `toolgraph.risk_penalty_scale` could carry one into a
+  report that then failed to serialize — the field now refuses it, and
+  `evaluate_selection` rejects a non-finite or oversized baseline with
+  `SelectionEvaluationError` rather than raising out of `float()`.
 
   Also fixes `safe_float`, the sibling helper this shares a module with: it
   documented itself as defending against untrusted external JSON while an

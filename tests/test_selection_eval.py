@@ -392,7 +392,15 @@ _SCORE_FIELDS = ("relevance_score", "risk_penalty", "final_score")
 _EXECUTION_FIELDS = ("latency_ms", "retry_count", "cost")
 # A JSON integer literal is unbounded, so an admitted record can hold one no
 # float can represent; `json.loads` also accepts the `NaN` literal (#856).
-_UNUSABLE = ((10**400, "oversized int"), (float("nan"), "NaN"))
+_UNUSABLE = (
+    (10**400, "oversized int"),
+    (float("nan"), "NaN"),
+    (float("inf"), "inf"),
+    ("fast", "string"),
+    (True, "bool"),
+    ([1], "array"),
+    ({"a": 1}, "object"),
+)
 
 
 @pytest.mark.parametrize("field", _SCORE_FIELDS)
@@ -448,6 +456,33 @@ def test_unusable_execution_field_is_dropped_from_its_sample(
     assert [name for name, count in counts.items() if count == 0] == [field]
 
 
+@pytest.mark.parametrize("field", _SCORE_FIELDS + _EXECUTION_FIELDS)
+def test_absent_or_null_numeric_field_is_not_unusable(tmp_path: Path, field: str) -> None:
+    """Nothing to read is not the same as something unreadable (#856).
+
+    `cost` is nullable in the writer's own shape, so counting a null would flag
+    every ordinary log.
+    """
+    for value in (None, "absent"):
+        log = tmp_path / f"{field}-{value}.jsonl"
+        selection, execution = _selection(), _execution()
+        holder = (
+            selection["candidate_features"]["ranked_candidates"][0]
+            if field in _SCORE_FIELDS
+            else execution
+        )
+        if value is None:
+            holder[field] = None
+        else:
+            holder.pop(field, None)
+        _write_jsonl(log, [selection, execution])
+
+        report = evaluate_selection(telemetry_path=log).data
+
+        assert report["data_quality"]["unusable_numbers"] == 0, (field, value)
+        assert report["status"] == "ok"
+
+
 def test_finite_values_whose_aggregate_overflows_report_no_value(tmp_path: Path) -> None:
     """Guarding the inputs does not bound the output (#856)."""
     log = tmp_path / "selection.jsonl"
@@ -466,9 +501,43 @@ def test_finite_values_whose_aggregate_overflows_report_no_value(tmp_path: Path)
     assert payload["status"] == "ok"
     assert report.data["data_quality"]["unusable_numbers"] == 0
     execution_metrics = report.data["production"]["execution"]
-    assert execution_metrics["cost_mean"] == {"value": None, "denominator": 2}
+    # The mean of two 1e308 values IS 1e308 — the summing form overflowed, the
+    # answer was always representable, and refusing it would lose an answer.
+    assert execution_metrics["cost_mean"] == {"value": 1e308, "denominator": 2}
     assert execution_metrics["latency_ms"]["count"] == 2
     assert execution_metrics["latency_ms"]["p50"] == 1e308
+
+
+def test_opposite_sign_extremes_interpolate_to_a_finite_percentile(tmp_path: Path) -> None:
+    """A percentile lies between its samples, so it is always representable."""
+    log = tmp_path / "selection.jsonl"
+    records: list[dict] = []
+    for sid, latency in (("sel-1", -1e308), ("sel-2", 1e308)):
+        execution = _execution(sid)
+        execution["latency_ms"] = latency
+        records += [_selection(sid), execution]
+    _write_jsonl(log, records)
+
+    report = evaluate_selection(telemetry_path=log)
+
+    assert json.loads(report.to_json())["status"] == "ok"
+    latency = report.data["production"]["execution"]["latency_ms"]
+    assert latency["count"] == 2
+    # The difference form would give inf here; the weighted form gives 0.
+    assert latency["p50"] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("value", "case"),
+    [(float("inf"), "inf"), (float("nan"), "NaN"), (10**400, "oversized int")],
+)
+def test_non_finite_baseline_is_a_clean_error(value: object, case: str) -> None:
+    """`ge=0` admits `inf`, and `float()` raises on an oversized int (#856)."""
+    with pytest.raises(SelectionEvaluationError, match="invalid baseline"):
+        evaluate_selection(baseline_graph_scale=value)  # type: ignore[arg-type]
+
+    with pytest.raises(SelectionEvaluationError, match="invalid baseline"):
+        evaluate_selection(baseline_review_penalty=value)  # type: ignore[arg-type]
 
 
 def test_oversized_graph_risk_score_in_a_dataset_is_a_clean_error(tmp_path: Path) -> None:
