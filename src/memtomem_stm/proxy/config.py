@@ -1828,7 +1828,7 @@ class ToolgraphConfig(BaseModel):
     """A specific candidate was never crawled (the graph's blind spot).
     ``open`` (default) does not hide a working tool; ``closed`` rejects
     uncrawled candidates (high-assurance)."""
-    risk_penalty_scale: float = Field(default=1.0, ge=0.0)
+    risk_penalty_scale: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
     """Multiplier mapping the graph's per-candidate ``risk_score`` (the
     rule-based data-flow/DENY risk, ``[0,1]``) to a relevance ``risk_penalty``
     for eligible-but-risky tools (#493): ``penalty = min(risk_score * scale,

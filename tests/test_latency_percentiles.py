@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 
 from memtomem_stm.proxy.metrics import CallMetrics, TokenTracker, _percentile
 
@@ -51,6 +53,18 @@ class TestPercentileHelper:
     def test_identical_values(self):
         assert _percentile([7.0, 7.0, 7.0, 7.0], 50) == 7.0
         assert _percentile([7.0, 7.0, 7.0, 7.0], 99) == 7.0
+
+    def test_identical_extreme_values_are_exact(self):
+        # Discriminating case: a weighted `lo*(1-f) + hi*f` returns the next
+        # float *below* this, so small identical values cannot pin it (#856).
+        biggest = sys.float_info.max
+        assert _percentile([biggest] * 7, 95) == biggest
+        assert _percentile([biggest] * 7, 50) == biggest
+
+    def test_opposite_sign_extremes_do_not_overflow(self):
+        # And the difference form gives inf here, which is why the weighted
+        # form has to remain reachable as the fallback.
+        assert _percentile([-1e308, 1e308], 50) == 0.0
 
 
 # ── TokenTracker percentile integration ──────────────────────────────────

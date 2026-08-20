@@ -101,6 +101,7 @@ if TYPE_CHECKING:
 from memtomem_stm.proxy.metrics import _percentile
 from memtomem_stm.proxy.privacy import contains_sensitive_content
 from memtomem_stm.utils import json_out
+from memtomem_stm.utils.numeric import finite_number
 from memtomem_stm.utils.fileio import fsync_dir
 from memtomem_stm.utils.locking import open_lock_fd, release_lock, try_lock
 
@@ -1425,9 +1426,9 @@ def aggregate_selection_log(path: Path | str, *, top_n: int = 10) -> dict[str, A
                             cache_miss += 1
                         else:
                             cache_unknown += 1
-                        lat = rec.get("latency_ms")
-                        if isinstance(lat, (int, float)) and not isinstance(lat, bool):
-                            latencies.append(float(lat))
+                        lat = finite_number(rec.get("latency_ms"))
+                        if lat is not None:
+                            latencies.append(lat)
                     elif event == "feedback":
                         result["events"]["feedback"] += 1
                     else:

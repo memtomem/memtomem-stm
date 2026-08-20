@@ -388,6 +388,334 @@ def test_non_string_tool_matching_selected_tool_yields_no_rank(tmp_path: Path) -
     assert report["production"]["selected_tool_alignment"]["mrr"]["denominator"] == 0
 
 
+_SCORE_FIELDS = ("relevance_score", "risk_penalty", "final_score")
+_EXECUTION_FIELDS = ("latency_ms", "retry_count", "cost")
+# A JSON integer literal is unbounded, so an admitted record can hold one no
+# float can represent; `json.loads` also accepts the `NaN` literal (#856).
+_UNUSABLE = (
+    (10**400, "oversized int"),
+    (float("nan"), "NaN"),
+    (float("inf"), "inf"),
+    ("fast", "string"),
+    (True, "bool"),
+    ([1], "array"),
+    ({"a": 1}, "object"),
+)
+
+
+@pytest.mark.parametrize("field", _SCORE_FIELDS)
+@pytest.mark.parametrize(("value", "case"), _UNUSABLE)
+def test_unusable_score_field_skips_parity_without_raising(
+    tmp_path: Path, field: str, value: object, case: str
+) -> None:
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    selection["candidate_features"]["ranked_candidates"][0][field] = value
+    _write_jsonl(log, [selection, _execution()])
+
+    report = evaluate_selection(telemetry_path=log)
+
+    assert json.loads(report.to_json())["status"] == "invalid", case
+    quality = report.data["data_quality"]
+    assert quality["unusable_numbers"] == 1
+    # Parity was not checked, and its denominator says so — `parity_mismatches:
+    # 0` must not read as a clean bill of health.
+    assert quality["parity_mismatches"] == 0
+    assert quality["parity_checked"] == 1
+    # The entry is otherwise well-formed, so it still ranks.
+    assert report.data["production"]["coverage"]["rankable_selections"] == 1
+    assert report.data["production"]["coverage"]["selected_rank_known"] == 1
+
+
+@pytest.mark.parametrize("field", _EXECUTION_FIELDS)
+@pytest.mark.parametrize(("value", "case"), _UNUSABLE)
+def test_unusable_execution_field_is_dropped_from_its_sample(
+    tmp_path: Path, field: str, value: object, case: str
+) -> None:
+    log = tmp_path / "selection.jsonl"
+    execution = _execution()
+    # `cost` defaults to None, which would make its count 0 either way.
+    execution["cost"] = 0.02
+    execution[field] = value
+    _write_jsonl(log, [_selection(), execution])
+
+    report = evaluate_selection(telemetry_path=log)
+
+    # A non-finite value used to build a report that then failed to serialize.
+    assert json.loads(report.to_json())["status"] == "invalid", case
+    assert report.data["data_quality"]["unusable_numbers"] == 1
+    production = report.data["production"]
+    assert production["execution"]["success_rate"]["numerator"] == 1
+    counts = {
+        "latency_ms": production["execution"]["latency_ms"]["count"],
+        "retry_count": production["coverage"]["retry_count_executions"],
+        "cost": production["coverage"]["cost_executions"],
+    }
+    # Dropped from its own sample only; the other two are unaffected.
+    assert counts[field] == 0
+    assert [name for name, count in counts.items() if count == 0] == [field]
+
+
+@pytest.mark.parametrize("field", _SCORE_FIELDS + _EXECUTION_FIELDS)
+def test_absent_or_null_numeric_field_is_not_unusable(tmp_path: Path, field: str) -> None:
+    """Nothing to read is not the same as something unreadable (#856).
+
+    `cost` is nullable in the writer's own shape, so counting a null would flag
+    every ordinary log.
+    """
+    for value in (None, "absent"):
+        log = tmp_path / f"{field}-{value}.jsonl"
+        selection, execution = _selection(), _execution()
+        holder = (
+            selection["candidate_features"]["ranked_candidates"][0]
+            if field in _SCORE_FIELDS
+            else execution
+        )
+        if value is None:
+            holder[field] = None
+        else:
+            holder.pop(field, None)
+        _write_jsonl(log, [selection, execution])
+
+        report = evaluate_selection(telemetry_path=log).data
+
+        assert report["data_quality"]["unusable_numbers"] == 0, (field, value)
+        assert report["status"] == "ok"
+
+
+def test_finite_values_whose_sum_overflows_still_report_their_mean(tmp_path: Path) -> None:
+    """Guarding the inputs does not bound the arithmetic (#856)."""
+    log = tmp_path / "selection.jsonl"
+    records: list[dict] = []
+    for sid in ("sel-1", "sel-2"):
+        execution = _execution(sid)
+        execution["cost"] = 1e308
+        execution["latency_ms"] = 1e308
+        records += [_selection(sid), execution]
+    _write_jsonl(log, records)
+
+    report = evaluate_selection(telemetry_path=log)
+
+    # Each value is finite and admitted; their sum is not.
+    payload = json.loads(report.to_json())
+    assert payload["status"] == "ok"
+    assert report.data["data_quality"]["unusable_numbers"] == 0
+    execution_metrics = report.data["production"]["execution"]
+    # The mean of two 1e308 values IS 1e308 — the summing form overflowed, the
+    # answer was always representable, and refusing it would lose an answer.
+    assert execution_metrics["cost_mean"] == {"value": 1e308, "denominator": 2}
+    assert execution_metrics["latency_ms"]["count"] == 2
+    assert execution_metrics["latency_ms"]["p50"] == 1e308
+
+
+def test_unusable_numbers_survives_a_ranker_mismatch(tmp_path: Path) -> None:
+    """A cohort verdict abandons the record; the data-quality count must not."""
+    log = tmp_path / "selection.jsonl"
+    execution = _execution()
+    execution["ranker_version"] = "v9-some-future-ranker"
+    execution["latency_ms"] = float("nan")
+    execution["retry_count"] = "many"
+    execution["cost"] = 10**400
+    _write_jsonl(log, [_selection(), execution])
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["data_quality"]["ranker_mismatches"] == 1
+    assert report["data_quality"]["unusable_numbers"] == 3
+
+
+def test_unusable_numbers_survives_a_structural_violation(tmp_path: Path) -> None:
+    """Same for the `candidate_tools` gate, which abandons the record earlier."""
+    log = tmp_path / "selection.jsonl"
+    selection = _selection()
+    selection["candidate_tools"] = "not-a-list"
+    selection["candidate_features"]["ranked_candidates"][0]["final_score"] = float("nan")
+    execution = _execution()
+    execution["latency_ms"] = "fast"
+    _write_jsonl(log, [selection, execution])
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["data_quality"]["invariant_violations"] == 1
+    assert report["data_quality"]["unusable_numbers"] == 2
+
+
+def test_unusable_numbers_counts_records_the_fold_discards(tmp_path: Path) -> None:
+    """The count is a property of the file, not of what survives the join."""
+    log = tmp_path / "selection.jsonl"
+    no_id = _execution()
+    no_id.pop("selection_id")
+    no_id["latency_ms"] = float("nan")
+    # A conflicting pair: neither copy survives, but both hold unreadable values.
+    left, right = _execution("sel-9"), _execution("sel-9")
+    left["latency_ms"] = float("nan")
+    right["latency_ms"] = "fast"
+    right["ok"] = False
+    _write_jsonl(log, [no_id, left, right])
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["data_quality"]["missing_selection_id"] == 1
+    assert report["data_quality"]["conflicting_records"] == 1
+    assert report["data_quality"]["unusable_numbers"] == 3
+
+
+def test_unusable_numbers_counts_a_duplicated_line_twice(tmp_path: Path) -> None:
+    """Physically, not logically — the file holds the value on both lines."""
+    log = tmp_path / "selection.jsonl"
+    execution = _execution()
+    execution["cost"] = float("inf")
+    _write_jsonl(log, [_selection(), execution, execution])
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["data_quality"]["duplicate_records"] == 1
+    assert report["data_quality"]["unusable_numbers"] == 2
+
+
+def test_records_the_reader_rejects_are_not_unusable_numbers(tmp_path: Path) -> None:
+    """The count is physical over ADMITTED records; rejection has its own counters."""
+    log = tmp_path / "selection.jsonl"
+    unsupported = _execution("sel-9")
+    unsupported["schema_version"] = 99
+    unsupported["latency_ms"] = float("nan")
+    # Built as a selection: a non-execution event is read for its score fields,
+    # so a top-level `latency_ms` here would read as 0 whether admitted or not.
+    unknown_event = _selection("sel-8")
+    unknown_event["event"] = "telemetry"
+    unknown_event["candidate_features"]["ranked_candidates"][0]["final_score"] = float("nan")
+    # A complete record, denied only by the missing terminating newline.
+    tail = json.dumps(_execution("sel-7") | {"latency_ms": float("nan")}, sort_keys=True)
+    _write_jsonl(
+        log,
+        [_selection(), _execution(), unsupported, unknown_event],
+        partial=tail,
+    )
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    quality = report["data_quality"]
+    # Each rejection path is exercised, and each rejected record holds a NaN
+    # that would be counted if it were admitted.
+    assert quality["unsupported_schema_records"] == 1
+    assert quality["unknown_event_records"] == 1
+    assert quality["truncated_tail_lines"] == 1
+    assert quality["unusable_numbers"] == 0
+
+
+def test_active_only_excludes_rotated_unusable_numbers(tmp_path: Path) -> None:
+    """The count follows the same segments as the rest of the report."""
+    log = tmp_path / "selection.jsonl"
+    rotated = tmp_path / "selection.jsonl.1"
+    _write_jsonl(log, [_selection(), _execution()])
+    rotated_execution = _execution("sel-9")
+    rotated_execution["latency_ms"] = float("nan")
+    _write_jsonl(rotated, [_selection("sel-9"), rotated_execution])
+
+    with_rotated = evaluate_selection(telemetry_path=log).data
+    active_only = evaluate_selection(telemetry_path=log, include_rotated=False).data
+
+    assert with_rotated["data_quality"]["unusable_numbers"] == 1
+    assert active_only["data_quality"]["unusable_numbers"] == 0
+
+
+def test_feedback_records_contribute_no_unusable_numbers(tmp_path: Path) -> None:
+    """They carry none of the six fields; a stray numeric key is not one."""
+    log = tmp_path / "selection.jsonl"
+    feedback = {
+        "schema_version": 1,
+        "event": "feedback",
+        "selection_id": "sel-1",
+        "user_corrected": True,
+        "latency_ms": float("nan"),
+    }
+    _write_jsonl(log, [_selection(), _execution(), feedback])
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["production"]["coverage"]["feedback_selections"] == 1
+    assert report["data_quality"]["unusable_numbers"] == 0
+
+
+def test_mean_of_three_maximum_floats_is_that_maximum(tmp_path: Path) -> None:
+    """Both the summing and the dividing form overflow here; the mean does not."""
+    log = tmp_path / "selection.jsonl"
+    records: list[dict] = []
+    for sid in ("sel-1", "sel-2", "sel-3"):
+        execution = _execution(sid)
+        execution["cost"] = sys.float_info.max
+        records += [_selection(sid), execution]
+    _write_jsonl(log, records)
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["production"]["execution"]["cost_mean"] == {
+        "value": sys.float_info.max,
+        "denominator": 3,
+    }
+
+
+def test_ordinary_means_are_unchanged_to_six_decimals(tmp_path: Path) -> None:
+    """The overflow path must not move the digits every ordinary report shows."""
+    log = tmp_path / "selection.jsonl"
+    costs = [1.0 / 3.0, 2.0 / 7.0, 1e-7, 123456.789]
+    records: list[dict] = []
+    for index, cost in enumerate(costs):
+        execution = _execution(f"sel-{index}")
+        execution["cost"] = cost
+        records += [_selection(f"sel-{index}"), execution]
+    _write_jsonl(log, records)
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    assert report["production"]["execution"]["cost_mean"]["value"] == round(
+        sum(costs) / len(costs), 6
+    )
+
+
+def test_opposite_sign_extremes_interpolate_to_a_finite_percentile(tmp_path: Path) -> None:
+    """A percentile lies between its samples, so it is always representable."""
+    log = tmp_path / "selection.jsonl"
+    records: list[dict] = []
+    for sid, latency in (("sel-1", -1e308), ("sel-2", 1e308)):
+        execution = _execution(sid)
+        execution["latency_ms"] = latency
+        records += [_selection(sid), execution]
+    _write_jsonl(log, records)
+
+    report = evaluate_selection(telemetry_path=log)
+
+    assert json.loads(report.to_json())["status"] == "ok"
+    latency = report.data["production"]["execution"]["latency_ms"]
+    assert latency["count"] == 2
+    # The difference form would give inf here; the weighted form gives 0.
+    assert latency["p50"] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("value", "case"),
+    [(float("inf"), "inf"), (float("nan"), "NaN"), (10**400, "oversized int")],
+)
+def test_non_finite_baseline_is_a_clean_error(value: object, case: str) -> None:
+    """`ge=0` admits `inf`, and `float()` raises on an oversized int (#856)."""
+    with pytest.raises(SelectionEvaluationError, match="invalid baseline"):
+        evaluate_selection(baseline_graph_scale=value)  # type: ignore[arg-type]
+
+    with pytest.raises(SelectionEvaluationError, match="invalid baseline"):
+        evaluate_selection(baseline_review_penalty=value)  # type: ignore[arg-type]
+
+
+def test_oversized_graph_risk_score_in_a_dataset_is_a_clean_error(tmp_path: Path) -> None:
+    """The dataset path reports its own errors; it must not raise OverflowError."""
+    dataset = json.loads(builtin_dataset_path().read_text(encoding="utf-8"))
+    dataset["cases"][0]["candidates"][0].setdefault("signals", {})["graph_risk_score"] = 10**400
+    path = tmp_path / "dataset.json"
+    path.write_text(json.dumps(dataset), encoding="utf-8")
+
+    with pytest.raises(SelectionEvaluationError, match="graph_risk_score must be in"):
+        load_selection_dataset(path)
+
+
 def test_unknown_future_ranker_skips_v1_score_parity(tmp_path: Path) -> None:
     log = tmp_path / "selection.jsonl"
     selection = _selection()

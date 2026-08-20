@@ -245,6 +245,80 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **`mms selection replay` no longer crashes on, or silently trusts, an
+  unreadable number** (#857, closes #856). Six fields on an admitted record
+  were guarded by a type check and then coerced with `float()`, which the type
+  does not make safe: `relevance_score`, `risk_penalty` and `final_score` in
+  the parity block, and `latency_ms`, `retry_count` and `cost` on the
+  execution record. A JSON integer literal is unbounded, so a large enough one
+  raised `OverflowError`; and `json.loads` accepts the `NaN` literal, so a
+  non-finite value passed the type check and travelled on. All six now go
+  through one predicate, `finite_number` — the definition `finite_risk_score`
+  (#852) already used for graph scores, lifted to `utils.numeric` and shared —
+  and every present, non-null value it rejects is counted in a new
+  `data_quality.unusable_numbers`.
+
+  Two further gaps of the same shape are closed with it. Guarding the inputs
+  does not bound the arithmetic that follows: the mean of two `1e308` samples
+  is `1e308` and the median of `-1e308` and `1e308` is `0`, but summing and
+  subtracting reached `inf` on the way to both. Each aggregate now keeps its
+  accurate formula while that formula's intermediate value is finite — the
+  digits an ordinary report shows are unchanged — and falls back only on
+  overflow, the mean by normalizing on the largest magnitude and percentiles
+  by interpolating as `low*(1-f) + high*f`. And `parity_mismatches` ships
+  beside a new `parity_checked` denominator, because `0` mismatches otherwise
+  reads as a clean bill of health even when nothing was checkable.
+
+  **Behavior change**, as measured against the previous release. *A traceback
+  becomes a report*: an oversized integer in any of the six fields. *A silent
+  or unserializable result becomes an `invalid` report*, so the command exits
+  1 where it exited 0. That covers every value in those fields that is not a
+  real number — `NaN` and `Infinity`, and also a string, a boolean, an array
+  or an object, which were previously ignored without a trace. Before, a
+  `NaN` in one of the three score fields left a `status: ok` report whose
+  `parity_mismatches: 0` meant "never checked", and a `NaN` in one of the
+  three execution fields built a report whose aggregate was non-finite and
+  whose `--json` failed with `Out of range float values are not JSON
+  compliant`. The count is physical over the records the reader admits: it is
+  taken as each supported record is read, before any join, deduplication or
+  cohort check can abandon one, so a ranker-mismatched execution, a record
+  dropped for a missing `selection_id`, and both halves of a conflicting pair
+  all still report the values they hold that cannot be read — and a duplicated
+  line reports them twice. It says nothing about lines the reader never
+  admits, which are already counted as their own quality problem: an
+  unparseable or oversized line, an unsupported `schema_version`, an unknown
+  event, or an incomplete tail. It follows the same segments as the rest of
+  the report, so `--active-only` excludes rotated files here too. An **absent
+  or `null`** field is not affected: nothing to read is not
+  the same as something unreadable, and `cost` is nullable in the writer's own
+  shape. *An aggregate no longer overflows*: finite samples whose sum or
+  difference exceeds the float limit now yield the representable answer
+  instead of `inf`.
+
+  Three sibling readers are fixed alongside. `aggregate_selection_log`, behind
+  the `stm_selection_stats` MCP tool, collected its `latency_ms` sample
+  through the identical pattern — raising `OverflowError` out of a path
+  documented to treat an unreadable file like an absent one, and pooling
+  `NaN` into its percentiles. A custom `--dataset` carrying an oversized
+  `graph_risk_score` raised `OverflowError` past the CLI's error boundary
+  instead of the `SelectionEvaluationError` every other invalid field in that
+  file produces. And a baseline penalty could be non-finite: `ge=0` does not
+  reject `Infinity`, so `toolgraph.risk_penalty_scale` could carry one into a
+  report that then failed to serialize — the field now refuses it, and
+  `evaluate_selection` rejects a non-finite or oversized baseline with
+  `SelectionEvaluationError` rather than raising out of `float()`.
+
+  Also fixes `safe_float`, the sibling helper this shares a module with: it
+  documented itself as defending against untrusted external JSON while an
+  oversized integer literal raised straight through its `except`. It now
+  returns the caller's default, as it already did for every other
+  unconvertible input — reachable from LLM output parsing and from surfacing's
+  MCP client and daemon adapter.
+
+  Not reachable from STM's own writer, which rounds real floats and records
+  measured values; reachable from a hand-edited log, an older or third-party
+  producer, or a future field that widens the range.
+
 - **`mms selection replay` no longer crashes on a malformed `rank` or
   `candidate_tools`** (#855, closes #854). The evaluator counts a record whose
   shape does not hold in `invariant_violations` and keeps scanning, so one bad
