@@ -573,6 +573,43 @@ def test_unusable_numbers_counts_a_duplicated_line_twice(tmp_path: Path) -> None
     assert report["data_quality"]["unusable_numbers"] == 2
 
 
+def test_records_the_reader_rejects_are_not_unusable_numbers(tmp_path: Path) -> None:
+    """The count is physical over ADMITTED records; rejection has its own counters."""
+    log = tmp_path / "selection.jsonl"
+    unsupported = _execution("sel-9")
+    unsupported["schema_version"] = 99
+    unsupported["latency_ms"] = float("nan")
+    unknown_event = {"schema_version": 1, "event": "telemetry", "latency_ms": float("nan")}
+    _write_jsonl(
+        log,
+        [_selection(), _execution(), unsupported, unknown_event],
+        partial='{"event": "execution", "latency_ms": ',
+    )
+
+    report = evaluate_selection(telemetry_path=log).data
+
+    quality = report["data_quality"]
+    assert quality["unsupported_schema_records"] == 1
+    # None of the three unadmitted lines contributes, though each holds a NaN.
+    assert quality["unusable_numbers"] == 0
+
+
+def test_active_only_excludes_rotated_unusable_numbers(tmp_path: Path) -> None:
+    """The count follows the same segments as the rest of the report."""
+    log = tmp_path / "selection.jsonl"
+    rotated = tmp_path / "selection.jsonl.1"
+    _write_jsonl(log, [_selection(), _execution()])
+    rotated_execution = _execution("sel-9")
+    rotated_execution["latency_ms"] = float("nan")
+    _write_jsonl(rotated, [_selection("sel-9"), rotated_execution])
+
+    with_rotated = evaluate_selection(telemetry_path=log).data
+    active_only = evaluate_selection(telemetry_path=log, include_rotated=False).data
+
+    assert with_rotated["data_quality"]["unusable_numbers"] == 1
+    assert active_only["data_quality"]["unusable_numbers"] == 0
+
+
 def test_feedback_records_contribute_no_unusable_numbers(tmp_path: Path) -> None:
     """They carry none of the six fields; a stray numeric key is not one."""
     log = tmp_path / "selection.jsonl"

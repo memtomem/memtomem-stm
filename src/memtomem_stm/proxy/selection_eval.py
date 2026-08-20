@@ -611,11 +611,13 @@ def _unusable_numbers(record: dict[str, Any]) -> int:
     to read is not the same as something unreadable, and ``cost`` is nullable
     in the writer's own shape.
 
-    Counted per record as read, which makes the total a physical property of
-    the file: a record dropped for a missing id, or one of a conflicting pair
-    neither of which survives, still holds values nobody can read, and a
-    duplicated line holds them twice. ``feedback`` carries none of these
-    fields and always returns zero.
+    Counted per record as read, which makes the total physical over the
+    records the reader admits: one dropped for a missing id, or one of a
+    conflicting pair neither of which survives, still holds values nobody can
+    read, and a duplicated line holds them twice. It says nothing about lines
+    the reader never admits — unparseable, oversized, unsupported schema,
+    unknown event — which carry their own counters. ``feedback`` carries none
+    of these fields and always returns zero.
     """
     if record.get("event") == "feedback":
         return 0
