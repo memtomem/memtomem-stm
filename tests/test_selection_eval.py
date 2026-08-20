@@ -579,18 +579,27 @@ def test_records_the_reader_rejects_are_not_unusable_numbers(tmp_path: Path) -> 
     unsupported = _execution("sel-9")
     unsupported["schema_version"] = 99
     unsupported["latency_ms"] = float("nan")
-    unknown_event = {"schema_version": 1, "event": "telemetry", "latency_ms": float("nan")}
+    # Built as a selection: a non-execution event is read for its score fields,
+    # so a top-level `latency_ms` here would read as 0 whether admitted or not.
+    unknown_event = _selection("sel-8")
+    unknown_event["event"] = "telemetry"
+    unknown_event["candidate_features"]["ranked_candidates"][0]["final_score"] = float("nan")
+    # A complete record, denied only by the missing terminating newline.
+    tail = json.dumps(_execution("sel-7") | {"latency_ms": float("nan")}, sort_keys=True)
     _write_jsonl(
         log,
         [_selection(), _execution(), unsupported, unknown_event],
-        partial='{"event": "execution", "latency_ms": ',
+        partial=tail,
     )
 
     report = evaluate_selection(telemetry_path=log).data
 
     quality = report["data_quality"]
+    # Each rejection path is exercised, and each rejected record holds a NaN
+    # that would be counted if it were admitted.
     assert quality["unsupported_schema_records"] == 1
-    # None of the three unadmitted lines contributes, though each holds a NaN.
+    assert quality["unknown_event_records"] == 1
+    assert quality["truncated_tail_lines"] == 1
     assert quality["unusable_numbers"] == 0
 
 

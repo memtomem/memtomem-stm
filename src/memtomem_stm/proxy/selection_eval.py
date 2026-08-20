@@ -616,7 +616,7 @@ def _unusable_numbers(record: dict[str, Any]) -> int:
     conflicting pair neither of which survives, still holds values nobody can
     read, and a duplicated line holds them twice. It says nothing about lines
     the reader never admits — unparseable, oversized, unsupported schema,
-    unknown event — which carry their own counters. ``feedback`` carries none
+    unknown event, or an unterminated tail — which carry their own counters. ``feedback`` carries none
     of these fields and always returns zero.
     """
     if record.get("event") == "feedback":

@@ -255,7 +255,8 @@ changes inline only. See the deprecation policy in
   non-finite value passed the type check and travelled on. All six now go
   through one predicate, `finite_number` — the definition `finite_risk_score`
   (#852) already used for graph scores, lifted to `utils.numeric` and shared —
-  and every value it rejects is counted in a new `data_quality.unusable_numbers`.
+  and every present, non-null value it rejects is counted in a new
+  `data_quality.unusable_numbers`.
 
   Two further gaps of the same shape are closed with it. Guarding the inputs
   does not bound the arithmetic that follows: the mean of two `1e308` samples
