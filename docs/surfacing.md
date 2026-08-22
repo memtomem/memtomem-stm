@@ -604,6 +604,7 @@ Check effectiveness with `stm_surfacing_stats`:
 ```
 Surfacing Stats
 ===============
+Verdict (this process, since start): HEALTHY — 2 of 25 LTM attempts faulted (8.0%); top fault: ltm_unavailable 2
 Total surfacings: 142
 Total feedback:   38
 
@@ -641,6 +642,20 @@ Outcomes (since process start):
 
 Cache (since process start): hits 9, misses 14, hit ratio 39.1%
 ```
+
+The `Verdict` line summarizes the same in-memory counters as the
+`Healthy skips` / `Fault skips` sections below it: it divides fault
+skips (LTM / circuit) plus timeout/error outcomes by the attempts
+that actually reached the LTM — surfaced results, `no_results_*`
+(the search completed and the candidates were filtered to nothing),
+and the faults themselves. Gate-level skips (`gate_cooldown`,
+`response_too_short`, `no_query`, …) are decided before any LTM work
+and are excluded from both sides, so a thousand cooldowns cannot
+dilute an outage into `HEALTHY`. The word is `FAULTY` at a fault ratio
+of 75% or more, `DEGRADED` at 25% or more, `HEALTHY` below that, and
+`insufficient data` under 10 attempts. Scope is one process since
+start — for the persisted 7-UTC-day fault view across restarts and the
+daemon, run `mms stats`.
 
 The first block (totals + ratings + helpfulness) is read from
 `stm_feedback.db` and persists across restarts. When every

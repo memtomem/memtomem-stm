@@ -132,6 +132,54 @@ Outcome = Literal[
     "error_other",
 ]
 
+# Inputs to the ``stm_surfacing_stats`` top-line verdict (#363, #351 part 1).
+#
+# The verdict answers "is surfacing healthy?" from a fault *ratio*, so it needs
+# a denominator that only counts attempts which actually depended on the LTM.
+# The three sets below name that denominator explicitly rather than leaving it
+# implicit in the renderer:
+#
+#   attempts = faults + completed
+#   faults    = FAULT_SKIP_REASONS skips + FAULT_OUTCOMES
+#   completed = SURFACED_OUTCOMES + SEARCH_COMPLETED_SKIP_REASONS
+#
+# Pre-LTM healthy skips (``response_too_short``, ``gate_*``, ``no_query``,
+# ``daemon_*``, ``disabled``, ``upstream_disabled``, ``progressive_mode_conflict``)
+# are deliberately excluded from both sides: they are decided before any LTM
+# work is attempted, so counting them would let a thousand cooldowns dilute a
+# total LTM outage down to a "healthy" ratio. The ``no_results_*`` family is
+# the opposite case — the search round trip completed and returned candidates
+# that were then filtered to nothing, so those are healthy *completions* and
+# belong in the denominator.
+#
+# ``circuit_open`` is recorded before the relevance gate (engine.py::surface),
+# so during a sustained outage the ratio saturates toward 100% rather than
+# being masked by cooldown skips. That matches the dogfood distribution the
+# thresholds in server.py are anchored against.
+SEARCH_COMPLETED_SKIP_REASONS: frozenset[str] = frozenset(
+    {
+        "no_results_score",
+        "no_results_dedup",
+        "no_results_demoted",
+        "no_results_invalidated",
+        "no_results_empty_cache",
+    }
+)
+
+SURFACED_OUTCOMES: frozenset[str] = frozenset(
+    {
+        "surfaced_cache_hit",
+        "surfaced_cache_miss",
+    }
+)
+
+FAULT_OUTCOMES: frozenset[str] = frozenset(
+    {
+        "error_timeout",
+        "error_other",
+    }
+)
+
 CacheBucket = Literal["hit", "miss"]
 
 # Sentinel string key for the "all tools" aggregate row in per-tool dicts.

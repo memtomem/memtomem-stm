@@ -871,6 +871,99 @@ class TestSurfacingStats:
         # zero-variance tripwire must degrade to silence, not crash.
         assert "zero score variance" not in result
 
+    async def test_verdict_is_the_first_line_after_the_header(self):
+        """#363: the operator's first question is "is surfacing healthy?", so
+        the verdict must be the top line — not merely present somewhere in the
+        50+ line output. Position is pinned, not just the substring."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = self._stats_with_scores(
+            {"count": 0, "min": None, "max": None}
+        )
+        mock_engine = MagicMock()
+        mock_engine.get_min_score_snapshot.return_value = {
+            "default": 0.030,
+            "auto_tune_enabled": False,
+            "auto_tune_min_samples": 20,
+            "adjusted": {},
+            "overrides": {},
+        }
+        mock_engine.observability.snapshot.return_value = {
+            "any_call": True,
+            "skip_reasons": {"__total__": {"circuit_open": 40, "gate_cooldown": 900}},
+            "outcomes": {"__total__": {"surfaced_cache_miss": 5}},
+            "cache": {"hit": 0, "miss": 5},
+        }
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=mock_engine)
+        result = await stm_surfacing_stats(ctx=ctx)
+
+        lines = result.splitlines()
+        assert lines[0] == "Surfacing Stats"
+        assert lines[1] == "==============="
+        assert lines[2].startswith("Verdict (this process, since start): FAULTY — ")
+        assert "40 of 45 LTM attempts faulted (88.9%)" in lines[2]
+        assert "top fault: circuit_open 40" in lines[2]
+        # The 900 gate_cooldown skips still render in the Healthy section —
+        # excluded from the verdict denominator, not from the output.
+        assert "gate_cooldown: 900" in result
+
+    async def test_verdict_absent_when_surfacing_never_invoked(self):
+        """Zero-traffic output stays byte-for-byte: a wired-but-unused engine
+        renders no verdict, same as the existing observability sections."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = self._stats_with_scores(
+            {"count": 0, "min": None, "max": None}
+        )
+        mock_engine = MagicMock()
+        mock_engine.get_min_score_snapshot.return_value = {
+            "default": 0.030,
+            "auto_tune_enabled": False,
+            "auto_tune_min_samples": 20,
+            "adjusted": {},
+            "overrides": {},
+        }
+        mock_engine.observability.snapshot.return_value = {
+            "any_call": False,
+            "skip_reasons": {},
+            "outcomes": {},
+            "cache": {},
+        }
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=mock_engine)
+        result = await stm_surfacing_stats(ctx=ctx)
+        assert "Verdict" not in result
+
+        # Same for an engine with observability disabled entirely.
+        mock_engine.observability = None
+        result_no_obs = await stm_surfacing_stats(ctx=ctx)
+        assert "Verdict" not in result_no_obs
+
+    async def test_verdict_snapshot_taken_once_per_call(self):
+        """The verdict and the skip sections must describe the same counters.
+        Two ``snapshot()`` calls could straddle a concurrent surfacing and
+        render a verdict the sections below contradict."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = self._stats_with_scores(
+            {"count": 0, "min": None, "max": None}
+        )
+        mock_engine = MagicMock()
+        mock_engine.get_min_score_snapshot.return_value = {
+            "default": 0.030,
+            "auto_tune_enabled": False,
+            "auto_tune_min_samples": 20,
+            "adjusted": {},
+            "overrides": {},
+        }
+        mock_engine.observability.snapshot.return_value = {
+            "any_call": True,
+            "skip_reasons": {"__total__": {"ltm_unavailable": 2}},
+            "outcomes": {"__total__": {"surfaced_cache_hit": 30}},
+            "cache": {"hit": 30, "miss": 0},
+        }
+        ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=mock_engine)
+        result = await stm_surfacing_stats(ctx=ctx)
+        assert mock_engine.observability.snapshot.call_count == 1
+        assert "HEALTHY" in result
+        assert "Fault skips" in result
+
     @staticmethod
     def _stats_with_scores(score_distribution: dict) -> dict:
         """Minimal stats shape for exercising the flat-score tripwire."""
