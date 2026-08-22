@@ -10,10 +10,18 @@ from __future__ import annotations
 
 from typing import get_args
 
-from memtomem_stm.server import _format_observability_sections, _ordered_tool_keys
+from memtomem_stm.server import (
+    _format_observability_sections,
+    _ordered_tool_keys,
+    _surfacing_verdict_line,
+)
 from memtomem_stm.surfacing.observability import (
+    FAULT_OUTCOMES,
     FAULT_SKIP_REASONS,
     HEALTHY_SKIP_REASONS,
+    SEARCH_COMPLETED_SKIP_REASONS,
+    SURFACED_OUTCOMES,
+    Outcome,
     SkipReason,
     SurfacingObservability,
 )
@@ -215,6 +223,22 @@ class TestSkipReasonCategorization:
         overlap = HEALTHY_SKIP_REASONS & FAULT_SKIP_REASONS
         assert overlap == set(), f"SkipReason values classified twice: {overlap}"
 
+    def test_verdict_category_sets_are_consistent(self):
+        """#363's denominator sets must stay consistent with the taxonomy
+        they slice. ``SEARCH_COMPLETED_SKIP_REASONS`` names the healthy skips
+        that still cost an LTM round trip, so it must be a subset of
+        ``HEALTHY_SKIP_REASONS`` (a fault reason leaking in would be counted
+        as a healthy completion and drag the verdict toward HEALTHY during an
+        outage), and the two outcome sets must partition ``Outcome`` (an
+        unclassified outcome would silently vanish from the denominator)."""
+        assert SEARCH_COMPLETED_SKIP_REASONS <= HEALTHY_SKIP_REASONS
+        assert SEARCH_COMPLETED_SKIP_REASONS & FAULT_SKIP_REASONS == set()
+        all_outcomes = set(get_args(Outcome))
+        assert SURFACED_OUTCOMES | FAULT_OUTCOMES == all_outcomes, (
+            f"unclassified Outcome values: {all_outcomes - (SURFACED_OUTCOMES | FAULT_OUTCOMES)}"
+        )
+        assert SURFACED_OUTCOMES & FAULT_OUTCOMES == set()
+
     def test_fault_skips_render_under_fault_subsection(self):
         """A snapshot with only LTM / circuit reasons renders the Fault
         skips subsection and omits the Healthy skips header — the whole
@@ -334,3 +358,183 @@ class TestSkipReasonCategorization:
         # __total__ appears in both (split by category contents).
         assert "__total__:" in healthy_block
         assert "__total__:" in fault_block
+
+
+class TestSurfacingVerdict:
+    """Pins the top-line verdict introduced in #363 (#351 part 1).
+
+    The verdict is an advisory an operator acts on, so a wrong word is worse
+    than no word: these tests pin each band, the sample floor, and the
+    denominator's composition rather than only asserting the string renders.
+    """
+
+    @staticmethod
+    def _snap(skips: dict, outcomes: dict) -> dict:
+        return {
+            "any_call": True,
+            "skip_reasons": {"__total__": skips} if skips else {},
+            "outcomes": {"__total__": outcomes} if outcomes else {},
+            "cache": {},
+        }
+
+    def test_healthy_when_faults_are_a_small_minority(self):
+        line = _surfacing_verdict_line(
+            self._snap({"ltm_unavailable": 2}, {"surfaced_cache_miss": 90}),
+            tool_filter=None,
+        )
+        assert line is not None
+        assert line.startswith("Verdict (this process, since start): HEALTHY — ")
+        assert "2 of 92 LTM attempts faulted (2.2%)" in line
+        assert "top fault: ltm_unavailable 2" in line
+
+    def test_degraded_between_the_bands(self):
+        line = _surfacing_verdict_line(
+            self._snap({}, {"error_timeout": 30, "surfaced_cache_miss": 41}),
+            tool_filter=None,
+        )
+        assert line is not None
+        assert "DEGRADED" in line
+        assert "30 of 71 LTM attempts faulted (42.3%)" in line
+        assert "top fault: error_timeout 30" in line
+
+    def test_faulty_during_an_outage(self):
+        """The dogfood outage shape: circuit_open dominates and the ratio
+        saturates because circuit_open is recorded before the gate."""
+        line = _surfacing_verdict_line(
+            self._snap({"circuit_open": 1163}, {"surfaced_cache_miss": 17}),
+            tool_filter=None,
+        )
+        assert line is not None
+        assert "FAULTY" in line
+        assert "1163 of 1180 LTM attempts faulted (98.6%)" in line
+        assert "top fault: circuit_open 1163" in line
+
+    def test_band_boundaries_are_inclusive_lower_edges(self):
+        """DEGRADED starts at exactly 25% and FAULTY at exactly 75% — pinned
+        so a future ``>`` / ``>=`` slip is caught. 24/96 = 25.0% and
+        75/100 = 75.0% land exactly on the two edges."""
+        degraded = _surfacing_verdict_line(
+            self._snap({}, {"error_other": 24, "surfaced_cache_hit": 72}),
+            tool_filter=None,
+        )
+        assert degraded is not None and "DEGRADED" in degraded
+        # One fault fewer (23/96 = 24.0%) falls back to HEALTHY.
+        healthy = _surfacing_verdict_line(
+            self._snap({}, {"error_other": 23, "surfaced_cache_hit": 73}),
+            tool_filter=None,
+        )
+        assert healthy is not None and "HEALTHY" in healthy
+        faulty = _surfacing_verdict_line(
+            self._snap({}, {"error_other": 75, "surfaced_cache_hit": 25}),
+            tool_filter=None,
+        )
+        assert faulty is not None and "FAULTY" in faulty
+        # One fault fewer (74/100 = 74.0%) stays DEGRADED.
+        still_degraded = _surfacing_verdict_line(
+            self._snap({}, {"error_other": 74, "surfaced_cache_hit": 26}),
+            tool_filter=None,
+        )
+        assert still_degraded is not None and "DEGRADED" in still_degraded
+
+    def test_insufficient_data_below_the_sample_floor(self):
+        line = _surfacing_verdict_line(
+            self._snap({}, {"error_timeout": 3, "surfaced_cache_miss": 6}),
+            tool_filter=None,
+        )
+        assert line is not None
+        assert "insufficient data — 9 LTM attempts (need 10)" in line
+        # No verdict word — an advisory on 9 samples is the failure mode the
+        # floor exists to prevent.
+        assert "DEGRADED" not in line and "FAULTY" not in line and "HEALTHY" not in line
+        # Exactly at the floor a real verdict renders.
+        at_floor = _surfacing_verdict_line(
+            self._snap({}, {"error_timeout": 3, "surfaced_cache_miss": 7}),
+            tool_filter=None,
+        )
+        assert at_floor is not None and "DEGRADED" in at_floor
+
+    def test_zero_faults_omits_the_top_fault_clause(self):
+        line = _surfacing_verdict_line(
+            self._snap({"no_results_score": 20}, {"surfaced_cache_hit": 37}),
+            tool_filter=None,
+        )
+        assert line is not None
+        assert "HEALTHY" in line
+        assert "0 of 57 LTM attempts faulted (0.0%)" in line
+        assert "top fault" not in line
+
+    def test_pre_ltm_skips_are_excluded_from_the_denominator(self):
+        """A thousand cooldown/gate skips must not dilute an outage into
+        HEALTHY: they are decided before any LTM work is attempted. Same
+        counters with and without the pre-LTM noise must give the same
+        verdict and the same denominator."""
+        faults_only = self._snap({"ltm_unavailable": 9}, {"surfaced_cache_miss": 2})
+        with_noise = self._snap(
+            {
+                "ltm_unavailable": 9,
+                "gate_cooldown": 1000,
+                "response_too_short": 500,
+                "gate_write_tool": 200,
+                "no_query": 40,
+                "daemon_busy": 5,
+                "disabled": 3,
+                "upstream_disabled": 2,
+                "progressive_mode_conflict": 1,
+            },
+            {"surfaced_cache_miss": 2},
+        )
+        bare = _surfacing_verdict_line(faults_only, tool_filter=None)
+        noisy = _surfacing_verdict_line(with_noise, tool_filter=None)
+        assert bare == noisy
+        assert noisy is not None
+        assert "FAULTY" in noisy
+        assert "9 of 11 LTM attempts faulted" in noisy
+
+    def test_no_results_skips_count_as_completions(self):
+        """``no_results_*`` means the search round trip completed and the
+        candidates were filtered to nothing — a healthy completion, so it
+        belongs in the denominator. Without it, a deployment whose threshold
+        filters everything would show one timeout against one surfacing and
+        read FAULTY."""
+        line = _surfacing_verdict_line(
+            self._snap(
+                {"error_timeout": 0, "no_results_score": 30, "no_results_dedup": 9},
+                {"error_timeout": 1, "surfaced_cache_miss": 1},
+            ),
+            tool_filter=None,
+        )
+        assert line is not None
+        assert "HEALTHY" in line
+        assert "1 of 41 LTM attempts faulted" in line
+
+    def test_tool_filter_uses_that_tools_counters_not_the_total(self):
+        snap = {
+            "any_call": True,
+            "skip_reasons": {
+                "sick_tool": {"ltm_unavailable": 40},
+                "well_tool": {"no_results_score": 5},
+                "__total__": {"ltm_unavailable": 40, "no_results_score": 5},
+            },
+            "outcomes": {
+                "sick_tool": {"surfaced_cache_miss": 2},
+                "well_tool": {"surfaced_cache_hit": 95},
+                "__total__": {"surfaced_cache_miss": 2, "surfaced_cache_hit": 95},
+            },
+            "cache": {},
+        }
+        sick = _surfacing_verdict_line(snap, tool_filter="sick_tool")
+        well = _surfacing_verdict_line(snap, tool_filter="well_tool")
+        total = _surfacing_verdict_line(snap, tool_filter=None)
+        assert sick is not None and "FAULTY" in sick
+        assert "40 of 42 LTM attempts faulted" in sick
+        assert well is not None and "HEALTHY" in well
+        assert "0 of 100 LTM attempts faulted" in well
+        # The aggregate is its own slice, not either tool's.
+        assert total is not None and "40 of 142 LTM attempts faulted" in total
+
+    def test_unknown_tool_renders_no_verdict(self):
+        """A tool the process has never surfaced for has no counters at all.
+        Rendering ``insufficient data`` there would read as a health signal
+        about that tool rather than as its absence from this process."""
+        snap = self._snap({"ltm_unavailable": 5}, {"surfaced_cache_miss": 20})
+        assert _surfacing_verdict_line(snap, tool_filter="never_seen") is None

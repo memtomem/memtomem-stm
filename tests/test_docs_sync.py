@@ -480,6 +480,7 @@ def test_surfacing_md_documents_phase_1_observability_sample() -> None:
     # rename, the test fails loudly here rather than silently passing
     # against stale docs.
     required_headers = (
+        "Verdict (this process, since start)",
         "Healthy skips",
         "Fault skips",
         "Outcomes",

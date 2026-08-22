@@ -13,6 +13,28 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- **`stm_surfacing_stats` opens with a health verdict** (#363, part of #351).
+  The output starts with raw counts and grows past 50 lines once skip reasons,
+  outcomes and cache buckets fill in, so the operator's first question — "is
+  surfacing healthy?" — was the one thing the tool did not answer. It now
+  renders `Verdict (this process, since start): FAULTY — 40 of 45 LTM attempts
+  faulted (88.9%); top fault: circuit_open 40` immediately under the header.
+  The ratio counts only attempts that reached the LTM: fault skips (circuit /
+  LTM) and timeout/error outcomes over those plus surfaced results and
+  `no_results_*` completions. Gate-level skips are decided before any LTM work
+  and are excluded from both sides, so a thousand `gate_cooldown` skips cannot
+  dilute an outage into `HEALTHY`. Bands are `FAULTY` at 75%, `DEGRADED` at
+  25%, and `insufficient data` under 10 attempts — an advisory on three samples
+  misfires more often than it helps. The thresholds are anchored on a 44-day
+  dogfood distribution where every LTM-outage day sat at 75.9-100% and every
+  ordinary day at or below 62.8%; they are constants, not config, because the
+  bands *are* the meaning of the words. The verdict is additive on top of the
+  healthy/fault skip partition from #362, not a replacement for it, and is
+  deliberately fault-only: helpfulness is not an input while
+  `surfacing_feedback` has no recorded distribution to anchor a target band
+  against (#364 stays open). Scope is one process since start, as the label
+  says — `mms stats` remains the persisted 7-UTC-day fault view.
+
 - **`mms selection feedback` labels a recorded tool selection** (#853, part of
   #469). The selection log's `feedback` event has been schema-pinned since #467
   with nothing to produce it, so the learning stage had only the implicit

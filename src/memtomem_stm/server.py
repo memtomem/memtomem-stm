@@ -41,8 +41,11 @@ from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
 from memtomem_stm.proxy.selection_log import aggregate_selection_log
 from memtomem_stm.surfacing.engine import SurfacingEngine
 from memtomem_stm.surfacing.observability import (
+    FAULT_OUTCOMES,
     FAULT_SKIP_REASONS,
     HEALTHY_SKIP_REASONS,
+    SEARCH_COMPLETED_SKIP_REASONS,
+    SURFACED_OUTCOMES,
     SurfacingObservability,
 )
 from memtomem_stm.observability.tracing import traced
@@ -69,6 +72,26 @@ ten identical values with zero spread is not — the compact-format
 rounding artifact this tripwire exists to catch produced *months* of a
 single constant. Deliberately a constant, not config: the warning is
 advisory text, and a knob would imply operators should tune it."""
+
+_VERDICT_MIN_ATTEMPTS = 10
+"""Minimum LTM attempts before ``stm_surfacing_stats`` renders a verdict word
+(#363). Below this the ratio is dominated by a single fault — one timeout in
+three attempts is 33%, which would read as ``DEGRADED`` on no evidence. An
+advisory that misfires is worse than no advisory, so a thin sample renders
+``insufficient data`` with the count instead of a verdict."""
+
+_VERDICT_DEGRADED_RATIO = 0.25
+_VERDICT_FAULTY_RATIO = 0.75
+"""Fault-ratio bands for the verdict word (#363, #351 part 1).
+
+Anchored on the dogfood ``surfacing_faults`` distribution (2026-08-22, 44 days,
+2061 faults over 844 events): daily ``faults / (faults + events)`` is bimodal —
+every LTM-outage day sits at 75.9-100%, every ordinary day at or below 62.8%
+with most under 15%, and the 30-63% middle is breaker flapping. ``0.75`` is
+therefore the floor of the observed outage cluster and ``0.25`` sits in the gap
+above ordinary-day noise. Constants rather than config: the bands are the
+meaning of the words, and a knob would let a deployment redefine ``HEALTHY``
+into a false all-clear. Revisit with a wider deployment sample, not by tuning."""
 
 
 @dataclass
@@ -1468,9 +1491,32 @@ async def stm_surfacing_stats(
     ):
         stats = app.feedback_tracker.get_stats(tool=tool, since=since_ts, limit=limit)
 
+        # Taken once, up front: the verdict line at the top and the skip /
+        # outcome / cache sections at the bottom must describe the same
+        # counters. Two snapshot() calls could straddle a concurrent
+        # surfacing and render a verdict the sections below contradict.
+        obs_snapshot: dict | None = None
+        if app.surfacing_engine is not None and app.surfacing_engine.observability is not None:
+            candidate = app.surfacing_engine.observability.snapshot()
+            if candidate["any_call"]:
+                obs_snapshot = candidate
+
         lines = [
             "Surfacing Stats",
             "===============",
+        ]
+
+        # Top-line verdict (#363): the operator's first question is "is
+        # surfacing healthy?", which was previously buried under 50+ lines of
+        # raw counters. Suppressed with the rest of the in-memory sections when
+        # surfacing has never been invoked, keeping the zero-traffic output
+        # byte-for-byte.
+        if obs_snapshot is not None:
+            verdict = _surfacing_verdict_line(obs_snapshot, tool_filter=tool)
+            if verdict is not None:
+                lines.append(verdict)
+
+        lines += [
             f"Events total:    {stats['events_total']}",
             f"Distinct tools:  {stats['distinct_tools']}",
             f"Total feedback:  {stats['total_feedback']}",
@@ -1700,10 +1746,8 @@ async def stm_surfacing_stats(
         # script against the legacy shape see a strict superset. Suppressed
         # entirely when surfacing has not been invoked, preserving the
         # zero-traffic output byte-for-byte.
-        if app.surfacing_engine is not None and app.surfacing_engine.observability is not None:
-            snapshot = app.surfacing_engine.observability.snapshot()
-            if snapshot["any_call"]:
-                lines.extend(_format_observability_sections(snapshot, tool_filter=tool))
+        if obs_snapshot is not None:
+            lines.extend(_format_observability_sections(obs_snapshot, tool_filter=tool))
 
         if tool:
             lines.append(f"\n(filtered by tool: {tool})")
@@ -1751,6 +1795,68 @@ def _split_skip_reasons_by_category(
         if f:
             fault_view[tool_name] = f
     return healthy_view, fault_view
+
+
+def _surfacing_verdict_line(snapshot: dict, *, tool_filter: str | None) -> str | None:
+    """Render the top-line health verdict for ``stm_surfacing_stats`` (#363).
+
+    Summarizes the same in-memory counters as the Healthy/Fault skip sections
+    below it, so the verdict is additive on top of the #362 partition rather
+    than a replacement for it: the word answers "is surfacing healthy?" at a
+    glance, the sections answer "why not?".
+
+    Scope is one process since start — the counters are
+    ``SurfacingObservability``'s, not the durable ``surfacing_faults`` table —
+    so the label says so rather than implying a deployment-wide all-clear.
+    ``mms stats`` renders the 7-UTC-day persisted fault view.
+
+    The denominator counts only attempts that reached the LTM (see
+    ``observability.py`` for the three category sets and why pre-LTM gate skips
+    are excluded from both sides). Returns ``None`` when a ``tool=`` filter
+    names a tool with no recorded counters — a verdict computed from an empty
+    slice would render ``insufficient data`` for a tool the process has simply
+    never surfaced for, which reads as a health signal rather than an absence.
+    """
+    key = tool_filter if tool_filter is not None else "__total__"
+    skips: dict[str, int] = snapshot["skip_reasons"].get(key) or {}
+    outcomes: dict[str, int] = snapshot["outcomes"].get(key) or {}
+    if not skips and not outcomes:
+        return None
+
+    fault_counts: dict[str, int] = {
+        name: count
+        for name, count in list(skips.items()) + list(outcomes.items())
+        if name in FAULT_SKIP_REASONS or name in FAULT_OUTCOMES
+    }
+    faults = sum(fault_counts.values())
+    completed = sum(
+        count
+        for name, count in list(skips.items()) + list(outcomes.items())
+        if name in SURFACED_OUTCOMES or name in SEARCH_COMPLETED_SKIP_REASONS
+    )
+    attempts = faults + completed
+
+    prefix = "Verdict (this process, since start):"
+    if attempts < _VERDICT_MIN_ATTEMPTS:
+        return (
+            f"{prefix} insufficient data — {attempts} LTM attempts (need {_VERDICT_MIN_ATTEMPTS})"
+        )
+
+    ratio = faults / attempts
+    if ratio >= _VERDICT_FAULTY_RATIO:
+        word = "FAULTY"
+    elif ratio >= _VERDICT_DEGRADED_RATIO:
+        word = "DEGRADED"
+    else:
+        word = "HEALTHY"
+
+    line = f"{prefix} {word} — {faults} of {attempts} LTM attempts faulted ({ratio * 100:.1f}%)"
+    if fault_counts:
+        # Same descending-count, name-tiebreak ordering the skip sections use,
+        # so the named reason matches the first row an operator reads below.
+        top_name, top_count = sorted(fault_counts.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+        line += f"; top fault: {top_name} {top_count}"
+    return line
 
 
 def _format_observability_sections(snapshot: dict, *, tool_filter: str | None) -> list[str]:
