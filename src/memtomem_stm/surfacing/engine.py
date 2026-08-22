@@ -810,8 +810,9 @@ class SurfacingEngine:
         accumulating samples. ``adjusted`` only contains tools whose
         ``AutoTuner.maybe_adjust`` has fired this process; an empty dict
         with ``enabled=True`` means auto-tuning is on but no tool has
-        moved off the default yet (either insufficient samples or ratio
-        inside the [0.2, 0.6] no-op band).
+        moved off the default yet (either insufficient samples, or ratios
+        inside the tuner's no-op region: negative ratio at or below 0.6
+        *and* helpful ratio at or below 0.8).
 
         ``overrides`` maps tool name → pinned ``min_score`` from
         ``context_tools.<tool>.min_score``. These tools bypass the

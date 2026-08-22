@@ -1470,7 +1470,8 @@ class TestSurfacingStats:
             "recent": [],
         }
         # The full history has 50 samples — well past the 20-sample threshold —
-        # but not yet adjusted (ratio in [0.2, 0.6] no-op band).
+        # but not yet adjusted (ratios inside the tuner's no-op region:
+        # negative at or below 0.6 and helpful at or below 0.8).
         mock_tracker.store.get_per_tool_feedback_counts.return_value = {"historic_tool": 50}
         mock_engine = MagicMock()
         mock_engine.observability = None
