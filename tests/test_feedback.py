@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+import re
 import time
 from pathlib import Path
 
@@ -843,3 +845,67 @@ class TestAutoTuner:
             assert summary["by_rating"].get("partially_helpful") == 1
         finally:
             tracker.close()
+
+
+class TestAutoTuneBandProseParity:
+    """Keeps prose describing the tuner's no-op region tied to the code.
+
+    The operator-facing explanation of "auto-tune is on but nothing moved"
+    drifted once already: it described a single ``[0.2, 0.6]`` band on the
+    negative-feedback axis, which was accurate only before #353 part 2 split
+    ``maybe_adjust`` into two independent gates (raise on negative > 0.6,
+    lower on helpful > 0.8). Nothing failed when the code changed, because a
+    comment has no test. This extracts the live thresholds from the source and
+    asserts every site that names them agrees — so changing a gate's number
+    without updating the prose fails here rather than misleading an operator.
+    """
+
+    # Sites whose prose explains the no-op region to a reader. Each must name
+    # both gates, since the region is the conjunction of the two.
+    _PROSE_SITES = (
+        "src/memtomem_stm/surfacing/engine.py",
+        "src/memtomem_stm/server.py",
+    )
+
+    @staticmethod
+    def _live_thresholds() -> tuple[str, str]:
+        """Pull the two gate literals out of ``AutoTuner.maybe_adjust``."""
+        src = inspect.getsource(AutoTuner.maybe_adjust)
+        neg = re.search(r"neg_ratio\s+is\s+not\s+None\s+and\s+neg_ratio\s*>\s*([0-9.]+)", src)
+        helpful = re.search(
+            r"helpful_ratio\s+is\s+not\s+None\s+and\s+helpful_ratio\s*>\s*([0-9.]+)", src
+        )
+        assert neg is not None, "negative-ratio gate not found in maybe_adjust"
+        assert helpful is not None, "helpful-ratio gate not found in maybe_adjust"
+        return neg.group(1), helpful.group(1)
+
+    def test_thresholds_are_the_ones_the_prose_claims(self):
+        """Positive control for the parity check below: pin the values the
+        current prose was written against. If a gate moves, this fails first
+        and names the new number, so the follow-up failure is unambiguous."""
+        assert self._live_thresholds() == ("0.6", "0.8")
+
+    @pytest.mark.parametrize("rel_path", _PROSE_SITES)
+    def test_prose_names_both_live_gates(self, rel_path: str):
+        neg, helpful = self._live_thresholds()
+        text = (Path(__file__).resolve().parents[1] / rel_path).read_text(encoding="utf-8")
+        # Restrict to the no-op-region explanations rather than the whole
+        # file: an unrelated 0.6 elsewhere must not satisfy the check.
+        regions = [
+            block
+            for block in re.split(r"\n\s*\n", text)
+            if "no-op region" in block or "tuner's gates" in block
+        ]
+        assert regions, f"{rel_path} no longer explains the tuner's no-op region"
+        for block in regions:
+            assert neg in block, f"{rel_path}: no-op prose omits the negative gate {neg}"
+            assert helpful in block, f"{rel_path}: no-op prose omits the helpful gate {helpful}"
+
+    @pytest.mark.parametrize("rel_path", (*_PROSE_SITES, "tests/test_server_tools.py"))
+    def test_pre_353_single_band_phrasing_is_gone(self, rel_path: str):
+        """The specific wrong description, pinned so it cannot come back by
+        copy-paste. ``[0.2, 0.6]`` implied one axis and implied that a *low*
+        negative ratio lowers the threshold — the pre-#353 branch, which
+        ``test_partially_helpful_does_not_lower_threshold`` proves is gone."""
+        text = (Path(__file__).resolve().parents[1] / rel_path).read_text(encoding="utf-8")
+        assert "[0.2, 0.6]" not in text

@@ -1669,7 +1669,8 @@ async def stm_surfacing_stats(
                         # (cold-start fallback). Reporting only the per-tool
                         # gate would label a tool "need N more" even when the
                         # very next surfacing would tune it from the global
-                        # pool with ratio outside the [0.2, 0.6] no-op band.
+                        # pool with a ratio past one of the tuner's gates
+                        # (negative above 0.6, or helpful above 0.8).
                         # Falls back to the windowed fb when the store didn't
                         # supply a count for this tool (closed/missing).
                         eligible_fb = readiness_counts.get(tool_name, fb)
