@@ -986,54 +986,85 @@ def hook_command(
     # byte-identical to the pre-group command.
     if ctx.invoked_subcommand is not None:
         return
-    overrides = runtime_env_overrides(
-        use_daemon=runtime_use_daemon,
-        surfacing_timeout_seconds=surfacing_timeout_seconds,
-        daemon_timeout_seconds=daemon_timeout_seconds,
-        persist_query_text=runtime_persist_query_text,
-    )
-    with _runtime_registration_env(overrides):
-        payload = _read_payload(sys.stdin)
-        host_tag = _resolve_host_tag(host, payload)
-        adapter = get_adapter(host_tag)
-        output: dict[str, Any] = {}
-        if payload is not None:
-            try:
-                output = asyncio.run(
-                    asyncio.wait_for(
-                        _orchestrate(
-                            payload,
-                            adapter,
-                            # Automatic/ambiguous routing must never enable the
-                            # sole destructive capability (native output replace).
-                            allow_output_replacement=host.strip() == "claude",
-                        ),
-                        timeout=_hook_budget_seconds(),
-                    )
-                )
-            except Exception:
-                logger.warning(
-                    "hook processing failed — passing tool output through", exc_info=True
-                )
-                output = {}
-        serialized = adapter.serialize(output)
-    # ``serialize`` returns "" only when nothing is emitted (Kimi's raw-stdout
-    # channel with nothing surfaced). An unconditional ``click.echo`` would still
-    # append a newline, making stdout "\n" — non-empty, which Kimi injects into
-    # the model context — so the "empty stdout" pass-through contract requires
-    # suppressing the newline on an empty payload. JSON hosts always serialize to
-    # a non-empty string ("{}" or more), so their trailing newline (and the
-    # pre-seam byte-identity) is unchanged.
+    # Top-level always-exit-0 barrier (#865). The inner ``except Exception``
+    # around ``asyncio.run`` stays for finer-grained degradation, but several
+    # per-invocation steps run outside it — flag validation, payload read, host
+    # resolution, ``adapter.serialize``, the stdout write — and the inner guard
+    # also misses ``SystemExit``/other ``BaseException`` escaping
+    # ``_orchestrate``. Any of those previously exited non-zero, which every
+    # host reads as a hook failure on the hottest code path (#862). ``adapter``
+    # and ``wrote`` track how far we got, so the fallback can (a) serialize the
+    # pass-through ``{}`` per the resolved host's channel shape (Kimi's raw
+    # stdout must stay truly empty) and (b) never append to a partially written
+    # stdout.
+    adapter: HostHookAdapter | None = None
+    wrote = False
     try:
-        click.echo(serialized, nl=bool(serialized))
-    except UnicodeEncodeError:
-        # Last resort for the always-exit-0 contract (#757). The JSON hosts'
-        # payload is escaped by the writer in ``serialize``, but Kimi's channel
-        # is raw stdout — surfaced text, not a JSON document — so nothing
-        # escapes an unencodable code unit there. Degrade to "nothing surfaced"
-        # rather than let the final write become a hook failure the host reads
-        # as a broken tool call.
-        logger.warning("hook output was not encodable — passing tool output through")
+        overrides = runtime_env_overrides(
+            use_daemon=runtime_use_daemon,
+            surfacing_timeout_seconds=surfacing_timeout_seconds,
+            daemon_timeout_seconds=daemon_timeout_seconds,
+            persist_query_text=runtime_persist_query_text,
+        )
+        with _runtime_registration_env(overrides):
+            payload = _read_payload(sys.stdin)
+            host_tag = _resolve_host_tag(host, payload)
+            adapter = get_adapter(host_tag)
+            output: dict[str, Any] = {}
+            if payload is not None:
+                try:
+                    output = asyncio.run(
+                        asyncio.wait_for(
+                            _orchestrate(
+                                payload,
+                                adapter,
+                                # Automatic/ambiguous routing must never enable the
+                                # sole destructive capability (native output replace).
+                                allow_output_replacement=host.strip() == "claude",
+                            ),
+                            timeout=_hook_budget_seconds(),
+                        )
+                    )
+                except Exception:
+                    logger.warning(
+                        "hook processing failed — passing tool output through", exc_info=True
+                    )
+                    output = {}
+            serialized = adapter.serialize(output)
+        # ``serialize`` returns "" only when nothing is emitted (Kimi's raw-stdout
+        # channel with nothing surfaced). An unconditional ``click.echo`` would
+        # still append a newline, making stdout "\n" — non-empty, which Kimi
+        # injects into the model context — so the "empty stdout" pass-through
+        # contract requires suppressing the newline on an empty payload. JSON
+        # hosts always serialize to a non-empty string ("{}" or more), so their
+        # trailing newline (and the pre-seam byte-identity) is unchanged.
+        wrote = True
+        try:
+            click.echo(serialized, nl=bool(serialized))
+        except UnicodeEncodeError:
+            # Last resort for the always-exit-0 contract (#757). The JSON hosts'
+            # payload is escaped by the writer in ``serialize``, but Kimi's
+            # channel is raw stdout — surfaced text, not a JSON document — so
+            # nothing escapes an unencodable code unit there. Degrade to
+            # "nothing surfaced" rather than let the final write become a hook
+            # failure the host reads as a broken tool call.
+            logger.warning("hook output was not encodable — passing tool output through")
+    except BaseException:  # noqa: BLE001 — the contract IS "swallow everything"
+        logger.warning(
+            "hook bridge failed outside inner barriers — passing tool output through",
+            exc_info=True,
+        )
+        if not wrote:
+            # Best-effort pass-through in the resolved host's channel shape:
+            # ``serialize({})`` is "{}" for the JSON hosts and "" for Kimi. If
+            # the adapter (or its serialize) is the very thing that failed,
+            # degrade to empty stdout — safe for every host on exit 0. Never
+            # emit after a (possibly partial) write already went out.
+            try:
+                fallback = adapter.serialize({}) if adapter is not None else "{}"
+                click.echo(fallback, nl=bool(fallback))
+            except Exception:
+                logger.warning("hook fallback emit failed — emitting nothing")
 
 
 def _hook_install_command_argv(host: str, *, policy: HostRuntimePolicy | None = None) -> list[str]:
