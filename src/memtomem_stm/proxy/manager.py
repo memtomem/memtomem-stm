@@ -876,20 +876,30 @@ class ProxyManager:
         # leaving strict withholding forever. Forcing the next refresh through
         # a full re-adopt makes recovery automatic.
         self._toolgraph_bundle_stamp = None
+        expected = isinstance(exc, (OSError, PolicyBundleError))
         self._toolgraph_degraded = True
         self._toolgraph_degraded_reason = REASON_TOOLGRAPH_PROTOCOL_ERROR
         if self._config.exposure.profile is ExposureProfile.STRICT:
             self._toolgraph_withhold_all = REASON_TOOLGRAPH_PROTOCOL_ERROR
             # Fail-closed supersedes binding: nothing is withheld *because*
-            # it failed to bind any more, it is withheld because the bundle
-            # is unreadable. Keeping the old snapshot's diagnosis would pair
-            # a live protocol error with a stale mapping/digest cause and
-            # send the operator after the wrong thing.
+            # it failed to bind any more, it is withheld because the reload
+            # produced no trusted snapshot. Keeping the old snapshot's
+            # diagnosis would pair a live protocol error with a stale
+            # mapping/digest cause and send the operator after the wrong thing.
             self._toolgraph_bind_stats = {}
             self._toolgraph_all_fail_cause = None
             self._toolgraph_all_fail_warned = False
             if startup:
-                raise ToolgraphStartupError(f"Invalid Toolgraph policy bundle: {exc}") from exc
+                # Only the expected classes mean the artifact itself is bad;
+                # an unexpected class is a fault inside the reload, and
+                # calling it an invalid bundle sends the operator to republish
+                # a file that was never the problem.
+                summary = (
+                    "Invalid Toolgraph policy bundle"
+                    if expected
+                    else "Toolgraph policy bundle reload failed"
+                )
+                raise ToolgraphStartupError(f"{summary}: {exc}") from exc
         elif (
             self._toolgraph_policy_snapshot is not None
             and self._toolgraph_bound_catalog_revision != self._tool_catalog_revision
@@ -902,11 +912,7 @@ class ProxyManager:
         # Unexpected classes keep their traceback: the message alone names
         # neither the raise site nor the class family the next fix should
         # widen to expect.
-        logger.warning(
-            "Toolgraph policy bundle reload rejected: %s",
-            exc,
-            exc_info=not isinstance(exc, (OSError, PolicyBundleError)),
-        )
+        logger.warning("Toolgraph policy bundle reload rejected: %s", exc, exc_info=not expected)
 
     def _refresh_toolgraph_bundle(self, *, force: bool = False, startup: bool = False) -> None:
         """Reload a changed portable policy artifact with atomic swap semantics."""
@@ -917,7 +923,7 @@ class ProxyManager:
             # ``expanduser`` is inside the barrier too: a ``~nosuchuser`` path
             # raises RuntimeError, not OSError, and must reject, not escape.
             path = cfg.bundle_path.expanduser()
-            # Deliberate O(1) syscall on every tools/call and each
+            # Deliberate O(1) syscall on every proxied tools/call and each
             # advertisement build (startup registration / lifespan cleanup): a
             # freshly published denial must take effect before cache lookup or
             # upstream dispatch. Catalog hashing remains revision-gated, so

@@ -597,7 +597,9 @@ def test_unexpected_refresh_error_fails_strict_but_review_degrades(tmp_path, mon
     strict, strict_path, tool = _manager(tmp_path / "strict")
     strict_path.parent.mkdir(parents=True)
     _write_bundle(strict_path, _bundle(tool))
-    with pytest.raises(ToolgraphStartupError, match="Invalid Toolgraph policy bundle"):
+    # "reload failed", not "invalid bundle": the artifact here is well-formed,
+    # so naming it invalid would send the operator to republish a good file.
+    with pytest.raises(ToolgraphStartupError, match="policy bundle reload failed"):
         strict._refresh_toolgraph_bundle(force=True, startup=True)
 
     review, review_path, tool = _manager(tmp_path / "review", profile=ExposureProfile.REVIEW)
@@ -610,7 +612,7 @@ def test_unexpected_refresh_error_fails_strict_but_review_degrades(tmp_path, mon
 
 
 def test_unexpected_runtime_refresh_error_does_not_crash_the_call_gate(tmp_path, monkeypatch):
-    # The same reload runs on every tools/call
+    # The same reload runs on every proxied tools/call
     # (_enforce_toolgraph_call_policy) and each advertisement build; an
     # unexpected exception class there crashed the in-flight request. It must
     # degrade instead — and under the strict profile fail closed (withhold,
@@ -641,7 +643,9 @@ def test_unexpanded_user_bundle_path_rejects_instead_of_escaping(tmp_path):
     # outcomes are identical either way.)
     strict, _, _ = _manager(tmp_path / "strict")
     strict._config.toolgraph.bundle_path = Path("~mms-no-such-user-866/bundle.json")
-    with pytest.raises(ToolgraphStartupError, match="Invalid Toolgraph policy bundle"):
+    # The summary differs by platform (POSIX RuntimeError -> "reload failed";
+    # Windows OSError -> "Invalid ... bundle"), so pin only the shared stem.
+    with pytest.raises(ToolgraphStartupError, match="Toolgraph policy bundle"):
         strict._refresh_toolgraph_bundle(force=True, startup=True)
 
     review, _, _ = _manager(tmp_path / "review", profile=ExposureProfile.REVIEW)
