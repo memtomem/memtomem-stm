@@ -584,9 +584,9 @@ def test_invalid_startup_fails_strict_but_review_degrades(tmp_path):
 
 def test_unexpected_refresh_error_fails_strict_but_review_degrades(tmp_path, monkeypatch):
     # #866: only OSError/PolicyBundleError were caught around the bundle
-    # reload, so any other exception class from a malformed bundle path
-    # escaped — at startup that aborted the whole MCP server instead of
-    # degrading the toolgraph feature. Unexpected classes must ride the same
+    # reload, so any other exception class escaping it — here an internal
+    # loader crash on a well-formed bundle — aborted the whole MCP server at
+    # startup instead of degrading the toolgraph feature. It must ride the same
     # semantics as the expected ones: strict fails startup loudly with
     # ToolgraphStartupError, review degrades with a logged fault.
     def _boom(*args, **kwargs):
@@ -612,8 +612,9 @@ def test_unexpected_refresh_error_fails_strict_but_review_degrades(tmp_path, mon
 def test_unexpected_runtime_refresh_error_does_not_crash_the_call_gate(tmp_path, monkeypatch):
     # The same reload runs on every tools/call
     # (_enforce_toolgraph_call_policy) and each advertisement build; an
-    # unexpected exception class there crashed the in-flight request. It must degrade instead — and under the
-    # strict profile fail closed (withhold, ToolError) rather than crash.
+    # unexpected exception class there crashed the in-flight request. It must
+    # degrade instead — and under the strict profile fail closed (withhold,
+    # ToolError) rather than crash.
     manager, path, tool = _manager(tmp_path)
     _write_bundle(path, _bundle(tool))
     manager._refresh_toolgraph_bundle(force=True, startup=True)  # healthy load first
