@@ -582,6 +582,121 @@ def test_invalid_startup_fails_strict_but_review_degrades(tmp_path):
     assert status["withholding_all"] is None
 
 
+def test_unexpected_refresh_error_fails_strict_but_review_degrades(tmp_path, monkeypatch):
+    # #866: only OSError/PolicyBundleError were caught around the bundle
+    # reload, so any other exception class escaping it — here an internal
+    # loader crash on a well-formed bundle — aborted the whole MCP server at
+    # startup instead of degrading the toolgraph feature. It must ride the same
+    # semantics as the expected ones: strict fails startup loudly with
+    # ToolgraphStartupError, review degrades with a logged fault.
+    def _boom(*args, **kwargs):
+        raise RuntimeError("unexpected loader crash")
+
+    monkeypatch.setattr(manager_mod, "load_policy_bundle", _boom)
+
+    strict, strict_path, tool = _manager(tmp_path / "strict")
+    strict_path.parent.mkdir(parents=True)
+    _write_bundle(strict_path, _bundle(tool))
+    # "reload failed", not "invalid bundle": the artifact here is well-formed,
+    # so naming it invalid would send the operator to republish a good file.
+    with pytest.raises(ToolgraphStartupError, match="policy bundle reload failed"):
+        strict._refresh_toolgraph_bundle(force=True, startup=True)
+
+    review, review_path, tool = _manager(tmp_path / "review", profile=ExposureProfile.REVIEW)
+    review_path.parent.mkdir(parents=True)
+    _write_bundle(review_path, _bundle(tool))
+    review._refresh_toolgraph_bundle(force=True, startup=True)
+    status = review.get_toolgraph_status()
+    assert status["degraded"] is True
+    assert status["withholding_all"] is None
+
+
+def test_unexpected_runtime_refresh_error_does_not_crash_the_call_gate(tmp_path, monkeypatch):
+    # The same reload runs on every proxied tools/call
+    # (_enforce_toolgraph_call_policy) and each advertisement build; an
+    # unexpected exception class there crashed the in-flight request. It must
+    # degrade instead — and under the strict profile fail closed (withhold,
+    # ToolError) rather than crash.
+    manager, path, tool = _manager(tmp_path)
+    _write_bundle(path, _bundle(tool))
+    manager._refresh_toolgraph_bundle(force=True, startup=True)  # healthy load first
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("unexpected loader crash")
+
+    monkeypatch.setattr(manager_mod, "load_policy_bundle", _boom)
+    # Deterministic stamp invalidation: touch() depends on filesystem mtime
+    # granularity; an explicit +1s utime always changes st_mtime_ns.
+    before = path.stat()
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 10**9))
+    with pytest.raises(ToolError, match="Policy denied"):
+        manager._enforce_toolgraph_call_policy("srv", "read")
+    assert manager.get_toolgraph_status()["withholding_all"] is not None
+
+
+def test_unexpanded_user_bundle_path_rejects_instead_of_escaping(tmp_path):
+    # Path.expanduser() raises RuntimeError (not OSError) for ``~nosuchuser``
+    # on POSIX; that ran OUTSIDE the reload barrier, so review startup still
+    # died with the raw exception. Both profiles must take the rejection
+    # semantics. (On Windows the class depends on the profile environment:
+    # expanduser may resolve the path, leaving stat() to raise OSError, or
+    # raise RuntimeError itself. The asserted outcomes hold for both.)
+    strict, _, _ = _manager(tmp_path / "strict")
+    strict._config.toolgraph.bundle_path = Path("~mms-no-such-user-866/bundle.json")
+    # The summary follows the exception family, which is what varies here
+    # (RuntimeError -> "reload failed"; OSError -> "Invalid ... bundle"), so
+    # pin only the shared stem.
+    with pytest.raises(ToolgraphStartupError, match="Toolgraph policy bundle"):
+        strict._refresh_toolgraph_bundle(force=True, startup=True)
+
+    review, _, _ = _manager(tmp_path / "review", profile=ExposureProfile.REVIEW)
+    review._config.toolgraph.bundle_path = Path("~mms-no-such-user-866/bundle.json")
+    review._refresh_toolgraph_bundle(force=True, startup=True)
+    assert review.get_toolgraph_status()["degraded"] is True
+
+
+def test_transient_stat_failure_recovers_when_path_returns_unchanged(tmp_path):
+    # A first-region rejection (expanduser/stat) must not stick: after a
+    # transient failure the path can come back with the SAME (ino, size,
+    # mtime_ns) stamp, and the unchanged-stamp early return would then skip
+    # the full reload that clears degraded/withhold-all state. Rejection
+    # therefore invalidates the stored stamp so the next refresh re-adopts.
+    manager, path, tool = _manager(tmp_path)
+    _write_bundle(path, _bundle(tool))
+    manager._refresh_toolgraph_bundle(force=True, startup=True)  # healthy load
+
+    hidden = path.with_suffix(".hidden")
+    path.rename(hidden)  # stat -> OSError; rename preserves ino/size/mtime
+    manager._refresh_toolgraph_bundle()
+    assert manager.get_toolgraph_status()["withholding_all"] is not None
+
+    hidden.rename(path)  # path recovers byte- and stamp-identical
+    manager._refresh_toolgraph_bundle()
+    status = manager.get_toolgraph_status()
+    assert status["withholding_all"] is None
+    assert status["degraded"] is False
+
+
+def test_rebind_bug_on_unchanged_stamp_propagates_not_withholds(tmp_path, monkeypatch):
+    # The unchanged-stamp catalog rebind is deliberately OUTSIDE the reject
+    # barrier: an internal binding bug is a programming error, not an invalid
+    # bundle, and reporting it as one would send the operator after the
+    # artifact instead of the code. It stays loud.
+    manager, path, tool = _manager(tmp_path)
+    _write_bundle(path, _bundle(tool))
+    manager._refresh_toolgraph_bundle(force=True, startup=True)  # healthy load
+
+    manager._tool_catalog_revision += 1  # catalog moved; stamp unchanged
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("binding bug")
+
+    monkeypatch.setattr(manager, "_apply_toolgraph_policy_snapshot", _boom)
+    with pytest.raises(RuntimeError, match="binding bug"):
+        manager._refresh_toolgraph_bundle()
+    assert manager.get_toolgraph_status()["withholding_all"] is None
+
+
 def test_bundle_mode_rejects_profile_split_brain(tmp_path):
     manager, path, tool = _manager(tmp_path)
     manager._config.toolgraph.query_profile = "review"
