@@ -742,3 +742,87 @@ class TestFactExtractorTimeout:
                 )
 
         assert extractor._cb.state == "open"
+
+
+class TestFactExtractorShutdown:
+    """#867: close() must drain in-flight extract() calls, bounded.
+
+    FactExtractor had no drain at all — ``aclose()`` could land under a live
+    request, tearing the httpx client down mid-call. It now carries the same
+    ``_in_flight``/``_idle`` gate LLMCompressor has, with the same bounded
+    wait so a stuck caller costs the drain ceiling rather than the process.
+    """
+
+    async def test_close_waits_for_in_flight_extract(self):
+        cfg = _tiny_timeout_config()
+        cfg.llm.llm_timeout_seconds = 30.0  # long enough that the gate, not the call, decides
+        cfg.strategy = ExtractionStrategy.LLM
+        extractor = FactExtractor(cfg)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_call_api(text: str) -> str:
+            started.set()
+            await release.wait()
+            return '[{"content": "f", "type": "concept", "confidence": 0.9}]'
+
+        with patch.object(extractor, "_call_api", new=slow_call_api):
+            task = asyncio.create_task(extractor.extract("x" * 100, server="s", tool="t"))
+            await started.wait()
+
+            close_task = asyncio.create_task(extractor.close())
+            for _ in range(10):
+                await asyncio.sleep(0)
+
+            assert not close_task.done(), (
+                "close() returned while an extract was in flight — no drain"
+            )
+            assert extractor._client is not None, (
+                "close() aclose'd the httpx client while extract was mid-call"
+            )
+
+            release.set()
+            facts = await task
+            await close_task
+
+        assert [f.content for f in facts] == ["f"]
+        assert extractor._client is None
+
+    async def test_extract_after_close_refuses_even_with_a_live_client(self):
+        # The gate must be the ``_closed`` flag, not "the client happens to be
+        # None": a stale client reference (a config swap handing the extractor
+        # back, a caller holding the instance) must still take the local
+        # heuristic instead of crossing the provider boundary. Nulling the
+        # client alone would make this pass without any gate at all.
+        cfg = _tiny_timeout_config()
+        cfg.strategy = ExtractionStrategy.LLM
+        extractor = FactExtractor(cfg)
+        await extractor.close()
+        extractor._client = MagicMock()  # resurrect a client the gate must ignore
+
+        called = False
+
+        async def record_call(text: str) -> str:
+            # A raise here would be swallowed by _extract_llm's broad except
+            # and degrade to the heuristic anyway — the assertion would then
+            # hold for the wrong reason. Record instead.
+            nonlocal called
+            called = True
+            return "[]"
+
+        with patch.object(extractor, "_call_api", new=record_call):
+            facts = await extractor.extract("def some_function(): pass", server="s", tool="t")
+
+        assert not called, "LLM route ran after close()"
+        assert all(isinstance(f, ExtractedFact) for f in facts)
+
+    async def test_close_drain_is_bounded_when_a_call_never_finishes(self):
+        cfg = _tiny_timeout_config()  # llm_timeout_seconds=0.05 keeps the ceiling small
+        extractor = FactExtractor(cfg)
+        extractor._in_flight = 1
+        extractor._idle.clear()
+
+        close_task = asyncio.create_task(extractor.close())
+        done, _ = await asyncio.wait({close_task}, timeout=10.0)
+        assert done, "close() never returned — the drain wait is unbounded"
+        assert extractor._client is None

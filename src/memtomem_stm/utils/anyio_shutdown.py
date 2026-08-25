@@ -1,4 +1,4 @@
-"""Detection helpers for AnyIO's cancel-scope shutdown errors.
+"""Shutdown helpers: AnyIO cancel-scope detection, and bounded in-flight drain.
 
 AnyIO cancel scopes are task-affine: exiting one from a different task than
 entered it raises a ``RuntimeError`` whose message is the only stable way to
@@ -6,9 +6,18 @@ recognize it. STM-owned MCP client contexts now use dedicated lifecycle owner
 tasks, so this is no longer an expected construction. The exact-match helper
 remains a narrow shutdown barrier for an upstream SDK unwind or a legacy
 injected adapter; mixed exception groups are never classified as clean.
+
+:func:`drain_or_warn` is the unrelated half: the ceiling every ``close()``
+puts on waiting for its in-flight callers, so one stuck request cannot
+hang shutdown (#867).
 """
 
 from __future__ import annotations
+
+import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
 
 _CANCEL_SCOPE_SHUTDOWN_MESSAGES = (
     "Attempted to exit a cancel scope that isn't the current tasks's current cancel scope",
@@ -37,3 +46,35 @@ def is_clean_cancel_scope_shutdown(exc: BaseException) -> bool:
     if isinstance(exc, BaseExceptionGroup):
         return all(is_clean_cancel_scope_shutdown(sub) for sub in exc.exceptions)
     return isinstance(exc, RuntimeError) and is_anyio_cancel_scope_shutdown_error(exc)
+
+
+# Grace added to an in-flight call's own deadline to get the drain ceiling.
+# The call is already bounded by ``llm_timeout_seconds``; this only covers the
+# hop from that deadline firing to the ``finally`` releasing the gate.
+CLOSE_DRAIN_GRACE_SECONDS = 2.0
+
+
+async def drain_or_warn(idle: asyncio.Event, *, timeout: float, what: str) -> bool:
+    """Wait for an in-flight gate to clear, bounded; log and proceed on timeout.
+
+    ``close()`` on the LLM helpers waits for registered callers to finish
+    before tearing their httpx client down. That wait must have a ceiling:
+    each in-flight call carries its own ``wait_for``, so a drain that outlives
+    it means a caller never released the gate — and an unbounded wait there
+    turns one stuck request into a shutdown that never completes (#867).
+    Proceeding is the lesser evil: the caller is already past its own
+    deadline, and a hung shutdown blocks the whole process.
+
+    Returns True when the gate cleared, False when the ceiling was hit.
+    """
+    try:
+        await asyncio.wait_for(idle.wait(), timeout=timeout)
+        return True
+    except TimeoutError:
+        logger.warning(
+            "%s.close(): in-flight calls did not drain within %.1fs — "
+            "closing the client anyway; an in-flight call may see a closed transport",
+            what,
+            timeout,
+        )
+        return False

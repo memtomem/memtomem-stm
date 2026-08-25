@@ -19,6 +19,7 @@ from memtomem_stm.proxy.config import (
     LLMProvider,
 )
 from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS, contains_sensitive_content
+from memtomem_stm.utils.anyio_shutdown import CLOSE_DRAIN_GRACE_SECONDS, drain_or_warn
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 from memtomem_stm.utils.json_out import scrub_lone_surrogates
 from memtomem_stm.utils.numeric import safe_float
@@ -191,6 +192,13 @@ class FactExtractor:
             name=f"extraction-{self._llm_cfg.provider.value}",
         )
         self._client: httpx.AsyncClient | None = httpx.AsyncClient(timeout=30) if httpx else None
+        # Shutdown gate, mirroring LLMCompressor (#867): close() must drain
+        # in-flight LLM calls before aclose()ing the client, or a stop() /
+        # config swap tears the transport down under a live request.
+        self._in_flight: int = 0
+        self._idle: asyncio.Event = asyncio.Event()
+        self._idle.set()
+        self._closed: bool = False
 
     async def extract(
         self,
@@ -248,6 +256,18 @@ class FactExtractor:
         if self._cb.is_open:
             logger.debug("Extraction circuit open, falling back to heuristic")
             return _extract_heuristic(text, max_facts=self._cfg.max_facts)
+        if self._closed:
+            # Gate on the flag, not on ``_client is None``: a caller holding a
+            # closed extractor (or a resurrected client reference) must still
+            # take the local heuristic rather than cross the provider boundary.
+            logger.debug("Extractor closed, falling back to heuristic")
+            return _extract_heuristic(text, max_facts=self._cfg.max_facts)
+        # Register in-flight so a concurrent close() parks on ``_idle`` until
+        # we are done touching ``_client``. Increment+clear is sync — no await
+        # between the ``_closed`` check and the claim, so close() cannot slip
+        # in and aclose() the client between our check and our registration.
+        self._in_flight += 1
+        self._idle.clear()
         try:
             # Same outer bound as LLMCompressor.compress: the httpx client's
             # own timeout covers socket phases, but a provider that streams
@@ -283,6 +303,10 @@ class FactExtractor:
                 exc,
             )
             return _extract_heuristic(text, max_facts=self._cfg.max_facts)
+        finally:
+            self._in_flight -= 1
+            if self._in_flight == 0:
+                self._idle.set()
 
     async def _extract_hybrid(self, text: str, *, server: str, tool: str) -> list[ExtractedFact]:
         """Combine LLM + heuristic extraction, deduplicate by content."""
@@ -395,6 +419,15 @@ class FactExtractor:
         return content
 
     async def close(self) -> None:
+        # Flip the gate first so new extract() calls take the heuristic
+        # instead of entering ``_in_flight``, then drain already-registered
+        # callers — bounded, so one stuck call cannot hang shutdown (#867).
+        self._closed = True
+        await drain_or_warn(
+            self._idle,
+            timeout=self._llm_cfg.llm_timeout_seconds + CLOSE_DRAIN_GRACE_SECONDS,
+            what="FactExtractor",
+        )
         if self._client:
             await self._client.aclose()
             self._client = None

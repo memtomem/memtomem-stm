@@ -28,6 +28,7 @@ from memtomem_stm.proxy.config import (
     TailMode,
 )
 from memtomem_stm.proxy.relevance import BM25Scorer, RelevanceScorer
+from memtomem_stm.utils.anyio_shutdown import CLOSE_DRAIN_GRACE_SECONDS, drain_or_warn
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker as _CircuitBreaker
 from memtomem_stm.utils.json_out import escape_lone_surrogates
 
@@ -2391,7 +2392,11 @@ class LLMCompressor:
         # instead of entering ``_in_flight``. Then wait for already-registered
         # callers to drain before aclose()ing the client.
         self._closed = True
-        await self._idle.wait()
+        await drain_or_warn(
+            self._idle,
+            timeout=self._cfg.llm_timeout_seconds + CLOSE_DRAIN_GRACE_SECONDS,
+            what="LLMCompressor",
+        )
         if self._client:
             await self._client.aclose()
             self._client = None

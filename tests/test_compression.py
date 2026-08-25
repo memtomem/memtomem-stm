@@ -738,3 +738,34 @@ class TestLLMCompressorShutdown:
 
             assert all(r == "summary" for r in results)
             assert comp._client is None
+
+    @pytest.mark.asyncio
+    async def test_close_drain_is_bounded_when_a_call_never_finishes(self):
+        """#867: the drain wait itself must have a ceiling.
+
+        In practice compress() is bounded by its own wait_for, but close()
+        awaiting ``_idle`` with no timeout means any future unbounded path
+        hangs shutdown forever. A stuck in-flight caller must cost the drain
+        ceiling, not the process.
+        """
+        import asyncio
+
+        # The ceiling derives from llm_timeout_seconds, so a small configured
+        # timeout keeps the test fast without patching the constant.
+        cfg = LLMCompressorConfig(
+            provider=LLMProvider.OPENAI, api_key="test", llm_timeout_seconds=0.1
+        )
+        comp = LLMCompressor(cfg)
+        # Simulate the pathological state directly: a caller that registered
+        # in-flight and never returns. Going through compress() would be
+        # bounded by its own wait_for, which is exactly the bound this test
+        # must not rely on.
+        comp._in_flight = 1
+        comp._idle.clear()
+
+        close_task = asyncio.create_task(comp.close())
+        done, _ = await asyncio.wait({close_task}, timeout=10.0)
+        assert done, "close() never returned — the drain wait is still unbounded"
+        assert comp._client is None, (
+            "close() must still tear the client down after a timed-out drain"
+        )
