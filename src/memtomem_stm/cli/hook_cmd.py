@@ -67,7 +67,7 @@ import logging
 import os
 import shlex
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import replace
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterator, TextIO
@@ -1050,21 +1050,28 @@ def hook_command(
             # failure the host reads as a broken tool call.
             logger.warning("hook output was not encodable — passing tool output through")
     except BaseException:  # noqa: BLE001 — the contract IS "swallow everything"
-        logger.warning(
-            "hook bridge failed outside inner barriers — passing tool output through",
-            exc_info=True,
-        )
+        # Recovery must not itself break the contract: every step below —
+        # logging included — is guarded with ``BaseException`` so a fallback
+        # ``serialize``/``echo`` raising e.g. ``SystemExit`` (or a broken
+        # logging handler) cannot become the process exit code either.
+        with suppress(BaseException):
+            logger.warning(
+                "hook bridge failed outside inner barriers — passing tool output through",
+                exc_info=True,
+            )
         if not wrote:
             # Best-effort pass-through in the resolved host's channel shape:
-            # ``serialize({})`` is "{}" for the JSON hosts and "" for Kimi. If
-            # the adapter (or its serialize) is the very thing that failed,
-            # degrade to empty stdout — safe for every host on exit 0. Never
-            # emit after a (possibly partial) write already went out.
+            # ``serialize({})`` is "{}" for the JSON hosts and "" for Kimi. A
+            # failure *before* adapter resolution takes the literal "{}"
+            # branch; if the adapter's ``serialize`` is the very thing that
+            # failed, degrade to empty stdout — safe for every host on exit 0.
+            # Never emit after a (possibly partial) write already went out.
             try:
                 fallback = adapter.serialize({}) if adapter is not None else "{}"
                 click.echo(fallback, nl=bool(fallback))
-            except Exception:
-                logger.warning("hook fallback emit failed — emitting nothing")
+            except BaseException:  # noqa: BLE001
+                with suppress(BaseException):
+                    logger.warning("hook fallback emit failed — emitting nothing")
 
 
 def _hook_install_command_argv(host: str, *, policy: HostRuntimePolicy | None = None) -> list[str]:

@@ -401,6 +401,22 @@ def test_cli_barrier_serialize_failure_degrades_to_nothing(monkeypatch: pytest.M
     assert result.output == ""
 
 
+def test_cli_barrier_fallback_baseexception_still_exits_zero(monkeypatch: pytest.MonkeyPatch):
+    # The recovery path must not itself violate the contract: when the primary
+    # ``serialize`` raises a ``BaseException`` (not just ``Exception``) and the
+    # fallback re-serialize of {} raises the same way, the barrier still exits 0
+    # with empty stdout instead of letting the escape become the process exit.
+    class _FatalAdapter(ClaudeHookAdapter):
+        def serialize(self, output):  # type: ignore[override]
+            raise SystemExit(3)
+
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd.get_adapter", lambda *a, **k: _FatalAdapter())
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._orchestrate", AsyncMock(return_value={}))
+    result = CliRunner().invoke(cli, ["hook"], input=json.dumps(_READ_PAYLOAD))
+    assert result.exit_code == 0
+    assert result.output == ""
+
+
 def test_cli_barrier_kimi_fallback_is_empty_stdout(monkeypatch: pytest.MonkeyPatch):
     # When the failing call had already resolved the Kimi adapter, the barrier's
     # fallback goes through ``adapter.serialize({})`` — which for Kimi's raw
