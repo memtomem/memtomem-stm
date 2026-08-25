@@ -80,3 +80,41 @@ class TestLazyEntriesStillDispatch:
         result = runner.invoke(cli, ["no-such-command"])
         assert result.exit_code != 0
         assert "No such command" in result.output
+
+    def test_typo_suggestion_includes_lazy_commands(self):
+        """Click builds "Did you mean" suggestions from ``self.commands``,
+        not ``list_commands`` — resolve_command must materialize the lazy
+        registry on an unknown name or the suggestions silently lose the
+        seven lazy families. Fresh subprocess: in-process tests have already
+        cached every lazy command onto the module-global group."""
+        proc = subprocess.run(
+            [sys.executable, "-m", "memtomem_stm", "selektion"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert proc.returncode != 0
+        assert "Did you mean 'selection'" in proc.stderr
+
+    def test_valid_lazy_dispatch_imports_only_its_own_module(self):
+        """The unknown-name materialization must not fire for a VALID lazy
+        invocation — the hook hot path stays on the one module it needs."""
+        code = (
+            "import sys\n"
+            "from click.testing import CliRunner\n"
+            "from memtomem_stm.cli.proxy import cli\n"
+            "r = CliRunner().invoke(cli, ['hook', '--help'])\n"
+            "assert r.exit_code == 0, r.output\n"
+            "import json\n"
+            "print(json.dumps([m for m in "
+            "('mcp', 'memtomem_stm.cli.selection_cmd', 'memtomem_stm.cli.daemon_cmd') "
+            "if m in sys.modules]))\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(proc.stdout) == []

@@ -1412,6 +1412,24 @@ class _LazyGroup(click.Group):
         self.add_command(loaded)
         return loaded
 
+    def resolve_command(
+        self, ctx: click.Context, args: list[str]
+    ) -> tuple[str | None, click.Command | None, list[str]]:
+        # Click builds its "Did you mean ...?" suggestions from
+        # ``self.commands`` (click 8.4 ``NoSuchCommand(possibilities=...)``),
+        # not from ``list_commands`` — so an unknown name must first
+        # materialize every lazy entry or the suggestions silently lose the
+        # seven lazy families. Import cost is irrelevant here: this branch
+        # only runs on an already-failing invocation. The registry membership
+        # check keeps a *valid* lazy invocation (e.g. the hook hot path) on
+        # the one-module import it was invoked for.
+        if args:
+            head = click.utils.make_str(args[0])
+            if head not in _LAZY_SUBCOMMANDS and super().get_command(ctx, head) is None:
+                for name in _LAZY_SUBCOMMANDS:
+                    self.get_command(ctx, name)
+        return super().resolve_command(ctx, args)
+
 
 @click.group(cls=_LazyGroup, context_settings=CONTEXT_SETTINGS, invoke_without_command=True)
 @click.version_option(
