@@ -643,8 +643,9 @@ def test_unexpanded_user_bundle_path_rejects_instead_of_escaping(tmp_path):
     # raise RuntimeError itself. The asserted outcomes hold for both.)
     strict, _, _ = _manager(tmp_path / "strict")
     strict._config.toolgraph.bundle_path = Path("~mms-no-such-user-866/bundle.json")
-    # The summary differs by platform (POSIX RuntimeError -> "reload failed";
-    # Windows OSError -> "Invalid ... bundle"), so pin only the shared stem.
+    # The summary follows the exception family, which is what varies here
+    # (RuntimeError -> "reload failed"; OSError -> "Invalid ... bundle"), so
+    # pin only the shared stem.
     with pytest.raises(ToolgraphStartupError, match="Toolgraph policy bundle"):
         strict._refresh_toolgraph_bundle(force=True, startup=True)
 
@@ -679,8 +680,8 @@ def test_transient_stat_failure_recovers_when_path_returns_unchanged(tmp_path):
 def test_rebind_bug_on_unchanged_stamp_propagates_not_withholds(tmp_path, monkeypatch):
     # The unchanged-stamp catalog rebind is deliberately OUTSIDE the reject
     # barrier: an internal binding bug is a programming error, not an invalid
-    # bundle. Converting it to withhold-all would misdiagnose the fault and
-    # stick — the unchanged-stamp early return never re-clears it.
+    # bundle, and reporting it as one would send the operator after the
+    # artifact instead of the code. It stays loud.
     manager, path, tool = _manager(tmp_path)
     _write_bundle(path, _bundle(tool))
     manager._refresh_toolgraph_bundle(force=True, startup=True)  # healthy load

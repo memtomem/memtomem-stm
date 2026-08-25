@@ -890,14 +890,15 @@ class ProxyManager:
             self._toolgraph_all_fail_cause = None
             self._toolgraph_all_fail_warned = False
             if startup:
-                # The known rejection classes are the ones whose diagnosis the
-                # loader has already shaped (a bad artifact, a missing or
-                # unreadable file); anything else escaped the reload itself, and
-                # calling that an invalid bundle can send the operator to
-                # republish a file that was never the problem. Neither class
-                # *proves* which it is — a stat() OSError can be transient, and
-                # a ~nosuchuser RuntimeError really is bad configuration — so
-                # the exception is carried through as the cause either way.
+                # The split is by exception family, not by proven cause:
+                # OSError/PolicyBundleError are the two the reload raises
+                # deliberately, so "invalid bundle" is a fair summary of them;
+                # anything else is a fault nobody classified, and calling that
+                # an invalid bundle can send the operator to republish a file
+                # that was never the problem. Neither family *proves* the
+                # artifact's state — a stat() OSError can be transient, and a
+                # ~nosuchuser RuntimeError really is bad configuration — so the
+                # exception is carried through as the cause either way.
                 summary = (
                     "Invalid Toolgraph policy bundle"
                     if expected
@@ -943,9 +944,9 @@ class ProxyManager:
             # decisions so new/mutated tools become UNMAPPED/DRIFTED before
             # either advertisement or a direct call. Deliberately OUTSIDE the
             # reject barrier (like the post-load apply below): a bug in
-            # binding is not an invalid bundle, and converting it to
-            # withhold-all would both misdiagnose the fault and stick (the
-            # unchanged-stamp early return would never re-clear it).
+            # binding is not an invalid bundle, and reporting it as one would
+            # send the operator after the artifact instead of the code. It
+            # stays loud so the bug is fixed, not degraded around.
             if (
                 self._toolgraph_policy_snapshot is not None
                 and self._toolgraph_bound_catalog_revision != self._tool_catalog_revision
