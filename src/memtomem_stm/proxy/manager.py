@@ -896,7 +896,14 @@ class ProxyManager:
             after_stamp = (after.st_ino, after.st_size, after.st_mtime_ns)
             if after_stamp != stamp:
                 raise PolicyBundleError("policy bundle changed while it was being read")
-        except (OSError, PolicyBundleError) as exc:
+        except Exception as exc:
+            # OSError/PolicyBundleError are the expected rejection classes; any
+            # other exception from a malformed bundle path must ride the SAME
+            # semantics rather than escape (#866) — at startup an escape aborted
+            # the whole MCP server, and at runtime it crashed the in-flight
+            # tools/list / tools/call that triggered the reload. Strict still
+            # fails closed (and loudly at startup, below); review degrades.
+            unexpected = not isinstance(exc, (OSError, PolicyBundleError))
             self._toolgraph_degraded = True
             self._toolgraph_degraded_reason = REASON_TOOLGRAPH_PROTOCOL_ERROR
             if self._config.exposure.profile is ExposureProfile.STRICT:
@@ -920,7 +927,10 @@ class ProxyManager:
                 # drifted tools are counted as would-block instead of escaping
                 # the stale snapshot.
                 self._apply_toolgraph_policy_snapshot(self._toolgraph_policy_snapshot)
-            logger.warning("Toolgraph policy bundle reload rejected: %s", exc)
+            # Unexpected classes keep their traceback: the message alone names
+            # neither the raise site nor the class family the next fix should
+            # widen to expect.
+            logger.warning("Toolgraph policy bundle reload rejected: %s", exc, exc_info=unexpected)
             return
 
         self._toolgraph_policy_snapshot = snapshot

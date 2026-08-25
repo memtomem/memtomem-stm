@@ -582,6 +582,52 @@ def test_invalid_startup_fails_strict_but_review_degrades(tmp_path):
     assert status["withholding_all"] is None
 
 
+def test_unexpected_refresh_error_fails_strict_but_review_degrades(tmp_path, monkeypatch):
+    # #866: only OSError/PolicyBundleError were caught around the bundle
+    # reload, so any other exception class from a malformed bundle path
+    # escaped — at startup that aborted the whole MCP server instead of
+    # degrading the toolgraph feature. Unexpected classes must ride the same
+    # semantics as the expected ones: strict fails startup loudly with
+    # ToolgraphStartupError, review degrades with a logged fault.
+    def _boom(*args, **kwargs):
+        raise RuntimeError("unexpected loader crash")
+
+    monkeypatch.setattr(manager_mod, "load_policy_bundle", _boom)
+
+    strict, strict_path, tool = _manager(tmp_path / "strict")
+    strict_path.parent.mkdir(parents=True)
+    _write_bundle(strict_path, _bundle(tool))
+    with pytest.raises(ToolgraphStartupError, match="Invalid Toolgraph policy bundle"):
+        strict._refresh_toolgraph_bundle(force=True, startup=True)
+
+    review, review_path, tool = _manager(tmp_path / "review", profile=ExposureProfile.REVIEW)
+    review_path.parent.mkdir(parents=True)
+    _write_bundle(review_path, _bundle(tool))
+    review._refresh_toolgraph_bundle(force=True, startup=True)
+    status = review.get_toolgraph_status()
+    assert status["degraded"] is True
+    assert status["withholding_all"] is None
+
+
+def test_unexpected_runtime_refresh_error_does_not_crash_the_call_gate(tmp_path, monkeypatch):
+    # The same reload runs on every tools/list and tools/call
+    # (_enforce_toolgraph_call_policy); an unexpected exception class there
+    # crashed the in-flight request. It must degrade instead — and under the
+    # strict profile fail closed (withhold, ToolError) rather than crash.
+    manager, path, tool = _manager(tmp_path)
+    _write_bundle(path, _bundle(tool))
+    manager._refresh_toolgraph_bundle(force=True, startup=True)  # healthy load first
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("unexpected loader crash")
+
+    monkeypatch.setattr(manager_mod, "load_policy_bundle", _boom)
+    path.touch()  # move the stamp so the reload actually re-reads
+    with pytest.raises(ToolError, match="Policy denied"):
+        manager._enforce_toolgraph_call_policy("srv", "read")
+    assert manager.get_toolgraph_status()["withholding_all"] is not None
+
+
 def test_bundle_mode_rejects_profile_split_brain(tmp_path):
     manager, path, tool = _manager(tmp_path)
     manager._config.toolgraph.query_profile = "review"
