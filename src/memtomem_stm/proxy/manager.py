@@ -890,10 +890,14 @@ class ProxyManager:
             self._toolgraph_all_fail_cause = None
             self._toolgraph_all_fail_warned = False
             if startup:
-                # Only the expected classes mean the artifact itself is bad;
-                # an unexpected class is a fault inside the reload, and
-                # calling it an invalid bundle sends the operator to republish
-                # a file that was never the problem.
+                # The known rejection classes are the ones whose diagnosis the
+                # loader has already shaped (a bad artifact, a missing or
+                # unreadable file); anything else escaped the reload itself, and
+                # calling that an invalid bundle can send the operator to
+                # republish a file that was never the problem. Neither class
+                # *proves* which it is — a stat() OSError can be transient, and
+                # a ~nosuchuser RuntimeError really is bad configuration — so
+                # the exception is carried through as the cause either way.
                 summary = (
                     "Invalid Toolgraph policy bundle"
                     if expected

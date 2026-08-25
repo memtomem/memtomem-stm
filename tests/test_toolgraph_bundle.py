@@ -638,9 +638,9 @@ def test_unexpanded_user_bundle_path_rejects_instead_of_escaping(tmp_path):
     # Path.expanduser() raises RuntimeError (not OSError) for ``~nosuchuser``
     # on POSIX; that ran OUTSIDE the reload barrier, so review startup still
     # died with the raw exception. Both profiles must take the rejection
-    # semantics. (On Windows expanduser resolves without checking the user
-    # exists, and the subsequent stat() fails with OSError — the asserted
-    # outcomes are identical either way.)
+    # semantics. (On Windows the class depends on the profile environment:
+    # expanduser may resolve the path, leaving stat() to raise OSError, or
+    # raise RuntimeError itself. The asserted outcomes hold for both.)
     strict, _, _ = _manager(tmp_path / "strict")
     strict._config.toolgraph.bundle_path = Path("~mms-no-such-user-866/bundle.json")
     # The summary differs by platform (POSIX RuntimeError -> "reload failed";
