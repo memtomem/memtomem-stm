@@ -1423,7 +1423,10 @@ class _LazyGroup(click.Group):
         # pass (one lookup, one ``token_normalize_func`` application, no
         # materialization for a valid lazy invocation like the hook hot
         # path), and Click's resilient-parsing mode returns instead of
-        # raising, so completion probes never hydrate the registry either.
+        # raising, so THIS path never hydrates the registry for completion
+        # probes. (Completion itself enumerates via ``list_commands``/
+        # ``get_command`` and does import every family — same as ``--help``;
+        # neither is a hot path.)
         # Import cost on the retry is irrelevant: the invocation is already
         # failing.
         try:
