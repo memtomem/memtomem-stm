@@ -1060,14 +1060,17 @@ def hook_command(
                 exc_info=True,
             )
         if not wrote:
-            # Best-effort pass-through in the resolved host's channel shape:
+            # Best-effort pass-through in the host's channel shape:
             # ``serialize({})`` is "{}" for the JSON hosts and "" for Kimi. A
-            # failure *before* adapter resolution takes the literal "{}"
-            # branch; if the adapter's ``serialize`` is the very thing that
+            # failure *before* adapter resolution re-resolves from the explicit
+            # ``--host`` value alone (``get_adapter`` maps auto/unknown to
+            # Claude) so ``--host kimi``'s raw-stdout channel stays truly empty
+            # even then; if the adapter's ``serialize`` is the very thing that
             # failed, degrade to empty stdout — safe for every host on exit 0.
             # Never emit after a (possibly partial) write already went out.
             try:
-                fallback = adapter.serialize({}) if adapter is not None else "{}"
+                fb_adapter = adapter if adapter is not None else get_adapter(host.strip())
+                fallback = fb_adapter.serialize({})
                 click.echo(fallback, nl=bool(fallback))
             except BaseException:  # noqa: BLE001
                 with suppress(BaseException):

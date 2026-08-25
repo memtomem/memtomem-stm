@@ -401,6 +401,22 @@ def test_cli_barrier_serialize_failure_degrades_to_nothing(monkeypatch: pytest.M
     assert result.output == ""
 
 
+def test_cli_barrier_pre_adapter_failure_honors_explicit_kimi_host(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # A failure BEFORE adapter resolution must still respect an explicitly
+    # selected host's channel shape: with --host kimi the pass-through is raw
+    # stdout, so the fallback must be truly empty — a literal "{}" would be
+    # injected into the model context.
+    monkeypatch.setattr(
+        "memtomem_stm.cli.hook_cmd.runtime_env_overrides",
+        lambda **k: (_ for _ in ()).throw(ValueError("flag validation exploded")),
+    )
+    result = CliRunner().invoke(cli, ["hook", "--host", "kimi"], input=json.dumps(_READ_PAYLOAD))
+    assert result.exit_code == 0
+    assert result.output == ""
+
+
 def test_cli_barrier_fallback_baseexception_still_exits_zero(monkeypatch: pytest.MonkeyPatch):
     # The recovery path must not itself violate the contract: when the primary
     # ``serialize`` raises a ``BaseException`` (not just ``Exception``) and the
