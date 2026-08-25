@@ -5012,9 +5012,10 @@ def tune(
     result without a restart.
 
     Unlike ``mms stats`` (pure read-only summaries), this opens the stores
-    read-write to run their idempotent schema migrations — the same step the
-    server performs at startup — but only when the DB files already exist;
-    a preview never creates anything.
+    read-write to run their idempotent schema migrations and the metrics
+    store's per-source retention reconciliation — the same steps the server
+    performs at startup — but only when the DB files already exist; a
+    preview never creates anything.
     """
     config_path = resolve_cli_config_path(config_path).path
     from memtomem_stm.proxy.compression_feedback_store import CompressionFeedbackStore
@@ -5080,7 +5081,10 @@ def tune(
         return
     feedback_path = typed_cfg.compression_feedback.db_path.expanduser()
 
-    metrics_store = MetricsStore(metrics_path)
+    # The configured cap must ride along: initialize() reconciles every
+    # source's retention, so the constructor default would silently apply a
+    # 10k cap regardless of what metrics.max_history says.
+    metrics_store = MetricsStore(metrics_path, max_history=typed_cfg.metrics.max_history)
     feedback_store = CompressionFeedbackStore(feedback_path) if feedback_path.exists() else None
     try:
         metrics_store.initialize()

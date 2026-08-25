@@ -453,15 +453,28 @@ class TestPerSourceTrim:
             store.close()
 
     def test_trim_after_concurrent_reconcile_deletes_nothing(self, tmp_path):
-        """The excess is computed inside the DELETE itself (codex review
-        round 2): reconciliation runs from every initialize and the hook
-        opens a short-lived store per call, so a trim decision can be stale
-        by the time it executes. Once one trim has brought the source to
-        cap, running the trim again — the stale racer — must delete zero
-        rows, not a pre-computed excess. (The cross-process interleaving
-        itself is untestable deterministically; the single-statement shape
-        is what makes it safe, and this pins that the statement re-derives
-        the excess at execution time.)"""
+        """Repeated trims at cap are no-ops (idempotency), and the trim is a
+        single self-limiting statement (codex review rounds 2-3).
+
+        Reconciliation runs from every initialize and the hook opens a
+        short-lived store per call, so two processes can trim the same
+        source concurrently. What makes that safe is that count-and-delete
+        is ONE statement — the excess is a scalar subquery inside the
+        DELETE's own LIMIT, so a racer can never apply a stale pre-computed
+        excess. The cross-process interleaving itself is not reproducible
+        deterministically (the sequential calls below would also pass
+        against a two-query implementation, which re-counts), so the
+        single-statement shape is pinned by source inspection alongside the
+        behavioral no-op check."""
+        import inspect
+        import re as _re
+
+        src = inspect.getsource(MetricsStore._trim_source)
+        assert len(_re.findall(r"db\.execute\(", src)) == 1, (
+            "_trim_source must stay a single count-and-delete statement; a "
+            "separate COUNT reintroduces the stale-excess over-delete race"
+        )
+        assert "LIMIT max(0," in src
         db_path = tmp_path / "metrics.db"
         store = MetricsStore(db_path, max_history=5)
         store.initialize()
