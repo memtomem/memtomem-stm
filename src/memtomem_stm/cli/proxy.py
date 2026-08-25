@@ -1388,9 +1388,9 @@ _LAZY_SUBCOMMANDS: dict[str, tuple[str, str]] = {
 class _LazyGroup(click.Group):
     """Click group that resolves ``_LAZY_SUBCOMMANDS`` on first access.
 
-    ``--help``, shell completion, and error suggestions all go through
-    ``list_commands``/``get_command``, so lazy entries stay indistinguishable
-    from eagerly registered ones.
+    ``--help`` and shell completion go through ``list_commands``/
+    ``get_command``, so lazy entries render and dispatch like eagerly
+    registered ones. Error suggestions do NOT — see ``resolve_command``.
     """
 
     def list_commands(self, ctx: click.Context) -> list[str]:
@@ -1417,28 +1417,24 @@ class _LazyGroup(click.Group):
     ) -> tuple[str | None, click.Command | None, list[str]]:
         # Click builds its "Did you mean ...?" suggestions from
         # ``self.commands`` (click 8.4 ``NoSuchCommand(possibilities=...)``),
-        # not from ``list_commands`` — so an unknown name must first
-        # materialize every lazy entry or the suggestions silently lose the
-        # seven lazy families. Import cost is irrelevant here: this branch
-        # only runs on an already-failing invocation. The registry membership
-        # check keeps a *valid* lazy invocation (e.g. the hook hot path) on
-        # the one-module import it was invoked for. Skipped during resilient
-        # parsing (shell-completion probes are not failing invocations), and
-        # the normalized name is consulted like Click itself does before
-        # concluding the head is unknown.
-        if args and not ctx.resilient_parsing:
-            head = click.utils.make_str(args[0])
-            candidates = [head]
-            if ctx.token_normalize_func is not None:
-                candidates.append(ctx.token_normalize_func(head))
-            if all(
-                name not in _LAZY_SUBCOMMANDS
-                and super(_LazyGroup, self).get_command(ctx, name) is None
-                for name in candidates
-            ):
-                for name in _LAZY_SUBCOMMANDS:
-                    self.get_command(ctx, name)
-        return super().resolve_command(ctx, args)
+        # not from ``list_commands`` — so a failing lookup must materialize
+        # every lazy entry or the suggestions silently lose the seven lazy
+        # families. Try-then-retry keeps the happy path a single base-Click
+        # pass (one lookup, one ``token_normalize_func`` application, no
+        # materialization for a valid lazy invocation like the hook hot
+        # path), and Click's resilient-parsing mode returns instead of
+        # raising, so completion probes never hydrate the registry either.
+        # Import cost on the retry is irrelevant: the invocation is already
+        # failing.
+        try:
+            return super().resolve_command(ctx, args)
+        except click.UsageError:
+            missing = [name for name in _LAZY_SUBCOMMANDS if name not in self.commands]
+            if not missing:
+                raise
+            for name in missing:
+                self.get_command(ctx, name)
+            return super().resolve_command(ctx, args)
 
 
 @click.group(cls=_LazyGroup, context_settings=CONTEXT_SETTINGS, invoke_without_command=True)

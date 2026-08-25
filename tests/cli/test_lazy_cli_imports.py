@@ -111,9 +111,10 @@ class TestLazyEntriesStillDispatch:
             "r = CliRunner().invoke(cli, ['hook', '--help'])\n"
             "assert r.exit_code == 0, r.output\n"
             "import json\n"
-            "print(json.dumps([m for m in "
-            "('mcp', 'memtomem_stm.cli.selection_cmd', 'memtomem_stm.cli.daemon_cmd') "
-            "if m in sys.modules]))\n"
+            "from memtomem_stm.cli.proxy import _LAZY_SUBCOMMANDS\n"
+            "others = ['mcp'] + [mod for name, (mod, _a) in _LAZY_SUBCOMMANDS.items() "
+            "if name != 'hook']\n"
+            "print(json.dumps([m for m in others if m in sys.modules]))\n"
         )
         proc = subprocess.run(
             [sys.executable, "-c", code],
