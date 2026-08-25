@@ -344,6 +344,124 @@ def test_cli_kimi_empty_surfacing_emits_truly_empty_stdout(monkeypatch: pytest.M
     assert result.output == ""
 
 
+# ── Always-exit-0 barrier around the whole bridge body (#865) ────────────────
+
+
+def test_cli_barrier_catches_pre_orchestrate_failure(monkeypatch: pytest.MonkeyPatch):
+    # Host resolution runs BEFORE the inner asyncio barrier; a crash there must
+    # not become a non-zero exit the host reads as a hook failure — it degrades
+    # to the standard pass-through "{}".
+    monkeypatch.setattr(
+        "memtomem_stm.cli.hook_cmd._resolve_host_tag",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("resolver exploded")),
+    )
+    result = CliRunner().invoke(cli, ["hook"], input=json.dumps(_READ_PAYLOAD))
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {}
+
+
+def test_cli_barrier_catches_flag_validation_failure(monkeypatch: pytest.MonkeyPatch):
+    # ``runtime_env_overrides`` runs before an adapter is even resolved; the
+    # barrier's fallback then has no adapter and must still emit "{}" / exit 0.
+    monkeypatch.setattr(
+        "memtomem_stm.cli.hook_cmd.runtime_env_overrides",
+        lambda **k: (_ for _ in ()).throw(ValueError("flag validation exploded")),
+    )
+    result = CliRunner().invoke(cli, ["hook"], input=json.dumps(_READ_PAYLOAD))
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {}
+
+
+def test_cli_barrier_catches_systemexit_from_orchestrate(monkeypatch: pytest.MonkeyPatch):
+    # The inner barrier catches ``Exception`` only; a ``SystemExit`` escaping
+    # ``_orchestrate`` previously became the process exit code. The outer
+    # barrier must swallow it (always-exit-0 contract) and pass through.
+    monkeypatch.setattr(
+        "memtomem_stm.cli.hook_cmd._orchestrate", AsyncMock(side_effect=SystemExit(3))
+    )
+    result = CliRunner().invoke(cli, ["hook", "--host", "claude"], input=json.dumps(_READ_PAYLOAD))
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {}
+
+
+def test_cli_barrier_serialize_failure_degrades_to_nothing(monkeypatch: pytest.MonkeyPatch):
+    # ``adapter.serialize`` is outside the inner barrier. If it raises — and the
+    # fallback re-serialize of {} raises too — the barrier still exits 0 with
+    # empty stdout (safe for every host) rather than crashing the hook.
+    class _BrokenAdapter(ClaudeHookAdapter):
+        def serialize(self, output):  # type: ignore[override]
+            raise RuntimeError("serialize exploded")
+
+    monkeypatch.setattr(
+        "memtomem_stm.cli.hook_cmd.get_adapter", lambda *a, **k: _BrokenAdapter()
+    )
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._orchestrate", AsyncMock(return_value={}))
+    result = CliRunner().invoke(cli, ["hook"], input=json.dumps(_READ_PAYLOAD))
+    assert result.exit_code == 0
+    assert result.output == ""
+
+
+def test_cli_barrier_pre_adapter_failure_honors_explicit_kimi_host(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # A failure BEFORE adapter resolution must still respect an explicitly
+    # selected host's channel shape: with --host kimi the pass-through is raw
+    # stdout, so the fallback must be truly empty — a literal "{}" would be
+    # injected into the model context.
+    monkeypatch.setattr(
+        "memtomem_stm.cli.hook_cmd.runtime_env_overrides",
+        lambda **k: (_ for _ in ()).throw(ValueError("flag validation exploded")),
+    )
+    result = CliRunner().invoke(cli, ["hook", "--host", "kimi"], input=json.dumps(_READ_PAYLOAD))
+    assert result.exit_code == 0
+    assert result.output == ""
+
+
+def test_cli_barrier_resolver_failure_auto_detects_kimi_payload(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # Under the default --host auto, a resolver crash must not discard what the
+    # already-read payload says about the host: a Kimi-shaped payload still
+    # routes the fallback through payload-shape detection, so the raw-stdout
+    # channel stays truly empty instead of getting a Claude-shaped "{}".
+    monkeypatch.setattr(
+        "memtomem_stm.cli.hook_cmd._resolve_host_tag",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("resolver exploded")),
+    )
+    result = CliRunner().invoke(cli, ["hook"], input=json.dumps(_KIMI_SHELL_PAYLOAD))
+    assert result.exit_code == 0
+    assert result.output == ""
+
+
+def test_cli_barrier_fallback_baseexception_still_exits_zero(monkeypatch: pytest.MonkeyPatch):
+    # The recovery path must not itself violate the contract: when the primary
+    # ``serialize`` raises a ``BaseException`` (not just ``Exception``) and the
+    # fallback re-serialize of {} raises the same way, the barrier still exits 0
+    # with empty stdout instead of letting the escape become the process exit.
+    class _FatalAdapter(ClaudeHookAdapter):
+        def serialize(self, output):  # type: ignore[override]
+            raise SystemExit(3)
+
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd.get_adapter", lambda *a, **k: _FatalAdapter())
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._orchestrate", AsyncMock(return_value={}))
+    result = CliRunner().invoke(cli, ["hook"], input=json.dumps(_READ_PAYLOAD))
+    assert result.exit_code == 0
+    assert result.output == ""
+
+
+def test_cli_barrier_kimi_fallback_is_empty_stdout(monkeypatch: pytest.MonkeyPatch):
+    # When the failing call had already resolved the Kimi adapter, the barrier's
+    # fallback goes through ``adapter.serialize({})`` — which for Kimi's raw
+    # stdout channel is "" — so nothing is injected into the model context.
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd.get_adapter", lambda *a, **k: KimiHookAdapter())
+    monkeypatch.setattr(
+        "memtomem_stm.cli.hook_cmd._orchestrate", AsyncMock(side_effect=SystemExit(3))
+    )
+    result = CliRunner().invoke(cli, ["hook"], input=json.dumps(_READ_PAYLOAD))
+    assert result.exit_code == 0
+    assert result.output == ""
+
+
 # ── Host selection (--host / auto-detect, B4) ────────────────────────────────
 
 _KIMI_SHELL_PAYLOAD = {
