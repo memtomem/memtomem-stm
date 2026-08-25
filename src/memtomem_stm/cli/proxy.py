@@ -1424,9 +1424,10 @@ class _LazyGroup(click.Group):
         # materialization for a valid lazy invocation like the hook hot
         # path), and Click's resilient-parsing mode returns instead of
         # raising, so THIS path never hydrates the registry for completion
-        # probes. (Completion itself enumerates via ``list_commands``/
-        # ``get_command`` and does import every family — same as ``--help``;
-        # neither is a hot path.)
+        # probes. (Completion enumerates via ``list_commands``/``get_command``
+        # and imports the families whose names match the incomplete prefix —
+        # all of them only for an empty prefix, like ``--help``; none of that
+        # is a hot path.)
         # Import cost on the retry is irrelevant: the invocation is already
         # failing.
         try:
@@ -8531,5 +8532,6 @@ def doctor(
 
 # The nested command families (`project`, `import`, `host`, `hook`, `daemon`,
 # `config`, `selection`) are NOT registered here — they resolve lazily through
-# ``_LAZY_SUBCOMMANDS`` / ``_LazyGroup`` above so the hook hot path never pays
-# their import cost.
+# ``_LAZY_SUBCOMMANDS`` / ``_LazyGroup`` above, so importing this module stays
+# light and each family is imported only when its own subcommand (or a
+# registry-wide path like help or unknown-command suggestions) needs it.

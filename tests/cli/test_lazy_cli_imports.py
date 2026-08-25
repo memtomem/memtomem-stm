@@ -65,11 +65,19 @@ class TestLazyEntriesStillDispatch:
             assert isinstance(cmd, click.Command), name
             assert cmd.name == name
 
-    def test_root_help_lists_every_lazy_command(self, runner):
-        result = runner.invoke(cli, ["--help"])
-        assert result.exit_code == 0
+    def test_root_help_lists_every_lazy_command(self):
+        """Fresh subprocess: the in-process tests above materialize every
+        family onto the module-global group, so only a fresh interpreter can
+        prove root help still reaches lazy entries through list_commands."""
+        proc = subprocess.run(
+            [sys.executable, "-m", "memtomem_stm", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert proc.returncode == 0, proc.stderr
         for name in _LAZY_SUBCOMMANDS:
-            assert f"\n  {name} " in result.output
+            assert f"\n  {name} " in proc.stdout
 
     @pytest.mark.parametrize("name", sorted(_LAZY_SUBCOMMANDS))
     def test_lazy_subcommand_help_dispatches(self, runner, name):

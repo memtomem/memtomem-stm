@@ -2,10 +2,11 @@
 
 Lives in its own leaf module (imports nothing from the package) because every
 CLI command that renders such a value needs it, and ``cli.proxy`` — where this
-started life in #754 — imports ``mms_import``, ``mms_host``, ``mms_project``,
-``config_cmd``, ``hook_cmd`` and ``selection_cmd`` at module scope to register
-their Click groups. Any of them importing back from ``proxy`` is a cycle, which
-is why #758 had to close its ``mms project route`` sites with a *function-local*
+started life in #754 — registers ``mms_import``, ``mms_host``, ``mms_project``,
+``config_cmd``, ``hook_cmd`` and ``selection_cmd`` as its Click subgroups
+(module-scope imports until #862, lazily resolved since). Any of them importing
+back from ``proxy`` at module scope risks a cycle, which is why #758 had to
+close its ``mms project route`` sites with a *function-local*
 ``from memtomem_stm.cli.proxy import _disp``. Same constraint ``utils/json_out``
 was split out for, and the same fix (#760).
 

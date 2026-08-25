@@ -450,8 +450,8 @@ def route_cmd(
     """
     # Lazy import avoids making the lightweight project-state module own a
     # second implementation of STM's JSON validation/atomic-save contract
-    # (and a module-level import would be circular: ``cli.proxy`` imports
-    # this module to register the group). The path default lives in the small
+    # (and a module-level import would be circular: ``cli.proxy`` resolves
+    # this module lazily to register the group, #862). The path default lives in the small
     # ``cli._defaults`` module so runtime resolution and help text stay aligned.
     from memtomem_stm.cli.proxy import (
         _backup_config_snapshot,
