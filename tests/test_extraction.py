@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -668,3 +669,76 @@ class TestExtractedFact:
 class TestExtractionStrategy:
     def test_all_values(self):
         assert set(ExtractionStrategy) == {"none", "llm", "heuristic", "hybrid"}
+
+
+# ---------------------------------------------------------------------------
+# LLM timeout bound (mirrors LLMCompressor.compress)
+# ---------------------------------------------------------------------------
+
+
+def _tiny_timeout_config() -> ExtractionConfig:
+    return ExtractionConfig(
+        enabled=True,
+        min_response_chars=10,
+        llm=LLMCompressorConfig(
+            provider=LLMProvider.OLLAMA,
+            model="qwen3:4b",
+            llm_timeout_seconds=0.05,
+        ),
+    )
+
+
+class TestFactExtractorTimeout:
+    async def test_hung_call_times_out_to_heuristic(self):
+        """A provider that never responds must not hold the caller past
+        llm_timeout_seconds: the client-level httpx timeout only covers
+        socket phases, so the wait_for is the one wall-clock bound on the
+        tool-response path (extraction.background=False awaits this inline)."""
+        cfg = _tiny_timeout_config()
+        extractor = FactExtractor(cfg)
+
+        async def hang(text: str) -> str:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        with patch.object(extractor, "_call_api", side_effect=hang):
+            text = "Decision: heuristic fallback reached. " * 5
+            facts = await asyncio.wait_for(extractor.extract(text, server="s", tool="t"), timeout=5)
+
+        # The heuristic path actually ran (the Decision line is its signal),
+        # and the breaker recorded the failure.
+        assert any(f.category == "decision" for f in facts)
+        assert extractor._cb._failures == 1
+
+    async def test_fast_call_unaffected_by_timeout_wrapper(self):
+        # Positive control: with the same tiny budget, a prompt reply still
+        # takes the LLM path — the wrapper only bounds, never rejects.
+        cfg = _tiny_timeout_config()
+        extractor = FactExtractor(cfg)
+
+        mock_response = json.dumps([{"content": "f", "category": "c", "confidence": 0.9}])
+        with patch.object(
+            extractor, "_call_api", new_callable=AsyncMock, return_value=mock_response
+        ):
+            facts = await extractor.extract("x" * 100, server="s", tool="t")
+
+        assert [f.content for f in facts] == ["f"]
+        assert extractor._cb._failures == 0
+
+    async def test_repeated_timeouts_open_breaker(self):
+        cfg = _tiny_timeout_config()
+        extractor = FactExtractor(cfg)
+
+        async def hang(text: str) -> str:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        with patch.object(extractor, "_call_api", side_effect=hang):
+            for _ in range(4):
+                # Outer guard so a regression in the production timeout fails
+                # the test instead of hanging the run (codex review round 2).
+                await asyncio.wait_for(
+                    extractor.extract("x" * 100, server="s", tool="t"), timeout=5
+                )
+
+        assert extractor._cb.state == "open"

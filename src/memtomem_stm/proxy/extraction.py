@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -248,12 +249,30 @@ class FactExtractor:
             logger.debug("Extraction circuit open, falling back to heuristic")
             return _extract_heuristic(text, max_facts=self._cfg.max_facts)
         try:
-            raw = await self._call_api(text)
+            # Same outer bound as LLMCompressor.compress: the httpx client's
+            # own timeout covers socket phases, but a provider that streams
+            # headers then stalls (or a per-request override like _ollama's
+            # timeout=60) can hold the call far longer than the pipeline
+            # budget. With extraction.background=False this await sits on the
+            # tool-response path, so the wall clock must be bounded here.
+            raw = await asyncio.wait_for(
+                self._call_api(text),
+                timeout=self._llm_cfg.llm_timeout_seconds,
+            )
             self._cb.record_success()
             facts = _parse_facts_json(raw, max_facts=self._cfg.max_facts)
             if not facts:
                 logger.debug("LLM returned no parseable facts for %s/%s", server, tool)
             return facts
+        except TimeoutError:
+            self._cb.record_failure()
+            logger.warning(
+                "LLM extraction timed out after %.1fs for %s/%s, falling back to heuristic",
+                self._llm_cfg.llm_timeout_seconds,
+                server,
+                tool,
+            )
+            return _extract_heuristic(text, max_facts=self._cfg.max_facts)
         except Exception as exc:
             self._cb.record_failure()
             logger.warning(
