@@ -397,6 +397,95 @@ class TestRecordPersistsNewFields:
         assert ("gh", "search") in err
 
 
+class TestPerSourceTrim:
+    """``max_history`` is enforced per ``source``, scoped to the writer's own.
+
+    The cap used to be table-wide FIFO, and the hook writer (one row per
+    built-in tool call) outpaces proxied MCP traffic by orders of magnitude —
+    in live data hook rows held 99.7% of the cap and evicted the ``'mcp'``
+    rows every tuner/stats aggregation is scoped to.
+    """
+
+    def _mcp_row(self, i: int) -> CallMetrics:
+        return CallMetrics(server="gh", tool=f"mcp{i}", original_chars=1, compressed_chars=1)
+
+    def _hook_row(self, i: int) -> CallMetrics:
+        return CallMetrics(
+            server="builtin", tool=f"Bash{i}", original_chars=1, compressed_chars=1, source="hook"
+        )
+
+    def _counts_by_source(self, store: MetricsStore) -> dict[str, int]:
+        return dict(
+            store._db.execute(
+                "SELECT source, COUNT(*) FROM proxy_metrics GROUP BY source"
+            ).fetchall()
+        )
+
+    def test_hook_churn_cannot_evict_mcp_rows(self, tmp_path):
+        store = MetricsStore(tmp_path / "metrics.db", max_history=5)
+        store.initialize()
+        try:
+            for i in range(3):
+                store.record(self._mcp_row(i))
+            for i in range(20):
+                store.record(self._hook_row(i))
+            assert self._counts_by_source(store) == {"mcp": 3, "hook": 5}
+        finally:
+            store.close()
+
+    def test_writer_source_still_trimmed_to_cap(self, tmp_path):
+        store = MetricsStore(tmp_path / "metrics.db", max_history=5)
+        store.initialize()
+        try:
+            for i in range(8):
+                store.record(self._mcp_row(i))
+            remaining = [
+                row[0]
+                for row in store._db.execute(
+                    "SELECT tool FROM proxy_metrics ORDER BY id"
+                ).fetchall()
+            ]
+            # Oldest rows go first; the newest max_history survive.
+            assert remaining == [f"mcp{i}" for i in range(3, 8)]
+        finally:
+            store.close()
+
+    def test_source_index_created_on_pre_source_db(self, tmp_path):
+        # The (source, created_at) index can only be created after _migrate
+        # adds ``source`` — initialize over the original pre-F2 schema must
+        # not crash and must end up with the index.
+        db_path = tmp_path / "metrics.db"
+        raw = sqlite3.connect(str(db_path))
+        raw.execute(
+            "CREATE TABLE proxy_metrics ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "server TEXT NOT NULL, tool TEXT NOT NULL, "
+            "original_chars INTEGER NOT NULL, "
+            "compressed_chars INTEGER NOT NULL, "
+            "cleaned_chars INTEGER NOT NULL DEFAULT 0, "
+            "created_at REAL NOT NULL)"
+        )
+        raw.commit()
+        raw.close()
+
+        store = MetricsStore(db_path, max_history=5)
+        store.initialize()
+        try:
+            names = {
+                row[0]
+                for row in store._db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index'"
+                ).fetchall()
+            }
+            assert "idx_metrics_source_created" in names
+            # And the per-source trim works against the migrated DB.
+            for i in range(8):
+                store.record(self._hook_row(i))
+            assert self._counts_by_source(store) == {"hook": 5}
+        finally:
+            store.close()
+
+
 class TestBusyTimeout:
     """The hook passes a small ``busy_timeout_ms`` so a locked shared DB
     fast-fails instead of stalling the host's tool call."""

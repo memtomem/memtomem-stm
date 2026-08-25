@@ -238,6 +238,14 @@ class MetricsStore:
             # as ``self._db`` so a failure here falls through to the outer
             # except and leaves the store un-initialized.
             self._migrate(db)
+            # ``source`` is a migrated column (absent from the base _CREATE),
+            # so the index backing the per-source _trim scan can only be
+            # created after _migrate has run.
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_metrics_source_created "
+                "ON proxy_metrics(source, created_at)"
+            )
+            db.commit()
         except Exception:
             db.close()
             raise
@@ -407,18 +415,33 @@ class MetricsStore:
                 ),
             )
             self._db.commit()
-            self._trim()
+            self._trim(metrics.source)
 
-    def _trim(self) -> None:
+    def _trim(self, source: str) -> None:
+        """Enforce ``max_history`` per ``source``, scoped to the writer's own.
+
+        The cap used to be table-wide with FIFO eviction, and the two writers
+        have wildly different rates: the ``mms hook`` path (``source='hook'``,
+        one row per built-in Read/Grep/Glob/Bash call) outpaces proxied MCP
+        traffic by orders of magnitude, so hook churn evicted nearly every
+        ``'mcp'`` row and starved the tuner/stats aggregations (which are all
+        ``source='mcp'``-scoped) down to a useless sample. Trimming within the
+        just-written source means neither writer can evict the other's rows;
+        the table's worst case becomes ``max_history × distinct sources``
+        (currently two).
+        """
         if self._db is None:
             return
-        count = self._db.execute("SELECT COUNT(*) FROM proxy_metrics").fetchone()[0]
+        count = self._db.execute(
+            "SELECT COUNT(*) FROM proxy_metrics WHERE source = ?", (source,)
+        ).fetchone()[0]
         if count > self._max_history:
             excess = count - self._max_history
             self._db.execute(
                 "DELETE FROM proxy_metrics WHERE id IN "
-                "(SELECT id FROM proxy_metrics ORDER BY created_at ASC LIMIT ?)",
-                (excess,),
+                "(SELECT id FROM proxy_metrics WHERE source = ? "
+                "ORDER BY created_at ASC LIMIT ?)",
+                (source, excess),
             )
             self._db.commit()
 
