@@ -10,6 +10,7 @@ lazy entry still resolves and dispatches like an eagerly registered command.
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import subprocess
 import sys
@@ -81,6 +82,10 @@ class TestLazyEntriesStillDispatch:
         assert result.exit_code != 0
         assert "No such command" in result.output
 
+    @pytest.mark.skipif(
+        tuple(int(p) for p in importlib.metadata.version("click").split(".")[:2]) < (8, 4),
+        reason="Click renders NoSuchCommand suggestions only from 8.4",
+    )
     def test_typo_suggestion_includes_lazy_commands(self):
         """Click builds "Did you mean" suggestions from ``self.commands``,
         not ``list_commands`` — resolve_command must materialize the lazy

@@ -701,6 +701,8 @@ def test_cli_md_commands_index_matches_click_group() -> None:
     shifts with the rendering width, which is not deterministic across
     environments; the words themselves are.
     """
+    import click
+
     from memtomem_stm.cli.proxy import cli as mms_cli
 
     cli_md = _read("docs/cli.md")
@@ -718,7 +720,12 @@ def test_cli_md_commands_index_matches_click_group() -> None:
     commands_match = re.search(r"Commands:\n(.*)\Z", blocks[0], re.DOTALL)
     assert commands_match, "The top-level help block lost its `Commands:` listing"
     documented = dict(re.findall(r"^ {2}(\S+) +(.+?)\s*$", commands_match.group(1), re.MULTILINE))
-    registered = mms_cli.commands
+    # Resolve through list_commands/get_command, not the raw ``commands``
+    # mapping: the nested command families are lazy (#862) and absent from
+    # the mapping until first access, which is exactly how `mms --help`
+    # itself renders the index this block is checked against.
+    ctx = click.Context(mms_cli)
+    registered = {name: mms_cli.get_command(ctx, name) for name in mms_cli.list_commands(ctx)}
     assert set(documented) == set(registered), (
         "docs/cli.md Commands index is out of sync with the `mms` click "
         f"group.\n  missing from docs: {sorted(set(registered) - set(documented))}\n"
@@ -2348,9 +2355,7 @@ def test_adr_0001_call_site_pin_rejects_a_second_emitter(tmp_path) -> None:
     (src / "elsewhere.py").write_text(
         "from third_party import feedback_command as run\n", encoding="utf-8"
     )
-    (src / "unrelated.py").write_text(
-        "def helper(x):\n    return run(x)\n", encoding="utf-8"
-    )
+    (src / "unrelated.py").write_text("def helper(x):\n    return run(x)\n", encoding="utf-8")
     reaching_now = _functions_reaching(src, "log_feedback")
     assert ("unrelated.py", "helper") not in reaching_now, (
         "an alias bound in another module must not travel by spelling alone"

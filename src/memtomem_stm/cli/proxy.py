@@ -1422,10 +1422,20 @@ class _LazyGroup(click.Group):
         # seven lazy families. Import cost is irrelevant here: this branch
         # only runs on an already-failing invocation. The registry membership
         # check keeps a *valid* lazy invocation (e.g. the hook hot path) on
-        # the one-module import it was invoked for.
-        if args:
+        # the one-module import it was invoked for. Skipped during resilient
+        # parsing (shell-completion probes are not failing invocations), and
+        # the normalized name is consulted like Click itself does before
+        # concluding the head is unknown.
+        if args and not ctx.resilient_parsing:
             head = click.utils.make_str(args[0])
-            if head not in _LAZY_SUBCOMMANDS and super().get_command(ctx, head) is None:
+            candidates = [head]
+            if ctx.token_normalize_func is not None:
+                candidates.append(ctx.token_normalize_func(head))
+            if all(
+                name not in _LAZY_SUBCOMMANDS
+                and super(_LazyGroup, self).get_command(ctx, name) is None
+                for name in candidates
+            ):
                 for name in _LAZY_SUBCOMMANDS:
                     self.get_command(ctx, name)
         return super().resolve_command(ctx, args)
