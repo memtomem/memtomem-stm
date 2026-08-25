@@ -450,6 +450,32 @@ class TestPerSourceTrim:
         finally:
             store.close()
 
+    def test_initialize_reconciles_over_cap_sources(self, tmp_path):
+        """Per-write trim only covers the writer's own source, so a source
+        that stops receiving writes after ``max_history`` is lowered would
+        otherwise stay over cap forever — initialize reconciles every source
+        once (codex review round 1)."""
+        db_path = tmp_path / "metrics.db"
+        big = MetricsStore(db_path, max_history=10)
+        big.initialize()
+        try:
+            for i in range(8):
+                big.record(self._hook_row(i))
+        finally:
+            big.close()
+
+        small = MetricsStore(db_path, max_history=5)
+        small.initialize()
+        try:
+            # Startup reconciled the idle hook source down to the new cap.
+            assert self._counts_by_source(small) == {"hook": 5}
+            # And mcp-only traffic afterwards never has to repair it.
+            for i in range(7):
+                small.record(self._mcp_row(i))
+            assert self._counts_by_source(small) == {"hook": 5, "mcp": 5}
+        finally:
+            small.close()
+
     def test_source_index_created_on_pre_source_db(self, tmp_path):
         # The (source, created_at) index can only be created after _migrate
         # adds ``source`` — initialize over the original pre-F2 schema must

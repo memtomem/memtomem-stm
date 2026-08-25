@@ -246,6 +246,12 @@ class MetricsStore:
                 "ON proxy_metrics(source, created_at)"
             )
             db.commit()
+            # Reconcile every source once at startup: the per-write _trim only
+            # covers the writer's own source, so an over-cap source that has
+            # stopped receiving writes (e.g. after lowering max_history) would
+            # otherwise never shrink.
+            for (src,) in db.execute("SELECT DISTINCT source FROM proxy_metrics").fetchall():
+                self._trim_source(db, src)
         except Exception:
             db.close()
             raise
@@ -432,18 +438,21 @@ class MetricsStore:
         """
         if self._db is None:
             return
-        count = self._db.execute(
+        self._trim_source(self._db, source)
+
+    def _trim_source(self, db: sqlite3.Connection, source: str) -> None:
+        count = db.execute(
             "SELECT COUNT(*) FROM proxy_metrics WHERE source = ?", (source,)
         ).fetchone()[0]
         if count > self._max_history:
             excess = count - self._max_history
-            self._db.execute(
+            db.execute(
                 "DELETE FROM proxy_metrics WHERE id IN "
                 "(SELECT id FROM proxy_metrics WHERE source = ? "
                 "ORDER BY created_at ASC LIMIT ?)",
                 (source, excess),
             )
-            self._db.commit()
+            db.commit()
 
     def get_tool_profiles(self, since_seconds: float = 86400.0) -> list[dict]:
         """Aggregate per ``(server, tool)`` stats for auto-tuner analysis.
