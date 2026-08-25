@@ -1040,9 +1040,9 @@ def _hook_install_command_argv(host: str, *, policy: HostRuntimePolicy | None = 
     ``memtomem-stm hook --host <host>`` console script. ``--host`` is always
     written explicitly so raw-stdout (Kimi) and Codex routing are unambiguous (a
     bare ``mms hook`` would auto-detect, which cannot tell Codex from Claude)."""
-    # Lazy import: ``cli.proxy`` imports this module at top level, so importing it
-    # here (only on the install path) avoids the cycle and keeps it off the
-    # latency-sensitive bare-hook path.
+    # Lazy import: ``cli.proxy`` resolves this module lazily to register the
+    # group (#862), so importing it here (only on the install path) avoids a
+    # cycle and keeps it off the latency-sensitive bare-hook path.
     from memtomem_stm.cli.proxy import _detect_install_type
 
     server_cmd, server_args = _detect_install_type()

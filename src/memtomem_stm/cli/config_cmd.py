@@ -11,8 +11,8 @@ non-zero so the command can gate CI or a commit hook. The runtime load path
 stays lenient — strictness lives only here.
 
 Lives in its own file per the subgroup convention (``mms_project.py`` etc.)
-and must not import from ``cli/proxy.py`` — that module imports this group
-for registration, so the dependency only goes one way.
+and must not import from ``cli/proxy.py`` — that module resolves this group
+lazily for registration (#862), so the dependency only goes one way.
 """
 
 from __future__ import annotations

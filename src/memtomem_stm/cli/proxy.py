@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import importlib
 import io
 import json
 import logging
@@ -48,14 +49,7 @@ from memtomem_stm.cli._display import _disp, _disp_escapes
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.utils.json_out import has_lone_surrogate, unencodable_field
 from memtomem_stm.cli._write_lock import with_config_write_lock
-from memtomem_stm.cli.config_cmd import config_group as _config_group
-from memtomem_stm.cli.daemon_cmd import daemon_group as _daemon_group
-from memtomem_stm.cli.hook_cmd import hook_command as _hook_command
 from memtomem_stm.cli.host_runtime import resolve_host_runtime_policy
-from memtomem_stm.cli.mms_host import host_group as _mms_host_group
-from memtomem_stm.cli.mms_import import import_command as _mms_import_command
-from memtomem_stm.cli.mms_project import project_group as _mms_project_group
-from memtomem_stm.cli.selection_cmd import selection_group as _selection_group
 from memtomem_stm.mms.import_hosts import (
     _DANGEROUS_ENV_KEYS,
     _desktop_config_path,
@@ -1363,7 +1357,93 @@ def _stdin_is_tty() -> bool:
     return bool(sys.stdin.isatty())
 
 
-@click.group(context_settings=CONTEXT_SETTINGS, invoke_without_command=True)
+# Nested command families live in sibling modules and are imported on demand:
+# when their subcommand dispatches, or when a registry-wide path (root help,
+# matching shell completion, unknown-command suggestions) enumerates them —
+# never merely by importing this module. The hook hot path (`mms hook`, run by
+# a host on every built-in tool call) pays this module's import cost each
+# invocation, and the eager sibling imports used to dominate it — most of all
+# ``selection_cmd``, whose ``proxy.manager`` dependency pulls in the whole MCP
+# SDK (~230 ms of the ~340 ms total). Value = ``(module, attribute)``.
+_LAZY_SUBCOMMANDS: dict[str, tuple[str, str]] = {
+    # `mms project ...` — RFC §7.1, kept out of this file for the W1 surface.
+    "project": ("memtomem_stm.cli.mms_project", "project_group"),
+    # `mms import ...` — RFC §7.2.
+    "import": ("memtomem_stm.cli.mms_import", "import_command"),
+    # `mms host ...` — RFC §7.3.
+    "host": ("memtomem_stm.cli.mms_host", "host_group"),
+    # `mms hook` — bridge a host's built-in tool calls (Claude Code
+    # PostToolUse) into STM surfacing.
+    "hook": ("memtomem_stm.cli.hook_cmd", "hook_command"),
+    # `mms daemon ...` — manage the local surfacing daemon (Stage 2 warm LTM
+    # connection for `mms hook`).
+    "daemon": ("memtomem_stm.cli.daemon_cmd", "daemon_group"),
+    # `mms config ...` — strict config-file linting (#611).
+    "config": ("memtomem_stm.cli.config_cmd", "config_group"),
+    # `mms selection replay` — offline selection-log validation + labelled
+    # relevance/safety evaluation (#468), deliberately CLI-only (no MCP
+    # file-read surface).
+    "selection": ("memtomem_stm.cli.selection_cmd", "selection_group"),
+}
+
+
+class _LazyGroup(click.Group):
+    """Click group that resolves ``_LAZY_SUBCOMMANDS`` on first access.
+
+    ``--help`` and shell completion go through ``list_commands``/
+    ``get_command``, so lazy entries render and dispatch like eagerly
+    registered ones. Error suggestions do NOT — see ``resolve_command``.
+    """
+
+    def list_commands(self, ctx: click.Context) -> list[str]:
+        return sorted(set(super().list_commands(ctx)) | set(_LAZY_SUBCOMMANDS))
+
+    def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
+        cmd = super().get_command(ctx, cmd_name)
+        if cmd is not None:
+            return cmd
+        spec = _LAZY_SUBCOMMANDS.get(cmd_name)
+        if spec is None:
+            return None
+        module_name, attr = spec
+        loaded = getattr(importlib.import_module(module_name), attr)
+        if not isinstance(loaded, click.Command):  # pragma: no cover - registry defect
+            raise TypeError(f"lazy subcommand {cmd_name!r} resolved to {type(loaded).__name__}")
+        # Cache so repeated lookups within one invocation (dispatch, help
+        # rendering, completion) import at most once.
+        self.add_command(loaded)
+        return loaded
+
+    def resolve_command(
+        self, ctx: click.Context, args: list[str]
+    ) -> tuple[str | None, click.Command | None, list[str]]:
+        # Click builds its "Did you mean ...?" suggestions from
+        # ``self.commands`` (click 8.4 ``NoSuchCommand(possibilities=...)``),
+        # not from ``list_commands`` — so a failing lookup must materialize
+        # every lazy entry or the suggestions silently lose the seven lazy
+        # families. Try-then-retry keeps the happy path a single base-Click
+        # pass (one lookup, one ``token_normalize_func`` application, no
+        # materialization for a valid lazy invocation like the hook hot
+        # path), and Click's resilient-parsing mode returns instead of
+        # raising, so THIS path never hydrates the registry for completion
+        # probes. (Completion enumerates via ``list_commands``/``get_command``
+        # and imports the families whose names match the incomplete prefix —
+        # all of them only for an empty prefix, like ``--help``; none of that
+        # is a hot path.)
+        # Import cost on the retry is irrelevant: the invocation is already
+        # failing.
+        try:
+            return super().resolve_command(ctx, args)
+        except click.UsageError:
+            missing = [name for name in _LAZY_SUBCOMMANDS if name not in self.commands]
+            if not missing:
+                raise
+            for name in missing:
+                self.get_command(ctx, name)
+            return super().resolve_command(ctx, args)
+
+
+@click.group(cls=_LazyGroup, context_settings=CONTEXT_SETTINGS, invoke_without_command=True)
 @click.version_option(
     package_name="memtomem-stm",
     prog_name="memtomem-stm",
@@ -8452,29 +8532,8 @@ def doctor(
         sys.exit(1)
 
 
-# `mms project ...` — RFC §7.1, lives in src/memtomem_stm/cli/mms_project.py
-# to keep this file from accreting another ~700 lines for the W1 surface.
-cli.add_command(_mms_project_group)
-
-# `mms import ...` — RFC §7.2, lives in src/memtomem_stm/cli/mms_import.py.
-cli.add_command(_mms_import_command)
-
-# `mms host ...` — RFC §7.3, lives in src/memtomem_stm/cli/mms_host.py.
-cli.add_command(_mms_host_group)
-
-# `mms hook` — bridge a host's built-in tool calls (Claude Code PostToolUse)
-# into STM surfacing; lives in src/memtomem_stm/cli/hook_cmd.py.
-cli.add_command(_hook_command)
-
-# `mms daemon ...` — manage the local surfacing daemon (Stage 2 warm LTM
-# connection for `mms hook`); lives in src/memtomem_stm/cli/daemon_cmd.py.
-cli.add_command(_daemon_group)
-
-# `mms config ...` — strict config-file linting (#611); lives in
-# src/memtomem_stm/cli/config_cmd.py.
-cli.add_command(_config_group)
-
-# `mms selection replay` — offline selection-log validation + labelled
-# relevance/safety evaluation (#468), deliberately CLI-only (no MCP file-read
-# surface). Lives in its own module like the other nested command families.
-cli.add_command(_selection_group)
+# The nested command families (`project`, `import`, `host`, `hook`, `daemon`,
+# `config`, `selection`) are NOT registered here — they resolve lazily through
+# ``_LAZY_SUBCOMMANDS`` / ``_LazyGroup`` above, so importing this module stays
+# light and each family is imported only when its own subcommand (or a
+# registry-wide path like help or unknown-command suggestions) needs it.
