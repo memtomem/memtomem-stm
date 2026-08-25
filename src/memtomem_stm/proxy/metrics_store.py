@@ -430,8 +430,10 @@ class MetricsStore:
         have wildly different rates: the ``mms hook`` path (``source='hook'``,
         one row per built-in Read/Grep/Glob/Bash call) outpaces proxied MCP
         traffic by orders of magnitude, so hook churn evicted nearly every
-        ``'mcp'`` row and starved the tuner/stats aggregations (which are all
-        ``source='mcp'``-scoped) down to a useless sample. Trimming within the
+        ``'mcp'`` row and starved the ``source='mcp'``-scoped aggregations
+        (``get_tool_profiles``, error stats; ``read_compression_summary``
+        filters by source only when one is passed) down to a useless sample.
+        Trimming within the
         just-written source means neither writer can evict the other's rows;
         the table's worst case becomes ``max_history × distinct sources``
         (currently two).
@@ -441,18 +443,21 @@ class MetricsStore:
         self._trim_source(self._db, source)
 
     def _trim_source(self, db: sqlite3.Connection, source: str) -> None:
-        count = db.execute(
-            "SELECT COUNT(*) FROM proxy_metrics WHERE source = ?", (source,)
-        ).fetchone()[0]
-        if count > self._max_history:
-            excess = count - self._max_history
-            db.execute(
-                "DELETE FROM proxy_metrics WHERE id IN "
-                "(SELECT id FROM proxy_metrics WHERE source = ? "
-                "ORDER BY created_at ASC LIMIT ?)",
-                (source, excess),
-            )
-            db.commit()
+        # The excess is computed INSIDE the DELETE so count-and-delete is one
+        # atomic statement: reconciliation runs from every initialize and the
+        # hook opens a short-lived store per call, so two processes can trim
+        # the same source concurrently — a pre-computed excess would be stale
+        # for the loser and over-delete below the cap. ``max(0, ...)`` matters:
+        # a negative LIMIT means "unlimited" in SQLite and would empty the
+        # source. When nothing is over cap the statement deletes zero rows.
+        db.execute(
+            "DELETE FROM proxy_metrics WHERE id IN "
+            "(SELECT id FROM proxy_metrics WHERE source = ? "
+            "ORDER BY created_at ASC "
+            "LIMIT max(0, (SELECT COUNT(*) FROM proxy_metrics WHERE source = ?) - ?))",
+            (source, source, self._max_history),
+        )
+        db.commit()
 
     def get_tool_profiles(self, since_seconds: float = 86400.0) -> list[dict]:
         """Aggregate per ``(server, tool)`` stats for auto-tuner analysis.

@@ -403,7 +403,9 @@ class TestPerSourceTrim:
     The cap used to be table-wide FIFO, and the hook writer (one row per
     built-in tool call) outpaces proxied MCP traffic by orders of magnitude —
     in live data hook rows held 99.7% of the cap and evicted the ``'mcp'``
-    rows every tuner/stats aggregation is scoped to.
+    rows the mcp-scoped aggregations (``get_tool_profiles``, error stats)
+    depend on. ``read_compression_summary`` filters by source only when one
+    is passed.
     """
 
     def _mcp_row(self, i: int) -> CallMetrics:
@@ -447,6 +449,29 @@ class TestPerSourceTrim:
             ]
             # Oldest rows go first; the newest max_history survive.
             assert remaining == [f"mcp{i}" for i in range(3, 8)]
+        finally:
+            store.close()
+
+    def test_trim_after_concurrent_reconcile_deletes_nothing(self, tmp_path):
+        """The excess is computed inside the DELETE itself (codex review
+        round 2): reconciliation runs from every initialize and the hook
+        opens a short-lived store per call, so a trim decision can be stale
+        by the time it executes. Once one trim has brought the source to
+        cap, running the trim again — the stale racer — must delete zero
+        rows, not a pre-computed excess. (The cross-process interleaving
+        itself is untestable deterministically; the single-statement shape
+        is what makes it safe, and this pins that the statement re-derives
+        the excess at execution time.)"""
+        db_path = tmp_path / "metrics.db"
+        store = MetricsStore(db_path, max_history=5)
+        store.initialize()
+        try:
+            for i in range(8):
+                store.record(self._hook_row(i))
+            assert self._counts_by_source(store) == {"hook": 5}
+            store._trim_source(store._db, "hook")
+            store._trim_source(store._db, "hook")
+            assert self._counts_by_source(store) == {"hook": 5}
         finally:
             store.close()
 
