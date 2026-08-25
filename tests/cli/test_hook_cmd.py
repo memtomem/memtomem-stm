@@ -417,6 +417,22 @@ def test_cli_barrier_pre_adapter_failure_honors_explicit_kimi_host(
     assert result.output == ""
 
 
+def test_cli_barrier_resolver_failure_auto_detects_kimi_payload(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # Under the default --host auto, a resolver crash must not discard what the
+    # already-read payload says about the host: a Kimi-shaped payload still
+    # routes the fallback through payload-shape detection, so the raw-stdout
+    # channel stays truly empty instead of getting a Claude-shaped "{}".
+    monkeypatch.setattr(
+        "memtomem_stm.cli.hook_cmd._resolve_host_tag",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("resolver exploded")),
+    )
+    result = CliRunner().invoke(cli, ["hook"], input=json.dumps(_KIMI_SHELL_PAYLOAD))
+    assert result.exit_code == 0
+    assert result.output == ""
+
+
 def test_cli_barrier_fallback_baseexception_still_exits_zero(monkeypatch: pytest.MonkeyPatch):
     # The recovery path must not itself violate the contract: when the primary
     # ``serialize`` raises a ``BaseException`` (not just ``Exception``) and the

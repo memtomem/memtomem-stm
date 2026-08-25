@@ -998,6 +998,7 @@ def hook_command(
     # stdout must stay truly empty) and (b) never append to a partially written
     # stdout.
     adapter: HostHookAdapter | None = None
+    payload: dict[str, Any] | None = None
     wrote = False
     try:
         overrides = runtime_env_overrides(
@@ -1062,14 +1063,18 @@ def hook_command(
         if not wrote:
             # Best-effort pass-through in the host's channel shape:
             # ``serialize({})`` is "{}" for the JSON hosts and "" for Kimi. A
-            # failure *before* adapter resolution re-resolves from the explicit
-            # ``--host`` value alone (``get_adapter`` maps auto/unknown to
-            # Claude) so ``--host kimi``'s raw-stdout channel stays truly empty
-            # even then; if the adapter's ``serialize`` is the very thing that
-            # failed, degrade to empty stdout — safe for every host on exit 0.
-            # Never emit after a (possibly partial) write already went out.
+            # failure *before* adapter resolution re-resolves the host the way
+            # the primary path does — a known ``--host`` value wins, otherwise
+            # payload-shape detection (``None``/undetected maps to Claude) —
+            # so Kimi's raw-stdout channel stays truly empty even then; if the
+            # adapter's ``serialize`` is the very thing that failed, degrade
+            # to empty stdout — safe for every host on exit 0. Never emit
+            # after a (possibly partial) write already went out.
             try:
-                fb_adapter = adapter if adapter is not None else get_adapter(host.strip())
+                fb_adapter = adapter
+                if fb_adapter is None:
+                    tag = host.strip()
+                    fb_adapter = get_adapter(tag if tag in known_hosts() else detect_host(payload))
                 fallback = fb_adapter.serialize({})
                 click.echo(fallback, nl=bool(fallback))
             except BaseException:  # noqa: BLE001
