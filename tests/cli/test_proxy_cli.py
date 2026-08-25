@@ -5125,9 +5125,7 @@ class TestRegisterCommand:
         assert result.exit_code == 0, result.output
         assert seen["config_path"] == env_config.resolve()
 
-    def test_registration_command_renders_a_broken_env_as_click_error(
-        self, tmp_path, monkeypatch
-    ):
+    def test_registration_command_renders_a_broken_env_as_click_error(self, tmp_path, monkeypatch):
         """#847 round 2: a broken MEMTOMEM_STM_* env failing the policy's
         STMConfig construction must leave ``_registration_command`` as a
         ClickException naming the variable, not a raw ValidationError."""
@@ -5135,9 +5133,7 @@ class TestRegisterCommand:
 
         set_home(monkeypatch, tmp_path / "home")
         config = tmp_path / "stm_proxy.json"
-        config.write_text(
-            json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8"
-        )
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
         monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND", "x")
 
         with pytest.raises(click.ClickException) as caught:
@@ -5151,14 +5147,10 @@ class TestRegisterCommand:
         document — exactly the output mode automation parses."""
         set_home(monkeypatch, tmp_path / "home")
         config = tmp_path / "stm_proxy.json"
-        config.write_text(
-            json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8"
-        )
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
         monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND", "x")
 
-        result = runner.invoke(
-            cli, ["register", "--mcp", "json", "--json", *_cfg_args(config)]
-        )
+        result = runner.invoke(cli, ["register", "--mcp", "json", "--json", *_cfg_args(config)])
 
         assert result.exit_code == 1
         payload = json.loads(result.output)
@@ -5174,14 +5166,10 @@ class TestRegisterCommand:
         echoing it — and the JSON document must survive either way."""
         set_home(monkeypatch, tmp_path / "home")
         config = tmp_path / "stm_proxy.json"
-        config.write_text(
-            json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8"
-        )
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
         monkeypatch.setenv("MEMTOMEM_STM_PROXY", '{"cache": "s3cret-sentinel"')
 
-        result = runner.invoke(
-            cli, ["register", "--mcp", "json", "--json", *_cfg_args(config)]
-        )
+        result = runner.invoke(cli, ["register", "--mcp", "json", "--json", *_cfg_args(config)])
 
         assert result.exit_code == 1
         payload = json.loads(result.output)
@@ -11711,8 +11699,9 @@ class TestDoctor:
         self._healthy_config(env_config)
         monkeypatch.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(env_config))
         via_env = runner.invoke(cli, ["doctor", "--json"])
-        assert "(from MEMTOMEM_STM_PROXY__CONFIG_PATH)" in (
-            self._check_by_id(via_env, "config_file")["detail"]
+        assert (
+            "(from MEMTOMEM_STM_PROXY__CONFIG_PATH)"
+            in (self._check_by_id(via_env, "config_file")["detail"])
         )
 
         monkeypatch.delenv("MEMTOMEM_STM_PROXY__CONFIG_PATH")
@@ -13862,6 +13851,43 @@ class TestTune:
         assert "confidence" in result.output
         assert "--apply" in result.output
         assert config.read_bytes() == before
+
+    def test_preview_respects_configured_max_history(self, runner, config, tmp_path):
+        """The tune store must carry metrics.max_history: initialize() runs
+        the per-source retention reconciliation, so the constructor default
+        (10k) would silently delete rows that a larger configured cap says
+        to keep (codex review round 3)."""
+        import sqlite3
+        import time
+
+        from memtomem_stm.proxy.metrics_store import MetricsStore
+
+        metrics_db = tmp_path / "metrics.db"
+        self._seed_config(
+            config, metrics_db, metrics={"db_path": str(metrics_db), "max_history": 20000}
+        )
+        store = MetricsStore(metrics_db, max_history=20000)
+        store.initialize()
+        try:
+            now = time.time()
+            store._db.executemany(
+                "INSERT INTO proxy_metrics (server, tool, original_chars, "
+                "compressed_chars, cleaned_chars, source, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [("srv", "big_tool", 1, 1, 1, "mcp", now) for _ in range(15000)],
+            )
+            store._db.commit()
+        finally:
+            store.close()
+
+        result = runner.invoke(cli, ["tune", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        db = sqlite3.connect(str(metrics_db))
+        try:
+            count = db.execute("SELECT COUNT(*) FROM proxy_metrics").fetchone()[0]
+        finally:
+            db.close()
+        assert count == 15000, "tune reconciled with the default cap instead of the configured one"
 
     def test_preview_json_shape(self, runner, config, tmp_path):
         metrics_db = tmp_path / "metrics.db"

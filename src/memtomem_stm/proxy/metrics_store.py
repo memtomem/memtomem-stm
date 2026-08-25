@@ -197,10 +197,22 @@ class MetricsStore:
     """SQLite-backed persistent metrics for proxy calls."""
 
     def __init__(
-        self, db_path: Path, max_history: int = 10000, *, busy_timeout_ms: int | None = None
+        self,
+        db_path: Path,
+        max_history: int = 10000,
+        *,
+        busy_timeout_ms: int | None = None,
+        reconcile_on_init: bool = True,
     ) -> None:
         self._db_path = db_path
         self._max_history = max_history
+        # ``reconcile_on_init=False`` is for openers whose ``max_history``
+        # does NOT come from the effective proxy JSON — the ``mms hook`` path
+        # builds an env-only STMConfig, so its (possibly default) cap must
+        # not be applied to OTHER sources' retention at startup. Such openers
+        # still trim their own source on write; only the cap-authoritative
+        # openers (server lifespan, ``mms tune``) reconcile every source.
+        self._reconcile_on_init = reconcile_on_init
         # Best-effort writers (the ``mms hook`` native-tool metrics path) pass a
         # small ``busy_timeout_ms`` so a locked shared ``proxy_metrics.db`` makes
         # initialize/record fast-fail (degrade to no row) instead of stalling the
@@ -238,6 +250,21 @@ class MetricsStore:
             # as ``self._db`` so a failure here falls through to the outer
             # except and leaves the store un-initialized.
             self._migrate(db)
+            # ``source`` is a migrated column (absent from the base _CREATE),
+            # so the index backing the per-source _trim scan can only be
+            # created after _migrate has run.
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_metrics_source_created "
+                "ON proxy_metrics(source, created_at)"
+            )
+            db.commit()
+            # Reconcile every source once at startup: the per-write _trim only
+            # covers the writer's own source, so an over-cap source that has
+            # stopped receiving writes (e.g. after lowering max_history) would
+            # otherwise never shrink. Gated: see reconcile_on_init in __init__.
+            if self._reconcile_on_init:
+                for (src,) in db.execute("SELECT DISTINCT source FROM proxy_metrics").fetchall():
+                    self._trim_source(db, src)
         except Exception:
             db.close()
             raise
@@ -407,20 +434,43 @@ class MetricsStore:
                 ),
             )
             self._db.commit()
-            self._trim()
+            self._trim(metrics.source)
 
-    def _trim(self) -> None:
+    def _trim(self, source: str) -> None:
+        """Enforce ``max_history`` per ``source``, scoped to the writer's own.
+
+        The cap used to be table-wide with FIFO eviction, and the two writers
+        have wildly different rates: the ``mms hook`` path (``source='hook'``,
+        one row per built-in Read/Grep/Glob/Bash call) outpaces proxied MCP
+        traffic by orders of magnitude, so hook churn evicted nearly every
+        ``'mcp'`` row and starved the ``source='mcp'``-scoped aggregations
+        (``get_tool_profiles``, error stats; ``read_compression_summary``
+        filters by source only when one is passed) down to a useless sample.
+        Trimming within the
+        just-written source means neither writer can evict the other's rows;
+        the table's worst case becomes ``max_history × distinct sources``
+        (currently two).
+        """
         if self._db is None:
             return
-        count = self._db.execute("SELECT COUNT(*) FROM proxy_metrics").fetchone()[0]
-        if count > self._max_history:
-            excess = count - self._max_history
-            self._db.execute(
-                "DELETE FROM proxy_metrics WHERE id IN "
-                "(SELECT id FROM proxy_metrics ORDER BY created_at ASC LIMIT ?)",
-                (excess,),
-            )
-            self._db.commit()
+        self._trim_source(self._db, source)
+
+    def _trim_source(self, db: sqlite3.Connection, source: str) -> None:
+        # The excess is computed INSIDE the DELETE so count-and-delete is one
+        # atomic statement: reconciliation runs from every initialize and the
+        # hook opens a short-lived store per call, so two processes can trim
+        # the same source concurrently — a pre-computed excess would be stale
+        # for the loser and over-delete below the cap. ``max(0, ...)`` matters:
+        # a negative LIMIT means "unlimited" in SQLite and would empty the
+        # source. When nothing is over cap the statement deletes zero rows.
+        db.execute(
+            "DELETE FROM proxy_metrics WHERE id IN "
+            "(SELECT id FROM proxy_metrics WHERE source = ? "
+            "ORDER BY created_at ASC "
+            "LIMIT max(0, (SELECT COUNT(*) FROM proxy_metrics WHERE source = ?) - ?))",
+            (source, source, self._max_history),
+        )
+        db.commit()
 
     def get_tool_profiles(self, since_seconds: float = 86400.0) -> list[dict]:
         """Aggregate per ``(server, tool)`` stats for auto-tuner analysis.
