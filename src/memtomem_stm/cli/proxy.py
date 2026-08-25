@@ -1357,8 +1357,10 @@ def _stdin_is_tty() -> bool:
     return bool(sys.stdin.isatty())
 
 
-# Nested command families live in sibling modules and are imported only when
-# their subcommand is actually invoked. The hook hot path (`mms hook`, run by
+# Nested command families live in sibling modules and are imported on demand:
+# when their subcommand dispatches, or when a registry-wide path (root help,
+# matching shell completion, unknown-command suggestions) enumerates them —
+# never merely by importing this module. The hook hot path (`mms hook`, run by
 # a host on every built-in tool call) pays this module's import cost each
 # invocation, and the eager sibling imports used to dominate it — most of all
 # ``selection_cmd``, whose ``proxy.manager`` dependency pulls in the whole MCP
