@@ -622,10 +622,51 @@ def test_unexpected_runtime_refresh_error_does_not_crash_the_call_gate(tmp_path,
         raise RuntimeError("unexpected loader crash")
 
     monkeypatch.setattr(manager_mod, "load_policy_bundle", _boom)
-    path.touch()  # move the stamp so the reload actually re-reads
+    # Deterministic stamp invalidation: touch() depends on filesystem mtime
+    # granularity; an explicit +1s utime always changes st_mtime_ns.
+    before = path.stat()
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 10**9))
     with pytest.raises(ToolError, match="Policy denied"):
         manager._enforce_toolgraph_call_policy("srv", "read")
     assert manager.get_toolgraph_status()["withholding_all"] is not None
+
+
+def test_unexpanded_user_bundle_path_rejects_instead_of_escaping(tmp_path):
+    # Path.expanduser() raises RuntimeError (not OSError) for ``~nosuchuser``
+    # on POSIX; that ran OUTSIDE the reload barrier, so review startup still
+    # died with the raw exception. Both profiles must take the rejection
+    # semantics. (On Windows expanduser resolves without checking the user
+    # exists, and the subsequent stat() fails with OSError — the asserted
+    # outcomes are identical either way.)
+    strict, _, _ = _manager(tmp_path / "strict")
+    strict._config.toolgraph.bundle_path = Path("~mms-no-such-user-866/bundle.json")
+    with pytest.raises(ToolgraphStartupError, match="Invalid Toolgraph policy bundle"):
+        strict._refresh_toolgraph_bundle(force=True, startup=True)
+
+    review, _, _ = _manager(tmp_path / "review", profile=ExposureProfile.REVIEW)
+    review._config.toolgraph.bundle_path = Path("~mms-no-such-user-866/bundle.json")
+    review._refresh_toolgraph_bundle(force=True, startup=True)
+    assert review.get_toolgraph_status()["degraded"] is True
+
+
+def test_rebind_bug_on_unchanged_stamp_propagates_not_withholds(tmp_path, monkeypatch):
+    # The unchanged-stamp catalog rebind is deliberately OUTSIDE the reject
+    # barrier: an internal binding bug is a programming error, not an invalid
+    # bundle. Converting it to withhold-all would misdiagnose the fault and
+    # stick — the unchanged-stamp early return never re-clears it.
+    manager, path, tool = _manager(tmp_path)
+    _write_bundle(path, _bundle(tool))
+    manager._refresh_toolgraph_bundle(force=True, startup=True)  # healthy load
+
+    manager._tool_catalog_revision += 1  # catalog moved; stamp unchanged
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("binding bug")
+
+    monkeypatch.setattr(manager, "_apply_toolgraph_policy_snapshot", _boom)
+    with pytest.raises(RuntimeError, match="binding bug"):
+        manager._refresh_toolgraph_bundle()
+    assert manager.get_toolgraph_status()["withholding_all"] is None
 
 
 def test_bundle_mode_rejects_profile_split_brain(tmp_path):

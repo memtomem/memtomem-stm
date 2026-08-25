@@ -855,30 +855,85 @@ class ProxyManager:
             else:
                 await self._consult_toolgraph()
 
+    def _reject_toolgraph_bundle(self, exc: Exception, *, startup: bool) -> None:
+        """Shared rejection semantics for a failed bundle reload.
+
+        OSError/PolicyBundleError are the expected rejection classes; any
+        other exception from a malformed bundle path must ride the SAME
+        semantics rather than escape (#866) — at startup an escape aborted the
+        whole MCP server, and at runtime it crashed the in-flight tools/list /
+        tools/call that triggered the reload. Strict still fails closed (and,
+        at startup, loudly via :class:`ToolgraphStartupError`); review
+        degrades. Only the *reload* rides this barrier — snapshot rebinding is
+        deliberately outside it, so an internal binding bug stays a loud
+        programming error instead of masquerading as an invalid bundle.
+        """
+        self._toolgraph_degraded = True
+        self._toolgraph_degraded_reason = REASON_TOOLGRAPH_PROTOCOL_ERROR
+        if self._config.exposure.profile is ExposureProfile.STRICT:
+            self._toolgraph_withhold_all = REASON_TOOLGRAPH_PROTOCOL_ERROR
+            # Fail-closed supersedes binding: nothing is withheld *because*
+            # it failed to bind any more, it is withheld because the bundle
+            # is unreadable. Keeping the old snapshot's diagnosis would pair
+            # a live protocol error with a stale mapping/digest cause and
+            # send the operator after the wrong thing.
+            self._toolgraph_bind_stats = {}
+            self._toolgraph_all_fail_cause = None
+            self._toolgraph_all_fail_warned = False
+            if startup:
+                raise ToolgraphStartupError(f"Invalid Toolgraph policy bundle: {exc}") from exc
+        elif (
+            self._toolgraph_policy_snapshot is not None
+            and self._toolgraph_bound_catalog_revision != self._tool_catalog_revision
+        ):
+            # Review mode keeps serving the last-known-good policy, but a
+            # changed catalog must still be rebound once so newly added or
+            # drifted tools are counted as would-block instead of escaping
+            # the stale snapshot.
+            self._apply_toolgraph_policy_snapshot(self._toolgraph_policy_snapshot)
+        # Unexpected classes keep their traceback: the message alone names
+        # neither the raise site nor the class family the next fix should
+        # widen to expect.
+        logger.warning(
+            "Toolgraph policy bundle reload rejected: %s",
+            exc,
+            exc_info=not isinstance(exc, (OSError, PolicyBundleError)),
+        )
+
     def _refresh_toolgraph_bundle(self, *, force: bool = False, startup: bool = False) -> None:
         """Reload a changed portable policy artifact with atomic swap semantics."""
         cfg = self._config.toolgraph
         if not cfg.enabled or cfg.source != "bundle":
             return
-        path = cfg.bundle_path.expanduser()
         try:
+            # ``expanduser`` is inside the barrier too: a ``~nosuchuser`` path
+            # raises RuntimeError, not OSError, and must reject, not escape.
+            path = cfg.bundle_path.expanduser()
             # Deliberate O(1) syscall on every tools/list and tools/call: a
             # freshly published denial must take effect before advertisement,
             # cache lookup, or upstream dispatch. Catalog hashing remains
             # revision-gated, so freshness does not become O(tool count).
             stat = path.stat()
             stamp = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
-            if not force and stamp == self._toolgraph_bundle_stamp:
-                # tools/list_changed may have altered the live catalog while
-                # the artifact itself stayed unchanged. Rebind the immutable
-                # decisions so new/mutated tools become UNMAPPED/DRIFTED before
-                # either advertisement or a direct call.
-                if (
-                    self._toolgraph_policy_snapshot is not None
-                    and self._toolgraph_bound_catalog_revision != self._tool_catalog_revision
-                ):
-                    self._apply_toolgraph_policy_snapshot(self._toolgraph_policy_snapshot)
-                return
+        except Exception as exc:
+            self._reject_toolgraph_bundle(exc, startup=startup)
+            return
+        if not force and stamp == self._toolgraph_bundle_stamp:
+            # tools/list_changed may have altered the live catalog while
+            # the artifact itself stayed unchanged. Rebind the immutable
+            # decisions so new/mutated tools become UNMAPPED/DRIFTED before
+            # either advertisement or a direct call. Deliberately OUTSIDE the
+            # reject barrier (like the post-load apply below): a bug in
+            # binding is not an invalid bundle, and converting it to
+            # withhold-all would both misdiagnose the fault and stick (the
+            # unchanged-stamp early return would never re-clear it).
+            if (
+                self._toolgraph_policy_snapshot is not None
+                and self._toolgraph_bound_catalog_revision != self._tool_catalog_revision
+            ):
+                self._apply_toolgraph_policy_snapshot(self._toolgraph_policy_snapshot)
+            return
+        try:
             active_profile = self._config.exposure.profile.value
             if cfg.query_profile != active_profile:
                 raise PolicyBundleError(
@@ -897,40 +952,7 @@ class ProxyManager:
             if after_stamp != stamp:
                 raise PolicyBundleError("policy bundle changed while it was being read")
         except Exception as exc:
-            # OSError/PolicyBundleError are the expected rejection classes; any
-            # other exception from a malformed bundle path must ride the SAME
-            # semantics rather than escape (#866) — at startup an escape aborted
-            # the whole MCP server, and at runtime it crashed the in-flight
-            # tools/list / tools/call that triggered the reload. Strict still
-            # fails closed (and loudly at startup, below); review degrades.
-            unexpected = not isinstance(exc, (OSError, PolicyBundleError))
-            self._toolgraph_degraded = True
-            self._toolgraph_degraded_reason = REASON_TOOLGRAPH_PROTOCOL_ERROR
-            if self._config.exposure.profile is ExposureProfile.STRICT:
-                self._toolgraph_withhold_all = REASON_TOOLGRAPH_PROTOCOL_ERROR
-                # Fail-closed supersedes binding: nothing is withheld *because*
-                # it failed to bind any more, it is withheld because the bundle
-                # is unreadable. Keeping the old snapshot's diagnosis would pair
-                # a live protocol error with a stale mapping/digest cause and
-                # send the operator after the wrong thing.
-                self._toolgraph_bind_stats = {}
-                self._toolgraph_all_fail_cause = None
-                self._toolgraph_all_fail_warned = False
-                if startup:
-                    raise ToolgraphStartupError(f"Invalid Toolgraph policy bundle: {exc}") from exc
-            elif (
-                self._toolgraph_policy_snapshot is not None
-                and self._toolgraph_bound_catalog_revision != self._tool_catalog_revision
-            ):
-                # Review mode keeps serving the last-known-good policy, but a
-                # changed catalog must still be rebound once so newly added or
-                # drifted tools are counted as would-block instead of escaping
-                # the stale snapshot.
-                self._apply_toolgraph_policy_snapshot(self._toolgraph_policy_snapshot)
-            # Unexpected classes keep their traceback: the message alone names
-            # neither the raise site nor the class family the next fix should
-            # widen to expect.
-            logger.warning("Toolgraph policy bundle reload rejected: %s", exc, exc_info=unexpected)
+            self._reject_toolgraph_bundle(exc, startup=startup)
             return
 
         self._toolgraph_policy_snapshot = snapshot
