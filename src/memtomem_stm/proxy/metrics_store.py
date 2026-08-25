@@ -197,10 +197,22 @@ class MetricsStore:
     """SQLite-backed persistent metrics for proxy calls."""
 
     def __init__(
-        self, db_path: Path, max_history: int = 10000, *, busy_timeout_ms: int | None = None
+        self,
+        db_path: Path,
+        max_history: int = 10000,
+        *,
+        busy_timeout_ms: int | None = None,
+        reconcile_on_init: bool = True,
     ) -> None:
         self._db_path = db_path
         self._max_history = max_history
+        # ``reconcile_on_init=False`` is for openers whose ``max_history``
+        # does NOT come from the effective proxy JSON — the ``mms hook`` path
+        # builds an env-only STMConfig, so its (possibly default) cap must
+        # not be applied to OTHER sources' retention at startup. Such openers
+        # still trim their own source on write; only the cap-authoritative
+        # openers (server lifespan, ``mms tune``) reconcile every source.
+        self._reconcile_on_init = reconcile_on_init
         # Best-effort writers (the ``mms hook`` native-tool metrics path) pass a
         # small ``busy_timeout_ms`` so a locked shared ``proxy_metrics.db`` makes
         # initialize/record fast-fail (degrade to no row) instead of stalling the
@@ -249,9 +261,10 @@ class MetricsStore:
             # Reconcile every source once at startup: the per-write _trim only
             # covers the writer's own source, so an over-cap source that has
             # stopped receiving writes (e.g. after lowering max_history) would
-            # otherwise never shrink.
-            for (src,) in db.execute("SELECT DISTINCT source FROM proxy_metrics").fetchall():
-                self._trim_source(db, src)
+            # otherwise never shrink. Gated: see reconcile_on_init in __init__.
+            if self._reconcile_on_init:
+                for (src,) in db.execute("SELECT DISTINCT source FROM proxy_metrics").fetchall():
+                    self._trim_source(db, src)
         except Exception:
             db.close()
             raise

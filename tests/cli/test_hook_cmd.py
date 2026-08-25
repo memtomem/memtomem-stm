@@ -824,6 +824,46 @@ def test_record_hook_metrics_writes_source_hook_row(tmp_path: Path):
     assert row["compressed_chars"] == len(f"{_COMPRESS_SENTINEL}\nshort")
 
 
+def test_record_hook_metrics_does_not_reconcile_foreign_sources(tmp_path: Path):
+    """The hook's cap comes from an env-only STMConfig, not the proxy JSON —
+    a hook invocation must never apply it to OTHER sources' retention
+    (codex review round 4: with a file-configured cap larger than the env
+    default, every hook call would have shrunk the mcp history)."""
+    import sqlite3
+    import time as _time
+
+    from memtomem_stm.proxy.metrics_store import MetricsStore
+
+    # Seed 15 mcp rows via a store whose (authoritative) cap allows them.
+    seed = MetricsStore(tmp_path / "metrics.db", max_history=100)
+    seed.initialize()
+    try:
+        now = _time.time()
+        seed._db.executemany(
+            "INSERT INTO proxy_metrics (server, tool, original_chars, "
+            "compressed_chars, cleaned_chars, source, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 'mcp', ?)",
+            [("srv", "t", 1, 1, 1, now) for _ in range(15)],
+        )
+        seed._db.commit()
+    finally:
+        seed.close()
+
+    # Hook invocation with a smaller (env-default-like) cap of 10.
+    cfg = _metrics_config(tmp_path)
+    cfg.proxy.metrics.max_history = 10
+    _record_hook_metrics(_canonical(_bash_payload({"stdout": _BIG_STDOUT})), None, None, cfg)
+
+    db = sqlite3.connect(str(tmp_path / "metrics.db"))
+    try:
+        counts = dict(
+            db.execute("SELECT source, COUNT(*) FROM proxy_metrics GROUP BY source").fetchall()
+        )
+    finally:
+        db.close()
+    assert counts == {"mcp": 15, "hook": 1}
+
+
 def test_record_hook_metrics_no_compression_original_equals_compressed(tmp_path: Path):
     from memtomem_stm.proxy.metrics_store import read_compression_summary
 

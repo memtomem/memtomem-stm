@@ -716,10 +716,15 @@ def _record_hook_metrics(
         from memtomem_stm.proxy.metrics import CallMetrics
         from memtomem_stm.proxy.metrics_store import MetricsStore
 
+        # reconcile_on_init=False: this config is the env-only STMConfig, not
+        # the proxy JSON — its (possibly default) max_history is authoritative
+        # only for the hook's own rows, so startup must not apply it to other
+        # sources' retention (the server and ``mms tune`` reconcile those).
         store = MetricsStore(
             config.proxy.metrics.db_path.expanduser(),
             max_history=config.proxy.metrics.max_history,
             busy_timeout_ms=_METRICS_BUSY_TIMEOUT_MS,
+            reconcile_on_init=False,
         )
         store.initialize()
         try:
