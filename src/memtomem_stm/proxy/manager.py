@@ -859,15 +859,23 @@ class ProxyManager:
         """Shared rejection semantics for a failed bundle reload.
 
         OSError/PolicyBundleError are the expected rejection classes; any
-        other exception from a malformed bundle path must ride the SAME
-        semantics rather than escape (#866) — at startup an escape aborted the
-        whole MCP server, and at runtime it crashed the in-flight tools/list /
-        tools/call that triggered the reload. Strict still fails closed (and,
-        at startup, loudly via :class:`ToolgraphStartupError`); review
-        degrades. Only the *reload* rides this barrier — snapshot rebinding is
-        deliberately outside it, so an internal binding bug stays a loud
-        programming error instead of masquerading as an invalid bundle.
+        other exception escaping the reload — a malformed bundle, or an
+        internal loader/stat/config error inside the reload regions — must
+        ride the SAME semantics rather than escape (#866): at startup an
+        escape aborted the whole MCP server, and at runtime it crashed the
+        in-flight tools/call (or advertisement rebuild) that triggered the
+        reload. Strict still fails closed (and, at startup, loudly via
+        :class:`ToolgraphStartupError`); review degrades. Only the *reload*
+        rides this barrier — snapshot rebinding is deliberately outside it, so
+        an internal binding bug stays a loud programming error instead of
+        masquerading as an invalid bundle.
         """
+        # Drop the stored stamp: after a transient failure the path can come
+        # back stamp-identical, and the unchanged-stamp early return would
+        # then skip the full reload that clears this degraded/withhold state —
+        # leaving strict withholding forever. Forcing the next refresh through
+        # a full re-adopt makes recovery automatic.
+        self._toolgraph_bundle_stamp = None
         self._toolgraph_degraded = True
         self._toolgraph_degraded_reason = REASON_TOOLGRAPH_PROTOCOL_ERROR
         if self._config.exposure.profile is ExposureProfile.STRICT:
@@ -909,10 +917,11 @@ class ProxyManager:
             # ``expanduser`` is inside the barrier too: a ``~nosuchuser`` path
             # raises RuntimeError, not OSError, and must reject, not escape.
             path = cfg.bundle_path.expanduser()
-            # Deliberate O(1) syscall on every tools/list and tools/call: a
-            # freshly published denial must take effect before advertisement,
-            # cache lookup, or upstream dispatch. Catalog hashing remains
-            # revision-gated, so freshness does not become O(tool count).
+            # Deliberate O(1) syscall on every tools/call and each
+            # advertisement build (startup registration / lifespan cleanup): a
+            # freshly published denial must take effect before cache lookup or
+            # upstream dispatch. Catalog hashing remains revision-gated, so
+            # freshness does not become O(tool count).
             stat = path.stat()
             stamp = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
         except Exception as exc:

@@ -610,9 +610,9 @@ def test_unexpected_refresh_error_fails_strict_but_review_degrades(tmp_path, mon
 
 
 def test_unexpected_runtime_refresh_error_does_not_crash_the_call_gate(tmp_path, monkeypatch):
-    # The same reload runs on every tools/list and tools/call
-    # (_enforce_toolgraph_call_policy); an unexpected exception class there
-    # crashed the in-flight request. It must degrade instead — and under the
+    # The same reload runs on every tools/call
+    # (_enforce_toolgraph_call_policy) and each advertisement build; an
+    # unexpected exception class there crashed the in-flight request. It must degrade instead — and under the
     # strict profile fail closed (withhold, ToolError) rather than crash.
     manager, path, tool = _manager(tmp_path)
     _write_bundle(path, _bundle(tool))
@@ -647,6 +647,28 @@ def test_unexpanded_user_bundle_path_rejects_instead_of_escaping(tmp_path):
     review._config.toolgraph.bundle_path = Path("~mms-no-such-user-866/bundle.json")
     review._refresh_toolgraph_bundle(force=True, startup=True)
     assert review.get_toolgraph_status()["degraded"] is True
+
+
+def test_transient_stat_failure_recovers_when_path_returns_unchanged(tmp_path):
+    # A first-region rejection (expanduser/stat) must not stick: after a
+    # transient failure the path can come back with the SAME (ino, size,
+    # mtime_ns) stamp, and the unchanged-stamp early return would then skip
+    # the full reload that clears degraded/withhold-all state. Rejection
+    # therefore invalidates the stored stamp so the next refresh re-adopts.
+    manager, path, tool = _manager(tmp_path)
+    _write_bundle(path, _bundle(tool))
+    manager._refresh_toolgraph_bundle(force=True, startup=True)  # healthy load
+
+    hidden = path.with_suffix(".hidden")
+    path.rename(hidden)  # stat -> OSError; rename preserves ino/size/mtime
+    manager._refresh_toolgraph_bundle()
+    assert manager.get_toolgraph_status()["withholding_all"] is not None
+
+    hidden.rename(path)  # path recovers byte- and stamp-identical
+    manager._refresh_toolgraph_bundle()
+    status = manager.get_toolgraph_status()
+    assert status["withholding_all"] is None
+    assert status["degraded"] is False
 
 
 def test_rebind_bug_on_unchanged_stamp_propagates_not_withholds(tmp_path, monkeypatch):
