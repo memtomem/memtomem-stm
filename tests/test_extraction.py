@@ -735,6 +735,10 @@ class TestFactExtractorTimeout:
 
         with patch.object(extractor, "_call_api", side_effect=hang):
             for _ in range(4):
-                await extractor.extract("x" * 100, server="s", tool="t")
+                # Outer guard so a regression in the production timeout fails
+                # the test instead of hanging the run (codex review round 2).
+                await asyncio.wait_for(
+                    extractor.extract("x" * 100, server="s", tool="t"), timeout=5
+                )
 
         assert extractor._cb.state == "open"
