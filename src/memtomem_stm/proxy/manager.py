@@ -739,10 +739,23 @@ class ProxyManager:
             # (#868): a survivor would keep running against the connections
             # being replaced, and the next notification would schedule a
             # second cap-exempt refresh for the same server beside it.
-            for refresh_task in list(self._tools_refresh_tasks.values()):
+            #
+            # cancel() is only a REQUEST, so wait for the unwind before
+            # deciding what to forget. Clearing the map on the request alone
+            # would orphan a task that delays cancellation: alive, unclaimed,
+            # and joined by a fresh cap-exempt refresh on the next
+            # notification — one more per start cycle. A task that does not
+            # unwind in time keeps its entry and its claim, exactly as in
+            # ``stop()``.
+            live_refreshes = list(self._tools_refresh_tasks.values())
+            for refresh_task in live_refreshes:
                 refresh_task.cancel()
-            self._tools_refresh_tasks.clear()
-            self._tools_refresh_running.clear()
+            if live_refreshes:
+                await asyncio.wait(live_refreshes, timeout=BACKGROUND_DRAIN_BUDGET_SECONDS)
+            self._tools_refresh_tasks = {
+                name: task for name, task in self._tools_refresh_tasks.items() if not task.done()
+            }
+            self._tools_refresh_running.intersection_update(self._tools_refresh_tasks)
             # Close the consult cache too so a re-entry that changed
             # ``toolgraph.consult_cache_path`` reopens the right DB (#494). Mirror
             # the stack-close try/except above: always null the handle so a failed
@@ -4965,9 +4978,11 @@ class ProxyManager:
                 )
                 if index_task is None:
                     # Shed: no task, so no promise. Ship the un-footered
-                    # response and record the miss as a real outcome rather
-                    # than leaving index_ok=None, which dashboards read as
-                    # "background work still pending".
+                    # response and record the miss as a real outcome. Leaving
+                    # index_ok=None would file this row with the SCHEDULED
+                    # background runs — the rows whose result is deliberately
+                    # never written back, which dashboards select with
+                    # ``WHERE index_ok IS NULL`` — and nothing was scheduled.
                     logger.info(
                         "Auto-index shed for %s/%s: background backlog at capacity "
                         "or manager stopping",
@@ -5063,7 +5078,8 @@ class ProxyManager:
         background failures stay visible via ``memory_ops.extract_and_store``'s
         WARNING log). A background run that was never scheduled — shed at the
         cap or during ``stop()`` — reports ``False`` / ``background_shed``
-        instead, since nothing is pending (#868). Like the index stage, the
+        instead, so it is not filed with the scheduled-but-unreported rows
+        (#868). Like the index stage, the
         gate reads ``cfg_snap`` but ``_extract_and_store`` keeps reading live
         ``self._config``.
         """
@@ -5090,11 +5106,12 @@ class ProxyManager:
                 )
                 if extract_task is None:
                     # Shed: record it as a real outcome. Leaving ok/error at
-                    # None is the tri-state that means "background work is
-                    # still pending", and nothing is pending here — the
-                    # coroutine was closed before it recorded an attempt, so
-                    # the attempt is recorded on its behalf (#868). Same
-                    # contract as the auto-index shed branch above.
+                    # None would file this row with the SCHEDULED background
+                    # runs, whose result is deliberately never written back —
+                    # but nothing ran here, and the coroutine was closed
+                    # before it could record its attempt, so the attempt is
+                    # recorded on its behalf (#868). Same contract as the
+                    # auto-index shed branch above.
                     logger.info(
                         "Background extraction shed for %s/%s: backlog at capacity "
                         "or stop() is draining",

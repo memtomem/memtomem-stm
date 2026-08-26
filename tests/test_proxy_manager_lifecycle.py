@@ -1600,11 +1600,12 @@ class TestBackgroundTaskBounds:
         mgr._tools_refresh_running.add("srv")
         try:
             await mgr.start()
-            # cancel() only REQUESTS cancellation; let it unwind before
-            # asserting, so this pins "was cancelled", not scheduler timing.
-            with contextlib.suppress(BaseException):
-                await asyncio.wait_for(straggler, timeout=5.0)
+            # Observe with asyncio.wait, NOT wait_for: wait_for cancels its
+            # awaitable on timeout, which would supply the very cancellation
+            # this test claims production performed.
+            done, _ = await asyncio.wait({straggler}, timeout=5.0)
 
+            assert done, "the straggler was never cancelled by the double-start guard"
             assert straggler.cancelled(), (
                 "a refresh task survived the double-start guard and now runs "
                 "against replaced connections"
@@ -1709,19 +1710,29 @@ class TestBackgroundTaskBounds:
                 await newer
 
     async def test_finished_refresh_releases_its_running_claim(self, tmp_path):
-        # The other half: a refresh that DID finish must release the claim, or
-        # stop()'s own bookkeeping-reset contract breaks and later
-        # notifications for that server are dropped ("running" with no task).
+        # The other half of the identity guard: a refresh that DID finish must
+        # release the claim and leave the map AT COMPLETION — before any
+        # stop(). Installing a pre-finished task and calling stop() would pass
+        # on stop()'s own filtering even if the coroutine's finally and the
+        # done-callback both failed to prune, so this schedules a real refresh
+        # and awaits it.
         mgr = _make_manager(tmp_path=tmp_path)
-        finished = asyncio.create_task(asyncio.sleep(0))
-        await finished
-        mgr._tools_refresh_tasks["srv"] = finished
-        mgr._tools_refresh_running.add("srv")
+        session = AsyncMock()
+        session.list_tools = AsyncMock(return_value=SimpleNamespace(tools=[]))
+        mgr._connections["srv"] = UpstreamConnection(
+            name="srv", config=UpstreamServerConfig(prefix="srv"), session=session, tools=[]
+        )
 
-        await mgr.stop()
+        mgr._schedule_tools_refresh("srv")
+        task = mgr._tools_refresh_tasks["srv"]
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)  # let the done-callback run
 
-        assert "srv" not in mgr._tools_refresh_running
-        assert "srv" not in mgr._tools_refresh_tasks
+        assert "srv" not in mgr._tools_refresh_running, (
+            "a finished refresh kept its claim — later notifications for this "
+            "server would be dropped"
+        )
+        assert "srv" not in mgr._tools_refresh_tasks, "the finished task lingers in the map"
 
     async def test_stop_re_cancels_a_task_that_ignores_its_first_cancel(self, tmp_path):
         # ``asyncio.wait`` defaults to ALL_COMPLETED, so waiting the whole
