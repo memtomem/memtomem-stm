@@ -2047,8 +2047,11 @@ class ProxyManager:
 
         One choke point for every background stage, so the cap, the tracking
         set, and the done-callback cannot drift apart between call sites.
-        Returns ``None`` when the task was shed — callers treat that the same
-        way they treat a stage that was never enabled.
+        Returns ``None`` when the task was shed. Callers must not treat that
+        like a stage that never ran: they record the refusal (an attempt, a
+        ``shed`` outcome, and ``False`` / ``background_shed`` on the metrics
+        row) so it is distinguishable from both a completed run and a row
+        that simply carries no outcome (#868).
         """
         if self._background_closed:
             coro.close()

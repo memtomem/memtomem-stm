@@ -1622,8 +1622,9 @@ class TestBackgroundTaskBounds:
     async def test_shed_background_extract_is_not_reported_as_pending(self, tmp_path):
         # Symmetric to the auto-index shed test in test_auto_index_background:
         # a background extraction that was never scheduled must not leave
-        # extract_ok/extract_error at None, which is the tri-state meaning
-        # "the outcome arrives later". The coroutine is closed before it can
+        # extract_ok/extract_error at None, the tri-state that records no
+        # outcome for this row — which here would be indistinguishable from
+        # a run that WAS scheduled. The coroutine is closed before it can
         # record its attempt, so the stage records it instead.
         from memtomem_stm.proxy.config import ExtractionConfig, ProxyConfig
         from memtomem_stm.proxy.manager import MAX_BACKGROUND_TASKS
