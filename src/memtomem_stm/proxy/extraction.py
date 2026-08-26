@@ -267,7 +267,7 @@ class FactExtractor:
         # we are done touching ``_client``. ``enter`` is sync — no await
         # between the closed check and the claim, so close() cannot slip in
         # and aclose() the client between our check and our registration.
-        self._gate.enter(call_timeout)
+        gate_token = self._gate.enter(call_timeout)
         try:
             # Same outer bound as LLMCompressor.compress: the httpx client's
             # own timeout covers socket phases, but a provider that streams
@@ -301,7 +301,7 @@ class FactExtractor:
             )
             return _extract_heuristic(text, max_facts=self._cfg.max_facts)
         finally:
-            self._gate.leave()
+            self._gate.leave(gate_token)
 
     async def _extract_hybrid(self, text: str, *, server: str, tool: str) -> list[ExtractedFact]:
         """Combine LLM + heuristic extraction, deduplicate by content."""
@@ -415,8 +415,8 @@ class FactExtractor:
 
     async def close(self) -> None:
         # Flip the gate first so new extract() calls take the heuristic
-        # instead of entering ``_in_flight``, then drain already-registered
-        # callers — bounded, so one stuck call cannot hang shutdown (#867).
+        # instead of registering, then drain already-registered callers —
+        # bounded, so one stuck call cannot hang shutdown (#867).
         self._gate.closed = True
         await drain_or_warn(
             self._gate.idle,

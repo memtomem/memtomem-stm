@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -58,44 +60,68 @@ CLOSE_DRAIN_GRACE_SECONDS = 2.0
 class InFlightGate:
     """Registration gate shared by the LLM helpers' ``close()`` drains.
 
-    Tracks how many callers are mid-request and, crucially, the largest
-    timeout any of them **captured when it started** — not whatever the
-    (mutable) config says later. ``close()`` deriving its ceiling from a
-    re-read of the config can undercut a live call: another task lowering
-    ``llm_timeout_seconds`` between the call's start and the close would
-    close the transport while that call is still inside its own deadline.
+    Tracks the callers currently mid-request by the **absolute deadline** each
+    one captured when it started, so ``close()`` waits out what is actually
+    left of them:
+
+    * A *relative* timeout would restart the clock — a 60s call already 59s in
+      would hand shutdown another 60s instead of the remaining second.
+    * The ceiling must come from the live registrations only. Re-reading the
+      (mutable) config instead can undercut a live call when another task
+      lowers ``llm_timeout_seconds``, and folding the config in alongside the
+      registrations lets raising it inflate shutdown arbitrarily. The config
+      is the fallback for "nothing in flight", nothing more.
+    * Deadlines are per registration and dropped on ``leave``, so a long
+      caller finishing does not leave its ceiling behind for a short one.
+
+    ``clock`` is injectable so tests can pin the arithmetic without sleeping.
     """
 
-    def __init__(self) -> None:
-        self.in_flight: int = 0
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self.closed: bool = False
         self.idle: asyncio.Event = asyncio.Event()
         self.idle.set()
-        self.closed: bool = False
-        # Max timeout captured by the callers currently registered; 0.0 when
-        # idle, so a close() with nothing in flight falls back to the config.
-        self._captured_ceiling: float = 0.0
+        self._clock = clock
+        self._deadlines: dict[int, float] = {}
+        self._next_token: int = 0
 
-    def enter(self, timeout: float) -> None:
-        """Register an in-flight caller that captured *timeout*.
+    @property
+    def in_flight(self) -> int:
+        return len(self._deadlines)
+
+    def enter(self, timeout: float) -> int:
+        """Register a caller whose own bound expires *timeout* from now.
 
         Sync on purpose: callers must not ``await`` between their ``closed``
         check and this claim, or ``close()`` can tear the client down in
-        between.
+        between. Returns the token to hand back to :meth:`leave`.
         """
-        self.in_flight += 1
-        self._captured_ceiling = max(self._captured_ceiling, timeout)
+        self._next_token += 1
+        token = self._next_token
+        self._deadlines[token] = self._clock() + timeout
         self.idle.clear()
+        return token
 
-    def leave(self) -> None:
-        self.in_flight -= 1
-        if self.in_flight <= 0:
-            self.in_flight = 0
-            self._captured_ceiling = 0.0
+    def leave(self, token: int) -> None:
+        """Drop a registration; idle again once the last one leaves."""
+        self._deadlines.pop(token, None)
+        if not self._deadlines:
             self.idle.set()
 
     def drain_ceiling(self, fallback_timeout: float) -> float:
-        """Seconds ``close()`` should wait, from the captured deadlines."""
-        return max(self._captured_ceiling, fallback_timeout) + CLOSE_DRAIN_GRACE_SECONDS
+        """Seconds ``close()`` should wait for the current registrations.
+
+        The longest *remaining* time among live callers (never negative — a
+        caller already past its deadline only owes the grace), or
+        ``fallback_timeout`` when nothing is registered, plus the grace that
+        covers the hop from a deadline firing to ``finally`` releasing.
+        """
+        if self._deadlines:
+            now = self._clock()
+            remaining = max(0.0, max(self._deadlines.values()) - now)
+        else:
+            remaining = fallback_timeout
+        return remaining + CLOSE_DRAIN_GRACE_SECONDS
 
 
 async def drain_or_warn(idle: asyncio.Event, *, timeout: float, what: str) -> bool:

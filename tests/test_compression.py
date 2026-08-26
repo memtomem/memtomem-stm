@@ -744,44 +744,64 @@ class TestLLMCompressorShutdown:
         """#867: the drain wait itself must have a ceiling.
 
         In practice compress() is bounded by its own wait_for, but close()
-        awaiting ``_idle`` with no timeout means any future unbounded path
+        awaiting the gate with no timeout means any future unbounded path
         hangs shutdown forever. A stuck in-flight caller must cost the drain
-        ceiling, not the process.
+        ceiling, not the process. The ceiling is asserted directly — the
+        value handed to drain_or_warn — rather than inferred from elapsed
+        wall clock, which cannot separate "waited the ceiling" from "a slow
+        CI worker scheduled us late".
         """
         import asyncio
 
-        import time
-
         from memtomem_stm.utils.anyio_shutdown import CLOSE_DRAIN_GRACE_SECONDS
 
-        # The ceiling derives from the deadline the live caller CAPTURED, so a
-        # small configured timeout keeps the test fast without patching the
-        # grace constant.
         cfg = LLMCompressorConfig(
             provider=LLMProvider.OPENAI, api_key="test", llm_timeout_seconds=0.1
         )
         comp = LLMCompressor(cfg)
-        # Simulate the pathological state directly: a caller that registered
-        # in-flight and never returns. Going through compress() would be
-        # bounded by its own wait_for, which is exactly the bound this test
-        # must not rely on.
+        # Register directly: going through compress() would rely on its own
+        # wait_for, which is exactly the bound this test must not depend on.
         comp._gate.enter(cfg.llm_timeout_seconds)
 
-        started = time.monotonic()
-        close_task = asyncio.create_task(comp.close())
-        done, _ = await asyncio.wait({close_task}, timeout=30.0)
-        elapsed = time.monotonic() - started
+        seen: dict[str, float] = {}
 
-        assert done, "close() never returned — the drain wait is still unbounded"
-        expected = cfg.llm_timeout_seconds + CLOSE_DRAIN_GRACE_SECONDS
-        # Lower bound: an implementation that ignores the gate and closes
-        # immediately (the pre-#867 FactExtractor shape) must fail here.
-        # Upper bound: the wait must be the derived ceiling, not some longer
-        # fixed constant.
-        assert expected * 0.5 <= elapsed < expected + 3.0, (
-            f"drain took {elapsed:.2f}s; expected ~{expected:.2f}s "
-            "(llm_timeout_seconds + CLOSE_DRAIN_GRACE_SECONDS)"
-        )
+        async def recording_drain(idle, *, timeout, what):
+            seen["timeout"] = timeout
+            seen["what"] = what
+            return False  # the ceiling fired
+
+        with patch("memtomem_stm.proxy.compression.drain_or_warn", new=recording_drain):
+            await asyncio.wait_for(comp.close(), timeout=5.0)
+
+        assert seen["what"] == "LLMCompressor"
+        # Remaining time on the captured deadline (~0.1s, minus the sliver
+        # spent registering) plus the grace — not a re-read of the config and
+        # not an unbounded wait.
+        assert (
+            CLOSE_DRAIN_GRACE_SECONDS
+            < seen["timeout"]
+            <= cfg.llm_timeout_seconds + CLOSE_DRAIN_GRACE_SECONDS
+        ), seen
         assert comp._client is None, (
             "close() must still tear the client down after a timed-out drain"
         )
+
+    @pytest.mark.asyncio
+    async def test_close_drain_actually_waits_and_gives_up(self):
+        """The real drain_or_warn must return on its own with the gate stuck."""
+        import asyncio
+        import time
+
+        cfg = LLMCompressorConfig(
+            provider=LLMProvider.OPENAI, api_key="test", llm_timeout_seconds=0.05
+        )
+        comp = LLMCompressor(cfg)
+        comp._gate.enter(cfg.llm_timeout_seconds)
+
+        started = time.monotonic()
+        await asyncio.wait_for(comp.close(), timeout=30.0)
+        elapsed = time.monotonic() - started
+
+        # It gave up rather than hanging, and it did not skip the wait.
+        assert elapsed >= cfg.llm_timeout_seconds
+        assert comp._client is None

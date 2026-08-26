@@ -2325,7 +2325,7 @@ class LLMCompressor:
         # until we finish touching ``_client``. ``enter`` is sync — no
         # ``await`` between the closed check above and the claim, so close()
         # cannot slip in and aclose() the client in between.
-        self._gate.enter(call_timeout)
+        gate_token = self._gate.enter(call_timeout)
         try:
             result = await asyncio.wait_for(
                 self._call_api(text, max_chars=max_chars),
@@ -2354,7 +2354,7 @@ class LLMCompressor:
             self._cb.failure()
             logger.warning(
                 "LLM compression timed out after %.1fs (strategy=llm/%s), falling back to truncate",
-                self._cfg.llm_timeout_seconds,
+                call_timeout,
                 self._cfg.provider.value,
             )
             self.last_fallback = "timeout"
@@ -2370,7 +2370,7 @@ class LLMCompressor:
             self.last_fallback = "llm_error"
             return _plain_truncate(text, max_chars=max_chars)
         finally:
-            self._gate.leave()
+            self._gate.leave(gate_token)
 
     async def _call_api(self, text: str, *, max_chars: int) -> str:
         if self._client is None:
