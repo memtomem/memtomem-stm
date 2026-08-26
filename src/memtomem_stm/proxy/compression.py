@@ -2314,18 +2314,18 @@ class LLMCompressor:
         if self._cb.is_open:
             self.last_fallback = "circuit_breaker"
             return _plain_truncate(text, max_chars=max_chars)
-        if self._gate.closed:
+        # Read the timeout ONCE: the gate turns it into a deadline, and the
+        # same value bounds our own call, so close() drains against what this
+        # caller actually committed to rather than a later config edit.
+        call_timeout = self._cfg.llm_timeout_seconds
+        # Registering is the closed check: try_enter refuses once close() has
+        # started, so a late caller cannot clear the gate's idle event after
+        # the drain ceiling was computed. Sync — no ``await`` between the
+        # claim and our use of ``_client``.
+        gate_token = self._gate.try_enter(call_timeout)
+        if gate_token is None:
             self.last_fallback = "closed"
             return _plain_truncate(text, max_chars=max_chars)
-        # Capture the deadline ONCE and hand it to the gate: close() derives
-        # its drain ceiling from what live callers actually captured, so a
-        # concurrent config edit cannot shorten the wait under them.
-        call_timeout = self._cfg.llm_timeout_seconds
-        # Register as in-flight so a concurrent close() blocks on the gate
-        # until we finish touching ``_client``. ``enter`` is sync — no
-        # ``await`` between the closed check above and the claim, so close()
-        # cannot slip in and aclose() the client in between.
-        gate_token = self._gate.enter(call_timeout)
         try:
             result = await asyncio.wait_for(
                 self._call_api(text, max_chars=max_chars),

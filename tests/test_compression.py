@@ -643,8 +643,9 @@ class TestLLMCompressorShutdown:
     ``RuntimeError("stream has been closed")``.
 
     Sister pattern to #125 (extraction), #129 (mcp_client), #130 (proxy
-    conn_stack) — the fix here uses an in-flight counter + ``asyncio.Event``
-    gate so ``close()`` drains in-flight callers before ``_client.aclose()``.
+    conn_stack) — the fix here uses the shared ``InFlightGate`` (per-caller
+    registrations + an ``asyncio.Event``) so ``close()`` drains in-flight
+    callers before ``_client.aclose()``.
     """
 
     import asyncio
@@ -761,7 +762,7 @@ class TestLLMCompressorShutdown:
         comp = LLMCompressor(cfg)
         # Register directly: going through compress() would rely on its own
         # wait_for, which is exactly the bound this test must not depend on.
-        comp._gate.enter(cfg.llm_timeout_seconds)
+        comp._gate.try_enter(cfg.llm_timeout_seconds)
 
         seen: dict[str, float] = {}
 
@@ -787,21 +788,23 @@ class TestLLMCompressorShutdown:
         )
 
     @pytest.mark.asyncio
-    async def test_close_drain_actually_waits_and_gives_up(self):
-        """The real drain_or_warn must return on its own with the gate stuck."""
+    async def test_close_drain_actually_waits_and_gives_up(self, caplog):
+        """The real drain_or_warn must reach its ceiling and return on its own.
+
+        The give-up warning is the observable that separates "waited, then
+        proceeded" from "never waited" — elapsed wall clock cannot, since a
+        delayed scheduler can hand an immediate return any duration.
+        """
         import asyncio
-        import time
 
         cfg = LLMCompressorConfig(
             provider=LLMProvider.OPENAI, api_key="test", llm_timeout_seconds=0.05
         )
         comp = LLMCompressor(cfg)
-        comp._gate.enter(cfg.llm_timeout_seconds)
+        comp._gate.try_enter(cfg.llm_timeout_seconds)
 
-        started = time.monotonic()
-        await asyncio.wait_for(comp.close(), timeout=30.0)
-        elapsed = time.monotonic() - started
+        with caplog.at_level("WARNING", logger="memtomem_stm.utils.anyio_shutdown"):
+            await asyncio.wait_for(comp.close(), timeout=30.0)
 
-        # It gave up rather than hanging, and it did not skip the wait.
-        assert elapsed >= cfg.llm_timeout_seconds
+        assert any("did not drain" in r.getMessage() for r in caplog.records), caplog.text
         assert comp._client is None

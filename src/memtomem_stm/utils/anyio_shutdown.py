@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections.abc import Callable
 
@@ -56,6 +57,14 @@ def is_clean_cancel_scope_shutdown(exc: BaseException) -> bool:
 # ``finally`` releasing the gate.
 CLOSE_DRAIN_GRACE_SECONDS = 2.0
 
+# Hard ceiling on any drain, whatever the callers captured. ``gt=0.0`` admits
+# ``+inf`` (the same hole #722 closed for the hook deadline), and these config
+# models are mutable, so a non-finite or absurd ``llm_timeout_seconds`` would
+# otherwise restore exactly the unbounded shutdown this gate exists to
+# prevent. A drain this long already means something is wrong; the point is
+# that the process can still exit.
+MAX_CLOSE_DRAIN_SECONDS = 60.0
+
 
 class InFlightGate:
     """Registration gate shared by the LLM helpers' ``close()`` drains.
@@ -73,6 +82,9 @@ class InFlightGate:
       is the fallback for "nothing in flight", nothing more.
     * Deadlines are per registration and dropped on ``leave``, so a long
       caller finishing does not leave its ceiling behind for a short one.
+    * Whatever the captures say, the ceiling is clamped to
+      :data:`MAX_CLOSE_DRAIN_SECONDS` — a non-finite or absurd configured
+      timeout must not restore an unbounded shutdown.
 
     ``clock`` is injectable so tests can pin the arithmetic without sleeping.
     """
@@ -89,13 +101,20 @@ class InFlightGate:
     def in_flight(self) -> int:
         return len(self._deadlines)
 
-    def enter(self, timeout: float) -> int:
+    def try_enter(self, timeout: float) -> int | None:
         """Register a caller whose own bound expires *timeout* from now.
 
-        Sync on purpose: callers must not ``await`` between their ``closed``
-        check and this claim, or ``close()`` can tear the client down in
-        between. Returns the token to hand back to :meth:`leave`.
+        Returns the token to hand back to :meth:`leave`, or ``None`` when the
+        gate is already closed — the caller must then take its degraded path
+        instead of touching the resource. Refusing here rather than leaving it
+        to each caller keeps a late registration from clearing ``idle`` after
+        ``close()`` computed its ceiling.
+
+        Sync on purpose: callers must not ``await`` between this claim and
+        their use of the resource, or ``close()`` can tear it down in between.
         """
+        if self.closed:
+            return None
         self._next_token += 1
         token = self._next_token
         self._deadlines[token] = self._clock() + timeout
@@ -121,7 +140,11 @@ class InFlightGate:
             remaining = max(0.0, max(self._deadlines.values()) - now)
         else:
             remaining = fallback_timeout
-        return remaining + CLOSE_DRAIN_GRACE_SECONDS
+        if not math.isfinite(remaining):
+            # ``+inf`` (admitted by ``gt=0.0``) is not a big budget — it is no
+            # bound at all. Fall through to the hard ceiling below.
+            remaining = MAX_CLOSE_DRAIN_SECONDS
+        return min(remaining + CLOSE_DRAIN_GRACE_SECONDS, MAX_CLOSE_DRAIN_SECONDS)
 
 
 async def drain_or_warn(idle: asyncio.Event, *, timeout: float, what: str) -> bool:

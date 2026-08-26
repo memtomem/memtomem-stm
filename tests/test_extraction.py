@@ -754,8 +754,6 @@ class TestFactExtractorShutdown:
     """
 
     async def test_close_waits_for_in_flight_extract(self):
-        import time
-
         cfg = _tiny_timeout_config()
         cfg.llm.llm_timeout_seconds = 30.0  # long enough that the gate, not the call, decides
         cfg.strategy = ExtractionStrategy.LLM
@@ -785,26 +783,37 @@ class TestFactExtractorShutdown:
 
             extractor._client = MagicMock(aclose=recording_aclose)
 
-            close_task = asyncio.create_task(extractor.close())
-            for _ in range(10):
-                await asyncio.sleep(0)
+            # Pin the CAUSE, not a duration: the recording drain waits on the
+            # very event object close() hands it, so the test can only proceed
+            # if close() is actually gated on the registration. A close that
+            # merely slept would fail the "not done" check below or never see
+            # this probe run at all.
+            drained_on: dict[str, object] = {}
 
-            assert not close_task.done(), (
-                "close() returned while an extract was in flight — no drain"
-            )
-            assert aclose_calls == 0, (
-                "close() called aclose() on the httpx client while extract was mid-call"
-            )
+            async def causal_drain(idle, *, timeout, what):
+                drained_on["idle"] = idle
+                drained_on["timeout"] = timeout
+                await idle.wait()
+                return True
 
-            release.set()
-            facts = await task
-            # Releasing the registration — not a sleep inside close() — is
-            # what lets close() finish, so it must complete promptly now.
-            released_at = time.monotonic()
-            await asyncio.wait_for(close_task, timeout=5.0)
-            assert time.monotonic() - released_at < 1.0, (
-                "close() did not resume promptly when the registration was released "
-                "— it may be waiting on something other than the gate"
+            with patch("memtomem_stm.proxy.extraction.drain_or_warn", new=causal_drain):
+                close_task = asyncio.create_task(extractor.close())
+                for _ in range(10):
+                    await asyncio.sleep(0)
+
+                assert not close_task.done(), (
+                    "close() returned while an extract was in flight — no drain"
+                )
+                assert aclose_calls == 0, (
+                    "close() called aclose() on the httpx client while extract was mid-call"
+                )
+
+                release.set()
+                facts = await task
+                await asyncio.wait_for(close_task, timeout=5.0)
+
+            assert drained_on["idle"] is extractor._gate.idle, (
+                "close() waited on something other than the gate's idle event"
             )
             assert aclose_calls == 1
 
@@ -812,7 +821,7 @@ class TestFactExtractorShutdown:
         assert extractor._client is None
 
     async def test_extract_after_close_refuses_even_with_a_live_client(self):
-        # The gate must be the ``_closed`` flag, not "the client happens to be
+        # The gate must be the gate's own closed state, not "the client happens to be
         # None": a stale client reference (a config swap handing the extractor
         # back, a caller holding the instance) must still take the local
         # heuristic instead of crossing the provider boundary. Nulling the
@@ -837,6 +846,9 @@ class TestFactExtractorShutdown:
             facts = await extractor.extract("def some_function(): pass", server="s", tool="t")
 
         assert not called, "LLM route ran after close()"
+        # Non-empty: ``all()`` over an empty list would also hold for a
+        # degrade path that quietly returned nothing.
+        assert facts, "post-close extraction returned nothing instead of heuristic facts"
         assert all(isinstance(f, ExtractedFact) for f in facts)
 
     async def test_close_drain_is_bounded_when_a_call_never_finishes(self):
@@ -847,7 +859,7 @@ class TestFactExtractorShutdown:
 
         cfg = _tiny_timeout_config()  # llm_timeout_seconds=0.05
         extractor = FactExtractor(cfg)
-        extractor._gate.enter(cfg.llm.llm_timeout_seconds)
+        extractor._gate.try_enter(cfg.llm.llm_timeout_seconds)
 
         seen: dict[str, object] = {}
 
@@ -867,19 +879,19 @@ class TestFactExtractorShutdown:
         ), seen
         assert extractor._client is None
 
-    async def test_close_drain_actually_waits_and_gives_up(self):
-        # The real drain_or_warn must return on its own with the gate stuck.
-        import time
-
+    async def test_close_drain_actually_waits_and_gives_up(self, caplog):
+        # The real drain_or_warn must reach its ceiling and return on its own
+        # with the gate stuck. The warning is the observable that separates
+        # "gave up after waiting" from "never waited": an implementation that
+        # skipped the wait would clear the gate check and log nothing.
         cfg = _tiny_timeout_config()
         extractor = FactExtractor(cfg)
-        extractor._gate.enter(cfg.llm.llm_timeout_seconds)
+        extractor._gate.try_enter(cfg.llm.llm_timeout_seconds)
 
-        started = time.monotonic()
-        await asyncio.wait_for(extractor.close(), timeout=30.0)
-        elapsed = time.monotonic() - started
+        with caplog.at_level("WARNING", logger="memtomem_stm.utils.anyio_shutdown"):
+            await asyncio.wait_for(extractor.close(), timeout=30.0)
 
-        assert elapsed >= cfg.llm.llm_timeout_seconds
+        assert any("did not drain" in r.getMessage() for r in caplog.records), caplog.text
         assert extractor._client is None
 
     async def test_close_drain_ceiling_follows_the_captured_deadline(self):
@@ -888,7 +900,7 @@ class TestFactExtractorShutdown:
         # llm_timeout_seconds mid-call must not shorten the drain under it.
         cfg = _tiny_timeout_config()
         extractor = FactExtractor(cfg)
-        extractor._gate.enter(3.0)  # what the live caller captured
+        extractor._gate.try_enter(3.0)  # what the live caller captured
         cfg.llm.llm_timeout_seconds = 0.05  # config lowered afterwards
 
         seen: dict[str, object] = {}
@@ -919,7 +931,7 @@ class TestInFlightGate:
 
         now = [1000.0]
         gate = self._gate(now)
-        gate.enter(60.0)  # deadline at 1060
+        gate.try_enter(60.0)  # deadline at 1060
         now[0] = 1059.0  # 59s already spent
         # The remaining second plus grace — NOT another full 60s.
         assert gate.drain_ceiling(60.0) == pytest.approx(1.0 + CLOSE_DRAIN_GRACE_SECONDS)
@@ -929,8 +941,8 @@ class TestInFlightGate:
 
         now = [0.0]
         gate = self._gate(now)
-        long_token = gate.enter(300.0)
-        gate.enter(1.0)
+        long_token = gate.try_enter(300.0)
+        gate.try_enter(1.0)
         gate.leave(long_token)  # the 300s caller finished; the 1s one is stuck
         assert gate.drain_ceiling(0.0) == pytest.approx(1.0 + CLOSE_DRAIN_GRACE_SECONDS)
 
@@ -939,19 +951,57 @@ class TestInFlightGate:
 
         now = [0.0]
         gate = self._gate(now)
-        gate.enter(1.0)
+        token = gate.try_enter(1.0)
         # Raising the config after capture must not inflate the drain.
-        assert gate.drain_ceiling(900.0) == pytest.approx(1.0 + CLOSE_DRAIN_GRACE_SECONDS)
-        gate.leave(1)
+        assert gate.drain_ceiling(30.0) == pytest.approx(1.0 + CLOSE_DRAIN_GRACE_SECONDS)
+        gate.leave(token)
         # With nothing registered, the config is the fallback.
-        assert gate.drain_ceiling(900.0) == pytest.approx(900.0 + CLOSE_DRAIN_GRACE_SECONDS)
+        assert gate.drain_ceiling(30.0) == pytest.approx(30.0 + CLOSE_DRAIN_GRACE_SECONDS)
+
+    def test_ceiling_is_the_longest_of_several_live_registrations(self):
+        # Both still registered, so this pins max() — a min() (or "last one
+        # wins") implementation would cut the drain under the longer caller.
+        from memtomem_stm.utils.anyio_shutdown import CLOSE_DRAIN_GRACE_SECONDS
+
+        now = [0.0]
+        gate = self._gate(now)
+        gate.try_enter(1.0)
+        gate.try_enter(9.0)
+        gate.try_enter(4.0)
+        assert gate.drain_ceiling(0.0) == pytest.approx(9.0 + CLOSE_DRAIN_GRACE_SECONDS)
+
+    @pytest.mark.parametrize("unbounded", [float("inf"), 1e9])
+    def test_ceiling_is_clamped_however_long_the_capture(self, unbounded: float):
+        # llm_timeout_seconds is only gt=0.0, which admits +inf (the hole #722
+        # closed for the hook deadline), and the config is mutable. Neither an
+        # infinite nor an absurd capture may restore an unbounded shutdown.
+        from memtomem_stm.utils.anyio_shutdown import MAX_CLOSE_DRAIN_SECONDS
+
+        now = [0.0]
+        gate = self._gate(now)
+        gate.try_enter(unbounded)
+        assert gate.drain_ceiling(0.0) == pytest.approx(MAX_CLOSE_DRAIN_SECONDS)
+        # Same via the no-registration fallback.
+        empty = self._gate([0.0])
+        assert empty.drain_ceiling(unbounded) == pytest.approx(MAX_CLOSE_DRAIN_SECONDS)
+
+    def test_try_enter_refuses_once_closed(self):
+        # A registration accepted after close() started would clear idle again
+        # — after the ceiling was computed — and drain against an unrelated
+        # fallback. The gate refuses instead of trusting each caller to check.
+        now = [0.0]
+        gate = self._gate(now)
+        gate.closed = True
+        assert gate.try_enter(1.0) is None
+        assert gate.in_flight == 0
+        assert gate.idle.is_set()
 
     def test_overdue_caller_owes_only_the_grace(self):
         from memtomem_stm.utils.anyio_shutdown import CLOSE_DRAIN_GRACE_SECONDS
 
         now = [0.0]
         gate = self._gate(now)
-        gate.enter(1.0)
+        gate.try_enter(1.0)
         now[0] = 100.0  # long past the deadline
         assert gate.drain_ceiling(0.0) == pytest.approx(CLOSE_DRAIN_GRACE_SECONDS)
 
@@ -959,8 +1009,8 @@ class TestInFlightGate:
         now = [0.0]
         gate = self._gate(now)
         assert gate.idle.is_set()
-        a = gate.enter(1.0)
-        b = gate.enter(1.0)
+        a = gate.try_enter(1.0)
+        b = gate.try_enter(1.0)
         assert not gate.idle.is_set()
         gate.leave(a)
         assert not gate.idle.is_set(), "idle set while a caller is still registered"
@@ -968,11 +1018,18 @@ class TestInFlightGate:
         assert gate.idle.is_set()
         assert gate.in_flight == 0
 
-    def test_unmatched_leave_is_inert(self):
+    def test_unmatched_leave_does_not_disturb_a_live_registration(self):
         now = [0.0]
         gate = self._gate(now)
-        token = gate.enter(1.0)
-        gate.leave(token)
-        gate.leave(token)  # double release must not unbalance the gate
+        live = gate.try_enter(1.0)
+        stale = gate.try_enter(1.0)
+        gate.leave(stale)
+        gate.leave(stale)  # double release must not drop the OTHER caller
+        assert gate.in_flight == 1
+        assert not gate.idle.is_set()
+        gate.leave(9999)  # a token this gate never issued
+        assert gate.in_flight == 1
+        assert not gate.idle.is_set()
+        gate.leave(live)
         assert gate.in_flight == 0
         assert gate.idle.is_set()

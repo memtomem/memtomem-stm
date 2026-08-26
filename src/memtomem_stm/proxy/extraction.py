@@ -253,21 +253,20 @@ class FactExtractor:
         if self._cb.is_open:
             logger.debug("Extraction circuit open, falling back to heuristic")
             return _extract_heuristic(text, max_facts=self._cfg.max_facts)
-        if self._gate.closed:
-            # Gate on the flag, not on ``_client is None``: a caller holding a
-            # closed extractor (or a resurrected client reference) must still
-            # take the local heuristic rather than cross the provider boundary.
+        # Read the timeout ONCE: the gate turns it into a deadline, and the
+        # same value bounds our own call, so close() drains against what this
+        # caller actually committed to rather than a later config edit.
+        call_timeout = self._llm_cfg.llm_timeout_seconds
+        # Registering IS the closed check — and it gates on the gate's state,
+        # not on ``_client is None``: a caller holding a closed extractor (or
+        # a resurrected client reference) must still take the local heuristic
+        # rather than cross the provider boundary. try_enter also refuses a
+        # late registration that would clear idle after close() computed its
+        # ceiling. Sync — no await between the claim and our use of _client.
+        gate_token = self._gate.try_enter(call_timeout)
+        if gate_token is None:
             logger.debug("Extractor closed, falling back to heuristic")
             return _extract_heuristic(text, max_facts=self._cfg.max_facts)
-        # Capture the deadline ONCE and hand it to the gate, so close()
-        # derives its ceiling from what live callers actually captured rather
-        # than from a config another task may have edited since.
-        call_timeout = self._llm_cfg.llm_timeout_seconds
-        # Register in-flight so a concurrent close() parks on the gate until
-        # we are done touching ``_client``. ``enter`` is sync — no await
-        # between the closed check and the claim, so close() cannot slip in
-        # and aclose() the client between our check and our registration.
-        gate_token = self._gate.enter(call_timeout)
         try:
             # Same outer bound as LLMCompressor.compress: the httpx client's
             # own timeout covers socket phases, but a provider that streams
