@@ -643,8 +643,9 @@ class TestLLMCompressorShutdown:
     ``RuntimeError("stream has been closed")``.
 
     Sister pattern to #125 (extraction), #129 (mcp_client), #130 (proxy
-    conn_stack) — the fix here uses an in-flight counter + ``asyncio.Event``
-    gate so ``close()`` drains in-flight callers before ``_client.aclose()``.
+    conn_stack) — the fix here uses the shared ``InFlightGate`` (per-caller
+    registrations + an ``asyncio.Event``) so ``close()`` drains in-flight
+    callers before ``_client.aclose()``.
     """
 
     import asyncio
@@ -738,3 +739,74 @@ class TestLLMCompressorShutdown:
 
             assert all(r == "summary" for r in results)
             assert comp._client is None
+
+    @pytest.mark.asyncio
+    async def test_close_drain_is_bounded_when_a_call_never_finishes(self):
+        """#867: the drain wait itself must have a ceiling.
+
+        In practice compress() is bounded by its own wait_for, but close()
+        awaiting the gate with no timeout means any future unbounded path
+        hangs shutdown forever. A stuck in-flight caller must cost the drain
+        ceiling, not the process. The ceiling is asserted directly — the
+        value handed to drain_or_warn — rather than inferred from elapsed
+        wall clock, which cannot separate "waited the ceiling" from "a slow
+        CI worker scheduled us late".
+        """
+        import asyncio
+
+        from memtomem_stm.utils.anyio_shutdown import CLOSE_DRAIN_GRACE_SECONDS
+
+        from memtomem_stm.utils.anyio_shutdown import InFlightGate
+
+        cfg = LLMCompressorConfig(
+            provider=LLMProvider.OPENAI, api_key="test", llm_timeout_seconds=30.0
+        )
+        comp = LLMCompressor(cfg)
+        # Pin the clock: with a real one, descheduling between registration
+        # and close() can eat the captured remainder and make the assertion
+        # flake. Register directly too — going through compress() would rely
+        # on its own wait_for, the very bound this test must not depend on.
+        comp._gate = InFlightGate(clock=lambda: 1000.0)
+        comp._gate.try_enter(cfg.llm_timeout_seconds)
+
+        seen: dict[str, float] = {}
+
+        async def recording_drain(idle, *, timeout, what):
+            seen["timeout"] = timeout
+            seen["what"] = what
+            return False  # the ceiling fired
+
+        with patch("memtomem_stm.proxy.compression.drain_or_warn", new=recording_drain):
+            await asyncio.wait_for(comp.close(), timeout=5.0)
+
+        assert seen["what"] == "LLMCompressor"
+        # Exactly the captured deadline plus the grace — not a re-read of the
+        # config, not an unbounded wait, and not a fixed constant.
+        assert seen["timeout"] == pytest.approx(
+            cfg.llm_timeout_seconds + CLOSE_DRAIN_GRACE_SECONDS
+        ), seen
+        assert comp._client is None, (
+            "close() must still tear the client down after a timed-out drain"
+        )
+
+    @pytest.mark.asyncio
+    async def test_close_drain_actually_waits_and_gives_up(self, caplog):
+        """The real drain_or_warn must reach its ceiling and return on its own.
+
+        The give-up warning is the observable that separates "waited, then
+        proceeded" from "never waited" — elapsed wall clock cannot, since a
+        delayed scheduler can hand an immediate return any duration.
+        """
+        import asyncio
+
+        cfg = LLMCompressorConfig(
+            provider=LLMProvider.OPENAI, api_key="test", llm_timeout_seconds=0.05
+        )
+        comp = LLMCompressor(cfg)
+        comp._gate.try_enter(cfg.llm_timeout_seconds)
+
+        with caplog.at_level("WARNING", logger="memtomem_stm.utils.anyio_shutdown"):
+            await asyncio.wait_for(comp.close(), timeout=30.0)
+
+        assert any("did not drain" in r.getMessage() for r in caplog.records), caplog.text
+        assert comp._client is None

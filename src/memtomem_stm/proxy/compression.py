@@ -28,6 +28,11 @@ from memtomem_stm.proxy.config import (
     TailMode,
 )
 from memtomem_stm.proxy.relevance import BM25Scorer, RelevanceScorer
+from memtomem_stm.utils.anyio_shutdown import (
+    InFlightGate,
+    drain_or_warn,
+    normalize_timeout,
+)
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker as _CircuitBreaker
 from memtomem_stm.utils.json_out import escape_lone_surrogates
 
@@ -2281,10 +2286,7 @@ class LLMCompressor:
         # drain before aclose()ing the httpx client. Otherwise a config swap
         # or stop() can tear the client down mid-request. Sister pattern to
         # #125 (extraction), #129 (mcp_client), #130 (proxy conn_stack).
-        self._in_flight: int = 0
-        self._idle: asyncio.Event = asyncio.Event()
-        self._idle.set()
-        self._closed: bool = False
+        self._gate = InFlightGate()
         # Warn about non-standard base_url to flag potential credential exfiltration
         if config.base_url:
             from urllib.parse import urlparse
@@ -2316,20 +2318,23 @@ class LLMCompressor:
         if self._cb.is_open:
             self.last_fallback = "circuit_breaker"
             return _plain_truncate(text, max_chars=max_chars)
-        if self._closed:
+        # Read the timeout ONCE: the gate turns it into a deadline, and the
+        # same value bounds our own call, so close() drains against what this
+        # caller actually committed to rather than a later config edit.
+        call_timeout = normalize_timeout(self._cfg.llm_timeout_seconds)
+        # Registering is the closed check: try_enter refuses once close() has
+        # started, so a late caller cannot clear the gate's idle event after
+        # the drain ceiling was computed. The closed check and the insertion
+        # are one sync step inside try_enter; from here the token is what
+        # keeps ``_client`` alive across the await below.
+        gate_token = self._gate.try_enter(call_timeout)
+        if gate_token is None:
             self.last_fallback = "closed"
             return _plain_truncate(text, max_chars=max_chars)
-        # Register as in-flight so a concurrent close() blocks on ``_idle``
-        # until we finish touching ``_client``. The increment+clear pair is
-        # sync — no ``await`` between the ``_closed`` check above and the
-        # clear, so close() cannot slip in and aclose() the client between
-        # our check and our claim.
-        self._in_flight += 1
-        self._idle.clear()
         try:
             result = await asyncio.wait_for(
                 self._call_api(text, max_chars=max_chars),
-                timeout=self._cfg.llm_timeout_seconds,
+                timeout=call_timeout,
             )
             self._cb.success()
             if len(result) > max_chars:
@@ -2354,7 +2359,7 @@ class LLMCompressor:
             self._cb.failure()
             logger.warning(
                 "LLM compression timed out after %.1fs (strategy=llm/%s), falling back to truncate",
-                self._cfg.llm_timeout_seconds,
+                call_timeout,
                 self._cfg.provider.value,
             )
             self.last_fallback = "timeout"
@@ -2370,9 +2375,7 @@ class LLMCompressor:
             self.last_fallback = "llm_error"
             return _plain_truncate(text, max_chars=max_chars)
         finally:
-            self._in_flight -= 1
-            if self._in_flight == 0:
-                self._idle.set()
+            self._gate.leave(gate_token)
 
     async def _call_api(self, text: str, *, max_chars: int) -> str:
         if self._client is None:
@@ -2388,10 +2391,14 @@ class LLMCompressor:
 
     async def close(self) -> None:
         # Flip the gate first so new compress() calls fall back to truncate
-        # instead of entering ``_in_flight``. Then wait for already-registered
+        # instead of entering the gate. Then wait for already-registered
         # callers to drain before aclose()ing the client.
-        self._closed = True
-        await self._idle.wait()
+        self._gate.closed = True
+        await drain_or_warn(
+            self._gate.idle,
+            timeout=self._gate.drain_ceiling(self._cfg.llm_timeout_seconds),
+            what="LLMCompressor",
+        )
         if self._client:
             await self._client.aclose()
             self._client = None

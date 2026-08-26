@@ -19,6 +19,11 @@ from memtomem_stm.proxy.config import (
     LLMProvider,
 )
 from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS, contains_sensitive_content
+from memtomem_stm.utils.anyio_shutdown import (
+    InFlightGate,
+    drain_or_warn,
+    normalize_timeout,
+)
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 from memtomem_stm.utils.json_out import scrub_lone_surrogates
 from memtomem_stm.utils.numeric import safe_float
@@ -191,6 +196,10 @@ class FactExtractor:
             name=f"extraction-{self._llm_cfg.provider.value}",
         )
         self._client: httpx.AsyncClient | None = httpx.AsyncClient(timeout=30) if httpx else None
+        # Shutdown gate, mirroring LLMCompressor (#867): close() must drain
+        # in-flight LLM calls before aclose()ing the client, or a stop() /
+        # config swap tears the transport down under a live request.
+        self._gate = InFlightGate()
 
     async def extract(
         self,
@@ -248,6 +257,21 @@ class FactExtractor:
         if self._cb.is_open:
             logger.debug("Extraction circuit open, falling back to heuristic")
             return _extract_heuristic(text, max_facts=self._cfg.max_facts)
+        # Read the timeout ONCE: the gate turns it into a deadline, and the
+        # same value bounds our own call, so close() drains against what this
+        # caller actually committed to rather than a later config edit.
+        call_timeout = normalize_timeout(self._llm_cfg.llm_timeout_seconds)
+        # Registering IS the closed check — and it gates on the gate's state,
+        # not on ``_client is None``: a caller holding a closed extractor (or
+        # a resurrected client reference) must still take the local heuristic
+        # rather than cross the provider boundary. try_enter also refuses a
+        # late registration that would clear idle after close() computed its
+        # ceiling. The closed check and the insertion are one sync step
+        # inside try_enter; from here the token keeps _client alive.
+        gate_token = self._gate.try_enter(call_timeout)
+        if gate_token is None:
+            logger.debug("Extractor closed, falling back to heuristic")
+            return _extract_heuristic(text, max_facts=self._cfg.max_facts)
         try:
             # Same outer bound as LLMCompressor.compress: the httpx client's
             # own timeout covers socket phases, but a provider that streams
@@ -255,10 +279,7 @@ class FactExtractor:
             # timeout=60) can hold the call far longer than the pipeline
             # budget. With extraction.background=False this await sits on the
             # tool-response path, so the wall clock must be bounded here.
-            raw = await asyncio.wait_for(
-                self._call_api(text),
-                timeout=self._llm_cfg.llm_timeout_seconds,
-            )
+            raw = await asyncio.wait_for(self._call_api(text), timeout=call_timeout)
             self._cb.record_success()
             facts = _parse_facts_json(raw, max_facts=self._cfg.max_facts)
             if not facts:
@@ -268,7 +289,7 @@ class FactExtractor:
             self._cb.record_failure()
             logger.warning(
                 "LLM extraction timed out after %.1fs for %s/%s, falling back to heuristic",
-                self._llm_cfg.llm_timeout_seconds,
+                call_timeout,
                 server,
                 tool,
             )
@@ -283,6 +304,8 @@ class FactExtractor:
                 exc,
             )
             return _extract_heuristic(text, max_facts=self._cfg.max_facts)
+        finally:
+            self._gate.leave(gate_token)
 
     async def _extract_hybrid(self, text: str, *, server: str, tool: str) -> list[ExtractedFact]:
         """Combine LLM + heuristic extraction, deduplicate by content."""
@@ -395,6 +418,15 @@ class FactExtractor:
         return content
 
     async def close(self) -> None:
+        # Flip the gate first so new extract() calls take the heuristic
+        # instead of registering, then drain already-registered callers —
+        # bounded, so one stuck call cannot hang shutdown (#867).
+        self._gate.closed = True
+        await drain_or_warn(
+            self._gate.idle,
+            timeout=self._gate.drain_ceiling(self._llm_cfg.llm_timeout_seconds),
+            what="FactExtractor",
+        )
         if self._client:
             await self._client.aclose()
             self._client = None
