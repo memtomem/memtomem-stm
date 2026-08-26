@@ -107,10 +107,9 @@ class IndexResult:
     """Stage-4 (INDEX) output. ``final_result`` is the response body the caller
     returns/continues with — the ``[Indexing…] · scheduled`` footer on the
     background path, the indexed summary on the sync path, or ``surfaced`` when
-    indexing is skipped/disabled. ``index_ok`` is tri-state: ``None`` = stage did
-    not run (disabled / no engine / below min_chars) or ran in the background
-    with the outcome still pending; ``True`` = ran ok (incl. the privacy pre-skip);
-    ``False`` = ran and failed.
+    indexing is skipped/disabled. ``index_ok`` is tri-state: ``None`` records
+    no outcome, ``True`` success, ``False`` non-success (failed, or shed
+    before it could run — ``index_error`` says which).
     """
 
     final_result: str
@@ -121,9 +120,10 @@ class IndexResult:
 
 @dataclass(frozen=True, slots=True)
 class ExtractResult:
-    """Stage-4b (EXTRACT) output. ``ok`` / ``error`` are ``None`` on the
-    background path (the outcome arrives after the metrics row is committed) and
-    populated on the sync path."""
+    """Stage-4b (EXTRACT) output. ``ok`` / ``error`` are populated on the sync
+    path, ``None`` for a scheduled background run (which never reports back
+    here), and ``False`` / ``background_shed`` when the background run was
+    refused (#868)."""
 
     ok: bool | None
     error: str | None

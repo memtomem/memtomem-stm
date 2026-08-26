@@ -37,9 +37,9 @@ _INDEX = "CREATE INDEX IF NOT EXISTS idx_metrics_created ON proxy_metrics(create
 def _tristate(value: bool | None) -> int | None:
     """Map a tri-state bool to SQLite-friendly ``int | None``.
 
-    ``None`` (stage did not run) is preserved as SQL ``NULL``; ``True`` and
-    ``False`` map to ``1`` and ``0``. Readers must distinguish ``NULL`` from
-    ``0`` — the former is "not observed", the latter is "observed failure".
+    ``None`` is preserved as SQL ``NULL``; ``True`` and ``False`` map to ``1``
+    and ``0``. Readers must distinguish ``NULL`` (no outcome recorded) from
+    ``0`` (recorded non-success).
     """
     if value is None:
         return None
@@ -283,8 +283,8 @@ class MetricsStore:
         Boolean columns use ``INTEGER NOT NULL DEFAULT 0`` so existing rows
         get a deterministic value. Tri-state columns (``index_ok``,
         ``extract_ok``, ``surfacing_on_progressive_ok``) are nullable
-        ``INTEGER DEFAULT NULL`` — ``NULL`` means "stage did not run", which
-        readers must distinguish from ``0`` (stage ran and failed).
+        ``INTEGER DEFAULT NULL`` — ``NULL`` means no outcome was recorded,
+        which readers must distinguish from ``0`` (recorded non-success).
 
         The ``table_info`` snapshot makes each ALTER conditional, but the
         check and the ALTER are not one atomic step across processes: two
