@@ -14,6 +14,7 @@ import uuid
 from collections import Counter
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
+from collections.abc import Coroutine
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -209,6 +210,19 @@ _TOOLGRAPH_UNREACHABLE_ERRORS: tuple[type[BaseException], ...] = (
     ToolgraphUnreachableError,
     *TOOLGRAPH_TRANSPORT_ERRORS,
 )
+
+
+# Ceiling on fire-and-forget index/extract tasks in flight at once (#868).
+# These are spawned per response with ``background=True``, so without a bound
+# the set tracks the request rate: memory grows, and stop() has more to drain
+# than it can. Past the cap the stage is SHED — dropping one background
+# enrichment is strictly better than unbounded growth, and the synchronous
+# path is unaffected.
+MAX_BACKGROUND_TASKS = 64
+
+# How long stop() waits for cancelled survivors to unwind before reporting
+# them. They are already cancelled by then; this only bounds the report.
+BACKGROUND_CANCEL_GRACE_SECONDS = 2.0
 
 
 class ToolgraphStartupError(RuntimeError):
@@ -641,6 +655,16 @@ class ProxyManager:
         self._relevance_scorer_instance = self._create_scorer(config)
         self._relevance_scorer_cfg = config.relevance_scorer
         self._background_tasks: set[asyncio.Task] = set()
+        # #868 shed bookkeeping. The latch keeps a sustained overload to one
+        # warning, and re-arms once the set drains well below the cap so a
+        # LATER burst is reported too (a one-shot latch would make every
+        # subsequent overload invisible).
+        self._background_shed_total: int = 0
+        self._background_shed_warned: bool = False
+        # Closed for the duration of stop(): the drain loop must not race a
+        # producer this manager creates itself (#868). Reopened by start(), so
+        # a stop -> start reuse gets working background stages again.
+        self._background_closed: bool = False
         # #557 ``tools/list_changed`` refresh bookkeeping. ``dirty`` marks
         # servers whose advertised tool list is known-stale; ``running`` holds
         # servers with a drain task in flight so notification bursts coalesce
@@ -661,6 +685,10 @@ class ProxyManager:
 
     async def start(self) -> None:
         """Connect to all upstream servers, discover their tools."""
+        # Reopen the background spawn path (#868): stop() closes it, and a
+        # stop -> start reuse of this manager must get working background
+        # stages again rather than silently skipping every one.
+        self._background_closed = False
         # Guard against double start — close previous stack to avoid leaking connections
         if self._stack is not None:
             for conn in self._connections.values():
@@ -1873,6 +1901,11 @@ class ProxyManager:
         if name in self._tools_refresh_running:
             return
         self._tools_refresh_running.add(name)
+        # Deliberately NOT shed at the cap: a dropped refresh would leave the
+        # advertised tool list permanently stale for this server (the dirty
+        # flag is already set, and nothing re-triggers it), unlike an index or
+        # extract stage whose loss costs only that one enrichment. Refreshes
+        # coalesce per server, so their count is bounded by upstream count.
         task = asyncio.create_task(self._drain_tools_refresh(name))
         self._background_tasks.add(task)
         task.add_done_callback(
@@ -1951,6 +1984,53 @@ class ProxyManager:
             len(stale),
         )
 
+    def _spawn_background(
+        self,
+        coro: Coroutine[Any, Any, Any],
+        *,
+        stage: str,
+        server: str,
+        tool: str,
+    ) -> asyncio.Task | None:
+        """Spawn a tracked fire-and-forget task, or shed it at the cap (#868).
+
+        One choke point for every background stage, so the cap, the tracking
+        set, and the done-callback cannot drift apart between call sites.
+        Returns ``None`` when the task was shed — callers treat that the same
+        way they treat a stage that was never enabled.
+        """
+        if self._background_closed:
+            coro.close()
+            logger.debug(
+                "Background %s for %s/%s skipped: manager is stopping", stage, server, tool
+            )
+            return None
+        if len(self._background_tasks) >= MAX_BACKGROUND_TASKS:
+            # Close the coroutine we are not going to await, or Python reports
+            # it as "coroutine was never awaited" at collection time, pinning
+            # the blame on a line that did the right thing.
+            coro.close()
+            self._background_shed_total += 1
+            if not self._background_shed_warned:
+                self._background_shed_warned = True
+                logger.warning(
+                    "Background %s for %s/%s shed: %d tasks already in flight (cap %d). "
+                    "Responses are unaffected; this enrichment is skipped while the "
+                    "backlog drains.",
+                    stage,
+                    server,
+                    tool,
+                    len(self._background_tasks),
+                    MAX_BACKGROUND_TASKS,
+                )
+            return None
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(
+            functools.partial(self._on_background_task_done, stage, server, tool)
+        )
+        return task
+
     def _on_background_task_done(
         self,
         stage: str,
@@ -1971,6 +2051,12 @@ class ProxyManager:
         is not logged.
         """
         self._background_tasks.discard(task)
+        if (
+            self._background_shed_warned
+            and len(self._background_tasks) <= MAX_BACKGROUND_TASKS // 2
+        ):
+            # Pressure is off — re-arm so the next overload is reported.
+            self._background_shed_warned = False
         if task.cancelled():
             return
         exc = task.exception()
@@ -1985,6 +2071,9 @@ class ProxyManager:
             )
 
     async def stop(self) -> None:
+        # Close the spawn path first: a stage that schedules its replacement
+        # while unwinding would otherwise outrun the drain loop forever (#868).
+        self._background_closed = True
         # Cancel and drain background tasks (extraction, etc.). Loop until
         # the set is empty — a concurrent call_tool may schedule a new
         # extraction task during our gather await (``call_tool`` adds to
@@ -2003,10 +2092,31 @@ class ProxyManager:
             for task in batch:
                 self._background_tasks.discard(task)
         else:
+            # The bounded loop gave up, but abandoning the survivors means
+            # they keep running against resources we are about to tear down
+            # (#868). Cancel until the set is empty rather than gathering
+            # (gathering is what let a replacement outrun us), still bounded:
+            # a producer that schedules a new task on every cancellation is
+            # unbounded by construction, and the process must still exit.
+            cancelled: list[asyncio.Task] = []
+            for _ in range(8):
+                remaining = [task for task in self._background_tasks if task not in set(cancelled)]
+                if not remaining:
+                    break
+                for task in remaining:
+                    task.cancel()
+                await asyncio.wait(remaining, timeout=BACKGROUND_CANCEL_GRACE_SECONDS)
+                cancelled.extend(remaining)
+            unfinished = [task for task in cancelled if not task.done()]
+            still_tracked = [task for task in self._background_tasks if not task.done()]
             logger.warning(
-                "ProxyManager.stop(): %d background tasks still pending after "
-                "drain loop; leaking them",
-                len(self._background_tasks),
+                "ProxyManager.stop(): %d background task(s) outlived the drain loop; "
+                "cancelled them (%d did not finish unwinding within %.1fs, %d still "
+                "pending after the cancel rounds)",
+                len(cancelled),
+                len(unfinished),
+                BACKGROUND_CANCEL_GRACE_SECONDS,
+                len(still_tracked),
             )
         self._background_tasks.clear()
         # Reset the #557 refresh bookkeeping. A drain task cancelled before its
@@ -4783,7 +4893,7 @@ class ProxyManager:
                     ns=ns,
                     chunks=None,
                 )
-                index_task = asyncio.create_task(
+                self._spawn_background(
                     self._auto_index_response(
                         server,
                         tool,
@@ -4794,11 +4904,10 @@ class ProxyManager:
                         original_chars=len(original_text),
                         compressed_chars=compressed_chars_for_metrics,
                         context_query=context_query,
-                    )
-                )
-                self._background_tasks.add(index_task)
-                index_task.add_done_callback(
-                    functools.partial(self._on_background_task_done, "auto_index", server, tool)
+                    ),
+                    stage="auto_index",
+                    server=server,
+                    tool=tool,
                 )
                 # index_ok / index_error / chunks_indexed stay None / None / 0
                 # — tri-state matches background extraction. Dashboards filter
@@ -4882,18 +4991,17 @@ class ProxyManager:
             and len(cleaned) >= ext_cfg.min_response_chars
         ):
             if ext_cfg.background:
-                task = asyncio.create_task(
+                self._spawn_background(
                     self._extract_and_store(
                         server,
                         tool,
                         upstream_args,
                         cleaned,
                         context_query=context_query,
-                    )
-                )
-                self._background_tasks.add(task)
-                task.add_done_callback(
-                    functools.partial(self._on_background_task_done, "extract", server, tool)
+                    ),
+                    stage="extract",
+                    server=server,
+                    tool=tool,
                 )
             else:
                 extract_outcome = await self._extract_and_store(

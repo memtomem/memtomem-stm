@@ -1312,3 +1312,114 @@ class TestOpenTransportHeaders:
         assert timeout.write == 12.0
         assert timeout.pool == 12.0
         assert timeout.read == 300.0
+
+
+class TestBackgroundTaskBounds:
+    """#868: the fire-and-forget set must be capped, and stop() must not leak.
+
+    Background index/extract tasks were added to an unbounded set, so under
+    sustained load with ``background=True`` the task count tracked the request
+    rate. ``stop()``'s drain loop then gave up after 8 passes, logged "leaking
+    them", and cleared the set — abandoning tasks that go on running against
+    torn-down resources.
+    """
+
+    async def _blocker(self, gate: asyncio.Event) -> None:
+        await gate.wait()
+
+    async def test_spawn_sheds_once_the_cap_is_reached(self, tmp_path, caplog):
+        from memtomem_stm.proxy.manager import MAX_BACKGROUND_TASKS
+
+        mgr = _make_manager(tmp_path=tmp_path)
+        gate = asyncio.Event()
+        try:
+            spawned = [
+                mgr._spawn_background(self._blocker(gate), stage="extract", server="s", tool="t")
+                for _ in range(MAX_BACKGROUND_TASKS)
+            ]
+            assert all(t is not None for t in spawned)
+            assert len(mgr._background_tasks) == MAX_BACKGROUND_TASKS
+
+            with caplog.at_level("WARNING", logger="memtomem_stm.proxy.manager"):
+                over = mgr._spawn_background(
+                    self._blocker(gate), stage="extract", server="s", tool="t"
+                )
+            assert over is None, "spawn past the cap must shed, not grow the set"
+            assert len(mgr._background_tasks) == MAX_BACKGROUND_TASKS
+            assert mgr._background_shed_total == 1
+            assert any("background" in r.getMessage().lower() for r in caplog.records), caplog.text
+        finally:
+            gate.set()
+            await asyncio.gather(*mgr._background_tasks, return_exceptions=True)
+
+    async def test_shed_warning_re_arms_after_pressure_clears(self, tmp_path, caplog):
+        # A one-shot latch would report the first burst and stay silent for
+        # every later one; the latch must re-arm once the set drains.
+        from memtomem_stm.proxy.manager import MAX_BACKGROUND_TASKS
+
+        mgr = _make_manager(tmp_path=tmp_path)
+        gate = asyncio.Event()
+        for _ in range(MAX_BACKGROUND_TASKS):
+            mgr._spawn_background(self._blocker(gate), stage="extract", server="s", tool="t")
+        mgr._spawn_background(self._blocker(gate), stage="extract", server="s", tool="t")
+        assert mgr._background_shed_warned is True
+
+        gate.set()
+        await asyncio.gather(*list(mgr._background_tasks), return_exceptions=True)
+        await asyncio.sleep(0)
+        assert mgr._background_shed_warned is False, "latch never re-armed"
+
+    async def test_stop_refuses_new_background_spawns(self, tmp_path):
+        # An unbounded respawn cannot be drained by any implementation, so the
+        # manager's own path must stop producing once stop() begins —
+        # otherwise the drain loop races a producer it created itself.
+        mgr = _make_manager(tmp_path=tmp_path)
+        await mgr.stop()
+        refused = mgr._spawn_background(asyncio.sleep(3600), stage="extract", server="s", tool="t")
+        assert refused is None, "stop() must close the background spawn path"
+        assert not mgr._background_tasks
+
+    async def test_stop_cancels_survivors_instead_of_leaking(self, tmp_path, caplog):
+        # A task that schedules a replacement as it unwinds outlives the
+        # bounded drain loop: each pass cancels what it snapshotted and a new
+        # one appears. Replacements are injected directly into the set (the
+        # shape a concurrent producer has), so this reaches the give-up branch
+        # regardless of the manager's own spawn refusal. After the bound, the
+        # survivors must be CANCELLED, not abandoned while the set is cleared
+        # out from under them.
+        mgr = _make_manager(tmp_path=tmp_path)
+        spawned: list[asyncio.Task] = []
+        generations = 12  # comfortably past the drain loop's 8 passes
+
+        def _respawn() -> None:
+            if len(spawned) >= generations:
+                return
+            replacement = asyncio.create_task(_respawning())
+            mgr._background_tasks.add(replacement)
+            spawned.append(replacement)
+
+        async def _respawning() -> None:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                _respawn()
+                raise
+
+        _respawn()
+        await asyncio.sleep(0)
+
+        with caplog.at_level("WARNING", logger="memtomem_stm.proxy.manager"):
+            await mgr.stop()
+
+        # More than the loop's 8 passes proves the give-up branch was reached;
+        # the exact count is an implementation detail of how many passes run.
+        assert len(spawned) > 8, (
+            f"only {len(spawned)} generations — the drain loop's bound was never "
+            "exhausted, so this test would pass without the fix"
+        )
+        alive = [t for t in spawned if not t.done()]
+        assert not alive, (
+            f"stop() returned with {len(alive)} background task(s) still running "
+            "against torn-down resources"
+        )
+        assert any("cancelled them" in r.getMessage() for r in caplog.records), caplog.text
