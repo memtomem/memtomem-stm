@@ -736,6 +736,38 @@ class TestEngineFaultPersistence:
         await engine.surface("gh", "read_file", _other_args("retry"), LONG_RESPONSE)
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {}
 
+    async def test_a_failed_fault_write_keeps_the_breaker_claim(self, tmp_path):
+        """A claim must survive a fault write that raises.
+
+        The two mistakes are not symmetric. A claim whose row never landed is
+        inert. But a write whose commit AND rollback both fail leaves the row
+        pending for an unrelated later write to publish — and if the claim was
+        dropped, that key's episode then stays open until it happens to
+        surface on its own, which is the whole bug #869 is about.
+        """
+        adapter = AsyncMock()
+        adapter.search = AsyncMock(return_value=([], [], "empty_results"))
+        config = _make_config(tmp_path)
+        tracker = FeedbackTracker(config)
+        engine = SurfacingEngine(config=config, mcp_adapter=adapter, feedback_tracker=tracker)
+
+        real_db = tracker.store._db
+        tracker.store._db = _FailingCommit(real_db, fail_rollback=True)  # type: ignore[assignment]
+        engine._persist_fault("gh", "blocked_tool", "circuit_open")
+        tracker.store._db = real_db  # type: ignore[assignment]
+        assert engine._breaker_blocked_keys == {("gh", "blocked_tool")}
+
+        # The abandoned INSERT rides out on an unrelated later write — count 2
+        # from one durable fault plus the one that was left pending.
+        tracker.record_fault("gh", "blocked_tool", "circuit_open")
+        assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {
+            "circuit_open": 2
+        }
+
+        # A different key's probe still closes it, because the claim survived.
+        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {}
+
     async def test_trackerless_engine_does_not_accumulate_blocked_keys(self, tmp_path):
         # Nothing durable exists to recover, and the recovery path returns
         # before the set is spent — so it must never fill up.

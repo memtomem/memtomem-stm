@@ -381,20 +381,19 @@ class SurfacingEngine:
         # but unowned, and a process that dies there needs that exact key to
         # succeed on its own before the episode can close. A claim whose row
         # never landed is harmless — its recovery UPDATE matches nothing.
-        claimed = kind == "circuit_open" and (server, tool) not in self._breaker_blocked_keys
-        if claimed:
+        if kind == "circuit_open":
             self._breaker_blocked_keys.add((server, tool))
         try:
             self._feedback_tracker.record_fault(server, tool, kind)
         except Exception:
+            # The claim is kept even though the write failed. The two mistakes
+            # are not symmetric: a claim whose row never landed is inert — its
+            # recovery UPDATE matches nothing — while dropping a claim whose
+            # row DID land (a failed commit whose rollback also failed, then
+            # published by an unrelated later write) leaves that key's episode
+            # open until it happens to surface on its own. So this must not
+            # depend on the store's rollback succeeding.
             logger.debug("Failed to persist surfacing fault counter", exc_info=True)
-            if claimed:
-                # Safe because the store rolls a failed write back (or drops
-                # the connection when it cannot), so a raised exception means
-                # no row landed and none can land later. Releases only the
-                # claim THIS call added: an earlier block on the same key is
-                # still owed its recovery.
-                self._breaker_blocked_keys.discard((server, tool))
 
     def _persist_diagnostic(self, server: str, tool: str, kind: str) -> None:
         """Best-effort durable counter for advisory pipeline diagnostics."""
