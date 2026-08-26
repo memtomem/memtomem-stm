@@ -690,10 +690,18 @@ class FeedbackStore:
             try:
                 for sql, params in statements:
                     self._db.execute(sql, params)
+                self._db.commit()
             except Exception:
-                self._db.rollback()
+                # The commit is inside the guard too: a commit that raises
+                # leaves the transaction OPEN, and the next unrelated write on
+                # this connection would then commit these half-applied rows.
+                # The rollback is best-effort so a failing rollback cannot
+                # replace the exception the caller needs to see.
+                try:
+                    self._db.rollback()
+                except Exception:
+                    logger.debug("Rollback after failed fault recovery failed", exc_info=True)
                 raise
-            self._db.commit()
 
     def _record_signal(
         self,

@@ -98,6 +98,19 @@ def _recovery_call_counter(tracker: FeedbackTracker):
     return lambda: calls["n"]
 
 
+class _FailingCommit:
+    """sqlite3.Connection proxy whose ``commit`` raises."""
+
+    def __init__(self, db) -> None:
+        self._db = db
+
+    def commit(self):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+
 class _FailNthRecoveryUpdate:
     """sqlite3.Connection proxy that fails the Nth recovery UPDATE.
 
@@ -249,6 +262,33 @@ class TestRecordFaultRecovery:
             kinds=frozenset({"circuit_open"}),
         )
         assert read_surfacing_summary(db_path)["active_faults"] == {"error_timeout": 1}
+        store.close()
+
+    def test_a_failed_commit_leaves_no_open_transaction(self, tmp_path, monkeypatch):
+        """A commit that raises must not leave the transaction open.
+
+        The next unrelated write on the connection would otherwise commit
+        these half-applied recovery rows as a side effect of its own work.
+        """
+        monkeypatch.setattr(
+            "memtomem_stm.surfacing.feedback_store.time.time",
+            lambda: 1_700_000_000.0,
+        )
+        db_path = tmp_path / "f.db"
+        store = FeedbackStore(db_path)
+        store.initialize()
+        store.record_fault("gh", "read_file", "error_timeout")
+
+        real_db = store._db
+        store._db = _FailingCommit(real_db)  # type: ignore[assignment]
+        with pytest.raises(sqlite3.OperationalError):
+            store.record_fault_recovery("gh", "read_file", recovered_at=1_700_000_000.0)
+        assert real_db.in_transaction is False
+        store._db = real_db  # type: ignore[assignment]
+
+        # An unrelated write must not carry the abandoned recovery in with it.
+        store.record_fault("gh", "other_tool", "error_timeout")
+        assert read_surfacing_summary(db_path)["active_faults"] == {"error_timeout": 2}
         store.close()
 
     def test_recovery_closes_episode_and_a_new_fault_reopens_it(self, tmp_path, monkeypatch):

@@ -57,7 +57,8 @@ value is ``"sha256:" + 16-hex-char digest`` → 23 chars total."""
 
 _CIRCUIT_OPEN_KIND: frozenset[str] = frozenset({"circuit_open"})
 """Recovery scope for keys this engine's breaker turned away: the success that
-closes the breaker disproves their ``circuit_open`` episode and nothing else."""
+closes the breaker disproves the ``circuit_open`` episode on those keys' rows,
+but no other kind — their timeouts are not evidence a probe elsewhere touched."""
 
 _MAX_ABANDONED_OPS = 4
 """How many cancelled LTM operations may still be unwinding before this engine
@@ -304,10 +305,12 @@ class SurfacingEngine:
         # key that was blocked — closing only the prober's episode would leave
         # the others reading broken until each happens to surface again. A
         # success proves this engine's breaker closed, so it closes the
-        # ``circuit_open`` episodes of every key this engine blocked, and
-        # nothing else: keys blocked by a peer process belong to a breaker this
-        # success says nothing about. Bounded by the upstream tool set and
-        # emptied on the next success.
+        # ``circuit_open`` episodes on the rows of every key this engine
+        # blocked — no other kind, and no key this engine never blocked. Those
+        # rows are shared day-aggregates, so a peer's ``circuit_open`` on the
+        # SAME key closes with them; that is the granularity the table has, and
+        # the peer's next fault reopens it. Bounded by the upstream tool set
+        # and emptied on the next success.
         self._breaker_blocked_keys: set[tuple[str, str]] = set()
 
     @property
@@ -368,19 +371,27 @@ class SurfacingEngine:
         degrades to a missing counter, never a raised exception.
         """
         if self._feedback_tracker is None:
+            # Nothing durable to recover, and the recovery path never spends
+            # the set — so a trackerless engine must not fill it up.
             return
+        # Remember whom this engine's breaker turned away, so the success that
+        # closes the breaker can close their episodes too (see the field's
+        # comment). Claimed BEFORE the write and released only if the write
+        # fails: claiming afterwards leaves a window where the row is on disk
+        # but unowned, and a process that dies there needs that exact key to
+        # succeed on its own before the episode can close. A claim whose row
+        # never landed is harmless — its recovery UPDATE matches nothing.
+        claimed = kind == "circuit_open" and (server, tool) not in self._breaker_blocked_keys
+        if claimed:
+            self._breaker_blocked_keys.add((server, tool))
         try:
             self._feedback_tracker.record_fault(server, tool, kind)
         except Exception:
             logger.debug("Failed to persist surfacing fault counter", exc_info=True)
-            return
-        # Remember whom this engine's breaker turned away, so the success that
-        # closes the breaker can close their episodes too (see the field's
-        # comment). Only after the row is actually on disk: there is nothing to
-        # recover otherwise, and a trackerless engine must not accumulate keys
-        # its recovery path will never spend.
-        if kind == "circuit_open":
-            self._breaker_blocked_keys.add((server, tool))
+            if claimed:
+                # Only the claim THIS call added: an earlier block on the same
+                # key is still owed its recovery.
+                self._breaker_blocked_keys.discard((server, tool))
 
     def _persist_diagnostic(self, server: str, tool: str, kind: str) -> None:
         """Best-effort durable counter for advisory pipeline diagnostics."""
