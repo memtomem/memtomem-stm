@@ -443,11 +443,20 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
                 # recovery. Partitioned in Python like ``signal_rows`` above so
                 # faults and diagnostics stay separable for readers that must
                 # never describe a miscalibrated-but-healthy search as a fault.
+                #
+                # Episodes are per ``(server, tool, kind)``, so the HAVING must
+                # run in an inner query grouped that way and only THEN roll up
+                # by kind. Comparing the maxima of an already-kind-wide group
+                # lets one key's newer recovery cancel out another key's older
+                # but still-open fault — a false all-clear whenever two servers
+                # or tools share a kind.
                 active_rows = db.execute(
-                    "SELECT kind, SUM(count), MAX(last_at), MAX(last_recovered_at) "
+                    "SELECT kind, SUM(events) FROM ("
+                    "SELECT server, tool, kind, SUM(count) AS events "
                     "FROM surfacing_faults"
-                    f"{fault_where} GROUP BY kind "
-                    "HAVING MAX(last_at) > COALESCE(MAX(last_recovered_at), 0)",
+                    f"{fault_where} GROUP BY server, tool, kind "
+                    "HAVING MAX(last_at) > COALESCE(MAX(last_recovered_at), 0)"
+                    ") GROUP BY kind",
                     fault_params,
                 ).fetchall()
                 summary["active_diagnostics"] = {
@@ -610,32 +619,34 @@ class FeedbackStore:
         each degraded-dependency kind at once, and they are not independently
         observable from the success side.
 
-        ``circuit_open`` is additionally swept for all keys. Its skip is
-        persisted before query extraction and the breaker is engine-global, so
-        the rows pile up under keys that may never succeed on their own — a
-        per-key recovery could never reach them, which is why every live
-        ``circuit_open`` row sat unrecovered (#869). A success proves the
-        breaker is closed engine-wide. With a DB shared by several proxy
-        processes this can stamp a peer's still-open episode, but the peer's
-        next ``circuit_open`` fault clears the stamp again via
-        ``record_fault``'s reset, so the active view self-corrects within one
-        event.
+        Strictly scoped to ``(server, tool)``, including ``circuit_open``.
+        That kind is recorded before query extraction and the breaker is
+        engine-global, so an un-keyed sweep looked tempting — but the rows are
+        shared by every process pointing at this DB, and one process's healthy
+        round trip is no evidence about a peer's breaker. Both live
+        ``circuit_open`` keys surface successfully on their own, so the sweep
+        would have bought no extra coverage for the false all-clear it costs.
 
-        The ``last_at <= now`` bound mirrors :meth:`record_diagnostic_recovery`:
-        a fault written concurrently with this call stays active.
+        ``last_at <= now`` (with *now* read under the lock) keeps a fault that
+        lands after this call active: writers serialize on the same lock, so a
+        later fault either misses this UPDATE or, having gone through
+        :meth:`record_fault`, clears the stamp it just wrote. A fault sharing
+        this call's timestamp — possible on a coarse clock — is stamped
+        recovered; these counters are advisory, and the next fault reopens the
+        episode.
         """
         if self._db is None:
             return
         if has_lone_surrogate(server) or has_lone_surrogate(tool):
             return
-        now = time.time()
         kinds = sorted(FAULT_KINDS)
         kind_placeholders = ", ".join("?" for _ in kinds)
         with self._lock:
+            now = time.time()
             self._db.execute(
                 "UPDATE surfacing_faults SET last_recovered_at = ? "
-                f"WHERE ((server = ? AND tool = ? AND kind IN ({kind_placeholders})) "
-                "OR kind = 'circuit_open') AND last_at <= ?",
+                f"WHERE server = ? AND tool = ? AND kind IN ({kind_placeholders}) "
+                "AND last_at <= ?",
                 (now, server, tool, *kinds, now),
             )
             self._db.commit()

@@ -237,11 +237,14 @@ class TestRecordFaultRecovery:
         assert summary["active_diagnostics"] == {"score_ceiling_below_min": 1}
         store.close()
 
-    def test_recovery_sweeps_circuit_open_across_keys(self, tmp_path, monkeypatch):
-        """``circuit_open`` is recorded before query extraction and the breaker
-        is engine-global, so its rows pile up under keys that may never succeed
-        themselves. One success proves the breaker closed for all of them —
-        while a per-key fault kind stays scoped to its own key."""
+    def test_recovery_is_scoped_to_its_own_key(self, tmp_path, monkeypatch):
+        """Every kind, ``circuit_open`` included, stays keyed.
+
+        An un-keyed ``circuit_open`` sweep would let one process's healthy
+        round trip stamp a peer process's still-open breaker episode — the
+        rows are shared by everything pointing at this DB, and a breaker is
+        process-local.
+        """
         monkeypatch.setattr(
             "memtomem_stm.surfacing.feedback_store.time.time",
             lambda: 1_700_000_000.0,
@@ -250,14 +253,75 @@ class TestRecordFaultRecovery:
         store = FeedbackStore(db_path)
         store.initialize()
         store.record_fault("gh", "read_file", "circuit_open")
-        store.record_fault("gh", "read_file", "error_timeout")
+        store.record_fault("gh", "other_tool", "circuit_open")
 
         store.record_fault_recovery("gh", "other_tool")
-        assert read_surfacing_summary(db_path)["active_faults"] == {"error_timeout": 1}
+        assert read_surfacing_summary(db_path)["active_faults"] == {"circuit_open": 1}
 
         store.record_fault_recovery("gh", "read_file")
         assert read_surfacing_summary(db_path)["active_faults"] == {}
         store.close()
+
+    def test_one_keys_recovery_does_not_clear_another_keys_episode(self, tmp_path, monkeypatch):
+        """Episodes are per ``(server, tool, kind)``.
+
+        Rolling the recovery check up by kind first let a newer recovery on one
+        key cancel an older but still-open fault on another, so the CLI printed
+        an all-clear while a server was still broken.
+        """
+        clock = [1_700_000_000.0]
+        monkeypatch.setattr(
+            "memtomem_stm.surfacing.feedback_store.time.time",
+            lambda: clock[0],
+        )
+        db_path = tmp_path / "f.db"
+        store = FeedbackStore(db_path)
+        store.initialize()
+        store.record_fault("gl", "read_file", "error_timeout")  # peer, recovered later
+        clock[0] += 10.0
+        store.record_fault("gh", "read_file", "error_timeout")  # stays broken
+        clock[0] += 10.0
+        store.record_fault_recovery("gl", "read_file")
+
+        assert read_surfacing_summary(db_path)["active_faults"] == {"error_timeout": 1}
+        # Same collision across two servers sharing one tool name, under the
+        # tool filter that the CLI uses.
+        assert read_surfacing_summary(db_path, tool="read_file")["active_faults"] == {
+            "error_timeout": 1
+        }
+        store.close()
+
+    def test_two_stores_on_one_db_interleave_recovery_and_refault(self, tmp_path, monkeypatch):
+        """Two stores on one file, as two proxy processes share one DB.
+
+        Episode state lives in the row, not in either process, so B's new fault
+        must read active even though A just recovered the key — this is the
+        shared-DB half of what the engine's unlatched retry depends on.
+        """
+        clock = [1_700_000_000.0]
+        monkeypatch.setattr(
+            "memtomem_stm.surfacing.feedback_store.time.time",
+            lambda: clock[0],
+        )
+        db_path = tmp_path / "f.db"
+        process_a = FeedbackStore(db_path)
+        process_a.initialize()
+        process_b = FeedbackStore(db_path)
+        process_b.initialize()
+
+        process_b.record_fault("gh", "read_file", "error_timeout")
+        clock[0] += 10.0
+        process_a.record_fault_recovery("gh", "read_file")
+        assert read_surfacing_summary(db_path)["active_faults"] == {}
+
+        clock[0] += 10.0
+        process_b.record_fault("gh", "read_file", "error_timeout")
+        assert read_surfacing_summary(db_path)["active_faults"] == {"error_timeout": 2}
+        clock[0] += 10.0
+        process_a.record_fault_recovery("gh", "read_file")
+        assert read_surfacing_summary(db_path)["active_faults"] == {}
+        process_a.close()
+        process_b.close()
 
     def test_recovery_leaves_a_concurrent_newer_fault_active(self, tmp_path, monkeypatch):
         # ``last_at <= now`` bound: a fault written while this recovery is in
@@ -389,10 +453,9 @@ class TestEngineFaultPersistence:
 
         assert read_surfacing_summary(config.feedback_db_path)["active_diagnostics"] == {}
 
-    async def test_success_closes_fault_episode_once_and_rearms(self, tmp_path):
+    async def test_success_closes_the_episode_and_a_later_fault_reopens_it(self, tmp_path):
         """The whole point of #869: a healthy round trip closes the episode,
-        the latch keeps the healthy hot path off the UPDATE, and a later fault
-        re-arms it so the NEXT success closes the NEW episode."""
+        and a later fault reopens one that the NEXT success closes again."""
         adapter = AsyncMock()
         adapter.search = AsyncMock(return_value=([], [], "empty_results"))
         config = _make_config(tmp_path)
@@ -402,30 +465,36 @@ class TestEngineFaultPersistence:
 
         await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {}
-        assert engine._fault_recovery_persisted == {("gh", "read_file")}
-
-        calls = _recovery_call_counter(tracker)
-        await engine.surface("gh", "read_file", _other_args("second"), LONG_RESPONSE)
-        assert calls() == 0  # latched: no UPDATE on the healthy hot path
 
         engine._persist_fault("gh", "read_file", "error_timeout")
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {
             "error_timeout": 2
         }
         await engine.surface("gh", "read_file", _other_args("third"), LONG_RESPONSE)
-        assert calls() == 1
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {}
 
-    async def test_circuit_open_fault_rearms_every_key(self, tmp_path):
-        # The breaker is engine-global, so its skip suppressed surfacing for
-        # keys that recorded no fault of their own — each must re-write.
-        engine = SurfacingEngine(config=_make_config(tmp_path), mcp_adapter=AsyncMock())
-        engine._fault_recovery_persisted.update({("gh", "a"), ("gh", "b")})
-        engine._persist_fault("gh", "a", "error_timeout")
-        assert engine._fault_recovery_persisted == {("gh", "b")}
-        engine._fault_recovery_persisted.add(("gh", "a"))
-        engine._persist_fault("gh", "a", "circuit_open")
-        assert engine._fault_recovery_persisted == set()
+    async def test_recovery_is_reattempted_on_every_miss_path_success(self, tmp_path):
+        """No once-per-process latch: another process can open an episode on
+        this key at any time, and this process must still close it."""
+        adapter = AsyncMock()
+        adapter.search = AsyncMock(return_value=([], [], "empty_results"))
+        config = _make_config(tmp_path)
+        tracker = FeedbackTracker(config)
+        engine = SurfacingEngine(config=config, mcp_adapter=adapter, feedback_tracker=tracker)
+
+        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        calls = _recovery_call_counter(tracker)
+        # A peer process opens an episode this engine never saw.
+        peer = FeedbackTracker(config)
+        peer.record_fault("gh", "read_file", "error_timeout")
+        peer.close()
+        assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {
+            "error_timeout": 1
+        }
+
+        await engine.surface("gh", "read_file", _other_args("second"), LONG_RESPONSE)
+        assert calls() == 1
+        assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {}
 
     async def test_first_success_closes_a_previous_process_episode(self, tmp_path):
         # Rows outlive the process that wrote them, so recovery cannot be
@@ -454,7 +523,6 @@ class TestEngineFaultPersistence:
         engine = SurfacingEngine(config=config, mcp_adapter=adapter, feedback_tracker=tracker)
 
         await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)  # populates cache
-        engine._fault_recovery_persisted.clear()
         tracker.record_fault("gh", "read_file", "error_timeout")
 
         calls = _recovery_call_counter(tracker)
@@ -488,7 +556,6 @@ class TestEngineFaultPersistence:
 
         tracker.record_fault_recovery = flaky  # type: ignore[method-assign]
         await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
-        assert engine._fault_recovery_persisted == set()  # unlatched, so it retries
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {
             "error_timeout": 1
         }

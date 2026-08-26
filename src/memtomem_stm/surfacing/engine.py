@@ -293,15 +293,6 @@ class SurfacingEngine:
         self._scale_gate_recovery_persisted: set[tuple[str, str]] = set()
         # Warn-once INFO latch for the first suspended batch this process.
         self._scale_gate_logged: bool = False
-        # Keys whose durable fault episodes were closed by a successful LTM
-        # round trip (#869). Fires on the FIRST miss-path success per key per
-        # process regardless of whether this process saw a fault: the rows are
-        # cross-process, so a restart must still close episodes a dead process
-        # left open. Armed only on a successful write, so a transient DB error
-        # retries on the next success. Re-armed per key by a new fault, and
-        # wholesale by ``circuit_open`` — an open breaker blocked every key, so
-        # every key's next success must re-write.
-        self._fault_recovery_persisted: set[tuple[str, str]] = set()
 
     @property
     def observability(self) -> SurfacingObservability | None:
@@ -360,16 +351,6 @@ class SurfacingEngine:
         branches already returning the original response, so any store error
         degrades to a missing counter, never a raised exception.
         """
-        # Re-arm the recovery latch so the next success re-closes THIS episode
-        # instead of skipping the UPDATE because an earlier one was already
-        # recovered (mirrors ``_persist_diagnostic``'s discard, and fires
-        # before the tracker guard for the same reason). ``circuit_open``
-        # clears every key: the breaker is engine-global, so its skip suppressed
-        # surfacing for keys that recorded no fault of their own.
-        if kind == "circuit_open":
-            self._fault_recovery_persisted.clear()
-        else:
-            self._fault_recovery_persisted.discard((server, tool))
         if self._feedback_tracker is None:
             return
         try:
@@ -410,17 +391,21 @@ class SurfacingEngine:
         Without this the ``surfacing_faults`` rows for every degraded-dependency
         kind stayed unrecovered forever, so ``mms stats`` reported a breaker
         loop that ended days ago as ongoing breakage (#869).
+
+        Deliberately unlatched. A "close it once per key per process" latch
+        would go stale the moment ANOTHER process wrote a fault for the same
+        key — the rows are shared, so this process would skip the UPDATE that
+        closes an episode it never saw open. The write is a single WHERE-guarded
+        UPDATE on a path that just paid a full LTM round trip, so re-running it
+        per success costs nothing worth that inconsistency, and a transient
+        failure simply retries on the next success.
         """
-        key = (server, tool)
-        if key in self._fault_recovery_persisted or self._feedback_tracker is None:
+        if self._feedback_tracker is None:
             return
         try:
             self._feedback_tracker.record_fault_recovery(server, tool)
         except Exception:
-            # Unlatched, so the next success on this key retries the write.
             logger.debug("Failed to persist surfacing fault recovery", exc_info=True)
-            return
-        self._fault_recovery_persisted.add(key)
 
     def _reset_score_scale_streak(self, server: str, tool: str) -> None:
         self._score_scale_streaks.pop((server, tool), None)
