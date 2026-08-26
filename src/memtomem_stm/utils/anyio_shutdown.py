@@ -48,10 +48,54 @@ def is_clean_cancel_scope_shutdown(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and is_anyio_cancel_scope_shutdown_error(exc)
 
 
-# Grace added to an in-flight call's own deadline to get the drain ceiling.
-# The call is already bounded by ``llm_timeout_seconds``; this only covers the
-# hop from that deadline firing to the ``finally`` releasing the gate.
+# Grace added to an in-flight call's own captured deadline to get the drain
+# ceiling. The call is already bounded by the timeout it captured when it
+# started; this only covers the hop from that deadline firing to the
+# ``finally`` releasing the gate.
 CLOSE_DRAIN_GRACE_SECONDS = 2.0
+
+
+class InFlightGate:
+    """Registration gate shared by the LLM helpers' ``close()`` drains.
+
+    Tracks how many callers are mid-request and, crucially, the largest
+    timeout any of them **captured when it started** — not whatever the
+    (mutable) config says later. ``close()`` deriving its ceiling from a
+    re-read of the config can undercut a live call: another task lowering
+    ``llm_timeout_seconds`` between the call's start and the close would
+    close the transport while that call is still inside its own deadline.
+    """
+
+    def __init__(self) -> None:
+        self.in_flight: int = 0
+        self.idle: asyncio.Event = asyncio.Event()
+        self.idle.set()
+        self.closed: bool = False
+        # Max timeout captured by the callers currently registered; 0.0 when
+        # idle, so a close() with nothing in flight falls back to the config.
+        self._captured_ceiling: float = 0.0
+
+    def enter(self, timeout: float) -> None:
+        """Register an in-flight caller that captured *timeout*.
+
+        Sync on purpose: callers must not ``await`` between their ``closed``
+        check and this claim, or ``close()`` can tear the client down in
+        between.
+        """
+        self.in_flight += 1
+        self._captured_ceiling = max(self._captured_ceiling, timeout)
+        self.idle.clear()
+
+    def leave(self) -> None:
+        self.in_flight -= 1
+        if self.in_flight <= 0:
+            self.in_flight = 0
+            self._captured_ceiling = 0.0
+            self.idle.set()
+
+    def drain_ceiling(self, fallback_timeout: float) -> float:
+        """Seconds ``close()`` should wait, from the captured deadlines."""
+        return max(self._captured_ceiling, fallback_timeout) + CLOSE_DRAIN_GRACE_SECONDS
 
 
 async def drain_or_warn(idle: asyncio.Event, *, timeout: float, what: str) -> bool:

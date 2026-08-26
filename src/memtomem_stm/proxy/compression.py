@@ -28,7 +28,7 @@ from memtomem_stm.proxy.config import (
     TailMode,
 )
 from memtomem_stm.proxy.relevance import BM25Scorer, RelevanceScorer
-from memtomem_stm.utils.anyio_shutdown import CLOSE_DRAIN_GRACE_SECONDS, drain_or_warn
+from memtomem_stm.utils.anyio_shutdown import InFlightGate, drain_or_warn
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker as _CircuitBreaker
 from memtomem_stm.utils.json_out import escape_lone_surrogates
 
@@ -2282,10 +2282,7 @@ class LLMCompressor:
         # drain before aclose()ing the httpx client. Otherwise a config swap
         # or stop() can tear the client down mid-request. Sister pattern to
         # #125 (extraction), #129 (mcp_client), #130 (proxy conn_stack).
-        self._in_flight: int = 0
-        self._idle: asyncio.Event = asyncio.Event()
-        self._idle.set()
-        self._closed: bool = False
+        self._gate = InFlightGate()
         # Warn about non-standard base_url to flag potential credential exfiltration
         if config.base_url:
             from urllib.parse import urlparse
@@ -2317,20 +2314,22 @@ class LLMCompressor:
         if self._cb.is_open:
             self.last_fallback = "circuit_breaker"
             return _plain_truncate(text, max_chars=max_chars)
-        if self._closed:
+        if self._gate.closed:
             self.last_fallback = "closed"
             return _plain_truncate(text, max_chars=max_chars)
-        # Register as in-flight so a concurrent close() blocks on ``_idle``
-        # until we finish touching ``_client``. The increment+clear pair is
-        # sync — no ``await`` between the ``_closed`` check above and the
-        # clear, so close() cannot slip in and aclose() the client between
-        # our check and our claim.
-        self._in_flight += 1
-        self._idle.clear()
+        # Capture the deadline ONCE and hand it to the gate: close() derives
+        # its drain ceiling from what live callers actually captured, so a
+        # concurrent config edit cannot shorten the wait under them.
+        call_timeout = self._cfg.llm_timeout_seconds
+        # Register as in-flight so a concurrent close() blocks on the gate
+        # until we finish touching ``_client``. ``enter`` is sync — no
+        # ``await`` between the closed check above and the claim, so close()
+        # cannot slip in and aclose() the client in between.
+        self._gate.enter(call_timeout)
         try:
             result = await asyncio.wait_for(
                 self._call_api(text, max_chars=max_chars),
-                timeout=self._cfg.llm_timeout_seconds,
+                timeout=call_timeout,
             )
             self._cb.success()
             if len(result) > max_chars:
@@ -2371,9 +2370,7 @@ class LLMCompressor:
             self.last_fallback = "llm_error"
             return _plain_truncate(text, max_chars=max_chars)
         finally:
-            self._in_flight -= 1
-            if self._in_flight == 0:
-                self._idle.set()
+            self._gate.leave()
 
     async def _call_api(self, text: str, *, max_chars: int) -> str:
         if self._client is None:
@@ -2389,12 +2386,12 @@ class LLMCompressor:
 
     async def close(self) -> None:
         # Flip the gate first so new compress() calls fall back to truncate
-        # instead of entering ``_in_flight``. Then wait for already-registered
+        # instead of entering the gate. Then wait for already-registered
         # callers to drain before aclose()ing the client.
-        self._closed = True
+        self._gate.closed = True
         await drain_or_warn(
-            self._idle,
-            timeout=self._cfg.llm_timeout_seconds + CLOSE_DRAIN_GRACE_SECONDS,
+            self._gate.idle,
+            timeout=self._gate.drain_ceiling(self._cfg.llm_timeout_seconds),
             what="LLMCompressor",
         )
         if self._client:

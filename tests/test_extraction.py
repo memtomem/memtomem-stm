@@ -770,6 +770,19 @@ class TestFactExtractorShutdown:
             task = asyncio.create_task(extractor.extract("x" * 100, server="s", tool="t"))
             await started.wait()
 
+            # Observe aclose() directly: ``_client`` is only nulled AFTER the
+            # await returns, so "client is not None" alone would also hold for
+            # an implementation already stalled inside aclose().
+            aclose_calls = 0
+            real_client = extractor._client
+
+            async def recording_aclose() -> None:
+                nonlocal aclose_calls
+                aclose_calls += 1
+                await real_client.aclose()
+
+            extractor._client = MagicMock(aclose=recording_aclose)
+
             close_task = asyncio.create_task(extractor.close())
             for _ in range(10):
                 await asyncio.sleep(0)
@@ -777,8 +790,8 @@ class TestFactExtractorShutdown:
             assert not close_task.done(), (
                 "close() returned while an extract was in flight — no drain"
             )
-            assert extractor._client is not None, (
-                "close() aclose'd the httpx client while extract was mid-call"
+            assert aclose_calls == 0, (
+                "close() called aclose() on the httpx client while extract was mid-call"
             )
 
             release.set()
@@ -817,12 +830,47 @@ class TestFactExtractorShutdown:
         assert all(isinstance(f, ExtractedFact) for f in facts)
 
     async def test_close_drain_is_bounded_when_a_call_never_finishes(self):
+        import time
+
+        from memtomem_stm.utils.anyio_shutdown import CLOSE_DRAIN_GRACE_SECONDS
+
         cfg = _tiny_timeout_config()  # llm_timeout_seconds=0.05 keeps the ceiling small
         extractor = FactExtractor(cfg)
-        extractor._in_flight = 1
-        extractor._idle.clear()
+        extractor._gate.enter(cfg.llm.llm_timeout_seconds)
 
+        started = time.monotonic()
         close_task = asyncio.create_task(extractor.close())
-        done, _ = await asyncio.wait({close_task}, timeout=10.0)
+        done, _ = await asyncio.wait({close_task}, timeout=30.0)
+        elapsed = time.monotonic() - started
+
         assert done, "close() never returned — the drain wait is unbounded"
+        expected = cfg.llm.llm_timeout_seconds + CLOSE_DRAIN_GRACE_SECONDS
+        # The lower bound is what makes this red against the pre-#867
+        # close(), which ignored the gate and returned immediately.
+        assert expected * 0.5 <= elapsed < expected + 3.0, (
+            f"drain took {elapsed:.2f}s; expected ~{expected:.2f}s"
+        )
         assert extractor._client is None
+
+    async def test_close_drain_ceiling_follows_the_captured_deadline(self):
+        # The ceiling must come from the deadline the live caller captured,
+        # not from a re-read of the mutable config: another task lowering
+        # llm_timeout_seconds mid-call must not shorten the drain under it.
+        import time
+
+        from memtomem_stm.utils.anyio_shutdown import CLOSE_DRAIN_GRACE_SECONDS
+
+        cfg = _tiny_timeout_config()
+        extractor = FactExtractor(cfg)
+        extractor._gate.enter(3.0)  # what the live caller captured
+        cfg.llm.llm_timeout_seconds = 0.05  # config lowered afterwards
+
+        started = time.monotonic()
+        await extractor.close()
+        elapsed = time.monotonic() - started
+
+        assert elapsed >= 3.0, (
+            f"drain took {elapsed:.2f}s — the ceiling re-read the lowered config "
+            f"instead of honoring the captured 3.0s deadline "
+            f"(expected ~{3.0 + CLOSE_DRAIN_GRACE_SECONDS:.2f}s)"
+        )

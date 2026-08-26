@@ -750,8 +750,13 @@ class TestLLMCompressorShutdown:
         """
         import asyncio
 
-        # The ceiling derives from llm_timeout_seconds, so a small configured
-        # timeout keeps the test fast without patching the constant.
+        import time
+
+        from memtomem_stm.utils.anyio_shutdown import CLOSE_DRAIN_GRACE_SECONDS
+
+        # The ceiling derives from the deadline the live caller CAPTURED, so a
+        # small configured timeout keeps the test fast without patching the
+        # grace constant.
         cfg = LLMCompressorConfig(
             provider=LLMProvider.OPENAI, api_key="test", llm_timeout_seconds=0.1
         )
@@ -760,12 +765,23 @@ class TestLLMCompressorShutdown:
         # in-flight and never returns. Going through compress() would be
         # bounded by its own wait_for, which is exactly the bound this test
         # must not rely on.
-        comp._in_flight = 1
-        comp._idle.clear()
+        comp._gate.enter(cfg.llm_timeout_seconds)
 
+        started = time.monotonic()
         close_task = asyncio.create_task(comp.close())
-        done, _ = await asyncio.wait({close_task}, timeout=10.0)
+        done, _ = await asyncio.wait({close_task}, timeout=30.0)
+        elapsed = time.monotonic() - started
+
         assert done, "close() never returned — the drain wait is still unbounded"
+        expected = cfg.llm_timeout_seconds + CLOSE_DRAIN_GRACE_SECONDS
+        # Lower bound: an implementation that ignores the gate and closes
+        # immediately (the pre-#867 FactExtractor shape) must fail here.
+        # Upper bound: the wait must be the derived ceiling, not some longer
+        # fixed constant.
+        assert expected * 0.5 <= elapsed < expected + 3.0, (
+            f"drain took {elapsed:.2f}s; expected ~{expected:.2f}s "
+            "(llm_timeout_seconds + CLOSE_DRAIN_GRACE_SECONDS)"
+        )
         assert comp._client is None, (
             "close() must still tear the client down after a timed-out drain"
         )
