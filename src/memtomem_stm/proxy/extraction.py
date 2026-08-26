@@ -19,7 +19,11 @@ from memtomem_stm.proxy.config import (
     LLMProvider,
 )
 from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS, contains_sensitive_content
-from memtomem_stm.utils.anyio_shutdown import InFlightGate, drain_or_warn
+from memtomem_stm.utils.anyio_shutdown import (
+    InFlightGate,
+    drain_or_warn,
+    normalize_timeout,
+)
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 from memtomem_stm.utils.json_out import scrub_lone_surrogates
 from memtomem_stm.utils.numeric import safe_float
@@ -256,7 +260,7 @@ class FactExtractor:
         # Read the timeout ONCE: the gate turns it into a deadline, and the
         # same value bounds our own call, so close() drains against what this
         # caller actually committed to rather than a later config edit.
-        call_timeout = self._llm_cfg.llm_timeout_seconds
+        call_timeout = normalize_timeout(self._llm_cfg.llm_timeout_seconds)
         # Registering IS the closed check — and it gates on the gate's state,
         # not on ``_client is None``: a caller holding a closed extractor (or
         # a resurrected client reference) must still take the local heuristic

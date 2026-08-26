@@ -28,7 +28,11 @@ from memtomem_stm.proxy.config import (
     TailMode,
 )
 from memtomem_stm.proxy.relevance import BM25Scorer, RelevanceScorer
-from memtomem_stm.utils.anyio_shutdown import InFlightGate, drain_or_warn
+from memtomem_stm.utils.anyio_shutdown import (
+    InFlightGate,
+    drain_or_warn,
+    normalize_timeout,
+)
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker as _CircuitBreaker
 from memtomem_stm.utils.json_out import escape_lone_surrogates
 
@@ -2317,7 +2321,7 @@ class LLMCompressor:
         # Read the timeout ONCE: the gate turns it into a deadline, and the
         # same value bounds our own call, so close() drains against what this
         # caller actually committed to rather than a later config edit.
-        call_timeout = self._cfg.llm_timeout_seconds
+        call_timeout = normalize_timeout(self._cfg.llm_timeout_seconds)
         # Registering is the closed check: try_enter refuses once close() has
         # started, so a late caller cannot clear the gate's idle event after
         # the drain ceiling was computed. The closed check and the insertion

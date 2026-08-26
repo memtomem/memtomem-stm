@@ -857,8 +857,14 @@ class TestFactExtractorShutdown:
         # completed wait.
         from memtomem_stm.utils.anyio_shutdown import CLOSE_DRAIN_GRACE_SECONDS
 
-        cfg = _tiny_timeout_config()  # llm_timeout_seconds=0.05
+        from memtomem_stm.utils.anyio_shutdown import InFlightGate
+
+        cfg = _tiny_timeout_config()
+        cfg.llm.llm_timeout_seconds = 30.0
         extractor = FactExtractor(cfg)
+        # Pinned clock: a real one lets descheduling eat the captured
+        # remainder between registration and close().
+        extractor._gate = InFlightGate(clock=lambda: 1000.0)
         extractor._gate.try_enter(cfg.llm.llm_timeout_seconds)
 
         seen: dict[str, object] = {}
@@ -872,10 +878,8 @@ class TestFactExtractorShutdown:
             await asyncio.wait_for(extractor.close(), timeout=5.0)
 
         assert seen["what"] == "FactExtractor"
-        assert (
-            CLOSE_DRAIN_GRACE_SECONDS
-            < seen["timeout"]
-            <= cfg.llm.llm_timeout_seconds + CLOSE_DRAIN_GRACE_SECONDS
+        assert seen["timeout"] == pytest.approx(
+            cfg.llm.llm_timeout_seconds + CLOSE_DRAIN_GRACE_SECONDS
         ), seen
         assert extractor._client is None
 
@@ -915,6 +919,75 @@ class TestFactExtractorShutdown:
         assert seen["timeout"] > 2.9, (
             f"ceiling {seen['timeout']} re-read the lowered config instead of honoring "
             "the captured 3.0s deadline"
+        )
+
+
+class TestNonFiniteTimeoutReachesBothConsumers:
+    """A non-finite llm_timeout_seconds must not survive into wait_for (#867).
+
+    The gate normalizing alone is not enough: if the caller still hands +inf
+    to its own asyncio.wait_for, the drain gives up after the substituted
+    ceiling while the call runs on unbounded — the mid-call teardown the gate
+    exists to prevent.
+    """
+
+    @pytest.mark.parametrize("bad", [float("inf"), float("nan")])
+    async def test_extract_wait_for_gets_a_finite_timeout(self, bad: float):
+        import math
+
+        cfg = _tiny_timeout_config()
+        cfg.strategy = ExtractionStrategy.LLM
+        extractor = FactExtractor(cfg)
+        cfg.llm.llm_timeout_seconds = bad  # assignment bypasses gt=0.0
+
+        seen: dict[str, float] = {}
+        real_wait_for = asyncio.wait_for
+
+        async def recording_wait_for(aw, timeout):
+            seen["timeout"] = timeout
+            return await real_wait_for(aw, timeout)
+
+        async def quick(text: str) -> str:
+            return "[]"
+
+        with (
+            patch.object(extractor, "_call_api", new=quick),
+            patch("memtomem_stm.proxy.extraction.asyncio.wait_for", new=recording_wait_for),
+        ):
+            await extractor.extract("x" * 100, server="s", tool="t")
+
+        assert math.isfinite(seen["timeout"]), (
+            f"wait_for received {seen['timeout']!r} — the caller skipped normalization"
+        )
+
+    @pytest.mark.parametrize("bad", [float("inf"), float("nan")])
+    async def test_compress_wait_for_gets_a_finite_timeout(self, bad: float):
+        import math
+
+        from memtomem_stm.proxy.compression import LLMCompressor
+
+        cfg = LLMCompressorConfig(provider=LLMProvider.OPENAI, api_key="test")
+        comp = LLMCompressor(cfg)
+        cfg.llm_timeout_seconds = bad
+
+        seen: dict[str, float] = {}
+        real_wait_for = asyncio.wait_for
+
+        async def recording_wait_for(aw, timeout):
+            seen["timeout"] = timeout
+            return await real_wait_for(aw, timeout)
+
+        async def quick(text: str, *, max_chars: int) -> str:
+            return "summary"
+
+        with (
+            patch.object(comp, "_call_api", new=quick),
+            patch("memtomem_stm.proxy.compression.asyncio.wait_for", new=recording_wait_for),
+        ):
+            await comp.compress("x" * 500, max_chars=100)
+
+        assert math.isfinite(seen["timeout"]), (
+            f"wait_for received {seen['timeout']!r} — the caller skipped normalization"
         )
 
 

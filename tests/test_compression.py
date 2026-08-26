@@ -756,12 +756,17 @@ class TestLLMCompressorShutdown:
 
         from memtomem_stm.utils.anyio_shutdown import CLOSE_DRAIN_GRACE_SECONDS
 
+        from memtomem_stm.utils.anyio_shutdown import InFlightGate
+
         cfg = LLMCompressorConfig(
-            provider=LLMProvider.OPENAI, api_key="test", llm_timeout_seconds=0.1
+            provider=LLMProvider.OPENAI, api_key="test", llm_timeout_seconds=30.0
         )
         comp = LLMCompressor(cfg)
-        # Register directly: going through compress() would rely on its own
-        # wait_for, which is exactly the bound this test must not depend on.
+        # Pin the clock: with a real one, descheduling between registration
+        # and close() can eat the captured remainder and make the assertion
+        # flake. Register directly too — going through compress() would rely
+        # on its own wait_for, the very bound this test must not depend on.
+        comp._gate = InFlightGate(clock=lambda: 1000.0)
         comp._gate.try_enter(cfg.llm_timeout_seconds)
 
         seen: dict[str, float] = {}
@@ -775,13 +780,10 @@ class TestLLMCompressorShutdown:
             await asyncio.wait_for(comp.close(), timeout=5.0)
 
         assert seen["what"] == "LLMCompressor"
-        # Remaining time on the captured deadline (~0.1s, minus the sliver
-        # spent registering) plus the grace — not a re-read of the config and
-        # not an unbounded wait.
-        assert (
-            CLOSE_DRAIN_GRACE_SECONDS
-            < seen["timeout"]
-            <= cfg.llm_timeout_seconds + CLOSE_DRAIN_GRACE_SECONDS
+        # Exactly the captured deadline plus the grace — not a re-read of the
+        # config, not an unbounded wait, and not a fixed constant.
+        assert seen["timeout"] == pytest.approx(
+            cfg.llm_timeout_seconds + CLOSE_DRAIN_GRACE_SECONDS
         ), seen
         assert comp._client is None, (
             "close() must still tear the client down after a timed-out drain"

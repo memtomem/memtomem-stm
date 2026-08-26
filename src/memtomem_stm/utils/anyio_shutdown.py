@@ -57,13 +57,31 @@ def is_clean_cancel_scope_shutdown(exc: BaseException) -> bool:
 # ``finally`` releasing the gate.
 CLOSE_DRAIN_GRACE_SECONDS = 2.0
 
-# Stand-in deadline for a timeout that is not one. ``gt=0.0`` admits ``+inf``
-# and ``NaN`` slips through comparisons (the same hole #722 closed for the
-# hook deadline), and these config models are mutable — a non-finite value
-# would otherwise restore exactly the unbounded shutdown this gate exists to
-# prevent. A *finite* timeout, however long, is a bound the operator chose:
-# the drain honors it rather than cutting a valid call short.
+# Stand-in deadline for a timeout that is not one. Validation admits ``+inf``
+# outright (``gt=0.0``; the same hole #722 closed for the hook deadline), and
+# ``NaN`` — which that comparison does reject — still arrives by assignment,
+# since these models are mutable and assignment is not re-validated. Either
+# would restore exactly the unbounded shutdown this gate exists to prevent.
+# A *finite* timeout, however long, is a bound the operator chose: the drain
+# honors it rather than cutting a valid call short.
 UNBOUNDED_TIMEOUT_FALLBACK_SECONDS = 60.0
+
+
+def normalize_timeout(timeout: float) -> float:
+    """Replace a timeout that is not a bound with one that is.
+
+    ``llm_timeout_seconds`` is validated ``gt=0.0``, which admits ``+inf``
+    (``NaN`` fails that comparison, but these models are mutable and
+    assignment is not re-validated — the PR that added this gate mutates one
+    in its own tests). Neither is a deadline: ``+inf`` makes
+    ``asyncio.wait_for`` unbounded, and ``NaN`` collapses through comparisons.
+
+    Callers normalize ONCE and use the result for both their own
+    ``wait_for`` and their gate registration, so the deadline ``close()``
+    drains against is the deadline the call actually runs under. The gate
+    normalizes again defensively for any caller that forgets.
+    """
+    return timeout if math.isfinite(timeout) else UNBOUNDED_TIMEOUT_FALLBACK_SECONDS
 
 
 class InFlightGate:
@@ -82,8 +100,8 @@ class InFlightGate:
       is the fallback for "nothing in flight", nothing more.
     * Deadlines are per registration and dropped on ``leave``, so a long
       caller finishing does not leave its ceiling behind for a short one.
-    * A non-finite capture (``+inf``/``NaN``, both of which pass the config's
-      ``gt=0.0``) is not a deadline at all; it is replaced at capture time by
+    * A non-finite capture is not a deadline at all; it is replaced at
+      capture time (see :func:`normalize_timeout`) by
       :data:`UNBOUNDED_TIMEOUT_FALLBACK_SECONDS` so it cannot restore an
       unbounded shutdown — nor, as ``NaN``, silently collapse another live
       caller's ceiling to zero through the comparisons.
@@ -119,11 +137,12 @@ class InFlightGate:
         """
         if self.closed:
             return None
-        if not math.isfinite(timeout):
-            # Normalize at capture so every stored deadline is finite: a NaN
-            # deadline survives ``max(0.0, nan) -> 0.0`` and would hand a
-            # simultaneously live caller nothing but the grace.
-            timeout = UNBOUNDED_TIMEOUT_FALLBACK_SECONDS
+        # Defensive second pass: callers are expected to have normalized
+        # already (so their own wait_for matches this deadline), but a stored
+        # non-finite deadline would be worse than a mismatch — NaN survives
+        # ``max(0.0, nan) -> 0.0`` and would hand a simultaneously live caller
+        # nothing but the grace.
+        timeout = normalize_timeout(timeout)
         self._next_token += 1
         token = self._next_token
         self._deadlines[token] = self._clock() + timeout
