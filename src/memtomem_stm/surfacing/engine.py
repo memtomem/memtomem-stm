@@ -389,8 +389,11 @@ class SurfacingEngine:
         except Exception:
             logger.debug("Failed to persist surfacing fault counter", exc_info=True)
             if claimed:
-                # Only the claim THIS call added: an earlier block on the same
-                # key is still owed its recovery.
+                # Safe because the store rolls a failed write back (or drops
+                # the connection when it cannot), so a raised exception means
+                # no row landed and none can land later. Releases only the
+                # claim THIS call added: an earlier block on the same key is
+                # still owed its recovery.
                 self._breaker_blocked_keys.discard((server, tool))
 
     def _persist_diagnostic(self, server: str, tool: str, kind: str) -> None:

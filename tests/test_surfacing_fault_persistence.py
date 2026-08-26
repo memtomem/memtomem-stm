@@ -99,13 +99,21 @@ def _recovery_call_counter(tracker: FeedbackTracker):
 
 
 class _FailingCommit:
-    """sqlite3.Connection proxy whose ``commit`` raises."""
+    """sqlite3.Connection proxy whose ``commit`` — and optionally whose
+    ``rollback`` — raises. ``Connection.commit`` is a read-only attribute, so
+    the failure has to be injected around the connection, not onto it."""
 
-    def __init__(self, db) -> None:
+    def __init__(self, db, *, fail_rollback: bool = False) -> None:
         self._db = db
+        self._fail_rollback = fail_rollback
 
     def commit(self):
         raise sqlite3.OperationalError("disk I/O error")
+
+    def rollback(self):
+        if self._fail_rollback:
+            raise sqlite3.OperationalError("disk I/O error")
+        return self._db.rollback()
 
     def __getattr__(self, name):
         return getattr(self._db, name)
@@ -290,6 +298,53 @@ class TestRecordFaultRecovery:
         store.record_fault("gh", "other_tool", "error_timeout")
         assert read_surfacing_summary(db_path)["active_faults"] == {"error_timeout": 2}
         store.close()
+
+    def test_a_failed_counter_commit_leaves_nothing_pending(self, tmp_path, monkeypatch):
+        """The engine reads a raised ``record_fault`` as "no row landed".
+
+        A counter write whose commit fails used to leave the row pending for
+        the next unrelated write to publish, so the engine released a breaker
+        claim for a row that then appeared anyway.
+        """
+        monkeypatch.setattr(
+            "memtomem_stm.surfacing.feedback_store.time.time",
+            lambda: 1_700_000_000.0,
+        )
+        db_path = tmp_path / "f.db"
+        store = FeedbackStore(db_path)
+        store.initialize()
+
+        real_db = store._db
+        store._db = _FailingCommit(real_db)  # type: ignore[assignment]
+        with pytest.raises(sqlite3.OperationalError):
+            store.record_fault("gh", "read_file", "circuit_open")
+        assert real_db.in_transaction is False
+        store._db = real_db  # type: ignore[assignment]
+
+        store.record_fault("gh", "other_tool", "error_timeout")
+        assert read_surfacing_summary(db_path)["active_faults"] == {"error_timeout": 1}
+        store.close()
+
+    def test_a_failed_rollback_drops_the_connection(self, tmp_path, monkeypatch):
+        # A connection whose rollback fails cannot be reasoned about: keeping
+        # it risks committing the abandoned transaction later, so the store
+        # degrades to "no durable counters" instead.
+        monkeypatch.setattr(
+            "memtomem_stm.surfacing.feedback_store.time.time",
+            lambda: 1_700_000_000.0,
+        )
+        db_path = tmp_path / "f.db"
+        store = FeedbackStore(db_path)
+        store.initialize()
+        store.record_fault("gh", "read_file", "error_timeout")
+
+        store._db = _FailingCommit(store._db, fail_rollback=True)  # type: ignore[assignment]
+        with pytest.raises(sqlite3.OperationalError):
+            store.record_fault_recovery("gh", "read_file", recovered_at=1_700_000_000.0)
+        assert store._db is None
+        # Degraded, not crashing: later writes are silent no-ops.
+        store.record_fault("gh", "read_file", "error_timeout")
+        store.record_fault_recovery("gh", "read_file", recovered_at=1_700_000_000.0)
 
     def test_recovery_closes_episode_and_a_new_fault_reopens_it(self, tmp_path, monkeypatch):
         # Windows can return the same time.time() for adjacent writes, so the

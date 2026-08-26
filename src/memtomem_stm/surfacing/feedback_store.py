@@ -692,16 +692,42 @@ class FeedbackStore:
                     self._db.execute(sql, params)
                 self._db.commit()
             except Exception:
-                # The commit is inside the guard too: a commit that raises
-                # leaves the transaction OPEN, and the next unrelated write on
-                # this connection would then commit these half-applied rows.
-                # The rollback is best-effort so a failing rollback cannot
-                # replace the exception the caller needs to see.
-                try:
-                    self._db.rollback()
-                except Exception:
-                    logger.debug("Rollback after failed fault recovery failed", exc_info=True)
+                self._abandon_transaction("fault recovery")
                 raise
+
+    def _abandon_transaction(self, what: str) -> None:
+        """Leave no pending transaction behind after a failed write.
+
+        A failing ``execute`` or ``commit`` leaves the transaction OPEN, and
+        the next unrelated write on this connection commits those rows as a
+        side effect of its own work — a fault counter silently publishing a
+        half-applied recovery, say. Rolling back is what prevents that.
+
+        If the rollback ITSELF fails the connection cannot be reasoned about
+        any more, so it is dropped: every write guards on ``self._db is None``
+        and degrades to a missing counter, which is the failure this module
+        already trades for, while keeping the connection risks committing
+        abandoned state later. Called from inside ``self._lock``; never raises,
+        so the caller's original exception is what propagates.
+        """
+        db = self._db
+        if db is None:
+            return
+        try:
+            db.rollback()
+            return
+        except Exception:
+            logger.warning(
+                "Rollback after a failed %s write failed; dropping the surfacing "
+                "feedback connection — durable counters are disabled for this process",
+                what,
+                exc_info=True,
+            )
+        self._db = None
+        try:
+            db.close()
+        except Exception:
+            logger.debug("Closing the abandoned feedback connection failed", exc_info=True)
 
     def _record_signal(
         self,
@@ -720,14 +746,22 @@ class FeedbackStore:
         day = time.strftime("%Y-%m-%d", time.gmtime(now))
         recovery_update = ", last_recovered_at = NULL" if reset_recovery else ""
         with self._lock:
-            self._db.execute(
-                "INSERT INTO surfacing_faults (day, server, tool, kind, count, last_at) "
-                "VALUES (?, ?, ?, ?, 1, ?) "
-                "ON CONFLICT(day, server, tool, kind) "
-                "DO UPDATE SET count = count + 1, last_at = excluded.last_at" + recovery_update,
-                (day, server, tool, kind, now),
-            )
-            self._db.commit()
+            try:
+                self._db.execute(
+                    "INSERT INTO surfacing_faults (day, server, tool, kind, count, last_at) "
+                    "VALUES (?, ?, ?, ?, 1, ?) "
+                    "ON CONFLICT(day, server, tool, kind) "
+                    "DO UPDATE SET count = count + 1, last_at = excluded.last_at" + recovery_update,
+                    (day, server, tool, kind, now),
+                )
+                self._db.commit()
+            except Exception:
+                # Same guarantee the recovery batch gets: a failed counter
+                # write must not leave a row pending for someone else's commit
+                # to publish. The engine's breaker bookkeeping reads a raised
+                # exception as "nothing landed", so that has to be true.
+                self._abandon_transaction("fault counter")
+                raise
 
     def delete_faults_older_than(self, retention_seconds: float) -> int:
         """Delete day-aggregated fault rows whose ``last_at`` is past the
