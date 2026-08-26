@@ -1382,6 +1382,7 @@ class TestBackgroundTaskBounds:
         second_gate = asyncio.Event()
         try:
             self._fill_to_cap(mgr, second_gate)
+            caplog.clear()  # else the FIRST burst's record satisfies the assert
             with caplog.at_level("WARNING", logger="memtomem_stm.proxy.manager"):
                 mgr._spawn_background(
                     self._blocker(second_gate), stage="extract", server="s", tool="t"
@@ -1494,13 +1495,15 @@ class TestBackgroundTaskBounds:
         await mgr.stop()
 
     async def test_stop_cancels_survivors_instead_of_leaking(self, tmp_path, caplog):
-        # A task that schedules a replacement as it unwinds outlives the
-        # bounded drain loop: each pass cancels what it snapshotted and a new
-        # one appears. Replacements are injected directly into the set (the
-        # shape a concurrent producer has), so this reaches the give-up branch
-        # regardless of the manager's own spawn refusal. After the bound, the
-        # survivors must be CANCELLED, not abandoned while the set is cleared
-        # out from under them.
+        # A task that schedules a replacement as it unwinds outruns any
+        # single drain pass: the pass cancels what it snapshotted and a new
+        # one appears behind it. Replacements are injected directly into the
+        # set (the shape a concurrent producer has), so the chain does not
+        # depend on the manager's own spawn refusal. Every generation must end
+        # up CANCELLED — the pre-fix code cleared the set instead, abandoning
+        # whatever the bounded loop had not reached. (This chain is finite, so
+        # it converges inside the budget; the straggler branch is pinned by
+        # test_stop_keeps_tracking_a_task_that_never_unwinds.)
         mgr = _make_manager(tmp_path=tmp_path)
         spawned: list[asyncio.Task] = []
         generations = 12  # more chained respawns than a single drain pass
@@ -1539,6 +1542,97 @@ class TestBackgroundTaskBounds:
         # about — the point is that no task was left running.
         assert not mgr._background_tasks
 
+    async def test_refresh_straggler_keeps_its_running_claim(self, tmp_path):
+        # tools_refresh is cap-EXEMPT, so a straggler that outlives the drain
+        # must keep its ``running`` claim: clearing it lets the next
+        # notification schedule a second cap-exempt refresh for the same
+        # server beside the old one, and every stop/start cycle would stack
+        # another — unbounded despite a fixed upstream count.
+        #
+        # The straggler is registered in the refresh bookkeeping only, NOT in
+        # ``_background_tasks``: this pins stop()'s bookkeeping decision, and
+        # keeping it out of the drain means the probe can be an ordinary
+        # cancellable task instead of one that swallows cancellation (which
+        # wedges the event loop at teardown).
+        mgr = _make_manager(tmp_path=tmp_path)
+        straggler = asyncio.create_task(asyncio.sleep(3600))
+        mgr._tools_refresh_tasks["srv"] = straggler
+        mgr._tools_refresh_running.add("srv")
+        try:
+            await mgr.stop()
+
+            assert not straggler.done()  # premise: it really is still alive
+            assert "srv" in mgr._tools_refresh_running, (
+                "the straggler's claim was cleared — the next notification would "
+                "schedule a second cap-exempt refresh beside it"
+            )
+
+            mgr._schedule_tools_refresh("srv")
+            assert not mgr._background_tasks, (
+                "a duplicate refresh was scheduled for a server that already has a live one"
+            )
+        finally:
+            straggler.cancel()
+            with contextlib.suppress(BaseException):
+                await straggler
+
+    async def test_finished_refresh_releases_its_running_claim(self, tmp_path):
+        # The other half: a refresh that DID finish must release the claim, or
+        # stop()'s own bookkeeping-reset contract breaks and later
+        # notifications for that server are dropped ("running" with no task).
+        mgr = _make_manager(tmp_path=tmp_path)
+        finished = asyncio.create_task(asyncio.sleep(0))
+        await finished
+        mgr._tools_refresh_tasks["srv"] = finished
+        mgr._tools_refresh_running.add("srv")
+
+        await mgr.stop()
+
+        assert "srv" not in mgr._tools_refresh_running
+        assert "srv" not in mgr._tools_refresh_tasks
+
+    async def test_stop_re_cancels_a_task_that_ignores_its_first_cancel(self, tmp_path):
+        # ``asyncio.wait`` defaults to ALL_COMPLETED, so waiting the whole
+        # budget in one call would let a task that ignores only its FIRST
+        # cancellation consume the entire window and never be asked again —
+        # it would still be running when resource teardown starts. The drain
+        # polls in slices so the second request actually arrives.
+        from memtomem_stm.proxy.manager import BACKGROUND_DRAIN_BUDGET_SECONDS
+
+        mgr = _make_manager(tmp_path=tmp_path)
+        started = asyncio.Event()
+        cancels = 0
+
+        async def stubborn_once() -> None:
+            nonlocal cancels
+            started.set()
+            while True:
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    cancels += 1
+                    if cancels >= 2:
+                        raise  # unwinds on the SECOND request
+                    continue
+
+        task = asyncio.create_task(stubborn_once())
+        mgr._background_tasks.add(task)
+        await started.wait()
+        try:
+            await asyncio.wait_for(mgr.stop(), timeout=BACKGROUND_DRAIN_BUDGET_SECONDS + 20.0)
+
+            assert cancels >= 2, (
+                f"only {cancels} cancellation(s) issued — one full-budget wait swallowed "
+                "the window, so a task that ignores its first cancel is never asked again"
+            )
+            assert task.cancelled()
+            assert not mgr._background_tasks
+        finally:
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(BaseException):
+                    await asyncio.wait_for(task, timeout=5.0)
+
     async def test_stop_keeps_tracking_a_task_that_never_unwinds(self, tmp_path, caplog):
         # cancel() only REQUESTS cancellation. A task that swallows it must
         # not be dropped from the set — clearing it is what made the old leak
@@ -1560,12 +1654,19 @@ class TestBackgroundTaskBounds:
         task = asyncio.create_task(stubborn())
         mgr._background_tasks.add(task)
         await started.wait()
+        stop_task = asyncio.create_task(mgr.stop())
         try:
             with caplog.at_level("WARNING", logger="memtomem_stm.proxy.manager"):
-                # Generous outer bound: this asserts stop() RETURNS, and the
-                # budget is what makes that true — an unbounded gather() would
-                # hang here forever.
-                await asyncio.wait_for(mgr.stop(), timeout=BACKGROUND_DRAIN_BUDGET_SECONDS + 20.0)
+                # Observe stop() rather than awaiting it: under the regression
+                # this pins against (an unbounded gather), stop() never
+                # returns AND cannot be cancelled, because the probe swallows
+                # cancellation. ``wait_for`` would then hang the suite instead
+                # of failing — the probe has to be released first, which only
+                # a non-awaiting observation allows.
+                done, _ = await asyncio.wait(
+                    {stop_task}, timeout=BACKGROUND_DRAIN_BUDGET_SECONDS + 20.0
+                )
+            assert done, "stop() did not return within its drain budget"
 
             assert not task.done()
             assert task in mgr._background_tasks, (
@@ -1573,7 +1674,8 @@ class TestBackgroundTaskBounds:
             )
             assert any("stay tracked" in r.getMessage() for r in caplog.records), caplog.text
         finally:
-            # MUST run even when an assertion above fails: the probe ignores
+            # MUST run even when an assertion above fails — and before
+            # awaiting anything that depends on the probe: it ignores
             # cancellation by construction, so a leaked one wedges the event
             # loop at teardown and the suite HANGS instead of reporting the
             # failure. A test whose job is to go red must be able to go red.
@@ -1581,3 +1683,6 @@ class TestBackgroundTaskBounds:
             task.cancel()
             with contextlib.suppress(BaseException):
                 await asyncio.wait_for(task, timeout=5.0)
+            stop_task.cancel()
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(stop_task, timeout=5.0)

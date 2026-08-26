@@ -55,9 +55,16 @@ from typing import Literal
 #   auto_index scans the exact markdown it would persist; extract scans
 #   the response text + rendered arguments before the extractor runs.
 #
-# Both write paths share this 5-label outcome set deliberately. auto_index
-# only fires ``stored``, ``error``, and ``privacy_skip``; ``dedup_skip`` and
-# ``extracted_zero_facts`` are extract-specific. Operators read the raw
+# - ``shed``: per call, terminal — the background stage was never
+#   scheduled because the fire-and-forget backlog was at capacity or
+#   ``stop()`` was draining (#868). Distinct from ``error`` (a run that
+#   failed) and from a NULL ``index_ok`` / ``extract_ok`` (work still
+#   pending): nothing ran, and nothing will. Fires from both paths, and
+#   only on their background variants.
+#
+# Both write paths share this 6-label outcome set deliberately. auto_index
+# only fires ``stored``, ``error``, ``privacy_skip``, and ``shed``;
+# ``dedup_skip`` and ``extracted_zero_facts`` are extract-specific. Operators read the raw
 # mem_add count as ``outcomes["__total__"]["stored"]`` regardless of
 # which path produced the write — path attribution lives in ``attempts``.
 #

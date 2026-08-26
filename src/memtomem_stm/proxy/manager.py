@@ -228,6 +228,12 @@ MAX_BACKGROUND_TASKS = 64
 # cleared away.
 BACKGROUND_DRAIN_BUDGET_SECONDS = 5.0
 
+# How long one drain round waits before re-issuing cancellation. ``asyncio.wait``
+# defaults to ALL_COMPLETED, so waiting the whole budget in one call would let a
+# task that ignores only its FIRST cancellation consume the entire window and
+# never be asked again (#868).
+BACKGROUND_DRAIN_POLL_SECONDS = 0.25
+
 
 class ToolgraphStartupError(RuntimeError):
     """A ``fail_start`` tool-graph failure aborts proxy startup (#465).
@@ -665,10 +671,11 @@ class ProxyManager:
         # subsequent overload invisible).
         self._background_shed_total: int = 0
         self._background_shed_warned: bool = False
-        # True only WHILE stop() is draining (#868): the drain loop must not
-        # race a producer this manager creates itself. Reopened when stop()
-        # finishes, so a stop -> start reuse — and the documented
-        # "notification after stop reschedules" contract — keep working.
+        # True while stop() runs (#868): the drain loop must not race a
+        # producer this manager creates itself, and the teardown that follows
+        # must not gain new work either. Cleared when stop() finishes, so a
+        # stop -> start reuse — and the documented "notification after stop
+        # reschedules" contract — keep working.
         self._background_closed: bool = False
         # #557 ``tools/list_changed`` refresh bookkeeping. ``dirty`` marks
         # servers whose advertised tool list is known-stale; ``running`` holds
@@ -676,6 +683,9 @@ class ProxyManager:
         # into one refresh chain. See ``_schedule_tools_refresh``.
         self._tools_refresh_dirty: set[str] = set()
         self._tools_refresh_running: set[str] = set()
+        # server -> its in-flight refresh task, so stop() can tell a straggler
+        # from a stale ``running`` claim (#868).
+        self._tools_refresh_tasks: dict[str, asyncio.Task] = {}
         # Per-key stampede guard — identical concurrent ``call_tool`` invocations
         # serialize on the same lock so a cache miss triggers one upstream
         # call rather than N. Entries are popped when the work completes so
@@ -1919,6 +1929,7 @@ class ProxyManager:
         # coalesce per server, so their count is bounded by upstream count.
         task = asyncio.create_task(self._drain_tools_refresh(name))
         self._background_tasks.add(task)
+        self._tools_refresh_tasks[name] = task
         task.add_done_callback(
             functools.partial(self._on_background_task_done, "tools_refresh", name, "*")
         )
@@ -2066,7 +2077,8 @@ class ProxyManager:
             self._background_shed_warned
             and len(self._background_tasks) <= MAX_BACKGROUND_TASKS // 2
         ):
-            # Pressure is off — re-arm so the next overload is reported.
+            # Pressure is off (at or below half the cap) — re-arm so the next
+            # overload is reported.
             self._background_shed_warned = False
         if task.cancelled():
             return
@@ -2109,7 +2121,9 @@ class ProxyManager:
             for task in pending:
                 task.cancel()
             cancelled.update(pending)
-            await asyncio.wait(pending, timeout=remaining_budget)
+            await asyncio.wait(
+                pending, timeout=min(remaining_budget, BACKGROUND_DRAIN_POLL_SECONDS)
+            )
         for task in list(self._background_tasks):
             if task.done():
                 self._background_tasks.discard(task)
@@ -2128,8 +2142,20 @@ class ProxyManager:
         # reuse of this manager would then drop every later ``list_changed``
         # notification for that server ("running" but no task). ``dirty`` is
         # cleared for symmetry; a stale entry there is merely unconsumed.
+        #
+        # Servers whose refresh task is STILL ALIVE keep their ``running``
+        # claim (#868): clearing it would let the next notification schedule a
+        # second cap-exempt refresh for the same server beside the straggler,
+        # and repeated stop/start cycles would then stack one per cycle —
+        # unbounded despite the fixed upstream count.
         self._tools_refresh_dirty.clear()
-        self._tools_refresh_running.clear()
+        live_refreshes = {
+            name for name, task in self._tools_refresh_tasks.items() if not task.done()
+        }
+        self._tools_refresh_tasks = {
+            name: task for name, task in self._tools_refresh_tasks.items() if not task.done()
+        }
+        self._tools_refresh_running.intersection_update(live_refreshes)
         # Close httpx clients
         if self._llm_compressor is not None:
             await self._llm_compressor.close()
@@ -2191,11 +2217,12 @@ class ProxyManager:
         # no upstreams — mirrors the double-start reset in ``start()``.
         self._failed_servers.clear()
         # Reopen the spawn path (#868). The closure exists to keep the drain
-        # loop from racing a producer this manager creates itself, so it lasts
-        # exactly as long as the drain: a later notification must be able to
-        # schedule again, which is what ``stop()``'s refresh-bookkeeping reset
-        # above is for. Anything scheduled after this point is drained by the
-        # next stop().
+        # loop from racing a producer this manager creates itself; it stays
+        # set through the rest of teardown too, since spawning against
+        # half-closed resources is no better. It is cleared HERE, at the end,
+        # so a later notification can schedule again — which is what
+        # ``stop()``'s refresh-bookkeeping reset above is for. Anything
+        # scheduled after this point is drained by the next stop().
         self._background_closed = False
 
     @property
@@ -5024,7 +5051,7 @@ class ProxyManager:
             and len(cleaned) >= ext_cfg.min_response_chars
         ):
             if ext_cfg.background:
-                self._spawn_background(
+                extract_task = self._spawn_background(
                     self._extract_and_store(
                         server,
                         tool,
@@ -5036,6 +5063,23 @@ class ProxyManager:
                     server=server,
                     tool=tool,
                 )
+                if extract_task is None:
+                    # Shed: record it as a real outcome. Leaving ok/error at
+                    # None is the tri-state that means "background work is
+                    # still pending", and nothing is pending here — the
+                    # coroutine was closed before it recorded an attempt, so
+                    # the attempt is recorded on its behalf (#868). Same
+                    # contract as the auto-index shed branch above.
+                    logger.info(
+                        "Background extraction shed for %s/%s: backlog at capacity "
+                        "or stop() is draining",
+                        server,
+                        tool,
+                    )
+                    self.index_observability.record_attempt(tool, "extract")
+                    self.index_observability.record_outcome(tool, "shed")
+                    extract_ok = False
+                    extract_error = "background_shed"
             else:
                 extract_outcome = await self._extract_and_store(
                     server,
