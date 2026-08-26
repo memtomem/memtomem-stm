@@ -703,31 +703,28 @@ class FeedbackStore:
         side effect of its own work — a fault counter silently publishing a
         half-applied recovery, say. Rolling back is what prevents that.
 
-        If the rollback ITSELF fails the connection cannot be reasoned about
-        any more, so it is dropped: every write guards on ``self._db is None``
-        and degrades to a missing counter, which is the failure this module
-        already trades for, while keeping the connection risks committing
-        abandoned state later. Called from inside ``self._lock``; never raises,
-        so the caller's original exception is what propagates.
+        A rollback that ITSELF fails is only logged. Dropping the connection
+        looks safer but is not: ``self._db is None`` makes every write a SILENT
+        no-op, and ``record_surfacing`` returning without writing leaves the
+        agent holding an advertised feedback ID that resolves to nothing —
+        whereas a raising write makes the engine re-render without the dead
+        handle. A connection whose rollback fails is broken anyway, so its next
+        write raises and degrades through the paths that already exist.
+
+        Called from inside ``self._lock``; never raises, so the caller's
+        original exception is what propagates.
         """
-        db = self._db
-        if db is None:
+        if self._db is None:
             return
         try:
-            db.rollback()
-            return
+            self._db.rollback()
         except Exception:
             logger.warning(
-                "Rollback after a failed %s write failed; dropping the surfacing "
-                "feedback connection — durable counters are disabled for this process",
+                "Rollback after a failed %s write failed; the surfacing feedback "
+                "connection may hold an uncommitted transaction",
                 what,
                 exc_info=True,
             )
-        self._db = None
-        try:
-            db.close()
-        except Exception:
-            logger.debug("Closing the abandoned feedback connection failed", exc_info=True)
 
     def _record_signal(
         self,

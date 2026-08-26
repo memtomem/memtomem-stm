@@ -325,10 +325,14 @@ class TestRecordFaultRecovery:
         assert read_surfacing_summary(db_path)["active_faults"] == {"error_timeout": 1}
         store.close()
 
-    def test_a_failed_rollback_drops_the_connection(self, tmp_path, monkeypatch):
-        # A connection whose rollback fails cannot be reasoned about: keeping
-        # it risks committing the abandoned transaction later, so the store
-        # degrades to "no durable counters" instead.
+    def test_a_failed_rollback_keeps_the_connection(self, tmp_path, monkeypatch, caplog):
+        """A failed rollback is logged, not answered by dropping the store.
+
+        Dropping it would make every write a SILENT no-op, and a
+        ``record_surfacing`` that returns without writing leaves the agent
+        holding an advertised feedback ID that resolves to nothing — while a
+        raising write makes the engine re-render without the dead handle.
+        """
         monkeypatch.setattr(
             "memtomem_stm.surfacing.feedback_store.time.time",
             lambda: 1_700_000_000.0,
@@ -338,13 +342,18 @@ class TestRecordFaultRecovery:
         store.initialize()
         store.record_fault("gh", "read_file", "error_timeout")
 
-        store._db = _FailingCommit(store._db, fail_rollback=True)  # type: ignore[assignment]
-        with pytest.raises(sqlite3.OperationalError):
-            store.record_fault_recovery("gh", "read_file", recovered_at=1_700_000_000.0)
-        assert store._db is None
-        # Degraded, not crashing: later writes are silent no-ops.
-        store.record_fault("gh", "read_file", "error_timeout")
-        store.record_fault_recovery("gh", "read_file", recovered_at=1_700_000_000.0)
+        real_db = store._db
+        store._db = _FailingCommit(real_db, fail_rollback=True)  # type: ignore[assignment]
+        with caplog.at_level("WARNING"):
+            with pytest.raises(sqlite3.OperationalError):
+                store.record_fault_recovery("gh", "read_file", recovered_at=1_700_000_000.0)
+        assert store._db is not None
+        assert "may hold an uncommitted transaction" in caplog.text
+
+        store._db = real_db  # type: ignore[assignment]
+        store.record_surfacing("sid-1", "gh", "read_file", "q", ["m1"], [0.5])
+        assert store.get_stats()["events_total"] == 1
+        store.close()
 
     def test_recovery_closes_episode_and_a_new_fault_reopens_it(self, tmp_path, monkeypatch):
         # Windows can return the same time.time() for adjacent writes, so the
