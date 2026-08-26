@@ -220,9 +220,13 @@ _TOOLGRAPH_UNREACHABLE_ERRORS: tuple[type[BaseException], ...] = (
 # path is unaffected.
 MAX_BACKGROUND_TASKS = 64
 
-# How long stop() waits for cancelled survivors to unwind before reporting
-# them. They are already cancelled by then; this only bounds the report.
-BACKGROUND_CANCEL_GRACE_SECONDS = 2.0
+# Total wall-clock stop() spends draining background tasks (#868). ``cancel()``
+# only REQUESTS cancellation, so a task that delays or suppresses it must not
+# be able to hold shutdown open — per-round grace multiplied by rounds would.
+# One budget for the whole phase keeps stop() bounded no matter how the tasks
+# behave, and whatever has not unwound by then stays tracked rather than being
+# cleared away.
+BACKGROUND_DRAIN_BUDGET_SECONDS = 5.0
 
 
 class ToolgraphStartupError(RuntimeError):
@@ -661,9 +665,10 @@ class ProxyManager:
         # subsequent overload invisible).
         self._background_shed_total: int = 0
         self._background_shed_warned: bool = False
-        # Closed for the duration of stop(): the drain loop must not race a
-        # producer this manager creates itself (#868). Reopened by start(), so
-        # a stop -> start reuse gets working background stages again.
+        # True only WHILE stop() is draining (#868): the drain loop must not
+        # race a producer this manager creates itself. Reopened when stop()
+        # finishes, so a stop -> start reuse — and the documented
+        # "notification after stop reschedules" contract — keep working.
         self._background_closed: bool = False
         # #557 ``tools/list_changed`` refresh bookkeeping. ``dirty`` marks
         # servers whose advertised tool list is known-stale; ``running`` holds
@@ -685,10 +690,6 @@ class ProxyManager:
 
     async def start(self) -> None:
         """Connect to all upstream servers, discover their tools."""
-        # Reopen the background spawn path (#868): stop() closes it, and a
-        # stop -> start reuse of this manager must get working background
-        # stages again rather than silently skipping every one.
-        self._background_closed = False
         # Guard against double start — close previous stack to avoid leaking connections
         if self._stack is not None:
             for conn in self._connections.values():
@@ -1900,6 +1901,16 @@ class ProxyManager:
         self._tools_refresh_dirty.add(name)
         if name in self._tools_refresh_running:
             return
+        if self._background_closed:
+            # Cap exemption and SHUTDOWN exemption are separate decisions
+            # (#868): a refresh spawned mid-drain lands in a set stop() has
+            # already passed over, so nothing cancels it. Leave the dirty flag
+            # set and do not claim ``running``, so the notification is not
+            # lost — the next one (or the one after stop() returns) schedules
+            # it, which is the reuse contract ``stop()``'s bookkeeping reset
+            # exists for.
+            logger.debug("tools/list_changed for '%s' deferred: stop() is draining", name)
+            return
         self._tools_refresh_running.add(name)
         # Deliberately NOT shed at the cap: a dropped refresh would leave the
         # advertised tool list permanently stale for this server (the dirty
@@ -2082,43 +2093,35 @@ class ProxyManager:
         # a late task pending. A second iteration catches and cancels it.
         # Bound the loop so a pathological task that keeps scheduling
         # replacements can't spin forever.
-        for _ in range(8):
-            if not self._background_tasks:
+        deadline = asyncio.get_running_loop().time() + BACKGROUND_DRAIN_BUDGET_SECONDS
+        cancelled: set[asyncio.Task] = set()
+        while True:
+            pending = [task for task in self._background_tasks if not task.done()]
+            if not pending:
                 break
-            batch = list(self._background_tasks)
-            for task in batch:
+            remaining_budget = deadline - asyncio.get_running_loop().time()
+            if remaining_budget <= 0:
+                break
+            # Re-cancel every pending task each round, including ones cancelled
+            # in an earlier round that have not unwound: excluding them is how
+            # they used to end up abandoned. A concurrent producer's late
+            # arrival is picked up by the same snapshot.
+            for task in pending:
                 task.cancel()
-            await asyncio.gather(*batch, return_exceptions=True)
-            for task in batch:
+            cancelled.update(pending)
+            await asyncio.wait(pending, timeout=remaining_budget)
+        for task in list(self._background_tasks):
+            if task.done():
                 self._background_tasks.discard(task)
-        else:
-            # The bounded loop gave up, but abandoning the survivors means
-            # they keep running against resources we are about to tear down
-            # (#868). Cancel until the set is empty rather than gathering
-            # (gathering is what let a replacement outrun us), still bounded:
-            # a producer that schedules a new task on every cancellation is
-            # unbounded by construction, and the process must still exit.
-            cancelled: list[asyncio.Task] = []
-            for _ in range(8):
-                remaining = [task for task in self._background_tasks if task not in set(cancelled)]
-                if not remaining:
-                    break
-                for task in remaining:
-                    task.cancel()
-                await asyncio.wait(remaining, timeout=BACKGROUND_CANCEL_GRACE_SECONDS)
-                cancelled.extend(remaining)
-            unfinished = [task for task in cancelled if not task.done()]
-            still_tracked = [task for task in self._background_tasks if not task.done()]
+        if self._background_tasks:
             logger.warning(
-                "ProxyManager.stop(): %d background task(s) outlived the drain loop; "
-                "cancelled them (%d did not finish unwinding within %.1fs, %d still "
-                "pending after the cancel rounds)",
+                "ProxyManager.stop(): %d background task(s) did not finish unwinding "
+                "within %.1fs; cancellation was requested for all %d drained task(s) "
+                "and the stragglers stay tracked",
+                len(self._background_tasks),
+                BACKGROUND_DRAIN_BUDGET_SECONDS,
                 len(cancelled),
-                len(unfinished),
-                BACKGROUND_CANCEL_GRACE_SECONDS,
-                len(still_tracked),
             )
-        self._background_tasks.clear()
         # Reset the #557 refresh bookkeeping. A drain task cancelled before its
         # first step never enters its ``finally`` (the coroutine body never
         # runs), so ``running`` can retain the server name — and a stop→start
@@ -2187,6 +2190,13 @@ class ProxyManager:
         # Clear startup-failure records too (#580) so a stopped manager reports
         # no upstreams — mirrors the double-start reset in ``start()``.
         self._failed_servers.clear()
+        # Reopen the spawn path (#868). The closure exists to keep the drain
+        # loop from racing a producer this manager creates itself, so it lasts
+        # exactly as long as the drain: a later notification must be able to
+        # schedule again, which is what ``stop()``'s refresh-bookkeeping reset
+        # above is for. Anything scheduled after this point is drained by the
+        # next stop().
+        self._background_closed = False
 
     @property
     def _config(self) -> ProxyConfig:
@@ -4883,17 +4893,12 @@ class ProxyManager:
                 # read-your-own-writes for the next tool call — opt-in only
                 # (default ai_cfg.background = False preserves sync contract).
                 ns = ai_cfg.namespace.format(server=server, tool=tool)
-                final_result = compose_index_footer(
-                    server=server,
-                    tool=tool,
-                    original_chars=len(original_text),
-                    compressed_chars=compressed_chars_for_metrics,
-                    text=cleaned,
-                    agent_summary=surfaced,
-                    ns=ns,
-                    chunks=None,
-                )
-                self._spawn_background(
+                # Schedule FIRST, footer second (#868). The ``[Indexing…] ·
+                # scheduled`` placeholder promises a run, so it must not ship
+                # when the spawn was shed at the cap or refused during
+                # shutdown — the same contract the #453 privacy pre-check
+                # already enforces one branch up.
+                index_task = self._spawn_background(
                     self._auto_index_response(
                         server,
                         tool,
@@ -4909,9 +4914,37 @@ class ProxyManager:
                     server=server,
                     tool=tool,
                 )
-                # index_ok / index_error / chunks_indexed stay None / None / 0
-                # — tri-state matches background extraction. Dashboards filter
-                # background rows with WHERE index_ok IS NULL.
+                if index_task is None:
+                    # Shed: no task, so no promise. Ship the un-footered
+                    # response and record the miss as a real outcome rather
+                    # than leaving index_ok=None, which dashboards read as
+                    # "background work still pending".
+                    logger.info(
+                        "Auto-index shed for %s/%s: background backlog at capacity "
+                        "or manager stopping",
+                        server,
+                        tool,
+                    )
+                    self.index_observability.record_attempt(tool, "auto_index")
+                    self.index_observability.record_outcome(tool, "shed")
+                    final_result = surfaced
+                    index_ok = False
+                    index_error = "background_shed"
+                else:
+                    final_result = compose_index_footer(
+                        server=server,
+                        tool=tool,
+                        original_chars=len(original_text),
+                        compressed_chars=compressed_chars_for_metrics,
+                        text=cleaned,
+                        agent_summary=surfaced,
+                        ns=ns,
+                        chunks=None,
+                    )
+                    # index_ok / index_error / chunks_indexed stay None / None
+                    # / 0 — tri-state matches background extraction.
+                    # Dashboards filter background rows with
+                    # WHERE index_ok IS NULL.
             else:
                 with traced(
                     "proxy_call_index",

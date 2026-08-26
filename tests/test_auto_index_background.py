@@ -137,6 +137,47 @@ class TestBackgroundAutoIndex:
         finally:
             await mgr.stop()
 
+    async def test_shed_background_index_returns_unfootered_response(self, tmp_path):
+        """A shed spawn must not ship ``[Indexing…] · scheduled`` (#868).
+
+        Same contract the #453 privacy pre-check enforces one branch up: the
+        placeholder promises an indexing run, so it must not go out when the
+        backlog was at capacity and nothing was scheduled. The metrics row
+        must say so too — leaving ``index_ok=None`` would read as "background
+        work still pending" on every dashboard that filters that way.
+        """
+        mgr, indexer = _bg_manager(tmp_path, background=True)
+        record_spy = MagicMock()
+        mgr.tracker.record = record_spy
+        # Fill the set to the cap so the auto-index spawn is shed.
+        gate = asyncio.Event()
+
+        async def _blocker() -> None:
+            await gate.wait()
+
+        from memtomem_stm.proxy.manager import MAX_BACKGROUND_TASKS
+
+        fillers = [
+            mgr._spawn_background(_blocker(), stage="extract", server="s", tool="t")
+            for _ in range(MAX_BACKGROUND_TASKS)
+        ]
+        try:
+            result = await mgr.call_tool("srv", "some_tool", {})
+
+            assert "[Indexing…]" not in result
+            assert "scheduled" not in result
+            indexer.index_file.assert_not_awaited()
+            snap = mgr.index_observability.snapshot()
+            assert snap["attempts"]["__total__"] == {"auto_index": 1}
+            assert snap["outcomes"]["__total__"] == {"shed": 1}
+            metrics = record_spy.call_args.args[0]
+            assert metrics.index_ok is False, "a shed stage must not look like pending work"
+            assert metrics.index_error == "background_shed"
+        finally:
+            gate.set()
+            await asyncio.gather(*fillers, return_exceptions=True)
+            await mgr.stop()
+
     async def test_background_drains_on_stop(self, tmp_path):
         """``stop()`` cancels in-flight background indexing tasks via the
         existing extraction drain loop — no new infrastructure."""
