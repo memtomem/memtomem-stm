@@ -2047,11 +2047,9 @@ class ProxyManager:
 
         One choke point for every background stage, so the cap, the tracking
         set, and the done-callback cannot drift apart between call sites.
-        Returns ``None`` when the task was shed. Callers must not treat that
-        like a stage that never ran: they record the refusal (an attempt, a
-        ``shed`` outcome, and ``False`` / ``background_shed`` on the metrics
-        row) so it is distinguishable from both a completed run and a row
-        that simply carries no outcome (#868).
+        Returns ``None`` when the task was shed. Callers record that refusal
+        — an attempt, a ``shed`` outcome, and ``False`` / ``background_shed``
+        on the metrics row — rather than leaving the row with no outcome.
         """
         if self._background_closed:
             coro.close()
@@ -4918,13 +4916,7 @@ class ProxyManager:
         inner ``_auto_index_response`` keeps reading live ``self._config`` exactly
         as before — this extraction relocates only the gate, not that behavior.
         """
-        # Track outcome for CallMetrics below. ``None`` means "this row
-        # carries no outcome" — the stage was disabled, the engine was
-        # missing, the content was below min_chars, or the stage was
-        # SCHEDULED in the background and its result is never written back
-        # here. ``False`` means "did not succeed": ran and failed, or (#868)
-        # was shed before it could run, which ``index_error`` distinguishes.
-        # Dashboards must keep the two apart.
+        # Track outcome for CallMetrics below.
         index_ok: bool | None = None
         index_error: str | None = None
         chunks_indexed = 0
@@ -4984,11 +4976,8 @@ class ProxyManager:
                 )
                 if index_task is None:
                     # Shed: no task, so no promise. Ship the un-footered
-                    # response and record the miss as a real outcome. Leaving
-                    # index_ok=None would file this row with the SCHEDULED
-                    # background runs — the rows whose result is deliberately
-                    # never written back, which dashboards select with
-                    # ``WHERE index_ok IS NULL`` — and nothing was scheduled.
+                    # response and record the refusal instead of leaving the
+                    # row with no outcome.
                     logger.info(
                         "Auto-index shed for %s/%s: background backlog at capacity "
                         "or manager stopping",
@@ -5084,8 +5073,7 @@ class ProxyManager:
         background failures stay visible via ``memory_ops.extract_and_store``'s
         WARNING log). A background run that was never scheduled — shed at the
         cap or during ``stop()`` — reports ``False`` / ``background_shed``
-        instead, so it is not filed with the scheduled-but-unreported rows
-        (#868). Like the index stage, the
+        instead (#868). Like the index stage, the
         gate reads ``cfg_snap`` but ``_extract_and_store`` keeps reading live
         ``self._config``.
         """
@@ -5111,13 +5099,10 @@ class ProxyManager:
                     tool=tool,
                 )
                 if extract_task is None:
-                    # Shed: record it as a real outcome. Leaving ok/error at
-                    # None would file this row with the SCHEDULED background
-                    # runs, whose result is deliberately never written back —
-                    # but nothing ran here, and the coroutine was closed
-                    # before it could record its attempt, so the attempt is
-                    # recorded on its behalf (#868). Same contract as the
-                    # auto-index shed branch above.
+                    # Shed: record the refusal rather than leaving the row
+                    # with no outcome. The coroutine was closed before it
+                    # could record its attempt, so the attempt is recorded on
+                    # its behalf.
                     logger.info(
                         "Background extraction shed for %s/%s: backlog at capacity "
                         "or stop() is draining",

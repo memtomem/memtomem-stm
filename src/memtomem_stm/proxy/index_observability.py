@@ -58,13 +58,10 @@ from typing import Literal
 # - ``shed``: per call, terminal — the background stage was never
 #   scheduled because the fire-and-forget backlog was at capacity or
 #   ``stop()`` was draining (#868). Distinct from ``error`` (a run that
-#   failed) and from a NULL ``index_ok`` / ``extract_ok``, which means the
-#   row records no outcome — either the stage did not run (disabled, no
-#   engine, below the size threshold) or it was scheduled in the
-#   background and its result is never written back here. ``shed`` is
-#   neither: it says a background stage was refused, so nothing ran and
-#   nothing will. Fires from both paths, and only on their background
-#   variants.
+#   failed) and from a NULL ``index_ok`` / ``extract_ok``, which records no
+#   outcome at all: ``shed`` says a background stage was refused, so
+#   nothing ran and nothing will. Fires from both paths, and only on their
+#   background variants.
 #
 # Both write paths share this 6-label outcome set deliberately. auto_index
 # only fires ``stored``, ``error``, ``privacy_skip``, and ``shed``;
@@ -94,9 +91,8 @@ IndexOutcome = Literal[
     "privacy_skip",
     # The background stage was never scheduled: the fire-and-forget backlog
     # was at capacity, or the manager was stopping (#868). Distinct from
-    # "error" (a run that failed) and from a NULL index_ok, which means the
-    # row records no outcome — the stage either did not run or was
-    # scheduled in the background and never reports back here.
+    # "error" (a run that failed) and from a NULL index_ok, which records no
+    # outcome at all.
     "shed",
     "error",
 ]

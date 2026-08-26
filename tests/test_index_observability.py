@@ -72,9 +72,8 @@ class TestIndexObservabilityCounters:
         (``stored``), from "content was refused before any write"
         (``privacy_skip``, #453), and from "the background stage was never
         scheduled at all" (``shed``, #868 — nothing ran and nothing will,
-        unlike a NULL ok column, which only says the row records no outcome:
-        the stage did not run, or it was scheduled in the background and
-        never reports back there)."""
+        unlike a NULL ok column, which only says no outcome was
+        recorded)."""
         obs = IndexObservability()
         obs.record_outcome("t", "stored")
         obs.record_outcome("t", "dedup_skip")

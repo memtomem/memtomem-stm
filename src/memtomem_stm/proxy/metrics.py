@@ -193,10 +193,25 @@ class CallMetrics:
     # (embedding service down, disk full, LTM connection dropped). Record the
     # outcome so dashboards can surface the break.
     #
-    # ``None`` means "stage did not run for this call" — e.g. auto-index
-    # disabled, response below ``min_chars`` threshold, or (for the
-    # surfacing_on_progressive fields) the call did not go down the
-    # progressive path. Readers must distinguish ``None`` from ``False``.
+    # Tri-state contract for the nullable outcome columns (``index_ok``,
+    # ``extract_ok``, ``surfacing_on_progressive_ok``). Stated in full here,
+    # where the schema lives; other sites keep only the part they act on.
+    #
+    #   ``None``  — this row records NO outcome. Either the stage did not run
+    #               (disabled, engine missing, below ``min_chars``, or for the
+    #               surfacing_on_progressive fields the call did not take the
+    #               progressive path), or it was SCHEDULED in the background
+    #               and its result is never written back to this row.
+    #   ``True``  — recorded success (including a terminal pre-skip, e.g. the
+    #               privacy gate declining before any write).
+    #   ``False`` — recorded NON-success: the stage ran and failed, or its
+    #               scheduling was refused (shed at the background cap or
+    #               during ``stop()``, #868). The paired ``*_error`` column
+    #               distinguishes the two.
+    #
+    # Readers must therefore distinguish ``None`` from ``False``: the first is
+    # "nothing to report here", the second is "reported, and it did not
+    # succeed".
     index_ok: bool | None = None
     index_error: str | None = None
     chunks_indexed: int = 0

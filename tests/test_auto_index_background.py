@@ -143,10 +143,8 @@ class TestBackgroundAutoIndex:
         Same contract the #453 privacy pre-check enforces one branch up: the
         placeholder promises an indexing run, so it must not go out when the
         backlog was at capacity and nothing was scheduled. The metrics row
-        must say so too — leaving ``index_ok=None`` would file this row with
-        the SCHEDULED background runs, the ones whose result is deliberately
-        never written back, which dashboards select with
-        ``WHERE index_ok IS NULL``.
+        must say so too — leaving ``index_ok=None`` would record no outcome,
+        making the refusal indistinguishable from a scheduled run.
         """
         mgr, indexer = _bg_manager(tmp_path, background=True)
         record_spy = MagicMock()
@@ -173,7 +171,7 @@ class TestBackgroundAutoIndex:
             assert snap["attempts"]["__total__"] == {"auto_index": 1}
             assert snap["outcomes"]["__total__"] == {"shed": 1}
             metrics = record_spy.call_args.args[0]
-            assert metrics.index_ok is False, "a shed stage must not look like pending work"
+            assert metrics.index_ok is False, "a shed stage must record an outcome"
             assert metrics.index_error == "background_shed"
         finally:
             gate.set()
