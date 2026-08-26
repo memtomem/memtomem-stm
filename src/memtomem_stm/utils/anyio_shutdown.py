@@ -57,13 +57,13 @@ def is_clean_cancel_scope_shutdown(exc: BaseException) -> bool:
 # ``finally`` releasing the gate.
 CLOSE_DRAIN_GRACE_SECONDS = 2.0
 
-# Hard ceiling on any drain, whatever the callers captured. ``gt=0.0`` admits
-# ``+inf`` (the same hole #722 closed for the hook deadline), and these config
-# models are mutable, so a non-finite or absurd ``llm_timeout_seconds`` would
-# otherwise restore exactly the unbounded shutdown this gate exists to
-# prevent. A drain this long already means something is wrong; the point is
-# that the process can still exit.
-MAX_CLOSE_DRAIN_SECONDS = 60.0
+# Stand-in deadline for a timeout that is not one. ``gt=0.0`` admits ``+inf``
+# and ``NaN`` slips through comparisons (the same hole #722 closed for the
+# hook deadline), and these config models are mutable — a non-finite value
+# would otherwise restore exactly the unbounded shutdown this gate exists to
+# prevent. A *finite* timeout, however long, is a bound the operator chose:
+# the drain honors it rather than cutting a valid call short.
+UNBOUNDED_TIMEOUT_FALLBACK_SECONDS = 60.0
 
 
 class InFlightGate:
@@ -82,9 +82,11 @@ class InFlightGate:
       is the fallback for "nothing in flight", nothing more.
     * Deadlines are per registration and dropped on ``leave``, so a long
       caller finishing does not leave its ceiling behind for a short one.
-    * Whatever the captures say, the ceiling is clamped to
-      :data:`MAX_CLOSE_DRAIN_SECONDS` — a non-finite or absurd configured
-      timeout must not restore an unbounded shutdown.
+    * A non-finite capture (``+inf``/``NaN``, both of which pass the config's
+      ``gt=0.0``) is not a deadline at all; it is replaced at capture time by
+      :data:`UNBOUNDED_TIMEOUT_FALLBACK_SECONDS` so it cannot restore an
+      unbounded shutdown — nor, as ``NaN``, silently collapse another live
+      caller's ceiling to zero through the comparisons.
 
     ``clock`` is injectable so tests can pin the arithmetic without sleeping.
     """
@@ -110,11 +112,18 @@ class InFlightGate:
         to each caller keeps a late registration from clearing ``idle`` after
         ``close()`` computed its ceiling.
 
-        Sync on purpose: callers must not ``await`` between this claim and
-        their use of the resource, or ``close()`` can tear it down in between.
+        The ``closed`` check and the insertion are one sync step on purpose:
+        a caller that awaited in between could register into a gate ``close()``
+        had already measured. Once registered, the token is what keeps the
+        resource alive — holding it across awaits is the point.
         """
         if self.closed:
             return None
+        if not math.isfinite(timeout):
+            # Normalize at capture so every stored deadline is finite: a NaN
+            # deadline survives ``max(0.0, nan) -> 0.0`` and would hand a
+            # simultaneously live caller nothing but the grace.
+            timeout = UNBOUNDED_TIMEOUT_FALLBACK_SECONDS
         self._next_token += 1
         token = self._next_token
         self._deadlines[token] = self._clock() + timeout
@@ -134,17 +143,21 @@ class InFlightGate:
         caller already past its deadline only owes the grace), or
         ``fallback_timeout`` when nothing is registered, plus the grace that
         covers the hop from a deadline firing to ``finally`` releasing.
+
+        The result is finite but not capped: a long finite timeout is a bound
+        the operator configured, and cutting the drain below it would close
+        the transport inside a call that is still legitimately running — the
+        very race this gate exists to prevent. Only a non-finite value is
+        substituted (at capture for registrations, here for the fallback).
         """
         if self._deadlines:
             now = self._clock()
             remaining = max(0.0, max(self._deadlines.values()) - now)
-        else:
+        elif math.isfinite(fallback_timeout):
             remaining = fallback_timeout
-        if not math.isfinite(remaining):
-            # ``+inf`` (admitted by ``gt=0.0``) is not a big budget — it is no
-            # bound at all. Fall through to the hard ceiling below.
-            remaining = MAX_CLOSE_DRAIN_SECONDS
-        return min(remaining + CLOSE_DRAIN_GRACE_SECONDS, MAX_CLOSE_DRAIN_SECONDS)
+        else:
+            remaining = UNBOUNDED_TIMEOUT_FALLBACK_SECONDS
+        return remaining + CLOSE_DRAIN_GRACE_SECONDS
 
 
 async def drain_or_warn(idle: asyncio.Event, *, timeout: float, what: str) -> bool:

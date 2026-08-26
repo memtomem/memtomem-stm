@@ -262,7 +262,8 @@ class FactExtractor:
         # a resurrected client reference) must still take the local heuristic
         # rather than cross the provider boundary. try_enter also refuses a
         # late registration that would clear idle after close() computed its
-        # ceiling. Sync — no await between the claim and our use of _client.
+        # ceiling. The closed check and the insertion are one sync step
+        # inside try_enter; from here the token keeps _client alive.
         gate_token = self._gate.try_enter(call_timeout)
         if gate_token is None:
             logger.debug("Extractor closed, falling back to heuristic")

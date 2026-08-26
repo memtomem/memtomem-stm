@@ -2320,8 +2320,9 @@ class LLMCompressor:
         call_timeout = self._cfg.llm_timeout_seconds
         # Registering is the closed check: try_enter refuses once close() has
         # started, so a late caller cannot clear the gate's idle event after
-        # the drain ceiling was computed. Sync — no ``await`` between the
-        # claim and our use of ``_client``.
+        # the drain ceiling was computed. The closed check and the insertion
+        # are one sync step inside try_enter; from here the token is what
+        # keeps ``_client`` alive across the await below.
         gate_token = self._gate.try_enter(call_timeout)
         if gate_token is None:
             self.last_fallback = "closed"

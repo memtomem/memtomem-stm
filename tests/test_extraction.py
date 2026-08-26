@@ -970,20 +970,57 @@ class TestInFlightGate:
         gate.try_enter(4.0)
         assert gate.drain_ceiling(0.0) == pytest.approx(9.0 + CLOSE_DRAIN_GRACE_SECONDS)
 
-    @pytest.mark.parametrize("unbounded", [float("inf"), 1e9])
-    def test_ceiling_is_clamped_however_long_the_capture(self, unbounded: float):
-        # llm_timeout_seconds is only gt=0.0, which admits +inf (the hole #722
-        # closed for the hook deadline), and the config is mutable. Neither an
-        # infinite nor an absurd capture may restore an unbounded shutdown.
-        from memtomem_stm.utils.anyio_shutdown import MAX_CLOSE_DRAIN_SECONDS
+    @pytest.mark.parametrize("bad", [float("inf"), float("nan")])
+    def test_non_finite_capture_is_substituted_not_propagated(self, bad: float):
+        # llm_timeout_seconds is only gt=0.0, which admits +inf, and NaN slips
+        # through comparisons (the hole #722 closed for the hook deadline).
+        # Neither may reach the drain: +inf would never time out, and NaN
+        # survives max(0.0, nan) -> 0.0, which would hand a simultaneously
+        # live caller nothing but the grace.
+        from memtomem_stm.utils.anyio_shutdown import (
+            CLOSE_DRAIN_GRACE_SECONDS,
+            UNBOUNDED_TIMEOUT_FALLBACK_SECONDS,
+        )
 
         now = [0.0]
         gate = self._gate(now)
-        gate.try_enter(unbounded)
-        assert gate.drain_ceiling(0.0) == pytest.approx(MAX_CLOSE_DRAIN_SECONDS)
-        # Same via the no-registration fallback.
+        gate.try_enter(bad)
+        assert gate.drain_ceiling(0.0) == pytest.approx(
+            UNBOUNDED_TIMEOUT_FALLBACK_SECONDS + CLOSE_DRAIN_GRACE_SECONDS
+        )
+
+        # And it must not drag a live finite registration down with it.
+        paired = self._gate([0.0])
+        paired.try_enter(bad)
+        paired.try_enter(5.0)
+        assert paired.drain_ceiling(0.0) >= 5.0 + CLOSE_DRAIN_GRACE_SECONDS
+
+        # Same substitution through the no-registration fallback.
         empty = self._gate([0.0])
-        assert empty.drain_ceiling(unbounded) == pytest.approx(MAX_CLOSE_DRAIN_SECONDS)
+        assert empty.drain_ceiling(bad) == pytest.approx(
+            UNBOUNDED_TIMEOUT_FALLBACK_SECONDS + CLOSE_DRAIN_GRACE_SECONDS
+        )
+
+    def test_a_long_finite_timeout_is_honored_not_capped(self):
+        # A finite timeout is a bound the operator chose. Cutting the drain
+        # below it would close the transport inside a call that is still
+        # legitimately running — the race this gate exists to prevent.
+        from memtomem_stm.utils.anyio_shutdown import CLOSE_DRAIN_GRACE_SECONDS
+
+        now = [0.0]
+        gate = self._gate(now)
+        gate.try_enter(300.0)
+        assert gate.drain_ceiling(0.0) == pytest.approx(300.0 + CLOSE_DRAIN_GRACE_SECONDS)
+
+    def test_the_grace_is_never_eaten_by_a_long_deadline(self):
+        # The grace covers the hop from a deadline firing to ``finally``
+        # releasing; it is added on top, not folded into a cap.
+        from memtomem_stm.utils.anyio_shutdown import CLOSE_DRAIN_GRACE_SECONDS
+
+        now = [0.0]
+        gate = self._gate(now)
+        gate.try_enter(60.0)
+        assert gate.drain_ceiling(0.0) == pytest.approx(60.0 + CLOSE_DRAIN_GRACE_SECONDS)
 
     def test_try_enter_refuses_once_closed(self):
         # A registration accepted after close() started would clear idle again

@@ -134,3 +134,52 @@ class TestIsCleanCancelScopeShutdown:
         assert isinstance(group, BaseExceptionGroup)
         assert not isinstance(group, ExceptionGroup)
         assert is_clean_cancel_scope_shutdown(group) is False
+
+
+class TestDrainOrWarn:
+    """The drain must actually wait on the event it is given (#867).
+
+    Asserting only the give-up warning is not enough: an implementation that
+    logged and returned without ever awaiting would satisfy that. These pin
+    both halves — it blocks while the gate is held, and it gives up when the
+    ceiling passes.
+    """
+
+    async def test_blocks_until_the_event_is_set(self):
+        import asyncio
+
+        from memtomem_stm.utils.anyio_shutdown import drain_or_warn
+
+        idle = asyncio.Event()  # unset: a caller is registered
+        task = asyncio.create_task(drain_or_warn(idle, timeout=30.0, what="probe"))
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not task.done(), "drain_or_warn returned without waiting on the event"
+
+        idle.set()
+        assert await asyncio.wait_for(task, timeout=5.0) is True
+
+    async def test_gives_up_and_warns_when_the_ceiling_passes(self, caplog):
+        import asyncio
+
+        from memtomem_stm.utils.anyio_shutdown import drain_or_warn
+
+        idle = asyncio.Event()  # never set
+        with caplog.at_level("WARNING", logger="memtomem_stm.utils.anyio_shutdown"):
+            result = await asyncio.wait_for(
+                drain_or_warn(idle, timeout=0.05, what="probe"), timeout=5.0
+            )
+
+        assert result is False
+        assert any("did not drain" in r.getMessage() for r in caplog.records), caplog.text
+
+    async def test_returns_immediately_when_already_idle(self):
+        import asyncio
+
+        from memtomem_stm.utils.anyio_shutdown import drain_or_warn
+
+        idle = asyncio.Event()
+        idle.set()
+        assert await asyncio.wait_for(
+            drain_or_warn(idle, timeout=30.0, what="probe"), timeout=5.0
+        ) is True
