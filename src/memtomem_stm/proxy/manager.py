@@ -735,6 +735,13 @@ class ProxyManager:
             # orphaned by a never-started drain task would silently drop every
             # ``list_changed`` notification for that server this session.
             self._tools_refresh_dirty.clear()
+            # Cancel live refresh tasks rather than only dropping their claims
+            # (#868): a survivor would keep running against the connections
+            # being replaced, and the next notification would schedule a
+            # second cap-exempt refresh for the same server beside it.
+            for refresh_task in list(self._tools_refresh_tasks.values()):
+                refresh_task.cancel()
+            self._tools_refresh_tasks.clear()
             self._tools_refresh_running.clear()
             # Close the consult cache too so a re-entry that changed
             # ``toolgraph.consult_cache_path`` reopens the right DB (#494). Mirror
@@ -1914,12 +1921,14 @@ class ProxyManager:
         if self._background_closed:
             # Cap exemption and SHUTDOWN exemption are separate decisions
             # (#868): a refresh spawned mid-drain lands in a set stop() has
-            # already passed over, so nothing cancels it. Leave the dirty flag
-            # set and do not claim ``running``, so the notification is not
-            # lost — the next one (or the one after stop() returns) schedules
-            # it, which is the reuse contract ``stop()``'s bookkeeping reset
-            # exists for.
-            logger.debug("tools/list_changed for '%s' deferred: stop() is draining", name)
+            # already passed over, so nothing cancels it. This notification is
+            # REFUSED, not deferred — ``stop()`` clears ``dirty`` on its way
+            # out, so nothing replays it. What matters is that ``running`` is
+            # not claimed: a claim without a task would block every later
+            # notification for this server, whereas a refusal only costs this
+            # one, and the next notification (or the reconnect's re-list)
+            # heals the advertised set.
+            logger.debug("tools/list_changed for '%s' refused: stop() is draining", name)
             return
         self._tools_refresh_running.add(name)
         # Deliberately NOT shed at the cap: a dropped refresh would leave the
@@ -1947,7 +1956,14 @@ class ProxyManager:
                 self._tools_refresh_dirty.discard(name)
                 await self._refresh_server_tools(name)
         finally:
-            self._tools_refresh_running.discard(name)
+            # Identity guard (#868): a double-start can leave an older task
+            # for this server alive while a newer one is registered. The older
+            # one finishing must not release the NEWER task's claim — that
+            # would let a third be scheduled beside them, and cap-exempt
+            # refreshes would stack one per cycle.
+            if self._tools_refresh_tasks.get(name) is asyncio.current_task():
+                self._tools_refresh_tasks.pop(name, None)
+                self._tools_refresh_running.discard(name)
 
     async def _refresh_server_tools(self, name: str) -> None:
         """Re-list an upstream's tools and invalidate cache rows the change
@@ -2073,6 +2089,12 @@ class ProxyManager:
         is not logged.
         """
         self._background_tasks.discard(task)
+        if stage == "tools_refresh" and self._tools_refresh_tasks.get(server) is task:
+            # A task cancelled before its first step never enters the
+            # coroutine's ``finally``, so prune here too — identity-guarded for
+            # the same reason (#868).
+            self._tools_refresh_tasks.pop(server, None)
+            self._tools_refresh_running.discard(server)
         if (
             self._background_shed_warned
             and len(self._background_tasks) <= MAX_BACKGROUND_TASKS // 2
@@ -5036,11 +5058,14 @@ class ProxyManager:
         context_query: str | None,
     ) -> ExtractResult:
         """Stage 4b: optional fact extraction (background by default). Sync path
-        populates ``ok`` / ``error``; background path leaves them ``None`` (the
-        outcome arrives after the metrics row is committed; background failures
-        stay visible via ``memory_ops.extract_and_store``'s WARNING log). Like the
-        index stage, the gate reads ``cfg_snap`` but ``_extract_and_store`` keeps
-        reading live ``self._config``.
+        populates ``ok`` / ``error``; a SCHEDULED background run leaves them
+        ``None`` (the outcome arrives after the metrics row is committed;
+        background failures stay visible via ``memory_ops.extract_and_store``'s
+        WARNING log). A background run that was never scheduled — shed at the
+        cap or during ``stop()`` — reports ``False`` / ``background_shed``
+        instead, since nothing is pending (#868). Like the index stage, the
+        gate reads ``cfg_snap`` but ``_extract_and_store`` keeps reading live
+        ``self._config``.
         """
         extract_ok: bool | None = None
         extract_error: str | None = None

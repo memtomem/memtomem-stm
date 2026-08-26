@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -1370,11 +1371,14 @@ class TestBackgroundTaskBounds:
         # SECOND burst must produce its own warning.
         mgr = _make_manager(tmp_path=tmp_path)
         first_gate = asyncio.Event()
-        self._fill_to_cap(mgr, first_gate)
-        mgr._spawn_background(self._blocker(first_gate), stage="extract", server="s", tool="t")
-        assert mgr._background_shed_warned is True
-
-        first_gate.set()
+        try:
+            self._fill_to_cap(mgr, first_gate)
+            mgr._spawn_background(self._blocker(first_gate), stage="extract", server="s", tool="t")
+            assert mgr._background_shed_warned is True
+        finally:
+            # Release even if the assert fails, so the blockers do not leak
+            # into the loop teardown as pending tasks.
+            first_gate.set()
         await asyncio.gather(*list(mgr._background_tasks), return_exceptions=True)
         await asyncio.sleep(0)
         assert mgr._background_shed_warned is False, "latch never re-armed"
@@ -1451,8 +1455,7 @@ class TestBackgroundTaskBounds:
         # tools_refresh bypasses the CAP deliberately, but it must not bypass
         # the DRAIN: it adds to the same set, so one scheduled mid-drain lands
         # where stop() has already passed and nothing cancels it. Probe from
-        # inside the drain. The dirty flag stays set and ``running`` is not
-        # claimed, so the notification is deferred, not lost.
+        # inside the drain.
         mgr = _make_manager(tmp_path=tmp_path)
         observed: dict[str, object] = {}
 
@@ -1461,8 +1464,9 @@ class TestBackgroundTaskBounds:
                 await asyncio.sleep(3600)
             except asyncio.CancelledError:
                 mgr._schedule_tools_refresh("srv")
+                # Snapshot INSIDE the drain: these are the values that decide
+                # whether a refresh task was created behind stop()'s back.
                 observed["tasks"] = len(mgr._background_tasks)
-                observed["dirty"] = "srv" in mgr._tools_refresh_dirty
                 observed["running"] = "srv" in mgr._tools_refresh_running
                 raise
 
@@ -1475,10 +1479,16 @@ class TestBackgroundTaskBounds:
             "a refresh was scheduled mid-drain — it would never be cancelled "
             f"(set held {observed['tasks']} task(s))"
         )
-        assert observed["dirty"] is True, "the notification was dropped instead of deferred"
         assert observed["running"] is False, (
             "claiming ``running`` without a task would block every later refresh"
         )
+        # The refusal is not a permanent block: once stop() has finished, a
+        # fresh notification schedules normally.
+        task = mgr._schedule_tools_refresh("srv")  # noqa: F841 - state asserted below
+        assert len(mgr._background_tasks) == 1
+        for pending in list(mgr._background_tasks):
+            pending.cancel()
+        await asyncio.gather(*list(mgr._background_tasks), return_exceptions=True)
 
     async def test_stop_reopens_the_spawn_path_when_it_finishes(self, tmp_path):
         # The closure is scoped to the drain, not to "stopped forever": a
@@ -1506,7 +1516,7 @@ class TestBackgroundTaskBounds:
         # test_stop_keeps_tracking_a_task_that_never_unwinds.)
         mgr = _make_manager(tmp_path=tmp_path)
         spawned: list[asyncio.Task] = []
-        generations = 12  # more chained respawns than a single drain pass
+        generations = 12  # more chained respawns than a single drain round
 
         def _respawn() -> None:
             if len(spawned) >= generations:
@@ -1528,11 +1538,12 @@ class TestBackgroundTaskBounds:
         with caplog.at_level("WARNING", logger="memtomem_stm.proxy.manager"):
             await mgr.stop()
 
-        # More than the loop's 8 passes proves the give-up branch was reached;
-        # the exact count is an implementation detail of how many passes run.
+        # Several generations prove the chain really did outrun individual
+        # drain rounds; the exact count depends on how many rounds the
+        # deadline allows.
         assert len(spawned) > 8, (
             f"only {len(spawned)} generations — the respawn chain never outran a "
-            "single drain pass, so this test would pass without the fix"
+            "single drain round, so this test would pass without the fix"
         )
         assert all(t.cancelled() for t in spawned), (
             "survivors must be cancelled, not merely done or abandoned: "
@@ -1575,6 +1586,127 @@ class TestBackgroundTaskBounds:
             straggler.cancel()
             with contextlib.suppress(BaseException):
                 await straggler
+
+    async def test_double_start_cancels_live_refreshes(self, tmp_path):
+        # The double-start guard replaces the connections a refresh is running
+        # against. Dropping only its ``running`` claim would leave the task
+        # alive AND let the next notification schedule a second cap-exempt
+        # refresh beside it — one more per start cycle.
+        mgr = _make_manager(servers={}, tmp_path=tmp_path)
+        await mgr.start()  # first start: _stack is set, so the next one guards
+
+        straggler = asyncio.create_task(asyncio.sleep(3600))
+        mgr._tools_refresh_tasks["srv"] = straggler
+        mgr._tools_refresh_running.add("srv")
+        try:
+            await mgr.start()
+            # cancel() only REQUESTS cancellation; let it unwind before
+            # asserting, so this pins "was cancelled", not scheduler timing.
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(straggler, timeout=5.0)
+
+            assert straggler.cancelled(), (
+                "a refresh task survived the double-start guard and now runs "
+                "against replaced connections"
+            )
+            assert not mgr._tools_refresh_tasks
+            assert "srv" not in mgr._tools_refresh_running
+        finally:
+            if not straggler.done():
+                straggler.cancel()
+            with contextlib.suppress(BaseException):
+                await straggler
+            await mgr.stop()
+
+    async def test_shed_background_extract_is_not_reported_as_pending(self, tmp_path):
+        # Symmetric to the auto-index shed test in test_auto_index_background:
+        # a background extraction that was never scheduled must not leave
+        # extract_ok/extract_error at None, which is the tri-state meaning
+        # "the outcome arrives later". The coroutine is closed before it can
+        # record its attempt, so the stage records it instead.
+        from memtomem_stm.proxy.config import ExtractionConfig, ProxyConfig
+        from memtomem_stm.proxy.manager import MAX_BACKGROUND_TASKS
+
+        mgr = _make_manager(tmp_path=tmp_path)
+        mgr._index_engine = AsyncMock()
+        mgr._connections["srv"] = UpstreamConnection(
+            name="srv",
+            config=UpstreamServerConfig(prefix="test"),
+            session=AsyncMock(),
+            tools=[],
+        )
+        cfg_snap = ProxyConfig(
+            config_path=tmp_path / "proxy.json",
+            upstream_servers={"srv": UpstreamServerConfig(prefix="test")},
+            extraction=ExtractionConfig(
+                enabled=True, background=True, min_response_chars=0, memory_dir=tmp_path / "f"
+            ),
+        )
+        tool_cfg = replace(
+            mgr._resolve_tool_config("srv", "t", cfg_snap),
+            extraction_enabled=True,
+        )
+        gate = asyncio.Event()
+        fillers = [
+            mgr._spawn_background(self._blocker(gate), stage="extract", server="s", tool="t")
+            for _ in range(MAX_BACKGROUND_TASKS)
+        ]
+        try:
+            result = await mgr._run_extract_stage(
+                server="srv",
+                tool="t",
+                upstream_args={},
+                tc=tool_cfg,
+                cfg_snap=cfg_snap,
+                cleaned="x" * 200,
+                context_query=None,
+            )
+
+            assert result.ok is False, "a shed extract must not look like pending work"
+            assert result.error == "background_shed"
+            snap = mgr.index_observability.snapshot()
+            assert snap["attempts"]["__total__"] == {"extract": 1}
+            assert snap["outcomes"]["__total__"] == {"shed": 1}
+        finally:
+            gate.set()
+            await asyncio.gather(*fillers, return_exceptions=True)
+
+    async def test_older_refresh_finishing_does_not_free_the_newer_one(self, tmp_path):
+        # Double-start can leave an older refresh task alive while a newer one
+        # is registered for the same server. When the older one finishes, its
+        # ``finally`` must NOT release the newer task's claim — that would let
+        # a third cap-exempt refresh be scheduled beside them, one per cycle.
+        # Exercised through the real task/callback path, not a synthetic map
+        # entry, since that interaction is what the guard protects.
+        mgr = _make_manager(tmp_path=tmp_path)
+        session = AsyncMock()
+        session.list_tools = AsyncMock(return_value=SimpleNamespace(tools=[]))
+        mgr._connections["srv"] = UpstreamConnection(
+            name="srv", config=UpstreamServerConfig(prefix="srv"), session=session, tools=[]
+        )
+
+        mgr._schedule_tools_refresh("srv")
+        older = mgr._tools_refresh_tasks["srv"]
+
+        # Simulate the double-start window: a newer task registered for the
+        # same server while the older one is still pending.
+        newer = asyncio.create_task(asyncio.sleep(3600))
+        mgr._tools_refresh_tasks["srv"] = newer
+        mgr._background_tasks.add(newer)
+        try:
+            await asyncio.gather(older, return_exceptions=True)
+            await asyncio.sleep(0)
+
+            assert "srv" in mgr._tools_refresh_running, (
+                "the older task's finally released the newer task's claim"
+            )
+            assert mgr._tools_refresh_tasks["srv"] is newer, (
+                "the older task pruned the newer map entry"
+            )
+        finally:
+            newer.cancel()
+            with contextlib.suppress(BaseException):
+                await newer
 
     async def test_finished_refresh_releases_its_running_claim(self, tmp_path):
         # The other half: a refresh that DID finish must release the claim, or
