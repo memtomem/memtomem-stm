@@ -37,12 +37,18 @@ _SOURCE_INDEX = (
     "CREATE INDEX IF NOT EXISTS idx_metrics_source_created ON proxy_metrics(source, created_at)"
 )
 
-# Index names as they appear in the two CREATE statements above, parsed from
+# Backs the predecessor lookup that schedules the per-write trim. The
+# (source, created_at) index above cannot serve it: ordering by id inside a
+# source degrades to scanning the whole partition there — measured 1.00 ms at
+# the 10,000 cap, against 0.0023 ms with this one.
+_SOURCE_ID_INDEX = "CREATE INDEX IF NOT EXISTS idx_metrics_source_id ON proxy_metrics(source, id)"
+
+# Index names as they appear in the CREATE statements above, parsed from
 # them rather than repeated: the fingerprint has to describe the indexes the
 # slow path actually builds, and a hand-copied second list would drift.
 _INDEX_NAMES = tuple(
     ddl.split("CREATE INDEX IF NOT EXISTS ", 1)[1].split(maxsplit=1)[0]
-    for ddl in (_INDEX, _SOURCE_INDEX)
+    for ddl in (_INDEX, _SOURCE_INDEX, _SOURCE_ID_INDEX)
 )
 
 # Columns declared by _CREATE above. Kept beside it so the fingerprint below
@@ -142,6 +148,11 @@ def _schema_fingerprint() -> str:
 
 
 _SCHEMA_FINGERPRINT = _schema_fingerprint()
+
+
+# Ceiling on how many inserts one per-write trim may cover. See
+# ``MetricsStore._trim_interval``.
+_MAX_TRIM_INTERVAL = 64
 
 
 def _tristate(value: bool | None) -> int | None:
@@ -392,6 +403,7 @@ class MetricsStore:
                 # so the index backing the per-source _trim scan can only be
                 # created after _migrate has run.
                 db.execute(_SOURCE_INDEX)
+                db.execute(_SOURCE_ID_INDEX)
                 # Stamp LAST. This is an ORDERING guarantee, not an atomic one:
                 # the base DDL above and _migrate each commit before this runs,
                 # so a failure part-way leaves that partial DDL committed. What
@@ -530,7 +542,7 @@ class MetricsStore:
         require_utf8_identifier(metrics.source, "source")
         now = time.time()
         with self._lock:
-            self._db.execute(
+            cursor = self._db.execute(
                 "INSERT INTO proxy_metrics "
                 "(server, tool, original_chars, compressed_chars, cleaned_chars, "
                 "is_error, error_category, error_code, error_message, trace_id, "
@@ -580,8 +592,101 @@ class MetricsStore:
                     now,
                 ),
             )
-            self._db.commit()
-            self._trim(metrics.source)
+            # One transaction for the insert and the trim it may trigger. If the
+            # DELETE fails, the crossing row goes with it: left committed it
+            # would become the next row's predecessor, land in the same bucket
+            # and consume the crossing, so a failing trim could defer itself
+            # indefinitely. Losing one best-effort metrics row is the cheaper
+            # side of that trade. Also one commit instead of two.
+            try:
+                if self._should_trim(metrics.source, cursor.lastrowid):
+                    self._trim_statement(self._db, metrics.source)
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def _trim_interval(self) -> int:
+        """How many inserts one trim is allowed to cover, as a divisor of the cap.
+
+        The trim's cost is its ``COUNT(*)``, a covering-index scan proportional
+        to the partition — 0.39 ms at the default 10,000 cap, and it grows with
+        ``max_history``. Running it once per interval amortizes that, at the
+        price of letting a partition sit above the cap between trims.
+
+        Deriving the interval from the cap keeps that excess proportional (~1%)
+        rather than absolute: a 100-row cap trims on every write and stays
+        exact, while the default cap trims every 64th. The ceiling bounds the
+        interval where the proportion stops mattering, so an enormous cap
+        cannot defer trimming further and further.
+        """
+        return max(1, min(_MAX_TRIM_INTERVAL, self._max_history // 100))
+
+    def _previous_row_id(self, source: str, before_id: int) -> int | None:
+        """Id of this source's newest row *older than* ``before_id``.
+
+        A seek in ``idx_metrics_source_id``, which covers both columns —
+        0.0023 ms against a partition at the 10,000 cap, versus 0.38 ms for the
+        ``COUNT(*)`` the trim itself runs. That ratio is what makes the
+        scheduling in ``_should_trim`` affordable on every write.
+
+        Keyed on ``id < before_id`` rather than on "the second-newest row",
+        which is only the caller's predecessor when nothing else interleaves.
+        Two writers that both commit before either asks would otherwise each
+        see the same newer row — one of them comparing itself against itself —
+        and both skip a crossing they should have taken. Ids are a total order
+        and are assigned by the INSERT, so this answer is caller-relative
+        whatever the other writers or their clocks do.
+        """
+        if self._db is None:
+            return None
+        row = self._db.execute(
+            "SELECT MAX(id) FROM proxy_metrics WHERE source = ? AND id < ?",
+            (source, before_id),
+        ).fetchone()
+        return None if row is None or row[0] is None else int(row[0])
+
+    def _should_trim(self, source: str, row_id: int | None) -> bool:
+        """Whether the row just inserted is the one that pays for the trim.
+
+        Fires when this source's rows cross a multiple of ``interval`` — that
+        is, when the new row falls in a different ``id // interval`` bucket than
+        this source's previous row. Ids come from AUTOINCREMENT, so they advance
+        by exactly one per insert *no matter which process wrote it*.
+
+        This bounds **every** source at ``cap + interval`` while it is being
+        written, with no state to keep: a source can add at most ``interval - 1``
+        rows inside one bucket, and its next row is necessarily in the next
+        bucket and trims. Two rules that look equivalent do not hold:
+
+        - A random sample (``random() < 1/interval``) has a geometric tail and
+          so no bound at all — 65 straight misses at interval 64 alone would
+          have probability ~36%.
+        - "Fire when ``id % interval == 0``" silently starves a source whose
+          rows never land on a multiple. Reproduced at interval 5 with a source
+          taking every 5th insert (ids 1, 6, 11, … — always 1 mod 5): it never
+          trimmed, reaching 700 rows against a cap of 500 and still climbing.
+          An in-memory watermark fixes that only for a store that writes a
+          source more than once, which is exactly what ``mms hook`` — one row
+          per subprocess — never does.
+
+        Deriving the schedule from the table instead of from memory is what
+        makes the one-shot writer behave like the long-lived one. It is also why
+        ``record`` commits the insert and the trim together: a crossing row that
+        stayed committed after its own DELETE failed would become the next row's
+        predecessor, put it in the same bucket, and silently consume the
+        crossing. Rolling both back leaves the next write to cross again.
+
+        ``lastrowid`` is ``None`` only if the INSERT produced no row, in which
+        case there is nothing to trim for.
+        """
+        interval = self._trim_interval()
+        if interval <= 1:
+            return True
+        if row_id is None:
+            return False
+        previous = self._previous_row_id(source, row_id)
+        return previous is None or row_id // interval != previous // interval
 
     def _trim(self, source: str) -> None:
         """Enforce ``max_history`` per ``source``, scoped to the writer's own.
@@ -597,12 +702,31 @@ class MetricsStore:
         just-written source means neither writer can evict the other's rows;
         the table's worst case becomes ``max_history × distinct sources``
         (currently two).
+
+        ``record`` runs this only on rows that cross an interval boundary (see
+        ``_should_trim``) rather than on every write, so a partition can sit
+        above the cap in between — by at most ``interval - 1`` further writes
+        from that source, not by a fixed number of table inserts, since an
+        interleaved source can cross on consecutive writes of its own. The
+        statement always removes the *full* excess, so one firing returns the
+        partition to the cap rather than converging a row at a time; the
+        reconcile pass in ``initialize`` remains exact.
+
+        The residual this leaves: a source that stops being written to keeps
+        whatever excess it had at its last insert — at most one interval's
+        rows — until some cap-authoritative opener reconciles. Nothing removes
+        it in a hook-only deployment that never starts a server or ``mms tune``.
         """
         if self._db is None:
             return
         self._trim_source(self._db, source)
 
-    def _trim_source(self, db: sqlite3.Connection, source: str) -> None:
+    def _trim_statement(self, db: sqlite3.Connection, source: str) -> None:
+        """The DELETE alone, leaving the transaction open for the caller.
+
+        Split from ``_trim_source`` so ``record`` can commit it together with
+        the insert that triggered it; the reconcile path wants its own commit.
+        """
         # The excess is computed INSIDE the DELETE so count-and-delete is one
         # atomic statement: reconciliation runs from every initialize and the
         # hook opens a short-lived store per call, so two processes can trim
@@ -617,6 +741,9 @@ class MetricsStore:
             "LIMIT max(0, (SELECT COUNT(*) FROM proxy_metrics WHERE source = ?) - ?))",
             (source, source, self._max_history),
         )
+
+    def _trim_source(self, db: sqlite3.Connection, source: str) -> None:
+        self._trim_statement(db, source)
         db.commit()
 
     def get_tool_profiles(self, since_seconds: float = 86400.0) -> list[dict]:

@@ -97,7 +97,7 @@ Status meanings:
 | `MEMTOMEM_STM_PROXY__EXTRACTION__MAX_INPUT_CHARS` | positive integer | `20000` | Maximum extractor input size. | Library |
 | `MEMTOMEM_STM_PROXY__METRICS__ENABLED` | boolean | `true` | Record proxy metrics. | Bundled |
 | `MEMTOMEM_STM_PROXY__METRICS__DB_PATH` | path | `~/.memtomem/proxy_metrics.db` | Proxy metrics SQLite file. | Bundled |
-| `MEMTOMEM_STM_PROXY__METRICS__MAX_HISTORY` | positive integer | `10000` | Maximum retained metric rows. | Bundled |
+| `MEMTOMEM_STM_PROXY__METRICS__MAX_HISTORY` | positive integer | `10000` | Retained metric rows to keep **per source** (`mcp`, `hook`), enforced approximately on write and exactly when a server or `mms tune` opens the store. | Bundled |
 | `MEMTOMEM_STM_PROXY__COMPRESSION_FEEDBACK__ENABLED` | boolean | `true` | Record compression feedback. | Bundled |
 | `MEMTOMEM_STM_PROXY__COMPRESSION_FEEDBACK__DB_PATH` | path | `~/.memtomem/stm_feedback.db` | Compression-feedback SQLite file. | Bundled |
 | `MEMTOMEM_STM_PROXY__COMPRESSION_FEEDBACK__RETENTION_DAYS` | non-negative integer | `90` | Compression-feedback retention period. | Bundled |
