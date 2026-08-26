@@ -2119,8 +2119,8 @@ def _render_surfacing_block(summary: dict[str, Any]) -> None:
             )
         else:
             click.echo(
-                "    all listed fault episodes recovered — a later surfacing "
-                "succeeded on the same server/tool"
+                "    all listed fault episodes recovered — surfacing has since "
+                "completed a successful LTM round trip"
             )
     diagnostics = summary.get("diagnostics") or {}
     if diagnostics:

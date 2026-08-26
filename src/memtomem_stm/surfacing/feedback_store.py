@@ -8,6 +8,7 @@ import re
 import sqlite3
 import threading
 import time
+from collections.abc import Iterable
 from pathlib import Path
 from typing import TypedDict
 
@@ -642,23 +643,56 @@ class FeedbackStore:
         Already-closed rows are left alone (``last_recovered_at`` is only
         advanced while the episode is open), so re-running this on an
         unchanged key writes nothing.
+
+        A row is a day-aggregate shared by every process writing this DB, so
+        closing it closes what a peer recorded for the same key too. That is
+        the granularity the table has; the peer's next fault on that key
+        reopens the episode through :meth:`record_fault`'s reset.
+        """
+        self.record_fault_recoveries(((server, tool, kinds),), recovered_at=recovered_at)
+
+    def record_fault_recoveries(
+        self,
+        entries: Iterable[tuple[str, str, frozenset[str]]],
+        *,
+        recovered_at: float,
+    ) -> None:
+        """Close several keys' episodes in ONE transaction.
+
+        The engine closes the successful key and the keys its breaker turned
+        away together. Committing them separately would let a mid-batch
+        failure leave the DB half-recovered, and a restart before the retry
+        would show the survivors as broken with the breaker long closed.
+        Per-key semantics are :meth:`record_fault_recovery`'s.
         """
         if self._db is None:
             return
-        if has_lone_surrogate(server) or has_lone_surrogate(tool):
-            return
-        selected = sorted(kinds & FAULT_KINDS)
-        if not selected:
-            return
-        kind_placeholders = ", ".join("?" for _ in selected)
-        with self._lock:
-            self._db.execute(
-                "UPDATE surfacing_faults SET last_recovered_at = ? "
-                f"WHERE server = ? AND tool = ? AND kind IN ({kind_placeholders}) "
-                "AND last_at <= ? "
-                "AND (last_recovered_at IS NULL OR last_recovered_at < last_at)",
-                (recovered_at, server, tool, *selected, recovered_at),
+        statements: list[tuple[str, tuple[object, ...]]] = []
+        for server, tool, kinds in entries:
+            if has_lone_surrogate(server) or has_lone_surrogate(tool):
+                continue
+            selected = sorted(kinds & FAULT_KINDS)
+            if not selected:
+                continue
+            kind_placeholders = ", ".join("?" for _ in selected)
+            statements.append(
+                (
+                    "UPDATE surfacing_faults SET last_recovered_at = ? "
+                    f"WHERE server = ? AND tool = ? AND kind IN ({kind_placeholders}) "
+                    "AND last_at <= ? "
+                    "AND (last_recovered_at IS NULL OR last_recovered_at < last_at)",
+                    (recovered_at, server, tool, *selected, recovered_at),
+                )
             )
+        if not statements:
+            return
+        with self._lock:
+            try:
+                for sql, params in statements:
+                    self._db.execute(sql, params)
+            except Exception:
+                self._db.rollback()
+                raise
             self._db.commit()
 
     def _record_signal(

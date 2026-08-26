@@ -86,16 +86,39 @@ def _fault_rows(db_path: Path) -> list[tuple[str, str, str, int]]:
 
 
 def _recovery_call_counter(tracker: FeedbackTracker):
-    """Count ``record_fault_recovery`` calls from here on, keeping the write."""
-    real = tracker.record_fault_recovery
+    """Count engine recovery batches from here on, keeping the write."""
+    real = tracker.record_fault_recoveries
     calls = {"n": 0}
 
-    def counting(server: str, tool: str, **kwargs) -> None:
+    def counting(entries, **kwargs) -> None:
         calls["n"] += 1
-        real(server, tool, **kwargs)
+        real(entries, **kwargs)
 
-    tracker.record_fault_recovery = counting  # type: ignore[method-assign]
+    tracker.record_fault_recoveries = counting  # type: ignore[method-assign]
     return lambda: calls["n"]
+
+
+class _FailNthRecoveryUpdate:
+    """sqlite3.Connection proxy that fails the Nth recovery UPDATE.
+
+    ``Connection.execute`` is a read-only attribute, so the interruption has
+    to be injected around the connection rather than onto it.
+    """
+
+    def __init__(self, db, *, fail_on: int) -> None:
+        self._db = db
+        self._fail_on = fail_on
+        self.attempts = 0
+
+    def execute(self, sql, *args):
+        if sql.startswith("UPDATE surfacing_faults SET last_recovered_at"):
+            self.attempts += 1
+            if self.attempts == self._fail_on:
+                raise sqlite3.OperationalError("disk I/O error")
+        return self._db.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
 
 
 def _other_args(marker: str) -> dict:
@@ -576,6 +599,46 @@ class TestEngineFaultPersistence:
             "error_other": 1
         }
 
+    async def test_a_mid_batch_failure_leaves_no_partial_recovery(self, tmp_path):
+        """The probe key and the blocked keys close in one transaction.
+
+        Committing them one by one would let a failure part-way through leave
+        the survivors reading broken with the breaker already closed — and a
+        restart before the in-process retry would make that permanent.
+        """
+        adapter = AsyncMock()
+        adapter.search = AsyncMock(return_value=([], [], "empty_results"))
+        config = _make_config(tmp_path)
+        tracker = FeedbackTracker(config)
+        tracker.record_fault("gh", "read_file", "error_timeout")
+        tracker.record_fault("gh", "blocked_tool", "circuit_open")
+        engine = SurfacingEngine(config=config, mcp_adapter=adapter, feedback_tracker=tracker)
+        engine._breaker_blocked_keys.add(("gh", "blocked_tool"))
+
+        real_db = tracker.store._db
+        failing = _FailNthRecoveryUpdate(real_db, fail_on=2)
+        tracker.store._db = failing  # type: ignore[assignment]
+        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        tracker.store._db = real_db  # type: ignore[assignment]
+        assert failing.attempts == 2  # the batch really did reach the second key
+
+        # Neither key recovered — not the one whose UPDATE had already run.
+        assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {
+            "error_timeout": 1,
+            "circuit_open": 1,
+        }
+        # The blocked key is still owed a recovery, so the next success pays it.
+        assert engine._breaker_blocked_keys == {("gh", "blocked_tool")}
+        await engine.surface("gh", "read_file", _other_args("retry"), LONG_RESPONSE)
+        assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {}
+
+    async def test_trackerless_engine_does_not_accumulate_blocked_keys(self, tmp_path):
+        # Nothing durable exists to recover, and the recovery path returns
+        # before the set is spent — so it must never fill up.
+        engine = SurfacingEngine(config=_make_config(tmp_path), mcp_adapter=AsyncMock())
+        engine._persist_fault("gh", "read_file", "circuit_open")
+        assert engine._breaker_blocked_keys == set()
+
     async def test_recovery_is_reattempted_on_every_miss_path_success(self, tmp_path):
         """No once-per-process latch: another process can open an episode on
         this key at any time, and this process must still close it."""
@@ -648,16 +711,16 @@ class TestEngineFaultPersistence:
         tracker.record_fault("gh", "read_file", "error_timeout")
         engine = SurfacingEngine(config=config, mcp_adapter=adapter, feedback_tracker=tracker)
 
-        real = tracker.record_fault_recovery
+        real = tracker.record_fault_recoveries
         failures = {"left": 1}
 
-        def flaky(server, tool, **kwargs):
+        def flaky(entries, **kwargs):
             if failures["left"]:
                 failures["left"] -= 1
                 raise sqlite3.OperationalError("database is locked")
-            real(server, tool, **kwargs)
+            real(entries, **kwargs)
 
-        tracker.record_fault_recovery = flaky  # type: ignore[method-assign]
+        tracker.record_fault_recoveries = flaky  # type: ignore[method-assign]
         await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {
             "error_timeout": 1

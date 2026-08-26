@@ -16,6 +16,7 @@ from memtomem_stm.proxy.privacy import contains_sensitive_content
 from memtomem_stm.surfacing.cache import SurfacingCache
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.context_extractor import ContextExtractor
+from memtomem_stm.surfacing.feedback_store import FAULT_KINDS
 from memtomem_stm.surfacing.formatter import SurfacingFormatter
 from memtomem_stm.surfacing.mcp_client import (
     KNOWN_SCORE_SCALES,
@@ -366,18 +367,20 @@ class SurfacingEngine:
         branches already returning the original response, so any store error
         degrades to a missing counter, never a raised exception.
         """
-        # Remember whom this engine's breaker turned away, so the success that
-        # closes the breaker can close their episodes too (see the field's
-        # comment). Before the tracker guard, so the set stays correct
-        # regardless of persistence backend.
-        if kind == "circuit_open":
-            self._breaker_blocked_keys.add((server, tool))
         if self._feedback_tracker is None:
             return
         try:
             self._feedback_tracker.record_fault(server, tool, kind)
         except Exception:
             logger.debug("Failed to persist surfacing fault counter", exc_info=True)
+            return
+        # Remember whom this engine's breaker turned away, so the success that
+        # closes the breaker can close their episodes too (see the field's
+        # comment). Only after the row is actually on disk: there is nothing to
+        # recover otherwise, and a trackerless engine must not accumulate keys
+        # its recovery path will never spend.
+        if kind == "circuit_open":
+            self._breaker_blocked_keys.add((server, tool))
 
     def _persist_diagnostic(self, server: str, tool: str, kind: str) -> None:
         """Best-effort durable counter for advisory pipeline diagnostics."""
@@ -419,6 +422,16 @@ class SurfacingEngine:
         blocked. *succeeded_at* is when the round trip completed, so a fault
         recorded after it (here or in a peer process) stays active.
 
+        Ownership is per key, not per process: rows are day-aggregates shared
+        by everything writing this DB, so closing a key this engine blocked
+        also closes what a peer recorded for that same key. Keys only a peer
+        blocked are never touched, which is the isolation the table's
+        granularity actually supports.
+
+        The whole batch goes in one store transaction — a mid-batch failure
+        that committed the earlier keys would leave the rest reading broken
+        with the breaker long closed.
+
         Deliberately unlatched. A "close it once per key per process" latch
         would go stale the moment ANOTHER process wrote a fault for the same
         key — the rows are shared, so this process would skip the UPDATE that
@@ -430,15 +443,13 @@ class SurfacingEngine:
         if self._feedback_tracker is None:
             return
         blocked = self._breaker_blocked_keys - {(server, tool)}
+        entries = [(server, tool, FAULT_KINDS)]
+        entries.extend(
+            (blocked_server, blocked_tool, _CIRCUIT_OPEN_KIND)
+            for blocked_server, blocked_tool in sorted(blocked)
+        )
         try:
-            self._feedback_tracker.record_fault_recovery(server, tool, recovered_at=succeeded_at)
-            for blocked_server, blocked_tool in sorted(blocked):
-                self._feedback_tracker.record_fault_recovery(
-                    blocked_server,
-                    blocked_tool,
-                    recovered_at=succeeded_at,
-                    kinds=_CIRCUIT_OPEN_KIND,
-                )
+            self._feedback_tracker.record_fault_recoveries(entries, recovered_at=succeeded_at)
         except Exception:
             logger.debug("Failed to persist surfacing fault recovery", exc_info=True)
             return
