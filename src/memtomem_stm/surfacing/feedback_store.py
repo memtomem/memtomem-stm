@@ -610,44 +610,54 @@ class FeedbackStore:
             )
             self._db.commit()
 
-    def record_fault_recovery(self, server: str, tool: str) -> None:
-        """Mark the open fault episodes closed by a successful surfacing.
+    def record_fault_recovery(
+        self,
+        server: str,
+        tool: str,
+        *,
+        recovered_at: float,
+        kinds: frozenset[str] = FAULT_KINDS,
+    ) -> None:
+        """Mark the fault episodes disproved by a successful surfacing closed.
 
-        Called from the one engine path that proves a full LTM round trip
-        succeeded, so it closes *every* :data:`FAULT_KINDS` episode for
-        ``(server, tool)`` in one statement: a healthy round trip disproves
-        each degraded-dependency kind at once, and they are not independently
-        observable from the success side.
+        By default closes *every* :data:`FAULT_KINDS` episode for
+        ``(server, tool)`` in one statement: the caller has proved a full LTM
+        round trip succeeded, which disproves each degraded-dependency kind at
+        once, and they are not independently observable from the success side.
+        The engine narrows *kinds* to ``circuit_open`` for the keys its breaker
+        blocked, which the success proves nothing else about.
 
-        Strictly scoped to ``(server, tool)``, including ``circuit_open``.
-        That kind is recorded before query extraction and the breaker is
-        engine-global, so an un-keyed sweep looked tempting — but the rows are
-        shared by every process pointing at this DB, and one process's healthy
-        round trip is no evidence about a peer's breaker. Both live
-        ``circuit_open`` keys surface successfully on their own, so the sweep
-        would have bought no extra coverage for the false all-clear it costs.
+        Always keyed — an un-keyed sweep would let one process's healthy round
+        trip stamp a peer's still-open episode, and the rows are shared by
+        everything pointing at this DB.
 
-        ``last_at <= now`` (with *now* read under the lock) keeps a fault that
-        lands after this call active: writers serialize on the same lock, so a
-        later fault either misses this UPDATE or, having gone through
-        :meth:`record_fault`, clears the stamp it just wrote. A fault sharing
-        this call's timestamp — possible on a coarse clock — is stamped
-        recovered; these counters are advisory, and the next fault reopens the
-        episode.
+        *recovered_at* is the moment the round trip succeeded, not the moment
+        of this write, and rows are matched with ``last_at <= recovered_at``:
+        a fault recorded after that instant — by this process or a peer, whose
+        writes this store's lock does not order — stays active, because the
+        success is no evidence about it. A fault sharing the timestamp exactly,
+        which a coarse clock makes possible, is stamped recovered; these
+        counters are advisory and the next fault reopens the episode.
+
+        Already-closed rows are left alone (``last_recovered_at`` is only
+        advanced while the episode is open), so re-running this on an
+        unchanged key writes nothing.
         """
         if self._db is None:
             return
         if has_lone_surrogate(server) or has_lone_surrogate(tool):
             return
-        kinds = sorted(FAULT_KINDS)
-        kind_placeholders = ", ".join("?" for _ in kinds)
+        selected = sorted(kinds & FAULT_KINDS)
+        if not selected:
+            return
+        kind_placeholders = ", ".join("?" for _ in selected)
         with self._lock:
-            now = time.time()
             self._db.execute(
                 "UPDATE surfacing_faults SET last_recovered_at = ? "
                 f"WHERE server = ? AND tool = ? AND kind IN ({kind_placeholders}) "
-                "AND last_at <= ?",
-                (now, server, tool, *kinds, now),
+                "AND last_at <= ? "
+                "AND (last_recovered_at IS NULL OR last_recovered_at < last_at)",
+                (recovered_at, server, tool, *selected, recovered_at),
             )
             self._db.commit()
 

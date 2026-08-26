@@ -7,6 +7,7 @@ from pathlib import Path
 
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.feedback_store import (
+    FAULT_KINDS,
     FeedbackDbStatus,
     FeedbackStore,
     inspect_feedback_db,
@@ -79,8 +80,15 @@ class FeedbackTracker:
     def record_fault(self, server: str, tool: str, kind: str) -> None:
         self._store.record_fault(server, tool, kind)
 
-    def record_fault_recovery(self, server: str, tool: str) -> None:
-        self._store.record_fault_recovery(server, tool)
+    def record_fault_recovery(
+        self,
+        server: str,
+        tool: str,
+        *,
+        recovered_at: float,
+        kinds: frozenset[str] = FAULT_KINDS,
+    ) -> None:
+        self._store.record_fault_recovery(server, tool, recovered_at=recovered_at, kinds=kinds)
 
     def record_diagnostic(self, server: str, tool: str, kind: str) -> None:
         self._store.record_diagnostic(server, tool, kind)

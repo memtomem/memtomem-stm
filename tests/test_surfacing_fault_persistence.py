@@ -90,9 +90,9 @@ def _recovery_call_counter(tracker: FeedbackTracker):
     real = tracker.record_fault_recovery
     calls = {"n": 0}
 
-    def counting(server: str, tool: str) -> None:
+    def counting(server: str, tool: str, **kwargs) -> None:
         calls["n"] += 1
-        real(server, tool)
+        real(server, tool, **kwargs)
 
     tracker.record_fault_recovery = counting  # type: ignore[method-assign]
     return lambda: calls["n"]
@@ -172,6 +172,62 @@ class TestRecordFaultRecovery:
     that ended days ago as ongoing breakage (#869).
     """
 
+    def test_repeating_recovery_leaves_a_closed_row_untouched(self, tmp_path, monkeypatch):
+        # Recovery runs on every healthy miss, so it must be a no-op once the
+        # episode is closed rather than re-stamping every historical row.
+        clock = [1_700_000_000.0]
+        monkeypatch.setattr(
+            "memtomem_stm.surfacing.feedback_store.time.time",
+            lambda: clock[0],
+        )
+        db_path = tmp_path / "f.db"
+        store = FeedbackStore(db_path)
+        store.initialize()
+        store.record_fault("gh", "read_file", "error_timeout")
+        clock[0] += 10.0
+        store.record_fault_recovery("gh", "read_file", recovered_at=clock[0])
+        stamped = store._db.execute("SELECT last_recovered_at FROM surfacing_faults").fetchone()[0]
+
+        clock[0] += 10.0
+        store.record_fault_recovery("gh", "read_file", recovered_at=clock[0])
+        assert (
+            store._db.execute("SELECT last_recovered_at FROM surfacing_faults").fetchone()[0]
+            == stamped
+        )
+        # Positive control: a new fault reopens the episode, and the next
+        # recovery does advance the stamp.
+        clock[0] += 10.0
+        store.record_fault("gh", "read_file", "error_timeout")
+        clock[0] += 10.0
+        store.record_fault_recovery("gh", "read_file", recovered_at=clock[0])
+        assert (
+            store._db.execute("SELECT last_recovered_at FROM surfacing_faults").fetchone()[0]
+            > stamped
+        )
+        store.close()
+
+    def test_recovery_only_covers_the_requested_kinds(self, tmp_path, monkeypatch):
+        # The engine closes ONLY ``circuit_open`` for keys its breaker blocked:
+        # the probe that closed the breaker says nothing about their timeouts.
+        monkeypatch.setattr(
+            "memtomem_stm.surfacing.feedback_store.time.time",
+            lambda: 1_700_000_000.0,
+        )
+        db_path = tmp_path / "f.db"
+        store = FeedbackStore(db_path)
+        store.initialize()
+        store.record_fault("gh", "read_file", "circuit_open")
+        store.record_fault("gh", "read_file", "error_timeout")
+
+        store.record_fault_recovery(
+            "gh",
+            "read_file",
+            recovered_at=1_700_000_000.0,
+            kinds=frozenset({"circuit_open"}),
+        )
+        assert read_surfacing_summary(db_path)["active_faults"] == {"error_timeout": 1}
+        store.close()
+
     def test_recovery_closes_episode_and_a_new_fault_reopens_it(self, tmp_path, monkeypatch):
         # Windows can return the same time.time() for adjacent writes, so the
         # re-open must come from ``record_fault``'s explicit recovery reset,
@@ -186,7 +242,7 @@ class TestRecordFaultRecovery:
         store.record_fault("gh", "read_file", "error_timeout")
         assert read_surfacing_summary(db_path)["active_faults"] == {"error_timeout": 1}
 
-        store.record_fault_recovery("gh", "read_file")
+        store.record_fault_recovery("gh", "read_file", recovered_at=1_700_000_000.0)
         summary = read_surfacing_summary(db_path)
         assert summary["active_faults"] == {}
         # The historical counter is untouched — recovery closes the episode,
@@ -214,7 +270,7 @@ class TestRecordFaultRecovery:
         assert len(_fault_rows(db_path)) == 2
         assert read_surfacing_summary(db_path)["active_faults"] == {"error_timeout": 2}
 
-        store.record_fault_recovery("gh", "read_file")
+        store.record_fault_recovery("gh", "read_file", recovered_at=now[0])
         assert read_surfacing_summary(db_path)["active_faults"] == {}
         store.close()
 
@@ -229,7 +285,7 @@ class TestRecordFaultRecovery:
         store.record_fault("gh", "read_file", "error_timeout")
         store.record_diagnostic("gh", "read_file", "score_ceiling_below_min")
 
-        store.record_fault_recovery("gh", "read_file")
+        store.record_fault_recovery("gh", "read_file", recovered_at=1_700_000_000.0)
         summary = read_surfacing_summary(db_path)
         # Positive control: the fault on the same key DID close, so the
         # surviving diagnostic is a partition boundary, not an inert write.
@@ -255,10 +311,10 @@ class TestRecordFaultRecovery:
         store.record_fault("gh", "read_file", "circuit_open")
         store.record_fault("gh", "other_tool", "circuit_open")
 
-        store.record_fault_recovery("gh", "other_tool")
+        store.record_fault_recovery("gh", "other_tool", recovered_at=1_700_000_000.0)
         assert read_surfacing_summary(db_path)["active_faults"] == {"circuit_open": 1}
 
-        store.record_fault_recovery("gh", "read_file")
+        store.record_fault_recovery("gh", "read_file", recovered_at=1_700_000_000.0)
         assert read_surfacing_summary(db_path)["active_faults"] == {}
         store.close()
 
@@ -281,7 +337,7 @@ class TestRecordFaultRecovery:
         clock[0] += 10.0
         store.record_fault("gh", "read_file", "error_timeout")  # stays broken
         clock[0] += 10.0
-        store.record_fault_recovery("gl", "read_file")
+        store.record_fault_recovery("gl", "read_file", recovered_at=clock[0])
 
         assert read_surfacing_summary(db_path)["active_faults"] == {"error_timeout": 1}
         # Same collision across two servers sharing one tool name, under the
@@ -311,14 +367,14 @@ class TestRecordFaultRecovery:
 
         process_b.record_fault("gh", "read_file", "error_timeout")
         clock[0] += 10.0
-        process_a.record_fault_recovery("gh", "read_file")
+        process_a.record_fault_recovery("gh", "read_file", recovered_at=clock[0])
         assert read_surfacing_summary(db_path)["active_faults"] == {}
 
         clock[0] += 10.0
         process_b.record_fault("gh", "read_file", "error_timeout")
         assert read_surfacing_summary(db_path)["active_faults"] == {"error_timeout": 2}
         clock[0] += 10.0
-        process_a.record_fault_recovery("gh", "read_file")
+        process_a.record_fault_recovery("gh", "read_file", recovered_at=clock[0])
         assert read_surfacing_summary(db_path)["active_faults"] == {}
         process_a.close()
         process_b.close()
@@ -336,14 +392,15 @@ class TestRecordFaultRecovery:
         store.initialize()
         clock[0] = 1_700_000_100.0
         store.record_fault("gh", "read_file", "error_timeout")
-        clock[0] = 1_700_000_050.0  # recovery observed a moment earlier
-        store.record_fault_recovery("gh", "read_file")
+        # The round trip succeeded BEFORE that fault was recorded, so the
+        # boundary it passes cannot disprove it.
+        store.record_fault_recovery("gh", "read_file", recovered_at=1_700_000_050.0)
         assert read_surfacing_summary(db_path)["active_faults"] == {"error_timeout": 1}
         store.close()
 
     def test_uninitialized_store_is_noop(self, tmp_path):
         store = FeedbackStore(tmp_path / "f.db")
-        store.record_fault_recovery("gh", "read_file")  # must not raise
+        store.record_fault_recovery("gh", "read_file", recovered_at=1_700_000_000.0)  # must not raise
 
     @pytest.mark.parametrize("surrogate", ["\ud800", "\udfff"])
     def test_unencodable_key_is_refused(self, tmp_path, monkeypatch, surrogate):
@@ -357,11 +414,11 @@ class TestRecordFaultRecovery:
         store = FeedbackStore(db_path)
         store.initialize()
         store.record_fault("gh", "read_file", "error_timeout")
-        store.record_fault_recovery(f"gh{surrogate}", "read_file")
-        store.record_fault_recovery("gh", f"read_file{surrogate}")
+        store.record_fault_recovery(f"gh{surrogate}", "read_file", recovered_at=1_700_000_000.0)
+        store.record_fault_recovery("gh", f"read_file{surrogate}", recovered_at=1_700_000_000.0)
         # Positive control: an encodable key does close the same episode.
         assert read_surfacing_summary(db_path)["active_faults"] == {"error_timeout": 1}
-        store.record_fault_recovery("gh", "read_file")
+        store.record_fault_recovery("gh", "read_file", recovered_at=1_700_000_000.0)
         assert read_surfacing_summary(db_path)["active_faults"] == {}
         store.close()
 
@@ -473,6 +530,52 @@ class TestEngineFaultPersistence:
         await engine.surface("gh", "read_file", _other_args("third"), LONG_RESPONSE)
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {}
 
+    async def test_a_different_key_closing_the_breaker_closes_the_blocked_key(self, tmp_path):
+        """Open the real breaker, let it block one key, then let ANOTHER key
+        make the half-open probe.
+
+        The breaker is engine-global but ``circuit_open`` rows are per key, so
+        the prober is usually not the key that was turned away. Closing only
+        the prober's episode leaves the blocked key reading broken with the
+        breaker already closed.
+        """
+        calls = {"n": 0}
+
+        async def failing_then_ok(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("LTM exploded")
+            return [], [], "empty_results"
+
+        adapter = AsyncMock()
+        adapter.search = failing_then_ok
+        config = _make_config(tmp_path, circuit_max_failures=1, circuit_reset_seconds=60.0)
+        tracker = FeedbackTracker(config)
+        engine = SurfacingEngine(config=config, mcp_adapter=adapter, feedback_tracker=tracker)
+
+        # search_code fails and opens the breaker; read_file is then turned
+        # away. (The gate refuses write-shaped tool names, so every key here is
+        # a read-shaped one.)
+        await engine.surface("gh", "search_code", _other_args("boom"), LONG_RESPONSE)
+        assert engine._circuit_breaker.is_open
+        await engine.surface("gh", "read_file", _other_args("blocked"), LONG_RESPONSE)
+        assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {
+            "error_other": 1,
+            "circuit_open": 1,
+        }
+
+        # Let the reset window elapse so the breaker reads half-open, then let
+        # a THIRD key make the probe that closes it.
+        engine._circuit_breaker._opened_at = time.monotonic() - 3600.0
+        await engine.surface("gh", "list_docs", _other_args("probe"), LONG_RESPONSE)
+        assert engine._circuit_breaker.state == "closed"
+        assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {
+            # read_file's circuit_open is closed by the probe; search_code's
+            # own error_other is NOT — a probe on another key is no evidence
+            # about search_code's LTM call.
+            "error_other": 1
+        }
+
     async def test_recovery_is_reattempted_on_every_miss_path_success(self, tmp_path):
         """No once-per-process latch: another process can open an episode on
         this key at any time, and this process must still close it."""
@@ -548,11 +651,11 @@ class TestEngineFaultPersistence:
         real = tracker.record_fault_recovery
         failures = {"left": 1}
 
-        def flaky(server, tool):
+        def flaky(server, tool, **kwargs):
             if failures["left"]:
                 failures["left"] -= 1
                 raise sqlite3.OperationalError("database is locked")
-            real(server, tool)
+            real(server, tool, **kwargs)
 
         tracker.record_fault_recovery = flaky  # type: ignore[method-assign]
         await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
@@ -838,7 +941,7 @@ class TestSummaryFaults:
         store = FeedbackStore(db_path)
         store.initialize()
         store.record_fault("builtin", "Bash", "error_timeout")
-        store.record_fault_recovery("builtin", "Bash")
+        store.record_fault_recovery("builtin", "Bash", recovered_at=time.time())
         store.close()
         _render_surfacing_block(read_surfacing_summary(db_path))
         out = capsys.readouterr().out
