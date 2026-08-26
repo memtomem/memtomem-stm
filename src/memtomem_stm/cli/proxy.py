@@ -2102,14 +2102,26 @@ def _render_surfacing_block(summary: dict[str, Any]) -> None:
         if isinstance(last_at, (int, float)):
             last_str = datetime.fromtimestamp(last_at).strftime("%Y-%m-%d %H:%M")
             click.echo(f"    last fault: {last_str}")
-        click.echo(
-            "  "
-            + _warn(
-                "surfacing has been skipping on degraded-LTM faults — "
-                "see stm-daemon.log / server stderr; timeouts usually mean the "
-                "LTM answers slower than surfacing.timeout_seconds"
+        # Warn only while an episode is still open: a kind whose newest fault
+        # predates its newest recovery describes breakage a later surfacing
+        # already disproved (#869). A DB written before the recovery column
+        # existed cannot tell them apart, so it keeps today's unconditional
+        # warning rather than silently claiming everything recovered.
+        active_faults = summary.get("active_faults") or {}
+        if active_faults or not summary.get("faults_recovery_supported", True):
+            click.echo(
+                "  "
+                + _warn(
+                    "surfacing has been skipping on degraded-LTM faults — "
+                    "see stm-daemon.log / server stderr; timeouts usually mean the "
+                    "LTM answers slower than surfacing.timeout_seconds"
+                )
             )
-        )
+        else:
+            click.echo(
+                "    all listed fault episodes recovered — a later surfacing "
+                "succeeded on the same server/tool"
+            )
     diagnostics = summary.get("diagnostics") or {}
     if diagnostics:
         window_days = summary.get("diagnostics_window_days")

@@ -330,6 +330,8 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
         "faults": {},
         "faults_last_at": None,
         "faults_window_days": _FAULT_SUMMARY_WINDOW_DAYS,
+        "active_faults": {},
+        "faults_recovery_supported": True,
         "diagnostics": {},
         "diagnostics_last_at": None,
         "active_diagnostics": {},
@@ -354,17 +356,21 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
             return summary
 
         # Schema-capability probe, hoisted above every empty-result early return:
-        # ``diagnostics_recovery_supported`` describes the FILE, not the filter,
+        # the ``*_recovery_supported`` flags describe the FILE, not the filter,
         # so a refused filter must not report a pre-``last_recovered_at`` DB as
         # recovery-capable. Same placement rule as ``schema_outdated`` in
-        # ``read_compression_summary``.
+        # ``read_compression_summary``. Faults and diagnostics share the column
+        # but get separate flags so a reader never gates fault rendering on a
+        # diagnostics-named capability.
         fault_columns: set[str] = set()
         if "surfacing_faults" in tables:
             fault_columns = {
                 str(row[1])
                 for row in db.execute("PRAGMA table_info('surfacing_faults')").fetchall()
             }
-            summary["diagnostics_recovery_supported"] = "last_recovered_at" in fault_columns
+            recovery_supported = "last_recovered_at" in fault_columns
+            summary["diagnostics_recovery_supported"] = recovery_supported
+            summary["faults_recovery_supported"] = recovery_supported
 
         if tool is not None and has_lone_surrogate(tool):
             # Cannot be bound as a SQLite parameter and can never match a stored
@@ -432,18 +438,27 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
             summary["diagnostics_last_at"] = max((row[2] for row in diagnostic_rows), default=None)
             summary["diagnostics_window_days"] = _FAULT_SUMMARY_WINDOW_DAYS
             if "last_recovered_at" in fault_columns:
-                kind_placeholders = ", ".join("?" for _ in DIAGNOSTIC_KINDS)
-                active_where = fault_where + f" AND kind IN ({kind_placeholders})"
+                # One episode-aware pass over both partitions: a kind is still
+                # "active" when its newest occurrence postdates its newest
+                # recovery. Partitioned in Python like ``signal_rows`` above so
+                # faults and diagnostics stay separable for readers that must
+                # never describe a miscalibrated-but-healthy search as a fault.
                 active_rows = db.execute(
                     "SELECT kind, SUM(count), MAX(last_at), MAX(last_recovered_at) "
                     "FROM surfacing_faults"
-                    f"{active_where} GROUP BY kind "
+                    f"{fault_where} GROUP BY kind "
                     "HAVING MAX(last_at) > COALESCE(MAX(last_recovered_at), 0)",
-                    [*fault_params, *sorted(DIAGNOSTIC_KINDS)],
+                    fault_params,
                 ).fetchall()
-                summary["active_diagnostics"] = {row[0]: row[1] for row in active_rows}
-            # No ``else``: ``diagnostics_recovery_supported`` was already set from
-            # ``fault_columns`` above, before any early return could skip it.
+                summary["active_diagnostics"] = {
+                    row[0]: row[1] for row in active_rows if row[0] in DIAGNOSTIC_KINDS
+                }
+                summary["active_faults"] = {
+                    row[0]: row[1] for row in active_rows if row[0] in FAULT_KINDS
+                }
+            # No ``else``: the ``*_recovery_supported`` flags were already set
+            # from ``fault_columns`` above, before any early return could skip
+            # them.
 
         summary["available"] = True
     except sqlite3.Error as exc:
@@ -549,8 +564,13 @@ class FeedbackStore:
         taxonomy drift must degrade to a missing counter, never to a new
         exception. Day buckets are UTC so counters aggregate stably across
         processes regardless of host timezone.
+
+        A new fault reopens the episode by clearing the row's recovery stamp
+        (``reset_recovery``), mirroring :meth:`record_diagnostic`: readers
+        treat a kind as active while its newest occurrence postdates its
+        newest recovery, so a re-break must not read as still-recovered.
         """
-        self._record_signal(server, tool, kind, FAULT_KINDS)
+        self._record_signal(server, tool, kind, FAULT_KINDS, reset_recovery=True)
 
     def record_diagnostic(self, server: str, tool: str, kind: str) -> None:
         """Increment a durable advisory diagnostic counter.
@@ -578,6 +598,45 @@ class FeedbackStore:
                 "UPDATE surfacing_faults SET last_recovered_at = ? "
                 "WHERE server = ? AND tool = ? AND kind = ? AND last_at <= ?",
                 (now, server, tool, kind, now),
+            )
+            self._db.commit()
+
+    def record_fault_recovery(self, server: str, tool: str) -> None:
+        """Mark the open fault episodes closed by a successful surfacing.
+
+        Called from the one engine path that proves a full LTM round trip
+        succeeded, so it closes *every* :data:`FAULT_KINDS` episode for
+        ``(server, tool)`` in one statement: a healthy round trip disproves
+        each degraded-dependency kind at once, and they are not independently
+        observable from the success side.
+
+        ``circuit_open`` is additionally swept for all keys. Its skip is
+        persisted before query extraction and the breaker is engine-global, so
+        the rows pile up under keys that may never succeed on their own — a
+        per-key recovery could never reach them, which is why every live
+        ``circuit_open`` row sat unrecovered (#869). A success proves the
+        breaker is closed engine-wide. With a DB shared by several proxy
+        processes this can stamp a peer's still-open episode, but the peer's
+        next ``circuit_open`` fault clears the stamp again via
+        ``record_fault``'s reset, so the active view self-corrects within one
+        event.
+
+        The ``last_at <= now`` bound mirrors :meth:`record_diagnostic_recovery`:
+        a fault written concurrently with this call stays active.
+        """
+        if self._db is None:
+            return
+        if has_lone_surrogate(server) or has_lone_surrogate(tool):
+            return
+        now = time.time()
+        kinds = sorted(FAULT_KINDS)
+        kind_placeholders = ", ".join("?" for _ in kinds)
+        with self._lock:
+            self._db.execute(
+                "UPDATE surfacing_faults SET last_recovered_at = ? "
+                f"WHERE ((server = ? AND tool = ? AND kind IN ({kind_placeholders})) "
+                "OR kind = 'circuit_open') AND last_at <= ?",
+                (now, server, tool, *kinds, now),
             )
             self._db.commit()
 
