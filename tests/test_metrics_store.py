@@ -24,6 +24,7 @@ from memtomem_stm.proxy.metrics_store import (
     _MIGRATIONS,
     _SCHEMA_FINGERPRINT,
     _SCHEMA_FINGERPRINT_KEY,
+    _SOURCE_ID_INDEX,
     _SOURCE_INDEX,
     MetricsStore,
     _schema_fingerprint,
@@ -520,9 +521,10 @@ class TestPerSourceTrim:
         import inspect
         import re as _re
 
-        src = inspect.getsource(MetricsStore._trim_source)
+        # The statement lives in _trim_statement; _trim_source is that plus a commit.
+        src = inspect.getsource(MetricsStore._trim_statement)
         assert len(_re.findall(r"db\.execute\(", src)) == 1, (
-            "_trim_source must stay a single count-and-delete statement; a "
+            "_trim_statement must stay a single count-and-delete statement; a "
             "separate COUNT reintroduces the stale-excess over-delete race"
         )
         assert "LIMIT max(0," in src
@@ -1118,7 +1120,9 @@ class TestInitializeFastPath:
         """The names are parsed from the CREATE statements, so they cannot
         drift from the indexes the slow path actually creates."""
         for name in _INDEX_NAMES:
-            assert f"CREATE INDEX IF NOT EXISTS {name} " in (_INDEX + _SOURCE_INDEX)
+            assert f"CREATE INDEX IF NOT EXISTS {name} " in (
+                _INDEX + _SOURCE_INDEX + _SOURCE_ID_INDEX
+            )
 
     def test_a_changed_migration_changes_the_fingerprint(self, monkeypatch):
         """The property the gate rests on: ship a new column, every stamped DB
@@ -1193,7 +1197,7 @@ class TestInitializeFastPath:
         "failing_prefix",
         [
             "ALTER TABLE proxy_metrics ADD COLUMN",  # fails mid-migration
-            "CREATE INDEX IF NOT EXISTS idx_metrics_source_created",  # fails at the LAST step
+            "CREATE INDEX IF NOT EXISTS idx_metrics_source_id",  # fails at the LAST step
         ],
     )
     def test_no_stamp_is_written_when_the_schema_work_fails(
@@ -1257,7 +1261,7 @@ class TestInitializeFastPath:
                 self._real = real
 
             def execute(self, sql: str, *args):  # noqa: ANN002, ANN202
-                if sql.startswith("CREATE INDEX IF NOT EXISTS idx_metrics_source_created"):
+                if sql.startswith("CREATE INDEX IF NOT EXISTS idx_metrics_source_id"):
                     raise sqlite3.OperationalError("disk I/O error")
                 return self._real.execute(sql, *args)
 
@@ -1361,3 +1365,390 @@ class TestInitializeFastPath:
             store.close()
         summary = read_compression_summary(db_path)
         assert summary["total_calls"] == 1
+
+
+class TestIntervalTrim:
+    """``record`` trims on interval boundaries instead of on every write.
+
+    The trim's cost is its ``COUNT(*)`` over the writer's partition — a
+    covering-index scan that sits *at* ``max_history`` in steady state and
+    grows with it (0.39 ms of a 0.43 ms ``record`` at the default 10,000 cap).
+    ``mms hook`` pays that on every host built-in tool call (#870).
+    """
+
+    @staticmethod
+    def _fill(store: MetricsStore, n: int, source: str = "hook", start: int = 0) -> None:
+        """Write ``n`` rows tagged by ``original_chars`` so survivors are identifiable."""
+        for i in range(start, start + n):
+            store.record(
+                CallMetrics(
+                    server="builtin",
+                    tool="Read",
+                    original_chars=1000 + i,
+                    compressed_chars=500,
+                    source=source,
+                )
+            )
+
+    @staticmethod
+    def _count(store: MetricsStore, source: str = "hook") -> int:
+        return store._db.execute(
+            "SELECT COUNT(*) FROM proxy_metrics WHERE source = ?", (source,)
+        ).fetchone()[0]
+
+    def test_interval_keeps_the_excess_proportional_to_the_cap(self, tmp_path):
+        """Small caps stay exact; large ones amortize, but never without bound."""
+        intervals = {
+            cap: MetricsStore(tmp_path / "m.db", max_history=cap)._trim_interval()
+            for cap in (0, 1, 99, 100, 199, 1000, 10_000, 10**9)
+        }
+        assert intervals[0] == 1, "must not divide by zero or skip trimming entirely"
+        assert intervals[1] == intervals[99] == intervals[100] == intervals[199] == 1
+        assert intervals[1000] == 10  # ~1% of the cap
+        assert intervals[10_000] == 64  # ceiling: ~0.6% of the default cap
+        assert intervals[10**9] == 64, "interval must stay bounded for huge caps"
+
+    def test_small_cap_trims_on_every_insert(self, tmp_path):
+        store = MetricsStore(tmp_path / "m.db", max_history=5)
+        store.initialize()
+        try:
+            assert all(store._should_trim("hook", row_id) for row_id in range(1, 50))
+        finally:
+            store.close()
+
+    def test_the_trigger_fires_on_the_real_boundary_ids(self, tmp_path):
+        """The rule as an observed sequence, not as hypothetical ids.
+
+        Records real rows and captures which ones actually reached the trim, so
+        the assertion is about the ids SQLite assigned and the predecessor each
+        row really had. Pinned as the exact set with equal gaps: a coin would
+        pass a "sometimes fires" check while allowing arbitrarily long ones.
+        """
+        fired: list[int] = []
+        store = MetricsStore(tmp_path / "m.db", max_history=10_000)
+        store.initialize()
+        real_statement = MetricsStore._trim_statement
+
+        def _spy(self, db, source):  # noqa: ANN001, ANN202
+            fired.append(
+                db.execute(
+                    "SELECT MAX(id) FROM proxy_metrics WHERE source = ?", (source,)
+                ).fetchone()[0]
+            )
+            return real_statement(self, db, source)
+
+        try:
+            assert store._trim_interval() == 64
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr(MetricsStore, "_trim_statement", _spy)
+                self._fill(store, 200)
+        finally:
+            store.close()
+        # Row 1 has no predecessor and trims; after that only the crossings,
+        # one interval apart (the first gap is 63, the bootstrap trim to row 64).
+        assert fired == [1, 64, 128, 192]
+        assert all(b - a == 64 for a, b in zip(fired[1:], fired[2:]))
+
+    def test_the_bound_holds_with_a_fresh_store_per_write(self, tmp_path):
+        """Production topology: ``mms hook`` builds a NEW store per invocation,
+        writes one row and exits, so nothing survives in memory between writes.
+
+        A schedule kept in the store object would silently degrade to "every
+        write is the first write" here. This is also the shape in which the
+        interleavings below have to hold.
+        """
+        cap, db_path = 500, tmp_path / "m.db"
+        warm = MetricsStore(db_path, max_history=cap)
+        warm.initialize()
+        interval = warm._trim_interval()
+        assert interval == 5
+        warm.close()
+
+        peak = 0
+        for i in range(cap + 300):
+            store = MetricsStore(db_path, max_history=cap, reconcile_on_init=False)
+            store.initialize()
+            try:
+                self._fill(store, 1, start=i)
+                peak = max(peak, self._count(store))
+            finally:
+                store.close()
+        assert peak <= cap + interval, f"one-shot writers reached {peak}, cap {cap}"
+        assert peak > cap, "positive control: it must actually exceed the cap sometimes"
+
+    @pytest.mark.parametrize("mcp_slot", [0, 1])
+    def test_no_interleaving_phase_can_starve_a_source(self, tmp_path, mcp_slot):
+        """Regression, and the reason the trigger is not ``id % interval == 0``.
+
+        That rule starves any source whose rows never land on a multiple: at
+        interval 5 with ``mcp`` taking ids 1, 6, 11, ... (always 1 mod 5) it
+        never trimmed, reaching 700 rows against a cap of 500 and still
+        climbing. Parameterized over the two phases that matter — ``mcp`` owning
+        every multiple, and ``mcp`` owning a non-multiple — and run through
+        one-shot stores so neither source has in-memory history to lean on.
+        """
+        # Cap 200 -> interval 2, so BOTH sources take half the ids and each one
+        # outgrows the cap within the loop. With a larger interval the sparse
+        # source never reaches its cap in a test-sized run, and the assertion
+        # below would hold no matter how badly the trigger behaved.
+        cap, db_path = 200, tmp_path / "m.db"
+        warm = MetricsStore(db_path, max_history=cap)
+        warm.initialize()
+        interval = warm._trim_interval()
+        assert interval == 2
+        warm.close()
+
+        written: dict[str, int] = {}
+        peak: dict[str, int] = {}
+        for i in range(600):
+            source = "mcp" if i % interval == mcp_slot else "hook"
+            written[source] = written.get(source, 0) + 1
+            store = MetricsStore(db_path, max_history=cap, reconcile_on_init=False)
+            store.initialize()
+            try:
+                self._fill(store, 1, source=source, start=i)
+                for src, n in store._db.execute(
+                    "SELECT source, COUNT(*) FROM proxy_metrics GROUP BY source"
+                ):
+                    peak[src] = max(peak.get(src, 0), n)
+            finally:
+                store.close()
+        # Precondition: untrimmed, every source would have blown past the cap,
+        # so an untrimmed source cannot hide inside the bound.
+        for src, n in written.items():
+            assert n > cap + interval, f"{src} wrote {n} rows: cannot detect starvation"
+        for src, n in peak.items():
+            assert n <= cap + interval, f"{src} starved at {n} rows, cap {cap}"
+
+    def test_partition_never_exceeds_cap_plus_interval_while_writing(self, tmp_path):
+        """The bound itself, measured rather than asserted about the trigger.
+
+        Writes well past the cap and checks the partition after *every* insert,
+        so a regression to unbounded growth (or to an unbounded-tail sample)
+        fails here even if the trigger arithmetic still looks plausible.
+        """
+        cap = 1000
+        store = MetricsStore(tmp_path / "m.db", max_history=cap)
+        store.initialize()
+        try:
+            interval = store._trim_interval()
+            assert interval == 10
+            high_water = 0
+            for i in range(cap + 200):
+                self._fill(store, 1, start=i)
+                high_water = max(high_water, self._count(store))
+            assert high_water <= cap + interval, f"partition reached {high_water}, cap {cap}"
+            assert high_water > cap, "positive control: it must actually exceed the cap sometimes"
+        finally:
+            store.close()
+
+    def test_uncovered_insert_runs_no_count_or_delete(self, tmp_path, monkeypatch):
+        """The point of the change: the scan is off the write path in between.
+
+        Includes the positive control — the same probe with the trim forced on
+        must show it, so an always-empty trace cannot pass this.
+        """
+        statements: list[str] = []
+        store = MetricsStore(tmp_path / "m.db", max_history=10_000)
+        store.initialize()
+        try:
+            self._fill(store, 3)
+            store._db.set_trace_callback(statements.append)
+
+            monkeypatch.setattr(MetricsStore, "_should_trim", lambda self, source, row_id: False)
+            self._fill(store, 1)
+            assert not [s for s in statements if "DELETE" in s.upper()]
+            assert not [s for s in statements if "COUNT(*)" in s.upper()]
+
+            statements.clear()
+            monkeypatch.setattr(MetricsStore, "_should_trim", lambda self, source, row_id: True)
+            self._fill(store, 1)
+            assert [s for s in statements if "DELETE" in s.upper()], "positive control failed"
+        finally:
+            store._db.set_trace_callback(None)
+            store.close()
+
+    def test_one_trim_returns_an_overshooting_partition_to_the_cap(self, tmp_path, monkeypatch):
+        """Excess is transient: the DELETE always removes the FULL excess.
+
+        This is what makes an approximate cap safe — a partition that drifted
+        above it snaps back on the next trim rather than converging one row per
+        write.
+        """
+        cap = 200
+        store = MetricsStore(tmp_path / "m.db", max_history=cap)
+        store.initialize()
+        try:
+            monkeypatch.setattr(MetricsStore, "_should_trim", lambda self, source, row_id: False)
+            self._fill(store, cap + 50)
+            assert self._count(store) == cap + 50, "trim-off did not let the partition grow"
+
+            monkeypatch.setattr(MetricsStore, "_should_trim", lambda self, source, row_id: True)
+            self._fill(store, 1, start=cap + 50)
+            assert self._count(store) == cap, "one trim must remove the whole excess"
+            # The survivors are the newest rows, as in the every-write regime:
+            # the 51 oldest of the 251 written are the ones that went.
+            oldest = store._db.execute(
+                "SELECT MIN(original_chars) FROM proxy_metrics WHERE source = 'hook'"
+            ).fetchone()[0]
+            assert oldest == 1000 + 51
+        finally:
+            store.close()
+
+    def test_initialize_reconcile_stays_exact(self, tmp_path, monkeypatch):
+        """Interval trimming is a write-path amortization only — startup
+        reconciliation must still bring every source exactly to the cap."""
+        db_path = tmp_path / "m.db"
+        cap = 200
+        store = MetricsStore(db_path, max_history=cap)
+        store.initialize()
+        monkeypatch.setattr(MetricsStore, "_should_trim", lambda self, source, row_id: False)
+        try:
+            self._fill(store, cap + 50)
+            assert self._count(store) == cap + 50, "precondition: partition must be over cap"
+        finally:
+            store.close()
+        monkeypatch.undo()
+
+        reconciler = MetricsStore(db_path, max_history=cap)
+        reconciler.initialize()
+        try:
+            assert self._count(reconciler) == cap
+        finally:
+            reconciler.close()
+
+    def test_trim_targets_only_the_written_source(self, tmp_path, monkeypatch):
+        """Interval trimming must not have widened the trim's scope: a hook
+        write still cannot evict 'mcp' rows."""
+        store = MetricsStore(tmp_path / "m.db", max_history=5)
+        store.initialize()
+        try:
+            self._fill(store, 3, source="mcp")
+            self._fill(store, 40, source="hook")
+            assert self._count(store, "mcp") == 3
+            assert self._count(store, "hook") == 5
+        finally:
+            store.close()
+
+
+class TestTrimSchedulingUnderFailure:
+    """The two ways a boundary crossing can be silently consumed (#870 review)."""
+
+    @staticmethod
+    def _row(i: int, source: str = "hook") -> CallMetrics:
+        return CallMetrics(
+            server="builtin",
+            tool="Read",
+            original_chars=1000 + i,
+            compressed_chars=500,
+            source=source,
+        )
+
+    def test_predecessor_is_caller_relative_not_second_newest(self, tmp_path):
+        """Two writers that both commit before either schedules must not both
+        skip the crossing.
+
+        "The second-newest row of this source" is the caller's predecessor only
+        when nothing interleaves: with rows 202 and 203 both committed, the
+        writer of 202 would find 202 and compare itself against itself, and 203
+        would compare against 202 — neither crossing. Keying on ``id < row_id``
+        makes the answer caller-relative regardless of commit order.
+        """
+        store = MetricsStore(tmp_path / "m.db", max_history=1000)
+        store.initialize()
+        try:
+            for i in range(5):
+                store.record(self._row(i))
+            newest = store._db.execute(
+                "SELECT MAX(id) FROM proxy_metrics WHERE source = 'hook'"
+            ).fetchone()[0]
+            # Asked about an EARLIER row while a newer one is already committed:
+            # the answer must be that row's own predecessor, not the newest.
+            assert store._previous_row_id("hook", newest) == newest - 1
+            assert store._previous_row_id("hook", newest - 1) == newest - 2
+            # And never the row itself.
+            for row_id in range(2, newest + 1):
+                assert store._previous_row_id("hook", row_id) < row_id
+        finally:
+            store.close()
+
+    def test_previous_row_id_ignores_clock_inversion(self, tmp_path):
+        """An older row stamped with a future ``created_at`` must not become
+        the predecessor — ordering is by id, which the insert assigns."""
+        store = MetricsStore(tmp_path / "m.db", max_history=1000)
+        store.initialize()
+        try:
+            for i in range(4):
+                store.record(self._row(i))
+            store._db.execute(
+                "UPDATE proxy_metrics SET created_at = created_at + 3600 WHERE id = 1"
+            )
+            store._db.commit()
+            assert store._previous_row_id("hook", 4) == 3
+        finally:
+            store.close()
+
+    def test_previous_row_id_is_stable_when_timestamps_tie(self, tmp_path):
+        store = MetricsStore(tmp_path / "m.db", max_history=1000)
+        store.initialize()
+        try:
+            for i in range(5):
+                store.record(self._row(i))
+            store._db.execute("UPDATE proxy_metrics SET created_at = 1.0")
+            store._db.commit()
+            assert store._previous_row_id("hook", 5) == 4
+        finally:
+            store.close()
+
+    def test_a_failed_trim_rolls_back_its_crossing_row(self, tmp_path, monkeypatch):
+        """A crossing row that survived its own failed DELETE would become the
+        next row's predecessor, land in the same bucket, and consume the
+        crossing. Insert and trim therefore commit together.
+
+        The failing write is a row that crosses *naturally* — at interval 2 an
+        even id crosses, so with 211 rows written the next one is id 212 — and
+        the assertion afterwards is an exact return to the cap. Forcing the
+        trigger and asserting only ``<= cap + interval`` would pass even for an
+        implementation that committed the insert first and consumed the
+        boundary.
+        """
+        cap = 200
+        store = MetricsStore(tmp_path / "m.db", max_history=cap)
+        store.initialize()
+        try:
+            interval = store._trim_interval()
+            assert interval == 2
+            for i in range(211):
+                store.record(self._row(i))
+            next_id = store._db.execute("SELECT MAX(id) FROM proxy_metrics").fetchone()[0] + 1
+            assert store._should_trim("hook", next_id), "fixture must set up a real crossing"
+            before = store._db.execute(
+                "SELECT COUNT(*) FROM proxy_metrics WHERE source = 'hook'"
+            ).fetchone()[0]
+
+            boom = RuntimeError("trim failed")
+            monkeypatch.setattr(
+                MetricsStore,
+                "_trim_statement",
+                lambda self, db, source: (_ for _ in ()).throw(boom),
+            )
+            with pytest.raises(RuntimeError, match="trim failed"):
+                store.record(self._row(9999))
+            monkeypatch.undo()
+
+            after = store._db.execute(
+                "SELECT COUNT(*) FROM proxy_metrics WHERE source = 'hook'"
+            ).fetchone()[0]
+            assert after == before, "the crossing row survived its failed trim"
+
+            # The boundary was not consumed: the next write crosses and trims
+            # all the way back, rather than deferring to the one after it.
+            store.record(self._row(10_000))
+            assert (
+                store._db.execute(
+                    "SELECT COUNT(*) FROM proxy_metrics WHERE source = 'hook'"
+                ).fetchone()[0]
+                == cap
+            )
+        finally:
+            store.close()
