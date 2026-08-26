@@ -4915,10 +4915,13 @@ class ProxyManager:
         inner ``_auto_index_response`` keeps reading live ``self._config`` exactly
         as before — this extraction relocates only the gate, not that behavior.
         """
-        # Track outcome for CallMetrics below. ``None`` means "stage did not
-        # run for this call" — either disabled, engine missing, or content
-        # below min_chars. ``False`` means "ran and failed"; dashboards must
-        # distinguish the two.
+        # Track outcome for CallMetrics below. ``None`` means "this row
+        # carries no outcome" — the stage was disabled, the engine was
+        # missing, the content was below min_chars, or the stage was
+        # SCHEDULED in the background and its result is never written back
+        # here. ``False`` means "did not succeed": ran and failed, or (#868)
+        # was shed before it could run, which ``index_error`` distinguishes.
+        # Dashboards must keep the two apart.
         index_ok: bool | None = None
         index_error: str | None = None
         chunks_indexed = 0

@@ -143,8 +143,10 @@ class TestBackgroundAutoIndex:
         Same contract the #453 privacy pre-check enforces one branch up: the
         placeholder promises an indexing run, so it must not go out when the
         backlog was at capacity and nothing was scheduled. The metrics row
-        must say so too — leaving ``index_ok=None`` would read as "background
-        work still pending" on every dashboard that filters that way.
+        must say so too — leaving ``index_ok=None`` would file this row with
+        the SCHEDULED background runs, the ones whose result is deliberately
+        never written back, which dashboards select with
+        ``WHERE index_ok IS NULL``.
         """
         mgr, indexer = _bg_manager(tmp_path, background=True)
         record_spy = MagicMock()
