@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from pathlib import Path
 
 from memtomem_stm.surfacing.config import SurfacingConfig
@@ -78,6 +79,14 @@ class FeedbackTracker:
 
     def record_fault(self, server: str, tool: str, kind: str) -> None:
         self._store.record_fault(server, tool, kind)
+
+    def record_fault_recoveries(
+        self,
+        entries: Iterable[tuple[str, str, frozenset[str]]],
+        *,
+        recovered_at: float,
+    ) -> None:
+        self._store.record_fault_recoveries(entries, recovered_at=recovered_at)
 
     def record_diagnostic(self, server: str, tool: str, kind: str) -> None:
         self._store.record_diagnostic(server, tool, kind)

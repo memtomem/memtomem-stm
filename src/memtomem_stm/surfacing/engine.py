@@ -16,6 +16,7 @@ from memtomem_stm.proxy.privacy import contains_sensitive_content
 from memtomem_stm.surfacing.cache import SurfacingCache
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.context_extractor import ContextExtractor
+from memtomem_stm.surfacing.feedback_store import FAULT_KINDS
 from memtomem_stm.surfacing.formatter import SurfacingFormatter
 from memtomem_stm.surfacing.mcp_client import (
     KNOWN_SCORE_SCALES,
@@ -53,6 +54,11 @@ _QUERY_HASH_PREFIX = "sha256:"
 hashed-form row without re-reading config and lets ad-hoc DB inspection
 tell user-derived text apart from a stable opaque ID. The full stored
 value is ``"sha256:" + 16-hex-char digest`` → 23 chars total."""
+
+_CIRCUIT_OPEN_KIND: frozenset[str] = frozenset({"circuit_open"})
+"""Recovery scope for keys this engine's breaker turned away: the success that
+closes the breaker disproves the ``circuit_open`` episode on those keys' rows,
+but no other kind — their timeouts are not evidence a probe elsewhere touched."""
 
 _MAX_ABANDONED_OPS = 4
 """How many cancelled LTM operations may still be unwinding before this engine
@@ -293,6 +299,19 @@ class SurfacingEngine:
         self._scale_gate_recovery_persisted: set[tuple[str, str]] = set()
         # Warn-once INFO latch for the first suspended batch this process.
         self._scale_gate_logged: bool = False
+        # Keys THIS engine turned away while its breaker was open (#869). The
+        # breaker is engine-global but the ``circuit_open`` row is per key, so
+        # the key that finally probes the half-open breaker is often not the
+        # key that was blocked — closing only the prober's episode would leave
+        # the others reading broken until each happens to surface again. A
+        # success proves this engine's breaker closed, so it closes the
+        # ``circuit_open`` episodes on the rows of every key this engine
+        # blocked — no other kind, and no key this engine never blocked. Those
+        # rows are shared day-aggregates, so a peer's ``circuit_open`` on the
+        # SAME key closes with them; that is the granularity the table has, and
+        # the peer's next fault reopens it. Bounded by the upstream tool set
+        # and emptied on the next success.
+        self._breaker_blocked_keys: set[tuple[str, str]] = set()
 
     @property
     def observability(self) -> SurfacingObservability | None:
@@ -352,10 +371,28 @@ class SurfacingEngine:
         degrades to a missing counter, never a raised exception.
         """
         if self._feedback_tracker is None:
+            # Nothing durable to recover, and the recovery path never spends
+            # the set — so a trackerless engine must not fill it up.
             return
+        # Remember whom this engine's breaker turned away, so the success that
+        # closes the breaker can close their episodes too (see the field's
+        # comment). Claimed BEFORE the write and released only if the write
+        # fails: claiming afterwards leaves a window where the row is on disk
+        # but unowned, and a process that dies there needs that exact key to
+        # succeed on its own before the episode can close. A claim whose row
+        # never landed is harmless — its recovery UPDATE matches nothing.
+        if kind == "circuit_open":
+            self._breaker_blocked_keys.add((server, tool))
         try:
             self._feedback_tracker.record_fault(server, tool, kind)
         except Exception:
+            # The claim is kept even though the write failed. The two mistakes
+            # are not symmetric: a claim whose row never landed is inert — its
+            # recovery UPDATE matches nothing — while dropping a claim whose
+            # row DID land (a failed commit whose rollback also failed, then
+            # published by an unrelated later write) leaves that key's episode
+            # open until it happens to surface on its own. So this must not
+            # depend on the store's rollback succeeding.
             logger.debug("Failed to persist surfacing fault counter", exc_info=True)
 
     def _persist_diagnostic(self, server: str, tool: str, kind: str) -> None:
@@ -384,6 +421,52 @@ class SurfacingEngine:
         except Exception:
             logger.debug("Failed to persist surfacing diagnostic recovery", exc_info=True)
             return False
+
+    def _persist_fault_recovery(self, server: str, tool: str, succeeded_at: float) -> None:
+        """Close the durable fault episodes a successful round trip disproved.
+
+        Without this the ``surfacing_faults`` rows for every degraded-dependency
+        kind stayed unrecovered forever, so ``mms stats`` reported a breaker
+        loop that ended days ago as ongoing breakage (#869).
+
+        Closes every kind for the calling key, plus the ``circuit_open``
+        episodes of the keys this engine's breaker turned away — the prober
+        that closes a half-open breaker is usually not the key that was
+        blocked. *succeeded_at* is when the round trip completed, so a fault
+        recorded after it (here or in a peer process) stays active.
+
+        Ownership is per key, not per process: rows are day-aggregates shared
+        by everything writing this DB, so closing a key this engine blocked
+        also closes what a peer recorded for that same key. Keys only a peer
+        blocked are never touched, which is the isolation the table's
+        granularity actually supports.
+
+        The whole batch goes in one store transaction — a mid-batch failure
+        that committed the earlier keys would leave the rest reading broken
+        with the breaker long closed.
+
+        Deliberately unlatched. A "close it once per key per process" latch
+        would go stale the moment ANOTHER process wrote a fault for the same
+        key — the rows are shared, so this process would skip the UPDATE that
+        closes an episode it never saw open. Each write is one WHERE-guarded
+        UPDATE that matches nothing once the episode is closed, on a path that
+        just paid a full LTM round trip, and a transient failure simply retries
+        on the next success.
+        """
+        if self._feedback_tracker is None:
+            return
+        blocked = self._breaker_blocked_keys - {(server, tool)}
+        entries = [(server, tool, FAULT_KINDS)]
+        entries.extend(
+            (blocked_server, blocked_tool, _CIRCUIT_OPEN_KIND)
+            for blocked_server, blocked_tool in sorted(blocked)
+        )
+        try:
+            self._feedback_tracker.record_fault_recoveries(entries, recovered_at=succeeded_at)
+        except Exception:
+            logger.debug("Failed to persist surfacing fault recovery", exc_info=True)
+            return
+        self._breaker_blocked_keys.clear()
 
     def _reset_score_scale_streak(self, server: str, tool: str) -> None:
         self._score_scale_streaks.pop((server, tool), None)
@@ -1626,6 +1709,16 @@ class SurfacingEngine:
             self._observability.record_skip(tool, "ltm_parse_empty")
             self._persist_fault(server, tool, "ltm_parse_empty")
             raise _DependencyFault(outcome)
+
+        # Past the last fault guard: a full LTM round trip completed, which is
+        # the only evidence that closes the durable fault episodes (#869). An
+        # "ok" outcome carrying zero results still counts — an empty search is
+        # healthy, not degraded. Deliberately not on the ``surface`` success
+        # path: that also fires for cache hits, which are served without
+        # touching LTM and so prove nothing about its current health. The
+        # timestamp is taken here, not at write time, so a fault recorded
+        # after this instant stays active.
+        self._persist_fault_recovery(server, tool, time.time())
 
         retrieved_results = [r for r in results if not getattr(r, "pinned", False)]
         score_scale, reranker_id = self._result_score_scale(retrieved_results)

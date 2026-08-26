@@ -8,6 +8,7 @@ import re
 import sqlite3
 import threading
 import time
+from collections.abc import Iterable
 from pathlib import Path
 from typing import TypedDict
 
@@ -330,6 +331,8 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
         "faults": {},
         "faults_last_at": None,
         "faults_window_days": _FAULT_SUMMARY_WINDOW_DAYS,
+        "active_faults": {},
+        "faults_recovery_supported": True,
         "diagnostics": {},
         "diagnostics_last_at": None,
         "active_diagnostics": {},
@@ -354,17 +357,21 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
             return summary
 
         # Schema-capability probe, hoisted above every empty-result early return:
-        # ``diagnostics_recovery_supported`` describes the FILE, not the filter,
+        # the ``*_recovery_supported`` flags describe the FILE, not the filter,
         # so a refused filter must not report a pre-``last_recovered_at`` DB as
         # recovery-capable. Same placement rule as ``schema_outdated`` in
-        # ``read_compression_summary``.
+        # ``read_compression_summary``. Faults and diagnostics share the column
+        # but get separate flags so a reader never gates fault rendering on a
+        # diagnostics-named capability.
         fault_columns: set[str] = set()
         if "surfacing_faults" in tables:
             fault_columns = {
                 str(row[1])
                 for row in db.execute("PRAGMA table_info('surfacing_faults')").fetchall()
             }
-            summary["diagnostics_recovery_supported"] = "last_recovered_at" in fault_columns
+            recovery_supported = "last_recovered_at" in fault_columns
+            summary["diagnostics_recovery_supported"] = recovery_supported
+            summary["faults_recovery_supported"] = recovery_supported
 
         if tool is not None and has_lone_surrogate(tool):
             # Cannot be bound as a SQLite parameter and can never match a stored
@@ -432,18 +439,36 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
             summary["diagnostics_last_at"] = max((row[2] for row in diagnostic_rows), default=None)
             summary["diagnostics_window_days"] = _FAULT_SUMMARY_WINDOW_DAYS
             if "last_recovered_at" in fault_columns:
-                kind_placeholders = ", ".join("?" for _ in DIAGNOSTIC_KINDS)
-                active_where = fault_where + f" AND kind IN ({kind_placeholders})"
+                # One episode-aware pass over both partitions: a kind is still
+                # "active" when its newest occurrence postdates its newest
+                # recovery. Partitioned in Python like ``signal_rows`` above so
+                # faults and diagnostics stay separable for readers that must
+                # never describe a miscalibrated-but-healthy search as a fault.
+                #
+                # Episodes are per ``(server, tool, kind)``, so the HAVING must
+                # run in an inner query grouped that way and only THEN roll up
+                # by kind. Comparing the maxima of an already-kind-wide group
+                # lets one key's newer recovery cancel out another key's older
+                # but still-open fault — a false all-clear whenever two servers
+                # or tools share a kind.
                 active_rows = db.execute(
-                    "SELECT kind, SUM(count), MAX(last_at), MAX(last_recovered_at) "
+                    "SELECT kind, SUM(events) FROM ("
+                    "SELECT server, tool, kind, SUM(count) AS events "
                     "FROM surfacing_faults"
-                    f"{active_where} GROUP BY kind "
-                    "HAVING MAX(last_at) > COALESCE(MAX(last_recovered_at), 0)",
-                    [*fault_params, *sorted(DIAGNOSTIC_KINDS)],
+                    f"{fault_where} GROUP BY server, tool, kind "
+                    "HAVING MAX(last_at) > COALESCE(MAX(last_recovered_at), 0)"
+                    ") GROUP BY kind",
+                    fault_params,
                 ).fetchall()
-                summary["active_diagnostics"] = {row[0]: row[1] for row in active_rows}
-            # No ``else``: ``diagnostics_recovery_supported`` was already set from
-            # ``fault_columns`` above, before any early return could skip it.
+                summary["active_diagnostics"] = {
+                    row[0]: row[1] for row in active_rows if row[0] in DIAGNOSTIC_KINDS
+                }
+                summary["active_faults"] = {
+                    row[0]: row[1] for row in active_rows if row[0] in FAULT_KINDS
+                }
+            # No ``else``: the ``*_recovery_supported`` flags were already set
+            # from ``fault_columns`` above, before any early return could skip
+            # them.
 
         summary["available"] = True
     except sqlite3.Error as exc:
@@ -549,8 +574,13 @@ class FeedbackStore:
         taxonomy drift must degrade to a missing counter, never to a new
         exception. Day buckets are UTC so counters aggregate stably across
         processes regardless of host timezone.
+
+        A new fault reopens the episode by clearing the row's recovery stamp
+        (``reset_recovery``), mirroring :meth:`record_diagnostic`: readers
+        treat a kind as active while its newest occurrence postdates its
+        newest recovery, so a re-break must not read as still-recovered.
         """
-        self._record_signal(server, tool, kind, FAULT_KINDS)
+        self._record_signal(server, tool, kind, FAULT_KINDS, reset_recovery=True)
 
     def record_diagnostic(self, server: str, tool: str, kind: str) -> None:
         """Increment a durable advisory diagnostic counter.
@@ -581,6 +611,121 @@ class FeedbackStore:
             )
             self._db.commit()
 
+    def record_fault_recovery(
+        self,
+        server: str,
+        tool: str,
+        *,
+        recovered_at: float,
+        kinds: frozenset[str] = FAULT_KINDS,
+    ) -> None:
+        """Mark the fault episodes disproved by a successful surfacing closed.
+
+        By default closes *every* :data:`FAULT_KINDS` episode for
+        ``(server, tool)`` in one statement: the caller has proved a full LTM
+        round trip succeeded, which disproves each degraded-dependency kind at
+        once, and they are not independently observable from the success side.
+        The engine narrows *kinds* to ``circuit_open`` for the keys its breaker
+        blocked, which the success proves nothing else about.
+
+        Always keyed — an un-keyed sweep would let one process's healthy round
+        trip stamp a peer's still-open episode, and the rows are shared by
+        everything pointing at this DB.
+
+        *recovered_at* is the moment the round trip succeeded, not the moment
+        of this write, and rows are matched with ``last_at <= recovered_at``:
+        a fault recorded after that instant — by this process or a peer, whose
+        writes this store's lock does not order — stays active, because the
+        success is no evidence about it. A fault sharing the timestamp exactly,
+        which a coarse clock makes possible, is stamped recovered; these
+        counters are advisory and the next fault reopens the episode.
+
+        Already-closed rows are left alone (``last_recovered_at`` is only
+        advanced while the episode is open), so re-running this on an
+        unchanged key writes nothing.
+
+        A row is a day-aggregate shared by every process writing this DB, so
+        closing it closes what a peer recorded for the same key too. That is
+        the granularity the table has; the peer's next fault on that key
+        reopens the episode through :meth:`record_fault`'s reset.
+        """
+        self.record_fault_recoveries(((server, tool, kinds),), recovered_at=recovered_at)
+
+    def record_fault_recoveries(
+        self,
+        entries: Iterable[tuple[str, str, frozenset[str]]],
+        *,
+        recovered_at: float,
+    ) -> None:
+        """Close several keys' episodes in ONE transaction.
+
+        The engine closes the successful key and the keys its breaker turned
+        away together. Committing them separately would let a mid-batch
+        failure leave the DB half-recovered, and a restart before the retry
+        would show the survivors as broken with the breaker long closed.
+        Per-key semantics are :meth:`record_fault_recovery`'s.
+        """
+        if self._db is None:
+            return
+        statements: list[tuple[str, tuple[object, ...]]] = []
+        for server, tool, kinds in entries:
+            if has_lone_surrogate(server) or has_lone_surrogate(tool):
+                continue
+            selected = sorted(kinds & FAULT_KINDS)
+            if not selected:
+                continue
+            kind_placeholders = ", ".join("?" for _ in selected)
+            statements.append(
+                (
+                    "UPDATE surfacing_faults SET last_recovered_at = ? "
+                    f"WHERE server = ? AND tool = ? AND kind IN ({kind_placeholders}) "
+                    "AND last_at <= ? "
+                    "AND (last_recovered_at IS NULL OR last_recovered_at < last_at)",
+                    (recovered_at, server, tool, *selected, recovered_at),
+                )
+            )
+        if not statements:
+            return
+        with self._lock:
+            try:
+                for sql, params in statements:
+                    self._db.execute(sql, params)
+                self._db.commit()
+            except Exception:
+                self._abandon_transaction("fault recovery")
+                raise
+
+    def _abandon_transaction(self, what: str) -> None:
+        """Leave no pending transaction behind after a failed write.
+
+        A failing ``execute`` or ``commit`` leaves the transaction OPEN, and
+        the next unrelated write on this connection commits those rows as a
+        side effect of its own work — a fault counter silently publishing a
+        half-applied recovery, say. Rolling back is what prevents that.
+
+        A rollback that ITSELF fails is only logged. Dropping the connection
+        looks safer but is not: ``self._db is None`` makes every write a SILENT
+        no-op, and ``record_surfacing`` returning without writing leaves the
+        agent holding an advertised feedback ID that resolves to nothing —
+        whereas a raising write makes the engine re-render without the dead
+        handle. A connection whose rollback fails is broken anyway, so its next
+        write raises and degrades through the paths that already exist.
+
+        Called from inside ``self._lock``; never raises, so the caller's
+        original exception is what propagates.
+        """
+        if self._db is None:
+            return
+        try:
+            self._db.rollback()
+        except Exception:
+            logger.warning(
+                "Rollback after a failed %s write failed; the surfacing feedback "
+                "connection may hold an uncommitted transaction",
+                what,
+                exc_info=True,
+            )
+
     def _record_signal(
         self,
         server: str,
@@ -598,14 +743,22 @@ class FeedbackStore:
         day = time.strftime("%Y-%m-%d", time.gmtime(now))
         recovery_update = ", last_recovered_at = NULL" if reset_recovery else ""
         with self._lock:
-            self._db.execute(
-                "INSERT INTO surfacing_faults (day, server, tool, kind, count, last_at) "
-                "VALUES (?, ?, ?, ?, 1, ?) "
-                "ON CONFLICT(day, server, tool, kind) "
-                "DO UPDATE SET count = count + 1, last_at = excluded.last_at" + recovery_update,
-                (day, server, tool, kind, now),
-            )
-            self._db.commit()
+            try:
+                self._db.execute(
+                    "INSERT INTO surfacing_faults (day, server, tool, kind, count, last_at) "
+                    "VALUES (?, ?, ?, ?, 1, ?) "
+                    "ON CONFLICT(day, server, tool, kind) "
+                    "DO UPDATE SET count = count + 1, last_at = excluded.last_at" + recovery_update,
+                    (day, server, tool, kind, now),
+                )
+                self._db.commit()
+            except Exception:
+                # Same guarantee the recovery batch gets: a failed counter
+                # write must not leave a row pending for someone else's commit
+                # to publish. The engine's breaker bookkeeping reads a raised
+                # exception as "nothing landed", so that has to be true.
+                self._abandon_transaction("fault counter")
+                raise
 
     def delete_faults_older_than(self, retention_seconds: float) -> int:
         """Delete day-aggregated fault rows whose ``last_at`` is past the
