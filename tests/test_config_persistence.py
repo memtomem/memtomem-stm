@@ -92,30 +92,6 @@ class TestProxyConfigLoader:
         # and now sees the same mtime → skips reload → returns stale config.
         assert loader.get().enabled is True
 
-    def test_unseeded_loader_with_broken_file_returns_defaults(self, tmp_path):
-        """An unseeded loader whose first load fails has no cache to fall back
-        on, and used to return None with the type error suppressed.
-
-        ``ProxyManager`` seeds its loader in ``__init__``, so this is NOT
-        reachable from the production request path; it is the contract for
-        anyone constructing a ``ProxyConfigLoader`` directly (tooling and
-        tests do). Every caller does attribute access on the result, so None
-        is never a usable answer — return defaults instead.
-        """
-        cfg_file = tmp_path / "stm_proxy.json"
-        cfg_file.write_text("{ not valid json")
-        loader = ProxyConfigLoader(cfg_file)
-
-        config = loader.get()
-        assert isinstance(config, ProxyConfig)
-        assert config.enabled is False  # defaults
-
-        # The parse-failure retry contract still holds: a later fix is picked
-        # up even though the failed load returned defaults.
-        time.sleep(0.05)
-        cfg_file.write_text(json.dumps({"enabled": True}))
-        assert loader.get().enabled is True
-
     def test_current_reports_only_seeded_or_loaded_generations(self, tmp_path):
         """``current`` is an identity check, so its None must mean "cannot compare".
 

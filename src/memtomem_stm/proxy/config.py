@@ -2617,8 +2617,4 @@ class ProxyConfigLoader:
                 # otherwise a fix that lands within filesystem mtime
                 # granularity (or before any other write) would be ignored.
                 logger.warning("Proxy config parse failed; keeping previous config")
-        # An unseeded loader whose first load failed has nothing cached, and
-        # every caller does attribute access on the result — hand back
-        # defaults rather than None. _mtime stays unadvanced above, so the
-        # next get() still retries the broken file.
-        return self._cached if self._cached is not None else ProxyConfig()
+        return self._cached  # type: ignore[return-value]

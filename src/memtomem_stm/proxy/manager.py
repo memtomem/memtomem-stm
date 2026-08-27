@@ -2977,9 +2977,6 @@ class ProxyManager:
         cfg_snap: ProxyConfig,
     ) -> tuple[str, str | None]:
         """Return (compressed_text, llm_fallback_reason_or_None)."""
-        # Anything published to a shared, longer-lived slot below must come
-        # from the live generation when this pin has been superseded.
-        sel_cfg = self._shared_selective_cfg(server, tool, sel_cfg, cfg_snap)
         if compression == CompressionStrategy.AUTO:
             resolved = auto_select_strategy(text, max_chars=max_chars)
             logger.debug("auto_select_strategy → %s for %s/%s", resolved.value, server, tool)
@@ -3004,6 +3001,8 @@ class ProxyManager:
                 max_chars,
                 hybrid_cfg,
                 sel_cfg,
+                server=server,
+                tool=tool,
                 context_query=context_query,
                 cfg_snap=cfg_snap,
             )
@@ -3023,9 +3022,17 @@ class ProxyManager:
                 # instance. A COLD slot is still filled, but from the live
                 # value resolved above, so the next live request agrees with
                 # what is there and leaves it alone.
-                if self._selective_compressor is None or (
-                    self._selective_compressor_cfg != sel_cfg
-                    and self._pin_is_live_generation(cfg_snap)
+                # Both the staleness test and the fill happen HERE, under the
+                # lock and with no await between them. Deciding before the lock
+                # leaves a window: a third generation can land while this
+                # coroutine waits, and the value it resolved as "live" is then
+                # already superseded by the time it publishes.
+                if self._selective_compressor is None:
+                    sel_compressor = self._rebuild_selective_compressor(
+                        self._shared_selective_cfg(server, tool, sel_cfg, cfg_snap)
+                    )
+                elif self._selective_compressor_cfg != sel_cfg and self._pin_is_live_generation(
+                    cfg_snap
                 ):
                     sel_compressor = self._rebuild_selective_compressor(sel_cfg)
                 else:
@@ -3316,6 +3323,8 @@ class ProxyManager:
         hybrid_cfg: HybridConfig | None,
         sel_cfg: SelectiveConfig | None,
         *,
+        server: str,
+        tool: str,
         context_query: str | None = None,
         cfg_snap: ProxyConfig,
     ) -> str:
@@ -3325,10 +3334,17 @@ class ProxyManager:
             timeout=cfg_snap.lock_timeout_seconds,
             name="selective_lock",
         ):
-            # Same generation guard as the SELECTIVE branch: this shares that
-            # compressor, and with it the pending store behind live TOC keys.
-            if self._selective_compressor is None or (
-                self._selective_compressor_cfg != sel_cfg and self._pin_is_live_generation(cfg_snap)
+            # Same generation guard as the SELECTIVE branch, decided in the same
+            # place and for the same reason: this shares that compressor, and
+            # with it the pending store behind live TOC keys. Resolving the
+            # publication config before the lock would leave a window for a
+            # third generation to land while this coroutine waits.
+            if self._selective_compressor is None:
+                self._rebuild_selective_compressor(
+                    self._shared_selective_cfg(server, tool, sel_cfg, cfg_snap)
+                )
+            elif self._selective_compressor_cfg != sel_cfg and self._pin_is_live_generation(
+                cfg_snap
             ):
                 self._rebuild_selective_compressor(sel_cfg)
 
@@ -3567,12 +3583,16 @@ class ProxyManager:
         trace_id: str | None = None,
         cfg_snap: ProxyConfig,
     ) -> str:
-        pin_is_live = self._pin_is_live_generation(cfg_snap)
         # Cold slot: publish the LIVE value, not this pin's, so the next live
         # request agrees with what is there instead of replacing the store the
-        # key minted below lives in.
-        sel_cfg = self._shared_selective_cfg(server, tool, sel_cfg, cfg_snap)
-        store = self._get_progressive_store(sel_cfg, allow_rebuild=pin_is_live)
+        # key minted below lives in. Decision and fill are one synchronous run
+        # — no await between them — so nothing can move the generation in
+        # between the way it can across a lock acquisition.
+        pin_is_live = self._pin_is_live_generation(cfg_snap)
+        store = self._get_progressive_store(
+            self._shared_selective_cfg(server, tool, sel_cfg, cfg_snap),
+            allow_rebuild=pin_is_live,
+        )
         if pin_is_live:
             # Eviction is STORE-WIDE, so it must never run on a superseded
             # policy: a stale pin carrying a smaller ``max_stored`` (or a
@@ -5035,6 +5055,8 @@ class ProxyManager:
                                         effective_max_chars,
                                         tc.hybrid,
                                         tc.selective,
+                                        server=server,
+                                        tool=tool,
                                         context_query=context_query,
                                         cfg_snap=cfg_snap,
                                     )

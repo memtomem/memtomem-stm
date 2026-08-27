@@ -278,10 +278,8 @@ changes inline only. See the deprecation policy in
 
   One loader change rides along because the scorer guard needs it:
   `ProxyConfigLoader` gained a `current` accessor that answers "is this pin
-  still the newest generation" without a `stat()`, and an unseeded loader whose
-  first load hits an unparseable file now returns defaults rather than `None`.
-  That fallback still drops `MEMTOMEM_STM_PROXY__*` overrides; #897 completes
-  it. Neither is reachable from the request path, which always seeds the loader.
+  still the newest generation" without a `stat()`. It is not reachable from the
+  request path, which always seeds the loader.
 
 - **Environment-override warnings now name the variables by measurement
   instead of inference** (#844, closes #843). Provenance was reconstructed
