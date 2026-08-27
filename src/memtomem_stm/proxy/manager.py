@@ -2362,29 +2362,33 @@ class ProxyManager:
         latest = self._config_loader.current
         return latest is None or cfg is latest
 
-    def _shared_selective_cfg(
+    def _publication_pair(
         self,
         server: str,
         tool: str,
         sel_cfg: SelectiveConfig | None,
         cfg_snap: ProxyConfig,
-    ) -> SelectiveConfig | None:
-        """The selective config a caller may PUBLISH to the shared slots.
+    ) -> tuple[ProxyConfig, SelectiveConfig | None]:
+        """The generation a fill publishes under, and its selective config.
 
-        A superseded pin gets the live generation's value instead of its own.
-        Refusing to overwrite a populated slot is only half the guard: when the
-        slot is EMPTY a stale caller would publish its own generation, and the
-        next live request — finding a config it disagrees with — replaces and
-        closes it, stranding the read-more key the stale caller just handed to
-        its client. Publishing the live value instead makes that later request
-        a no-op, so the store the key lives in survives.
+        Both come from ONE object on purpose. A superseded pin must not publish
+        its own generation into a shared slot: refusing to overwrite a
+        populated slot is only half the guard, because on an EMPTY slot the
+        stale value would be published and the next live request — finding a
+        config it disagrees with — replaces and closes that store, taking the
+        read-more key the stale caller already returned to its client. And the
+        two values cannot be resolved independently: each ``self._config`` is a
+        loader read that may re-load from disk, so two of them inside one fill
+        can bake two generations into one instance even with no ``await``
+        between them.
 
-        Costs one loader read, and only in the stale window; the pinned value
+        Costs one loader read, and only in the stale window; the pinned config
         still drives everything scoped to this call.
         """
         if self._pin_is_live_generation(cfg_snap):
-            return sel_cfg
-        return self._resolve_tool_config(server, tool, self._config).selective
+            return cfg_snap, sel_cfg
+        live = self._config
+        return live, self._resolve_tool_config(server, tool, live).selective
 
     def _relevance_scorer_for(self, cfg: ProxyConfig) -> "RelevanceScorer":
         """``_relevance_scorer`` against a caller-pinned config (#871).
@@ -2712,7 +2716,9 @@ class ProxyManager:
                 probe.close()
         return None
 
-    def _rebuild_selective_compressor(self, sel_cfg: SelectiveConfig | None) -> SelectiveCompressor:
+    def _rebuild_selective_compressor(
+        self, sel_cfg: SelectiveConfig | None, *, cfg: ProxyConfig | None = None
+    ) -> SelectiveCompressor:
         """Replace the cached selective compressor, closing the superseded one
         so a SQLite-backed store from a changed config does not leak its
         connection (#583). Returns the new compressor. Only called when the cfg
@@ -2724,7 +2730,7 @@ class ProxyManager:
         old compressor cached and usable rather than a closed store behind the
         cfg-equality fast path.
         """
-        new = self._create_selective(sel_cfg)
+        new = self._create_selective(sel_cfg, cfg=cfg)
         old = self._selective_compressor
         self._selective_compressor = new
         self._selective_compressor_cfg = sel_cfg
@@ -2735,7 +2741,9 @@ class ProxyManager:
                 logger.debug("Failed to close superseded selective compressor", exc_info=True)
         return new
 
-    def _create_selective(self, sel_cfg: SelectiveConfig | None) -> SelectiveCompressor:
+    def _create_selective(
+        self, sel_cfg: SelectiveConfig | None, *, cfg: ProxyConfig | None = None
+    ) -> SelectiveCompressor:
         """Create a SelectiveCompressor with the appropriate PendingStore backend."""
         kwargs: dict[str, Any] = {}
         store = None
@@ -2764,7 +2772,15 @@ class ProxyManager:
         # an accepted edge case, tracked as a follow-up. Baking in a snapshot
         # captured before the upstream call would make that stale instance one
         # generation older still.
-        kwargs["scorer"] = self._relevance_scorer
+        # ``cfg`` is the generation the CALLER decided to publish under. A
+        # bare ``self._relevance_scorer`` is another loader read, and
+        # ``get()`` can re-load from disk here — so without it the scorer
+        # baked into this compressor can come from a LATER generation than the
+        # config it is being published as, inside the very lock that exists to
+        # keep one fill on one generation.
+        kwargs["scorer"] = (
+            self._relevance_scorer_for(cfg) if cfg is not None else self._relevance_scorer
+        )
         return SelectiveCompressor(**kwargs)
 
     def _resolve_tool_config(
@@ -3028,8 +3044,11 @@ class ProxyManager:
                 # coroutine waits, and the value it resolved as "live" is then
                 # already superseded by the time it publishes.
                 if self._selective_compressor is None:
+                    publish_cfg, publish_sel = self._publication_pair(
+                        server, tool, sel_cfg, cfg_snap
+                    )
                     sel_compressor = self._rebuild_selective_compressor(
-                        self._shared_selective_cfg(server, tool, sel_cfg, cfg_snap)
+                        publish_sel, cfg=publish_cfg
                     )
                 elif self._selective_compressor_cfg != sel_cfg and self._pin_is_live_generation(
                     cfg_snap
@@ -3340,9 +3359,8 @@ class ProxyManager:
             # publication config before the lock would leave a window for a
             # third generation to land while this coroutine waits.
             if self._selective_compressor is None:
-                self._rebuild_selective_compressor(
-                    self._shared_selective_cfg(server, tool, sel_cfg, cfg_snap)
-                )
+                publish_cfg, publish_sel = self._publication_pair(server, tool, sel_cfg, cfg_snap)
+                self._rebuild_selective_compressor(publish_sel, cfg=publish_cfg)
             elif self._selective_compressor_cfg != sel_cfg and self._pin_is_live_generation(
                 cfg_snap
             ):
@@ -3589,10 +3607,8 @@ class ProxyManager:
         # — no await between them — so nothing can move the generation in
         # between the way it can across a lock acquisition.
         pin_is_live = self._pin_is_live_generation(cfg_snap)
-        store = self._get_progressive_store(
-            self._shared_selective_cfg(server, tool, sel_cfg, cfg_snap),
-            allow_rebuild=pin_is_live,
-        )
+        _publish_cfg, publish_sel = self._publication_pair(server, tool, sel_cfg, cfg_snap)
+        store = self._get_progressive_store(publish_sel, allow_rebuild=pin_is_live)
         if pin_is_live:
             # Eviction is STORE-WIDE, so it must never run on a superseded
             # policy: a stale pin carrying a smaller ``max_stored`` (or a

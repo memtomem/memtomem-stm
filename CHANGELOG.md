@@ -265,8 +265,12 @@ changes inline only. See the deprecation policy in
   expired". Store-wide eviction is likewise refused to a superseded pin, which
   could otherwise delete the current generation's live keys.
 
-  A request that constructs a long-lived component pays one extra read per
-  component (3 cold, 4 if it builds both; 2 once warm). **Behavior change**:
+  A request stays on the 2-read baseline even when it constructs the selective
+  compressor: the build publishes under one resolved generation and takes its
+  scorer from that same object, so the extra read is paid only in the stale
+  window. Only the fact extractor still costs one of its own, since it is built
+  from live config by design and rides no publication generation (3 cold, 2
+  once warm). **Behavior change**:
   for per-request decisions — including `mms surfacing <server> off` — a config
   edit landing while a request is in flight now applies from the next request
   instead of taking effect partway through the pipeline. Long-lived
@@ -276,10 +280,13 @@ changes inline only. See the deprecation policy in
   the fact extractor, which is built once and never rebuilt, so a later
   `extraction` edit needs a restart (#890, unchanged here).
 
-  One loader change rides along because the scorer guard needs it:
+  One loader change rides along because the generation guards need it:
   `ProxyConfigLoader` gained a `current` accessor that answers "is this pin
-  still the newest generation" without a `stat()`. It is not reachable from the
-  request path, which always seeds the loader.
+  still the newest generation" without a `stat()`. It reports the last config
+  the loader SEEDED or successfully LOADED — deliberately not "the last object
+  `get()` returned", since the unseeded fallbacks build one per call without
+  recording it, and `None` then reads as "no generation to compare against",
+  the safe answer for an identity check.
 
 - **Environment-override warnings now name the variables by measurement
   instead of inference** (#844, closes #843). Provenance was reconstructed

@@ -262,19 +262,19 @@ class TestPerRequestSnapshot:
         await mgr.call_tool("srv", "tool", {"a": 1})
         assert calls[0] == 2, f"expected 1 snapshot + 1 enforcement read, got {calls[0]}"
 
-    async def test_building_a_long_lived_component_takes_one_live_read(self, mgr):
-        """The build path reads live config exactly once more, by design.
+    async def test_building_the_compressor_costs_no_extra_read(self, mgr):
+        """Building the selective compressor adds NO loader read of its own.
 
-        A component cached for the process — here the selective compressor's
-        scorer — must not be baked from a snapshot pinned before the upstream
-        call, or a reload landing mid-call freezes the pre-edit generation for
-        every later request. Per-call decisions use the snapshot; things that
-        outlive the call read live. This pins the price of that rule so it
-        cannot grow unnoticed.
+        The component is cached for the process, so it must not be baked from a
+        superseded generation — but "not superseded" is exactly what the
+        request's own pin already is in the common case. The build publishes
+        under one resolved generation and takes its scorer from that same
+        object, so the extra read is paid only in the stale window. This pins
+        the price so it cannot grow back unnoticed.
         """
         calls = count_loader_reads(mgr)
         await mgr.call_tool("srv", "tool", {"a": 1})
-        assert calls[0] == 3, f"expected 2 baseline + 1 live build read, got {calls[0]}"
+        assert calls[0] == 2, f"expected the 2-read baseline, got {calls[0]}"
         assert mgr._selective_compressor is not None
 
     async def test_one_loader_read_on_the_cache_hit_path(self, truncate_mgr):
@@ -317,9 +317,10 @@ class TestPerRequestSnapshot:
     async def test_combined_construction_read_count(self, tmp_path):
         """Both build paths on one request: the reads add, they do not multiply.
 
-        This is the worst case a single request can reach — 1 snapshot plus one
-        live read per long-lived component it constructs. Pinned so a third
-        such component cannot be added without the count moving here.
+        Only the fact extractor still costs a read of its own — it is built
+        from LIVE config by design and has no publication generation to ride.
+        Pinned so a component that starts taking its own read again, or a third
+        one, moves the count here.
         """
         mgr, store, cache = _build_mgr(
             tmp_path, compression=CompressionStrategy.SELECTIVE, extraction=True
@@ -330,7 +331,7 @@ class TestPerRequestSnapshot:
             calls = count_loader_reads(mgr)
             await mgr.call_tool("srv", "tool", {"a": 1})
             assert mgr._selective_compressor is not None and mgr._extractor is not None
-            assert calls[0] == 4, f"expected 2 baseline + 2 live build reads, got {calls[0]}"
+            assert calls[0] == 3, f"expected 2 baseline + 1 live extractor read, got {calls[0]}"
 
             calls[0] = 0
             await mgr.call_tool("srv", "tool", {"b": 2})
