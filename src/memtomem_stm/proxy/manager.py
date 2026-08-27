@@ -3273,8 +3273,15 @@ class ProxyManager:
         this does NOT rebuild when ``extraction`` changes: an edit to the
         provider/model/limits is picked up by ``ext_cfg`` at the call site but
         not by the extractor object itself. That predates the per-request
-        snapshot and is tracked separately (#890); the snapshot here only
-        removes the loader read for the lock timeout.
+        snapshot and is tracked separately (#890).
+
+        Because of that, the CONSTRUCTION deliberately reads live config rather
+        than the request's ``cfg_snap``. A request pins its snapshot before the
+        upstream call; if the file reloads while that call is in flight, a
+        snapshot-built extractor would freeze the pre-reload config for the rest
+        of the process — turning a latent staleness bug into a reachable one.
+        The snapshot is used only for the lock timeout, which is re-read per
+        call and so cannot be frozen.
         """
         if cfg_snap is None:
             cfg_snap = self._config
@@ -3284,7 +3291,7 @@ class ProxyManager:
             name="extractor_lock",
         ):
             if self._extractor is None:
-                self._extractor = FactExtractor(cfg_snap.extraction)
+                self._extractor = FactExtractor(self._config.extraction)
             return self._extractor
 
     async def _extract_and_store(
@@ -5185,9 +5192,9 @@ class ProxyManager:
         WARNING log). A background run that was never scheduled — shed at the
         cap or during ``stop()`` — reports ``False`` / ``background_shed``
         instead (#868). Like the index stage, gate and ``_extract_and_store``
-        both read the request's ``cfg_snap`` snapshot (#871) — note that the
-        cached ``FactExtractor`` itself is still built once, see
-        ``_get_extractor``.
+        both read the request's ``cfg_snap`` snapshot for ``ext_cfg`` (#871).
+        The cached ``FactExtractor`` is deliberately NOT snapshot-built — see
+        ``_get_extractor`` for why, and #890 for the staleness it works around.
         """
         extract_ok: bool | None = None
         extract_error: str | None = None
@@ -5803,12 +5810,15 @@ class ProxyManager:
 
         # ── Stages 2+3: COMPRESS (or PROGRESSIVE) + SURFACE ──
         # Capture the scorer INSTANCE (not just its counter) before compression
-        # so the metrics record below sees a delta covering compression and
-        # everything after. Re-resolving the scorer after the await could hand
-        # back a different object — a concurrent request pinned to another
-        # config generation can replace the manager's cached scorer mid-flight —
-        # and the delta would then be taken against a counter that never saw
-        # this call's compression.
+        # so both ends of the delta read the same object: re-resolving after the
+        # await could hand back a different one, since a concurrent request
+        # pinned to another config generation can replace the manager's cached
+        # scorer mid-flight, and the delta would then be meaningless.
+        #
+        # This is a same-object delta, NOT full coverage of every compression
+        # path: SELECTIVE/HYBRID score through their cached compressor's own
+        # captured scorer, so a fallback there is not counted here. That gap
+        # predates the snapshot work and is unchanged by it.
         _scorer = self._relevance_scorer_for(cfg_snap)
         _pre_scorer_fb = getattr(_scorer, "fallback_count", 0)
         comp = await self._compress_and_surface(

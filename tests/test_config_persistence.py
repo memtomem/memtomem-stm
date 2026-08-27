@@ -94,10 +94,13 @@ class TestProxyConfigLoader:
 
     def test_unseeded_loader_with_broken_file_returns_defaults(self, tmp_path):
         """An unseeded loader whose first load fails has no cache to fall back
-        on. It must still hand back a usable config: every caller reaches it
-        through the ``ProxyManager._config`` property and does attribute
-        access on the result, so returning None turns a config typo into an
-        AttributeError deep in the request path.
+        on, and used to return None with the type error suppressed.
+
+        ``ProxyManager`` seeds its loader in ``__init__``, so this is NOT
+        reachable from the production request path; it is the contract for
+        anyone constructing a ``ProxyConfigLoader`` directly (tooling and
+        tests do). Every caller does attribute access on the result, so None
+        is never a usable answer — return defaults instead.
         """
         cfg_file = tmp_path / "stm_proxy.json"
         cfg_file.write_text("{ not valid json")
