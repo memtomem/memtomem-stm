@@ -348,6 +348,25 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **An unseeded loader with an unreadable config file answers, and honors
+  `MEMTOMEM_STM_PROXY__*`** (#897). `ProxyConfigLoader.get()` returned `None`
+  when nothing was cached and the first load failed, with the type error
+  suppressed — every caller does attribute access on that result. It now
+  returns a config. Which config matters: this class promises
+  `env > file > defaults` and its missing-file branch honors that by rebuilding
+  from the overlay, so returning bare defaults here would make the SAME
+  environment mean different things depending on whether the file was absent
+  (overrides applied) or unparseable (overrides silently gone) — and the case
+  that drops them is the one where an operator has least reason to suspect it.
+  The overlay is applied through the same `model_validate` the missing-file
+  branch uses; an overlay that is itself invalid falls back to defaults with a
+  WARNING rather than in silence. `_mtime` still does not advance, so the next
+  `get()` retries the file. **Behavior change**: such a loader returns an
+  env-applied config where it previously returned `None`, and an unusable
+  overlay logs a WARNING. Not reachable from the proxied request path, which
+  always seeds the loader; this is the contract for tooling and tests that
+  construct a loader directly.
+
 - **`mms selection replay` no longer crashes on, or silently trusts, an
   unreadable number** (#857, closes #856). Six fields on an admitted record
   were guarded by a type check and then coerced with `float()`, which the type

@@ -2617,4 +2617,30 @@ class ProxyConfigLoader:
                 # otherwise a fix that lands within filesystem mtime
                 # granularity (or before any other write) would be ignored.
                 logger.warning("Proxy config parse failed; keeping previous config")
-        return self._cached  # type: ignore[return-value]
+        # An unseeded loader whose first load failed has nothing cached, and
+        # every caller does attribute access on the result — hand back a config
+        # rather than None. _mtime stays unadvanced above, so the next get()
+        # still retries the broken file.
+        return self._cached if self._cached is not None else self._env_only_config()
+
+    def _env_only_config(self) -> ProxyConfig:
+        """Defaults for an unseeded loader with nothing loadable, env applied.
+
+        A broken file must not be the one condition that drops
+        ``MEMTOMEM_STM_PROXY__*``: this class promises they win over file
+        contents, and the sibling OSError branch above honors them through
+        ``load_from_file``. Bare defaults here would make the SAME environment
+        mean different things depending on whether the file is missing (env
+        applied) or unparseable (env silently gone).
+        """
+        overlay = _as_overlay(self._env_overrides)
+        fragment = overlay.fragment if overlay is not None else None
+        if fragment:
+            try:
+                return ProxyConfig.model_validate(fragment)
+            except ValidationError:
+                # The overlay itself is unusable; defaults are all that is
+                # left. Logged because a silently dropped override is the
+                # dark-failure mode this branch exists to close.
+                logger.warning("Environment config overrides are invalid; using defaults")
+        return ProxyConfig()
