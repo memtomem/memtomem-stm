@@ -279,10 +279,31 @@ def _count_loader_reads(manager: ProxyManager) -> list[int]:
 class TestPerRequestSnapshot:
     async def test_one_loader_read_per_call_tool(self, mgr):
         """The whole request — policy gate, ranking, cache lookup, and every
-        pipeline stage — runs off a single snapshot."""
+        pipeline stage — runs off a single snapshot.
+
+        Warmed up first: a request that CONSTRUCTS a long-lived component
+        deliberately takes one extra live read (see the build-path test below),
+        so the steady-state cost is what this pins.
+        """
+        await mgr.call_tool("srv", "tool", {"warm": 1})
         calls = _count_loader_reads(mgr)
         await mgr.call_tool("srv", "tool", {"a": 1})
         assert calls[0] == 1, f"expected 1 loader read per request, got {calls[0]}"
+
+    async def test_building_a_long_lived_component_takes_one_live_read(self, mgr):
+        """The build path reads live config exactly once more, by design.
+
+        A component cached for the process — here the selective compressor's
+        scorer — must not be baked from a snapshot pinned before the upstream
+        call, or a reload landing mid-call freezes the pre-edit generation for
+        every later request. Per-call decisions use the snapshot; things that
+        outlive the call read live. This pins the price of that rule so it
+        cannot grow unnoticed.
+        """
+        calls = _count_loader_reads(mgr)
+        await mgr.call_tool("srv", "tool", {"a": 1})
+        assert calls[0] == 2, f"expected 1 snapshot + 1 live build read, got {calls[0]}"
+        assert mgr._selective_compressor is not None
 
     async def test_one_loader_read_on_the_cache_hit_path(self, truncate_mgr):
         """The hit path re-applies surfacing and so reads config of its own;
@@ -300,6 +321,7 @@ class TestPerRequestSnapshot:
 
     async def test_snapshot_does_not_leak_across_requests(self, mgr):
         """One per request, not one per manager: the second call re-reads."""
+        await mgr.call_tool("srv", "tool", {"warm": 1})
         calls = _count_loader_reads(mgr)
         await mgr.call_tool("srv", "tool", {"a": 1})
         await mgr.call_tool("srv", "tool", {"b": 2})
@@ -323,7 +345,6 @@ class TestPerRequestSnapshot:
             "_surfacing_enabled_for",
             "_auto_index_response",
             "_extract_and_store",
-            "_get_extractor",
         }
         seen: dict[str, list[object]] = {}
 
@@ -347,18 +368,20 @@ class TestPerRequestSnapshot:
         first = received[0]
         assert all(snap is first for snap in received), "helpers saw different config objects"
 
-    async def test_extractor_is_built_from_the_requesting_snapshot(self, extract_mgr, tmp_path):
-        """Extraction and storage agree for the call that builds the extractor.
+    async def test_extractor_is_built_from_live_config_not_the_snapshot(
+        self, extract_mgr, tmp_path
+    ):
+        """A never-rebuilt singleton takes the FRESHEST config, not the pinned one.
 
-        ``_extract_and_store`` persists with the request's ``cfg_snap``, so
-        ``_get_extractor`` must construct from that same snapshot rather than a
-        fresh read — otherwise provider/limits could come from one generation
-        while namespace/dedup came from another.
+        Everything else on the request path reads ``cfg_snap``, because those
+        are decisions scoped to one call. This instance outlives every request,
+        so whichever generation builds it wins until restart — and pinning it to
+        a snapshot captured before the upstream call would freeze the PRE-edit
+        generation whenever a reload lands mid-call.
 
-        The reload is driven from inside the mocked upstream call, so the two
-        candidate implementations diverge: a ``cfg_snap`` build sees the
-        PRE-reload value, a live reread sees the post-reload one. Without that
-        divergence the assertion passes either way and pins nothing.
+        The reload is driven from inside the mocked upstream call so the two
+        candidate implementations diverge: a live read sees the post-reload
+        value, a ``cfg_snap`` build sees the pre-reload one.
         """
         import os
 
@@ -387,10 +410,10 @@ class TestPerRequestSnapshot:
         await mgr.call_tool("srv", "tool", {"a": 1})
 
         assert mgr._extractor is not None, "extraction stage did not run"
-        # Built from the pinned snapshot (10), NOT the post-reload file (3):
-        # the same snapshot the storage side of this call used.
-        assert mgr._extractor._cfg.max_facts == 10
         assert mgr._config.extraction.max_facts == 3, "the reload did not land"
+        assert mgr._extractor._cfg.max_facts == 3, (
+            "extractor was pinned to the pre-reload snapshot"
+        )
 
     async def test_extractor_is_not_rebuilt_on_config_change(self, extract_mgr, tmp_path):
         """Pins #890's KNOWN GAP so the follow-up has a red-to-green target.

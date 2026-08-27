@@ -225,6 +225,26 @@ changes inline only. See the deprecation policy in
 
 ### Changed
 
+- **One config snapshot per proxied request** (#889, closes #871).
+  `ProxyManager._config` is a property over the hot-reload loader, so each
+  textual read cost a `stat()` and two reads within one call could land on
+  either side of a reload. The existing per-request `cfg_snap` pin moved up
+  into `call_tool`, and now reaches the toolgraph policy gate, the relevance
+  ranker, and every pipeline stage. Measured over a SELECTIVE-plus-cache
+  configuration, a steady-state request went from 6 loader reads to 1.
+  Components cached beyond the call — the selective compressor's scorer, the
+  fact extractor — deliberately keep reading live config, since baking a
+  snapshot pinned before the upstream call into an object that outlives the
+  request would freeze the pre-edit generation for every later call; a request
+  that builds one pays exactly one extra read. **Behavior change**: a config
+  edit that lands while a request is in flight now applies from the next
+  request instead of taking effect partway through the pipeline — including
+  `mms surfacing <server> off`. Hot reload is still restart-free; only the
+  granularity changed, deliberately, since mid-request generation mixing was
+  the defect. Separately, an unseeded `ProxyConfigLoader` whose first load
+  hits an unparseable file now returns defaults rather than `None`; this is
+  not reachable from the request path, which always seeds the loader.
+
 - **Environment-override warnings now name the variables by measurement
   instead of inference** (#844, closes #843). Provenance was reconstructed
   after the overlay resolved, which could not be checked against anything; a

@@ -2593,9 +2593,7 @@ class ProxyManager:
                 probe.close()
         return None
 
-    def _rebuild_selective_compressor(
-        self, sel_cfg: SelectiveConfig | None, *, cfg_snap: ProxyConfig | None = None
-    ) -> SelectiveCompressor:
+    def _rebuild_selective_compressor(self, sel_cfg: SelectiveConfig | None) -> SelectiveCompressor:
         """Replace the cached selective compressor, closing the superseded one
         so a SQLite-backed store from a changed config does not leak its
         connection (#583). Returns the new compressor. Only called when the cfg
@@ -2607,7 +2605,7 @@ class ProxyManager:
         old compressor cached and usable rather than a closed store behind the
         cfg-equality fast path.
         """
-        new = self._create_selective(sel_cfg, cfg_snap=cfg_snap)
+        new = self._create_selective(sel_cfg)
         old = self._selective_compressor
         self._selective_compressor = new
         self._selective_compressor_cfg = sel_cfg
@@ -2618,9 +2616,7 @@ class ProxyManager:
                 logger.debug("Failed to close superseded selective compressor", exc_info=True)
         return new
 
-    def _create_selective(
-        self, sel_cfg: SelectiveConfig | None, *, cfg_snap: ProxyConfig | None = None
-    ) -> SelectiveCompressor:
+    def _create_selective(self, sel_cfg: SelectiveConfig | None) -> SelectiveCompressor:
         """Create a SelectiveCompressor with the appropriate PendingStore backend."""
         kwargs: dict[str, Any] = {}
         store = None
@@ -2642,15 +2638,14 @@ class ProxyManager:
         # TOC with the operator's configured scorer (e.g. embedding) instead of
         # SelectiveCompressor's built-in BM25 default. With the default bm25
         # scorer this is a no-op (passing a BM25Scorer == the class default).
-        # The scorer is resolved against the caller's config (the request
-        # snapshot on the call path, a fresh read otherwise), so a compressor
-        # built after a scorer change picks up the new scorer; a scorer-only
-        # hot-reload that does not also change the selective config keeps the
-        # cached compressor (and its scorer) until the next rebuild — an
-        # accepted edge case, tracked as a follow-up.
-        kwargs["scorer"] = self._relevance_scorer_for(
-            cfg_snap if cfg_snap is not None else self._config
-        )
+        # LIVE read, not the request snapshot: this scorer is baked into a
+        # compressor that outlives the call, and the rebuild predicate keys only
+        # on ``sel_cfg``, so a scorer-only hot-reload keeps the cached
+        # compressor (and its scorer) until the next selective-config rebuild —
+        # an accepted edge case, tracked as a follow-up. Baking in a snapshot
+        # captured before the upstream call would make that stale instance one
+        # generation older still.
+        kwargs["scorer"] = self._relevance_scorer
         return SelectiveCompressor(**kwargs)
 
     def _resolve_tool_config(
@@ -2901,7 +2896,7 @@ class ProxyManager:
                 name="selective_lock",
             ):
                 if self._selective_compressor is None or self._selective_compressor_cfg != sel_cfg:
-                    sel_compressor = self._rebuild_selective_compressor(sel_cfg, cfg_snap=cfg_snap)
+                    sel_compressor = self._rebuild_selective_compressor(sel_cfg)
                 else:
                     sel_compressor = self._selective_compressor
                 # Pin the compressor before the lock drops: the off-thread
@@ -3204,7 +3199,7 @@ class ProxyManager:
             name="selective_lock",
         ):
             if self._selective_compressor is None or self._selective_compressor_cfg != sel_cfg:
-                self._rebuild_selective_compressor(sel_cfg, cfg_snap=cfg_snap)
+                self._rebuild_selective_compressor(sel_cfg)
 
             sel_compressor = self._selective_compressor
             compressor = HybridCompressor(
@@ -3267,33 +3262,32 @@ class ProxyManager:
             observability=self.index_observability,
         )
 
-    async def _get_extractor(self, *, cfg_snap: ProxyConfig | None = None) -> FactExtractor:
-        """The lazily-built ``FactExtractor``, constructed from the config of
-        whichever request first reaches this method — and NOT rebuilt when
-        ``extraction`` changes afterwards (#890).
+    async def _get_extractor(self) -> FactExtractor:
+        """The lazily-built ``FactExtractor``, never rebuilt when ``extraction``
+        changes (#890).
 
-        Building from ``cfg_snap`` rather than a fresh read is what keeps the
-        request that builds it self-consistent: ``_extract_and_store`` persists
-        with the same snapshot, so extraction and storage cannot disagree about
-        provider, limits, namespace or dedup for that call.
+        Deliberately reads LIVE config rather than the caller's request
+        snapshot, unlike the per-call sites in this class. The distinction is
+        lifetime: a snapshot is right for a decision scoped to one call, but
+        this instance outlives every request, so whichever generation builds it
+        wins until restart. Pinning it to a snapshot captured before the
+        upstream call would freeze the PRE-edit generation whenever a reload
+        lands mid-call — trading one call's internal consistency for a
+        permanently staler singleton. Freshness wins for something that never
+        rebuilds.
 
-        Rebuilding on change is deliberately NOT done here. It needs the
-        superseded instance to stay alive for callers already holding it, i.e.
-        an explicit lease (borrow before the handoff, close after the last
-        borrower releases) — lifecycle work in its own right, not part of a
-        per-request-snapshot change. #890 carries the analysis. Until then the staleness is bounded and documented rather
-        than half-solved: a config edit to the extraction block needs a
-        restart, exactly as before this PR.
+        Rebuilding on change would remove the trade entirely, but it needs the
+        superseded instance to stay usable by callers already holding it — an
+        explicit lease. That is lifecycle work in its own right; #890 carries
+        the analysis.
         """
-        if cfg_snap is None:
-            cfg_snap = self._config
         async with bounded_lock(
             self._extractor_lock,
-            timeout=cfg_snap.lock_timeout_seconds,
+            timeout=self._config.lock_timeout_seconds,
             name="extractor_lock",
         ):
             if self._extractor is None:
-                self._extractor = FactExtractor(cfg_snap.extraction)
+                self._extractor = FactExtractor(self._config.extraction)
             return self._extractor
 
     async def _extract_and_store(
@@ -3309,7 +3303,7 @@ class ProxyManager:
         """Extract facts from response and store as individual memory entries."""
         if cfg_snap is None:
             cfg_snap = self._config
-        extractor = await self._get_extractor(cfg_snap=cfg_snap)
+        extractor = await self._get_extractor()
         return await extract_and_store(
             index_engine=self._index_engine,
             extractor=extractor,
