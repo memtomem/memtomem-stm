@@ -999,7 +999,16 @@ class TestExtractAndStore:
         ]
 
         mgr = _make_manager(tmp_path=tmp_path, index_engine=mock_indexer)
+        ext_cfg = ExtractionConfig(
+            enabled=True,
+            memory_dir=tmp_path / "facts",
+            dedup_threshold=0.9,
+        )
         mgr._extractor = mock_extractor
+        # Pair the injected instance with the config it stands for:
+        # _get_extractor rebuilds when the two disagree (#890), so injecting
+        # the instance alone would have it discarded before extract() runs.
+        mgr._extractor_cfg = ext_cfg
 
         with patch.object(
             type(mgr),
@@ -1008,11 +1017,7 @@ class TestExtractAndStore:
                 lambda self: ProxyConfig(
                     config_path=tmp_path / "proxy.json",
                     upstream_servers={"srv": UpstreamServerConfig(prefix="test")},
-                    extraction=ExtractionConfig(
-                        enabled=True,
-                        memory_dir=tmp_path / "facts",
-                        dedup_threshold=0.9,
-                    ),
+                    extraction=ext_cfg,
                 )
             ),
         ):

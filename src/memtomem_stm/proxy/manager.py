@@ -57,6 +57,7 @@ from memtomem_stm.proxy.config import (
     CompressionStrategy,
     EnvOverlayResult,
     ExposureProfile,
+    ExtractionConfig,
     ExtractionStrategy,
     HybridConfig,
     LLMCompressorConfig,
@@ -650,6 +651,7 @@ class ProxyManager:
         self._selective_compressor_cfg: SelectiveConfig | None = None
         self._selective_lock = asyncio.Lock()
         self._extractor: FactExtractor | None = None
+        self._extractor_cfg: ExtractionConfig | None = None
         self._extractor_lock = asyncio.Lock()
         # In-memory counters for both INDEX-pipeline write paths
         # (auto_index_response + extract_and_store). Always instantiated for
@@ -2224,6 +2226,7 @@ class ProxyManager:
             # None, so a stop->start cycle gets a fresh httpx client instead of
             # the closed instance (whose extract() asserts _client is not None).
             self._extractor = None
+            self._extractor_cfg = None
         # Close the #494 consult disk cache (re-opened lazily on the next start).
         # Always null the handle so a failed close cannot leave a stale closed
         # connection that the next start() would reuse.
@@ -3269,29 +3272,32 @@ class ProxyManager:
         """The lazily-built ``FactExtractor``, constructed from whichever config
         first reached this method.
 
-        Unlike ``_relevance_scorer_for`` / ``_rebuild_selective_compressor``,
-        this does NOT rebuild when ``extraction`` changes: an edit to the
-        provider/model/limits is picked up by ``ext_cfg`` at the call site but
-        not by the extractor object itself. That predates the per-request
-        snapshot and is tracked separately (#890).
+        Rebuilt when ``extraction`` changes, like ``_llm_compressor`` above and
+        ``_relevance_scorer_for`` / ``_rebuild_selective_compressor`` (#890).
+        Without that, this lazily-built singleton would freeze whichever
+        generation happened to construct it: the caller persists with
+        ``cfg_snap.extraction``, so a never-rebuilt extractor would run the
+        provider/model/limits of one generation while storage used another —
+        and a reload landing mid-request would make the mismatch permanent.
 
-        Because of that, the CONSTRUCTION deliberately reads live config rather
-        than the request's ``cfg_snap``. A request pins its snapshot before the
-        upstream call; if the file reloads while that call is in flight, a
-        snapshot-built extractor would freeze the pre-reload config for the rest
-        of the process — turning a latent staleness bug into a reachable one.
-        The snapshot is used only for the lock timeout, which is re-read per
-        call and so cannot be frozen.
+        The old instance is closed inside the lock, mirroring
+        ``_llm_compressor``. ``FactExtractor.close()`` flips its gate before a
+        bounded drain, so an extraction already in flight degrades to the local
+        heuristic rather than failing.
         """
         if cfg_snap is None:
             cfg_snap = self._config
+        ext_cfg = cfg_snap.extraction
         async with bounded_lock(
             self._extractor_lock,
             timeout=cfg_snap.lock_timeout_seconds,
             name="extractor_lock",
         ):
-            if self._extractor is None:
-                self._extractor = FactExtractor(self._config.extraction)
+            if self._extractor is None or self._extractor_cfg != ext_cfg:
+                if self._extractor is not None:
+                    await self._extractor.close()
+                self._extractor = FactExtractor(ext_cfg)
+                self._extractor_cfg = ext_cfg
             return self._extractor
 
     async def _extract_and_store(
@@ -5192,9 +5198,9 @@ class ProxyManager:
         WARNING log). A background run that was never scheduled — shed at the
         cap or during ``stop()`` — reports ``False`` / ``background_shed``
         instead (#868). Like the index stage, gate and ``_extract_and_store``
-        both read the request's ``cfg_snap`` snapshot for ``ext_cfg`` (#871).
-        The cached ``FactExtractor`` is deliberately NOT snapshot-built — see
-        ``_get_extractor`` for why, and #890 for the staleness it works around.
+        both read the request's ``cfg_snap`` snapshot (#871), and the cached
+        ``FactExtractor`` is rebuilt from that same snapshot when ``extraction``
+        changes (#890) — extraction and storage cannot split generations.
         """
         extract_ok: bool | None = None
         extract_error: str | None = None
