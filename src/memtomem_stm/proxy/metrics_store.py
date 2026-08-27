@@ -33,6 +33,116 @@ CREATE TABLE IF NOT EXISTS proxy_metrics (
 
 _INDEX = "CREATE INDEX IF NOT EXISTS idx_metrics_created ON proxy_metrics(created_at);"
 
+_SOURCE_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_metrics_source_created ON proxy_metrics(source, created_at)"
+)
+
+# Index names as they appear in the two CREATE statements above, parsed from
+# them rather than repeated: the fingerprint has to describe the indexes the
+# slow path actually builds, and a hand-copied second list would drift.
+_INDEX_NAMES = tuple(
+    ddl.split("CREATE INDEX IF NOT EXISTS ", 1)[1].split(maxsplit=1)[0]
+    for ddl in (_INDEX, _SOURCE_INDEX)
+)
+
+# Columns declared by _CREATE above. Kept beside it so the fingerprint below
+# describes the whole schema, base columns included.
+_BASE_COLUMNS = frozenset(
+    {
+        "id",
+        "server",
+        "tool",
+        "original_chars",
+        "compressed_chars",
+        "cleaned_chars",
+        "created_at",
+    }
+)
+
+# Columns introduced after the initial schema, applied by ``_migrate``.
+# Module-level so ``_SCHEMA_FINGERPRINT`` is derived from the same dict the
+# migration runs — adding an entry here cannot get out of sync with the
+# fingerprint, so there is no version number to forget to bump.
+_MIGRATIONS: dict[str, str] = {
+    "is_error": "ALTER TABLE proxy_metrics ADD COLUMN is_error INTEGER NOT NULL DEFAULT 0",
+    "error_category": "ALTER TABLE proxy_metrics ADD COLUMN error_category TEXT DEFAULT NULL",
+    "error_code": "ALTER TABLE proxy_metrics ADD COLUMN error_code INTEGER DEFAULT NULL",
+    "trace_id": "ALTER TABLE proxy_metrics ADD COLUMN trace_id TEXT DEFAULT NULL",
+    "compression_strategy": (
+        "ALTER TABLE proxy_metrics ADD COLUMN compression_strategy TEXT DEFAULT NULL"
+    ),
+    "ratio_violation": (
+        "ALTER TABLE proxy_metrics ADD COLUMN ratio_violation INTEGER NOT NULL DEFAULT 0"
+    ),
+    "scorer_fallback": (
+        "ALTER TABLE proxy_metrics ADD COLUMN scorer_fallback INTEGER NOT NULL DEFAULT 0"
+    ),
+    "index_ok": "ALTER TABLE proxy_metrics ADD COLUMN index_ok INTEGER DEFAULT NULL",
+    "index_error": "ALTER TABLE proxy_metrics ADD COLUMN index_error TEXT DEFAULT NULL",
+    "chunks_indexed": (
+        "ALTER TABLE proxy_metrics ADD COLUMN chunks_indexed INTEGER NOT NULL DEFAULT 0"
+    ),
+    "extract_ok": "ALTER TABLE proxy_metrics ADD COLUMN extract_ok INTEGER DEFAULT NULL",
+    "extract_error": "ALTER TABLE proxy_metrics ADD COLUMN extract_error TEXT DEFAULT NULL",
+    "surfacing_on_progressive_ok": (
+        "ALTER TABLE proxy_metrics ADD COLUMN surfacing_on_progressive_ok INTEGER DEFAULT NULL"
+    ),
+    "surface_error": "ALTER TABLE proxy_metrics ADD COLUMN surface_error TEXT DEFAULT NULL",
+    "error_message": "ALTER TABLE proxy_metrics ADD COLUMN error_message TEXT DEFAULT NULL",
+    # Provenance: pre-existing rows are all proxied MCP calls, so the
+    # backfill default is ``'mcp'``; ``mms hook`` writes ``'hook'`` for
+    # native built-in tools. NOT NULL + DEFAULT keeps old rows readable.
+    "source": "ALTER TABLE proxy_metrics ADD COLUMN source TEXT NOT NULL DEFAULT 'mcp'",
+}
+
+# Schema bookkeeping in a table of our own rather than in ``PRAGMA
+# user_version``. That pragma is a property of the DATABASE, not of a table,
+# and ``metrics.db_path`` takes an arbitrary path — point it at a file another
+# component stamps (the response cache does) and this store would read a number
+# it never wrote, so the migration below would silently not run (#797). Nothing
+# stops another component from touching a named table, but no other component in
+# this codebase writes this one, whereas ``user_version`` is a single slot they
+# all inevitably share.
+_META_CREATE = """
+CREATE TABLE IF NOT EXISTS metrics_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"""
+
+_SCHEMA_FINGERPRINT_KEY = "schema_fingerprint"
+
+# Version of the fingerprint's own ENCODING, not of the schema. Bump it when the
+# string below changes shape — a new field, a different separator — so stamps
+# written by an older layout cannot accidentally compare equal to a new one.
+#
+# Additive schema changes need no bump: a new column changes ``_MIGRATIONS`` and
+# a new index changes ``_INDEX_NAMES``, and both feed the fingerprint directly.
+# A bump is also NOT a way to apply a *non*-additive change (an existing
+# column's type or default, a dropped index): the slow path only ever adds
+# (``IF NOT EXISTS`` DDL, ``_migrate`` skips columns that exist by name), so it
+# would stamp "current" over a schema it never changed. Those need a real
+# migration step first — a pre-existing limit of this store, not one the
+# fingerprint introduces.
+_SCHEMA_EPOCH = 1
+
+
+def _schema_fingerprint() -> str:
+    """Describe the schema ``initialize`` would produce, as a stable string.
+
+    Covers exactly what the slow path can apply: the set of column *names* and
+    the index names, plus the epoch. Derived from ``_MIGRATIONS`` rather than
+    hand-maintained, so adding a column invalidates every stamped DB on its own
+    with no version to bump — see ``_SCHEMA_EPOCH`` for what it deliberately
+    does not cover. Plain text, not a hash, so a stale stamp is readable with
+    ``sqlite3 proxy_metrics.db 'SELECT * FROM metrics_meta'``.
+    """
+    columns = ",".join(sorted(_BASE_COLUMNS | set(_MIGRATIONS)))
+    return f"{_SCHEMA_EPOCH}|{columns}|{','.join(_INDEX_NAMES)}"
+
+
+_SCHEMA_FINGERPRINT = _schema_fingerprint()
+
 
 def _tristate(value: bool | None) -> int | None:
     """Map a tri-state bool to SQLite-friendly ``int | None``.
@@ -230,6 +340,33 @@ class MetricsStore:
         self._lock = threading.Lock()
 
     def initialize(self) -> None:
+        """Open the DB, building or migrating the schema only when it is stale.
+
+        Trade-off worth knowing about: because a current stamp short-circuits
+        the DDL, this no longer re-creates a table, column or index that went
+        missing *after* the stamp was written. It used to, incidentally — the
+        unconditional ``IF NOT EXISTS`` cycle repaired such a DB on the next
+        open. Only external damage gets there; nothing in this codebase drops
+        them. What each kind of loss then looks like:
+
+        - a dropped *column* or the whole ``proxy_metrics`` table is loud —
+          ``record`` fails on its insert;
+        - a dropped *index* is **silent**. ``record`` does not need one, so the
+          only symptom is that its ``COUNT``/``ORDER BY`` scans and the reader
+          aggregations get slower. Accepted knowingly: an index nothing drops
+          is not worth a per-invocation check.
+
+        Repair is to clear the stamp (``DELETE FROM metrics_meta``) and reopen,
+        which rebuilds the indexes, the table, and every ``_MIGRATIONS`` column.
+        It does **not** restore a dropped *base* column — ``_CREATE`` is
+        ``IF NOT EXISTS`` and cannot alter an existing table — so that one case
+        needs the file rebuilt. Losing ``metrics_meta`` itself needs no action:
+        the probe reads that as "not current" and the slow path recreates it.
+
+        Paying the probe on every one of thousands of daily hook invocations to
+        keep an accidental repair for a state nothing produces is the worse
+        trade (#870).
+        """
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         connect_timeout = (
             self._busy_timeout_ms / 1000.0 if self._busy_timeout_ms is not None else 5.0
@@ -243,21 +380,35 @@ class MetricsStore:
                 # best-effort writer fast-fails on a locked DB. Lower bound only —
                 # the DDL/INSERT below then raise quickly and the caller degrades.
                 db.execute(f"PRAGMA busy_timeout={int(self._busy_timeout_ms)}")
-            db.execute(_CREATE)
-            db.execute(_INDEX)
-            db.commit()
-            # Run migrations against the local ``db`` before it is exposed
-            # as ``self._db`` so a failure here falls through to the outer
-            # except and leaves the store un-initialized.
-            self._migrate(db)
-            # ``source`` is a migrated column (absent from the base _CREATE),
-            # so the index backing the per-source _trim scan can only be
-            # created after _migrate has run.
-            db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_metrics_source_created "
-                "ON proxy_metrics(source, created_at)"
-            )
-            db.commit()
+            if not self._schema_is_current(db):
+                db.execute(_CREATE)
+                db.execute(_INDEX)
+                db.commit()
+                # Run migrations against the local ``db`` before it is exposed
+                # as ``self._db`` so a failure here falls through to the outer
+                # except and leaves the store un-initialized.
+                self._migrate(db)
+                # ``source`` is a migrated column (absent from the base _CREATE),
+                # so the index backing the per-source _trim scan can only be
+                # created after _migrate has run.
+                db.execute(_SOURCE_INDEX)
+                # Stamp LAST. This is an ORDERING guarantee, not an atomic one:
+                # the base DDL above and _migrate each commit before this runs,
+                # so a failure part-way leaves that partial DDL committed. What
+                # ordering buys is that the stamp never becomes CURRENT for a
+                # schema whose build did not finish — a fresh DB is left with no
+                # stamp and an upgrading one keeps its old (now stale) value, and
+                # both read as "not current", so the next opener redoes the full
+                # path. Concurrent openers both land here and write the same
+                # value (the DDL is idempotent and _migrate tolerates the
+                # duplicate-column race), so last-writer-wins is a no-op.
+                db.execute(_META_CREATE)
+                db.execute(
+                    "INSERT INTO metrics_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (_SCHEMA_FINGERPRINT_KEY, _SCHEMA_FINGERPRINT),
+                )
+                db.commit()
             # Reconcile every source once at startup: the per-write _trim only
             # covers the writer's own source, so an over-cap source that has
             # stopped receiving writes (e.g. after lowering max_history) would
@@ -270,15 +421,49 @@ class MetricsStore:
             raise
         self._db = db
 
+    def _schema_is_current(self, db: sqlite3.Connection) -> bool:
+        """Whether this DB already carries the schema ``initialize`` would build.
+
+        One SELECT on a one-row table that lets the hot path skip the DDL +
+        ``PRAGMA table_info`` + conditional-ALTER cycle. ``mms hook`` runs as a
+        one-shot subprocess on every host built-in tool call, so that cycle ran
+        thousands of times a day to reach a schema that had not changed since
+        the first run (#870).
+
+        Of the ``OperationalError``s, only a missing ``metrics_meta`` is treated
+        as "not current" — that is a fresh or pre-#870 DB, and the slow path
+        builds it. (An absent row or a stale value is not an error at all; both
+        simply return ``False`` below.) Every other ``OperationalError``
+        propagates rather than being retried as DDL: the
+        caller would hit the same condition one statement later, and reporting
+        it from the DDL instead of from here would name the wrong statement.
+        The hook wraps this whole path in its own best-effort catch, so a
+        propagated error still degrades to no row.
+
+        Says nothing about whether the columns are really there: it reads the
+        stamp, not the schema. See ``initialize`` for what that costs.
+        """
+        try:
+            row = db.execute(
+                "SELECT value FROM metrics_meta WHERE key = ?", (_SCHEMA_FINGERPRINT_KEY,)
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            return False
+        return bool(row) and str(row[0]) == _SCHEMA_FINGERPRINT
+
     def _migrate(self, db: sqlite3.Connection) -> None:
         """Add columns introduced after initial schema (idempotent).
 
         Idempotency is guaranteed per-column via ``PRAGMA table_info`` — a
-        column that already exists is skipped, so restarting against an
-        already-migrated DB runs no ALTER statements. This is stronger than
-        a single ``user_version`` gate because adding a new column below
-        doesn't require bumping a version number; the existence check covers
-        all migration states (fresh, pre-migration, already-migrated).
+        column that already exists is skipped, so running this against an
+        already-migrated DB executes no ALTER statements. The existence check
+        covers all migration states (fresh, pre-migration, already-migrated),
+        and it — not the ``_SCHEMA_FINGERPRINT`` gate in ``initialize`` —
+        decides *what* runs. The fingerprint only decides whether this method
+        is worth calling at all; because it is derived from ``_MIGRATIONS``,
+        adding a column below still requires no version bump.
 
         Boolean columns use ``INTEGER NOT NULL DEFAULT 0`` so existing rows
         get a deterministic value. Tri-state columns (``index_ok``,
@@ -296,45 +481,7 @@ class MetricsStore:
         real failure and propagates.
         """
         existing = self._existing_columns(db)
-        migrations = {
-            "is_error": "ALTER TABLE proxy_metrics ADD COLUMN is_error INTEGER NOT NULL DEFAULT 0",
-            "error_category": "ALTER TABLE proxy_metrics ADD COLUMN error_category TEXT DEFAULT NULL",
-            "error_code": "ALTER TABLE proxy_metrics ADD COLUMN error_code INTEGER DEFAULT NULL",
-            "trace_id": "ALTER TABLE proxy_metrics ADD COLUMN trace_id TEXT DEFAULT NULL",
-            "compression_strategy": (
-                "ALTER TABLE proxy_metrics ADD COLUMN compression_strategy TEXT DEFAULT NULL"
-            ),
-            "ratio_violation": (
-                "ALTER TABLE proxy_metrics ADD COLUMN ratio_violation INTEGER NOT NULL DEFAULT 0"
-            ),
-            "scorer_fallback": (
-                "ALTER TABLE proxy_metrics ADD COLUMN scorer_fallback INTEGER NOT NULL DEFAULT 0"
-            ),
-            "index_ok": "ALTER TABLE proxy_metrics ADD COLUMN index_ok INTEGER DEFAULT NULL",
-            "index_error": "ALTER TABLE proxy_metrics ADD COLUMN index_error TEXT DEFAULT NULL",
-            "chunks_indexed": (
-                "ALTER TABLE proxy_metrics ADD COLUMN chunks_indexed INTEGER NOT NULL DEFAULT 0"
-            ),
-            "extract_ok": "ALTER TABLE proxy_metrics ADD COLUMN extract_ok INTEGER DEFAULT NULL",
-            "extract_error": (
-                "ALTER TABLE proxy_metrics ADD COLUMN extract_error TEXT DEFAULT NULL"
-            ),
-            "surfacing_on_progressive_ok": (
-                "ALTER TABLE proxy_metrics ADD COLUMN surfacing_on_progressive_ok "
-                "INTEGER DEFAULT NULL"
-            ),
-            "surface_error": (
-                "ALTER TABLE proxy_metrics ADD COLUMN surface_error TEXT DEFAULT NULL"
-            ),
-            "error_message": (
-                "ALTER TABLE proxy_metrics ADD COLUMN error_message TEXT DEFAULT NULL"
-            ),
-            # Provenance: pre-existing rows are all proxied MCP calls, so the
-            # backfill default is ``'mcp'``; ``mms hook`` writes ``'hook'`` for
-            # native built-in tools. NOT NULL + DEFAULT keeps old rows readable.
-            "source": "ALTER TABLE proxy_metrics ADD COLUMN source TEXT NOT NULL DEFAULT 'mcp'",
-        }
-        for col, ddl in migrations.items():
+        for col, ddl in _MIGRATIONS.items():
             if col not in existing:
                 try:
                     db.execute(ddl)

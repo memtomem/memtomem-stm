@@ -16,7 +16,19 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from memtomem_stm.proxy.metrics import CallMetrics
-from memtomem_stm.proxy.metrics_store import MetricsStore, read_compression_summary
+from memtomem_stm.proxy.metrics_store import (
+    _BASE_COLUMNS,
+    _CREATE,
+    _INDEX,
+    _INDEX_NAMES,
+    _MIGRATIONS,
+    _SCHEMA_FINGERPRINT,
+    _SCHEMA_FINGERPRINT_KEY,
+    _SOURCE_INDEX,
+    MetricsStore,
+    _schema_fingerprint,
+    read_compression_summary,
+)
 
 
 NEW_COLUMNS = {
@@ -33,6 +45,33 @@ NEW_COLUMNS = {
 
 def _column_names(db: sqlite3.Connection) -> set[str]:
     return {row[1] for row in db.execute("PRAGMA table_info(proxy_metrics)")}
+
+
+def _clear_schema_stamp(db_path) -> None:
+    """Remove the ``initialize`` schema stamp so the next open takes the slow path.
+
+    Models the window a concurrent opener really sees — it probes
+    ``metrics_meta`` before the other process commits its stamp.
+    """
+    db = sqlite3.connect(str(db_path))
+    try:
+        db.execute("DELETE FROM metrics_meta")
+        db.commit()
+    finally:
+        db.close()
+
+
+def _read_schema_stamp(db_path) -> str | None:
+    db = sqlite3.connect(str(db_path))
+    try:
+        row = db.execute(
+            "SELECT value FROM metrics_meta WHERE key = ?", (_SCHEMA_FINGERPRINT_KEY,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None  # no metrics_meta table at all
+    finally:
+        db.close()
+    return None if row is None else str(row[0])
 
 
 class TestMigrationIdempotency:
@@ -101,34 +140,41 @@ class TestMigrationIdempotency:
         finally:
             store.close()
 
-    def test_already_migrated_db_is_noop(self, tmp_path):
-        """Closing and reopening an already-migrated store must not raise.
+    def test_already_migrated_db_is_noop(self, tmp_path, monkeypatch):
+        """Re-running ``_migrate`` against an already-migrated DB must not raise.
 
-        This is the critical invariant: every proxy restart after F2
-        ships re-runs ``_migrate``. If the ALTER statements are not
-        guarded against "column already exists", SQLite raises
-        ``OperationalError: duplicate column name`` and the store fails
-        to initialize — i.e., the proxy cannot start on an existing DB.
+        This is the critical invariant: if the ALTER statements are not guarded
+        against "column already exists", SQLite raises ``OperationalError:
+        duplicate column name`` and the store fails to initialize — i.e., the
+        proxy cannot start on an existing DB.
+
+        The stamp is cleared before each reopen and ``_migrate`` is asserted to
+        have run. Since #870 a stamped DB fast-paths, so without clearing it
+        these openers would skip ``_migrate`` entirely and the test would pass
+        no matter how badly the re-run behaved.
         """
         db_path = tmp_path / "metrics.db"
         # First open: creates + migrates.
         store = MetricsStore(db_path)
         store.initialize()
         store.close()
-        # Second open: every migration must be a no-op.
-        store = MetricsStore(db_path)
-        try:
-            store.initialize()  # must not raise
-            cols = _column_names(store._db)
-            assert NEW_COLUMNS.issubset(cols)
-        finally:
-            store.close()
-        # Third open for good measure — migrations run on every init().
-        store = MetricsStore(db_path)
-        try:
-            store.initialize()
-        finally:
-            store.close()
+
+        migrated: list[bool] = []
+        real_migrate = MetricsStore._migrate
+        monkeypatch.setattr(
+            MetricsStore,
+            "_migrate",
+            lambda self, conn: (migrated.append(True), real_migrate(self, conn))[1],
+        )
+        for expected in (1, 2):
+            _clear_schema_stamp(db_path)
+            store = MetricsStore(db_path)
+            try:
+                store.initialize()  # must not raise
+                assert NEW_COLUMNS.issubset(_column_names(store._db))
+            finally:
+                store.close()
+            assert len(migrated) == expected, "reopen did not re-run the migration"
 
     def test_migrate_tolerates_lost_race_duplicate_column(self, tmp_path, monkeypatch):
         """A migration whose ``_existing_columns`` snapshot is stale (another
@@ -146,6 +192,11 @@ class TestMigrationIdempotency:
         winner = MetricsStore(db_path)
         winner.initialize()
         winner.close()
+        # Drop the winner's schema stamp: in the real race the loser probes
+        # ``metrics_meta`` BEFORE the winner's stamp commit, so it takes the
+        # slow path. Without this the loser would fast-path out of ``_migrate``
+        # entirely and the stale-snapshot tolerance below would go untested.
+        _clear_schema_stamp(db_path)
 
         # Loser reads a stale (empty) snapshot → every ALTER targets an
         # already-present column and raises "duplicate column name".
@@ -970,3 +1021,343 @@ class TestProgressiveDegradations:
         deg = store.get_progressive_degradations(since_seconds=60.0)
         assert deg["total"] == 0
         assert deg["by_server_tool"] == []
+
+
+class TestInitializeFastPath:
+    """``initialize`` must skip DDL/migration once the schema is stamped current.
+
+    ``mms hook`` opens this store as a one-shot subprocess on every host
+    built-in tool call, so the DDL + ``PRAGMA table_info`` + conditional-ALTER
+    cycle ran thousands of times a day against a schema that had not changed
+    since the first run (#870). These tests pin that it now runs once per
+    schema, and that every state which is NOT current still takes the slow path.
+    """
+
+    @staticmethod
+    def _traced(monkeypatch) -> list[list[str]]:
+        """Record the SQL each new connection executes, one list per connect."""
+        traces: list[list[str]] = []
+        real_connect = sqlite3.connect
+
+        def _connect(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            conn = real_connect(*args, **kwargs)
+            statements: list[str] = []
+            traces.append(statements)
+            conn.set_trace_callback(statements.append)
+            return conn
+
+        monkeypatch.setattr("memtomem_stm.proxy.metrics_store.sqlite3.connect", _connect)
+        return traces
+
+    @staticmethod
+    def _schema_work(statements: list[str]) -> list[str]:
+        """The schema statements the fast path is supposed to elide."""
+        prefixes = (
+            "CREATE TABLE IF NOT EXISTS proxy_metrics",
+            "CREATE INDEX",
+            "ALTER TABLE",
+            "PRAGMA table_info",
+        )
+        flat = [" ".join(s.split()) for s in statements]
+        return [s for s in flat if s.startswith(prefixes)]
+
+    def test_second_initialize_skips_ddl_and_migration(self, tmp_path, monkeypatch):
+        """The core #870 property, with its own positive control.
+
+        The first open must show schema work (proving the trace seam observes
+        DDL at all — without that control an always-empty trace would pass),
+        the second must show none.
+        """
+        db_path = tmp_path / "metrics.db"
+        traces = self._traced(monkeypatch)
+
+        first = MetricsStore(db_path)
+        first.initialize()
+        first.close()
+        # Positive control: a fresh DB really does run the DDL we look for.
+        assert self._schema_work(traces[0]), "trace seam saw no DDL on a fresh DB"
+        assert any(s.startswith("PRAGMA table_info") for s in self._schema_work(traces[0]))
+
+        second = MetricsStore(db_path)
+        try:
+            second.initialize()
+        finally:
+            second.close()
+        assert self._schema_work(traces[1]) == [], (
+            f"warm initialize re-ran schema work: {self._schema_work(traces[1])}"
+        )
+
+    def test_fingerprint_is_derived_from_the_migrations_it_gates(self):
+        """No hand-maintained version number: the fingerprint's column list is
+        exactly the set the slow path can produce, so adding a migration
+        invalidates every stamped DB on its own.
+
+        Parsed into fields rather than substring-matched: ``"id" in
+        fingerprint`` is satisfied by ``trace_id``, so a substring check would
+        pass even for a column the fingerprint omits.
+        """
+        epoch, columns, indexes = _SCHEMA_FINGERPRINT.split("|")
+        assert epoch.isdigit()
+        assert set(columns.split(",")) == set(_MIGRATIONS) | set(_BASE_COLUMNS)
+        assert set(indexes.split(",")) == set(_INDEX_NAMES)
+
+    def test_base_columns_match_the_create_statement(self):
+        """``_BASE_COLUMNS`` is hand-written beside ``_CREATE``; this is what
+        keeps the two from drifting, and it uses SQLite as the parser rather
+        than re-implementing one.
+        """
+        db = sqlite3.connect(":memory:")
+        try:
+            db.execute(_CREATE)
+            declared = {row[1] for row in db.execute("PRAGMA table_info(proxy_metrics)")}
+        finally:
+            db.close()
+        assert declared == set(_BASE_COLUMNS)
+
+    def test_fingerprint_index_names_match_the_ddl_that_builds_them(self):
+        """The names are parsed from the CREATE statements, so they cannot
+        drift from the indexes the slow path actually creates."""
+        for name in _INDEX_NAMES:
+            assert f"CREATE INDEX IF NOT EXISTS {name} " in (_INDEX + _SOURCE_INDEX)
+
+    def test_a_changed_migration_changes_the_fingerprint(self, monkeypatch):
+        """The property the gate rests on: ship a new column, every stamped DB
+        goes through the slow path once."""
+        before = _schema_fingerprint()
+        monkeypatch.setitem(_MIGRATIONS, "brand_new_column", "ALTER TABLE proxy_metrics ADD ...")
+        assert _schema_fingerprint() != before
+        assert "brand_new_column" in _schema_fingerprint()
+
+    def test_initialize_stamps_the_current_fingerprint(self, tmp_path):
+        db_path = tmp_path / "metrics.db"
+        store = MetricsStore(db_path)
+        store.initialize()
+        store.close()
+        assert _read_schema_stamp(db_path) == _SCHEMA_FINGERPRINT
+
+    def test_stale_fingerprint_reruns_migration_and_restamps(self, tmp_path, monkeypatch):
+        """A release that adds a column ships a different fingerprint; the
+        stamped DB must fall back to the slow path exactly once."""
+        db_path = tmp_path / "metrics.db"
+        store = MetricsStore(db_path)
+        store.initialize()
+        store.close()
+
+        db = sqlite3.connect(str(db_path))
+        db.execute(
+            "UPDATE metrics_meta SET value = ? WHERE key = ?",
+            ("0|stale", _SCHEMA_FINGERPRINT_KEY),
+        )
+        db.commit()
+        db.close()
+
+        called: list[bool] = []
+        real_migrate = MetricsStore._migrate
+
+        def _spy(self, conn):  # noqa: ANN001, ANN202
+            called.append(True)
+            return real_migrate(self, conn)
+
+        monkeypatch.setattr(MetricsStore, "_migrate", _spy)
+        store = MetricsStore(db_path)
+        try:
+            store.initialize()
+            assert called == [True], "stale stamp did not re-run the migration"
+            assert NEW_COLUMNS.issubset(_column_names(store._db))
+        finally:
+            store.close()
+        assert _read_schema_stamp(db_path) == _SCHEMA_FINGERPRINT
+
+    def test_missing_meta_table_falls_back_to_the_slow_path(self, tmp_path):
+        """The upgrade case: a fully-migrated pre-#870 DB has no stamp table."""
+        db_path = tmp_path / "metrics.db"
+        store = MetricsStore(db_path)
+        store.initialize()
+        store.close()
+
+        db = sqlite3.connect(str(db_path))
+        db.execute("DROP TABLE metrics_meta")
+        db.commit()
+        db.close()
+        assert _read_schema_stamp(db_path) is None
+
+        store = MetricsStore(db_path)
+        try:
+            store.initialize()  # must not raise
+            assert NEW_COLUMNS.issubset(_column_names(store._db))
+        finally:
+            store.close()
+        assert _read_schema_stamp(db_path) == _SCHEMA_FINGERPRINT
+
+    @pytest.mark.parametrize(
+        "failing_prefix",
+        [
+            "ALTER TABLE proxy_metrics ADD COLUMN",  # fails mid-migration
+            "CREATE INDEX IF NOT EXISTS idx_metrics_source_created",  # fails at the LAST step
+        ],
+    )
+    def test_no_stamp_is_written_when_the_schema_work_fails(
+        self, tmp_path, monkeypatch, failing_prefix
+    ):
+        """A half-applied schema must never look current to the next opener.
+
+        Parameterized over an early and the *last* pre-stamp statement: the
+        ordering guarantee has to hold for a failure right before the stamp,
+        not only for one that aborts before any DDL has committed.
+        """
+        db_path = tmp_path / "metrics.db"
+
+        class _FailingConnection:
+            def __init__(self, real: sqlite3.Connection) -> None:
+                self._real = real
+
+            def execute(self, sql: str, *args):  # noqa: ANN002, ANN202
+                if sql.startswith(failing_prefix):
+                    raise sqlite3.OperationalError("disk I/O error")
+                return self._real.execute(sql, *args)
+
+            def __getattr__(self, name: str):  # noqa: ANN202
+                return getattr(self._real, name)
+
+        real_connect = sqlite3.connect
+        monkeypatch.setattr(
+            "memtomem_stm.proxy.metrics_store.sqlite3.connect",
+            lambda *a, **k: _FailingConnection(real_connect(*a, **k)),
+        )
+        store = MetricsStore(db_path)
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            store.initialize()
+
+        monkeypatch.undo()
+        assert _read_schema_stamp(db_path) is None, "stamped a schema that was never applied"
+
+    def test_upgrade_failure_leaves_the_old_stamp_which_still_reads_as_stale(
+        self, tmp_path, monkeypatch
+    ):
+        """The upgrade half of the ordering guarantee, driven through a real failure.
+
+        A failed re-stamp keeps the PREVIOUS value rather than clearing it, so
+        the promise is not "no stamp" but "never a *current* stamp": the old one
+        still mismatches, and the opener after it must run the slow path.
+        """
+        db_path = tmp_path / "metrics.db"
+        store = MetricsStore(db_path)
+        store.initialize()
+        store.close()
+        # Model the pre-upgrade state: this DB was stamped by an older release.
+        db = sqlite3.connect(str(db_path))
+        db.execute(
+            "UPDATE metrics_meta SET value = ? WHERE key = ?", ("0|stale", _SCHEMA_FINGERPRINT_KEY)
+        )
+        db.commit()
+        db.close()
+
+        class _IndexFailsConnection:
+            def __init__(self, real: sqlite3.Connection) -> None:
+                self._real = real
+
+            def execute(self, sql: str, *args):  # noqa: ANN002, ANN202
+                if sql.startswith("CREATE INDEX IF NOT EXISTS idx_metrics_source_created"):
+                    raise sqlite3.OperationalError("disk I/O error")
+                return self._real.execute(sql, *args)
+
+            def __getattr__(self, name: str):  # noqa: ANN202
+                return getattr(self._real, name)
+
+        real_connect = sqlite3.connect
+        monkeypatch.setattr(
+            "memtomem_stm.proxy.metrics_store.sqlite3.connect",
+            lambda *a, **k: _IndexFailsConnection(real_connect(*a, **k)),
+        )
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            MetricsStore(db_path).initialize()
+        monkeypatch.undo()
+
+        # The old value survived, and it is still not current.
+        assert _read_schema_stamp(db_path) == "0|stale"
+        assert _read_schema_stamp(db_path) != _SCHEMA_FINGERPRINT
+
+        # So the next opener redoes the full path and restamps.
+        migrated: list[bool] = []
+        real_migrate = MetricsStore._migrate
+        monkeypatch.setattr(
+            MetricsStore,
+            "_migrate",
+            lambda self, conn: (migrated.append(True), real_migrate(self, conn))[1],
+        )
+        store = MetricsStore(db_path)
+        try:
+            store.initialize()
+        finally:
+            store.close()
+        assert migrated == [True], "a stale stamp must send the next opener down the slow path"
+        assert _read_schema_stamp(db_path) == _SCHEMA_FINGERPRINT
+
+    def test_probe_propagates_errors_that_are_not_a_missing_table(self, tmp_path, monkeypatch):
+        """Only "no such table" means "not current".
+
+        Anything else is reported from the statement that hit it instead of
+        being retried as DDL that would fail the same way one statement later.
+        """
+        db_path = tmp_path / "metrics.db"
+        store = MetricsStore(db_path)
+        store.initialize()
+        store.close()
+
+        class _ProbeFailsConnection:
+            def __init__(self, real: sqlite3.Connection) -> None:
+                self._real = real
+
+            def execute(self, sql: str, *args):  # noqa: ANN002, ANN202
+                if sql.startswith("SELECT value FROM metrics_meta"):
+                    raise sqlite3.OperationalError("database is locked")
+                return self._real.execute(sql, *args)
+
+            def __getattr__(self, name: str):  # noqa: ANN202
+                return getattr(self._real, name)
+
+        real_connect = sqlite3.connect
+        monkeypatch.setattr(
+            "memtomem_stm.proxy.metrics_store.sqlite3.connect",
+            lambda *a, **k: _ProbeFailsConnection(real_connect(*a, **k)),
+        )
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            MetricsStore(db_path).initialize()
+
+    def test_fast_path_store_still_records(self, tmp_path, monkeypatch):
+        """End-to-end sanity: the second opener writes a readable row.
+
+        Proves the opener skipped the schema work by spying on ``_migrate``.
+        Checking ``_schema_is_current`` *after* ``initialize`` would prove
+        nothing — the slow path stamps before returning, so it reads current
+        either way.
+        """
+        db_path = tmp_path / "metrics.db"
+        warm = MetricsStore(db_path)
+        warm.initialize()
+        warm.close()
+
+        migrated: list[bool] = []
+        real_migrate = MetricsStore._migrate
+        monkeypatch.setattr(
+            MetricsStore,
+            "_migrate",
+            lambda self, conn: (migrated.append(True), real_migrate(self, conn))[1],
+        )
+        store = MetricsStore(db_path, reconcile_on_init=False)
+        store.initialize()
+        assert migrated == [], "expected this opener to use the fast path"
+        try:
+            store.record(
+                CallMetrics(
+                    server="builtin",
+                    tool="Read",
+                    original_chars=1000,
+                    compressed_chars=400,
+                    source="hook",
+                )
+            )
+        finally:
+            store.close()
+        summary = read_compression_summary(db_path)
+        assert summary["total_calls"] == 1
