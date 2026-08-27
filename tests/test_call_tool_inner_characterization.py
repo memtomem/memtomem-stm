@@ -229,7 +229,9 @@ class TestCacheStoresPreSurfacing:
         async def fake_compress(*args, **kwargs):
             return "COMPRESSED-SENTINEL", None
 
-        async def fake_surface(server, tool, arguments, text, *, trace_id=None, context_query=None):
+        async def fake_surface(
+            server, tool, arguments, text, *, trace_id=None, context_query=None, cfg_snap=None
+        ):
             return text + " [[SURFACED]]"
 
         mgr._apply_compression = fake_compress

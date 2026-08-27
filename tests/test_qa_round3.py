@@ -528,6 +528,27 @@ class TestConfigSnapshot:
         ]
         assert len(config_refs) == 0, f"Found self._config after snapshot: {config_refs}"
 
+    def test_call_tool_pins_the_request_snapshot(self):
+        """#871 hoisted the pin into ``call_tool`` so the policy gate and the
+        ranker share the guarded section's generation. ``_call_tool_guarded``
+        must then only re-pin as a fallback for direct callers."""
+        import inspect
+
+        from memtomem_stm.proxy.manager import ProxyManager
+
+        outer = inspect.getsource(ProxyManager.call_tool)
+        assert "cfg_snap = self._config" in outer
+        assert "cfg_snap=cfg_snap" in outer
+
+        guarded = inspect.getsource(ProxyManager._call_tool_guarded)
+        reads = [
+            line.strip()
+            for line in guarded.split("\n")
+            if "self._config" in line and not line.strip().startswith("#")
+        ]
+        # Exactly one: the ``if cfg_snap is None`` fallback re-pin.
+        assert reads == ["cfg_snap = self._config"], reads
+
 
 # ---------------------------------------------------------------------------
 # 15. _parse_scratch_list key with ": " (P3)

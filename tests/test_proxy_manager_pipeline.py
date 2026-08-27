@@ -964,7 +964,7 @@ class TestContextQuerySanitization:
         captured: dict[str, object] = {}
 
         async def _spy_surfacing(
-            server, tool, arguments, text, *, trace_id=None, context_query=None
+            server, tool, arguments, text, *, trace_id=None, context_query=None, cfg_snap=None
         ):
             captured["context_query"] = context_query
             return text

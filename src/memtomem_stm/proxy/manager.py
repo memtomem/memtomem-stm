@@ -914,7 +914,9 @@ class ProxyManager:
             else:
                 await self._consult_toolgraph()
 
-    def _reject_toolgraph_bundle(self, exc: Exception, *, startup: bool) -> None:
+    def _reject_toolgraph_bundle(
+        self, exc: Exception, *, startup: bool, cfg_snap: ProxyConfig | None = None
+    ) -> None:
         """Shared rejection semantics for a failed bundle reload.
 
         OSError/PolicyBundleError are the expected rejection classes; any
@@ -935,10 +937,12 @@ class ProxyManager:
         # leaving strict withholding forever. Forcing the next refresh through
         # a full re-adopt makes recovery automatic.
         self._toolgraph_bundle_stamp = None
+        if cfg_snap is None:
+            cfg_snap = self._config
         expected = isinstance(exc, (OSError, PolicyBundleError))
         self._toolgraph_degraded = True
         self._toolgraph_degraded_reason = REASON_TOOLGRAPH_PROTOCOL_ERROR
-        if self._config.exposure.profile is ExposureProfile.STRICT:
+        if cfg_snap.exposure.profile is ExposureProfile.STRICT:
             self._toolgraph_withhold_all = REASON_TOOLGRAPH_PROTOCOL_ERROR
             # Fail-closed supersedes binding: nothing is withheld *because*
             # it failed to bind any more, it is withheld because the reload
@@ -972,15 +976,25 @@ class ProxyManager:
             # changed catalog must still be rebound once so newly added or
             # drifted tools are counted as would-block instead of escaping
             # the stale snapshot.
-            self._apply_toolgraph_policy_snapshot(self._toolgraph_policy_snapshot)
+            self._apply_toolgraph_policy_snapshot(
+                self._toolgraph_policy_snapshot, cfg_snap=cfg_snap
+            )
         # Unexpected classes keep their traceback: the message alone names
         # neither the raise site nor the class family the next fix should
         # widen to expect.
         logger.warning("Toolgraph policy bundle reload rejected: %s", exc, exc_info=not expected)
 
-    def _refresh_toolgraph_bundle(self, *, force: bool = False, startup: bool = False) -> None:
+    def _refresh_toolgraph_bundle(
+        self,
+        *,
+        force: bool = False,
+        startup: bool = False,
+        cfg_snap: ProxyConfig | None = None,
+    ) -> None:
         """Reload a changed portable policy artifact with atomic swap semantics."""
-        cfg = self._config.toolgraph
+        if cfg_snap is None:
+            cfg_snap = self._config
+        cfg = cfg_snap.toolgraph
         if not cfg.enabled or cfg.source != "bundle":
             return
         try:
@@ -995,7 +1009,7 @@ class ProxyManager:
             stat = path.stat()
             stamp = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
         except Exception as exc:
-            self._reject_toolgraph_bundle(exc, startup=startup)
+            self._reject_toolgraph_bundle(exc, startup=startup, cfg_snap=cfg_snap)
             return
         if not force and stamp == self._toolgraph_bundle_stamp:
             # tools/list_changed may have altered the live catalog while
@@ -1010,10 +1024,12 @@ class ProxyManager:
                 self._toolgraph_policy_snapshot is not None
                 and self._toolgraph_bound_catalog_revision != self._tool_catalog_revision
             ):
-                self._apply_toolgraph_policy_snapshot(self._toolgraph_policy_snapshot)
+                self._apply_toolgraph_policy_snapshot(
+                    self._toolgraph_policy_snapshot, cfg_snap=cfg_snap
+                )
             return
         try:
-            active_profile = self._config.exposure.profile.value
+            active_profile = cfg_snap.exposure.profile.value
             if cfg.query_profile != active_profile:
                 raise PolicyBundleError(
                     "toolgraph.query_profile must match exposure.profile in bundle mode "
@@ -1031,7 +1047,7 @@ class ProxyManager:
             if after_stamp != stamp:
                 raise PolicyBundleError("policy bundle changed while it was being read")
         except Exception as exc:
-            self._reject_toolgraph_bundle(exc, startup=startup)
+            self._reject_toolgraph_bundle(exc, startup=startup, cfg_snap=cfg_snap)
             return
 
         self._toolgraph_policy_snapshot = snapshot
@@ -1042,7 +1058,7 @@ class ProxyManager:
         self._toolgraph_degraded = False
         self._toolgraph_degraded_reason = None
         self._toolgraph_withhold_all = None
-        self._apply_toolgraph_policy_snapshot(snapshot)
+        self._apply_toolgraph_policy_snapshot(snapshot, cfg_snap=cfg_snap)
         self._warn_on_bundle_provenance(path)
         logger.info(
             "Toolgraph policy bundle active: instance %s generation %d digest %s",
@@ -1072,9 +1088,11 @@ class ProxyManager:
             "; ".join(findings),
         )
 
-    def _apply_toolgraph_policy_snapshot(self, snapshot: PolicySnapshot) -> None:
+    def _apply_toolgraph_policy_snapshot(
+        self, snapshot: PolicySnapshot, *, cfg_snap: ProxyConfig | None = None
+    ) -> None:
         """Bind portable qualified decisions to the current live MCP catalog."""
-        cfg = self._config.toolgraph
+        cfg = (cfg_snap if cfg_snap is not None else self._config).toolgraph
         rejects: dict[tuple[str, str], str] = {}
         penalties: dict[tuple[str, str], float] = {}
         facts: dict[tuple[str, str], dict[str, Any]] = {}
@@ -1186,25 +1204,29 @@ class ProxyManager:
                 drifted,
             )
 
-    def _enforce_toolgraph_call_policy(self, server: str, tool: str) -> None:
+    def _enforce_toolgraph_call_policy(
+        self, server: str, tool: str, *, cfg_snap: ProxyConfig | None = None
+    ) -> None:
         """Apply the same policy snapshot at call time, before cache/upstream."""
-        cfg = self._config.toolgraph
+        if cfg_snap is None:
+            cfg_snap = self._config
+        cfg = cfg_snap.toolgraph
         if not cfg.enabled or cfg.source != "bundle":
             return
-        self._refresh_toolgraph_bundle()
+        self._refresh_toolgraph_bundle(cfg_snap=cfg_snap)
         reason = self._toolgraph_withhold_all or self._toolgraph_external_rejects.get(
             (server, tool)
         )
         if reason is None:
             return
-        if self._config.exposure.profile is ExposureProfile.STRICT:
+        if cfg_snap.exposure.profile is ExposureProfile.STRICT:
             from mcp.server.mcpserver.exceptions import ToolError
 
             raise ToolError(
                 f"Policy denied tool call '{server}/{tool}' ({reason}); "
                 "refresh the Toolgraph policy bundle after review"
             )
-        if self._config.exposure.profile is ExposureProfile.REVIEW:
+        if cfg_snap.exposure.profile is ExposureProfile.REVIEW:
             self._toolgraph_would_block_calls += 1
             logger.warning("Toolgraph review mode would block %s/%s (%s)", server, tool, reason)
 
@@ -2268,9 +2290,20 @@ class ProxyManager:
     @property
     def _relevance_scorer(self) -> "RelevanceScorer":
         """Return the cached scorer, recreating if config changed via hot-reload."""
-        current_cfg = self._config.relevance_scorer
+        return self._relevance_scorer_for(self._config)
+
+    def _relevance_scorer_for(self, cfg: ProxyConfig) -> "RelevanceScorer":
+        """``_relevance_scorer`` against a caller-pinned config (#871).
+
+        Request-path callers read the scorer several times per call, and the
+        property is a loader read (``stat()``) each time. Taking the config as
+        an argument also keeps the rebuild decision and the rebuild itself on
+        ONE config: reading ``self._config`` twice here could compare against
+        one generation and construct from another.
+        """
+        current_cfg = cfg.relevance_scorer
         if current_cfg != self._relevance_scorer_cfg:
-            self._relevance_scorer_instance = self._create_scorer(self._config)
+            self._relevance_scorer_instance = self._create_scorer(cfg)
             self._relevance_scorer_cfg = current_cfg
         return self._relevance_scorer_instance
 
@@ -2312,10 +2345,15 @@ class ProxyManager:
         alongside the advertisement so selection telemetry (#467) and
         relevance ranking (#466) describe exactly this exposure decision.
         """
-        self._refresh_toolgraph_bundle()
+        # One snapshot for the whole advertisement build, for the same reason
+        # ``call_tool`` pins one per request (#871): each ``self._config`` read
+        # is a loader ``stat()``, and the exposure decision must describe a
+        # single config generation.
+        cfg_snap = self._config
+        self._refresh_toolgraph_bundle(cfg_snap=cfg_snap)
         candidates: list[ExposureCandidate] = []
-        global_max_desc = self._config.max_description_chars
-        global_strip = self._config.strip_schema_descriptions
+        global_max_desc = cfg_snap.max_description_chars
+        global_strip = cfg_snap.strip_schema_descriptions
 
         for conn in self._connections.values():
             # Deliberately the connect-time snapshot: the advertisement is
@@ -2356,7 +2394,7 @@ class ProxyManager:
                 schema = t.input_schema or {"type": "object"}
                 if strip:
                     schema = self._distill_schema(schema, True)
-                if self._config.advertise_context_query:
+                if cfg_snap.advertise_context_query:
                     schema = self._with_context_query_schema(schema)
 
                 candidates.append(
@@ -2379,7 +2417,7 @@ class ProxyManager:
 
         verdict = filter_tools(
             candidates,
-            self._config.exposure,
+            cfg_snap.exposure,
             self._unhealthy_tools,
             external_rejects=self._toolgraph_external_rejects or None,
             withhold_all=self._toolgraph_withhold_all,
@@ -2553,7 +2591,9 @@ class ProxyManager:
                 probe.close()
         return None
 
-    def _rebuild_selective_compressor(self, sel_cfg: SelectiveConfig | None) -> SelectiveCompressor:
+    def _rebuild_selective_compressor(
+        self, sel_cfg: SelectiveConfig | None, *, cfg_snap: ProxyConfig | None = None
+    ) -> SelectiveCompressor:
         """Replace the cached selective compressor, closing the superseded one
         so a SQLite-backed store from a changed config does not leak its
         connection (#583). Returns the new compressor. Only called when the cfg
@@ -2565,7 +2605,7 @@ class ProxyManager:
         old compressor cached and usable rather than a closed store behind the
         cfg-equality fast path.
         """
-        new = self._create_selective(sel_cfg)
+        new = self._create_selective(sel_cfg, cfg_snap=cfg_snap)
         old = self._selective_compressor
         self._selective_compressor = new
         self._selective_compressor_cfg = sel_cfg
@@ -2576,7 +2616,9 @@ class ProxyManager:
                 logger.debug("Failed to close superseded selective compressor", exc_info=True)
         return new
 
-    def _create_selective(self, sel_cfg: SelectiveConfig | None) -> SelectiveCompressor:
+    def _create_selective(
+        self, sel_cfg: SelectiveConfig | None, *, cfg_snap: ProxyConfig | None = None
+    ) -> SelectiveCompressor:
         """Create a SelectiveCompressor with the appropriate PendingStore backend."""
         kwargs: dict[str, Any] = {}
         store = None
@@ -2598,12 +2640,15 @@ class ProxyManager:
         # TOC with the operator's configured scorer (e.g. embedding) instead of
         # SelectiveCompressor's built-in BM25 default. With the default bm25
         # scorer this is a no-op (passing a BM25Scorer == the class default).
-        # The scorer is read via the self-refreshing property, so a compressor
+        # The scorer is resolved against the caller's config (the request
+        # snapshot on the call path, a fresh read otherwise), so a compressor
         # built after a scorer change picks up the new scorer; a scorer-only
         # hot-reload that does not also change the selective config keeps the
         # cached compressor (and its scorer) until the next rebuild — an
         # accepted edge case, tracked as a follow-up.
-        kwargs["scorer"] = self._relevance_scorer
+        kwargs["scorer"] = self._relevance_scorer_for(
+            cfg_snap if cfg_snap is not None else self._config
+        )
         return SelectiveCompressor(**kwargs)
 
     def _resolve_tool_config(
@@ -2813,8 +2858,11 @@ class ProxyManager:
         tool: str,
         *,
         context_query: str | None = None,
+        cfg_snap: ProxyConfig | None = None,
     ) -> tuple[str, str | None]:
         """Return (compressed_text, llm_fallback_reason_or_None)."""
+        if cfg_snap is None:
+            cfg_snap = self._config
         if compression == CompressionStrategy.AUTO:
             resolved = auto_select_strategy(text, max_chars=max_chars)
             logger.debug("auto_select_strategy → %s for %s/%s", resolved.value, server, tool)
@@ -2830,22 +2878,28 @@ class ProxyManager:
                 server,
                 tool,
                 context_query=context_query,
+                cfg_snap=cfg_snap,
             )
 
         if compression == CompressionStrategy.HYBRID:
             result = await self._apply_hybrid(
-                text, max_chars, hybrid_cfg, sel_cfg, context_query=context_query
+                text,
+                max_chars,
+                hybrid_cfg,
+                sel_cfg,
+                context_query=context_query,
+                cfg_snap=cfg_snap,
             )
             return result, None
 
         if compression == CompressionStrategy.SELECTIVE:
             async with bounded_lock(
                 self._selective_lock,
-                timeout=self._config.lock_timeout_seconds,
+                timeout=cfg_snap.lock_timeout_seconds,
                 name="selective_lock",
             ):
                 if self._selective_compressor is None or self._selective_compressor_cfg != sel_cfg:
-                    sel_compressor = self._rebuild_selective_compressor(sel_cfg)
+                    sel_compressor = self._rebuild_selective_compressor(sel_cfg, cfg_snap=cfg_snap)
                 else:
                     sel_compressor = self._selective_compressor
                 # Pin the compressor before the lock drops: the off-thread
@@ -2878,7 +2932,7 @@ class ProxyManager:
             if llm_cfg is not None:
                 async with bounded_lock(
                     self._llm_compressor_lock,
-                    timeout=self._config.lock_timeout_seconds,
+                    timeout=cfg_snap.lock_timeout_seconds,
                     name="llm_compressor_lock",
                 ):
                     if self._llm_compressor is None or self._llm_compressor_cfg != llm_cfg:
@@ -2910,7 +2964,7 @@ class ProxyManager:
                 server,
                 tool,
             )
-            scorer = self._relevance_scorer
+            scorer = self._relevance_scorer_for(cfg_snap)
             return (
                 await self._compress_maybe_offthread(
                     TruncateCompressor(scorer=scorer),
@@ -2923,7 +2977,7 @@ class ProxyManager:
             )
 
         if compression == CompressionStrategy.TRUNCATE:
-            scorer = self._relevance_scorer
+            scorer = self._relevance_scorer_for(cfg_snap)
             return (
                 await self._compress_maybe_offthread(
                     TruncateCompressor(scorer=scorer),
@@ -2941,7 +2995,7 @@ class ProxyManager:
         # remaining strategies routed through get_compressor (NONE, PROGRESSIVE,
         # EXTRACT_FIELDS) take neither a scorer nor a context_query.
         if compression == CompressionStrategy.SCHEMA_PRUNING:
-            scorer = self._relevance_scorer
+            scorer = self._relevance_scorer_for(cfg_snap)
             return (
                 await self._compress_maybe_offthread(
                     SchemaPruningCompressor(scorer=scorer),
@@ -2954,7 +3008,7 @@ class ProxyManager:
             )
 
         if compression == CompressionStrategy.SKELETON:
-            scorer = self._relevance_scorer
+            scorer = self._relevance_scorer_for(cfg_snap)
             return (
                 await self._compress_maybe_offthread(
                     SkeletonCompressor(scorer=scorer),
@@ -2968,17 +3022,20 @@ class ProxyManager:
 
         return get_compressor(compression).compress(text, max_chars=max_chars), None
 
-    def _surfacing_enabled_for(self, server: str) -> bool:
+    def _surfacing_enabled_for(self, server: str, *, cfg_snap: ProxyConfig | None = None) -> bool:
         """Whether this upstream opts into surfacing.
 
-        Read from the hot-reloaded ``stm_proxy.json`` (``self._config``) so a
-        ``mms surfacing <server> off`` takes effect without a restart. This is
-        the per-upstream enforcement point the ``SurfacingEngine`` gate cannot
-        be: the engine is built once at startup from the top-level
+        Read from the hot-reloaded ``stm_proxy.json`` — via the caller's
+        per-request snapshot (#871) — so a ``mms surfacing <server> off`` takes
+        effect on the next tool call without a restart. This is the
+        per-upstream enforcement point the ``SurfacingEngine`` gate cannot be:
+        the engine is built once at startup from the top-level
         ``SurfacingConfig`` and never sees per-upstream config. Unknown servers
         fail open (``True``) — surfacing stays best-effort.
         """
-        cfg = self._config.upstream_servers.get(server)
+        if cfg_snap is None:
+            cfg_snap = self._config
+        cfg = cfg_snap.upstream_servers.get(server)
         return cfg.surfacing_enabled if cfg is not None else True
 
     def _record_surfacing_skip(self, tool: str, reason: SkipReason) -> None:
@@ -2999,11 +3056,12 @@ class ProxyManager:
         *,
         trace_id: str | None = None,
         context_query: str | None = None,
+        cfg_snap: ProxyConfig | None = None,
     ) -> str:
         """Apply proactive memory surfacing if eligible."""
         if self._surfacing_engine is None:
             return text
-        if not self._surfacing_enabled_for(server):
+        if not self._surfacing_enabled_for(server, cfg_snap=cfg_snap):
             self._record_surfacing_skip(tool, "upstream_disabled")
             return text
         try:
@@ -3050,6 +3108,7 @@ class ProxyManager:
         *,
         trace_id: str | None = None,
         context_query: str | None = None,
+        cfg_snap: ProxyConfig | None = None,
     ) -> tuple[str, bool | None, str | None]:
         """Surface on a progressive first-chunk when the formatter mode keeps
         the ``PROGRESSIVE_FOOTER_TOKEN`` concat invariant intact.
@@ -3070,7 +3129,7 @@ class ProxyManager:
         """
         if self._surfacing_engine is None:
             return text, None, None
-        if not self._surfacing_enabled_for(server):
+        if not self._surfacing_enabled_for(server, cfg_snap=cfg_snap):
             self._record_surfacing_skip(tool, "upstream_disabled")
             return text, None, None
         if self._surfacing_engine.injection_mode == "prepend":
@@ -3132,15 +3191,18 @@ class ProxyManager:
         sel_cfg: SelectiveConfig | None,
         *,
         context_query: str | None = None,
+        cfg_snap: ProxyConfig | None = None,
     ) -> str:
+        if cfg_snap is None:
+            cfg_snap = self._config
         cfg = hybrid_cfg or HybridConfig()
         async with bounded_lock(
             self._selective_lock,
-            timeout=self._config.lock_timeout_seconds,
+            timeout=cfg_snap.lock_timeout_seconds,
             name="selective_lock",
         ):
             if self._selective_compressor is None or self._selective_compressor_cfg != sel_cfg:
-                self._rebuild_selective_compressor(sel_cfg)
+                self._rebuild_selective_compressor(sel_cfg, cfg_snap=cfg_snap)
 
             sel_compressor = self._selective_compressor
             compressor = HybridCompressor(
@@ -3184,12 +3246,13 @@ class ProxyManager:
         original_chars: int | None = None,
         compressed_chars: int | None = None,
         context_query: str | None = None,
+        cfg_snap: ProxyConfig | None = None,
     ) -> AutoIndexOutcome:
         if self._index_engine is None:
             raise RuntimeError("index_engine not available")
         return await auto_index_response(
             index_engine=self._index_engine,
-            ai_cfg=self._config.auto_index,
+            ai_cfg=(cfg_snap if cfg_snap is not None else self._config).auto_index,
             server=server,
             tool=tool,
             arguments=arguments,
@@ -3202,14 +3265,16 @@ class ProxyManager:
             observability=self.index_observability,
         )
 
-    async def _get_extractor(self) -> FactExtractor:
+    async def _get_extractor(self, *, cfg_snap: ProxyConfig | None = None) -> FactExtractor:
+        if cfg_snap is None:
+            cfg_snap = self._config
         async with bounded_lock(
             self._extractor_lock,
-            timeout=self._config.lock_timeout_seconds,
+            timeout=cfg_snap.lock_timeout_seconds,
             name="extractor_lock",
         ):
             if self._extractor is None:
-                self._extractor = FactExtractor(self._config.extraction)
+                self._extractor = FactExtractor(cfg_snap.extraction)
             return self._extractor
 
     async def _extract_and_store(
@@ -3220,13 +3285,16 @@ class ProxyManager:
         text: str,
         *,
         context_query: str | None = None,
+        cfg_snap: ProxyConfig | None = None,
     ) -> ExtractOutcome:
         """Extract facts from response and store as individual memory entries."""
-        extractor = await self._get_extractor()
+        if cfg_snap is None:
+            cfg_snap = self._config
+        extractor = await self._get_extractor(cfg_snap=cfg_snap)
         return await extract_and_store(
             index_engine=self._index_engine,
             extractor=extractor,
-            ext_cfg=self._config.extraction,
+            ext_cfg=cfg_snap.extraction,
             server=server,
             tool=tool,
             arguments=arguments,
@@ -3604,6 +3672,8 @@ class ProxyManager:
         tool: str,
         arguments: dict[str, Any],
         trace_id: str,
+        *,
+        cfg_snap: ProxyConfig | None = None,
     ) -> str | CallToolResult:
         """Shared hit path: record metric, trace span, re-apply surfacing.
 
@@ -3621,6 +3691,7 @@ class ProxyManager:
                 cached,
                 trace_id=trace_id,
                 context_query=context_query if isinstance(context_query, str) else None,
+                cfg_snap=cfg_snap,
             )
             structured_content = getattr(cached, "structured_content", None)
             result_meta = getattr(cached, "meta", None)
@@ -3666,10 +3737,20 @@ class ProxyManager:
         """
         if server not in self._connections:
             raise KeyError(f"Unknown upstream server: '{server}'")
+        # ONE config snapshot for the whole request (#871). ``self._config`` is
+        # a property over the hot-reload loader, so each textual read is a
+        # ``stat()`` — and worse, two reads can land on either side of a
+        # reload. Pinning here (rather than inside ``_call_tool_guarded``) puts
+        # the policy gate, the ranker, the cache key, and every pipeline stage
+        # on one reload generation: a denial published mid-request cannot
+        # apply to the gate but not the stages, and the fast-path get key
+        # cannot split from the stampede-lock key. Hot reload still lands —
+        # at the next request boundary.
+        cfg_snap = self._config
         # Bundle enforcement is deliberately before selection telemetry,
         # response-cache lookup, and upstream dispatch. A stale cached result
         # can never bypass a newly published denial.
-        self._enforce_toolgraph_call_policy(server, tool)
+        self._enforce_toolgraph_call_policy(server, tool, cfg_snap=cfg_snap)
         if trace_id is None:
             trace_id = uuid.uuid4().hex[:16]
         # Selection telemetry (#467): the prefixed name shares the
@@ -3678,7 +3759,7 @@ class ProxyManager:
         # snapshot on purpose — ``prefix`` is restart-only, like the
         # advertisement it must match.
         selected_tool = f"{self._connections[server].config.prefix}__{tool}"
-        candidate_features, ranker_version = self._rank_candidates(arguments)
+        candidate_features, ranker_version = self._rank_candidates(arguments, cfg_snap=cfg_snap)
         selection_id = self._log_selection(
             server, selected_tool, arguments, trace_id, candidate_features, ranker_version
         )
@@ -3689,7 +3770,7 @@ class ProxyManager:
         ):
             try:
                 result, cache_hit = await self._call_tool_guarded(
-                    server, tool, arguments, trace_id=trace_id
+                    server, tool, arguments, trace_id=trace_id, cfg_snap=cfg_snap
                 )
             except Exception as exc:
                 # Upstream/transport/timeout/protocol errors are already
@@ -3760,7 +3841,7 @@ class ProxyManager:
             return result
 
     def _rank_candidates(
-        self, arguments: dict[str, Any]
+        self, arguments: dict[str, Any], *, cfg_snap: ProxyConfig | None = None
     ) -> tuple[dict[str, Any] | None, str | None]:
         """Tool-relevance ranking for one call (#466 v0) — telemetry input only.
 
@@ -3775,7 +3856,7 @@ class ProxyManager:
         """
         if self._selection_log is None:
             return None, None
-        trc = self._config.tool_relevance
+        trc = (cfg_snap if cfg_snap is not None else self._config).tool_relevance
         if not trc.enabled or not self._advertised_infos:
             return None, None
         try:
@@ -3894,6 +3975,7 @@ class ProxyManager:
         arguments: dict[str, Any],
         *,
         trace_id: str,
+        cfg_snap: ProxyConfig | None = None,
     ) -> tuple[str | list | CallToolResult, bool]:
         """Cache stampede guard: serialize identical concurrent ``call_tool``
         invocations on a per-key lock so a cold cache + duplicate requests
@@ -3919,12 +4001,13 @@ class ProxyManager:
         # lookup computes here matches the key the store computes there.
         raw_context_query = arguments.get("_context_query") if arguments else None
         context_query = raw_context_query if isinstance(raw_context_query, str) else None
-        # One snapshot for the whole guarded section (each ``self._config``
-        # read is a loader call, and a hot reload mid-request must not split
-        # the fast-path get key from the stampede-lock key). The same snapshot
-        # is threaded into ``_call_tool_inner`` so a confirmed miss stores
-        # under the fingerprint this lookup missed on.
-        cfg_snap = self._config
+        # ``call_tool`` pins the request's snapshot and passes it in, so the
+        # fast-path get key cannot split from the stampede-lock key and the
+        # same snapshot reaches ``_call_tool_inner`` — a confirmed miss stores
+        # under the fingerprint this lookup missed on. Direct callers (tests,
+        # internal dispatch) omit it and get a fresh pin here.
+        if cfg_snap is None:
+            cfg_snap = self._config
 
         # No cache configured, OR a non-positive configured TTL disables it: go
         # straight through (no lookup, no store, no stampede lock). The TTL check
@@ -3988,7 +4071,12 @@ class ProxyManager:
             server, tool, upstream_args, context_query=context_query, config_fingerprint=config_fp
         )
         if cached is not None:
-            return await self._on_cache_hit(cached, server, tool, arguments, trace_id), True
+            return (
+                await self._on_cache_hit(
+                    cached, server, tool, arguments, trace_id, cfg_snap=cfg_snap
+                ),
+                True,
+            )
 
         # ``context_query`` is part of the lock key on purpose: two concurrent
         # calls that differ only in query context store DIFFERENT rows, so
@@ -4010,7 +4098,12 @@ class ProxyManager:
                     config_fingerprint=config_fp,
                 )
                 if cached is not None:
-                    return await self._on_cache_hit(cached, server, tool, arguments, trace_id), True
+                    return (
+                        await self._on_cache_hit(
+                            cached, server, tool, arguments, trace_id, cfg_snap=cfg_snap
+                        ),
+                        True,
+                    )
                 # Eligible cache lookup confirmed missing (the lock-free fast-path
                 # AND this in-lock double-check). This is the SINGLE eligible-miss
                 # exit, so account the miss here. The ineligible and no-cache paths
@@ -4565,6 +4658,7 @@ class ProxyManager:
                 compressed,
                 trace_id=trace_id,
                 context_query=context_query,
+                cfg_snap=cfg_snap,
             )
             _surface_ms = (_time.monotonic() - _t0) * 1000
         else:
@@ -4636,6 +4730,7 @@ class ProxyManager:
                         server,
                         tool,
                         context_query=context_query,
+                        cfg_snap=cfg_snap,
                     )
                 except sqlite3.Error:
                     # sqlite is reachable in this path ONLY via the
@@ -4667,7 +4762,7 @@ class ProxyManager:
                         tool,
                         exc_info=True,
                     )
-                    _fb_scorer = self._relevance_scorer
+                    _fb_scorer = self._relevance_scorer_for(cfg_snap)
                     compressed = await self._compress_maybe_offthread(
                         TruncateCompressor(scorer=_fb_scorer),
                         cleaned,
@@ -4771,6 +4866,7 @@ class ProxyManager:
                                         tc.hybrid,
                                         tc.selective,
                                         context_query=context_query,
+                                        cfg_snap=cfg_snap,
                                     )
                                     if len(compressed) / cleaned_len >= dynamic:
                                         metrics_strategy = f"{original_strategy}→hybrid_fallback"
@@ -4795,7 +4891,7 @@ class ProxyManager:
                         # direct path when content is too small for progressive
                         # and lacks structure for hybrid.
                         if not progressive_fallback and not hybrid_fallback:
-                            _fb_scorer = self._relevance_scorer
+                            _fb_scorer = self._relevance_scorer_for(cfg_snap)
                             compressed = await self._compress_maybe_offthread(
                                 TruncateCompressor(scorer=_fb_scorer),
                                 cleaned,
@@ -4862,6 +4958,7 @@ class ProxyManager:
                         compressed,
                         trace_id=trace_id,
                         context_query=context_query,
+                        cfg_snap=cfg_snap,
                     )
                     _surface_ms = (_time.monotonic() - _t0) * 1000
             else:
@@ -4877,6 +4974,7 @@ class ProxyManager:
                         compressed,
                         trace_id=trace_id,
                         context_query=context_query,
+                        cfg_snap=cfg_snap,
                     )
                     _surface_ms = (_time.monotonic() - _t0) * 1000
 
@@ -4912,9 +5010,10 @@ class ProxyManager:
     ) -> IndexResult:
         """Stage 4: optional auto-indexing (privacy-skip / background-footer /
         sync / disabled). Returns the response body to continue with plus the
-        tri-state index outcome. The gate reads the ``cfg_snap`` snapshot, but the
-        inner ``_auto_index_response`` keeps reading live ``self._config`` exactly
-        as before — this extraction relocates only the gate, not that behavior.
+        tri-state index outcome. Gate and inner ``_auto_index_response`` both
+        read the request's ``cfg_snap`` snapshot (#871), so the enable decision
+        and the ``auto_index`` config it runs under cannot come from two
+        different reload generations.
         """
         # Track outcome for CallMetrics below.
         index_ok: bool | None = None
@@ -4969,6 +5068,7 @@ class ProxyManager:
                         original_chars=len(original_text),
                         compressed_chars=compressed_chars_for_metrics,
                         context_query=context_query,
+                        cfg_snap=cfg_snap,
                     ),
                     stage="auto_index",
                     server=server,
@@ -5027,6 +5127,7 @@ class ProxyManager:
                             original_chars=len(original_text),
                             compressed_chars=compressed_chars_for_metrics,
                             context_query=context_query,
+                            cfg_snap=cfg_snap,
                         )
                         final_result = outcome.summary
                         index_ok = outcome.ok
@@ -5073,9 +5174,8 @@ class ProxyManager:
         background failures stay visible via ``memory_ops.extract_and_store``'s
         WARNING log). A background run that was never scheduled — shed at the
         cap or during ``stop()`` — reports ``False`` / ``background_shed``
-        instead (#868). Like the index stage, the
-        gate reads ``cfg_snap`` but ``_extract_and_store`` keeps reading live
-        ``self._config``.
+        instead (#868). Like the index stage, gate and ``_extract_and_store``
+        both read the request's ``cfg_snap`` snapshot (#871).
         """
         extract_ok: bool | None = None
         extract_error: str | None = None
@@ -5093,6 +5193,7 @@ class ProxyManager:
                         upstream_args,
                         cleaned,
                         context_query=context_query,
+                        cfg_snap=cfg_snap,
                     ),
                     stage="extract",
                     server=server,
@@ -5120,6 +5221,7 @@ class ProxyManager:
                     upstream_args,
                     cleaned,
                     context_query=context_query,
+                    cfg_snap=cfg_snap,
                 )
                 extract_ok = extract_outcome.ok
                 extract_error = extract_outcome.error
@@ -5690,7 +5792,7 @@ class ProxyManager:
         # ── Stages 2+3: COMPRESS (or PROGRESSIVE) + SURFACE ──
         # Capture the scorer fallback counter BEFORE compression so the metrics
         # record below sees a delta covering compression and everything after.
-        _pre_scorer_fb = getattr(self._relevance_scorer, "fallback_count", 0)
+        _pre_scorer_fb = getattr(self._relevance_scorer_for(cfg_snap), "fallback_count", 0)
         comp = await self._compress_and_surface(
             server=server,
             tool=tool,
@@ -5775,7 +5877,8 @@ class ProxyManager:
                 compression_strategy=metrics_strategy,
                 ratio_violation=ratio_violation,
                 scorer_fallback=(
-                    getattr(self._relevance_scorer, "fallback_count", 0) > _pre_scorer_fb
+                    getattr(self._relevance_scorer_for(cfg_snap), "fallback_count", 0)
+                    > _pre_scorer_fb
                 ),
                 index_ok=index_ok,
                 index_error=index_error,
