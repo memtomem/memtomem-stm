@@ -319,6 +319,55 @@ class TestPerRequestSnapshot:
         assert session.call_tool.await_count == upstream_calls, "second call was not a cache hit"
         assert calls[0] == 1, f"expected 1 loader read on a cache hit, got {calls[0]}"
 
+    async def test_extraction_request_read_counts(self, extract_mgr):
+        """The extraction path's cost, warm and cold, pinned separately.
+
+        ``_get_extractor`` splits by lifetime: the lock timeout rides the
+        snapshot, the extractor is built LIVE. So a cold extraction request
+        pays one extra read for that construction and a warm one pays none —
+        counting only the compression build would have missed this entirely.
+        """
+        mgr = extract_mgr
+        calls = _count_loader_reads(mgr)
+        await mgr.call_tool("srv", "tool", {"a": 1})
+        cold = calls[0]
+        assert mgr._extractor is not None, "extraction stage did not run"
+
+        calls[0] = 0
+        await mgr.call_tool("srv", "tool", {"b": 2})
+        warm = calls[0]
+
+        assert warm == 1, f"expected 1 loader read for a warm extraction request, got {warm}"
+        # 1 snapshot + 1 live extractor build. TRUNCATE here, so no selective
+        # compressor is constructed; the combined case is covered below.
+        assert cold == 2, f"expected 1 snapshot + 1 live build read, got {cold}"
+
+    async def test_combined_construction_read_count(self, tmp_path):
+        """Both build paths on one request: the reads add, they do not multiply.
+
+        This is the worst case a single request can reach — 1 snapshot plus one
+        live read per long-lived component it constructs. Pinned so a third
+        such component cannot be added without the count moving here.
+        """
+        mgr, store, cache = _build_mgr(
+            tmp_path, compression=CompressionStrategy.SELECTIVE, extraction=True
+        )
+        mgr._surfacing_engine = _FakeSurfacingEngine()
+        mgr._index_engine = _fake_index_engine()
+        try:
+            calls = _count_loader_reads(mgr)
+            await mgr.call_tool("srv", "tool", {"a": 1})
+            assert mgr._selective_compressor is not None and mgr._extractor is not None
+            assert calls[0] == 3, f"expected 1 snapshot + 2 live build reads, got {calls[0]}"
+
+            calls[0] = 0
+            await mgr.call_tool("srv", "tool", {"b": 2})
+            assert calls[0] == 1, f"expected 1 read once both are built, got {calls[0]}"
+        finally:
+            await _drain(mgr)
+            cache.close()
+            store.close()
+
     async def test_snapshot_does_not_leak_across_requests(self, mgr):
         """One per request, not one per manager: the second call re-reads."""
         await mgr.call_tool("srv", "tool", {"warm": 1})
@@ -411,9 +460,7 @@ class TestPerRequestSnapshot:
 
         assert mgr._extractor is not None, "extraction stage did not run"
         assert mgr._config.extraction.max_facts == 3, "the reload did not land"
-        assert mgr._extractor._cfg.max_facts == 3, (
-            "extractor was pinned to the pre-reload snapshot"
-        )
+        assert mgr._extractor._cfg.max_facts == 3, "extractor used the stale snapshot"
 
     async def test_extractor_is_not_rebuilt_on_config_change(self, extract_mgr, tmp_path):
         """Pins #890's KNOWN GAP so the follow-up has a red-to-green target.

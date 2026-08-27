@@ -232,18 +232,23 @@ changes inline only. See the deprecation policy in
   into `call_tool`, and now reaches the toolgraph policy gate, the relevance
   ranker, and every pipeline stage. Measured over a SELECTIVE-plus-cache
   configuration, a steady-state request went from 6 loader reads to 1.
-  Components cached beyond the call — the selective compressor's scorer, the
-  fact extractor — deliberately keep reading live config, since baking a
-  snapshot pinned before the upstream call into an object that outlives the
-  request would freeze the pre-edit generation for every later call; a request
-  that builds one pays exactly one extra read. **Behavior change**: a config
-  edit that lands while a request is in flight now applies from the next
-  request instead of taking effect partway through the pipeline — including
-  `mms surfacing <server> off`. Hot reload is still restart-free; only the
-  granularity changed, deliberately, since mid-request generation mixing was
-  the defect. Separately, an unseeded `ProxyConfigLoader` whose first load
-  hits an unparseable file now returns defaults rather than `None`; this is
-  not reachable from the request path, which always seeds the loader.
+  The split is by lifetime: values scoped to one call ride the snapshot, while
+  anything baked into an object that outlives the request — the selective
+  compressor's scorer, the fact extractor, the Toolgraph bind maps — keeps
+  reading live config, since a snapshot pinned before the upstream call would
+  freeze the pre-edit generation for every later call. A request that
+  constructs such a component pays one extra read per component (2 cold, 3 if
+  it builds both; 1 once warm). **Behavior change**: for per-request decisions
+  — including `mms surfacing <server> off` — a config edit landing while a
+  request is in flight now applies from the next request instead of taking
+  effect partway through the pipeline. Long-lived construction is the stated
+  exception and still consumes live config during that same request. Hot
+  reload stays restart-free for those per-request decisions; the pre-existing
+  exception is the fact extractor, which is built once and never rebuilt, so a
+  later `extraction` edit needs a restart (#890, unchanged here). Separately,
+  an unseeded `ProxyConfigLoader` whose first load hits an unparseable file
+  now returns defaults rather than `None`; this is not reachable from the
+  request path, which always seeds the loader.
 
 - **Environment-override warnings now name the variables by measurement
   instead of inference** (#844, closes #843). Provenance was reconstructed

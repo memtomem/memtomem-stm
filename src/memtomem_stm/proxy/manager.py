@@ -914,9 +914,7 @@ class ProxyManager:
             else:
                 await self._consult_toolgraph()
 
-    def _reject_toolgraph_bundle(
-        self, exc: Exception, *, startup: bool, cfg_snap: ProxyConfig | None = None
-    ) -> None:
+    def _reject_toolgraph_bundle(self, exc: Exception, *, startup: bool) -> None:
         """Shared rejection semantics for a failed bundle reload.
 
         OSError/PolicyBundleError are the expected rejection classes; any
@@ -937,12 +935,11 @@ class ProxyManager:
         # leaving strict withholding forever. Forcing the next refresh through
         # a full re-adopt makes recovery automatic.
         self._toolgraph_bundle_stamp = None
-        if cfg_snap is None:
-            cfg_snap = self._config
         expected = isinstance(exc, (OSError, PolicyBundleError))
         self._toolgraph_degraded = True
         self._toolgraph_degraded_reason = REASON_TOOLGRAPH_PROTOCOL_ERROR
-        if cfg_snap.exposure.profile is ExposureProfile.STRICT:
+        # Live, like the binding below: ``_toolgraph_withhold_all`` persists.
+        if self._config.exposure.profile is ExposureProfile.STRICT:
             self._toolgraph_withhold_all = REASON_TOOLGRAPH_PROTOCOL_ERROR
             # Fail-closed supersedes binding: nothing is withheld *because*
             # it failed to bind any more, it is withheld because the reload
@@ -976,25 +973,19 @@ class ProxyManager:
             # changed catalog must still be rebound once so newly added or
             # drifted tools are counted as would-block instead of escaping
             # the stale snapshot.
-            self._apply_toolgraph_policy_snapshot(
-                self._toolgraph_policy_snapshot, cfg_snap=cfg_snap
-            )
+            self._apply_toolgraph_policy_snapshot(self._toolgraph_policy_snapshot)
         # Unexpected classes keep their traceback: the message alone names
         # neither the raise site nor the class family the next fix should
         # widen to expect.
         logger.warning("Toolgraph policy bundle reload rejected: %s", exc, exc_info=not expected)
 
-    def _refresh_toolgraph_bundle(
-        self,
-        *,
-        force: bool = False,
-        startup: bool = False,
-        cfg_snap: ProxyConfig | None = None,
-    ) -> None:
-        """Reload a changed portable policy artifact with atomic swap semantics."""
-        if cfg_snap is None:
-            cfg_snap = self._config
-        cfg = cfg_snap.toolgraph
+    def _refresh_toolgraph_bundle(self, *, force: bool = False, startup: bool = False) -> None:
+        """Reload a changed portable policy artifact with atomic swap semantics.
+
+        Reads LIVE config: what it adopts — the policy snapshot, the bind maps,
+        the withhold state — outlives the request that triggered the refresh.
+        """
+        cfg = self._config.toolgraph
         if not cfg.enabled or cfg.source != "bundle":
             return
         try:
@@ -1009,7 +1000,7 @@ class ProxyManager:
             stat = path.stat()
             stamp = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
         except Exception as exc:
-            self._reject_toolgraph_bundle(exc, startup=startup, cfg_snap=cfg_snap)
+            self._reject_toolgraph_bundle(exc, startup=startup)
             return
         if not force and stamp == self._toolgraph_bundle_stamp:
             # tools/list_changed may have altered the live catalog while
@@ -1024,12 +1015,10 @@ class ProxyManager:
                 self._toolgraph_policy_snapshot is not None
                 and self._toolgraph_bound_catalog_revision != self._tool_catalog_revision
             ):
-                self._apply_toolgraph_policy_snapshot(
-                    self._toolgraph_policy_snapshot, cfg_snap=cfg_snap
-                )
+                self._apply_toolgraph_policy_snapshot(self._toolgraph_policy_snapshot)
             return
         try:
-            active_profile = cfg_snap.exposure.profile.value
+            active_profile = self._config.exposure.profile.value
             if cfg.query_profile != active_profile:
                 raise PolicyBundleError(
                     "toolgraph.query_profile must match exposure.profile in bundle mode "
@@ -1047,7 +1036,7 @@ class ProxyManager:
             if after_stamp != stamp:
                 raise PolicyBundleError("policy bundle changed while it was being read")
         except Exception as exc:
-            self._reject_toolgraph_bundle(exc, startup=startup, cfg_snap=cfg_snap)
+            self._reject_toolgraph_bundle(exc, startup=startup)
             return
 
         self._toolgraph_policy_snapshot = snapshot
@@ -1058,7 +1047,7 @@ class ProxyManager:
         self._toolgraph_degraded = False
         self._toolgraph_degraded_reason = None
         self._toolgraph_withhold_all = None
-        self._apply_toolgraph_policy_snapshot(snapshot, cfg_snap=cfg_snap)
+        self._apply_toolgraph_policy_snapshot(snapshot)
         self._warn_on_bundle_provenance(path)
         logger.info(
             "Toolgraph policy bundle active: instance %s generation %d digest %s",
@@ -1088,11 +1077,18 @@ class ProxyManager:
             "; ".join(findings),
         )
 
-    def _apply_toolgraph_policy_snapshot(
-        self, snapshot: PolicySnapshot, *, cfg_snap: ProxyConfig | None = None
-    ) -> None:
-        """Bind portable qualified decisions to the current live MCP catalog."""
-        cfg = (cfg_snap if cfg_snap is not None else self._config).toolgraph
+    def _apply_toolgraph_policy_snapshot(self, snapshot: PolicySnapshot) -> None:
+        """Bind portable qualified decisions to the current live MCP catalog.
+
+        Reads LIVE config, not a request snapshot: the maps built here
+        (``_toolgraph_external_rejects``, ``_toolgraph_risk_penalties``)
+        persist across requests and are the enforcement authority for every
+        later call, so binding them from a snapshot pinned before an upstream
+        call would let a stale ``server_name_map`` keep allowing a tool the
+        current mapping denies. Same rule as ``_get_extractor``: a value that
+        outlives the call reads live.
+        """
+        cfg = self._config.toolgraph
         rejects: dict[tuple[str, str], str] = {}
         penalties: dict[tuple[str, str], float] = {}
         facts: dict[tuple[str, str], dict[str, Any]] = {}
@@ -1213,7 +1209,7 @@ class ProxyManager:
         cfg = cfg_snap.toolgraph
         if not cfg.enabled or cfg.source != "bundle":
             return
-        self._refresh_toolgraph_bundle(cfg_snap=cfg_snap)
+        self._refresh_toolgraph_bundle()
         reason = self._toolgraph_withhold_all or self._toolgraph_external_rejects.get(
             (server, tool)
         )
@@ -2352,7 +2348,7 @@ class ProxyManager:
         # advertisement mixes one live global snapshot with session-stable
         # server snapshots — see the comment at the loop head for why.
         cfg_snap = self._config
-        self._refresh_toolgraph_bundle(cfg_snap=cfg_snap)
+        self._refresh_toolgraph_bundle()
         candidates: list[ExposureCandidate] = []
         global_max_desc = cfg_snap.max_description_chars
         global_strip = cfg_snap.strip_schema_descriptions
@@ -3262,15 +3258,15 @@ class ProxyManager:
             observability=self.index_observability,
         )
 
-    async def _get_extractor(self) -> FactExtractor:
+    async def _get_extractor(self, *, cfg_snap: ProxyConfig | None = None) -> FactExtractor:
         """The lazily-built ``FactExtractor``, never rebuilt when ``extraction``
         changes (#890).
 
-        Deliberately reads LIVE config rather than the caller's request
-        snapshot, unlike the per-call sites in this class. The distinction is
-        lifetime: a snapshot is right for a decision scoped to one call, but
-        this instance outlives every request, so whichever generation builds it
-        wins until restart. Pinning it to a snapshot captured before the
+        Split by LIFETIME, the rule this class applies throughout: the lock
+        timeout is a decision scoped to THIS acquisition, so it rides the
+        request snapshot; the extractor itself outlives every request, so it is
+        constructed from LIVE config. Whichever generation builds that instance
+        wins until restart, and pinning it to a snapshot captured before the
         upstream call would freeze the PRE-edit generation whenever a reload
         lands mid-call — trading one call's internal consistency for a
         permanently staler singleton. Freshness wins for something that never
@@ -3281,9 +3277,11 @@ class ProxyManager:
         explicit lease. That is lifecycle work in its own right; #890 carries
         the analysis.
         """
+        if cfg_snap is None:
+            cfg_snap = self._config
         async with bounded_lock(
             self._extractor_lock,
-            timeout=self._config.lock_timeout_seconds,
+            timeout=cfg_snap.lock_timeout_seconds,
             name="extractor_lock",
         ):
             if self._extractor is None:
@@ -3303,7 +3301,7 @@ class ProxyManager:
         """Extract facts from response and store as individual memory entries."""
         if cfg_snap is None:
             cfg_snap = self._config
-        extractor = await self._get_extractor()
+        extractor = await self._get_extractor(cfg_snap=cfg_snap)
         return await extract_and_store(
             index_engine=self._index_engine,
             extractor=extractor,
@@ -5188,12 +5186,14 @@ class ProxyManager:
         WARNING log). A background run that was never scheduled — shed at the
         cap or during ``stop()`` — reports ``False`` / ``background_shed``
         instead (#868). Like the index stage, gate and ``_extract_and_store``
-        both read the request's ``cfg_snap`` snapshot (#871), so the call that
-        BUILDS the extractor has extraction and storage on one generation. The
-        cached ``FactExtractor`` is never rebuilt, so after a later
-        ``extraction`` edit storage moves to the new generation while the
-        extractor stays on the old one until restart — pre-existing, tracked in
-        #890.
+        both read the request's ``cfg_snap`` snapshot for ``ext_cfg`` (#871).
+        The ``FactExtractor`` itself is built from LIVE config and never
+        rebuilt (#890), so the two can split in one direction on the call that
+        constructs it — a reload landing mid-call gives the extractor the NEW
+        generation while storage keeps the snapshot — and permanently in the
+        other afterwards, storage moving on while the extractor does not. That
+        is the deliberate trade: one call's split costs one call, a stale
+        singleton costs every later one.
         """
         extract_ok: bool | None = None
         extract_error: str | None = None
@@ -5816,8 +5816,11 @@ class ProxyManager:
         #
         # This is a same-object delta, NOT full coverage of every compression
         # path: SELECTIVE/HYBRID score through their cached compressor's own
-        # captured scorer, so a fallback there is not counted here. That gap
-        # predates the snapshot work and is unchanged by it.
+        # captured scorer, so a fallback there is not counted here. The counter
+        # is also process-shared, so a concurrent request incrementing it during
+        # this call's await is attributed here. Both gaps predate the snapshot
+        # work and are unchanged by it; a per-operation signal returned from
+        # compression is the real fix.
         _scorer = self._relevance_scorer_for(cfg_snap)
         _pre_scorer_fb = getattr(_scorer, "fallback_count", 0)
         comp = await self._compress_and_surface(
