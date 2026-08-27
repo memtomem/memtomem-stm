@@ -30,6 +30,7 @@ from memtomem_stm.proxy.manager import ProxyManager, ToolgraphStartupError, Upst
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.proxy.tool_eligibility import (
     REASON_TOOLGRAPH_DRIFTED,
+    REASON_TOOLGRAPH_PROTOCOL_ERROR,
     REASON_TOOLGRAPH_UNMAPPED,
 )
 from memtomem_stm.proxy import toolgraph_bundle as toolgraph_bundle_mod
@@ -601,6 +602,175 @@ async def test_bundle_mode_loader_read_counts(tmp_path):
     calls[0] = 0
     await manager.call_tool("srv", tool.name, {})
     assert calls[0] == 2, f"bundle steady state: expected 2 loader reads, got {calls[0]}"
+
+
+def _reload_config(manager, tmp_path, payload: dict) -> None:
+    """Rewrite the manager's config file and force its mtime past the last read."""
+    import os
+
+    cfg_file = tmp_path / "proxy.json"
+    cfg_file.write_text(json.dumps(payload))
+    seen = manager._config_loader._mtime
+    os.utime(cfg_file, (seen + 10, seen + 10))
+
+
+def _bundle_config(path: Path, *, profile: str = "strict", enabled: bool = True) -> dict:
+    return {
+        "enabled": True,
+        "upstream_servers": {"srv": {"prefix": "srv", "compression": "none"}},
+        "exposure": {"profile": profile},
+        "toolgraph": {
+            "enabled": enabled,
+            "source": "bundle",
+            "bundle_path": str(path),
+            "agent_id": "stm-proxy",
+            "query_profile": profile,
+            "server_name_map": {"srv": "graph-srv"},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_disabling_toolgraph_retires_its_verdicts(tmp_path):
+    """Turning Toolgraph off must retire the verdicts it produced.
+
+    Enforcement state outlives the request that produced it by design, so
+    nothing retired it when the config that produced it went away: the refresh
+    returned at the disabled gate with the maps intact, and ``get_proxy_tools``
+    kept handing those rejects to the exposure filter. The tool stayed
+    withheld by a feature the operator had switched off, and only a restart
+    cleared it.
+
+    This exercises the exposure CHOKE POINT, which is what the retirement
+    fixes. It is deliberately not a claim about the live client's tool list:
+    ``server.py`` registers ``get_proxy_tools()`` once at startup, so a tool
+    withheld then stays absent until a restart re-registers it. Call-time
+    enforcement is the half that recovers on the next request.
+    """
+    manager, path, tool = _manager(tmp_path, profile=ExposureProfile.STRICT)
+    # A bundle that maps a DIFFERENT graph server, so the live tool binds
+    # UNMAPPED and is withheld — a verdict with a visible advertisement effect.
+    doc = _bundle(tool, profile="strict")
+    doc["tools"][0]["tool_key"] = f"renamed::{tool.name}"
+    _write_bundle(path, doc)
+    manager._refresh_toolgraph_bundle(force=True, startup=True)
+    assert manager._toolgraph_external_rejects == {("srv", tool.name): REASON_TOOLGRAPH_UNMAPPED}
+    assert manager.get_proxy_tools() == [], "the tool must start withheld"
+
+    _reload_config(manager, tmp_path, _bundle_config(path, enabled=False))
+    assert manager._config.toolgraph.enabled is False
+
+    assert manager.get_proxy_tools() != [], "a disabled Toolgraph still withheld the tool"
+    assert manager._toolgraph_external_rejects == {}
+    assert manager._toolgraph_policy_snapshot is None
+    assert manager._toolgraph_bundle_stamp is None
+
+
+@pytest.mark.asyncio
+async def test_stdio_verdicts_survive_a_bundle_refresh(tmp_path):
+    """The retirement above must not fire on state the bundle path does not own.
+
+    ``get_proxy_tools`` refreshes on every build and the stdio consult writes
+    the SAME verdict fields, so a retirement that inferred its owner from which
+    fields are populated would wipe a stdio consult's verdict once per
+    advertisement rebuild.
+    """
+    manager, path, tool = _manager(tmp_path, profile=ExposureProfile.STRICT)
+    stdio_cfg = _bundle_config(path)
+    stdio_cfg["toolgraph"]["source"] = "stdio"
+    _reload_config(manager, tmp_path, stdio_cfg)
+    assert manager._config.toolgraph.source == "stdio"
+
+    # Stand in for a completed stdio consult.
+    manager._toolgraph_external_rejects = {("srv", tool.name): REASON_TOOLGRAPH_UNMAPPED}
+    manager._toolgraph_state_owner = "stdio"
+
+    manager._refresh_toolgraph_bundle()
+
+    assert manager._toolgraph_external_rejects == {
+        ("srv", tool.name): REASON_TOOLGRAPH_UNMAPPED
+    }, "the bundle gate retired a verdict it did not produce"
+
+
+@pytest.mark.asyncio
+async def test_bundle_rejection_does_not_inherit_stdio_verdicts(tmp_path):
+    """A failed bundle must not relabel a stdio consult's verdicts as its own.
+
+    The owner is a label, not a transfer of authority: leaving stdio-derived
+    rejects in place while marking the state bundle-owned keeps them enforcing
+    under a source that never produced them, and reports bundle enforcement as
+    degraded at the same time.
+    """
+    manager, path, tool = _manager(tmp_path, profile=ExposureProfile.REVIEW)
+    manager._toolgraph_external_rejects = {("srv", tool.name): REASON_TOOLGRAPH_UNMAPPED}
+    manager._toolgraph_risk_penalties = {("srv", tool.name): 0.5}
+    manager._toolgraph_state_owner = "stdio"
+
+    # No bundle on disk: the incoming source fails on its first refresh.
+    _reload_config(manager, tmp_path, _bundle_config(path, profile="review"))
+    manager._refresh_toolgraph_bundle()
+
+    assert manager._toolgraph_state_owner == "bundle"
+    assert manager._toolgraph_degraded is True
+    assert manager._toolgraph_external_rejects == {}, "stdio verdicts survived as bundle state"
+    assert manager._toolgraph_risk_penalties == {}
+
+
+@pytest.mark.asyncio
+async def test_disabling_toolgraph_retires_a_stdio_verdict_too(tmp_path):
+    """Off means off, whichever source produced what is still enforcing.
+
+    The retirement is owner-gated so a bundle refresh cannot wipe a stdio
+    verdict — but that gate must not become a way for stdio state to outlive
+    ``toolgraph.enabled: false``. Enabling stdio again stays restart-bound
+    (the consult runs only in ``start()``); retiring is the half that must
+    still happen, since serving a verdict from a source the operator switched
+    off is worse than serving none.
+    """
+    manager, path, tool = _manager(tmp_path, profile=ExposureProfile.STRICT)
+    stdio_cfg = _bundle_config(path)
+    stdio_cfg["toolgraph"]["source"] = "stdio"
+    _reload_config(manager, tmp_path, stdio_cfg)
+    manager._toolgraph_external_rejects = {("srv", tool.name): REASON_TOOLGRAPH_UNMAPPED}
+    manager._toolgraph_state_owner = "stdio"
+    assert manager.get_proxy_tools() == [], "the stdio verdict must start in force"
+
+    disabled = _bundle_config(path, enabled=False)
+    disabled["toolgraph"]["source"] = "stdio"
+    _reload_config(manager, tmp_path, disabled)
+    assert manager._config.toolgraph.enabled is False
+
+    assert manager.get_proxy_tools() != [], "a disabled Toolgraph still withheld the tool"
+    assert manager._toolgraph_external_rejects == {}
+    assert manager._toolgraph_state_owner is None
+
+
+@pytest.mark.asyncio
+async def test_strict_withhold_does_not_survive_a_move_to_review(tmp_path):
+    """A withhold recorded under strict must not outlive the strict profile.
+
+    ``filter_tools`` reads ``_toolgraph_withhold_all`` profile-independently,
+    so a strict-era withhold left in place after a move to review keeps
+    advertising nothing and reporting a strict verdict no live config agrees
+    with. Fail-closed is strict's rule alone.
+    """
+    manager, path, tool = _manager(tmp_path, profile=ExposureProfile.STRICT)
+    _write_bundle(path, _bundle(tool, profile="strict"))
+    manager._refresh_toolgraph_bundle(force=True, startup=True)
+
+    path.unlink()  # every later refresh fails
+    manager._refresh_toolgraph_bundle()
+    assert manager._toolgraph_withhold_all == REASON_TOOLGRAPH_PROTOCOL_ERROR
+
+    _reload_config(manager, tmp_path, _bundle_config(path, profile="review"))
+    assert manager._config.exposure.profile is ExposureProfile.REVIEW
+
+    manager._refresh_toolgraph_bundle()
+
+    assert manager._toolgraph_withhold_all is None, (
+        "a strict-era withhold survived into review"
+    )
+    assert manager._toolgraph_degraded is True, "review still degrades; only the withhold lifts"
 
 
 @pytest.mark.asyncio

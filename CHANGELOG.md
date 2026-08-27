@@ -367,6 +367,39 @@ changes inline only. See the deprecation policy in
   always seeds the loader; this is the contract for tooling and tests that
   construct a loader directly.
 
+- **Toolgraph verdicts no longer outlive the config that produced them**
+  (#899). Verdicts are persistent by design — built once, consulted by every
+  later request — but nothing retired them when the configuration behind them
+  went away, so two ordinary edits to `stm_proxy.json` left a tool denied under
+  a rule the operator had already relaxed, until the next restart.
+
+  Turning Toolgraph off left its verdicts enforcing. The refresh returned at the
+  disabled gate with the bind maps intact and `get_proxy_tools()` kept handing
+  them to the exposure filter, so a tool stayed withheld by a feature that was
+  switched off. Retirement is now a single choke point, gated on which SOURCE
+  owns the current state (`bundle` / `stdio` / none) rather than on which fields
+  happen to be populated — both sources write the same fields and the refresh
+  runs on every advertisement rebuild, so an inferred owner would have wiped a
+  live stdio verdict once per rebuild. A failed bundle adoption no longer
+  inherits a stdio consult's verdicts by relabelling them either.
+
+  A `strict`-era withhold survived a move to `review`. `filter_tools` reads
+  `withhold_all` profile-independently, so the relaxed profile kept advertising
+  nothing and reporting a verdict no live config agreed with; fail-closed is
+  `strict`'s rule alone, and a non-strict rejection now clears it.
+
+  **Behavior change**: both are EXPOSURE state, which the call gate never
+  consults — it returns early when Toolgraph is disabled, and review mode warns
+  rather than raising. What they fix is `get_proxy_tools()` handing the filter
+  verdicts nothing live stands behind, which matters at the next advertisement
+  build. The advertisement is registered with the MCP server once in `start()`,
+  so a tool withheld at startup is ABSENT rather than denied and becomes
+  callable again only after a restart; dynamic re-registration with a
+  `list_changed` notification is not implemented here. Enabling Toolgraph at
+  runtime stays restart-bound for the same reason — the stdio consult runs only
+  in `start()`, so a retired stdio verdict is stopped from enforcing, not
+  re-consulted.
+
 - **`mms selection replay` no longer crashes on, or silently trusts, an
   unreadable number** (#857, closes #856). Six fields on an admitted record
   were guarded by a type check and then coerced with `float()`, which the type
