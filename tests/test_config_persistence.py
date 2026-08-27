@@ -92,6 +92,68 @@ class TestProxyConfigLoader:
         # and now sees the same mtime → skips reload → returns stale config.
         assert loader.get().enabled is True
 
+    def test_unseeded_loader_with_broken_file_returns_defaults(self, tmp_path):
+        """An unseeded loader whose first load fails has no cache to fall back
+        on, and used to return None with the type error suppressed.
+
+        ``ProxyManager`` seeds its loader in ``__init__``, so this is NOT
+        reachable from the production request path; it is the contract for
+        anyone constructing a ``ProxyConfigLoader`` directly (tooling and
+        tests do). Every caller does attribute access on the result, so None
+        is never a usable answer — return defaults instead.
+        """
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text("{ not valid json")
+        loader = ProxyConfigLoader(cfg_file)
+
+        config = loader.get()
+        assert isinstance(config, ProxyConfig)
+        assert config.enabled is False  # defaults
+
+        # The parse-failure retry contract still holds: a later fix is picked
+        # up even though the failed load returned defaults.
+        time.sleep(0.05)
+        cfg_file.write_text(json.dumps({"enabled": True}))
+        assert loader.get().enabled is True
+
+    def test_unseeded_broken_file_still_applies_env_overrides(self, tmp_path):
+        """The broken-file fallback must not be where env overrides vanish.
+
+        The class contract is ``env > file > defaults``, and the missing-file
+        branch honors it through ``load_from_file``. If the parse-failure
+        fallback returned bare defaults instead, the SAME environment would
+        mean different things depending on whether the file is absent or
+        unparseable — and the one that drops the override is the one where the
+        operator has least reason to suspect it.
+        """
+        overrides = {"enabled": True, "max_description_chars": 321}
+
+        missing = ProxyConfigLoader(tmp_path / "absent.json", env_overrides=overrides)
+        assert missing.get().max_description_chars == 321, "missing-file branch regressed"
+
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text("{ not valid json")
+        broken = ProxyConfigLoader(cfg_file, env_overrides=overrides)
+
+        config = broken.get()
+        assert config.enabled is True
+        assert config.max_description_chars == 321
+
+    def test_unseeded_broken_file_with_invalid_env_falls_back_to_defaults(self, tmp_path):
+        """An unusable overlay on top of an unparseable file still answers.
+
+        Both inputs are broken here, so defaults are the only honest result —
+        but the loader must return one rather than raise: every caller does
+        attribute access on it.
+        """
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text("{ not valid json")
+        loader = ProxyConfigLoader(cfg_file, env_overrides={"max_description_chars": "not-an-int"})
+
+        config = loader.get()
+        assert isinstance(config, ProxyConfig)
+        assert config.enabled is False
+
     def test_current_reports_only_seeded_or_loaded_generations(self, tmp_path):
         """``current`` is an identity check, so its None must mean "cannot compare".
 
