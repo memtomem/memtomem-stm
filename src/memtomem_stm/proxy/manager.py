@@ -610,6 +610,12 @@ class ProxyManager:
         # a half-parsed artifact during an atomic producer update.
         self._toolgraph_policy_snapshot: PolicySnapshot | None = None
         self._toolgraph_bundle_stamp: tuple[int, int, int] | None = None
+        # WHICH source produced the current verdict fields — ``"bundle"``,
+        # ``"stdio"`` or ``None``. Both sources write the same fields, so
+        # retirement needs an explicit owner rather than inferring one from
+        # which fields happen to be set, and it must be able to retire a
+        # stdio-owned verdict too when Toolgraph is switched off.
+        self._toolgraph_state_owner: str | None = None
         self._toolgraph_bundle_digest: str | None = None
         self._graph_instance_id: str | None = None
         self._toolgraph_would_block_calls: int = 0
@@ -949,6 +955,14 @@ class ProxyManager:
         # leaving strict withholding forever. Forcing the next refresh through
         # a full re-adopt makes recovery automatic.
         self._toolgraph_bundle_stamp = None
+        # A bundle failure must not INHERIT a stdio consult's verdicts by
+        # relabelling them: under review the stale stdio rejects would keep
+        # enforcing while health reports bundle enforcement as degraded, and
+        # the last-known-good rebind below would rebind a snapshot that source
+        # never produced. Only genuinely bundle-owned state is kept.
+        if self._toolgraph_state_owner == "stdio":
+            self._retire_toolgraph_state(owners=("stdio",))
+        self._toolgraph_state_owner = "bundle"
         expected = isinstance(exc, (OSError, PolicyBundleError))
         self._toolgraph_degraded = True
         self._toolgraph_degraded_reason = REASON_TOOLGRAPH_PROTOCOL_ERROR
@@ -980,21 +994,76 @@ class ProxyManager:
                     else "Toolgraph policy bundle reload failed"
                 )
                 raise ToolgraphStartupError(f"{summary}: {exc}") from exc
-        elif (
-            self._toolgraph_policy_snapshot is not None
-            and self._toolgraph_bound_catalog_revision != self._tool_catalog_revision
-        ):
-            # Review mode keeps serving the last-known-good policy, but a
-            # changed catalog must still be rebound once so newly added or
-            # drifted tools are counted as would-block instead of escaping
-            # the stale snapshot.
-            self._apply_toolgraph_policy_snapshot(
-                self._toolgraph_policy_snapshot, cfg_live=cfg_live
-            )
+        else:
+            # Fail-closed is STRICT's rule alone, and ``_toolgraph_withhold_all``
+            # is read profile-independently by ``filter_tools``. A withhold
+            # recorded under an earlier strict generation must therefore be
+            # cleared when a later failure is judged under review/explore —
+            # otherwise the relaxed profile keeps advertising nothing and
+            # reporting a strict verdict nothing live agrees with.
+            self._toolgraph_withhold_all = None
+            if (
+                self._toolgraph_policy_snapshot is not None
+                and self._toolgraph_bound_catalog_revision != self._tool_catalog_revision
+            ):
+                # Review mode keeps serving the last-known-good policy, but a
+                # changed catalog must still be rebound once so newly added or
+                # drifted tools are counted as would-block instead of escaping
+                # the stale snapshot.
+                self._apply_toolgraph_policy_snapshot(
+                    self._toolgraph_policy_snapshot, cfg_live=cfg_live
+                )
         # Unexpected classes keep their traceback: the message alone names
         # neither the raise site nor the class family the next fix should
         # widen to expect.
         logger.warning("Toolgraph policy bundle reload rejected: %s", exc, exc_info=not expected)
+
+    def _retire_toolgraph_state(self, *, owners: tuple[str, ...]) -> None:
+        """Drop enforcement state once live config stops backing it.
+
+        Verdicts outlive the request that produced them by design, so nothing
+        retired them when the config that produced them went away: a reload
+        that sets ``toolgraph.enabled: false`` (or moves ``source`` off
+        ``bundle``) used to return from the refresh with the maps intact, and
+        ``get_proxy_tools`` kept feeding those stale rejects to the exposure
+        filter — a tool still withheld by a feature the operator turned off.
+
+        *owners* names which producers this retirement is entitled to clear.
+        Turning Toolgraph off retires whoever owns the state, including the
+        startup stdio consult; moving ``source`` between the two retires only
+        the source being left, so the incoming one starts clean. Ownership is
+        explicit rather than inferred from which fields are populated: both
+        sources write the SAME fields and this runs on every advertisement
+        build, so an inferred owner would let the bundle gate wipe a stdio
+        consult's verdict once per rebuild.
+
+        A stdio verdict retired here is NOT re-consulted: that consult is
+        startup-only by design (nothing holds the adapter past ``start()``), so
+        enabling stdio at runtime stays restart-bound. Retiring is still the
+        right half to do — serving a verdict from a source the operator turned
+        off is worse than serving none.
+        """
+        if self._toolgraph_state_owner not in owners:
+            return
+        self._reset_toolgraph_verdict_state()
+        self._toolgraph_policy_snapshot = None
+        self._toolgraph_bundle_stamp = None
+        self._toolgraph_bundle_digest = None
+        self._graph_instance_id = None
+        self._toolgraph_bind_stats = {}
+        self._toolgraph_all_fail_cause = None
+        self._toolgraph_all_fail_warned = False
+        self._toolgraph_bound_catalog_revision = None
+        # Re-advise if the same path is adopted again later: the finding is
+        # about a directory this manager is no longer watching.
+        self._toolgraph_provenance_warned = None
+        retired = self._toolgraph_state_owner
+        self._toolgraph_state_owner = None
+        logger.info(
+            "Toolgraph %s enforcement is no longer configured — retired its policy "
+            "state and every verdict derived from it",
+            retired,
+        )
 
     def _refresh_toolgraph_bundle(
         self,
@@ -1014,7 +1083,15 @@ class ProxyManager:
         """
         cfg_live = cfg_live if cfg_live is not None else self._config
         cfg = cfg_live.toolgraph
-        if not cfg.enabled or cfg.source != "bundle":
+        if not cfg.enabled:
+            # Off means off, whichever source produced what is still in force.
+            self._retire_toolgraph_state(owners=("bundle", "stdio"))
+            return
+        if cfg.source != "bundle":
+            # Still enabled, just not by this source: retire only the bundle's
+            # own state so a live stdio verdict survives the advertisement
+            # rebuilds that call through here.
+            self._retire_toolgraph_state(owners=("bundle",))
             return
         try:
             # ``expanduser`` is inside the barrier too: a ``~nosuchuser`` path
@@ -1071,6 +1148,7 @@ class ProxyManager:
 
         self._toolgraph_policy_snapshot = snapshot
         self._toolgraph_bundle_stamp = after_stamp
+        self._toolgraph_state_owner = "bundle"
         self._toolgraph_bundle_digest = snapshot.bundle_digest
         self._graph_instance_id = snapshot.instance_id
         self._graph_generation = snapshot.generation
@@ -1316,6 +1394,7 @@ class ProxyManager:
         """
         cfg = cfg if cfg is not None else self._config.toolgraph
         self._reset_toolgraph_verdict_state()
+        self._toolgraph_state_owner = "stdio"
 
         ref_to_keys, refs = self._build_toolgraph_candidates(cfg)
         if not refs:
@@ -1429,6 +1508,7 @@ class ProxyManager:
         self._reset_toolgraph_verdict_state()
         self._toolgraph_policy_snapshot = None
         self._toolgraph_bundle_stamp = None
+        self._toolgraph_state_owner = None
         self._toolgraph_bundle_digest = None
         self._graph_instance_id = None
         self._toolgraph_would_block_calls = 0
