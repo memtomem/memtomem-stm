@@ -2649,7 +2649,9 @@ class ProxyManager:
             timeout=sc.embedding_timeout,
         )
 
-    def _distinct_sqlite_selective_cfgs(self) -> list[SelectiveConfig]:
+    def _distinct_sqlite_selective_cfgs(
+        self, cfg: ProxyConfig | None = None
+    ) -> list[SelectiveConfig]:
         """All configured SQLite ``SelectiveConfig`` s, deduped by resolved
         path, in deterministic order (#583).
 
@@ -2662,7 +2664,8 @@ class ProxyManager:
         """
         out: list[SelectiveConfig] = []
         seen_paths: set[str] = set()
-        for _srv_name, srv_cfg in sorted(self._config.upstream_servers.items()):
+        live = cfg if cfg is not None else self._config
+        for _srv_name, srv_cfg in sorted(live.upstream_servers.items()):
             candidates: list[SelectiveConfig | None] = [srv_cfg.selective]
             candidates.extend(
                 srv_cfg.tool_overrides[t].selective for t in sorted(srv_cfg.tool_overrides)
@@ -2675,7 +2678,9 @@ class ProxyManager:
                         out.append(sel)
         return out
 
-    def _sqlite_cfg_holding_key(self, key: str) -> SelectiveConfig | None:
+    def _sqlite_cfg_holding_key(
+        self, key: str, cfg: ProxyConfig | None = None
+    ) -> SelectiveConfig | None:
         """The distinct configured SQLite ``SelectiveConfig`` whose store
         currently holds *key*, or ``None`` if none does (#583).
 
@@ -3053,7 +3058,12 @@ class ProxyManager:
                 elif self._selective_compressor_cfg != sel_cfg and self._pin_is_live_generation(
                     cfg_snap
                 ):
-                    sel_compressor = self._rebuild_selective_compressor(sel_cfg)
+                    # ``cfg`` for the same reason the cold fill passes one: the
+                    # scorer must come from the generation this compressor is
+                    # published under, not from a fresh read that may have
+                    # re-loaded since. Reaching here means the pin IS live, so
+                    # that generation is the pin itself.
+                    sel_compressor = self._rebuild_selective_compressor(sel_cfg, cfg=cfg_snap)
                 else:
                     sel_compressor = self._selective_compressor
                 # Pin the compressor before the lock drops: the off-thread
@@ -3364,7 +3374,7 @@ class ProxyManager:
             elif self._selective_compressor_cfg != sel_cfg and self._pin_is_live_generation(
                 cfg_snap
             ):
-                self._rebuild_selective_compressor(sel_cfg)
+                self._rebuild_selective_compressor(sel_cfg, cfg=cfg_snap)
 
             sel_compressor = self._selective_compressor
             compressor = HybridCompressor(
@@ -3492,7 +3502,11 @@ class ProxyManager:
         return "not found or expired" in text
 
     def select_chunks(self, key: str, sections: list[str]) -> str:
-        cfgs = self._distinct_sqlite_selective_cfgs()
+        # ONE generation for the whole recovery: the configs probed, the one
+        # chosen, and the scorer baked into the compressor cached below must
+        # not come from separate loader reads that can straddle a re-load.
+        cfg_live = self._config
+        cfgs = self._distinct_sqlite_selective_cfgs(cfg_live)
         if self._selective_compressor is None:
             # Restart recovery (#583): no compress call has run yet this process,
             # so the compressor (and its store handle) hasn't been built — but a
@@ -3507,11 +3521,11 @@ class ProxyManager:
             # check and the assignment, and neither do the lock-holding compress
             # paths, so this can't interleave with them on the event loop — no
             # _selective_lock needed here.
-            sel_cfg = self._sqlite_cfg_holding_key(key) or (cfgs[0] if cfgs else None)
+            sel_cfg = self._sqlite_cfg_holding_key(key, cfg_live) or (cfgs[0] if cfgs else None)
             if sel_cfg is None:
                 return "Selective compression not active — no pending TOC selections."
             try:
-                compressor = self._create_selective(sel_cfg)
+                compressor = self._create_selective(sel_cfg, cfg=cfg_live)
             except Exception:
                 logger.warning(
                     "Could not open the configured SQLite pending store for select_chunks recovery",
@@ -3527,10 +3541,10 @@ class ProxyManager:
             # cached a *different* store (#583). Probe the others; if one holds
             # the key, serve it from a temporary compressor without disturbing
             # the cache or this session's in-memory selections.
-            alt = self._sqlite_cfg_holding_key(key)
+            alt = self._sqlite_cfg_holding_key(key, cfg_live)
             if alt is not None and alt != self._selective_compressor_cfg:
                 try:
-                    tmp = self._create_selective(alt)
+                    tmp = self._create_selective(alt, cfg=cfg_live)
                 except Exception:
                     logger.warning(
                         "Could not open alternate SQLite pending store for select_chunks recovery",
@@ -3679,10 +3693,13 @@ class ProxyManager:
         # keys written since startup. On a SQLite open failure, degrade to the
         # sentinel; _get_progressive_store caches only after initialize()
         # succeeds, so nothing bad is pinned and the next call retries.
-        cfgs = self._distinct_sqlite_selective_cfgs()
+        # One generation for this recovery too — the stores probed and the one
+        # opened must not come from reads that straddle a re-load.
+        cfg_live = self._config
+        cfgs = self._distinct_sqlite_selective_cfgs(cfg_live)
         temp_store: ProgressiveStoreAdapter | None = None
         if self._progressive_store is None:
-            fallback = self._sqlite_cfg_holding_key(key) or (cfgs[0] if cfgs else None)
+            fallback = self._sqlite_cfg_holding_key(key, cfg_live) or (cfgs[0] if cfgs else None)
             if fallback is not None:
                 try:
                     store = self._get_progressive_store(fallback)
@@ -3703,7 +3720,7 @@ class ProxyManager:
             # one (#583). Probe the others and, if one holds the key, serve it
             # from a temporary adapter (closed below) without disturbing the
             # cache or this session's in-memory progressive responses.
-            alt = self._sqlite_cfg_holding_key(key)
+            alt = self._sqlite_cfg_holding_key(key, cfg_live)
             if alt is not None and alt != self._progressive_store_cfg:
                 try:
                     temp_store = self._open_progressive_adapter(alt)

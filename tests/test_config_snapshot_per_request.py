@@ -544,6 +544,43 @@ class TestPerRequestSnapshot:
         assert mgr._pin_is_live_generation(live) is True
         return stale, live
 
+    async def test_warm_rebuild_stays_on_the_request_generation(self, mgr):
+        """A live config change rebuilds the compressor without a second read.
+
+        The rebuild is a fill too: whatever generation it publishes under has
+        to be the one its scorer comes from. Reading the scorer separately
+        would both cost a read and let ``get()`` re-load between the two, so
+        the compressor would pair this request's selective config with a later
+        scorer. Reaching this branch means the pin IS live, so the pin is that
+        generation and nothing needs re-reading.
+        """
+        from memtomem_stm.proxy.config import CompressionStrategy as CS
+        from memtomem_stm.proxy.config import SelectiveConfig
+
+        # Warm the slot under a config the next call will disagree with.
+        mgr._rebuild_selective_compressor(SelectiveConfig(max_pending=5))
+        warm = mgr._selective_compressor
+        cfg_snap = mgr._config
+        sel_cfg = mgr._resolve_tool_config("srv", "tool", cfg_snap).selective
+        assert mgr._selective_compressor_cfg != sel_cfg, "the rebuild branch must be taken"
+
+        calls = count_loader_reads(mgr)
+        await mgr._apply_compression(
+            "word " * 400,
+            CS.SELECTIVE,
+            200,
+            sel_cfg,
+            None,
+            None,
+            "srv",
+            "tool",
+            cfg_snap=cfg_snap,
+        )
+
+        assert mgr._selective_compressor is not warm, "the rebuild did not happen"
+        assert calls[0] == 0, f"the warm rebuild took {calls[0]} loader read(s) of its own"
+        assert mgr._selective_compressor_cfg == sel_cfg
+
     async def test_stale_request_key_survives_the_next_live_request(self, truncate_mgr):
         """The end-to-end property: a key handed out under a stale pin still reads.
 
