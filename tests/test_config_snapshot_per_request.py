@@ -281,14 +281,18 @@ class TestPerRequestSnapshot:
         """The whole request — policy gate, ranking, cache lookup, and every
         pipeline stage — runs off a single snapshot.
 
-        Warmed up first: a request that CONSTRUCTS a long-lived component
-        deliberately takes one extra live read (see the build-path test below),
-        so the steady-state cost is what this pins.
+        Steady state is TWO loader reads, not one: the request snapshot, plus
+        one live read in the Toolgraph enforcement gate. That gate is
+        deliberately excluded from the snapshot — its verdict has to agree with
+        withhold state derived from live config, and splitting them fails open
+        (tests/test_toolgraph_bundle.py). Warmed up first: a request that
+        CONSTRUCTS a long-lived component takes further live reads, pinned
+        separately below.
         """
         await mgr.call_tool("srv", "tool", {"warm": 1})
         calls = _count_loader_reads(mgr)
         await mgr.call_tool("srv", "tool", {"a": 1})
-        assert calls[0] == 1, f"expected 1 loader read per request, got {calls[0]}"
+        assert calls[0] == 2, f"expected 1 snapshot + 1 enforcement read, got {calls[0]}"
 
     async def test_building_a_long_lived_component_takes_one_live_read(self, mgr):
         """The build path reads live config exactly once more, by design.
@@ -302,7 +306,7 @@ class TestPerRequestSnapshot:
         """
         calls = _count_loader_reads(mgr)
         await mgr.call_tool("srv", "tool", {"a": 1})
-        assert calls[0] == 2, f"expected 1 snapshot + 1 live build read, got {calls[0]}"
+        assert calls[0] == 3, f"expected 2 baseline + 1 live build read, got {calls[0]}"
         assert mgr._selective_compressor is not None
 
     async def test_one_loader_read_on_the_cache_hit_path(self, truncate_mgr):
@@ -317,7 +321,7 @@ class TestPerRequestSnapshot:
         calls = _count_loader_reads(mgr)
         await mgr.call_tool("srv", "tool", {"a": 1})
         assert session.call_tool.await_count == upstream_calls, "second call was not a cache hit"
-        assert calls[0] == 1, f"expected 1 loader read on a cache hit, got {calls[0]}"
+        assert calls[0] == 2, f"expected the 2-read baseline on a cache hit, got {calls[0]}"
 
     async def test_extraction_request_read_counts(self, extract_mgr):
         """The extraction path's cost, warm and cold, pinned separately.
@@ -337,10 +341,10 @@ class TestPerRequestSnapshot:
         await mgr.call_tool("srv", "tool", {"b": 2})
         warm = calls[0]
 
-        assert warm == 1, f"expected 1 loader read for a warm extraction request, got {warm}"
-        # 1 snapshot + 1 live extractor build. TRUNCATE here, so no selective
+        assert warm == 2, f"expected the 2-read baseline for a warm request, got {warm}"
+        # baseline + 1 live extractor build. TRUNCATE here, so no selective
         # compressor is constructed; the combined case is covered below.
-        assert cold == 2, f"expected 1 snapshot + 1 live build read, got {cold}"
+        assert cold == 3, f"expected 2 baseline + 1 live build read, got {cold}"
 
     async def test_combined_construction_read_count(self, tmp_path):
         """Both build paths on one request: the reads add, they do not multiply.
@@ -358,11 +362,11 @@ class TestPerRequestSnapshot:
             calls = _count_loader_reads(mgr)
             await mgr.call_tool("srv", "tool", {"a": 1})
             assert mgr._selective_compressor is not None and mgr._extractor is not None
-            assert calls[0] == 3, f"expected 1 snapshot + 2 live build reads, got {calls[0]}"
+            assert calls[0] == 4, f"expected 2 baseline + 2 live build reads, got {calls[0]}"
 
             calls[0] = 0
             await mgr.call_tool("srv", "tool", {"b": 2})
-            assert calls[0] == 1, f"expected 1 read once both are built, got {calls[0]}"
+            assert calls[0] == 2, f"expected the 2-read baseline once built, got {calls[0]}"
         finally:
             await _drain(mgr)
             cache.close()
@@ -374,11 +378,15 @@ class TestPerRequestSnapshot:
         calls = _count_loader_reads(mgr)
         await mgr.call_tool("srv", "tool", {"a": 1})
         await mgr.call_tool("srv", "tool", {"b": 2})
-        assert calls[0] == 2
+        assert calls[0] == 4  # the 2-read baseline, twice
 
     async def test_every_request_helper_receives_the_same_object(self, active_mgr, monkeypatch):
         """Counting alone cannot catch a helper that re-pins from a *stale*
         loader; pin object identity instead.
+
+        Toolgraph enforcement is deliberately absent: it reads live config, not
+        the snapshot, so that its verdict cannot disagree with the withhold
+        state it consults — see tests/test_toolgraph_bundle.py.
 
         Runs on the ``active_mgr`` fixture so the surfacing, auto-index and
         extraction stages actually execute — on a manager with those engines
@@ -387,7 +395,6 @@ class TestPerRequestSnapshot:
         """
         mgr = active_mgr
         expected = {
-            "_enforce_toolgraph_call_policy",
             "_rank_candidates",
             "_resolve_cache_ttl",
             "_apply_compression",

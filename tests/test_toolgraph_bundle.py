@@ -494,6 +494,46 @@ async def test_explore_bundle_rejection_is_non_enforcing(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_refresh_failure_under_strict_denies_the_call(tmp_path):
+    """A refresh failure under strict withholds everything, and the call-time
+    verdict must act on it.
+
+    ``_reject_toolgraph_bundle`` records ``_toolgraph_withhold_all`` from LIVE
+    config; ``_enforce_toolgraph_call_policy`` must take its strict/review
+    verdict from the same place. Splitting them across two generations (#871
+    threaded a request snapshot in here for one revision) lets a request whose
+    pinned profile says ``review`` walk past a withhold the live ``strict``
+    profile had just recorded — the enforcement path allowing a call while its
+    own state says withhold-everything.
+    """
+    manager, path, tool = _manager(tmp_path, profile=ExposureProfile.STRICT)
+    _write_bundle(path, _bundle(tool, profile="strict"))
+    manager._refresh_toolgraph_bundle(force=True, startup=True)
+
+    path.unlink()  # next refresh fails
+
+    with pytest.raises(Exception) as excinfo:
+        manager._enforce_toolgraph_call_policy("srv", tool.name)
+    assert "Policy denied" in str(excinfo.value)
+    assert manager._toolgraph_withhold_all is not None
+    assert manager._toolgraph_degraded is True
+
+
+def test_enforcement_takes_no_config_snapshot():
+    """Source-level pin for the above: the enforcement path reads live config
+    only. A ``cfg_snap`` parameter here is what split the decision in two."""
+    import inspect
+
+    from memtomem_stm.proxy.manager import ProxyManager
+
+    src = inspect.getsource(ProxyManager._enforce_toolgraph_call_policy)
+    assert "cfg_snap" not in src, "enforcement must not evaluate a pinned profile"
+    for name in ("_refresh_toolgraph_bundle", "_reject_toolgraph_bundle"):
+        method_src = inspect.getsource(getattr(ProxyManager, name))
+        assert "cfg_snap" not in method_src, f"{name} feeds persistent state; must read live"
+
+
+@pytest.mark.asyncio
 async def test_start_drops_stale_bundle_state_when_toolgraph_is_disabled(tmp_path):
     config = ProxyConfig(config_path=tmp_path / "missing.json", upstream_servers={})
     manager = ProxyManager(config, TokenTracker())

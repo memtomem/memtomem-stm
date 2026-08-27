@@ -229,20 +229,25 @@ changes inline only. See the deprecation policy in
   `ProxyManager._config` is a property over the hot-reload loader, so each
   textual read cost a `stat()` and two reads within one call could land on
   either side of a reload. The existing per-request `cfg_snap` pin moved up
-  into `call_tool`, and now reaches the toolgraph policy gate, the relevance
-  ranker, and every pipeline stage. Measured over a SELECTIVE-plus-cache
-  configuration, a steady-state request went from 6 loader reads to 1.
+  into `call_tool`, and now reaches the relevance ranker, the cache key, and
+  every pipeline stage. Measured over a SELECTIVE-plus-cache configuration, a
+  steady-state request went from 6 loader reads to 2 — the request snapshot
+  plus one live read in the Toolgraph enforcement gate.
   The split is by lifetime: values scoped to one call ride the snapshot, while
   anything baked into an object that outlives the request — the selective
   compressor's scorer, the fact extractor, the Toolgraph bind maps — keeps
   reading live config, since a snapshot pinned before the upstream call would
-  freeze the pre-edit generation for every later call. A request that
-  constructs such a component pays one extra read per component (2 cold, 3 if
-  it builds both; 1 once warm). **Behavior change**: for per-request decisions
-  — including `mms surfacing <server> off` — a config edit landing while a
-  request is in flight now applies from the next request instead of taking
-  effect partway through the pipeline. Long-lived construction is the stated
-  exception and still consumes live config during that same request. Hot
+  freeze the pre-edit generation for every later call. Toolgraph enforcement
+  is excluded for a related reason: its verdict must agree with withhold state
+  the reject path derives from live config, and evaluating it against a pinned
+  profile lets a request walk past a withhold that state had just recorded. A
+  request that constructs a long-lived component pays one extra read per
+  component (3 cold, 4 if it builds both; 2 once warm). **Behavior change**:
+  for per-request decisions — including `mms surfacing <server> off` — a config
+  edit landing while a request is in flight now applies from the next request
+  instead of taking effect partway through the pipeline. Long-lived
+  construction and Toolgraph bundle enforcement are the stated exceptions and
+  still consume live config during that same request. Hot
   reload stays restart-free for those per-request decisions; the pre-existing
   exception is the fact extractor, which is built once and never rebuilt, so a
   later `extraction` edit needs a restart (#890, unchanged here). Separately,

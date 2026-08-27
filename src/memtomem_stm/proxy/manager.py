@@ -1200,13 +1200,24 @@ class ProxyManager:
                 drifted,
             )
 
-    def _enforce_toolgraph_call_policy(
-        self, server: str, tool: str, *, cfg_snap: ProxyConfig | None = None
-    ) -> None:
-        """Apply the same policy snapshot at call time, before cache/upstream."""
-        if cfg_snap is None:
-            cfg_snap = self._config
-        cfg = cfg_snap.toolgraph
+    def _enforce_toolgraph_call_policy(self, server: str, tool: str) -> None:
+        """Apply the same policy snapshot at call time, before cache/upstream.
+
+        Reads LIVE config throughout, deliberately excluded from the
+        per-request snapshot (#871). The withhold state this consults is
+        derived from live config in ``_reject_toolgraph_bundle`` and persists
+        across requests, so evaluating the verdict against a pinned profile
+        would split ONE decision across two generations: a request that pinned
+        ``strict`` while live config moved to ``review`` would find
+        ``_toolgraph_withhold_all`` unset — the reject never recorded one,
+        because live said review — and return early, allowing a call it
+        believed it was enforcing strictly. Enforcement reads one generation
+        end to end; the loader read it costs is the price of that.
+        """
+        # ONE live read for the whole decision: the gate, the refresh it
+        # triggers, and the verdict below must not disagree with each other.
+        cfg_live = self._config
+        cfg = cfg_live.toolgraph
         if not cfg.enabled or cfg.source != "bundle":
             return
         self._refresh_toolgraph_bundle()
@@ -1215,14 +1226,14 @@ class ProxyManager:
         )
         if reason is None:
             return
-        if cfg_snap.exposure.profile is ExposureProfile.STRICT:
+        if cfg_live.exposure.profile is ExposureProfile.STRICT:
             from mcp.server.mcpserver.exceptions import ToolError
 
             raise ToolError(
                 f"Policy denied tool call '{server}/{tool}' ({reason}); "
                 "refresh the Toolgraph policy bundle after review"
             )
-        if cfg_snap.exposure.profile is ExposureProfile.REVIEW:
+        if cfg_live.exposure.profile is ExposureProfile.REVIEW:
             self._toolgraph_would_block_calls += 1
             logger.warning("Toolgraph review mode would block %s/%s (%s)", server, tool, reason)
 
@@ -3761,7 +3772,7 @@ class ProxyManager:
         # Bundle enforcement is deliberately before selection telemetry,
         # response-cache lookup, and upstream dispatch. A stale cached result
         # can never bypass a newly published denial.
-        self._enforce_toolgraph_call_policy(server, tool, cfg_snap=cfg_snap)
+        self._enforce_toolgraph_call_policy(server, tool)
         if trace_id is None:
             trace_id = uuid.uuid4().hex[:16]
         # Selection telemetry (#467): the prefixed name shares the
