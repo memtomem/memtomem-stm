@@ -1159,7 +1159,9 @@ class TestCleanupLogCredentialRedaction:
                 ),
             ):
                 with _pt.raises(asyncio.TimeoutError):
-                    await mgr._fetch_upstream("bad", "t", {"_trace_id": None}, trace_id=None)
+                    await mgr._fetch_upstream(
+                        "bad", "t", {"_trace_id": None}, trace_id=None, cfg_snap=mgr._config
+                    )
 
         self._assert_redacted(caplog, "Post-deadline reconnect failed for 'bad'")
 
@@ -1187,7 +1189,9 @@ class TestCleanupLogCredentialRedaction:
                 side_effect=ConnectionError(f"reconnect boom for {self.URL}"),
             ):
                 with _pt.raises(_ProtocolError):
-                    await mgr._fetch_upstream("bad", "t", {"_trace_id": None}, trace_id=None)
+                    await mgr._fetch_upstream(
+                        "bad", "t", {"_trace_id": None}, trace_id=None, cfg_snap=mgr._config
+                    )
 
         self._assert_redacted(caplog, "Post-protocol-error reconnect failed for 'bad'")
 
@@ -1211,7 +1215,9 @@ class TestCleanupLogCredentialRedaction:
                 side_effect=ConnectionError(f"reconnect boom for {self.URL}"),
             ):
                 with _pt.raises(ConnectionError, match="upstream boom"):
-                    await mgr._fetch_upstream("bad", "t", {"_trace_id": None}, trace_id=None)
+                    await mgr._fetch_upstream(
+                        "bad", "t", {"_trace_id": None}, trace_id=None, cfg_snap=mgr._config
+                    )
 
         self._assert_redacted(caplog, "Post-failure reconnect failed for 'bad'")
 
@@ -1237,7 +1243,9 @@ class TestCleanupLogCredentialRedaction:
                 side_effect=ConnectionError(f"reconnect boom for {self.URL}"),
             ):
                 with _pt.raises(ConnectionError, match="reconnect boom"):
-                    await mgr._fetch_upstream("bad", "t", {"_trace_id": None}, trace_id=None)
+                    await mgr._fetch_upstream(
+                        "bad", "t", {"_trace_id": None}, trace_id=None, cfg_snap=mgr._config
+                    )
 
         self._assert_redacted(caplog, "Reconnect to 'bad' failed")
 

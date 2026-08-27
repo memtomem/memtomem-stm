@@ -44,6 +44,7 @@ class TestInMemoryPendingStore:
 
         assert store.get("selective") is None
         assert store.get("progressive") is not None
+
     def test_put_and_get(self):
         store = InMemoryPendingStore()
         sel = _make_selection()
@@ -452,7 +453,9 @@ class TestReadMoreRestartRecovery:
         mgr1, sel = _sqlite_manager(tmp_path)
         prog_cfg = ProgressiveConfig(chunk_size=40)
         text = "First chunk content. " * 20
-        first = mgr1._apply_progressive(text, prog_cfg, "srv", "some_tool", sel)
+        first = mgr1._apply_progressive(
+            text, prog_cfg, "srv", "some_tool", sel, cfg_snap=mgr1._config
+        )
         # Recover the key from the footer.
         import re
 
@@ -497,7 +500,9 @@ class TestReadMoreRestartRecovery:
         prog_cfg = ProgressiveConfig(chunk_size=40)
         text = "In memory chunk. " * 20
         # Write WITHOUT sel_cfg → builds/caches an in-memory store.
-        first = mgr._apply_progressive(text, prog_cfg, "srv", "some_tool", None)
+        first = mgr._apply_progressive(
+            text, prog_cfg, "srv", "some_tool", None, cfg_snap=mgr._config
+        )
         import re
 
         m = re.search(r'key="([0-9a-f]{16})"', first)
@@ -573,7 +578,9 @@ class TestMultiPathRecovery:
 
         mgr1, _sel_a, sel_b = _two_store_manager(tmp_path)
         text = "Second store chunk. " * 20
-        first = mgr1._apply_progressive(text, ProgressiveConfig(chunk_size=40), "b", "tool", sel_b)
+        first = mgr1._apply_progressive(
+            text, ProgressiveConfig(chunk_size=40), "b", "tool", sel_b, cfg_snap=mgr1._config
+        )
         m = re.search(r'key="([0-9a-f]{16})"', first)
         assert m is not None, first
         key = m.group(1)
@@ -613,7 +620,7 @@ class TestMultiPathRecovery:
         writer, _sa, sel_b = _two_store_manager(tmp_path)
         text = "Second store progressive. " * 20
         first = writer._apply_progressive(
-            text, ProgressiveConfig(chunk_size=40), "b", "tool", sel_b
+            text, ProgressiveConfig(chunk_size=40), "b", "tool", sel_b, cfg_snap=writer._config
         )
         key = re.search(r'key="([0-9a-f]{16})"', first).group(1)
         writer._progressive_store.close()
@@ -644,7 +651,9 @@ class TestStoreLifecycleCleanup:
 
         mgr, sel = _sqlite_manager(tmp_path)
         mgr.select_chunks("k1", ["A"])  # opens a SQLite-backed selective compressor
-        mgr._apply_progressive("y " * 50, ProgressiveConfig(chunk_size=40), "srv", "t", sel)
+        mgr._apply_progressive(
+            "y " * 50, ProgressiveConfig(chunk_size=40), "srv", "t", sel, cfg_snap=mgr._config
+        )
         sel_comp = mgr._selective_compressor
         prog = mgr._progressive_store
         assert sel_comp is not None and prog is not None

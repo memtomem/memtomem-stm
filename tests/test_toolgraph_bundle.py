@@ -43,6 +43,9 @@ from memtomem_stm.proxy.toolgraph_bundle import (
 from memtomem_stm.cli.proxy import cli
 from memtomem_stm.cli import proxy as proxy_cli
 from memtomem_stm.proxy import manager as manager_mod
+from helpers import count_loader_reads
+
+import logging
 
 
 def _tool(name: str = "read", *, description: str = "Read data") -> SimpleNamespace:
@@ -491,6 +494,189 @@ async def test_explore_bundle_rejection_is_non_enforcing(tmp_path):
     assert [item.original_name for item in manager.get_proxy_tools()] == ["read"]
     assert await manager.call_tool("srv", "read", {}) == "ok"
     assert manager.get_toolgraph_status()["would_block_calls"] == 0
+
+
+@pytest.mark.asyncio
+async def test_refresh_failure_under_strict_denies_the_call(tmp_path):
+    """A refresh failure under strict withholds everything, and the call-time
+    verdict must act on it.
+
+    ``_reject_toolgraph_bundle`` records ``_toolgraph_withhold_all`` from LIVE
+    config; ``_enforce_toolgraph_call_policy`` must take its strict/review
+    verdict from the same place. Splitting them across two generations (#871
+    threaded a request snapshot in here for one revision) lets a request whose
+    pinned profile says ``review`` walk past a withhold the live ``strict``
+    profile had just recorded — the enforcement path allowing a call while its
+    own state says withhold-everything.
+    """
+    manager, path, tool = _manager(tmp_path, profile=ExposureProfile.STRICT)
+    _write_bundle(path, _bundle(tool, profile="strict"))
+    manager._refresh_toolgraph_bundle(force=True, startup=True)
+
+    path.unlink()  # next refresh fails
+
+    with pytest.raises(Exception) as excinfo:
+        manager._enforce_toolgraph_call_policy("srv", tool.name)
+    assert "Policy denied" in str(excinfo.value)
+    assert manager._toolgraph_withhold_all is not None
+    assert manager._toolgraph_degraded is True
+
+
+@pytest.mark.asyncio
+async def test_start_threads_one_generation_into_the_bundle_refresh(tmp_path):
+    """``start()`` decides enablement, source AND refresh on ONE read.
+
+    The reload is armed at the exact moment that matters: the gate has already
+    read ``enabled``/``source`` and chosen the bundle path, and the very next
+    loader read — the one the refresh would take for itself — returns a
+    generation whose source is ``stdio``. A refresh reading live then returns
+    at its own source gate and adopts NOTHING, leaving a strict profile with
+    enforcement enabled and no verdict: worse than either branch alone, and
+    silent. Threading the gate's own read down is what makes that unreachable.
+    """
+    manager, path, tool = _manager(tmp_path, profile=ExposureProfile.STRICT)
+    _write_bundle(path, _bundle(tool, profile="strict"))
+
+    bundle_cfg = manager._config
+    stdio_cfg = bundle_cfg.model_copy(
+        update={"toolgraph": bundle_cfg.toolgraph.model_copy(update={"source": "stdio"})}
+    )
+    armed = [False]
+
+    def gated_get():
+        return stdio_cfg if armed[0] else bundle_cfg
+
+    manager._config_loader.get = gated_get
+
+    real_refresh = manager._refresh_toolgraph_bundle
+
+    def spy_refresh(**kwargs):
+        # The gate has chosen bundle; everything read from here on says stdio.
+        armed[0] = True
+        return real_refresh(**kwargs)
+
+    manager._refresh_toolgraph_bundle = spy_refresh
+
+    consulted: list[object] = []
+
+    async def spy_consult(cfg=None):
+        consulted.append(cfg)
+
+    manager._consult_toolgraph = spy_consult
+
+    await manager.start()
+
+    assert consulted == [], "the gate chose bundle; the stdio consult must not have run"
+    assert manager._toolgraph_policy_snapshot is not None, (
+        "the refresh returned without adopting — it read a generation the gate "
+        "that selected it never saw"
+    )
+    assert manager._toolgraph_degraded is False
+
+
+@pytest.mark.asyncio
+async def test_bundle_mode_loader_read_counts(tmp_path):
+    """#871 read-count ceiling with bundle enforcement ON.
+
+    The per-request snapshot work advertises 2 reads in steady state, but that
+    figure is measured with Toolgraph DISABLED. Bundle mode is excluded from
+    the request snapshot — enforcement decides on live config — so it needs its
+    own ceiling, pinned here rather than inferred from the disabled-path number.
+
+    Enforcement takes ONE live read and threads it through the refresh, the
+    rejection and the verdict, so bundle mode now costs the same 2 reads as the
+    disabled path (request snapshot + enforcement's own). Letting each of those
+    steps read for itself is what made this 5.
+    """
+    manager, path, tool = _manager(tmp_path, profile=ExposureProfile.STRICT)
+    _write_bundle(path, _bundle(tool, profile="strict"))
+    manager._call_tool_guarded = AsyncMock(return_value=("ok", False))
+
+    calls = count_loader_reads(manager)
+
+    await manager.call_tool("srv", tool.name, {})
+    # request snapshot + enforcement's single live read (adoption included)
+    assert calls[0] == 2, f"bundle adoption: expected 2 loader reads, got {calls[0]}"
+
+    calls[0] = 0
+    await manager.call_tool("srv", tool.name, {})
+    assert calls[0] == 2, f"bundle steady state: expected 2 loader reads, got {calls[0]}"
+
+
+@pytest.mark.asyncio
+async def test_enforcement_verdict_agrees_with_the_state_it_records(tmp_path, caplog):
+    """A reload landing mid-enforcement must not let the verdict and the
+    withhold state it consults come from two different profiles.
+
+    The failure this pins is one-directional and silent: ``review`` pinned at
+    the top of enforcement, ``strict`` live by the time the refresh fails, so
+    ``_reject_toolgraph_bundle`` records withhold-everything while the verdict
+    reads the pinned ``review`` and only warns — the call is ALLOWED by a path
+    whose own state says withhold. The loader here hands out a different
+    generation on every read, which is the strongest form of that race: any
+    step that takes its own read gets a profile no other step saw.
+    """
+    manager, path, tool = _manager(tmp_path, profile=ExposureProfile.REVIEW)
+    _write_bundle(path, _bundle(tool, profile="review"))
+    manager._refresh_toolgraph_bundle(force=True, startup=True)
+    path.unlink()  # the next refresh fails
+
+    review_cfg = manager._config
+    strict_cfg = review_cfg.model_copy(
+        update={"exposure": ExposureConfig(profile=ExposureProfile.STRICT)}
+    )
+    reads = [0]
+
+    def flipping_get():
+        # First read: review. Every later read in the same decision: strict.
+        reads[0] += 1
+        return review_cfg if reads[0] == 1 else strict_cfg
+
+    manager._config_loader.get = flipping_get
+
+    denied = False
+    with caplog.at_level(logging.WARNING):
+        try:
+            manager._enforce_toolgraph_call_policy("srv", tool.name)
+        except ToolError:
+            denied = True
+
+    # One read means no step could have seen a profile another step did not.
+    assert reads[0] == 1, f"enforcement took {reads[0]} reads; the decision can split"
+    assert manager._toolgraph_degraded is True, "the refresh must still have failed"
+    # Every outcome named, so the test cannot pass by taking a third path:
+    # the whole decision ran as REVIEW, which records no withhold and warns.
+    assert manager._toolgraph_withhold_all is None, (
+        "the rejection recorded strict's withhold while the verdict read review"
+    )
+    assert denied is False, "the verdict denied under a profile the rejection never used"
+    assert any("reload rejected" in r.getMessage() for r in caplog.records), (
+        "the rejection did not run at all; the test proves nothing"
+    )
+
+
+def test_enforcement_threads_one_generation_through_the_refresh():
+    """Source-level companion to the two tests above.
+
+    ``cfg_snap`` (a snapshot pinned before the upstream call) must never reach
+    this path — that is the split #871 originally introduced. The refresh and
+    the rejection take ``cfg_live`` instead: the caller's own live read, handed
+    down so one decision cannot straddle a reload.
+    """
+    import inspect
+
+    from memtomem_stm.proxy.manager import ProxyManager
+
+    src = inspect.getsource(ProxyManager._enforce_toolgraph_call_policy)
+    assert "cfg_snap" not in src, "enforcement must not evaluate a pinned profile"
+    # Shape only — the behavior is pinned by the execution test above; this
+    # catches a future edit that reintroduces an independent read here.
+    assert src.count("self._config") == 1, (
+        "enforcement must take exactly one live read and thread it down"
+    )
+    for name in ("_refresh_toolgraph_bundle", "_reject_toolgraph_bundle"):
+        method_src = inspect.getsource(getattr(ProxyManager, name))
+        assert "cfg_snap" not in method_src, f"{name} feeds persistent state; must read live"
 
 
 @pytest.mark.asyncio

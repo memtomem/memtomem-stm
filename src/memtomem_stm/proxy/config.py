@@ -2576,6 +2576,26 @@ class ProxyConfigLoader:
         except OSError:
             self._mtime = -1.0
 
+    @property
+    def current(self) -> ProxyConfig | None:
+        """The last config this loader SEEDED or successfully LOADED, no stat().
+
+        Identity ("is the snapshot I pinned still the newest generation?") is
+        the only question this answers, and answering it must not itself be a
+        filesystem read — the callers are the ones avoiding those (#871).
+
+        Deliberately NOT "the last object ``get()`` returned": the unseeded
+        fallbacks (missing file, unparseable file) build a config per call and
+        do not record it, because recording one would have to advance state
+        the parse-failure retry contract depends on staying unadvanced. Those
+        loaders answer ``None`` here even after handing a config out, which
+        reads as "no generation to compare against" — the safe answer for an
+        identity check, since a caller that cannot establish staleness must
+        not act as if it had. ``ProxyManager`` seeds in ``__init__``, so its
+        loader always has one.
+        """
+        return self._cached
+
     def get(self) -> ProxyConfig:
         try:
             mtime = self._path.stat().st_mtime

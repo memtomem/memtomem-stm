@@ -639,6 +639,7 @@ class TestManagerPassesContextQuery:
                 "server",
                 "tool",
                 context_query="test query",
+                cfg_snap=mgr._config,
             )
             mock.assert_called_once()
             _, kwargs = mock.call_args
@@ -671,6 +672,7 @@ class TestManagerPassesContextQuery:
                 "server",
                 "tool",
                 context_query="section A query",
+                cfg_snap=mgr._config,
             )
             mock.assert_called_once()
             _, kwargs = mock.call_args

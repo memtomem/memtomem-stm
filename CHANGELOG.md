@@ -225,6 +225,87 @@ changes inline only. See the deprecation policy in
 
 ### Changed
 
+- **One config snapshot per proxied request** (#889, closes #871).
+  `ProxyManager._config` is a property over the hot-reload loader, so each
+  textual read cost a `stat()` and two reads within one call could land on
+  either side of a reload. The existing per-request `cfg_snap` pin moved up
+  into `call_tool`, and now reaches the relevance ranker, the cache key, and
+  every pipeline stage. Measured over a SELECTIVE-plus-cache configuration, a
+  steady-state request with Toolgraph off went from 6 loader reads to 2 — the
+  request snapshot plus one live read in the Toolgraph enforcement gate. Bundle
+  enforcement costs the same 2, adoption included: the gate takes ONE live read
+  and threads it through the refresh, the rejection and the verdict, so that
+  whole decision is one generation rather than five reads that could disagree.
+  The advertisement build runs on one generation for the same reason, and so
+  does startup: `start()` read `toolgraph.enabled` and `toolgraph.source`
+  separately with the refresh taking a third read of its own, so a reload
+  landing between them could enable a strict profile and then adopt nothing at
+  all — enforcement on, no verdict, silently.
+
+  The split is by lifetime: values scoped to one call ride the snapshot, while
+  persistent state whose contributing config is NOT fully represented in its
+  rebuild key keeps reading live — the selective compressor's scorer (which
+  rebuild-keys only on the selective block), the never-rebuilt fact extractor,
+  and the Toolgraph bind maps. A snapshot pinned before the upstream call would
+  freeze the pre-edit generation there for every later call. Caches keyed on
+  exactly the config that built them, like the LLM compressor, are safe either
+  way. Toolgraph enforcement is excluded for a related reason: its verdict must
+  agree with the withhold state the reject path derives from live config, and
+  evaluating it against a pinned profile lets a request walk past a withhold
+  that state had just recorded.
+
+  Shared components that OUTLIVE the request need their own rule. The relevance
+  scorer is written only by the caller holding the newest generation: a request
+  whose pin has been superseded still gets a scorer built from its own config
+  but does not publish it, so interleaved requests cannot rebuild that
+  singleton backward.
+
+  The selective compressor and the progressive store need a stronger one,
+  because they hold the chunks behind every outstanding `stm_proxy_read_more`
+  and `stm_proxy_select_chunks` key: every request now works on the store of
+  the NEWEST generation, so a rebuild is always forward. Both directions were
+  wrong on their own. Letting a superseded pin publish its own config replaced
+  a live store and stranded keys the client already held. Merely reusing
+  whatever was cached was no better: when that is an older generation's store,
+  the request mints its key there and the next live request closes it, so the
+  key is returned and then reports "not found or expired". Store-wide eviction
+  is still refused to a superseded pin, which carries a policy that could
+  delete the current generation's live keys.
+
+  This covers the request that DECIDES which store to use. It does not close a
+  narrower pre-existing race: a SELECTIVE/HYBRID compress runs off-thread while
+  holding its compressor pinned (`begin_use`, which defers the retired
+  instance's `close`), so a config change landing mid-compress lets that worker
+  finish and write its key into a store `select_chunks` no longer consults, and
+  lets its own `_evict` apply a superseded `max_pending`/TTL to a shared SQLite
+  path. That predates this work — the pin and the deferred close are unchanged
+  — and closing it needs retired stores to stay reachable until their keys
+  expire, the same explicit-lease lifecycle #890 carries for the fact
+  extractor. Tracked as #898 rather than smuggled in here.
+
+  A request stays on the 2-read baseline even when it constructs the selective
+  compressor: the build publishes under one resolved generation and takes its
+  scorer from that same object, so the extra read is paid only in the stale
+  window. Only the fact extractor still costs one of its own, since it is built
+  from live config by design and rides no publication generation (3 cold, 2
+  once warm). **Behavior change**:
+  for per-request decisions — including `mms surfacing <server> off` — a config
+  edit landing while a request is in flight now applies from the next request
+  instead of taking effect partway through the pipeline. Long-lived
+  construction and Toolgraph bundle enforcement are the stated exceptions and
+  still consume live config during that same request. Hot reload stays
+  restart-free for those per-request decisions; the pre-existing exception is
+  the fact extractor, which is built once and never rebuilt, so a later
+  `extraction` edit needs a restart (#890, unchanged here).
+
+  One loader change rides along because the generation guards need it:
+  `ProxyConfigLoader` gained a `current` accessor that answers "is this pin
+  still the newest generation" without a `stat()`. It reports the last config
+  the loader SEEDED or successfully LOADED — deliberately not "the last object
+  `get()` returned", since the unseeded fallbacks build one per call without
+  recording it, and `None` then reads as "no generation to compare against",
+  the safe answer for an identity check.
+
 - **Environment-override warnings now name the variables by measurement
   instead of inference** (#844, closes #843). Provenance was reconstructed
   after the overlay resolved, which could not be checked against anything; a

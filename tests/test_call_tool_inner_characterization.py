@@ -45,20 +45,12 @@ from memtomem_stm.proxy.config import (
     ProxyConfig,
     UpstreamServerConfig,
 )
-from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
-from memtomem_stm.proxy.metrics import TokenTracker
+from memtomem_stm.proxy.manager import ProxyManager
 from memtomem_stm.proxy.metrics_store import MetricsStore
+from helpers import FakeSurfacingEngine, fake_tool_result, wire_proxy_manager
 
 
 # ── fixtures / helpers ───────────────────────────────────────────────────
-
-
-def _text_content(text: str):
-    return SimpleNamespace(type="text", text=text)
-
-
-def _result(text: str, *, is_error: bool = False):
-    return SimpleNamespace(content=[_text_content(text)], is_error=is_error)
 
 
 def _build_mgr(
@@ -76,8 +68,6 @@ def _build_mgr(
     """ProxyManager wired to a real MetricsStore (and optionally a real
     ProxyCache) with a mocked upstream session — the same seam the existing
     pipeline tests use."""
-    store = MetricsStore(tmp_path / "metrics.db")
-    store.initialize()
     server_cfg = UpstreamServerConfig(
         prefix="test",
         compression=compression,
@@ -96,16 +86,13 @@ def _build_mgr(
     if extraction is not None:
         cfg_kwargs["extraction"] = extraction
     proxy_cfg = ProxyConfig(**cfg_kwargs)
-    mgr = ProxyManager(proxy_cfg, TokenTracker(metrics_store=store), index_engine=index_engine)
-    mgr._connections["srv"] = UpstreamConnection(
-        name="srv", config=server_cfg, session=AsyncMock(), tools=[]
+    return wire_proxy_manager(
+        proxy_cfg,
+        server_cfg,
+        tmp_path,
+        index_engine=index_engine,
+        with_cache=with_cache,
     )
-    cache: ProxyCache | None = None
-    if with_cache:
-        cache = ProxyCache(tmp_path / "cache.db", max_entries=100)
-        cache.initialize()
-        mgr._cache = cache
-    return mgr, store, cache
 
 
 @pytest.fixture
@@ -144,34 +131,6 @@ def _row_count(store: MetricsStore) -> int:
     return store._db.execute("SELECT COUNT(*) FROM proxy_metrics").fetchone()[0]
 
 
-class _FakeSurfacingEngine:
-    """Minimal surfacing engine: the manager only reads ``injection_mode`` /
-    ``observability`` and awaits ``surface(...)``. ``surface`` APPENDS a suffix
-    so a progressive first chunk's read-more footer survives — a replacement
-    fake could report success while silently breaking the progressive protocol.
-    """
-
-    def __init__(self, mode: str, *, suffix: str = " [mem]", raises: Exception | None = None):
-        self.injection_mode = mode
-        self.observability = None
-        self._suffix = suffix
-        self._raises = raises
-
-    async def surface(
-        self,
-        *,
-        server: str,
-        tool: str,
-        arguments: dict,
-        response_text: str,
-        trace_id=None,
-        context_query=None,
-    ) -> str:
-        if self._raises is not None:
-            raise self._raises
-        return response_text + self._suffix
-
-
 # ── R1: compressed_chars differs by branch ───────────────────────────────
 
 
@@ -183,7 +142,7 @@ class TestCompressedCharsDualValue:
             max_result_chars=500,
             min_retention=0.0,  # disable the ratio-guard ladder
         )
-        mgr._connections["srv"].session.call_tool.return_value = _result("word " * 1000)
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result("word " * 1000)
         # No surfacing engine and no index → the returned value IS `compressed`.
         result = await mgr.call_tool("srv", "tool", {})
         row = _latest(store, "compressed_chars", "cleaned_chars", "compression_strategy")
@@ -200,7 +159,7 @@ class TestCompressedCharsDualValue:
         # length, not merely compared to each other.
         mgr._clean_content = lambda text, cfg: text
         text = "content paragraph. " * 200  # 3800 chars, single line → no cleaning collapse
-        mgr._connections["srv"].session.call_tool.return_value = _result(text)
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result(text)
         result = await mgr.call_tool("srv", "tool", {})
         assert "stm_proxy_read_more" in result
         row = _latest(store, "compressed_chars", "cleaned_chars", "compression_strategy")
@@ -222,14 +181,16 @@ class TestCacheStoresPreSurfacing:
         mgr, store, cache = make_mgr(
             compression=CompressionStrategy.TRUNCATE, min_retention=0.0, with_cache=True
         )
-        mgr._connections["srv"].session.call_tool.return_value = _result(
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result(
             "CLEANED-SOURCE-TEXT " * 50
         )
 
         async def fake_compress(*args, **kwargs):
             return "COMPRESSED-SENTINEL", None
 
-        async def fake_surface(server, tool, arguments, text, *, trace_id=None, context_query=None):
+        async def fake_surface(
+            server, tool, arguments, text, *, trace_id=None, context_query=None, cfg_snap=None
+        ):
             return text + " [[SURFACED]]"
 
         mgr._apply_compression = fake_compress
@@ -247,7 +208,7 @@ class TestCacheStoresPreSurfacing:
 
     async def test_cache_key_args_exclude_trace_id(self, make_mgr):
         mgr, store, cache = make_mgr(with_cache=True)
-        mgr._connections["srv"].session.call_tool.return_value = _result("payload")
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result("payload")
 
         captured: dict = {}
         real_set = cache.set
@@ -271,7 +232,7 @@ class TestArgsRouting:
     async def test_upstream_and_surfacing_get_mutated_args_cache_gets_snapshot(self, make_mgr):
         mgr, store, cache = make_mgr(with_cache=True)
         session = mgr._connections["srv"].session
-        session.call_tool.return_value = _result("data")
+        session.call_tool.return_value = fake_tool_result("data")
 
         surf_spy = AsyncMock(wraps=mgr._apply_surfacing)
         mgr._apply_surfacing = surf_spy
@@ -303,7 +264,7 @@ class TestArgsRouting:
             auto_index=AutoIndexConfig(enabled=True, background=False, min_chars=1),
             extraction=ExtractionConfig(enabled=True, background=False, min_response_chars=1),
         )
-        mgr._connections["srv"].session.call_tool.return_value = _result("some upstream text body")
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result("some upstream text body")
 
         captured: dict = {}
 
@@ -338,7 +299,7 @@ class TestSurfacingHelperSelection:
 
     async def test_non_progressive_uses_plain_surfacing(self, make_mgr):
         mgr, store, _ = make_mgr(compression=CompressionStrategy.TRUNCATE)
-        mgr._connections["srv"].session.call_tool.return_value = _result("small text")
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result("small text")
         plain, prog = self._spy_both(mgr)
         await mgr.call_tool("srv", "tool", {})
         plain.assert_awaited_once()
@@ -349,7 +310,7 @@ class TestSurfacingHelperSelection:
             compression=CompressionStrategy.PROGRESSIVE,
             progressive=ProgressiveConfig(chunk_size=500),
         )
-        mgr._connections["srv"].session.call_tool.return_value = _result(
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result(
             "content paragraph. " * 200
         )
         plain, prog = self._spy_both(mgr)
@@ -364,7 +325,7 @@ class TestSurfacingHelperSelection:
             max_result_chars=500,
             progressive=ProgressiveConfig(chunk_size=500),
         )
-        mgr._connections["srv"].session.call_tool.return_value = _result(
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result(
             "content paragraph. " * 800  # ~15k → truncate to 500 violates the floor
         )
         plain, prog = self._spy_both(mgr)
@@ -389,8 +350,8 @@ class TestSurfacingOnProgressiveMetric:
 
     async def test_append_mode_records_ok_true(self, make_mgr):
         mgr, store, _ = self._progressive_mgr(make_mgr)
-        mgr._surfacing_engine = _FakeSurfacingEngine("append", suffix=" [mem]")
-        mgr._connections["srv"].session.call_tool.return_value = _result(
+        mgr._surfacing_engine = FakeSurfacingEngine("append", suffix=" [mem]")
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result(
             "content paragraph. " * 200
         )
         result = await mgr.call_tool("srv", "tool", {})
@@ -404,8 +365,8 @@ class TestSurfacingOnProgressiveMetric:
 
     async def test_prepend_mode_records_ok_none(self, make_mgr):
         mgr, store, _ = self._progressive_mgr(make_mgr)
-        mgr._surfacing_engine = _FakeSurfacingEngine("prepend")
-        mgr._connections["srv"].session.call_tool.return_value = _result(
+        mgr._surfacing_engine = FakeSurfacingEngine("prepend")
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result(
             "content paragraph. " * 200
         )
         result = await mgr.call_tool("srv", "tool", {})
@@ -417,8 +378,8 @@ class TestSurfacingOnProgressiveMetric:
 
     async def test_surface_exception_records_ok_false_and_error(self, make_mgr):
         mgr, store, _ = self._progressive_mgr(make_mgr)
-        mgr._surfacing_engine = _FakeSurfacingEngine("append", raises=RuntimeError("boom"))
-        mgr._connections["srv"].session.call_tool.return_value = _result(
+        mgr._surfacing_engine = FakeSurfacingEngine("append", raises=RuntimeError("boom"))
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result(
             "content paragraph. " * 200
         )
         result = await mgr.call_tool("srv", "tool", {})
@@ -429,7 +390,7 @@ class TestSurfacingOnProgressiveMetric:
 
     async def test_non_progressive_records_ok_none(self, make_mgr):
         mgr, store, _ = make_mgr(compression=CompressionStrategy.TRUNCATE)
-        mgr._connections["srv"].session.call_tool.return_value = _result("small text")
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result("small text")
         await mgr.call_tool("srv", "tool", {})
         row = _latest(store, "surfacing_on_progressive_ok")
         assert row["surfacing_on_progressive_ok"] is None
@@ -489,7 +450,7 @@ class TestSourceResponseCharsForwarding:
         engine = _CapturingSurfacingEngine()
         mgr._surfacing_engine = engine
         text = "word " * 1000  # 5000 chars, TRUNCATEd well below 500
-        mgr._connections["srv"].session.call_tool.return_value = _result(text)
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result(text)
 
         result = await mgr.call_tool("srv", "tool", {})
 
@@ -512,7 +473,7 @@ class TestSourceResponseCharsForwarding:
         engine = _CapturingSurfacingEngine()
         mgr._surfacing_engine = engine
         text = "content paragraph. " * 200  # 3800 chars, first chunk = 500
-        mgr._connections["srv"].session.call_tool.return_value = _result(text)
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result(text)
 
         result = await mgr.call_tool("srv", "tool", {})
 
@@ -568,7 +529,7 @@ class TestScorerFallbackRecorded:
         mgr, store, _ = make_mgr(compression=CompressionStrategy.TRUNCATE, min_retention=0.0)
         # ``_relevance_scorer`` is a hot-reload property over this backing field.
         mgr._relevance_scorer_instance = SimpleNamespace(fallback_count=0)
-        mgr._connections["srv"].session.call_tool.return_value = _result("some text")
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result("some text")
 
         async def bump(*args, **kwargs):
             mgr._relevance_scorer_instance.fallback_count += 1
@@ -582,7 +543,7 @@ class TestScorerFallbackRecorded:
     async def test_false_when_scorer_count_stable(self, make_mgr):
         mgr, store, _ = make_mgr(compression=CompressionStrategy.TRUNCATE, min_retention=0.0)
         mgr._relevance_scorer_instance = SimpleNamespace(fallback_count=0)
-        mgr._connections["srv"].session.call_tool.return_value = _result("some text")
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result("some text")
 
         async def no_bump(*args, **kwargs):
             return "compressed-out", None
@@ -614,7 +575,7 @@ class TestUpstreamSurrogateScrub:
         from mcp.types import TextContent
 
         mgr, _, _ = make_mgr(compression=CompressionStrategy.NONE)
-        mgr._connections["srv"].session.call_tool.return_value = _result(
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result(
             f"before{self.SURROGATE}after"
         )
         result = await mgr.call_tool("srv", "tool", {})
@@ -627,7 +588,7 @@ class TestUpstreamSurrogateScrub:
     async def test_clean_text_is_returned_unchanged(self, make_mgr):
         mgr, _, _ = make_mgr(compression=CompressionStrategy.NONE)
         payload = "ordinary 서버 🚀 text"
-        mgr._connections["srv"].session.call_tool.return_value = _result(payload)
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result(payload)
         result = await mgr.call_tool("srv", "tool", {})
 
         assert (result if isinstance(result, str) else result.content[0].text) == payload
@@ -637,7 +598,7 @@ class TestUpstreamSurrogateScrub:
         the same model, so escaping only ``content`` would move the raise."""
         mgr, _, _ = make_mgr(compression=CompressionStrategy.NONE)
         upstream = SimpleNamespace(
-            content=[_text_content("plain")],
+            content=[SimpleNamespace(type="text", text="plain")],
             is_error=False,
             structured_content={f"k{self.SURROGATE}": f"v{self.SURROGATE}"},
             meta={"note": f"m{self.SURROGATE}"},
@@ -654,7 +615,7 @@ class TestUpstreamSurrogateScrub:
         it back as an error result, so a scrub placed inside ``_shape_response``
         would miss it — which is why this one is placed before shaping."""
         mgr, _, _ = make_mgr(compression=CompressionStrategy.NONE)
-        mgr._connections["srv"].session.call_tool.return_value = _result(
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result(
             f"boom{self.SURROGATE}", is_error=True
         )
         result = await mgr.call_tool("srv", "tool", {})

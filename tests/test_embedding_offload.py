@@ -192,10 +192,17 @@ def _selective_stub(compressor: object, lock_timeout: float = 5.0) -> SimpleName
     stub = SimpleNamespace(
         _selective_lock=asyncio.Lock(),
         _config=SimpleNamespace(lock_timeout_seconds=lock_timeout),
+        # ``_apply_compression`` asks whether the caller's pin is still the
+        # newest generation before it fills a shared slot; ``current`` is None
+        # here, which reads as "no generation to compare against" and leaves
+        # the passed selective config alone.
+        _config_loader=SimpleNamespace(current=None),
         _selective_compressor=compressor,
         _selective_compressor_cfg=None,
     )
     stub._compress_maybe_offthread = MethodType(ProxyManager._compress_maybe_offthread, stub)
+    stub._pin_is_live_generation = MethodType(ProxyManager._pin_is_live_generation, stub)
+    stub._publication_pair = MethodType(ProxyManager._publication_pair, stub)
     return stub
 
 
@@ -211,6 +218,7 @@ def _selective_call(stub: SimpleNamespace, text: str = "z" * 300):
         "srv",
         "tool",
         context_query="q",
+        cfg_snap=stub._config,
     )
 
 

@@ -507,26 +507,42 @@ class TestFeedbackTrackerPosition:
 
 
 class TestConfigSnapshot:
-    def test_call_tool_inner_uses_snapshot(self):
-        """Verify _call_tool_inner references cfg_snap, not self._config."""
+    def _live_reads(self, method) -> list[str]:
+        import inspect
+
+        return [
+            line.strip()
+            for line in inspect.getsource(method).split("\n")
+            if "self._config" in line
+            and "self._config_loader" not in line
+            and not line.strip().startswith("#")
+        ]
+
+    def test_call_tool_inner_takes_no_live_read(self):
+        """``_call_tool_inner`` runs entirely on the caller's snapshot.
+
+        It used to re-pin one for direct callers; the parameter is required
+        now, so any ``self._config`` here is a stage that escaped the snapshot.
+        """
+        from memtomem_stm.proxy.manager import ProxyManager
+
+        reads = self._live_reads(ProxyManager._call_tool_inner)
+        assert reads == [], f"Found live config reads inside the request: {reads}"
+
+    def test_call_tool_pins_the_request_snapshot(self):
+        """#871 hoisted the pin into ``call_tool`` so the policy gate and the
+        ranker share the guarded section's generation. Everything downstream
+        takes it as a required argument rather than re-pinning."""
         import inspect
 
         from memtomem_stm.proxy.manager import ProxyManager
 
-        source = inspect.getsource(ProxyManager._call_tool_inner)
-        # After the snapshot line, self._config should not appear
-        snapshot_line = "cfg_snap = self._config"
-        assert snapshot_line in source
+        outer = inspect.getsource(ProxyManager.call_tool)
+        assert "cfg_snap = self._config" in outer
+        assert "cfg_snap=cfg_snap" in outer
 
-        # Count self._config references after the snapshot line
-        after_snapshot = source.split(snapshot_line, 1)[1]
-        # self._config should only appear in comments or not at all
-        config_refs = [
-            line.strip()
-            for line in after_snapshot.split("\n")
-            if "self._config" in line and not line.strip().startswith("#")
-        ]
-        assert len(config_refs) == 0, f"Found self._config after snapshot: {config_refs}"
+        reads = self._live_reads(ProxyManager._call_tool_guarded)
+        assert reads == [], f"the guarded section must not re-pin: {reads}"
 
 
 # ---------------------------------------------------------------------------

@@ -92,6 +92,26 @@ class TestProxyConfigLoader:
         # and now sees the same mtime → skips reload → returns stale config.
         assert loader.get().enabled is True
 
+    def test_current_reports_only_seeded_or_loaded_generations(self, tmp_path):
+        """``current`` is an identity check, so its None must mean "cannot compare".
+
+        The unseeded fallbacks build a config per call without recording it —
+        recording one would advance state the parse-failure retry depends on.
+        So a loader can hand out a config and still answer None here; that is
+        the safe answer for a staleness check, and the docstring says so.
+        """
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text("{ not valid json")
+        broken = ProxyConfigLoader(cfg_file)
+        assert broken.current is None
+        broken.get()
+        assert broken.current is None, "a per-call fallback must not pose as a generation"
+
+        time.sleep(0.05)
+        cfg_file.write_text(json.dumps({"enabled": True}))
+        loaded = broken.get()
+        assert broken.current is loaded, "a real load must be comparable by identity"
+
     def test_duplicate_prefix_reload_keeps_previous_good_config(self, tmp_path):
         """If a hot-reloaded config violates the duplicate-prefix validator,
         the loader must keep the previously cached good config rather than

@@ -53,12 +53,15 @@ class TestConfigField:
 
 class TestEnabledLookup:
     def test_reads_per_upstream_flag(self, tmp_path: Path) -> None:
-        assert _manager(tmp_path, surfacing_enabled=False)._surfacing_enabled_for("svc") is False
-        assert _manager(tmp_path, surfacing_enabled=True)._surfacing_enabled_for("svc") is True
+        off = _manager(tmp_path, surfacing_enabled=False)
+        assert off._surfacing_enabled_for("svc", cfg_snap=off._config) is False
+        on = _manager(tmp_path, surfacing_enabled=True)
+        assert on._surfacing_enabled_for("svc", cfg_snap=on._config) is True
 
     def test_unknown_server_fails_open(self, tmp_path: Path) -> None:
         # An unconfigured server must not silently lose surfacing — best-effort.
-        assert _manager(tmp_path, surfacing_enabled=False)._surfacing_enabled_for("ghost") is True
+        mgr = _manager(tmp_path, surfacing_enabled=False)
+        assert mgr._surfacing_enabled_for("ghost", cfg_snap=mgr._config) is True
 
 
 # ── ProxyManager enforcement ─────────────────────────────────────────────
@@ -67,7 +70,7 @@ class TestEnabledLookup:
 class TestApplySurfacing:
     async def test_disabled_upstream_short_circuits(self, tmp_path: Path) -> None:
         mgr = _manager(tmp_path, surfacing_enabled=False)
-        out = await mgr._apply_surfacing("svc", "lookup", {}, _LONG)
+        out = await mgr._apply_surfacing("svc", "lookup", {}, _LONG, cfg_snap=mgr._config)
         assert out == _LONG
         mgr._surfacing_engine.surface.assert_not_called()
         mgr._surfacing_engine.observability.record_skip.assert_called_once_with(
@@ -76,7 +79,7 @@ class TestApplySurfacing:
 
     async def test_enabled_upstream_surfaces(self, tmp_path: Path) -> None:
         mgr = _manager(tmp_path, surfacing_enabled=True)
-        out = await mgr._apply_surfacing("svc", "lookup", {}, _LONG)
+        out = await mgr._apply_surfacing("svc", "lookup", {}, _LONG, cfg_snap=mgr._config)
         assert out == "SURFACED"
         mgr._surfacing_engine.surface.assert_awaited_once()
         mgr._surfacing_engine.observability.record_skip.assert_not_called()
@@ -85,7 +88,9 @@ class TestApplySurfacing:
 class TestApplySurfacingProgressive:
     async def test_disabled_upstream_short_circuits(self, tmp_path: Path) -> None:
         mgr = _manager(tmp_path, surfacing_enabled=False)
-        text, ok, err = await mgr._apply_surfacing_on_progressive("svc", "lookup", {}, _LONG)
+        text, ok, err = await mgr._apply_surfacing_on_progressive(
+            "svc", "lookup", {}, _LONG, cfg_snap=mgr._config
+        )
         assert (text, ok, err) == (_LONG, None, None)
         mgr._surfacing_engine.surface.assert_not_called()
         mgr._surfacing_engine.observability.record_skip.assert_called_once_with(
@@ -94,7 +99,9 @@ class TestApplySurfacingProgressive:
 
     async def test_enabled_upstream_surfaces(self, tmp_path: Path) -> None:
         mgr = _manager(tmp_path, surfacing_enabled=True)
-        text, ok, err = await mgr._apply_surfacing_on_progressive("svc", "lookup", {}, _LONG)
+        text, ok, err = await mgr._apply_surfacing_on_progressive(
+            "svc", "lookup", {}, _LONG, cfg_snap=mgr._config
+        )
         assert text == "SURFACED"
         assert ok is True
         mgr._surfacing_engine.surface.assert_awaited_once()
