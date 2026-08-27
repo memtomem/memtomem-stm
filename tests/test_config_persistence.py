@@ -92,6 +92,27 @@ class TestProxyConfigLoader:
         # and now sees the same mtime → skips reload → returns stale config.
         assert loader.get().enabled is True
 
+    def test_unseeded_loader_with_broken_file_returns_defaults(self, tmp_path):
+        """An unseeded loader whose first load fails has no cache to fall back
+        on. It must still hand back a usable config: every caller reaches it
+        through the ``ProxyManager._config`` property and does attribute
+        access on the result, so returning None turns a config typo into an
+        AttributeError deep in the request path.
+        """
+        cfg_file = tmp_path / "stm_proxy.json"
+        cfg_file.write_text("{ not valid json")
+        loader = ProxyConfigLoader(cfg_file)
+
+        config = loader.get()
+        assert isinstance(config, ProxyConfig)
+        assert config.enabled is False  # defaults
+
+        # The parse-failure retry contract still holds: a later fix is picked
+        # up even though the failed load returned defaults.
+        time.sleep(0.05)
+        cfg_file.write_text(json.dumps({"enabled": True}))
+        assert loader.get().enabled is True
+
     def test_duplicate_prefix_reload_keeps_previous_good_config(self, tmp_path):
         """If a hot-reloaded config violates the duplicate-prefix validator,
         the loader must keep the previously cached good config rather than
