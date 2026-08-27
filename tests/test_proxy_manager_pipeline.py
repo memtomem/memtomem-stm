@@ -78,6 +78,7 @@ class TestApplyCompression:
             hybrid_cfg=None,
             server="srv",
             tool="t",
+            cfg_snap=mgr._config,
         )
         assert result == text
         assert fallback is None
@@ -95,6 +96,7 @@ class TestApplyCompression:
             hybrid_cfg=None,
             server="srv",
             tool="t",
+            cfg_snap=mgr._config,
         )
         assert len(result) <= len(text)
 
@@ -113,6 +115,7 @@ class TestApplyCompression:
                 hybrid_cfg=HybridConfig(),
                 server="srv",
                 tool="t",
+                cfg_snap=mgr._config,
             )
         assert result == "hybrid-out"
         mock_hybrid.assert_awaited_once()
@@ -130,6 +133,7 @@ class TestApplyCompression:
             hybrid_cfg=None,
             server="srv",
             tool="t",
+            cfg_snap=mgr._config,
         )
         # Selective compressor produces a TOC with a selection_key
         assert "selection_key" in result.lower() or "section" in result.lower()
@@ -147,6 +151,7 @@ class TestApplyCompression:
             hybrid_cfg=None,
             server="srv",
             tool="t",
+            cfg_snap=mgr._config,
         )
         assert fallback == "no_config"
         assert len(result) <= 200
@@ -166,6 +171,7 @@ class TestApplyCompression:
             server="srv",
             tool="t",
             context_query="find important data",
+            cfg_snap=mgr._config,
         )
         assert len(result) <= len(text)
 
@@ -199,6 +205,7 @@ class TestApplyCompression:
                 hybrid_cfg=None,
                 server="srv",
                 tool="t",
+                cfg_snap=mgr._config,
             )
         assert fallback == "privacy"
         assert len(result) <= len(text)
@@ -230,6 +237,7 @@ class TestApplyCompression:
                 hybrid_cfg=None,
                 server="srv",
                 tool="t",
+                cfg_snap=mgr._config,
             )
         assert fallback is None
         assert result == "llm-output"
@@ -263,6 +271,7 @@ class TestApplyCompression:
                 hybrid_cfg=None,
                 server="srv",
                 tool="t",
+                cfg_snap=mgr._config,
             )
         assert fallback is None
         assert result == "llm-output"
@@ -310,6 +319,7 @@ class TestLLMCompressorLifecycle:
                     hybrid_cfg=None,
                     server="srv",
                     tool="t",
+                    cfg_snap=mgr._config,
                 )
 
         mock_cls.assert_called_once_with(cfg)
@@ -338,6 +348,7 @@ class TestLLMCompressorLifecycle:
                 hybrid_cfg=None,
                 server="srv",
                 tool="t",
+                cfg_snap=mgr._config,
             )
             await mgr._apply_compression(
                 "x" * 500,
@@ -348,6 +359,7 @@ class TestLLMCompressorLifecycle:
                 hybrid_cfg=None,
                 server="srv",
                 tool="t",
+                cfg_snap=mgr._config,
             )
 
         assert mock_cls.call_count == 2
@@ -371,6 +383,7 @@ class TestLLMCompressorLifecycle:
                 hybrid_cfg=None,
                 server="srv",
                 tool="t",
+                cfg_snap=mgr._config,
             )
 
         await mgr.stop()
@@ -438,6 +451,7 @@ class TestLLMCompressorLifecycle:
                     hybrid_cfg=None,
                     server="srv",
                     tool="t",
+                    cfg_snap=mgr._config,
                 )
             )
             await first_started.wait()
@@ -454,6 +468,7 @@ class TestLLMCompressorLifecycle:
                     hybrid_cfg=None,
                     server="srv",
                     tool="t",
+                    cfg_snap=mgr._config,
                 )
             )
             for _ in range(20):
@@ -486,7 +501,7 @@ class TestApplySurfacing:
         """Without surfacing engine, text passes through unchanged."""
         mgr = _make_manager(tmp_path=tmp_path)
         mgr._surfacing_engine = None
-        result = await mgr._apply_surfacing("srv", "t", {}, "original")
+        result = await mgr._apply_surfacing("srv", "t", {}, "original", cfg_snap=mgr._config)
         assert result == "original"
 
     async def test_engine_called(self, tmp_path):
@@ -496,7 +511,9 @@ class TestApplySurfacing:
         mock_engine.surface.return_value = "surfaced text"
         mgr._surfacing_engine = mock_engine
 
-        result = await mgr._apply_surfacing("srv", "t", {"q": "x"}, "original")
+        result = await mgr._apply_surfacing(
+            "srv", "t", {"q": "x"}, "original", cfg_snap=mgr._config
+        )
 
         assert result == "surfaced text"
         mock_engine.surface.assert_awaited_once_with(
@@ -515,7 +532,7 @@ class TestApplySurfacing:
         mock_engine.surface.side_effect = RuntimeError("boom")
         mgr._surfacing_engine = mock_engine
 
-        result = await mgr._apply_surfacing("srv", "t", {}, "original")
+        result = await mgr._apply_surfacing("srv", "t", {}, "original", cfg_snap=mgr._config)
 
         assert result == "original"
         assert "Surfacing failed" in caplog.text
@@ -545,7 +562,9 @@ class TestApplySurfacingOnProgressive:
         """Without surfacing engine, returns ``(text, None, None)``."""
         mgr = _make_manager(tmp_path=tmp_path)
         mgr._surfacing_engine = None
-        text, ok, err = await mgr._apply_surfacing_on_progressive("srv", "t", {}, "original")
+        text, ok, err = await mgr._apply_surfacing_on_progressive(
+            "srv", "t", {}, "original", cfg_snap=mgr._config
+        )
         assert (text, ok, err) == ("original", None, None)
 
     async def test_append_mode_surfaces(self, tmp_path):
@@ -554,7 +573,7 @@ class TestApplySurfacingOnProgressive:
         mgr._surfacing_engine = _mock_engine_with_mode("append", surface_return="with memories")
 
         text, ok, err = await mgr._apply_surfacing_on_progressive(
-            "srv", "t", {"q": "x"}, "progressive chunk"
+            "srv", "t", {"q": "x"}, "progressive chunk", cfg_snap=mgr._config
         )
 
         assert text == "with memories"
@@ -567,7 +586,9 @@ class TestApplySurfacingOnProgressive:
         mgr = _make_manager(tmp_path=tmp_path)
         mgr._surfacing_engine = _mock_engine_with_mode("section", surface_return="w/ section")
 
-        text, ok, err = await mgr._apply_surfacing_on_progressive("srv", "t", {}, "chunk")
+        text, ok, err = await mgr._apply_surfacing_on_progressive(
+            "srv", "t", {}, "chunk", cfg_snap=mgr._config
+        )
 
         assert text == "w/ section"
         assert ok is True
@@ -581,10 +602,10 @@ class TestApplySurfacingOnProgressive:
 
         with caplog.at_level("WARNING"):
             text_a, ok_a, err_a = await mgr._apply_surfacing_on_progressive(
-                "srv", "t", {}, "first chunk"
+                "srv", "t", {}, "first chunk", cfg_snap=mgr._config
             )
             text_b, ok_b, err_b = await mgr._apply_surfacing_on_progressive(
-                "srv", "t", {}, "second chunk"
+                "srv", "t", {}, "second chunk", cfg_snap=mgr._config
             )
 
         assert (text_a, ok_a, err_a) == ("first chunk", None, None)
@@ -604,9 +625,9 @@ class TestApplySurfacingOnProgressive:
         obs = SurfacingObservability()
         mgr._surfacing_engine = _mock_engine_with_mode("prepend", observability=obs)
 
-        await mgr._apply_surfacing_on_progressive("srv", "tool_a", {}, "c1")
-        await mgr._apply_surfacing_on_progressive("srv", "tool_a", {}, "c2")
-        await mgr._apply_surfacing_on_progressive("srv", "tool_b", {}, "c3")
+        await mgr._apply_surfacing_on_progressive("srv", "tool_a", {}, "c1", cfg_snap=mgr._config)
+        await mgr._apply_surfacing_on_progressive("srv", "tool_a", {}, "c2", cfg_snap=mgr._config)
+        await mgr._apply_surfacing_on_progressive("srv", "tool_b", {}, "c3", cfg_snap=mgr._config)
 
         snap = obs.snapshot()
         assert snap["skip_reasons"]["tool_a"]["progressive_mode_conflict"] == 2
@@ -619,7 +640,9 @@ class TestApplySurfacingOnProgressive:
         mgr = _make_manager(tmp_path=tmp_path)
         mgr._surfacing_engine = _mock_engine_with_mode("prepend", observability=None)
 
-        text, ok, err = await mgr._apply_surfacing_on_progressive("srv", "t", {}, "chunk")
+        text, ok, err = await mgr._apply_surfacing_on_progressive(
+            "srv", "t", {}, "chunk", cfg_snap=mgr._config
+        )
         assert (text, ok, err) == ("chunk", None, None)
 
     async def test_engine_failure_captured_as_error(self, tmp_path, caplog):
@@ -631,7 +654,7 @@ class TestApplySurfacingOnProgressive:
         mgr._surfacing_engine = engine
 
         text, ok, err = await mgr._apply_surfacing_on_progressive(
-            "srv", "t", {}, "progressive chunk"
+            "srv", "t", {}, "progressive chunk", cfg_snap=mgr._config
         )
 
         assert text == "progressive chunk"
@@ -654,7 +677,9 @@ class TestContextQueryPlumbing:
         mock_engine.surface.return_value = "surfaced"
         mgr._surfacing_engine = mock_engine
 
-        await mgr._apply_surfacing("srv", "t", {"q": "x"}, "text", context_query="find auth")
+        await mgr._apply_surfacing(
+            "srv", "t", {"q": "x"}, "text", context_query="find auth", cfg_snap=mgr._config
+        )
 
         mock_engine.surface.assert_awaited_once_with(
             server="srv",
@@ -671,7 +696,7 @@ class TestContextQueryPlumbing:
         mgr._surfacing_engine = engine
 
         await mgr._apply_surfacing_on_progressive(
-            "srv", "t", {"q": "x"}, "chunk", context_query="find auth"
+            "srv", "t", {"q": "x"}, "chunk", context_query="find auth", cfg_snap=mgr._config
         )
 
         kwargs = engine.surface.await_args.kwargs
@@ -686,7 +711,9 @@ class TestContextQueryPlumbing:
         mgr._surfacing_engine = mock_engine
 
         args = {"path": "/x.py", "_context_query": "find auth"}
-        await mgr._on_cache_hit("cached body", "srv", "t", args, trace_id="abc")
+        await mgr._on_cache_hit(
+            "cached body", "srv", "t", args, trace_id="abc", cfg_snap=mgr._config
+        )
 
         # The cache-hit path forwards ``arguments`` as-is (without stripping)
         # so the legacy in-args branch keeps working for direct callers; the
@@ -708,7 +735,9 @@ class TestContextQueryPlumbing:
         mock_engine.surface.return_value = "ok"
         mgr._surfacing_engine = mock_engine
 
-        await mgr._on_cache_hit("body", "srv", "t", {"q": "x"}, trace_id="abc")
+        await mgr._on_cache_hit(
+            "body", "srv", "t", {"q": "x"}, trace_id="abc", cfg_snap=mgr._config
+        )
 
         assert mock_engine.surface.await_args.kwargs["context_query"] is None
 
@@ -863,6 +892,7 @@ class TestAutoIndex:
                 compression_strategy="truncate",
                 original_chars=500,
                 compressed_chars=100,
+                cfg_snap=mgr._config,
             )
 
         assert "[Indexed]" in outcome.summary
@@ -913,6 +943,7 @@ class TestAutoIndex:
                 arguments={},
                 text="Full content here",
                 agent_summary="Summary",
+                cfg_snap=mgr._config,
             )
 
         assert outcome.ok is False
@@ -1017,7 +1048,9 @@ class TestExtractAndStore:
                 )
             ),
         ):
-            await mgr._extract_and_store("srv", "t", {}, "Some long response text")
+            await mgr._extract_and_store(
+                "srv", "t", {}, "Some long response text", cfg_snap=mgr._config
+            )
 
         # index_file should NOT be called because the fact was a duplicate
         mock_indexer.index_file.assert_not_awaited()

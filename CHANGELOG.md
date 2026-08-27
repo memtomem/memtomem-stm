@@ -232,33 +232,46 @@ changes inline only. See the deprecation policy in
   into `call_tool`, and now reaches the relevance ranker, the cache key, and
   every pipeline stage. Measured over a SELECTIVE-plus-cache configuration, a
   steady-state request with Toolgraph off went from 6 loader reads to 2 — the
-  request snapshot plus one live read in the Toolgraph enforcement gate. With
-  bundle enforcement on it is 3 steady and 5 on the request that adopts a
-  bundle, since that path is deliberately live throughout.
+  request snapshot plus one live read in the Toolgraph enforcement gate. Bundle
+  enforcement costs the same 2, adoption included: the gate takes ONE live read
+  and threads it through the refresh, the rejection and the verdict, so that
+  whole decision is one generation rather than five reads that could disagree.
+  The advertisement build and the startup Toolgraph consult each run on one
+  generation for the same reason.
+
   The split is by lifetime: values scoped to one call ride the snapshot, while
   persistent state whose contributing config is NOT fully represented in its
-  rebuild key keeps reading live — the selective compressor's scorer (that
-  rebuild keys only on the selective block), the never-rebuilt fact extractor,
-  and the Toolgraph bind maps. A snapshot pinned before the upstream call
-  would freeze the pre-edit generation there for every later call. Caches
-  keyed on exactly the config that built them, like the LLM compressor, are
-  safe either way. Toolgraph enforcement
-  is excluded for a related reason: its verdict must agree with withhold state
-  the reject path derives from live config, and evaluating it against a pinned
-  profile lets a request walk past a withhold that state had just recorded. A
-  request that constructs a long-lived component pays one extra read per
+  rebuild key keeps reading live — the selective compressor's scorer (which
+  rebuild-keys only on the selective block), the never-rebuilt fact extractor,
+  and the Toolgraph bind maps. A snapshot pinned before the upstream call would
+  freeze the pre-edit generation there for every later call. Caches keyed on
+  exactly the config that built them, like the LLM compressor, are safe either
+  way. Toolgraph enforcement is excluded for a related reason: its verdict must
+  agree with the withhold state the reject path derives from live config, and
+  evaluating it against a pinned profile lets a request walk past a withhold
+  that state had just recorded.
+
+  Shared components that OUTLIVE the request are written only by the caller
+  holding the newest generation. A request whose pinned config has already been
+  superseded still gets a component built from it, but does not publish it, so
+  interleaved requests cannot rebuild a singleton backward. This covers the
+  relevance scorer, the selective compressor and the progressive store — the
+  last two hold the chunks behind every outstanding `stm_proxy_read_more` key,
+  and replacing one from a superseded generation closed a store whose keys the
+  client already had, so the next `read_more` reported them "not found or
+  expired". Store-wide eviction is likewise refused to a superseded pin, which
+  could otherwise delete the current generation's live keys.
+
+  A request that constructs a long-lived component pays one extra read per
   component (3 cold, 4 if it builds both; 2 once warm). **Behavior change**:
   for per-request decisions — including `mms surfacing <server> off` — a config
   edit landing while a request is in flight now applies from the next request
   instead of taking effect partway through the pipeline. Long-lived
   construction and Toolgraph bundle enforcement are the stated exceptions and
-  still consume live config during that same request. Hot
-  reload stays restart-free for those per-request decisions; the pre-existing
-  exception is the fact extractor, which is built once and never rebuilt, so a
-  later `extraction` edit needs a restart (#890, unchanged here). Separately,
-  an unseeded `ProxyConfigLoader` whose first load hits an unparseable file
-  now returns defaults rather than `None`; this is not reachable from the
-  request path, which always seeds the loader.
+  still consume live config during that same request. Hot reload stays
+  restart-free for those per-request decisions; the pre-existing exception is
+  the fact extractor, which is built once and never rebuilt, so a later
+  `extraction` edit needs a restart (#890, unchanged here).
 
 - **Environment-override warnings now name the variables by measurement
   instead of inference** (#844, closes #843). Provenance was reconstructed

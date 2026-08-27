@@ -116,6 +116,7 @@ class TestManagerSelectiveForwardsQuery:
             "srv",
             "tool",
             context_query="billing invoice",
+            cfg_snap=mgr._config,
         )
         assert fallback is None
         assert captured["context_query"] == "billing invoice"

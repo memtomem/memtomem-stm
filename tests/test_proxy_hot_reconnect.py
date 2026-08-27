@@ -227,7 +227,9 @@ def _ok_result(text="ok"):
 
 
 async def _fetch(mgr: ProxyManager, server: str = "srv", tool: str = "t"):
-    return await mgr._fetch_upstream(server, tool, {"_trace_id": None}, trace_id=None)
+    return await mgr._fetch_upstream(
+        server, tool, {"_trace_id": None}, trace_id=None, cfg_snap=mgr._config
+    )
 
 
 class TestConfigChangeDetection:
@@ -701,14 +703,18 @@ class TestLiveStdioReconnect:
         try:
             assert "echo" in mgr._connections, mgr._failed_servers
 
-            r1 = await mgr._fetch_upstream("echo", "greet", {"_trace_id": None}, trace_id=None)
+            r1 = await mgr._fetch_upstream(
+                "echo", "greet", {"_trace_id": None}, trace_id=None, cfg_snap=mgr._config
+            )
             assert "hello from alpha/v1" in r1.content[0].text
 
             _reseed(mgr, tmp_path, {"echo": cfg_b})
 
             # Same task as the connect: before lifecycle ownership this call
             # died with CancelledError while closing the old stack.
-            r2 = await mgr._fetch_upstream("echo", "greet", {"_trace_id": None}, trace_id=None)
+            r2 = await mgr._fetch_upstream(
+                "echo", "greet", {"_trace_id": None}, trace_id=None, cfg_snap=mgr._config
+            )
             assert "hello from beta/v2" in r2.content[0].text
 
             conn = mgr._connections["echo"]
@@ -718,7 +724,9 @@ class TestLiveStdioReconnect:
             # The swapped connection must survive further calls (scope stack
             # left consistent), including a SECOND same-task reconnect.
             _reseed(mgr, tmp_path, {"echo": cfg_a})
-            r3 = await mgr._fetch_upstream("echo", "greet", {"_trace_id": None}, trace_id=None)
+            r3 = await mgr._fetch_upstream(
+                "echo", "greet", {"_trace_id": None}, trace_id=None, cfg_snap=mgr._config
+            )
             assert "hello from alpha/v1" in r3.content[0].text
             assert mgr._connections["echo"].reconnect_generation == 2
         finally:

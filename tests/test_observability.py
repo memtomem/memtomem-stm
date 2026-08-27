@@ -233,7 +233,9 @@ class TestProgressiveTraceIdPropagation:
         pcfg = ProgressiveConfig(chunk_size=100)
         text = "x" * 5000
 
-        rendered = mgr._apply_progressive(text, pcfg, "srv", "my-tool", trace_id="tid-deadbeef")
+        rendered = mgr._apply_progressive(
+            text, pcfg, "srv", "my-tool", trace_id="tid-deadbeef", cfg_snap=mgr._config
+        )
         key = _extract_key(rendered)
 
         resp = mgr._get_progressive_store().get(key)
@@ -247,7 +249,9 @@ class TestProgressiveTraceIdPropagation:
         pcfg = ProgressiveConfig(chunk_size=100)
         text = "x" * 5000
 
-        rendered = mgr._apply_progressive(text, pcfg, "srv", "my-tool", trace_id="tid-deadbeef")
+        rendered = mgr._apply_progressive(
+            text, pcfg, "srv", "my-tool", trace_id="tid-deadbeef", cfg_snap=mgr._config
+        )
         key = _extract_key(rendered)
 
         recorded: list[tuple[str, dict]] = []
@@ -339,7 +343,9 @@ class TestProgressiveTraceIdPropagation:
         pcfg = ProgressiveConfig(chunk_size=100)
         text = "abcdefghij" * 600  # 6000 chars, plenty for multiple chunks
 
-        rendered = mgr._apply_progressive(text, pcfg, "srv", "tool", trace_id="tid-snapshot")
+        rendered = mgr._apply_progressive(
+            text, pcfg, "srv", "tool", trace_id="tid-snapshot", cfg_snap=mgr._config
+        )
         key = _extract_key(rendered)
         resp = mgr._get_progressive_store().get(key)
         assert resp is not None

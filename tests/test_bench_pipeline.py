@@ -1196,7 +1196,7 @@ class TestProxyManagerIntegration:
         mgr = self._make_manager(tracker, CompressionStrategy.TRUNCATE, max_chars=500)
         self._inject_mock_upstream(mgr, "bench", CODE_FILE)
 
-        result = await mgr._call_tool_inner("bench", "read_file", {})
+        result = await mgr._call_tool_inner("bench", "read_file", {}, cfg_snap=mgr._config)
         assert isinstance(result, str)
         # With min_retention=0.5, output may be larger than max_chars
         assert len(result) < len(CODE_FILE)
@@ -1211,7 +1211,7 @@ class TestProxyManagerIntegration:
         mgr = self._make_manager(tracker, CompressionStrategy.HYBRID, max_chars=800)
         self._inject_mock_upstream(mgr, "bench", CODE_FILE)
 
-        result = await mgr._call_tool_inner("bench", "read_file", {})
+        result = await mgr._call_tool_inner("bench", "read_file", {}, cfg_snap=mgr._config)
         assert isinstance(result, str)
         assert "Authentication Module" in result  # head preserved
 
@@ -1221,7 +1221,7 @@ class TestProxyManagerIntegration:
         mgr = self._make_manager(tracker, CompressionStrategy.EXTRACT_FIELDS, max_chars=500)
         self._inject_mock_upstream(mgr, "bench", API_RESPONSE_JSON)
 
-        result = await mgr._call_tool_inner("bench", "get_users", {})
+        result = await mgr._call_tool_inner("bench", "get_users", {}, cfg_snap=mgr._config)
         assert isinstance(result, str)
         # Top-level keys should be visible
         assert "users" in result.lower() or "total" in result.lower()
@@ -1234,7 +1234,7 @@ class TestProxyManagerIntegration:
         mgr = self._make_manager(tracker, CompressionStrategy.SELECTIVE, max_chars=200)
         self._inject_mock_upstream(mgr, "bench", CODE_FILE)
 
-        result = await mgr._call_tool_inner("bench", "read_file", {})
+        result = await mgr._call_tool_inner("bench", "read_file", {}, cfg_snap=mgr._config)
         assert isinstance(result, str)
         toc = json.loads(result)
         assert toc["type"] == "toc"
@@ -1254,7 +1254,7 @@ class TestProxyManagerIntegration:
         mgr = self._make_manager(tracker, CompressionStrategy.TRUNCATE, max_chars=2000)
         self._inject_mock_upstream(mgr, "bench", SHORT_RESPONSE)
 
-        result = await mgr._call_tool_inner("bench", "save_file", {})
+        result = await mgr._call_tool_inner("bench", "save_file", {}, cfg_snap=mgr._config)
         assert result == SHORT_RESPONSE
 
     async def test_metrics_recorded(self):
@@ -1263,7 +1263,7 @@ class TestProxyManagerIntegration:
         mgr = self._make_manager(tracker, CompressionStrategy.TRUNCATE, max_chars=500)
         self._inject_mock_upstream(mgr, "bench", MEETING_NOTES)
 
-        await mgr._call_tool_inner("bench", "read_doc", {})
+        await mgr._call_tool_inner("bench", "read_doc", {}, cfg_snap=mgr._config)
 
         summary = tracker.get_summary()
         assert summary["total_calls"] == 1
@@ -1277,7 +1277,7 @@ class TestProxyManagerIntegration:
         mgr = self._make_manager(tracker, CompressionStrategy.TRUNCATE, max_chars=2000)
         self._inject_mock_upstream(mgr, "bench", HTML_MIXED)
 
-        result = await mgr._call_tool_inner("bench", "read_docs", {})
+        result = await mgr._call_tool_inner("bench", "read_docs", {}, cfg_snap=mgr._config)
         assert "<script>" not in result
         assert "<style>" not in result
 
@@ -1288,7 +1288,10 @@ class TestProxyManagerIntegration:
         mock_session = self._inject_mock_upstream(mgr, "bench", SHORT_RESPONSE)
 
         await mgr._call_tool_inner(
-            "bench", "read_file", {"path": "/test", "_context_query": "auth tokens"}
+            "bench",
+            "read_file",
+            {"path": "/test", "_context_query": "auth tokens"},
+            cfg_snap=mgr._config,
         )
         # _context_query should NOT be forwarded to upstream
         call_args = mock_session.call_tool.call_args

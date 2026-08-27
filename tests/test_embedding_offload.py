@@ -211,6 +211,7 @@ def _selective_call(stub: SimpleNamespace, text: str = "z" * 300):
         "srv",
         "tool",
         context_query="q",
+        cfg_snap=stub._config,
     )
 
 

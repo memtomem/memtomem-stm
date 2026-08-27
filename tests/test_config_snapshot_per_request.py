@@ -18,6 +18,7 @@ through the response rather than through the loader.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -32,23 +33,19 @@ from memtomem_stm.proxy.config import (
     ExtractionConfig,
     ExtractionStrategy,
     ProxyConfig,
+    RelevanceScorerConfig,
     UpstreamServerConfig,
 )
-from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
-from memtomem_stm.proxy.metrics import TokenTracker
+from memtomem_stm.proxy.manager import ProxyManager
 from memtomem_stm.proxy.metrics_store import MetricsStore
+from helpers import (
+    FakeSurfacingEngine,
+    count_loader_reads,
+    wire_proxy_manager,
+)
 
 UPSTREAM_CHARS = 5000
 MAX_RESULT_CHARS = 200
-
-
-def _result(text: str):
-    return SimpleNamespace(
-        content=[SimpleNamespace(type="text", text=text)],
-        is_error=False,
-        structured_content=None,
-        meta=None,
-    )
 
 
 def _file_config(
@@ -119,8 +116,6 @@ def _build_mgr(
     auto_index: bool = False,
     extraction: bool = False,
 ) -> tuple[ProxyManager, MetricsStore, ProxyCache]:
-    store = MetricsStore(tmp_path / "metrics.db")
-    store.initialize()
     # No explicit ``compression`` on the server: the strategy then resolves
     # from ``default_compression``, which is what the hot-reload test edits.
     server_cfg = UpstreamServerConfig(
@@ -156,15 +151,14 @@ def _build_mgr(
         ),
         cache=CacheConfig(db_path=tmp_path / "cache.db", tool_annotation_policy="ignore"),
     )
-    mgr = ProxyManager(proxy_cfg, TokenTracker(metrics_store=store))
-    session = AsyncMock()
-    session.call_tool.return_value = _result("upstream content " * body_repeat)
-    mgr._connections["srv"] = UpstreamConnection(
-        name="srv", config=server_cfg, session=session, tools=[]
+    mgr, store, cache = wire_proxy_manager(
+        proxy_cfg,
+        server_cfg,
+        tmp_path,
+        with_cache=True,
+        upstream_text="upstream content " * body_repeat,
     )
-    cache = ProxyCache(tmp_path / "cache.db", max_entries=100)
-    cache.initialize()
-    mgr._cache = cache
+    assert cache is not None
     return mgr, store, cache
 
 
@@ -195,18 +189,6 @@ async def _drain(manager: ProxyManager) -> None:
         manager._extractor = None
 
 
-class _FakeSurfacingEngine:
-    """Minimal surfacing engine: the manager reads ``injection_mode`` /
-    ``observability`` and awaits ``surface(...)``. Appends rather than
-    prepends so a progressive footer would survive."""
-
-    injection_mode = "append"
-    observability = None
-
-    async def surface(self, *, response_text: str, **_kwargs) -> str:
-        return response_text + " [mem]"
-
-
 @pytest.fixture
 async def active_mgr(tmp_path):
     """A manager whose surfacing, auto-index and extraction stages all RUN.
@@ -221,7 +203,7 @@ async def active_mgr(tmp_path):
         auto_index=True,
         extraction=True,
     )
-    manager._surfacing_engine = _FakeSurfacingEngine()
+    manager._surfacing_engine = FakeSurfacingEngine()
     manager._index_engine = _fake_index_engine()
     yield manager
     await _drain(manager)
@@ -241,7 +223,7 @@ async def extract_mgr(tmp_path):
         body_repeat=100,
         extraction=True,
     )
-    manager._surfacing_engine = _FakeSurfacingEngine()
+    manager._surfacing_engine = FakeSurfacingEngine()
     manager._index_engine = _fake_index_engine()
     yield manager
     await _drain(manager)
@@ -263,19 +245,6 @@ def truncate_mgr(tmp_path):
     store.close()
 
 
-def _count_loader_reads(manager: ProxyManager) -> list[int]:
-    """Wrap the manager's loader so every ``get()`` bumps a counter."""
-    calls = [0]
-    real_get = manager._config_loader.get
-
-    def counting_get():
-        calls[0] += 1
-        return real_get()
-
-    manager._config_loader.get = counting_get  # type: ignore[method-assign]
-    return calls
-
-
 class TestPerRequestSnapshot:
     async def test_one_loader_read_per_call_tool(self, mgr):
         """The whole request — policy gate, ranking, cache lookup, and every
@@ -290,7 +259,7 @@ class TestPerRequestSnapshot:
         separately below.
         """
         await mgr.call_tool("srv", "tool", {"warm": 1})
-        calls = _count_loader_reads(mgr)
+        calls = count_loader_reads(mgr)
         await mgr.call_tool("srv", "tool", {"a": 1})
         assert calls[0] == 2, f"expected 1 snapshot + 1 enforcement read, got {calls[0]}"
 
@@ -304,7 +273,7 @@ class TestPerRequestSnapshot:
         outlive the call read live. This pins the price of that rule so it
         cannot grow unnoticed.
         """
-        calls = _count_loader_reads(mgr)
+        calls = count_loader_reads(mgr)
         await mgr.call_tool("srv", "tool", {"a": 1})
         assert calls[0] == 3, f"expected 2 baseline + 1 live build read, got {calls[0]}"
         assert mgr._selective_compressor is not None
@@ -318,7 +287,7 @@ class TestPerRequestSnapshot:
         session = mgr._connections["srv"].session
         upstream_calls = session.call_tool.await_count
 
-        calls = _count_loader_reads(mgr)
+        calls = count_loader_reads(mgr)
         await mgr.call_tool("srv", "tool", {"a": 1})
         assert session.call_tool.await_count == upstream_calls, "second call was not a cache hit"
         assert calls[0] == 2, f"expected the 2-read baseline on a cache hit, got {calls[0]}"
@@ -332,7 +301,7 @@ class TestPerRequestSnapshot:
         counting only the compression build would have missed this entirely.
         """
         mgr = extract_mgr
-        calls = _count_loader_reads(mgr)
+        calls = count_loader_reads(mgr)
         await mgr.call_tool("srv", "tool", {"a": 1})
         cold = calls[0]
         assert mgr._extractor is not None, "extraction stage did not run"
@@ -356,10 +325,10 @@ class TestPerRequestSnapshot:
         mgr, store, cache = _build_mgr(
             tmp_path, compression=CompressionStrategy.SELECTIVE, extraction=True
         )
-        mgr._surfacing_engine = _FakeSurfacingEngine()
+        mgr._surfacing_engine = FakeSurfacingEngine()
         mgr._index_engine = _fake_index_engine()
         try:
-            calls = _count_loader_reads(mgr)
+            calls = count_loader_reads(mgr)
             await mgr.call_tool("srv", "tool", {"a": 1})
             assert mgr._selective_compressor is not None and mgr._extractor is not None
             assert calls[0] == 4, f"expected 2 baseline + 2 live build reads, got {calls[0]}"
@@ -375,7 +344,7 @@ class TestPerRequestSnapshot:
     async def test_snapshot_does_not_leak_across_requests(self, mgr):
         """One per request, not one per manager: the second call re-reads."""
         await mgr.call_tool("srv", "tool", {"warm": 1})
-        calls = _count_loader_reads(mgr)
+        calls = count_loader_reads(mgr)
         await mgr.call_tool("srv", "tool", {"a": 1})
         await mgr.call_tool("srv", "tool", {"b": 2})
         assert calls[0] == 4  # the 2-read baseline, twice
@@ -524,3 +493,128 @@ class TestPerRequestSnapshot:
         second = await mgr.call_tool("srv", "tool", {"b": 2})
         assert isinstance(second, str)
         assert len(second) > MAX_RESULT_CHARS * 2, "config edit did not reach the next request"
+
+    async def test_stale_pin_does_not_rebuild_the_shared_scorer_backward(self, mgr):
+        """The scorer cache outlives the request, so a stale pin must not write it.
+
+        ``_relevance_scorer_for`` takes the caller's snapshot, and the instance
+        it stamps is shared by every later request. A call that pinned an older
+        generation and resumed after a newer one already rebuilt the shared
+        scorer forward would otherwise stamp the singleton BACK, and interleaved
+        traffic would ping-pong it until the stale requests drain. The stale
+        caller still gets a scorer built from its own config — it just does not
+        publish it.
+        """
+        gen1 = mgr._config
+        gen2 = gen1.model_copy(
+            update={"relevance_scorer": RelevanceScorerConfig(scorer="bm25", embedding_timeout=7.0)}
+        )
+        mgr._config_loader.seed(gen2)
+
+        forward = mgr._relevance_scorer_for(gen2)
+        assert mgr._relevance_scorer_instance is forward
+        assert mgr._relevance_scorer_cfg == gen2.relevance_scorer
+
+        stale = mgr._relevance_scorer_for(gen1)
+
+        assert stale is not None
+        assert mgr._relevance_scorer_instance is forward, "stale pin rebuilt the shared scorer"
+        assert mgr._relevance_scorer_cfg == gen2.relevance_scorer, "stale pin restamped the cache"
+
+    async def test_stale_pin_does_not_replace_the_live_progressive_store(self, truncate_mgr):
+        """The progressive store holds live read-more keys; a stale pin must not
+        close it.
+
+        This store outlives the request that built it — a client can come back
+        for a chunk minutes later — so a request that pinned an older
+        generation and resumed after a newer one moved the store would take the
+        newer generation's outstanding keys down with it. The symptom is not a
+        crash but a lie: ``stm_proxy_read_more`` reports "not found or expired"
+        for a key the client was handed seconds earlier.
+        """
+        from memtomem_stm.proxy.config import SelectiveConfig
+        from memtomem_stm.proxy.progressive import ProgressiveResponse
+
+        mgr = truncate_mgr
+        gen2 = mgr._config
+        live_store = mgr._get_progressive_store()
+        live_store.put(
+            "live-key",
+            ProgressiveResponse(
+                content="chunk",
+                total_chars=5,
+                total_lines=1,
+                content_type="text",
+                structure_hint="1 lines",
+                created_at=time.monotonic(),
+            ),
+        )
+        assert mgr._get_progressive_store().get("live-key") is not None
+
+        stale = gen2.model_copy()
+        assert stale is not mgr._config_loader.current, "the pin must look superseded"
+        moved = SelectiveConfig(pending_store="sqlite")
+
+        mgr._get_progressive_store(
+            moved, allow_rebuild=mgr._pin_is_live_generation(stale)
+        )
+
+        assert mgr._get_progressive_store() is live_store, "a stale pin replaced the store"
+        assert mgr._get_progressive_store().get("live-key") is not None, (
+            "the live generation's outstanding read-more key was dropped"
+        )
+
+    async def test_stale_pin_does_not_rebuild_the_selective_compressor(self, mgr):
+        """Same rule for the selective compressor, which owns the pending store.
+
+        ``_apply_compression`` and ``_apply_hybrid`` both rebuild it from the
+        caller's pinned config; only the newest generation may publish.
+        """
+        from memtomem_stm.proxy.config import SelectiveConfig
+
+        gen1 = mgr._config
+        first = mgr._rebuild_selective_compressor(SelectiveConfig(max_pending=11))
+        assert mgr._selective_compressor is first
+
+        assert mgr._pin_is_live_generation(gen1) is True, "the pin should still be current"
+        stale = gen1.model_copy()
+        assert mgr._pin_is_live_generation(stale) is False, "a superseded pin must not publish"
+
+    def test_threaded_helpers_require_a_snapshot(self):
+        """An omitted ``cfg_snap`` must be a TypeError, not a silent live read.
+
+        A defaulted parameter makes the omission indistinguishable from correct
+        code at the call site: a new stage that forgets to thread the snapshot
+        compiles, passes on every path a fixture does not exercise, and
+        reintroduces the split this file exists to prevent. The pre-existing
+        snapshot helpers already required it; these are the ones #871 added.
+        """
+        import inspect
+
+        threaded = [
+            "_apply_compression",
+            "_apply_surfacing",
+            "_apply_surfacing_on_progressive",
+            "_surfacing_enabled_for",
+            "_apply_hybrid",
+            "_auto_index_response",
+            "_get_extractor",
+            "_extract_and_store",
+            "_on_cache_hit",
+            "_rank_candidates",
+            "_call_tool_guarded",
+            "_fetch_upstream",
+            "_call_tool_inner",
+            # pre-existing, required from the start — kept here so the whole
+            # set is one list rather than two conventions
+            "_cache_key_fingerprint",
+            "_resolve_cache_ttl",
+            "_tool_cache_eligible",
+        ]
+        for name in threaded:
+            sig = inspect.signature(getattr(ProxyManager, name))
+            param = sig.parameters.get("cfg_snap")
+            assert param is not None, f"{name} lost its cfg_snap parameter"
+            assert param.default is inspect.Parameter.empty, (
+                f"{name}.cfg_snap has a default; an omitted snapshot must raise"
+            )

@@ -321,6 +321,7 @@ class TestManagerStructuralForwardsQuery:
             "srv",
             "tool",
             context_query="orders total",
+            cfg_snap=mgr._config,
         )
         assert out == "OUT"
         assert fallback is None

@@ -300,14 +300,11 @@ class TestProgressiveContentIntegrity:
                 # footer). Canonical split must land on the footer, not the
                 # trailing content HR.
                 "content_ending_in_triple_dash_before_footer",
-                "".join(f"Line {i}: filler text here\n" for i in range(80))
-                + "\n---\n",
+                "".join(f"Line {i}: filler text here\n" for i in range(80)) + "\n---\n",
             ),
         ],
     )
-    def test_dangerous_content_reassembles_with_canonical_token(
-        self, content_label, text
-    ):
+    def test_dangerous_content_reassembles_with_canonical_token(self, content_label, text):
         """Content embedding ``\\n---\\n`` sequences (markdown HR, YAML
         frontmatter, lookalike brackets, trailing HR) must still round-trip
         byte-for-byte when agents split on :data:`PROGRESSIVE_FOOTER_TOKEN`.
@@ -344,10 +341,7 @@ class TestProgressiveContentIntegrity:
         noticing: on content containing a markdown horizontal rule, the
         legacy rule drops bytes while the canonical rule preserves them.
         """
-        text = (
-            "Intro paragraph.\n\n---\n\nContent after the rule.\n\n"
-            + "x" * 500
-        )
+        text = "Intro paragraph.\n\n---\n\nContent after the rule.\n\n" + "x" * 500
         chunker = ProgressiveChunker(chunk_size=4000)
         result = chunker.first_chunk(text, "key-legacy")
 
@@ -626,7 +620,9 @@ class TestReadMoreRespectsProgressiveConfig:
         return ProxyManager(ProxyConfig(enabled=True), TokenTracker())
 
     def _apply_and_get_key(self, mgr, text, cfg):
-        first = mgr._apply_progressive(text, cfg, server="srv", tool="tool_c", trace_id="t3")
+        first = mgr._apply_progressive(
+            text, cfg, server="srv", tool="tool_c", trace_id="t3", cfg_snap=mgr._config
+        )
         store = mgr._get_progressive_store()
         key = next(iter(store._store._data.keys()))  # type: ignore[attr-defined]
         return first, key
@@ -763,7 +759,7 @@ class TestProgressiveReadsTelemetry:
             text = "x" * 10000
             cfg = ProgressiveConfig(chunk_size=4000)
             first = mgr._apply_progressive(
-                text, cfg, server="srv", tool="tool_a", trace_id="t1"
+                text, cfg, server="srv", tool="tool_a", trace_id="t1", cfg_snap=mgr._config
             )
             assert PROGRESSIVE_FOOTER_TOKEN in first
 
@@ -781,7 +777,7 @@ class TestProgressiveReadsTelemetry:
             text = "y" * 12000
             cfg = ProgressiveConfig(chunk_size=4000)
             first = mgr._apply_progressive(
-                text, cfg, server="srv", tool="tool_b", trace_id="t2"
+                text, cfg, server="srv", tool="tool_b", trace_id="t2", cfg_snap=mgr._config
             )
 
             # Recover the key from the in-memory progressive store
@@ -826,7 +822,12 @@ class TestProgressiveReadsTelemetry:
         )
         text = "z" * 8000
         first = mgr._apply_progressive(
-            text, ProgressiveConfig(chunk_size=4000), server="s", tool="t", trace_id=None
+            text,
+            ProgressiveConfig(chunk_size=4000),
+            server="s",
+            tool="t",
+            trace_id=None,
+            cfg_snap=mgr._config,
         )
         assert PROGRESSIVE_FOOTER_TOKEN in first
 
@@ -836,7 +837,12 @@ class TestProgressiveReadsTelemetry:
         tracker.close()  # simulate shutdown race
         text = "q" * 6000
         first = mgr._apply_progressive(
-            text, ProgressiveConfig(chunk_size=4000), server="s", tool="t", trace_id="tx"
+            text,
+            ProgressiveConfig(chunk_size=4000),
+            server="s",
+            tool="t",
+            trace_id="tx",
+            cfg_snap=mgr._config,
         )
         assert PROGRESSIVE_FOOTER_TOKEN in first
 
@@ -847,7 +853,7 @@ class TestProgressiveReadsTelemetry:
             text = "u" * 5000
             cfg = ProgressiveConfig(chunk_size=4000)
             mgr._apply_progressive(
-                text, cfg, server="srv", tool="tool_c", trace_id="t3"
+                text, cfg, server="srv", tool="tool_c", trace_id="t3", cfg_snap=mgr._config
             )
 
             store = mgr._get_progressive_store()

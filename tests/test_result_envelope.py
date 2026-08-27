@@ -135,7 +135,7 @@ class TestEnvelopePreservation:
     async def test_text_with_structured_and_meta_returns_envelope(self, make_mgr):
         mgr, _, _ = make_mgr()
         _set_upstream(mgr, _result("payload text", structured={"a": 1}, meta={"trace": "x"}))
-        res = await mgr._call_tool_inner("srv", "tool", {})
+        res = await mgr._call_tool_inner("srv", "tool", {}, cfg_snap=mgr._config)
         assert isinstance(res, CallToolResult)
         assert res.structured_content == {"a": 1}
         assert res.meta == {"trace": "x"}
@@ -147,7 +147,7 @@ class TestEnvelopePreservation:
     async def test_meta_only_result_preserves_meta(self, make_mgr):
         mgr, _, _ = make_mgr()
         _set_upstream(mgr, _result("payload", meta={"m": 2}))
-        res = await mgr._call_tool_inner("srv", "tool", {})
+        res = await mgr._call_tool_inner("srv", "tool", {}, cfg_snap=mgr._config)
         assert isinstance(res, CallToolResult)
         assert res.meta == {"m": 2}
         assert res.structured_content is None
@@ -155,7 +155,7 @@ class TestEnvelopePreservation:
     async def test_structured_only_empty_content_returns_envelope_not_sentinel(self, make_mgr):
         mgr, store, _ = make_mgr()
         _set_upstream(mgr, _result(blocks=[], structured={"only": "structured"}))
-        res = await mgr._call_tool_inner("srv", "tool", {})
+        res = await mgr._call_tool_inner("srv", "tool", {}, cfg_snap=mgr._config)
         assert isinstance(res, CallToolResult)
         assert res.structured_content == {"only": "structured"}
         assert res.content == []  # no "[empty response]" fabricated into the envelope
@@ -168,7 +168,7 @@ class TestEnvelopePreservation:
         mgr, _, _ = make_mgr()
         img = _image_content()
         _set_upstream(mgr, _result(blocks=[img, _text_content("txt")], structured={"a": 1}))
-        res = await mgr._call_tool_inner("srv", "tool", {})
+        res = await mgr._call_tool_inner("srv", "tool", {}, cfg_snap=mgr._config)
         assert isinstance(res, CallToolResult)
         assert res.structured_content == {"a": 1}
         assert res.content[0] is img  # leading image stays leading
@@ -178,7 +178,7 @@ class TestEnvelopePreservation:
     async def test_text_only_no_envelope_stays_plain_str(self, make_mgr):
         mgr, _, _ = make_mgr()
         _set_upstream(mgr, _result("plain"))
-        res = await mgr._call_tool_inner("srv", "tool", {})
+        res = await mgr._call_tool_inner("srv", "tool", {}, cfg_snap=mgr._config)
         assert isinstance(res, str)
         assert "plain" in res
 
@@ -186,7 +186,7 @@ class TestEnvelopePreservation:
         mgr, _, _ = make_mgr()
         img = _image_content()
         _set_upstream(mgr, _result(blocks=[img, _text_content("txt")]))
-        res = await mgr._call_tool_inner("srv", "tool", {})
+        res = await mgr._call_tool_inner("srv", "tool", {}, cfg_snap=mgr._config)
         assert isinstance(res, list)
         assert res[0] is img
         assert isinstance(res[1], TextContent)
@@ -195,7 +195,7 @@ class TestEnvelopePreservation:
         mgr, _, _ = make_mgr()
         img = _image_content()
         _set_upstream(mgr, _result(blocks=[_text_content("txt"), img]))
-        res = await mgr._call_tool_inner("srv", "tool", {})
+        res = await mgr._call_tool_inner("srv", "tool", {}, cfg_snap=mgr._config)
         assert isinstance(res, list)
         assert isinstance(res[0], TextContent)
         assert res[1] is img
@@ -208,7 +208,7 @@ class TestIsErrorOrdering:
     async def test_non_text_only_error_preserves_envelope(self, make_mgr):
         mgr, store, _ = make_mgr()
         _set_upstream(mgr, _result(blocks=[_image_content()], is_error=True))
-        result = await mgr._call_tool_inner("srv", "tool", {})
+        result = await mgr._call_tool_inner("srv", "tool", {}, cfg_snap=mgr._config)
         assert result.is_error is True
         assert result.content[0].type == "image"
         err = _latest_error(store)
@@ -219,14 +219,14 @@ class TestIsErrorOrdering:
     async def test_empty_content_error_preserves_error_flag(self, make_mgr):
         mgr, _, _ = make_mgr()
         _set_upstream(mgr, _result(blocks=[], is_error=True))
-        result = await mgr._call_tool_inner("srv", "tool", {})
+        result = await mgr._call_tool_inner("srv", "tool", {}, cfg_snap=mgr._config)
         assert result.is_error is True
         assert result.content == []
 
     async def test_error_with_text_and_structured_preserves_both(self, make_mgr):
         mgr, _, _ = make_mgr()
         _set_upstream(mgr, _result("boom", is_error=True, structured={"detail": 1}))
-        result = await mgr._call_tool_inner("srv", "tool", {})
+        result = await mgr._call_tool_inner("srv", "tool", {}, cfg_snap=mgr._config)
         assert result.is_error is True
         assert result.content[0].text == "boom"
         assert result.structured_content == {"detail": 1}
@@ -234,7 +234,7 @@ class TestIsErrorOrdering:
     async def test_error_never_becomes_success_after_compression(self, make_mgr):
         mgr, _, _ = make_mgr()
         _set_upstream(mgr, _result("x" * 5000, is_error=True))
-        result = await mgr._call_tool_inner("srv", "tool", {})
+        result = await mgr._call_tool_inner("srv", "tool", {}, cfg_snap=mgr._config)
         assert result.is_error is True
         assert len(result.content[0].text) == 5000
 
@@ -271,7 +271,7 @@ class TestEnvelopeCache:
         assert cache.stats()["total_entries"] == 1
         mgr._config.cache.default_ttl_seconds = 0
         _set_upstream(mgr, _result("fresh", structured={"a": 1}))
-        res = await mgr._call_tool_inner("srv", "tool", {"a": 1})
+        res = await mgr._call_tool_inner("srv", "tool", {"a": 1}, cfg_snap=mgr._config)
         assert isinstance(res, CallToolResult)
         assert cache.stats()["total_entries"] == 0
 
