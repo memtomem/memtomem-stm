@@ -2695,8 +2695,13 @@ class ProxyManager:
         Single-store / no-store configs return ``None`` **without probing** —
         callers fall back to the sole (or first) configured store, so the common
         case pays no extra open and only genuinely multi-store configs probe.
+
+        ``cfg`` is the recovery's pinned generation. Enumerating the candidate
+        stores from a read of its own would let the store CHOSEN here come from
+        a different generation than the compressor the caller then builds
+        around it.
         """
-        cfgs = self._distinct_sqlite_selective_cfgs()
+        cfgs = self._distinct_sqlite_selective_cfgs(cfg)
         if len(cfgs) <= 1:
             return None
 

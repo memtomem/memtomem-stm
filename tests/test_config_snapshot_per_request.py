@@ -544,7 +544,8 @@ class TestPerRequestSnapshot:
         assert mgr._pin_is_live_generation(live) is True
         return stale, live
 
-    async def test_warm_rebuild_stays_on_the_request_generation(self, mgr):
+    @pytest.mark.parametrize("strategy", ["selective", "hybrid"])
+    async def test_warm_rebuild_stays_on_the_request_generation(self, mgr, strategy):
         """A live config change rebuilds the compressor without a second read.
 
         The rebuild is a fill too: whatever generation it publishes under has
@@ -555,7 +556,13 @@ class TestPerRequestSnapshot:
         generation and nothing needs re-reading.
         """
         from memtomem_stm.proxy.config import CompressionStrategy as CS
-        from memtomem_stm.proxy.config import SelectiveConfig
+        from memtomem_stm.proxy.config import HybridConfig, SelectiveConfig
+
+        # HYBRID rebuilds the SAME compressor from its own call site, so both
+        # branches need the assertion; one covering the other is how a dropped
+        # argument stays green.
+        compression = CS.SELECTIVE if strategy == "selective" else CS.HYBRID
+        hybrid_cfg = None if strategy == "selective" else HybridConfig()
 
         # Warm the slot under a config the next call will disagree with.
         mgr._rebuild_selective_compressor(SelectiveConfig(max_pending=5))
@@ -567,11 +574,11 @@ class TestPerRequestSnapshot:
         calls = count_loader_reads(mgr)
         await mgr._apply_compression(
             "word " * 400,
-            CS.SELECTIVE,
+            compression,
             200,
             sel_cfg,
             None,
-            None,
+            hybrid_cfg,
             "srv",
             "tool",
             cfg_snap=cfg_snap,
