@@ -2220,13 +2220,21 @@ class ProxyManager:
         if self._llm_compressor is not None:
             await self._llm_compressor.close()
             self._llm_compressor = None
-        if self._extractor is not None:
-            await self._extractor.close()
-            # Null it like _llm_compressor above: _get_extractor() rebuilds on
-            # None, so a stop->start cycle gets a fresh httpx client instead of
-            # the closed instance (whose extract() asserts _client is not None).
-            self._extractor = None
-            self._extractor_cfg = None
+        # Under the extractor lock: _get_extractor() can now publish a
+        # REPLACEMENT mid-run (#890), so an unguarded read-close-clear here
+        # could close the old instance while a rebuild installs a new client
+        # behind it, leaking that client for the life of the process.
+        # ``_background_closed`` is already True by this point, so a rebuild
+        # that arrives after this block raises instead of publishing.
+        async with self._extractor_lock:
+            if self._extractor is not None:
+                await self._extractor.close()
+                # Null it like _llm_compressor above: _get_extractor() rebuilds
+                # on None, so a stop->start cycle gets a fresh httpx client
+                # instead of the closed instance (whose extract() asserts
+                # _client is not None).
+                self._extractor = None
+                self._extractor_cfg = None
         # Close the #494 consult disk cache (re-opened lazily on the next start).
         # Always null the handle so a failed close cannot leave a stale closed
         # connection that the next start() would reuse.
@@ -2348,10 +2356,12 @@ class ProxyManager:
         alongside the advertisement so selection telemetry (#467) and
         relevance ranking (#466) describe exactly this exposure decision.
         """
-        # One snapshot for the whole advertisement build, for the same reason
-        # ``call_tool`` pins one per request (#871): each ``self._config`` read
-        # is a loader ``stat()``, and the exposure decision must describe a
-        # single config generation.
+        # One snapshot for the GLOBAL fields of this advertisement build, for
+        # the same reason ``call_tool`` pins one per request (#871): each
+        # ``self._config`` read is a loader ``stat()``. Per-server fields below
+        # deliberately stay on the connect-time ``conn.config`` instead, so an
+        # advertisement mixes one live global snapshot with session-stable
+        # server snapshots — see the comment at the loop head for why.
         cfg_snap = self._config
         self._refresh_toolgraph_bundle(cfg_snap=cfg_snap)
         candidates: list[ExposureCandidate] = []
@@ -3280,25 +3290,44 @@ class ProxyManager:
         provider/model/limits of one generation while storage used another —
         and a reload landing mid-request would make the mismatch permanent.
 
-        The old instance is closed inside the lock, mirroring
-        ``_llm_compressor``. ``FactExtractor.close()`` flips its gate before a
-        bounded drain, so an extraction already in flight degrades to the local
-        heuristic rather than failing.
+        The replacement is published under the lock and the superseded instance
+        is closed OUTSIDE it, unlike ``_llm_compressor``, which closes in place.
+        ``FactExtractor.close()`` lets callers already registered with its gate
+        RUN TO COMPLETION, draining up to ``llm_timeout_seconds`` plus grace
+        (only a call arriving after the gate closes takes the local heuristic
+        instead). That drain can outlast
+        ``lock_timeout_seconds`` and would then fail every concurrent request
+        with ``LockTimeoutError``. Publishing first also makes the swap
+        cancellation-safe: there is no await between deciding to rebuild and
+        installing the new instance, so a cancelled rebuild cannot leave a
+        CLOSED extractor cached under a matching config, silently forcing every
+        later extraction onto the heuristic.
+
+        Refuses to publish once ``stop()`` has closed the background surface, so
+        a rebuild racing shutdown cannot install a client that ``stop()`` has
+        already walked past. The extract stage records the raise as its outcome.
         """
         if cfg_snap is None:
             cfg_snap = self._config
         ext_cfg = cfg_snap.extraction
+        superseded: FactExtractor | None = None
         async with bounded_lock(
             self._extractor_lock,
             timeout=cfg_snap.lock_timeout_seconds,
             name="extractor_lock",
         ):
             if self._extractor is None or self._extractor_cfg != ext_cfg:
-                if self._extractor is not None:
-                    await self._extractor.close()
+                if self._background_closed:
+                    raise RuntimeError("ProxyManager is stopping; extractor not rebuilt")
+                superseded = self._extractor
                 self._extractor = FactExtractor(ext_cfg)
                 self._extractor_cfg = ext_cfg
-            return self._extractor
+            extractor = self._extractor
+        if superseded is not None:
+            # Outside the lock: this await is bounded by the drain ceiling, and
+            # only the request that triggered the rebuild pays it.
+            await superseded.close()
+        return extractor
 
     async def _extract_and_store(
         self,
