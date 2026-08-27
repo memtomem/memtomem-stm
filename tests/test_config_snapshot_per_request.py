@@ -354,19 +354,51 @@ class TestPerRequestSnapshot:
         ``_get_extractor`` must construct from that same snapshot rather than a
         fresh read — otherwise provider/limits could come from one generation
         while namespace/dedup came from another.
+
+        The reload is driven from inside the mocked upstream call, so the two
+        candidate implementations diverge: a ``cfg_snap`` build sees the
+        PRE-reload value, a live reread sees the post-reload one. Without that
+        divergence the assertion passes either way and pins nothing.
         """
+        import os
+
         mgr = extract_mgr
+        cfg_file = tmp_path / "proxy.json"
+        session = mgr._connections["srv"].session
+        upstream_result = session.call_tool.return_value
+
+        async def reload_config_mid_request(*_args, **_kwargs):
+            cfg_file.write_text(
+                json.dumps(
+                    _file_config(
+                        tmp_path,
+                        compression=CompressionStrategy.TRUNCATE,
+                        extraction=True,
+                        extraction_overrides={"max_facts": 3},
+                    )
+                )
+            )
+            seen = mgr._config_loader._mtime
+            os.utime(cfg_file, (seen + 10, seen + 10))
+            return upstream_result
+
+        session.call_tool.side_effect = reload_config_mid_request
+
         await mgr.call_tool("srv", "tool", {"a": 1})
+
         assert mgr._extractor is not None, "extraction stage did not run"
-        assert mgr._extractor._cfg == mgr._config.extraction
+        # Built from the pinned snapshot (10), NOT the post-reload file (3):
+        # the same snapshot the storage side of this call used.
+        assert mgr._extractor._cfg.max_facts == 10
+        assert mgr._config.extraction.max_facts == 3, "the reload did not land"
 
     async def test_extractor_is_not_rebuilt_on_config_change(self, extract_mgr, tmp_path):
         """Pins #890's KNOWN GAP so the follow-up has a red-to-green target.
 
         The extractor is a process-lifetime singleton with no rebuild, so an
         edit to the extraction block needs a restart. That predates this PR and
-        is unchanged by it; a safe swap needs FactExtractor to expose a use
-        token, since callers can already be holding the instance.
+        is unchanged by it; a safe swap needs an explicit lease, since callers
+        can already be holding the instance when a replacement is published.
         """
         import os
 

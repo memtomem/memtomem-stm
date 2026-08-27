@@ -3278,11 +3278,10 @@ class ProxyManager:
         provider, limits, namespace or dedup for that call.
 
         Rebuilding on change is deliberately NOT done here. It needs the
-        superseded instance to stay alive for callers already holding it, and
-        ``FactExtractor`` registers with its in-flight gate inside ``extract()``
-        rather than exposing a use token, so a safe swap means changing that
-        API — out of scope for a per-request-snapshot change. #890 carries the
-        analysis. Until then the staleness is bounded and documented rather
+        superseded instance to stay alive for callers already holding it, i.e.
+        an explicit lease (borrow before the handoff, close after the last
+        borrower releases) — lifecycle work in its own right, not part of a
+        per-request-snapshot change. #890 carries the analysis. Until then the staleness is bounded and documented rather
         than half-solved: a config edit to the extraction block needs a
         restart, exactly as before this PR.
         """
@@ -5195,10 +5194,12 @@ class ProxyManager:
         WARNING log). A background run that was never scheduled — shed at the
         cap or during ``stop()`` — reports ``False`` / ``background_shed``
         instead (#868). Like the index stage, gate and ``_extract_and_store``
-        both read the request's ``cfg_snap`` snapshot (#871), so extraction and
-        storage agree for any given call. The cached ``FactExtractor`` is still
-        built once and never rebuilt, so a LATER ``extraction`` edit needs a
-        restart — pre-existing, tracked in #890.
+        both read the request's ``cfg_snap`` snapshot (#871), so the call that
+        BUILDS the extractor has extraction and storage on one generation. The
+        cached ``FactExtractor`` is never rebuilt, so after a later
+        ``extraction`` edit storage moves to the new generation while the
+        extractor stays on the old one until restart — pre-existing, tracked in
+        #890.
         """
         extract_ok: bool | None = None
         extract_error: str | None = None
