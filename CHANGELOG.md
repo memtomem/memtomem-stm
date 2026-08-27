@@ -272,6 +272,17 @@ changes inline only. See the deprecation policy in
   is still refused to a superseded pin, which carries a policy that could
   delete the current generation's live keys.
 
+  This covers the request that DECIDES which store to use. It does not close a
+  narrower pre-existing race: a SELECTIVE/HYBRID compress runs off-thread while
+  holding its compressor pinned (`begin_use`, which defers the retired
+  instance's `close`), so a config change landing mid-compress lets that worker
+  finish and write its key into a store `select_chunks` no longer consults, and
+  lets its own `_evict` apply a superseded `max_pending`/TTL to a shared SQLite
+  path. That predates this work — the pin and the deferred close are unchanged
+  — and closing it needs retired stores to stay reachable until their keys
+  expire, the same explicit-lease lifecycle #890 carries for the fact
+  extractor. Tracked as #898 rather than smuggled in here.
+
   A request stays on the 2-read baseline even when it constructs the selective
   compressor: the build publishes under one resolved generation and takes its
   scorer from that same object, so the extra read is paid only in the stale
