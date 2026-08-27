@@ -2424,9 +2424,16 @@ class ProxyManager:
                     )
                 )
 
+        # LIVE exposure, not the advertisement snapshot: this verdict is paired
+        # with ``_toolgraph_external_rejects`` / ``_toolgraph_withhold_all``,
+        # which the refresh above derives from live config, and its output is
+        # stored in ``_advertised_*`` for later requests to read. Pinning the
+        # profile here while those come from live lets a review→strict reload
+        # leave a rejected tool advertised — the exposure gate failing open on
+        # the same split the enforcement path had.
         verdict = filter_tools(
             candidates,
-            cfg_snap.exposure,
+            self._config.exposure,
             self._unhealthy_tools,
             external_rejects=self._toolgraph_external_rejects or None,
             withhold_all=self._toolgraph_withhold_all,
@@ -3759,15 +3766,18 @@ class ProxyManager:
         """
         if server not in self._connections:
             raise KeyError(f"Unknown upstream server: '{server}'")
-        # ONE config snapshot for the whole request (#871). ``self._config`` is
-        # a property over the hot-reload loader, so each textual read is a
-        # ``stat()`` — and worse, two reads can land on either side of a
-        # reload. Pinning here (rather than inside ``_call_tool_guarded``) puts
-        # the policy gate, the ranker, the cache key, and every pipeline stage
-        # on one reload generation: a denial published mid-request cannot
-        # apply to the gate but not the stages, and the fast-path get key
-        # cannot split from the stampede-lock key. Hot reload still lands —
-        # at the next request boundary.
+        # ONE config snapshot for the whole request PIPELINE (#871).
+        # ``self._config`` is a property over the hot-reload loader, so each
+        # textual read is a ``stat()`` — and worse, two reads can land on
+        # either side of a reload. Pinning here (rather than inside
+        # ``_call_tool_guarded``) puts the ranker, the cache key, and every
+        # pipeline stage on one reload generation, so the fast-path get key
+        # cannot split from the stampede-lock key. Hot reload still lands — at
+        # the next request boundary.
+        #
+        # Toolgraph enforcement below is deliberately NOT on this snapshot: it
+        # reads live config, because its verdict has to agree with withhold
+        # state the reject path derives from live config.
         cfg_snap = self._config
         # Bundle enforcement is deliberately before selection telemetry,
         # response-cache lookup, and upstream dispatch. A stale cached result

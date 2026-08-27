@@ -231,13 +231,18 @@ changes inline only. See the deprecation policy in
   either side of a reload. The existing per-request `cfg_snap` pin moved up
   into `call_tool`, and now reaches the relevance ranker, the cache key, and
   every pipeline stage. Measured over a SELECTIVE-plus-cache configuration, a
-  steady-state request went from 6 loader reads to 2 — the request snapshot
-  plus one live read in the Toolgraph enforcement gate.
+  steady-state request with Toolgraph off went from 6 loader reads to 2 — the
+  request snapshot plus one live read in the Toolgraph enforcement gate. With
+  bundle enforcement on it is 3 steady and 5 on the request that adopts a
+  bundle, since that path is deliberately live throughout.
   The split is by lifetime: values scoped to one call ride the snapshot, while
-  anything baked into an object that outlives the request — the selective
-  compressor's scorer, the fact extractor, the Toolgraph bind maps — keeps
-  reading live config, since a snapshot pinned before the upstream call would
-  freeze the pre-edit generation for every later call. Toolgraph enforcement
+  persistent state whose contributing config is NOT fully represented in its
+  rebuild key keeps reading live — the selective compressor's scorer (that
+  rebuild keys only on the selective block), the never-rebuilt fact extractor,
+  and the Toolgraph bind maps. A snapshot pinned before the upstream call
+  would freeze the pre-edit generation there for every later call. Caches
+  keyed on exactly the config that built them, like the LLM compressor, are
+  safe either way. Toolgraph enforcement
   is excluded for a related reason: its verdict must agree with withhold state
   the reject path derives from live config, and evaluating it against a pinned
   profile lets a request walk past a withhold that state had just recorded. A

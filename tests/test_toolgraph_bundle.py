@@ -519,6 +519,39 @@ async def test_refresh_failure_under_strict_denies_the_call(tmp_path):
     assert manager._toolgraph_degraded is True
 
 
+@pytest.mark.asyncio
+async def test_bundle_mode_loader_read_counts(tmp_path):
+    """#871 read-count ceiling with bundle enforcement ON.
+
+    The per-request snapshot work advertises 2 reads in steady state, but that
+    figure is measured with Toolgraph disabled. Bundle mode is deliberately
+    excluded from the snapshot — enforcement, refresh, rejection and binding
+    all read live so one decision cannot span two generations — so it costs
+    more, and the ceiling has to be pinned where it is actually highest.
+    """
+    manager, path, tool = _manager(tmp_path, profile=ExposureProfile.STRICT)
+    _write_bundle(path, _bundle(tool, profile="strict"))
+    manager._call_tool_guarded = AsyncMock(return_value=("ok", False))
+
+    real_get = manager._config_loader.get
+    calls = [0]
+
+    def counting_get():
+        calls[0] += 1
+        return real_get()
+
+    manager._config_loader.get = counting_get
+
+    await manager.call_tool("srv", tool.name, {})
+    # snapshot + enforcement gate + refresh gate + profile validation + binding
+    assert calls[0] == 5, f"bundle adoption: expected 5 loader reads, got {calls[0]}"
+
+    calls[0] = 0
+    await manager.call_tool("srv", tool.name, {})
+    # Unchanged stamp: validation and binding are skipped.
+    assert calls[0] == 3, f"bundle steady state: expected 3 loader reads, got {calls[0]}"
+
+
 def test_enforcement_takes_no_config_snapshot():
     """Source-level pin for the above: the enforcement path reads live config
     only. A ``cfg_snap`` parameter here is what split the decision in two."""
