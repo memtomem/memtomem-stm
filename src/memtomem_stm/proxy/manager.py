@@ -3266,6 +3266,16 @@ class ProxyManager:
         )
 
     async def _get_extractor(self, *, cfg_snap: ProxyConfig | None = None) -> FactExtractor:
+        """The lazily-built ``FactExtractor``, constructed from whichever config
+        first reached this method.
+
+        Unlike ``_relevance_scorer_for`` / ``_rebuild_selective_compressor``,
+        this does NOT rebuild when ``extraction`` changes: an edit to the
+        provider/model/limits is picked up by ``ext_cfg`` at the call site but
+        not by the extractor object itself. That predates the per-request
+        snapshot and is tracked separately (#890); the snapshot here only
+        removes the loader read for the lock timeout.
+        """
         if cfg_snap is None:
             cfg_snap = self._config
         async with bounded_lock(
@@ -5175,7 +5185,9 @@ class ProxyManager:
         WARNING log). A background run that was never scheduled — shed at the
         cap or during ``stop()`` — reports ``False`` / ``background_shed``
         instead (#868). Like the index stage, gate and ``_extract_and_store``
-        both read the request's ``cfg_snap`` snapshot (#871).
+        both read the request's ``cfg_snap`` snapshot (#871) — note that the
+        cached ``FactExtractor`` itself is still built once, see
+        ``_get_extractor``.
         """
         extract_ok: bool | None = None
         extract_error: str | None = None
@@ -5790,9 +5802,15 @@ class ProxyManager:
             _clean_ms = (_time.monotonic() - _t0) * 1000
 
         # ── Stages 2+3: COMPRESS (or PROGRESSIVE) + SURFACE ──
-        # Capture the scorer fallback counter BEFORE compression so the metrics
-        # record below sees a delta covering compression and everything after.
-        _pre_scorer_fb = getattr(self._relevance_scorer_for(cfg_snap), "fallback_count", 0)
+        # Capture the scorer INSTANCE (not just its counter) before compression
+        # so the metrics record below sees a delta covering compression and
+        # everything after. Re-resolving the scorer after the await could hand
+        # back a different object — a concurrent request pinned to another
+        # config generation can replace the manager's cached scorer mid-flight —
+        # and the delta would then be taken against a counter that never saw
+        # this call's compression.
+        _scorer = self._relevance_scorer_for(cfg_snap)
+        _pre_scorer_fb = getattr(_scorer, "fallback_count", 0)
         comp = await self._compress_and_surface(
             server=server,
             tool=tool,
@@ -5876,10 +5894,7 @@ class ProxyManager:
                 surfaced_chars=len(surfaced),
                 compression_strategy=metrics_strategy,
                 ratio_violation=ratio_violation,
-                scorer_fallback=(
-                    getattr(self._relevance_scorer_for(cfg_snap), "fallback_count", 0)
-                    > _pre_scorer_fb
-                ),
+                scorer_fallback=getattr(_scorer, "fallback_count", 0) > _pre_scorer_fb,
                 index_ok=index_ok,
                 index_error=index_error,
                 chunks_indexed=chunks_indexed,
