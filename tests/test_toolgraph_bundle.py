@@ -523,6 +523,58 @@ async def test_refresh_failure_under_strict_denies_the_call(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_start_threads_one_generation_into_the_bundle_refresh(tmp_path):
+    """``start()`` decides enablement, source AND refresh on ONE read.
+
+    The reload is armed at the exact moment that matters: the gate has already
+    read ``enabled``/``source`` and chosen the bundle path, and the very next
+    loader read — the one the refresh would take for itself — returns a
+    generation whose source is ``stdio``. A refresh reading live then returns
+    at its own source gate and adopts NOTHING, leaving a strict profile with
+    enforcement enabled and no verdict: worse than either branch alone, and
+    silent. Threading the gate's own read down is what makes that unreachable.
+    """
+    manager, path, tool = _manager(tmp_path, profile=ExposureProfile.STRICT)
+    _write_bundle(path, _bundle(tool, profile="strict"))
+
+    bundle_cfg = manager._config
+    stdio_cfg = bundle_cfg.model_copy(
+        update={"toolgraph": bundle_cfg.toolgraph.model_copy(update={"source": "stdio"})}
+    )
+    armed = [False]
+
+    def gated_get():
+        return stdio_cfg if armed[0] else bundle_cfg
+
+    manager._config_loader.get = gated_get
+
+    real_refresh = manager._refresh_toolgraph_bundle
+
+    def spy_refresh(**kwargs):
+        # The gate has chosen bundle; everything read from here on says stdio.
+        armed[0] = True
+        return real_refresh(**kwargs)
+
+    manager._refresh_toolgraph_bundle = spy_refresh
+
+    consulted: list[object] = []
+
+    async def spy_consult(cfg=None):
+        consulted.append(cfg)
+
+    manager._consult_toolgraph = spy_consult
+
+    await manager.start()
+
+    assert consulted == [], "the gate chose bundle; the stdio consult must not have run"
+    assert manager._toolgraph_policy_snapshot is not None, (
+        "the refresh returned without adopting — it read a generation the gate "
+        "that selected it never saw"
+    )
+    assert manager._toolgraph_degraded is False
+
+
+@pytest.mark.asyncio
 async def test_bundle_mode_loader_read_counts(tmp_path):
     """#871 read-count ceiling with bundle enforcement ON.
 

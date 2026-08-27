@@ -890,7 +890,13 @@ class ProxyManager:
         # proxy/tool_eligibility.py). Without a metrics store (metrics
         # disabled) there is no health signal and the filter runs on
         # config/structural rules alone.
-        exposure_cfg = self._config.exposure
+        # ONE read for the whole startup enforcement decision (#871). Reading
+        # ``enabled`` and ``source`` separately let a reload land between them:
+        # the gate could see enforcement ON from one generation and pick a
+        # source from another, and the refresh would then return at its own
+        # gate — leaving a strict profile enabled with no verdict at all.
+        cfg_start = self._config
+        exposure_cfg = cfg_start.exposure
         self._unhealthy_tools = compute_health_flags(self.tracker.metrics_store, exposure_cfg)
         if (
             self.tracker.metrics_store is None
@@ -908,11 +914,11 @@ class ProxyManager:
         # raises here — before any tool is advertised — which is the intended
         # loud failure (a broken/typo'd provider must not silently disable
         # enforcement).
-        if self._config.toolgraph.enabled:
-            if self._config.toolgraph.source == "bundle":
-                self._refresh_toolgraph_bundle(force=True, startup=True)
+        if cfg_start.toolgraph.enabled:
+            if cfg_start.toolgraph.source == "bundle":
+                self._refresh_toolgraph_bundle(force=True, startup=True, cfg_live=cfg_start)
             else:
-                await self._consult_toolgraph()
+                await self._consult_toolgraph(cfg_start.toolgraph)
 
     def _reject_toolgraph_bundle(
         self, exc: Exception, *, startup: bool, cfg_live: ProxyConfig | None = None
@@ -1297,7 +1303,7 @@ class ProxyManager:
                 ref_to_keys.setdefault(ref, []).append((conn.name, t.name))
         return ref_to_keys, list(ref_to_keys.keys())
 
-    async def _consult_toolgraph(self) -> None:
+    async def _consult_toolgraph(self, cfg: ToolgraphConfig | None = None) -> None:
         """Run the one-shot startup consult and cache its verdict (#465).
 
         Mirrors :func:`compute_health_flags`: consult once, hold the snapshot
@@ -1308,7 +1314,7 @@ class ProxyManager:
         :class:`ToolgraphStartupError` (out of ``start()``) before any tool is
         advertised.
         """
-        cfg = self._config.toolgraph
+        cfg = cfg if cfg is not None else self._config.toolgraph
         self._reset_toolgraph_verdict_state()
 
         ref_to_keys, refs = self._build_toolgraph_candidates(cfg)
@@ -2356,6 +2362,30 @@ class ProxyManager:
         latest = self._config_loader.current
         return latest is None or cfg is latest
 
+    def _shared_selective_cfg(
+        self,
+        server: str,
+        tool: str,
+        sel_cfg: SelectiveConfig | None,
+        cfg_snap: ProxyConfig,
+    ) -> SelectiveConfig | None:
+        """The selective config a caller may PUBLISH to the shared slots.
+
+        A superseded pin gets the live generation's value instead of its own.
+        Refusing to overwrite a populated slot is only half the guard: when the
+        slot is EMPTY a stale caller would publish its own generation, and the
+        next live request — finding a config it disagrees with — replaces and
+        closes it, stranding the read-more key the stale caller just handed to
+        its client. Publishing the live value instead makes that later request
+        a no-op, so the store the key lives in survives.
+
+        Costs one loader read, and only in the stale window; the pinned value
+        still drives everything scoped to this call.
+        """
+        if self._pin_is_live_generation(cfg_snap):
+            return sel_cfg
+        return self._resolve_tool_config(server, tool, self._config).selective
+
     def _relevance_scorer_for(self, cfg: ProxyConfig) -> "RelevanceScorer":
         """``_relevance_scorer`` against a caller-pinned config (#871).
 
@@ -2947,6 +2977,9 @@ class ProxyManager:
         cfg_snap: ProxyConfig,
     ) -> tuple[str, str | None]:
         """Return (compressed_text, llm_fallback_reason_or_None)."""
+        # Anything published to a shared, longer-lived slot below must come
+        # from the live generation when this pin has been superseded.
+        sel_cfg = self._shared_selective_cfg(server, tool, sel_cfg, cfg_snap)
         if compression == CompressionStrategy.AUTO:
             resolved = auto_select_strategy(text, max_chars=max_chars)
             logger.debug("auto_select_strategy → %s for %s/%s", resolved.value, server, tool)
@@ -2982,12 +3015,14 @@ class ProxyManager:
                 timeout=cfg_snap.lock_timeout_seconds,
                 name="selective_lock",
             ):
-                # A stale pin must not rebuild this: the compressor OWNS the
+                # A stale pin must not replace this: the compressor OWNS the
                 # pending store that later ``stm_proxy_read_more`` lookups read,
                 # so replacing it from a superseded generation closes a store
                 # whose keys were already handed to the client — they come back
                 # "not found or expired". A stale caller uses the current
-                # instance instead; only a cold cache builds unconditionally.
+                # instance. A COLD slot is still filled, but from the live
+                # value resolved above, so the next live request agrees with
+                # what is there and leaves it alone.
                 if self._selective_compressor is None or (
                     self._selective_compressor_cfg != sel_cfg
                     and self._pin_is_live_generation(cfg_snap)
@@ -3533,6 +3568,10 @@ class ProxyManager:
         cfg_snap: ProxyConfig,
     ) -> str:
         pin_is_live = self._pin_is_live_generation(cfg_snap)
+        # Cold slot: publish the LIVE value, not this pin's, so the next live
+        # request agrees with what is there instead of replacing the store the
+        # key minted below lives in.
+        sel_cfg = self._shared_selective_cfg(server, tool, sel_cfg, cfg_snap)
         store = self._get_progressive_store(sel_cfg, allow_rebuild=pin_is_live)
         if pin_is_live:
             # Eviction is STORE-WIDE, so it must never run on a superseded

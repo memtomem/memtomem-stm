@@ -18,7 +18,6 @@ through the response rather than through the loader.
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -521,64 +520,105 @@ class TestPerRequestSnapshot:
         assert mgr._relevance_scorer_instance is forward, "stale pin rebuilt the shared scorer"
         assert mgr._relevance_scorer_cfg == gen2.relevance_scorer, "stale pin restamped the cache"
 
-    async def test_stale_pin_does_not_replace_the_live_progressive_store(self, truncate_mgr):
-        """The progressive store holds live read-more keys; a stale pin must not
-        close it.
+    def _stale_and_live(self, mgr):
+        """Seed a NEWER generation so the manager's current pin reads stale.
 
-        This store outlives the request that built it — a client can come back
-        for a chunk minutes later — so a request that pinned an older
-        generation and resumed after a newer one moved the store would take the
-        newer generation's outstanding keys down with it. The symptom is not a
-        crash but a lie: ``stm_proxy_read_more`` reports "not found or expired"
-        for a key the client was handed seconds earlier.
+        Returns ``(stale_cfg, live_cfg)`` differing in the per-server
+        ``selective`` block, which is what the shared stores key their rebuild
+        decision on.
         """
         from memtomem_stm.proxy.config import SelectiveConfig
-        from memtomem_stm.proxy.progressive import ProgressiveResponse
+
+        stale = mgr._config
+        srv = stale.upstream_servers["srv"]
+        live = stale.model_copy(
+            update={
+                "upstream_servers": {
+                    "srv": srv.model_copy(update={"selective": SelectiveConfig(max_pending=77)})
+                }
+            }
+        )
+        mgr._config_loader.seed(live)
+        assert mgr._pin_is_live_generation(stale) is False, "the pin should read superseded"
+        assert mgr._pin_is_live_generation(live) is True
+        return stale, live
+
+    async def test_stale_request_key_survives_the_next_live_request(self, truncate_mgr):
+        """The end-to-end property: a key handed out under a stale pin still reads.
+
+        Refusing to overwrite a POPULATED shared slot is only half the guard.
+        On a COLD slot a stale caller would publish its own generation, and the
+        next live request — finding a config it disagrees with — would replace
+        and close that store, taking the read-more key the stale caller already
+        returned to its client with it. This drives the real
+        ``_apply_progressive`` → ``read_more`` path rather than poking the
+        store, because that is where the key's lifetime actually lives.
+        """
+        from memtomem_stm.proxy.config import ProgressiveConfig
+        from memtomem_stm.proxy.progressive import PROGRESSIVE_FOOTER_TOKEN
 
         mgr = truncate_mgr
-        gen2 = mgr._config
-        live_store = mgr._get_progressive_store()
-        live_store.put(
-            "live-key",
-            ProgressiveResponse(
-                content="chunk",
-                total_chars=5,
-                total_lines=1,
-                content_type="text",
-                structure_hint="1 lines",
-                created_at=time.monotonic(),
-            ),
+        assert mgr._progressive_store is None, "the slot must start cold"
+        stale, live = self._stale_and_live(mgr)
+
+        pcfg = ProgressiveConfig(chunk_size=2000, include_structure_hint=False)
+        text = "z" * 12000
+
+        first = mgr._apply_progressive(
+            text,
+            pcfg,
+            server="srv",
+            tool="tool",
+            sel_cfg=mgr._resolve_tool_config("srv", "tool", stale).selective,
+            cfg_snap=stale,
         )
-        assert mgr._get_progressive_store().get("live-key") is not None
+        key = next(iter(mgr._get_progressive_store()._store._data.keys()))
+        initial = len(first.split(PROGRESSIVE_FOOTER_TOKEN, 1)[0])
+        assert initial == 2000
 
-        stale = gen2.model_copy()
-        assert stale is not mgr._config_loader.current, "the pin must look superseded"
-        moved = SelectiveConfig(pending_store="sqlite")
-
-        mgr._get_progressive_store(
-            moved, allow_rebuild=mgr._pin_is_live_generation(stale)
+        # The live generation now runs the same stage.
+        mgr._apply_progressive(
+            text,
+            pcfg,
+            server="srv",
+            tool="tool",
+            sel_cfg=mgr._resolve_tool_config("srv", "tool", live).selective,
+            cfg_snap=live,
         )
 
-        assert mgr._get_progressive_store() is live_store, "a stale pin replaced the store"
-        assert mgr._get_progressive_store().get("live-key") is not None, (
-            "the live generation's outstanding read-more key was dropped"
-        )
+        chunk = mgr.read_more(key, offset=initial).split(PROGRESSIVE_FOOTER_TOKEN, 1)[0]
+        assert chunk == "z" * 2000, "the stale request's key was stranded"
 
-    async def test_stale_pin_does_not_rebuild_the_selective_compressor(self, mgr):
-        """Same rule for the selective compressor, which owns the pending store.
+    async def test_cold_shared_slot_is_published_from_the_live_generation(self, mgr):
+        """The mechanism behind the test above, on the compression path.
 
-        ``_apply_compression`` and ``_apply_hybrid`` both rebuild it from the
-        caller's pinned config; only the newest generation may publish.
+        A stale caller filling an empty slot publishes the LIVE selective
+        config, not its own, so the next live request agrees with what it finds
+        and leaves the store alone.
         """
-        from memtomem_stm.proxy.config import SelectiveConfig
+        from memtomem_stm.proxy.config import CompressionStrategy as CS
 
-        gen1 = mgr._config
-        first = mgr._rebuild_selective_compressor(SelectiveConfig(max_pending=11))
-        assert mgr._selective_compressor is first
+        assert mgr._selective_compressor is None, "the slot must start cold"
+        stale, live = self._stale_and_live(mgr)
+        live_sel = mgr._resolve_tool_config("srv", "tool", live).selective
+        stale_sel = mgr._resolve_tool_config("srv", "tool", stale).selective
+        assert stale_sel != live_sel, "the two generations must actually differ"
 
-        assert mgr._pin_is_live_generation(gen1) is True, "the pin should still be current"
-        stale = gen1.model_copy()
-        assert mgr._pin_is_live_generation(stale) is False, "a superseded pin must not publish"
+        await mgr._apply_compression(
+            "word " * 400,
+            CS.SELECTIVE,
+            200,
+            stale_sel,
+            None,
+            None,
+            "srv",
+            "tool",
+            cfg_snap=stale,
+        )
+
+        assert mgr._selective_compressor_cfg == live_sel, (
+            "a stale pin published its own generation into the shared slot"
+        )
 
     def test_threaded_helpers_require_a_snapshot(self):
         """An omitted ``cfg_snap`` must be a TypeError, not a silent live read.

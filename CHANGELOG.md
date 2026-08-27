@@ -236,8 +236,11 @@ changes inline only. See the deprecation policy in
   enforcement costs the same 2, adoption included: the gate takes ONE live read
   and threads it through the refresh, the rejection and the verdict, so that
   whole decision is one generation rather than five reads that could disagree.
-  The advertisement build and the startup Toolgraph consult each run on one
-  generation for the same reason.
+  The advertisement build runs on one generation for the same reason, and so
+  does startup: `start()` read `toolgraph.enabled` and `toolgraph.source`
+  separately with the refresh taking a third read of its own, so a reload
+  landing between them could enable a strict profile and then adopt nothing at
+  all — enforcement on, no verdict, silently.
 
   The split is by lifetime: values scoped to one call ride the snapshot, while
   persistent state whose contributing config is NOT fully represented in its
@@ -272,6 +275,13 @@ changes inline only. See the deprecation policy in
   restart-free for those per-request decisions; the pre-existing exception is
   the fact extractor, which is built once and never rebuilt, so a later
   `extraction` edit needs a restart (#890, unchanged here).
+
+  One loader change rides along because the scorer guard needs it:
+  `ProxyConfigLoader` gained a `current` accessor that answers "is this pin
+  still the newest generation" without a `stat()`, and an unseeded loader whose
+  first load hits an unparseable file now returns defaults rather than `None`.
+  That fallback still drops `MEMTOMEM_STM_PROXY__*` overrides; #897 completes
+  it. Neither is reachable from the request path, which always seeds the loader.
 
 - **Environment-override warnings now name the variables by measurement
   instead of inference** (#844, closes #843). Provenance was reconstructed
