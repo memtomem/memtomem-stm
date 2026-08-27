@@ -17,7 +17,6 @@ through the response rather than through the loader.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -194,7 +193,6 @@ async def _drain(manager: ProxyManager) -> None:
     if manager._extractor is not None:
         await manager._extractor.close()
         manager._extractor = None
-        manager._extractor_cfg = None
 
 
 class _FakeSurfacingEngine:
@@ -349,137 +347,53 @@ class TestPerRequestSnapshot:
         first = received[0]
         assert all(snap is first for snap in received), "helpers saw different config objects"
 
-    async def test_extractor_is_not_frozen_from_an_obsolete_snapshot(self, extract_mgr, tmp_path):
-        """The lazily-built FactExtractor is cached for the process, so without
-        a rebuild-on-change whichever config built it would win forever (#890).
+    async def test_extractor_is_built_from_the_requesting_snapshot(self, extract_mgr, tmp_path):
+        """Extraction and storage agree for the call that builds the extractor.
 
-        A request pins its snapshot BEFORE the upstream call, so a reload
-        landing while that call is in flight leaves the extractor built from the
-        pre-reload generation — which is correct for THAT request, since its
-        storage side used the same snapshot. What must not happen is that the
-        stale instance survives: the next request carries the new config and has
-        to rebuild, or extraction runs one generation while storage uses another
-        for the rest of the process.
+        ``_extract_and_store`` persists with the request's ``cfg_snap``, so
+        ``_get_extractor`` must construct from that same snapshot rather than a
+        fresh read — otherwise provider/limits could come from one generation
+        while namespace/dedup came from another.
+        """
+        mgr = extract_mgr
+        await mgr.call_tool("srv", "tool", {"a": 1})
+        assert mgr._extractor is not None, "extraction stage did not run"
+        assert mgr._extractor._cfg == mgr._config.extraction
+
+    async def test_extractor_is_not_rebuilt_on_config_change(self, extract_mgr, tmp_path):
+        """Pins #890's KNOWN GAP so the follow-up has a red-to-green target.
+
+        The extractor is a process-lifetime singleton with no rebuild, so an
+        edit to the extraction block needs a restart. That predates this PR and
+        is unchanged by it; a safe swap needs FactExtractor to expose a use
+        token, since callers can already be holding the instance.
         """
         import os
 
         mgr = extract_mgr
-        cfg_file = tmp_path / "proxy.json"
-        session = mgr._connections["srv"].session
-        upstream_result = session.call_tool.return_value
-
-        async def reload_config_mid_request(*_args, **_kwargs):
-            # Stands in for an operator editing stm_proxy.json while the
-            # upstream call is in flight.
-            cfg_file.write_text(
-                json.dumps(
-                    _file_config(
-                        tmp_path,
-                        compression=CompressionStrategy.TRUNCATE,
-                        extraction=True,
-                        extraction_overrides={"max_facts": 3},
-                    )
-                )
-            )
-            seen = mgr._config_loader._mtime
-            os.utime(cfg_file, (seen + 10, seen + 10))
-            return upstream_result
-
-        session.call_tool.side_effect = reload_config_mid_request
-
         await mgr.call_tool("srv", "tool", {"a": 1})
-        assert mgr._extractor is not None, "extraction stage did not run"
-        # This request pinned its snapshot before the edit, so it legitimately
-        # extracts and stores under the old generation.
+        assert mgr._extractor is not None
         assert mgr._extractor._cfg.max_facts == 10
 
-        session.call_tool.side_effect = None
+        cfg_file = tmp_path / "proxy.json"
+        cfg_file.write_text(
+            json.dumps(
+                _file_config(
+                    tmp_path,
+                    compression=CompressionStrategy.TRUNCATE,
+                    extraction=True,
+                    extraction_overrides={"max_facts": 3},
+                )
+            )
+        )
+        seen = mgr._config_loader._mtime
+        os.utime(cfg_file, (seen + 10, seen + 10))
+
         await mgr.call_tool("srv", "tool", {"b": 2})
-        assert mgr._extractor._cfg.max_facts == 3, (
-            "extractor stayed frozen on the pre-reload config"
-        )
-
-    async def test_rebuild_does_not_hold_the_lock_across_the_drain(self, extract_mgr):
-        """The superseded extractor is closed OUTSIDE _extractor_lock.
-
-        A registered LLM extraction drains for up to llm_timeout_seconds plus
-        grace, which can exceed lock_timeout_seconds — closing in place would
-        fail every concurrent request with LockTimeoutError.
-        """
-        mgr = extract_mgr
-        await mgr._get_extractor()
-        first = mgr._extractor
-        assert first is not None
-
-        released = asyncio.Event()
-
-        async def slow_close():
-            released.set()
-            await asyncio.sleep(0.2)
-
-        first.close = slow_close  # type: ignore[method-assign]
-
-        changed = mgr._config.model_copy(
-            update={"extraction": mgr._config.extraction.model_copy(update={"max_facts": 5})}
-        )
-        rebuild = asyncio.create_task(mgr._get_extractor(cfg_snap=changed))
-        await released.wait()
-
-        # The drain is in progress; the lock must already be free.
-        assert not mgr._extractor_lock.locked(), "rebuild held the lock across the drain"
-        await asyncio.wait_for(mgr._get_extractor(), timeout=0.5)
-        await asyncio.wait_for(rebuild, timeout=1.0)
-
-    async def test_cancelled_rebuild_does_not_cache_a_closed_extractor(self, extract_mgr):
-        """Publishing happens before any await, so a rebuild cancelled during
-        the drain cannot leave a closed instance cached under a matching config
-        — which would silently force every later extraction to the heuristic."""
-        mgr = extract_mgr
-        await mgr._get_extractor()
-        first = mgr._extractor
-
-        entered = asyncio.Event()
-        release = asyncio.Event()
-
-        async def blocking_close():
-            entered.set()
-            # Released in the test's finally: a close that never returns would
-            # hang the whole suite instead of failing red if this code ever
-            # regresses to closing while holding the lock.
-            await release.wait()
-
-        assert first is not None
-        first.close = blocking_close  # type: ignore[method-assign]
-
-        changed = mgr._config.model_copy(
-            update={"extraction": mgr._config.extraction.model_copy(update={"max_facts": 5})}
-        )
-        rebuild = asyncio.create_task(mgr._get_extractor(cfg_snap=changed))
-        try:
-            await asyncio.wait_for(entered.wait(), timeout=1.0)
-            rebuild.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(rebuild, timeout=1.0)
-        finally:
-            release.set()
-
-        assert mgr._extractor is not first, "cancelled rebuild left the old instance cached"
-        assert mgr._extractor_cfg is not None and mgr._extractor_cfg.max_facts == 5
-        assert mgr._extractor is not None and mgr._extractor._gate.closed is False
-
-    async def test_rebuild_refuses_to_publish_after_stop_closed_the_surface(self, extract_mgr):
-        """stop() closes the background surface, then closes the extractor. A
-        rebuild arriving after that must not install a client stop() has
-        already walked past."""
-        mgr = extract_mgr
-        await mgr._get_extractor()
-        mgr._background_closed = True
-
-        changed = mgr._config.model_copy(
-            update={"extraction": mgr._config.extraction.model_copy(update={"max_facts": 5})}
-        )
-        with pytest.raises(RuntimeError, match="stopping"):
-            await mgr._get_extractor(cfg_snap=changed)
+        # The new generation reaches ext_cfg at the call site...
+        assert mgr._config.extraction.max_facts == 3
+        # ...but not the cached extractor. When #890 lands, this flips to 3.
+        assert mgr._extractor._cfg.max_facts == 10
 
     async def test_config_edit_lands_on_the_next_request(self, mgr, tmp_path):
         """Snapshotting moves hot-reload to a request boundary; it must not

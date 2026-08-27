@@ -1005,10 +1005,6 @@ class TestExtractAndStore:
             dedup_threshold=0.9,
         )
         mgr._extractor = mock_extractor
-        # Pair the injected instance with the config it stands for:
-        # _get_extractor rebuilds when the two disagree (#890), so injecting
-        # the instance alone would have it discarded before extract() runs.
-        mgr._extractor_cfg = ext_cfg
 
         with patch.object(
             type(mgr),

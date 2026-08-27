@@ -57,7 +57,6 @@ from memtomem_stm.proxy.config import (
     CompressionStrategy,
     EnvOverlayResult,
     ExposureProfile,
-    ExtractionConfig,
     ExtractionStrategy,
     HybridConfig,
     LLMCompressorConfig,
@@ -651,7 +650,6 @@ class ProxyManager:
         self._selective_compressor_cfg: SelectiveConfig | None = None
         self._selective_lock = asyncio.Lock()
         self._extractor: FactExtractor | None = None
-        self._extractor_cfg: ExtractionConfig | None = None
         self._extractor_lock = asyncio.Lock()
         # In-memory counters for both INDEX-pipeline write paths
         # (auto_index_response + extract_and_store). Always instantiated for
@@ -2220,21 +2218,12 @@ class ProxyManager:
         if self._llm_compressor is not None:
             await self._llm_compressor.close()
             self._llm_compressor = None
-        # Under the extractor lock: _get_extractor() can now publish a
-        # REPLACEMENT mid-run (#890), so an unguarded read-close-clear here
-        # could close the old instance while a rebuild installs a new client
-        # behind it, leaking that client for the life of the process.
-        # ``_background_closed`` is already True by this point, so a rebuild
-        # that arrives after this block raises instead of publishing.
-        async with self._extractor_lock:
-            if self._extractor is not None:
-                await self._extractor.close()
-                # Null it like _llm_compressor above: _get_extractor() rebuilds
-                # on None, so a stop->start cycle gets a fresh httpx client
-                # instead of the closed instance (whose extract() asserts
-                # _client is not None).
-                self._extractor = None
-                self._extractor_cfg = None
+        if self._extractor is not None:
+            await self._extractor.close()
+            # Null it like _llm_compressor above: _get_extractor() rebuilds on
+            # None, so a stop->start cycle gets a fresh httpx client instead of
+            # the closed instance (whose extract() asserts _client is not None).
+            self._extractor = None
         # Close the #494 consult disk cache (re-opened lazily on the next start).
         # Always null the handle so a failed close cannot leave a stale closed
         # connection that the next start() would reuse.
@@ -3279,55 +3268,34 @@ class ProxyManager:
         )
 
     async def _get_extractor(self, *, cfg_snap: ProxyConfig | None = None) -> FactExtractor:
-        """The lazily-built ``FactExtractor``, constructed from whichever config
-        first reached this method.
+        """The lazily-built ``FactExtractor``, constructed from the config of
+        whichever request first reaches this method — and NOT rebuilt when
+        ``extraction`` changes afterwards (#890).
 
-        Rebuilt when ``extraction`` changes, like ``_llm_compressor`` above and
-        ``_relevance_scorer_for`` / ``_rebuild_selective_compressor`` (#890).
-        Without that, this lazily-built singleton would freeze whichever
-        generation happened to construct it: the caller persists with
-        ``cfg_snap.extraction``, so a never-rebuilt extractor would run the
-        provider/model/limits of one generation while storage used another —
-        and a reload landing mid-request would make the mismatch permanent.
+        Building from ``cfg_snap`` rather than a fresh read is what keeps the
+        request that builds it self-consistent: ``_extract_and_store`` persists
+        with the same snapshot, so extraction and storage cannot disagree about
+        provider, limits, namespace or dedup for that call.
 
-        The replacement is published under the lock and the superseded instance
-        is closed OUTSIDE it, unlike ``_llm_compressor``, which closes in place.
-        ``FactExtractor.close()`` lets callers already registered with its gate
-        RUN TO COMPLETION, draining up to ``llm_timeout_seconds`` plus grace
-        (only a call arriving after the gate closes takes the local heuristic
-        instead). That drain can outlast
-        ``lock_timeout_seconds`` and would then fail every concurrent request
-        with ``LockTimeoutError``. Publishing first also makes the swap
-        cancellation-safe: there is no await between deciding to rebuild and
-        installing the new instance, so a cancelled rebuild cannot leave a
-        CLOSED extractor cached under a matching config, silently forcing every
-        later extraction onto the heuristic.
-
-        Refuses to publish once ``stop()`` has closed the background surface, so
-        a rebuild racing shutdown cannot install a client that ``stop()`` has
-        already walked past. The extract stage records the raise as its outcome.
+        Rebuilding on change is deliberately NOT done here. It needs the
+        superseded instance to stay alive for callers already holding it, and
+        ``FactExtractor`` registers with its in-flight gate inside ``extract()``
+        rather than exposing a use token, so a safe swap means changing that
+        API — out of scope for a per-request-snapshot change. #890 carries the
+        analysis. Until then the staleness is bounded and documented rather
+        than half-solved: a config edit to the extraction block needs a
+        restart, exactly as before this PR.
         """
         if cfg_snap is None:
             cfg_snap = self._config
-        ext_cfg = cfg_snap.extraction
-        superseded: FactExtractor | None = None
         async with bounded_lock(
             self._extractor_lock,
             timeout=cfg_snap.lock_timeout_seconds,
             name="extractor_lock",
         ):
-            if self._extractor is None or self._extractor_cfg != ext_cfg:
-                if self._background_closed:
-                    raise RuntimeError("ProxyManager is stopping; extractor not rebuilt")
-                superseded = self._extractor
-                self._extractor = FactExtractor(ext_cfg)
-                self._extractor_cfg = ext_cfg
-            extractor = self._extractor
-        if superseded is not None:
-            # Outside the lock: this await is bounded by the drain ceiling, and
-            # only the request that triggered the rebuild pays it.
-            await superseded.close()
-        return extractor
+            if self._extractor is None:
+                self._extractor = FactExtractor(cfg_snap.extraction)
+            return self._extractor
 
     async def _extract_and_store(
         self,
@@ -5227,9 +5195,10 @@ class ProxyManager:
         WARNING log). A background run that was never scheduled — shed at the
         cap or during ``stop()`` — reports ``False`` / ``background_shed``
         instead (#868). Like the index stage, gate and ``_extract_and_store``
-        both read the request's ``cfg_snap`` snapshot (#871), and the cached
-        ``FactExtractor`` is rebuilt from that same snapshot when ``extraction``
-        changes (#890) — extraction and storage cannot split generations.
+        both read the request's ``cfg_snap`` snapshot (#871), so extraction and
+        storage agree for any given call. The cached ``FactExtractor`` is still
+        built once and never rebuilt, so a LATER ``extraction`` edit needs a
+        restart — pre-existing, tracked in #890.
         """
         extract_ok: bool | None = None
         extract_error: str | None = None
