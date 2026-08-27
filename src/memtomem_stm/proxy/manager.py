@@ -3040,35 +3040,32 @@ class ProxyManager:
                 timeout=cfg_snap.lock_timeout_seconds,
                 name="selective_lock",
             ):
-                # A stale pin must not replace this: the compressor OWNS the
-                # pending store that later ``stm_proxy_read_more`` lookups read,
-                # so replacing it from a superseded generation closes a store
-                # whose keys were already handed to the client — they come back
-                # "not found or expired". A stale caller uses the current
-                # instance. A COLD slot is still filled, but from the live
-                # value resolved above, so the next live request agrees with
-                # what is there and leaves it alone.
-                # Both the staleness test and the fill happen HERE, under the
-                # lock and with no await between them. Deciding before the lock
-                # leaves a window: a third generation can land while this
-                # coroutine waits, and the value it resolved as "live" is then
-                # already superseded by the time it publishes.
-                if self._selective_compressor is None:
-                    publish_cfg, publish_sel = self._publication_pair(
-                        server, tool, sel_cfg, cfg_snap
-                    )
+                # This compressor OWNS the pending store that later
+                # ``stm_proxy_read_more`` / ``stm_proxy_select_chunks`` lookups
+                # read, so the ONE rule is: every request works on the store of
+                # the newest generation, and any rebuild is therefore forward.
+                #
+                # Both failure modes come from breaking that rule in one
+                # direction or the other. Letting a superseded pin publish its
+                # own config replaces a live store and strands keys the client
+                # already holds. Making a superseded pin merely REUSE whatever
+                # is cached is no better: if that is an old-generation store,
+                # this request mints a key into one the next live request is
+                # about to close, so the key it just returned dies. Comparing
+                # the slot against the PUBLICATION generation covers both and
+                # collapses the two cases into one condition.
+                #
+                # Resolution and fill happen HERE, under the lock and with no
+                # await between them. Deciding before the lock leaves a window:
+                # a third generation can land while this coroutine waits.
+                publish_cfg, publish_sel = self._publication_pair(server, tool, sel_cfg, cfg_snap)
+                if (
+                    self._selective_compressor is None
+                    or self._selective_compressor_cfg != publish_sel
+                ):
                     sel_compressor = self._rebuild_selective_compressor(
                         publish_sel, cfg=publish_cfg
                     )
-                elif self._selective_compressor_cfg != sel_cfg and self._pin_is_live_generation(
-                    cfg_snap
-                ):
-                    # ``cfg`` for the same reason the cold fill passes one: the
-                    # scorer must come from the generation this compressor is
-                    # published under, not from a fresh read that may have
-                    # re-loaded since. Reaching here means the pin IS live, so
-                    # that generation is the pin itself.
-                    sel_compressor = self._rebuild_selective_compressor(sel_cfg, cfg=cfg_snap)
                 else:
                     sel_compressor = self._selective_compressor
                 # Pin the compressor before the lock drops: the off-thread
@@ -3368,18 +3365,12 @@ class ProxyManager:
             timeout=cfg_snap.lock_timeout_seconds,
             name="selective_lock",
         ):
-            # Same generation guard as the SELECTIVE branch, decided in the same
-            # place and for the same reason: this shares that compressor, and
-            # with it the pending store behind live TOC keys. Resolving the
-            # publication config before the lock would leave a window for a
-            # third generation to land while this coroutine waits.
-            if self._selective_compressor is None:
-                publish_cfg, publish_sel = self._publication_pair(server, tool, sel_cfg, cfg_snap)
+            # Same one rule as the SELECTIVE branch, decided in the same place
+            # and for the same reason: this shares that compressor, and with it
+            # the pending store behind live TOC keys.
+            publish_cfg, publish_sel = self._publication_pair(server, tool, sel_cfg, cfg_snap)
+            if self._selective_compressor is None or self._selective_compressor_cfg != publish_sel:
                 self._rebuild_selective_compressor(publish_sel, cfg=publish_cfg)
-            elif self._selective_compressor_cfg != sel_cfg and self._pin_is_live_generation(
-                cfg_snap
-            ):
-                self._rebuild_selective_compressor(sel_cfg, cfg=cfg_snap)
 
             sel_compressor = self._selective_compressor
             compressor = HybridCompressor(
@@ -3581,20 +3572,16 @@ class ProxyManager:
         return ProgressiveStoreAdapter(store)
 
     def _get_progressive_store(
-        self,
-        sel_cfg: SelectiveConfig | None = None,
-        *,
-        allow_rebuild: bool = True,
+        self, sel_cfg: SelectiveConfig | None = None
     ) -> ProgressiveStoreAdapter:
         """The shared progressive store, rebuilt when *sel_cfg* moved it.
 
-        ``allow_rebuild=False`` is the stale-pin guard: this store holds the
-        chunks behind every outstanding ``stm_proxy_read_more`` key, so a
-        request whose pinned config has already been superseded must not close
-        it and take the newer generation's live keys with it.
+        Callers that mint keys pass the PUBLICATION config (see
+        ``_publication_pair``), never a superseded pin's own value, so every
+        rebuild reached from here moves the store forward.
         """
         if self._progressive_store is None or (
-            allow_rebuild and sel_cfg is not None and sel_cfg != self._progressive_store_cfg
+            sel_cfg is not None and sel_cfg != self._progressive_store_cfg
         ):
             # Build the replacement BEFORE closing the old one (#583): if the new
             # SQLite store fails to open this raises with the old adapter still
@@ -3625,9 +3612,14 @@ class ProxyManager:
         # key minted below lives in. Decision and fill are one synchronous run
         # — no await between them — so nothing can move the generation in
         # between the way it can across a lock acquisition.
+        # Same one rule as the compressor slots: the key minted below must land
+        # in the store of the NEWEST generation, so the comparison is against
+        # the publication config and any rebuild is forward. Reusing whatever
+        # is cached would let a superseded pin write into a store the next live
+        # request is about to close — the key would be returned and then die.
         pin_is_live = self._pin_is_live_generation(cfg_snap)
         _publish_cfg, publish_sel = self._publication_pair(server, tool, sel_cfg, cfg_snap)
-        store = self._get_progressive_store(publish_sel, allow_rebuild=pin_is_live)
+        store = self._get_progressive_store(publish_sel)
         if pin_is_live:
             # Eviction is STORE-WIDE, so it must never run on a superseded
             # policy: a stale pin carrying a smaller ``max_stored`` (or a

@@ -254,16 +254,23 @@ changes inline only. See the deprecation policy in
   evaluating it against a pinned profile lets a request walk past a withhold
   that state had just recorded.
 
-  Shared components that OUTLIVE the request are written only by the caller
-  holding the newest generation. A request whose pinned config has already been
-  superseded still gets a component built from it, but does not publish it, so
-  interleaved requests cannot rebuild a singleton backward. This covers the
-  relevance scorer, the selective compressor and the progressive store — the
-  last two hold the chunks behind every outstanding `stm_proxy_read_more` key,
-  and replacing one from a superseded generation closed a store whose keys the
-  client already had, so the next `read_more` reported them "not found or
-  expired". Store-wide eviction is likewise refused to a superseded pin, which
-  could otherwise delete the current generation's live keys.
+  Shared components that OUTLIVE the request need their own rule. The relevance
+  scorer is written only by the caller holding the newest generation: a request
+  whose pin has been superseded still gets a scorer built from its own config
+  but does not publish it, so interleaved requests cannot rebuild that
+  singleton backward.
+
+  The selective compressor and the progressive store need a stronger one,
+  because they hold the chunks behind every outstanding `stm_proxy_read_more`
+  and `stm_proxy_select_chunks` key: every request now works on the store of
+  the NEWEST generation, so a rebuild is always forward. Both directions were
+  wrong on their own. Letting a superseded pin publish its own config replaced
+  a live store and stranded keys the client already held. Merely reusing
+  whatever was cached was no better: when that is an older generation's store,
+  the request mints its key there and the next live request closes it, so the
+  key is returned and then reports "not found or expired". Store-wide eviction
+  is still refused to a superseded pin, which carries a policy that could
+  delete the current generation's live keys.
 
   A request stays on the 2-read baseline even when it constructs the selective
   compressor: the build publishes under one resolved generation and takes its

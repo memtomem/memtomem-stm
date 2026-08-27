@@ -245,7 +245,7 @@ def truncate_mgr(tmp_path):
 
 
 class TestPerRequestSnapshot:
-    async def test_one_loader_read_per_call_tool(self, mgr):
+    async def test_two_loader_reads_per_call_tool(self, mgr):
         """The whole request — policy gate, ranking, cache lookup, and every
         pipeline stage — runs off a single snapshot.
 
@@ -277,7 +277,7 @@ class TestPerRequestSnapshot:
         assert calls[0] == 2, f"expected the 2-read baseline, got {calls[0]}"
         assert mgr._selective_compressor is not None
 
-    async def test_one_loader_read_on_the_cache_hit_path(self, truncate_mgr):
+    async def test_cache_hit_path_stays_on_the_two_read_baseline(self, truncate_mgr):
         """The hit path re-applies surfacing and so reads config of its own;
         it must ride the same single snapshot."""
         mgr = truncate_mgr
@@ -633,6 +633,53 @@ class TestPerRequestSnapshot:
 
         chunk = mgr.read_more(key, offset=initial).split(PROGRESSIVE_FOOTER_TOKEN, 1)[0]
         assert chunk == "z" * 2000, "the stale request's key was stranded"
+
+    async def test_stale_request_key_survives_a_warm_old_store(self, truncate_mgr):
+        """The warm case of the same rule: a stale pin must not write into a
+        store that is about to be closed.
+
+        Refusing to let a superseded pin REPLACE the store fixes one direction
+        and breaks the other if it then reuses whatever is cached: when the
+        cached store belongs to an older generation, the stale request mints
+        its key there and the next live request closes it, so the key it just
+        handed to the client dies. Every request works on the newest
+        generation's store, which makes both directions safe.
+        """
+        from memtomem_stm.proxy.config import ProgressiveConfig
+        from memtomem_stm.proxy.progressive import PROGRESSIVE_FOOTER_TOKEN
+
+        mgr = truncate_mgr
+        stale, live = self._stale_and_live(mgr)
+        pcfg = ProgressiveConfig(chunk_size=2000, include_structure_hint=False)
+        text = "z" * 12000
+
+        # Warm the slot under the STALE generation's store, the way a request
+        # that ran before the reload would have left it.
+        mgr._get_progressive_store(mgr._resolve_tool_config("srv", "tool", stale).selective)
+        assert mgr._progressive_store is not None
+
+        first = mgr._apply_progressive(
+            text,
+            pcfg,
+            server="srv",
+            tool="tool",
+            sel_cfg=mgr._resolve_tool_config("srv", "tool", stale).selective,
+            cfg_snap=stale,
+        )
+        key = next(iter(mgr._get_progressive_store()._store._data.keys()))
+        initial = len(first.split(PROGRESSIVE_FOOTER_TOKEN, 1)[0])
+
+        mgr._apply_progressive(
+            text,
+            pcfg,
+            server="srv",
+            tool="tool",
+            sel_cfg=mgr._resolve_tool_config("srv", "tool", live).selective,
+            cfg_snap=live,
+        )
+
+        chunk = mgr.read_more(key, offset=initial).split(PROGRESSIVE_FOOTER_TOKEN, 1)[0]
+        assert chunk == "z" * 2000, "the stale request minted its key into a doomed store"
 
     async def test_cold_shared_slot_is_published_from_the_live_generation(self, mgr):
         """The mechanism behind the test above, on the compression path.
