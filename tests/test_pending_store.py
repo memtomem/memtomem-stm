@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -95,9 +96,9 @@ class TestInMemoryPendingStore:
         assert len(store) == 0
 
     def test_reput_refreshes_recency_for_eviction(self):
-        # A re-put key must count as the NEWEST entry (SQLite: INSERT OR
-        # REPLACE rewrites created_at). A duplicate _order entry used to make
-        # evict_oldest pop the re-put key first — dropping the fresh data.
+        # A re-put key must count as the NEWEST entry (SQLite: the re-put takes
+        # the next ``seq``). A duplicate _order entry used to make evict_oldest
+        # pop the re-put key first — dropping the fresh data.
         store = InMemoryPendingStore()
         store.put("k1", _make_selection())
         store.put("k2", _make_selection())
@@ -108,8 +109,9 @@ class TestInMemoryPendingStore:
         assert fresh is not None and fresh.chunks == {"sec": "fresh"}
 
     def test_touch_moves_key_to_back_of_eviction_order(self):
-        # touch() refreshes created_at; eviction order must follow (SQLite
-        # orders by created_at), else a just-touched entry is dropped first.
+        # touch() marks a key most-recent; eviction order must follow (SQLite
+        # gives it the next ``seq``), else a just-touched entry is dropped
+        # first.
         store = InMemoryPendingStore()
         store.put("k1", _make_selection())
         store.put("k2", _make_selection())
@@ -194,13 +196,18 @@ class TestSQLitePendingStore:
         store.close()
 
     def test_evict_oldest(self, tmp_path):
+        # No sleep between puts: eviction ranks rows by insertion order rather
+        # than by their timestamps (#901), so which keys survive does not
+        # consult the clock at all and five rapid puts are deterministic
+        # everywhere. Asserting WHICH ones — not just how many — is what makes
+        # this an ordering test rather than a counting one.
         store = self._make_store(tmp_path)
         for i in range(5):
             store.put(f"k{i}", _make_selection())
-            time.sleep(0.01)  # ensure different timestamps
         assert len(store) == 5
         store.evict_oldest(max_size=2)
         assert len(store) == 2
+        assert {k for k in (f"k{i}" for i in range(5)) if store.get(k) is not None} == {"k3", "k4"}
         store.close()
 
     def test_persistence_across_reopen(self, tmp_path):
@@ -773,8 +780,13 @@ class TestLoneSurrogateDefenseInDepth:
         store = SQLitePendingStore(tmp_path / "p.db")
         store.initialize()
         try:
+            # Columns named, not positional: such a row comes from outside this
+            # class by definition, so it is written the way an external writer
+            # would — and it leaves ``seq`` unset, which is also what a process
+            # running the pre-#901 code would do.
             store._get_db().execute(
-                "INSERT OR REPLACE INTO pending_selections VALUES (?,?,?,?,?)",
+                "INSERT OR REPLACE INTO pending_selections "
+                "(key, chunks_json, format, created_at, total_chars) VALUES (?,?,?,?,?)",
                 ("k", '{"sec": "x\\ud800y"}', "markdown", time.time(), 10),
             )
             store._get_db().commit()
@@ -796,6 +808,543 @@ class TestLoneSurrogateDefenseInDepth:
             store.put("k", _make_selection(chunks))
             got = store.get("k")
             assert got is not None and got.chunks == chunks
+        finally:
+            store.close()
+
+
+# ── eviction ranks rows by operation order, not by the clock (#901) ────
+
+
+def _tie_all_created_at(store: SQLitePendingStore, value: float = 1000.0) -> None:
+    """Give every row the same timestamp, the way a coarse clock does.
+
+    Rows written inside one clock tick carry the same wall-clock ``created_at``
+    in production — the state PR #900's Windows runner hit. Writing it
+    explicitly makes the tests reach that state on any platform instead of
+    hoping the local clock is coarse enough to produce it, and it removes the
+    timestamp as a possible explanation for the survivors: what is left to
+    decide them is the operation order.
+    """
+    store._get_db().execute("UPDATE pending_selections SET created_at = ?", (value,))
+    store._get_db().commit()
+
+
+class TestSQLiteEvictionOrder:
+    """The SQLite twins of the in-memory ordering pins.
+
+    ``InMemoryPendingStore`` has kept an explicit ``_order`` deque all along and
+    is pinned by three tests above; the SQLite backend had no equivalents, which
+    is how it shipped ordering by ``created_at`` — a clock reading standing in
+    for the operation order it was meant to express.
+    """
+
+    def _store(self, tmp_path: Path) -> SQLitePendingStore:
+        store = SQLitePendingStore(tmp_path / "pending.db")
+        store.initialize()
+        return store
+
+    def _survivors(self, store: SQLitePendingStore, keys: tuple[str, ...]) -> set[str]:
+        return {k for k in keys if store.get(k) is not None}
+
+    def test_reput_counts_as_newest(self, tmp_path: Path):
+        """Twin of test_reput_refreshes_recency_for_eviction."""
+        store = self._store(tmp_path)
+        try:
+            store.put("k1", _make_selection())
+            store.put("k2", _make_selection())
+            store.put("k1", _make_selection({"sec": "fresh"}))
+            _tie_all_created_at(store)
+
+            store.evict_oldest(max_size=1)
+
+            assert store.get("k2") is None
+            fresh = store.get("k1")
+            assert fresh is not None and fresh.chunks == {"sec": "fresh"}
+        finally:
+            store.close()
+
+    def test_touch_counts_as_newest(self, tmp_path: Path):
+        """Twin of test_touch_moves_key_to_back_of_eviction_order — and the
+        reason ordering on rowid was not enough on its own.
+
+        ``touch`` used to be an UPDATE, which keeps the row's rowid. A key that
+        a reader had just selected would then rank as the LEAST recent row in
+        the store and be the first evicted — the opposite of what touching a key
+        means, and of what the in-memory backend does. Three keys with
+        ``max_size=2`` separates the two orders: only a backend that treats the
+        touched key as newest keeps k1 alongside k3.
+        """
+        store = self._store(tmp_path)
+        try:
+            for k in ("k1", "k2", "k3"):
+                store.put(k, _make_selection())
+            store.touch("k1")
+            _tie_all_created_at(store)
+
+            store.evict_oldest(max_size=2)
+
+            assert self._survivors(store, ("k1", "k2", "k3")) == {"k1", "k3"}
+        finally:
+            store.close()
+
+    def test_delete_then_reput_counts_as_newest(self, tmp_path: Path):
+        """Twin of test_delete_then_reput_does_not_leave_stale_order_entry."""
+        store = self._store(tmp_path)
+        try:
+            store.put("k1", _make_selection())
+            store.delete("k1")
+            store.put("k2", _make_selection())
+            store.put("k1", _make_selection({"sec": "fresh"}))
+            _tie_all_created_at(store)
+
+            store.evict_oldest(max_size=1)
+
+            assert store.get("k2") is None
+            assert store.get("k1") is not None
+        finally:
+            store.close()
+
+    def test_a_backward_clock_step_does_not_reorder_recency(self, tmp_path: Path):
+        """Recency is the order operations happened in, not what the clock said.
+
+        The wall clock can move backward — an NTP correction, a manual set, a
+        container starting with a skewed clock against a store shared with a
+        host whose clock is right. A later write then carries a SMALLER
+        ``created_at`` than an earlier one, so ordering on the timestamp ranks
+        it as the older row and the trim discards the key just written. A
+        tiebreak behind ``created_at`` does not help: the timestamps differ, so
+        the tiebreak is never consulted.
+        """
+        store = self._store(tmp_path)
+        try:
+            store.put("first_write", _make_selection())
+            store.put("second_write", _make_selection())
+            # The second write's clock reading lands before the first's.
+            store._get_db().execute(
+                "UPDATE pending_selections SET created_at = ? WHERE key = ?",
+                (2000.0, "first_write"),
+            )
+            store._get_db().execute(
+                "UPDATE pending_selections SET created_at = ? WHERE key = ?",
+                (1000.0, "second_write"),
+            )
+            store._get_db().commit()
+
+            store.evict_oldest(max_size=1)
+
+            assert store.get("second_write") is not None, (
+                "the later write was evicted because the clock had stepped back"
+            )
+            assert store.get("first_write") is None
+        finally:
+            store.close()
+
+    def test_a_just_published_key_is_never_the_one_discarded(self, tmp_path: Path):
+        """The #900 failure, reduced. Its Windows runner published a selection
+        into a store at ``max_pending``, the new row tied with an older one, and
+        the trim discarded the key the compress had just returned to the client.
+        """
+        store = self._store(tmp_path)
+        try:
+            for i in range(3):
+                store.put(f"filler{i}", _make_selection())
+            store.put("published", _make_selection())
+            _tie_all_created_at(store)
+
+            store.evict_oldest(max_size=2)
+
+            assert store.get("published") is not None, (
+                "the trim discarded the key that was just handed to the client"
+            )
+        finally:
+            store.close()
+
+    def test_both_backends_agree_on_the_survivors(self, tmp_path: Path):
+        """The contract belongs to the Protocol, not to one implementation:
+        the same sequence must keep the same keys on either backend.
+
+        Three keys and ``max_size=2``, not two and one: with a single survivor
+        the untied backend can agree by luck — the touched key happens to sit
+        where an arbitrary tie order leaves it — and the test would pass against
+        the defect it exists to catch.
+        """
+        sqlite_store = self._store(tmp_path)
+        memory_store = InMemoryPendingStore()
+        try:
+            for store in (sqlite_store, memory_store):
+                for k in ("a", "b", "c"):
+                    store.put(k, _make_selection())
+                store.touch("a")
+            _tie_all_created_at(sqlite_store)
+
+            for store in (sqlite_store, memory_store):
+                store.evict_oldest(max_size=2)
+
+            keys = ("a", "b", "c")
+            assert self._survivors(sqlite_store, keys) == {"a", "c"}
+            assert {k for k in keys if memory_store.get(k) is not None} == {"a", "c"}
+        finally:
+            sqlite_store.close()
+
+    def test_an_existing_database_upgrades_in_place(self, tmp_path: Path):
+        """A store written before ``seq`` existed must keep working, and its
+        rows must keep the order they were written in — ``rowid`` carries that,
+        so the migration seeds from it rather than leaving the column NULL."""
+        db_path = tmp_path / "pending.db"
+        self._legacy_db(db_path, ("old1", "old2", "old3"))
+
+        store = SQLitePendingStore(db_path)
+        store.initialize()
+        try:
+            assert store.get("old1") is not None, "the upgrade lost a row"
+            seqs = dict(store._get_db().execute("SELECT key, seq FROM pending_selections"))
+            assert all(v is not None for v in seqs.values()), "rows were left unranked"
+            assert seqs["old1"] < seqs["old2"] < seqs["old3"], "write order was not preserved"
+
+            store.put("new", _make_selection())
+            store.evict_oldest(max_size=2)
+
+            assert self._survivors(store, ("old1", "old2", "old3", "new")) == {"old3", "new"}
+        finally:
+            store.close()
+
+    def _legacy_db(self, db_path: Path, keys: tuple[str, ...]) -> None:
+        """A database as the pre-#901 code left it: five columns, no ``seq``."""
+        legacy = sqlite3.connect(str(db_path))
+        legacy.execute(
+            """CREATE TABLE pending_selections (
+                key TEXT PRIMARY KEY,
+                chunks_json TEXT NOT NULL,
+                format TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                total_chars INTEGER NOT NULL
+            )"""
+        )
+        for k in keys:
+            legacy.execute(
+                "INSERT INTO pending_selections VALUES (?,?,?,?,?)",
+                (k, '{"sec": "x"}', "markdown", 1000.0, 1),
+            )
+        legacy.commit()
+        legacy.close()
+
+    def test_concurrent_openers_leave_one_consistent_schema(self, tmp_path: Path):
+        """Four openers against one legacy file: none errors, every row ends up
+        ranked, and the ranks stay unique as they then write through their own
+        connections.
+
+        Scope note: this does NOT deterministically reproduce the interleaving
+        that makes the migration's atomicity load-bearing — it passes against a
+        detect-then-write migration too, because the threads rarely land inside
+        the window. The atomicity itself is pinned by
+        ``test_migration_runs_in_one_immediate_transaction`` below; this test
+        covers the outcome an operator sees.
+        """
+        db_path = tmp_path / "pending.db"
+        self._legacy_db(db_path, ("old1", "old2"))
+
+        stores = [SQLitePendingStore(db_path) for _ in range(4)]
+        errors: list[BaseException] = []
+        barrier = threading.Barrier(len(stores))
+
+        def opener(store: SQLitePendingStore) -> None:
+            try:
+                barrier.wait(timeout=10)
+                store.initialize()
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=opener, args=(s,)) for s in stores]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        try:
+            assert not errors, f"concurrent initialize() raised: {errors}"
+
+            ranks = [
+                row[0] for row in stores[0]._get_db().execute("SELECT seq FROM pending_selections")
+            ]
+            assert all(r is not None for r in ranks), "a row was left unranked"
+            assert len(set(ranks)) == len(ranks), f"duplicate ranks after the race: {ranks}"
+
+            # Writes through the different connections must keep minting
+            # distinct, increasing ranks.
+            for i, store in enumerate(stores):
+                store.put(f"new{i}", _make_selection())
+            all_ranks = [
+                row[0] for row in stores[0]._get_db().execute("SELECT seq FROM pending_selections")
+            ]
+            assert len(set(all_ranks)) == len(all_ranks), f"duplicate ranks: {all_ranks}"
+        finally:
+            for store in stores:
+                store.close()
+
+    def test_migration_runs_in_one_immediate_transaction(self, tmp_path: Path):
+        """Detect, ALTER and backfill must be one write transaction, acquired
+        before the schema check.
+
+        Two openers that each merely *check* for the column can both find it
+        missing and race the ALTER; and a writer landing between another's ALTER
+        and its backfill gets a rank the backfill then overwrites with a
+        rowid-derived one, colliding with a rank already handed out. Taking the
+        write lock ahead of the check closes both.
+
+        Pinned by recording the statements the migration issues, because the
+        interleaving itself cannot be provoked deterministically from threads:
+        the order and the transaction boundaries are the guarantee, so those are
+        what this asserts.
+        """
+        db_path = tmp_path / "pending.db"
+        self._legacy_db(db_path, ("old1",))
+
+        statements: list[str] = []
+        real_connect = sqlite3.connect
+
+        def recording_connect(*args, **kwargs):
+            conn = real_connect(*args, **kwargs)
+            conn.set_trace_callback(lambda sql: statements.append(" ".join(sql.split())))
+            return conn
+
+        store = SQLitePendingStore(db_path)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(sqlite3, "connect", recording_connect)
+            store.initialize()
+        try:
+
+            def index_of(prefix: str) -> int:
+                matches = [i for i, s in enumerate(statements) if s.startswith(prefix)]
+                assert matches, f"no {prefix!r} statement in {statements}"
+                return matches[0]
+
+            begin = index_of("BEGIN IMMEDIATE")
+            alter = index_of("ALTER TABLE")
+            backfill = index_of("UPDATE pending_selections SET seq")
+            checks = [i for i, s in enumerate(statements) if s.startswith("PRAGMA table_info")]
+            assert len(checks) >= 2, (
+                "the column must be checked twice — cheaply before the lock, "
+                f"then authoritatively under it: {statements}"
+            )
+            assert any(begin < c < alter for c in checks), (
+                "no schema check ran between taking the write lock and the "
+                "ALTER, so an opener that waited for the lock while another "
+                "migrated the file would migrate it a second time"
+            )
+            assert alter < backfill, (
+                f"unexpected migration order: {statements[begin : backfill + 1]}"
+            )
+            # Order alone is not the guarantee: BEGIN, ALTER, COMMIT, backfill
+            # has the right order and still leaves the backfill outside the
+            # transaction. The span from BEGIN to the backfill must contain no
+            # end-of-transaction at all, and the commit must come after it.
+            span = statements[begin:backfill]
+            assert not [s for s in span if s.startswith(("COMMIT", "ROLLBACK", "END"))], (
+                f"the transaction ended before the backfill: {span}"
+            )
+            assert any(s.startswith("COMMIT") for s in statements[backfill:]), (
+                "the migration never committed"
+            )
+            assert store.get("old1") is not None
+        finally:
+            store.close()
+
+    def test_an_already_migrated_file_opens_without_the_write_lock(self, tmp_path: Path):
+        """Opening is not always a write.
+
+        ``select_chunks`` and ``read_more`` open throwaway stores purely to
+        probe for a key. Taking the write lock on every open to discover that
+        no migration is needed makes those probes wait out — or fail behind —
+        an unrelated writer, which is a cost the migration has no business
+        imposing once it has run. The column check has to be cheap first and
+        locked only when it finds work.
+        """
+        db_path = tmp_path / "pending.db"
+        SQLitePendingStore(db_path).initialize()  # first open migrates
+
+        statements: list[str] = []
+        real_connect = sqlite3.connect
+
+        def recording_connect(*args, **kwargs):
+            conn = real_connect(*args, **kwargs)
+            conn.set_trace_callback(lambda sql: statements.append(" ".join(sql.split())))
+            return conn
+
+        store = SQLitePendingStore(db_path)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(sqlite3, "connect", recording_connect)
+            store.initialize()
+        try:
+            assert not [s for s in statements if s.startswith("BEGIN")], (
+                f"a routine open took the write lock: {statements}"
+            )
+            assert store.get("missing") is None
+        finally:
+            store.close()
+
+    def test_a_failed_backfill_leaves_the_old_schema(self, tmp_path: Path):
+        """The other half of atomicity: if the backfill fails, the ALTER must go
+        with it rather than leaving a column the rows were never ranked into.
+
+        A trigger on the legacy table makes the backfill's UPDATE abort. SQLite
+        rolls DDL back with the rest of the transaction, so the file must come
+        back out as it went in — five columns, rows intact — and the next open
+        must be able to migrate it for real.
+        """
+        db_path = tmp_path / "pending.db"
+        self._legacy_db(db_path, ("old1", "old2"))
+        setup = sqlite3.connect(str(db_path))
+        setup.execute(
+            "CREATE TRIGGER fail_backfill BEFORE UPDATE ON pending_selections "
+            "BEGIN SELECT RAISE(ABORT, 'backfill blocked'); END"
+        )
+        setup.commit()
+        setup.close()
+
+        with pytest.raises(sqlite3.Error):
+            SQLitePendingStore(db_path).initialize()
+
+        after = sqlite3.connect(str(db_path))
+        try:
+            columns = [row[1] for row in after.execute("PRAGMA table_info(pending_selections)")]
+            assert "seq" not in columns, f"a half-migrated schema was left behind: {columns}"
+            assert after.execute("SELECT COUNT(*) FROM pending_selections").fetchone()[0] == 2
+            after.execute("DROP TRIGGER fail_backfill")
+            after.commit()
+        finally:
+            after.close()
+
+        store = SQLitePendingStore(db_path)
+        store.initialize()
+        try:
+            ranks = [
+                row[0] for row in store._get_db().execute("SELECT seq FROM pending_selections")
+            ]
+            assert all(r is not None for r in ranks), "the retry did not migrate the file"
+        finally:
+            store.close()
+
+    def test_an_upgraded_file_rejects_the_older_writer(self, tmp_path: Path):
+        """The documented cost of the new column, pinned rather than assumed.
+
+        A process still on the pre-#901 code inserts positionally into five
+        columns, which the upgraded six-column table refuses. That is why
+        instances sharing a ``pending_store_path`` have to be upgraded
+        together. Its reads and its expiry sweep keep working, so an upgrade
+        does not strand a key that is already out.
+        """
+        store = self._store(tmp_path)
+        try:
+            store.put("k", _make_selection())
+            old = sqlite3.connect(str(tmp_path / "pending.db"))
+            try:
+                with pytest.raises(sqlite3.OperationalError, match="6 columns but 5 values"):
+                    old.execute(
+                        "INSERT OR REPLACE INTO pending_selections VALUES (?,?,?,?,?)",
+                        ("legacy", '{"sec": "x"}', "markdown", 1000.0, 1),
+                    )
+                # Reads and the expiry sweep are unaffected.
+                assert (
+                    old.execute(
+                        "SELECT chunks_json FROM pending_selections WHERE key = ?", ("k",)
+                    ).fetchone()
+                    is not None
+                )
+                old.execute("DELETE FROM pending_selections WHERE created_at < ?", (0.0,))
+                old.commit()
+            finally:
+                old.close()
+            assert store.get("k") is not None
+        finally:
+            store.close()
+
+    def test_touch_does_not_rewrite_the_payload(self, tmp_path: Path):
+        """``touch`` must re-rank a row without rewriting its payload.
+
+        Progressive keeps an entire response body in ``chunks_json`` and
+        ``read_more`` touches the row once per chunk, so a re-rank that rewrote
+        the payload would rewrite the whole response on every chunk: 3956 ms
+        against 461 ms for a 2 MB response read in 4 KB chunks.
+
+        Four guards, because each alone is passable and each covers a shape the
+        others miss:
+
+        - ``UPDATE OF chunks_json`` catches an in-place rewrite —
+          ``SET chunks_json = chunks_json`` costs the same as a real one and
+          keeps the rowid, so the rowid check would not see it;
+        - ``BEFORE DELETE`` catches an explicit delete-and-reinsert, which
+          ``UPDATE OF`` does not fire on and which the rowid check can miss:
+          on a sole row SQLite hands the reinsert the same rowid back;
+        - ``BEFORE INSERT`` catches ``INSERT OR REPLACE``, whose implicit
+          delete does NOT fire the DELETE trigger while ``recursive_triggers``
+          is off (the default), and which can carry the rowid forward;
+        - the rowid check catches a reinsert that lands somewhere else.
+        """
+        store = self._store(tmp_path)
+        try:
+            store.put("other", _make_selection())
+            store.put("k", _make_selection({"__content__": "x" * 50_000}))
+            store._get_db().execute(
+                "CREATE TRIGGER no_payload_write BEFORE UPDATE OF chunks_json "
+                "ON pending_selections BEGIN "
+                "SELECT RAISE(ABORT, 'touch rewrote chunks_json'); END"
+            )
+            store._get_db().execute(
+                "CREATE TRIGGER no_row_delete BEFORE DELETE ON pending_selections "
+                "WHEN OLD.key = 'k' BEGIN "
+                "SELECT RAISE(ABORT, 'touch deleted and reinserted the row'); END"
+            )
+            # Created last, so the fixture rows above are already in: any write
+            # that re-inserts this key aborts here. INSERT OR REPLACE is the
+            # reason it is needed — with recursive_triggers off (the default)
+            # its implicit delete does NOT fire the DELETE trigger, and a
+            # replacement that carries the rowid forward keeps the rowid check
+            # happy too, so this is the only guard that sees it.
+            store._get_db().execute(
+                "CREATE TRIGGER no_row_insert BEFORE INSERT ON pending_selections "
+                "WHEN NEW.key = 'k' BEGIN "
+                "SELECT RAISE(ABORT, 'touch re-inserted the row'); END"
+            )
+            before = (
+                store._get_db()
+                .execute("SELECT rowid FROM pending_selections WHERE key = ?", ("k",))
+                .fetchone()[0]
+            )
+
+            store.touch("k")
+
+            after = (
+                store._get_db()
+                .execute("SELECT rowid FROM pending_selections WHERE key = ?", ("k",))
+                .fetchone()[0]
+            )
+            assert after == before, "touch replaced the row instead of updating it in place"
+        finally:
+            store.close()
+
+    def test_touch_preserves_the_row(self, tmp_path: Path):
+        """``touch`` rewrites two narrow columns; the payload it carries must
+        come through unchanged, and a missing key must stay a no-op."""
+        store = self._store(tmp_path)
+        try:
+            chunks = {"sec": "서버 🚀 payload"}
+            store.put("k1", _make_selection(chunks))
+            before = store.get("k1")
+            assert before is not None
+
+            store.touch("k1")
+            store.touch("absent")
+
+            after = store.get("k1")
+            assert after is not None
+            assert after.chunks == chunks
+            assert after.format == before.format
+            assert after.total_chars == before.total_chars
+            # Deliberately NOT asserting the timestamp advanced: this change
+            # exists because the wall clock can move backward, so a test that
+            # required it to move forward would contradict its own premise and
+            # flake on an NTP correction. That touch re-ranks the row is
+            # asserted through eviction, not through the clock.
+            assert len(store) == 1, "touching an absent key must not create a row"
         finally:
             store.close()
 
@@ -894,17 +1443,12 @@ class TestSupersededEvictionPolicy:
         here G2's tight ``max_pending`` has to bite on its own store."""
         g1, g2 = self._shared_pair(tmp_path, old_max=100, live_max=2)
         try:
-            # Eviction orders by ``created_at`` alone, which the store stamps
-            # with wall time. Three rapid puts can therefore tie on a coarse
-            # clock (~15.6 ms on Windows) and make WHICH rows survive arbitrary,
-            # so the ages are written explicitly rather than raced for.
+            # Plain puts: eviction ranks rows by the order they were written
+            # (#901), so these three and the key published below have a defined
+            # order without any clock manipulation. What is under test here is
+            # WHOSE policy runs, not how the order is derived.
             for i in range(3):
                 g2._store.put(f"live{i}", _make_selection())
-                g2._store._get_db().execute(
-                    "UPDATE pending_selections SET created_at = ? WHERE key = ?",
-                    (time.time() - (30 - i), f"live{i}"),
-                )
-            g2._store._get_db().commit()
 
             key = json.loads(g1.compress("## S\n" + "s" * 400, max_chars=200))["selection_key"]
 
@@ -945,16 +1489,11 @@ class TestSupersededEvictionPolicy:
         comp = SelectiveCompressor(max_pending=1, store=store)
         try:
             store.put("old", _make_selection())
-            # Age the row explicitly. Eviction orders on wall-clock
-            # ``created_at`` with no tie-breaker (#901), so on a coarse clock
-            # this row and the one published below can tie and the trim can
-            # discard EITHER — including the key just handed to the caller.
-            # Observed on the Windows runner (~15.6 ms granularity).
-            store._get_db().execute(
-                "UPDATE pending_selections SET created_at = ? WHERE key = ?",
-                (time.time() - 30, "old"),
-            )
-            store._get_db().commit()
+            # No clock manipulation: this row is written before the compress
+            # publishes its key, and eviction now ranks on that order (#901).
+            # The explicit ageing this used to need was a workaround for the
+            # tie that made it fail on the Windows runner, where the trim could
+            # discard the key just handed to the caller.
             key = json.loads(comp.compress("## S\n" + "s" * 400, max_chars=200))["selection_key"]
             assert store.get("old") is None, "max_pending stopped being enforced"
             assert store.get(key) is not None

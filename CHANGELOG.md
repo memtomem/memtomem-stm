@@ -341,6 +341,86 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **Pending eviction no longer discards a key just handed to a client** (#902,
+  issue #901). `SQLitePendingStore.evict_oldest` ranked rows by `created_at`,
+  which is a wall-clock reading standing in for the order the operations
+  actually happened in. It fails as a stand-in twice over. Rows written inside
+  one clock tick carry the same value, and SQLite leaves the order among equal
+  keys unspecified, so which rows survived a trim was arbitrary — and the loser
+  could be the selection a compress had just returned, handing a client a key
+  that reported `not found or expired` on first use. `max_pending` is small by
+  default, so a burst of compressions against one store is enough; no config
+  change or restart is involved, and #900's Windows CI run reproduced it. The
+  wall clock can also step *backward* — an NTP correction, or a shared store
+  whose writers' clocks disagree — which ranks a later write as the older row
+  even with a tiebreak behind the timestamp.
+
+  Rows now carry an explicit `seq`, taken fresh on every `put` and every
+  `touch`, and eviction ranks on that instead of on the clock. `created_at`
+  still drives `evict_expired`, which asks about age rather than order. Ranking
+  had to be a narrow column rather than the row's own position: progressive
+  keeps an entire response body in the same row and `read_more` touches it once
+  per chunk, so re-ranking by rewriting the row would rewrite the whole response
+  on every chunk — 3956 ms against 461 ms for a 2 MB response read in 4 KB
+  chunks. The two
+  backends now express the same operation order, and the `PendingStore` protocol
+  states that contract in relative-recency terms; the backends keep different
+  clocks, so their timestamps were never comparable to begin with.
+
+  The column is added in place on first open, seeded from each row's existing
+  insertion order, so existing databases upgrade without losing rows or their
+  order. Detection is by column presence rather than a schema version, since
+  this file is shared and a version pragma belongs to the database rather than
+  to one component's table (#797). The column is checked twice: cheaply and
+  without a lock first, so that every open after the migration — including the
+  read-only probes `select_chunks` and `read_more` make — stays a reader; then
+  again under `BEGIN IMMEDIATE` when that first check finds work, since another
+  process may have migrated the file while this one waited for the lock. The
+  `ALTER` and the backfill share that transaction, so no write can land between
+  them and have its rank overwritten. One transitional wrinkle, bounded by
+  the entry type's configured TTL — 300 s for a selection, 1800 s for a
+  progressive read, both configurable: a row written and last read *before* this
+  upgrade is seeded from when it was written, since the old in-place `touch`
+  left no trace of the read to recover; it ranks correctly again after its next
+  write or read.
+
+  **Instances sharing a `pending_store_path` must be upgraded together.** The
+  older code inserts positionally into five columns and the upgraded table has
+  six, so its writes fail against a migrated file — the manager degrades those
+  to a non-SELECTIVE strategy through its existing `sqlite3.Error` guard rather
+  than failing the call. Reads and expiry from the older code keep working, so
+  an upgrade strands no key that is already out, but a rolling upgrade leaves
+  the not-yet-upgraded instances unable to publish new selections.
+
+  The sibling trims in the metrics store, the response cache and the Toolgraph
+  cache share the shape and are left alone — the caches do update timestamps in
+  place on a hit, so they can tie, but a tie there loses an interchangeable
+  cached row rather than a key promised to a caller.
+
+  One consequent fix, in the shared SQLite tuning every store opens through:
+  the `journal_mode=WAL` switch is now retried while another connection holds
+  the file, and `busy_timeout` is set before it rather than after. SQLite does
+  not run the busy handler for a `journal_mode` change, so it reports
+  `database is locked` immediately — meaning two processes opening one store
+  file at the same time could fail to start on a file that was busy for a
+  millisecond. The migration transaction above widens that window enough to
+  make it reproducible (3 of 8 runs of the new concurrent-opener test before
+  the retry; 25 of 25 after), but the gap is not new to it. Only `SQLITE_BUSY`
+  is retried, read from `sqlite_errorcode` rather than matched on the message,
+  so a permanent failure such as a read-only file still surfaces at once. The
+  wait is bounded by the caller's lock budget, which `tune_connection` now
+  takes as an argument: `MetricsStore` deliberately fast-fails on a locked file
+  and used to lower the timeout *after* tuning returned, which would have been
+  after the wait it was meant to shorten.
+
+  **Behavior change**: under `pending_store: "sqlite"`, every `max_pending`
+  trim now follows the order selections were written or last read, replacing an
+  order that tracked wall-clock timestamps (`evict_expired` still ages rows by
+  the clock, as it should). That changes which rows survive in three cases:
+  timestamps that tie (previously unspecified), timestamps that moved backward
+  between two writes, and a store shared by writers whose clocks disagree.
+  Instances sharing one store file must be upgraded together, as above.
+
 - **A selection key minted off-thread lands in the generation the reader
   consults** (#898). A SELECTIVE/HYBRID compress can run on a worker thread for
   as long as its embedding scorer takes, and `begin_use` (#628) only keeps that

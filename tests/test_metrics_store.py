@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from memtomem_stm.proxy import metrics_store as metrics_store_module
 from memtomem_stm.proxy.metrics import CallMetrics
 from memtomem_stm.proxy.metrics_store import (
     _BASE_COLUMNS,
@@ -1752,3 +1753,50 @@ class TestTrimSchedulingUnderFailure:
             )
         finally:
             store.close()
+
+
+class TestBusyTimeoutReachesTuning:
+    """The fast-fail budget must be passed INTO tuning, not applied after it.
+
+    ``MetricsStore`` opts into a short lock budget so a best-effort write on a
+    locked ``proxy_metrics.db`` degrades instead of stalling a hook. Tuning now
+    spends that budget itself, retrying the one PRAGMA the busy timeout cannot
+    cover (#901), so lowering the pragma after ``tune_connection`` returns would
+    arrive after the very wait it was meant to shorten. Spying on the call is
+    what catches a revert to that ordering; asserting on the resulting pragma
+    would not, since both orderings end with the same value set.
+    """
+
+    def _spy(self, monkeypatch):
+        calls: list[dict] = []
+        real = metrics_store_module.tune_connection
+
+        def spy(conn, **kwargs):
+            calls.append(kwargs)
+            return real(conn, **kwargs)
+
+        monkeypatch.setattr(metrics_store_module, "tune_connection", spy)
+        return calls
+
+    def test_budget_is_passed_into_tune_connection(self, tmp_path, monkeypatch):
+        calls = self._spy(monkeypatch)
+        store = MetricsStore(tmp_path / "metrics.db", busy_timeout_ms=250)
+        try:
+            store.initialize()
+        finally:
+            store.close()
+
+        assert calls == [{"busy_timeout_ms": 250}], (
+            "the fast-fail budget did not reach tune_connection — it is being "
+            "applied after tuning again, which is too late for the WAL retry"
+        )
+
+    def test_default_opener_leaves_the_shared_budget_alone(self, tmp_path, monkeypatch):
+        calls = self._spy(monkeypatch)
+        store = MetricsStore(tmp_path / "metrics.db")
+        try:
+            store.initialize()
+        finally:
+            store.close()
+
+        assert calls == [{}], "a store with no budget of its own must take the shared default"
