@@ -670,6 +670,12 @@ class ProxyManager:
         self._extractor: FactExtractor | None = None
         self._extractor_cfg: ExtractionConfig | None = None
         self._extractor_lock = asyncio.Lock()
+        # Extractors replaced by a rebuild and not yet confirmed closed. The
+        # rebuilding task awaits the close itself, but that await can be
+        # cancelled or raise, and once the instance is out of the slot no other
+        # reference to it exists — it would leak its httpx client with nothing
+        # left to retry the teardown. ``stop()`` closes whatever is still here.
+        self._retiring_extractors: set[FactExtractor] = set()
         # In-memory counters for both INDEX-pipeline write paths
         # (auto_index_response + extract_and_store). Always instantiated for
         # library callers that inspect ``index_observability.snapshot()``.
@@ -2366,15 +2372,32 @@ class ProxyManager:
         if self._llm_compressor is not None:
             await self._llm_compressor.close()
             self._llm_compressor = None
-        if self._extractor is not None:
-            await self._extractor.close()
-            # Null it like _llm_compressor above: _get_extractor() rebuilds on
-            # None, so a stop->start cycle gets a fresh httpx client instead of
-            # the closed instance (whose extract() asserts _client is not None).
-            # The cfg stamp goes with it — left behind it would be a claim about
-            # an instance that no longer exists.
-            self._extractor = None
-            self._extractor_cfg = None
+        # Under the lock, so a rebuild in progress cannot publish a replacement
+        # into the slot between this close and the clear — that instance would
+        # be neither shared nor closed. ``_background_closed`` is already set,
+        # so a rebuild that takes the lock after this point declines to publish
+        # at all. The lock is only ever held across a synchronous build, so
+        # waiting for it here is bounded.
+        async with self._extractor_lock:
+            if self._extractor is not None:
+                await self._extractor.close()
+                # Null it like _llm_compressor above: _get_extractor() rebuilds
+                # on None, so a stop->start cycle gets a fresh httpx client
+                # instead of the closed instance (whose extract() asserts
+                # _client is not None). The cfg stamp goes with it — left behind
+                # it would be a claim about an instance that no longer exists.
+                self._extractor = None
+                self._extractor_cfg = None
+        # Superseded instances whose own close never completed — the rebuilding
+        # task was cancelled mid-drain, or the close raised. Closing is
+        # idempotent (the transport teardown is guarded on the client handle),
+        # so overlapping with a drain that is still running is safe.
+        for retiring in list(self._retiring_extractors):
+            try:
+                await retiring.close()
+            except Exception:
+                logger.debug("Failed to close retiring fact extractor on stop", exc_info=True)
+        self._retiring_extractors.clear()
         # Close the #494 consult disk cache (re-opened lazily on the next start).
         # Always null the handle so a failed close cannot leave a stale closed
         # connection that the next start() would reuse.
@@ -3577,12 +3600,27 @@ class ProxyManager:
         leaves the working instance installed, open, and stamped with its own
         cfg, so the next call retries instead of fast-pathing onto a broken
         state (#890). The superseded close drains in-flight LLM calls, so it is
-        awaited OUTSIDE the lock — inside, a drain would time out every
-        concurrent ``bounded_lock`` waiter. The task that triggers the rebuild
-        absorbs that one wait; with ``extraction.background=True`` (the
-        default) it is a background task rather than the response path. A
-        caller still holding the old reference keeps working: its gate is
-        closed, so ``extract()`` takes the local heuristic (#867).
+        awaited OUTSIDE the lock — inside, that drain would hold the lock for
+        as long as the in-flight calls run, so any concurrent caller whose
+        ``lock_timeout_seconds`` is shorter than the drain would fail rather
+        than take the replacement that is already published. The task that
+        triggers the rebuild absorbs that wait; with ``extraction.background=
+        True`` (the default) it is a background task rather than the response
+        path. A caller still holding the old reference keeps working: its gate
+        is closed, so ``extract()`` takes the local heuristic (#867).
+
+        Because the drain runs unlocked, a SECOND rebuild can retire the
+        instance this call published while this call is still draining the
+        first — so the return value is re-read from the slot afterwards rather
+        than handed back from the local capture. That narrows the window but
+        does not close it: without a lease, any reference can be retired the
+        moment its holder stops looking, which is exactly the case the gate's
+        heuristic fallback covers.
+
+        ``stop()`` takes the same lock and sets ``_background_closed`` before
+        it does, so a rebuild cannot publish into a slot teardown has already
+        cleared; a rebuild that finds the flag set keeps the installed instance
+        rather than replacing it.
         """
         old: FactExtractor | None = None
         async with bounded_lock(
@@ -3593,17 +3631,30 @@ class ProxyManager:
             # One loader read: the property stats the config file per access,
             # and the predicate must judge the same generation it builds from.
             ext_live = self._config.extraction
-            if self._extractor is None or self._extractor_cfg != ext_live:
+            stale = self._extractor is None or self._extractor_cfg != ext_live
+            # Teardown owns the slot from the moment it starts. Publishing a
+            # replacement into it would leave an instance nobody closes, and
+            # the config it would track is about to stop mattering anyway.
+            if stale and not (self._background_closed and self._extractor is not None):
                 replacement = FactExtractor(ext_live)
                 old = self._extractor
                 self._extractor = replacement
                 self._extractor_cfg = ext_live
+                if old is not None:
+                    self._retiring_extractors.add(old)
             current = self._extractor
         if old is not None:
             try:
                 await old.close()
             except Exception:
                 logger.debug("Failed to close superseded fact extractor", exc_info=True)
+            else:
+                self._retiring_extractors.discard(old)
+            # Re-read: another rebuild may have retired ``current`` while this
+            # task was draining, and handing back a closed instance would send
+            # the caller to the heuristic for a reason it cannot see.
+            current = self._extractor or current
+        assert current is not None
         return current
 
     async def _extract_and_store(

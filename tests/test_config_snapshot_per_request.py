@@ -576,11 +576,88 @@ class TestPerRequestSnapshot:
         assert old._client is not None, "transport closed under a registered call"
         assert mgr._extractor is not old, "the replacement was not published before the drain"
 
+        # The load-bearing half: a second caller must get the replacement WHILE
+        # the drain runs. Publishing before the drain is not enough on its own —
+        # a close awaited inside ``_extractor_lock`` would satisfy every
+        # assertion above and still block this one until the gate is released.
+        concurrent = await asyncio.wait_for(
+            mgr._get_extractor(cfg_snap=mgr._config), timeout=5
+        )
+        assert concurrent is mgr._extractor, "a concurrent caller was served the retired instance"
+        assert not rebuild.done(), "the drain ended early; the concurrency check proved nothing"
+
         old._gate.leave(token)
         new = await asyncio.wait_for(rebuild, timeout=5)
 
         assert new is mgr._extractor
         assert old._client is None, "the drained instance was never closed"
+
+    async def test_an_unstamped_slot_is_rebuilt(self, extract_mgr):
+        """``None`` in the cfg stamp is not a wildcard.
+
+        A predicate that only compares when a stamp exists would keep any
+        externally installed instance forever — which is the pre-#890 behavior
+        wearing the new field. The stamp is the claim "this instance was built
+        from that block"; absent, there is no such claim to honor.
+        """
+        mgr = extract_mgr
+        installed = await mgr._get_extractor(cfg_snap=mgr._config)
+        mgr._extractor_cfg = None
+
+        rebuilt = await mgr._get_extractor(cfg_snap=mgr._config)
+
+        assert rebuilt is not installed, "an unstamped slot was treated as current"
+        assert mgr._extractor_cfg == mgr._config.extraction
+
+    async def test_stop_does_not_strand_a_replacement_published_mid_teardown(
+        self, extract_mgr, tmp_path
+    ):
+        """``stop()`` and a rebuild contend for one slot; neither may drop an
+        open instance on the floor.
+
+        Teardown closes the extractor and clears the slot. A rebuild running
+        concurrently used to be able to publish its replacement between those
+        two steps, leaving an open httpx client that was neither shared nor
+        closed. Driven through the real contention: the in-flight gate holds
+        ``stop()`` inside its close while the rebuild tries to publish.
+
+        The invariant is ownership, not ordering. Either outcome is legitimate
+        — the rebuild declines while teardown owns the slot, or it lands after
+        teardown finished and is indistinguishable from a post-stop request —
+        so what is asserted is that whatever it returns is either installed
+        (and so closed by the next stop) or already closed. An instance that is
+        neither is the leak.
+        """
+        import asyncio
+
+        mgr = extract_mgr
+        installed = await mgr._get_extractor(cfg_snap=mgr._config)
+        token = installed._gate.try_enter(30.0)
+        assert token is not None
+
+        stopping = asyncio.create_task(mgr.stop())
+        await asyncio.sleep(0.05)
+        assert not stopping.done(), "stop() did not reach the extractor drain"
+
+        _reload_with_max_facts(mgr, tmp_path, 3)
+        rebuild = asyncio.create_task(mgr._get_extractor(cfg_snap=mgr._config))
+        await asyncio.sleep(0.05)
+
+        installed._gate.leave(token)
+        await asyncio.wait_for(stopping, timeout=10)
+        published = await asyncio.wait_for(rebuild, timeout=10)
+
+        assert installed._client is None, "teardown did not close the installed extractor"
+        assert mgr._retiring_extractors == set(), "a superseded instance was left unclosed"
+        if published is mgr._extractor:
+            # Landed after teardown: tracked, so the next stop() closes it.
+            assert mgr._extractor_cfg == mgr._config.extraction
+        else:
+            # Declined to publish: it must be the instance teardown closed,
+            # never a fresh open one dropped on the floor.
+            assert published is installed
+            assert mgr._extractor is None
+            assert mgr._extractor_cfg is None
 
     async def test_config_edit_lands_on_the_next_request(self, mgr, tmp_path):
         """Snapshotting moves hot-reload to a request boundary; it must not

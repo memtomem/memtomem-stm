@@ -357,20 +357,23 @@ changes inline only. See the deprecation policy in
   The replacement is built before the slot is touched, so a construction
   failure leaves the working extractor installed, open, and stamped with its
   own config — the next call retries rather than fast-pathing onto a closed
-  instance. The superseded one is then closed, which drains its in-flight LLM
-  calls before the HTTP transport goes away (#867); that close is awaited after
-  the build lock is released, so a concurrent request sees the replacement
-  immediately instead of queueing behind another caller's shutdown. A caller
-  still holding the old reference keeps working: its gate is closed, so
-  extraction falls back to the local heuristic rather than crossing the
-  provider boundary on a torn-down client.
+  instance. The superseded one is then drained and closed, releasing its HTTP
+  transport only once its in-flight LLM calls have finished (#867). That close
+  is awaited after the build lock is released, so a concurrent request sees the
+  replacement immediately instead of queueing behind another caller's shutdown;
+  since it runs unlocked, the manager keeps a reference to every instance whose
+  close has not completed and `stop()` closes what is left, so a cancelled or
+  failed teardown cannot strand a transport. A caller still holding an old
+  reference keeps working: its gate is closed, so extraction falls back to the
+  local heuristic rather than crossing the provider boundary on a torn-down
+  client.
 
   **Behavior change**: `extraction` edits take effect without a restart, from
-  the next extraction onward. Two costs come with that. The task that observes
-  the change absorbs the drain of the instance it replaces, bounded by the
-  in-flight calls' own `llm_timeout_seconds` plus a two-second grace; with the
-  default `extraction.background: true` that task is a background one, not the
-  tool-response path. And the rebuild check reads the live config once per
+  the next lookup that observes them. Two costs come with that. The task that
+  observes the change absorbs the drain of the instance it replaces, bounded by
+  the in-flight calls' own `llm_timeout_seconds` plus a two-second grace; with
+  the default `extraction.background: true` that task is a background one, not
+  the tool-response path. And the rebuild check reads the live config once per
   extraction rather than only on the first, which is one additional `stat()`
   on the config file per extracting request.
 
