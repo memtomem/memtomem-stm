@@ -21,7 +21,18 @@ logger = logging.getLogger(__name__)
 
 
 class PendingStore(Protocol):
-    """Protocol for pending TOC selection storage."""
+    """Protocol for pending TOC selection storage.
+
+    Recency contract (#901). ``put`` and ``touch`` both mark a key
+    most-recent, and ``evict_oldest`` drops the least-recently put-or-touched
+    keys first. That order must be total and deterministic: a backend may not
+    let two keys written close together come out in an arbitrary order, since
+    the loser can be a selection key a client is holding. The contract is
+    stated in terms of RELATIVE recency, not timestamps — the backends here
+    keep different clocks (``InMemoryPendingStore`` monotonic,
+    ``SQLitePendingStore`` wall), so ``created_at`` values are not comparable
+    across them. ``evict_expired`` ages rows against the backend's own clock.
+    """
 
     def put(self, key: str, selection: PendingSelection) -> None: ...
     def get(self, key: str) -> PendingSelection | None: ...
@@ -45,10 +56,12 @@ class InMemoryPendingStore:
         self._lock = threading.Lock()
 
     # Invariant: ``_order`` holds exactly the keys of ``_data``, once each,
-    # in recency order (oldest left) — matching the SQLite backend, whose
-    # evict_oldest keeps the most recent ``created_at`` rows. Every mutation
-    # below maintains it; a duplicate or stale ``_order`` entry makes
-    # evict_oldest silently drop a fresh entry.
+    # in recency order (oldest left) — matching the SQLite backend, which keeps
+    # the highest ``seq`` rows and takes the next ``seq`` on both put and touch,
+    # so the two express the same operation order rather than two readings of a
+    # clock (#901). Every mutation below maintains it; a
+    # duplicate or stale ``_order`` entry makes evict_oldest silently drop a
+    # fresh entry.
 
     def put(self, key: str, selection: PendingSelection) -> None:
         with self._lock:
@@ -111,7 +124,17 @@ class InMemoryPendingStore:
 
 
 class SQLitePendingStore:
-    """SQLite-backed pending store for multi-instance sharing."""
+    """SQLite-backed pending store for multi-instance sharing.
+
+    Instances sharing one ``pending_store_path`` must run the same version.
+    The ``seq`` column added for #901 makes the table six columns wide, and a
+    process still running the older code inserts positionally into five, so its
+    writes fail against an upgraded file (the manager degrades those to a
+    non-SELECTIVE strategy through its ``sqlite3.Error`` guard rather than
+    failing the call). Reads and expiry from the older code keep working, so an
+    upgrade strands no key that is already out — but the instances have to be
+    upgraded together rather than one at a time.
+    """
 
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
@@ -130,14 +153,51 @@ class SQLitePendingStore:
                     chunks_json TEXT NOT NULL,
                     format TEXT NOT NULL,
                     created_at REAL NOT NULL,
-                    total_chars INTEGER NOT NULL
+                    total_chars INTEGER NOT NULL,
+                    seq INTEGER
                 )"""
             )
-            db.commit()
+            # ``seq`` is the eviction order (#901), added after the table
+            # shipped. Detect it rather than stamping a schema version: this
+            # file is shared, and a version pragma is a property of the DATABASE
+            # rather than of a table, so another component's value would make
+            # the migration silently not run (#797).
+            #
+            # Checked twice, and the cheap check comes first. Once the column
+            # exists — every open after the first — this reads it without a
+            # lock and returns, which matters because opening is not always a
+            # write: ``select_chunks`` and ``read_more`` open throwaway stores
+            # purely to probe for a key, and taking the write lock to tell them
+            # a migration is not needed makes them wait out, or fail behind,
+            # an unrelated writer.
+            if not self._has_seq_column(db):
+                # The migration itself is a write, and ALTER plus backfill have
+                # to be ONE of them. ``BEGIN IMMEDIATE`` takes the write lock up
+                # front, then the column is checked AGAIN — that second read is
+                # the authoritative one, since another opener may have migrated
+                # the file while this one waited for the lock. Nothing may land
+                # between the ALTER and the backfill either: such a row would be
+                # given a ``seq`` and then have the backfill overwrite it with a
+                # rowid-derived one, colliding with a rank already handed out.
+                # Existing rows seed from ``rowid``, the insertion order they
+                # already carry.
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    if not self._has_seq_column(db):
+                        db.execute("ALTER TABLE pending_selections ADD COLUMN seq INTEGER")
+                        db.execute("UPDATE pending_selections SET seq = rowid WHERE seq IS NULL")
+                except Exception:
+                    db.rollback()
+                    raise
+                db.commit()
         except Exception:
             db.close()
             raise
         self._db = db
+
+    @staticmethod
+    def _has_seq_column(db: sqlite3.Connection) -> bool:
+        return any(row[1] == "seq" for row in db.execute("PRAGMA table_info(pending_selections)"))
 
     def close(self) -> None:
         if self._db:
@@ -149,10 +209,18 @@ class SQLitePendingStore:
             raise RuntimeError("SQLitePendingStore not initialized")
         return self._db
 
+    # The next eviction rank, computed inside the writing statement so two
+    # processes sharing this file cannot read the same maximum and mint the
+    # same rank: SQLite serializes writers, so the subquery sees every earlier
+    # commit (#901).
+    _NEXT_SEQ = "(SELECT IFNULL(MAX(seq), 0) + 1 FROM pending_selections)"
+
     def put(self, key: str, selection: PendingSelection) -> None:
         with self._lock:
             self._get_db().execute(
-                "INSERT OR REPLACE INTO pending_selections VALUES (?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO pending_selections "
+                "(key, chunks_json, format, created_at, total_chars, seq) "
+                f"VALUES (?, ?, ?, ?, ?, {self._NEXT_SEQ})",
                 (
                     key,
                     _json_dumps(selection.chunks, ensure_ascii=False),
@@ -198,8 +266,18 @@ class SQLitePendingStore:
 
     def touch(self, key: str) -> None:
         with self._lock:
+            # Bump the eviction rank as well as the timestamp: a key a reader
+            # just selected must count as the most recently used, not the least
+            # (#901). Only the two narrow columns are written — the row keeps
+            # its identity and its payload. That matters here more than
+            # anywhere: progressive stores an entire response body in
+            # ``chunks_json``, and ``read_more`` touches the row once per chunk,
+            # so a scheme that rewrote the payload to re-rank it would rewrite
+            # the whole response on every chunk (3956 ms against this
+            # implementation's 461 ms for a 2 MB response read in 4 KB chunks).
             self._get_db().execute(
-                "UPDATE pending_selections SET created_at = ? WHERE key = ?",
+                f"UPDATE pending_selections SET created_at = ?, seq = {self._NEXT_SEQ} "
+                "WHERE key = ?",
                 (time.time(), key),
             )
             self._get_db().commit()
@@ -237,10 +315,32 @@ class SQLitePendingStore:
             where += " AND format != ?"
             params.append(exclude_format)
         with self._lock:
+            # Order on ``seq``, not ``created_at`` (#901). Recency here means
+            # the order operations happened in, and ``seq`` records exactly
+            # that: every put and every touch takes the next value.
+            # ``created_at`` only ever approximated it, and badly in two ways —
+            # rows written inside one clock tick tie, which left the survivors
+            # unspecified and let a trim discard the key just handed to a client
+            # (reproduced on the Windows runner); and the wall clock can step
+            # BACKWARD, which ranks a later write as older however the ties are
+            # broken. A shared store makes that worse, since the timestamps then
+            # come from several machines' clocks while ``seq`` stays one
+            # sequence per file. ``created_at`` remains the right basis for
+            # ``evict_expired``, which asks about age rather than order.
+            #
+            # Every row this class writes carries a ``seq``, and the migration
+            # backfills the ones that predate it, so a NULL rank means a row
+            # some other writer put here by hand. Those sort last and are
+            # trimmed first, deliberately: this store cannot know where such a
+            # row belongs in its sequence, and no key it handed out is riding on
+            # it. Falling back to ``rowid`` instead would be worse than useless
+            # — the two are different number domains, so once touches push
+            # ``seq`` past the rowid range a freshly inserted row would compare
+            # as older than rows written long before it.
             self._get_db().execute(
                 f"DELETE FROM pending_selections WHERE {where} AND key NOT IN "
                 f"(SELECT key FROM pending_selections WHERE {where} "
-                "ORDER BY created_at DESC LIMIT ?)",
+                "ORDER BY seq DESC LIMIT ?)",
                 [*params, *params, max_size],
             )
             self._get_db().commit()

@@ -385,12 +385,15 @@ class MetricsStore:
         db = sqlite3.connect(str(self._db_path), check_same_thread=False, timeout=connect_timeout)
         try:
             ensure_private_db_files(self._db_path)
-            tune_connection(db)
+            # Pass the budget IN rather than overriding the pragma afterwards
+            # (#901): tuning's WAL retry spends the lock budget during this
+            # call, so a later override would arrive after the wait it was
+            # meant to shorten. A best-effort writer fast-fails on a locked DB —
+            # the DDL/INSERT below then raise quickly and the caller degrades.
             if self._busy_timeout_ms is not None:
-                # Override tune_connection's shared 3000 ms busy timeout so a
-                # best-effort writer fast-fails on a locked DB. Lower bound only —
-                # the DDL/INSERT below then raise quickly and the caller degrades.
-                db.execute(f"PRAGMA busy_timeout={int(self._busy_timeout_ms)}")
+                tune_connection(db, busy_timeout_ms=int(self._busy_timeout_ms))
+            else:
+                tune_connection(db)
             if not self._schema_is_current(db):
                 db.execute(_CREATE)
                 db.execute(_INDEX)
