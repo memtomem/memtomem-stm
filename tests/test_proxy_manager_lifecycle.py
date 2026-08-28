@@ -368,7 +368,8 @@ class TestStop:
     async def test_stop_nulls_extractor_so_restart_rebuilds(self):
         """stop() nulls _extractor (like _llm_compressor) — _get_extractor()
         rebuilds on None, so a stop->start cycle gets a fresh httpx client
-        instead of the closed instance whose extract() would AssertionError.
+        instead of a closed instance, whose gate would send every extract() to
+        the local heuristic for the rest of the process (#867).
 
         The #890 cfg stamp is cleared with it: a stamp left behind describes an
         instance that no longer exists, and the rebuild predicate reads both."""
@@ -380,6 +381,34 @@ class TestStop:
 
         assert mgr._extractor is None
         assert mgr._extractor_cfg is None
+
+    async def test_stop_closes_retiring_extractors(self):
+        """A rebuild whose own close never completed leaves its instance in
+        ``_retiring_extractors``; stop() is the retry, and a success drops it."""
+        mgr = _make_manager(servers={})
+        retiring = AsyncMock()
+        mgr._retiring_extractors.add(retiring)
+
+        await mgr.stop()
+
+        retiring.close.assert_awaited_once()
+        assert mgr._retiring_extractors == set()
+
+    async def test_stop_keeps_a_retiring_extractor_whose_close_fails(self):
+        """A failed retry must NOT drop the entry.
+
+        The set is the manager's last reference to that instance — clearing it
+        wholesale strands an open transport with nothing left to retry it. The
+        entry stays so the next rebuild or stop() tries again."""
+        mgr = _make_manager(servers={})
+        stubborn = AsyncMock()
+        stubborn.close.side_effect = RuntimeError("transport wedged")
+        mgr._retiring_extractors.add(stubborn)
+
+        await mgr.stop()
+
+        stubborn.close.assert_awaited_once()
+        assert stubborn in mgr._retiring_extractors, "a failed close dropped the last reference"
 
     async def test_stop_closes_connection_stacks(self):
         """stop() closes per-connection stacks and clears _connections."""

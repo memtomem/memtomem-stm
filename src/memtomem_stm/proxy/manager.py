@@ -2375,29 +2375,28 @@ class ProxyManager:
         # Under the lock, so a rebuild in progress cannot publish a replacement
         # into the slot between this close and the clear — that instance would
         # be neither shared nor closed. ``_background_closed`` is already set,
-        # so a rebuild that takes the lock after this point declines to publish
-        # at all. The lock is only ever held across a synchronous build, so
-        # waiting for it here is bounded.
+        # so a rebuild that takes the lock from here on does not touch the slot
+        # at all: it hands its caller an instance registered as retiring, which
+        # this manager still owns. The lock is only ever held across a
+        # synchronous build, so waiting for it here is bounded.
         async with self._extractor_lock:
             if self._extractor is not None:
                 await self._extractor.close()
                 # Null it like _llm_compressor above: _get_extractor() rebuilds
                 # on None, so a stop->start cycle gets a fresh httpx client
-                # instead of the closed instance (whose extract() asserts
-                # _client is not None). The cfg stamp goes with it — left behind
-                # it would be a claim about an instance that no longer exists.
+                # instead of a closed instance (whose extract() would take the
+                # heuristic path forever). The cfg stamp goes with it — left
+                # behind it would be a claim about an instance that is gone.
                 self._extractor = None
                 self._extractor_cfg = None
-        # Superseded instances whose own close never completed — the rebuilding
-        # task was cancelled mid-drain, or the close raised. Closing is
-        # idempotent (the transport teardown is guarded on the client handle),
-        # so overlapping with a drain that is still running is safe.
-        for retiring in list(self._retiring_extractors):
-            try:
-                await retiring.close()
-            except Exception:
-                logger.debug("Failed to close retiring fact extractor on stop", exc_info=True)
-        self._retiring_extractors.clear()
+        # Instances whose own close never completed — a rebuilding task
+        # cancelled mid-drain, a close that raised, or one handed out during
+        # this teardown. Closing is idempotent (the transport teardown is
+        # guarded on the client handle), so overlapping a drain still running
+        # elsewhere is safe. Entries are dropped INDIVIDUALLY on success: one
+        # that fails again keeps its owner, since clearing wholesale would drop
+        # the manager's last reference to a transport that is still open.
+        await self._close_retiring_extractors()
         # Close the #494 consult disk cache (re-opened lazily on the next start).
         # Always null the handle so a failed close cannot leave a stale closed
         # connection that the next start() would reuse.
@@ -3617,10 +3616,12 @@ class ProxyManager:
         moment its holder stops looking, which is exactly the case the gate's
         heuristic fallback covers.
 
-        ``stop()`` takes the same lock and sets ``_background_closed`` before
-        it does, so a rebuild cannot publish into a slot teardown has already
-        cleared; a rebuild that finds the flag set keeps the installed instance
-        rather than replacing it.
+        ``stop()`` sets ``_background_closed`` before taking the same lock, so
+        from the moment teardown begins the slot belongs to it: a rebuild that
+        takes the lock while the flag is set publishes nothing. It returns the
+        installed instance if there still is one, and otherwise builds a
+        transient one registered as retiring, so even the extractor handed out
+        mid-teardown has an owner that closes it.
         """
         old: FactExtractor | None = None
         async with bounded_lock(
@@ -3631,31 +3632,53 @@ class ProxyManager:
             # One loader read: the property stats the config file per access,
             # and the predicate must judge the same generation it builds from.
             ext_live = self._config.extraction
-            stale = self._extractor is None or self._extractor_cfg != ext_live
-            # Teardown owns the slot from the moment it starts. Publishing a
-            # replacement into it would leave an instance nobody closes, and
-            # the config it would track is about to stop mattering anyway.
-            if stale and not (self._background_closed and self._extractor is not None):
+            installed = self._extractor
+            if installed is not None and self._extractor_cfg == ext_live:
+                current = installed
+            elif self._background_closed:
+                # Teardown owns the slot. An instance published here would be
+                # one stop() has already walked past, and the config it would
+                # track stops mattering the moment teardown finishes.
+                if installed is not None:
+                    current = installed
+                else:
+                    current = FactExtractor(ext_live)
+                    self._retiring_extractors.add(current)
+            else:
                 replacement = FactExtractor(ext_live)
                 old = self._extractor
                 self._extractor = replacement
                 self._extractor_cfg = ext_live
                 if old is not None:
                     self._retiring_extractors.add(old)
-            current = self._extractor
+                current = replacement
         if old is not None:
-            try:
-                await old.close()
-            except Exception:
-                logger.debug("Failed to close superseded fact extractor", exc_info=True)
-            else:
-                self._retiring_extractors.discard(old)
+            # Retries the whole retiring set, not just this call's own instance:
+            # a close that failed or was cancelled has no other retry point
+            # before stop(), so without this the set — and the transports it
+            # holds open — would grow one entry per rebuild.
+            await self._close_retiring_extractors()
             # Re-read: another rebuild may have retired ``current`` while this
             # task was draining, and handing back a closed instance would send
             # the caller to the heuristic for a reason it cannot see.
             current = self._extractor or current
-        assert current is not None
         return current
+
+    async def _close_retiring_extractors(self) -> None:
+        """Close every extractor awaiting teardown, dropping the ones that make it.
+
+        A failure keeps its entry: the set is the manager's only remaining
+        reference to that instance, so discarding it wholesale would strand an
+        open transport with nothing left to retry it. The next rebuild — or
+        ``stop()`` — tries again.
+        """
+        for retiring in list(self._retiring_extractors):
+            try:
+                await retiring.close()
+            except Exception:
+                logger.debug("Failed to close retiring fact extractor", exc_info=True)
+            else:
+                self._retiring_extractors.discard(retiring)
 
     async def _extract_and_store(
         self,

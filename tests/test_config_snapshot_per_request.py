@@ -592,6 +592,35 @@ class TestPerRequestSnapshot:
         assert new is mgr._extractor
         assert old._client is None, "the drained instance was never closed"
 
+    async def test_the_rebuild_predicate_reads_live_config_under_the_lock(self, extract_mgr):
+        """WHERE the live read happens is the whole argument, so pin it.
+
+        Reading before acquiring the lock would let a caller observe an older
+        generation, block, and then stamp the shared slot backward over a newer
+        rebuild — the race ``_relevance_scorer_for`` needs an explicit stale-pin
+        guard for. Under the lock, that ordering is impossible and no guard is
+        needed. Counting reads cannot tell the two apart; recording whether the
+        lock is held at the moment of the read can, and fails deterministically
+        against a pre-lock implementation.
+        """
+        mgr = extract_mgr
+        cfg_snap = mgr._config
+        held: list[bool] = []
+        real_get = mgr._config_loader.get
+
+        def recording_get():
+            held.append(mgr._extractor_lock.locked())
+            return real_get()
+
+        mgr._config_loader.get = recording_get  # type: ignore[method-assign]
+        try:
+            await mgr._get_extractor(cfg_snap=cfg_snap)
+        finally:
+            mgr._config_loader.get = real_get  # type: ignore[method-assign]
+
+        assert held, "_get_extractor took no live read at all"
+        assert all(held), f"the live read ran outside the lock: {held}"
+
     async def test_an_unstamped_slot_is_rebuilt(self, extract_mgr):
         """``None`` in the cfg stamp is not a wildcard.
 
@@ -636,8 +665,18 @@ class TestPerRequestSnapshot:
         assert token is not None
 
         stopping = asyncio.create_task(mgr.stop())
-        await asyncio.sleep(0.05)
-        assert not stopping.done(), "stop() did not reach the extractor drain"
+        # Wait for an OBSERVABLE teardown signal, not a sleep: close() flips the
+        # gate as its first step, so this pins that stop() is inside the
+        # extractor close — and therefore holding _extractor_lock — before the
+        # rebuild starts. A bare sleep would also pass if stop() were still
+        # awaiting something earlier and the lock were free.
+        for _ in range(200):
+            if installed._gate.closed:
+                break
+            await asyncio.sleep(0.01)
+        assert installed._gate.closed, "stop() never reached the extractor close"
+        assert mgr._extractor_lock.locked(), "the extractor close did not hold the lock"
+        assert not stopping.done()
 
         _reload_with_max_facts(mgr, tmp_path, 3)
         rebuild = asyncio.create_task(mgr._get_extractor(cfg_snap=mgr._config))
@@ -648,16 +687,45 @@ class TestPerRequestSnapshot:
         published = await asyncio.wait_for(rebuild, timeout=10)
 
         assert installed._client is None, "teardown did not close the installed extractor"
-        assert mgr._retiring_extractors == set(), "a superseded instance was left unclosed"
-        if published is mgr._extractor:
-            # Landed after teardown: tracked, so the next stop() closes it.
-            assert mgr._extractor_cfg == mgr._config.extraction
-        else:
-            # Declined to publish: it must be the instance teardown closed,
-            # never a fresh open one dropped on the floor.
-            assert published is installed
-            assert mgr._extractor is None
-            assert mgr._extractor_cfg is None
+        # Which side of teardown the rebuild lands on is a genuine race — the
+        # lock is released before stop() finishes — so the assertion is the
+        # ownership invariant, not an ordering: whatever comes back is closed,
+        # installed (and so closed by the next stop), or registered as
+        # retiring. An open extractor that is none of the three is the leak.
+        assert (
+            published._client is None
+            or published is mgr._extractor
+            or published in mgr._retiring_extractors
+        ), "the rebuild handed out an open extractor that nothing owns"
+
+    async def test_a_rebuild_during_teardown_does_not_publish(self, extract_mgr, tmp_path):
+        """The deterministic half of the race above.
+
+        Teardown owns the slot from the moment ``_background_closed`` is set —
+        including after it has cleared the slot, which is the window a guard
+        written as "decline only while an instance is installed" leaves open.
+        An extractor published there is one ``stop()`` has already walked past.
+        Driven by setting the flag directly, so the outcome does not depend on
+        where the event loop happens to resume.
+        """
+        mgr = extract_mgr
+        await mgr._get_extractor(cfg_snap=mgr._config)
+        _reload_with_max_facts(mgr, tmp_path, 3)
+
+        # Exactly the state stop() is in between clearing the slot and its
+        # final reopen of the spawn path.
+        mgr._extractor = None
+        mgr._extractor_cfg = None
+        mgr._background_closed = True
+        try:
+            handed_out = await mgr._get_extractor(cfg_snap=mgr._config)
+        finally:
+            mgr._background_closed = False
+
+        assert mgr._extractor is None, "a rebuild published into a slot teardown owns"
+        assert mgr._extractor_cfg is None
+        assert handed_out in mgr._retiring_extractors, "the transient instance has no owner"
+        assert handed_out._cfg.max_facts == 3
 
     async def test_config_edit_lands_on_the_next_request(self, mgr, tmp_path):
         """Snapshotting moves hot-reload to a request boundary; it must not
