@@ -10,6 +10,7 @@ import re
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
@@ -872,6 +873,8 @@ class SelectiveCompressor:
         min_section_chars: int = 50,
         store: PendingStore | None = None,
         scorer: RelevanceScorer | None = None,
+        live_provider: Callable[[], SelectiveCompressor | None] | None = None,
+        publish_lock: threading.Lock | None = None,
     ) -> None:
         self._max_pending = max_pending
         self._ttl = pending_ttl_seconds
@@ -884,6 +887,15 @@ class SelectiveCompressor:
         self._use_lock = threading.Lock()
         self._in_use = 0
         self._close_requested = False
+        # Write-time publication barrier (#898). A compress that started under
+        # one generation must not mint a key into a store the readers no longer
+        # consult; ``live_provider`` re-resolves the manager's current selective
+        # compressor at put time. Both None (standalone construction) keeps the
+        # single-generation behavior. The manager injects them on every instance
+        # it builds, including the throwaway recovery/probe ones — those are
+        # inert here because they only ``select()``, never compress.
+        self._live_provider = live_provider
+        self._publish_lock = publish_lock or threading.Lock()
         if store is not None:
             self._store = store
         else:
@@ -931,7 +943,29 @@ class SelectiveCompressor:
     ) -> str:
         selection_key = uuid.uuid4().hex[:16]
 
-        self._store.put(
+        # Query-aware ordering: when a context query is supplied, surface the
+        # most relevant sections first so the agent sees them at the top of the
+        # TOC. Selection by key is unaffected — ``chunks`` still holds every
+        # section. With no query (or no signal) the original insertion order is
+        # preserved, which callers and tests rely on. Stable sort keeps ties in
+        # insertion order. Order is decided ONCE here so the preview-budget
+        # search below rebuilds the same entries in the same order.
+        #
+        # Scoring runs BEFORE the write, and that ordering is load-bearing
+        # (#898): an embedding scorer is a network round trip — the reason this
+        # compress was off-loaded to a worker thread at all — so it is by far
+        # the widest window a config reload can land in. Publishing first would
+        # resolve the live generation, then sit through that entire call while a
+        # rebuild retired the store underneath, which is the very race the write
+        # barrier exists to close.
+        items = list(chunks.items())
+        if context_query and context_query.strip():
+            scores = _scores_or_none(self._scorer, context_query, items)
+            if scores is not None:
+                order = sorted(range(len(items)), key=lambda i: -scores[i])
+                items = [items[i] for i in order]
+
+        ttl = self._publish(
             selection_key,
             PendingSelection(
                 chunks=chunks,
@@ -940,21 +974,6 @@ class SelectiveCompressor:
                 total_chars=len(text),
             ),
         )
-        self._evict()
-
-        # Query-aware ordering: when a context query is supplied, surface the
-        # most relevant sections first so the agent sees them at the top of the
-        # TOC. Selection by key is unaffected — ``chunks`` still holds every
-        # section. With no query (or no signal) the original insertion order is
-        # preserved, which callers and tests rely on. Stable sort keeps ties in
-        # insertion order. Order is decided ONCE here so the preview-budget
-        # search below rebuilds the same entries in the same order.
-        items = list(chunks.items())
-        if context_query and context_query.strip():
-            scores = _scores_or_none(self._scorer, context_query, items)
-            if scores is not None:
-                order = sorted(range(len(items)), key=lambda i: -scores[i])
-                items = [items[i] for i in order]
 
         def build(preview_cap: int) -> str:
             entries = []
@@ -981,7 +1000,7 @@ class SelectiveCompressor:
                 "selection_key": selection_key,
                 "format": fmt,
                 "total_chars": len(text),
-                "ttl_seconds_remaining": int(self._ttl),
+                "ttl_seconds_remaining": int(ttl),
                 "entries": entries,
                 "hint": (
                     f"Call stm_proxy_select_chunks(key='{selection_key}', "
@@ -1041,6 +1060,11 @@ class SelectiveCompressor:
         otherwise close the pending store mid-write. ``begin_use`` runs on
         the event loop while the manager lock is still held, so a later
         ``close()`` defers to the balancing :meth:`end_use` instead.
+
+        The pin keeps this instance's parser, scorer and store USABLE for the
+        duration; it does not make them the ones a later reader consults. The
+        selection write itself targets the live generation (:meth:`_publish`,
+        #898), so the pin no longer carries that reachability burden.
         """
         with self._use_lock:
             self._in_use += 1
@@ -1193,6 +1217,58 @@ class SelectiveCompressor:
         if fmt == "markdown":
             return "heading"
         return "paragraph"
+
+    def _publish(self, key: str, pending: PendingSelection) -> float:
+        """Store *key* where the readers will look for it, and evict under the
+        policy of whoever owns that store. Returns the enforcing TTL.
+
+        A SELECTIVE/HYBRID compress can run off-thread (#618) for as long as its
+        scorer takes, and ``begin_use`` only keeps THIS instance alive — a
+        config-change rebuild in that window repoints the manager's slot, which
+        is what ``select_chunks`` consults. Writing to ``self._store`` then mints
+        a key into a retired store and hands the client a key that was never
+        reachable (#898). Re-resolving the live generation at write time lands
+        the key in the store the next reader opens.
+
+        Eviction follows the same target for the same reason: ``_evict`` is an
+        instance policy with a store-wide effect, so a superseded ``max_pending``
+        applied to a shared ``pending_store_path`` deletes the live generation's
+        keys. The current owner's policy is the only correct one to run.
+
+        The publish lock covers resolving the target AND the store work, and the
+        manager holds the same lock across its slot swap and the superseded
+        close. Resolving under the lock and then releasing it before the write
+        does not work: a pin keeps the target open but not CURRENT, so a rebuild
+        landing between the pin and the put would leave the key in a store the
+        reader no longer consults — the original defect, one generation over —
+        and would run that generation's now-superseded eviction over a shared
+        path. Both halves need the target to still be live when the write lands,
+        which means holding the lock across it.
+
+        The cost is that a rebuild on the event loop can wait for one put and
+        two eviction passes against a local SQLite file. That is accepted rather
+        than overlooked: it is bounded, small, and the same synchronous
+        store-on-the-loop pattern every sibling write here already has (#879
+        tracks that class repo-wide).
+
+        With no ``live_provider`` (standalone construction) there is only one
+        generation and this is the historical put-then-evict. The throwaway
+        recovery/probe instances DO get a provider, but never reach this method
+        — they only ``select()``.
+        """
+        if self._live_provider is None:
+            self._store.put(key, pending)
+            self._evict()
+            return self._ttl
+        with self._publish_lock:
+            # ``or self``: ``stop()`` clears the slot, and this instance's own
+            # store is still open (the manager pins it across the compress, so
+            # its close defers to end_use). The key dies with the shutdown
+            # either way.
+            target = self._live_provider() or self
+            target._store.put(key, pending)
+            target._evict()
+            return target._ttl
 
     def _evict(self) -> None:
         self._store.evict_expired(self._ttl, exclude_format="progressive")

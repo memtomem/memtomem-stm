@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import re
 import sqlite3
 import threading
@@ -21,7 +22,8 @@ from types import MethodType, SimpleNamespace
 
 import pytest
 
-from memtomem_stm.proxy.config import CompressionStrategy
+from memtomem_stm.proxy.compression import SelectiveCompressor
+from memtomem_stm.proxy.config import CompressionStrategy, SelectiveConfig
 from memtomem_stm.proxy.manager import ProxyManager
 from memtomem_stm.proxy.relevance import BM25Scorer, EmbeddingScorer, create_scorer
 
@@ -356,6 +358,339 @@ class TestAllScorerSitesRouteThroughHelper:
         pin = 'scorer=getattr(sel_compressor, "_scorer", None)'
         assert pin in self._source("_apply_compression")
         assert pin in self._source("_apply_hybrid")
+
+
+# ── the off-thread write follows the live generation (#898) ───────────
+
+
+class _GatedScorer:
+    """Blocks where the real embedding scorer blocks: a network round trip.
+
+    The gate belongs HERE, not in parsing. Scoring is why the compress was
+    off-loaded to a worker thread in the first place, so it is the widest
+    window a config reload can land in — and the ordering that keeps it
+    ahead of the write is the thing under test. A parse-only gate passes
+    whether or not scoring precedes publication.
+    """
+
+    uses_blocking_io = True
+
+    def __init__(self, gate: threading.Event) -> None:
+        self._gate = gate
+        self.started = threading.Event()
+
+    def score_sections(self, query: str, sections: list[tuple[str, str]]) -> list[float]:
+        self.started.set()
+        assert self._gate.wait(timeout=10), "test gate never released"
+        return [0.0] * len(sections)
+
+
+def _barrier_stub() -> SimpleNamespace:
+    """Manager stub carrying the real generation-swap machinery."""
+    stub = SimpleNamespace(
+        _selective_compressor=None,
+        _selective_compressor_cfg=None,
+        _selective_publish_mu=threading.Lock(),
+        _relevance_scorer=BM25Scorer(),
+    )
+    stub._create_selective = MethodType(ProxyManager._create_selective, stub)
+    stub._rebuild_selective_compressor = MethodType(
+        ProxyManager._rebuild_selective_compressor, stub
+    )
+    return stub
+
+
+def _publish_gated(stub: SimpleNamespace, gate: threading.Event) -> SelectiveCompressor:
+    """Install a scorer-gated compressor as the stub's current generation."""
+    scorer = _GatedScorer(gate)
+    gated = SelectiveCompressor(
+        scorer=scorer,
+        live_provider=lambda: stub._selective_compressor,
+        publish_lock=stub._selective_publish_mu,
+    )
+    gated.started = scorer.started
+    stub._selective_compressor = gated
+    stub._selective_compressor_cfg = SelectiveConfig()
+    return gated
+
+
+_TEXT = "## Alpha\n" + "a" * 400 + "\n\n## Beta\n" + "b" * 400
+
+
+def _key_of(toc: str) -> str:
+    return json.loads(toc)["selection_key"]
+
+
+class TestSelectiveWriteBarrier:
+    """#898: a compress that started under one generation must not mint its
+    retrieval key into a store the readers no longer consult."""
+
+    def test_create_selective_wires_the_live_provider(self):
+        stub = _barrier_stub()
+        g1 = stub._rebuild_selective_compressor(SelectiveConfig(max_pending=5))
+        assert g1._live_provider() is g1, "a lone generation must resolve to itself"
+
+        g2 = stub._rebuild_selective_compressor(SelectiveConfig(max_pending=7))
+        assert g1._live_provider() is g2, (
+            "the retired compressor must resolve writes to the live generation"
+        )
+        assert g1._publish_lock is stub._selective_publish_mu
+
+    def _swap_during_compress(self, stub, gated, gate, swaps: int) -> str:
+        """Run gated.compress off-thread, swap generations while it scores."""
+        result: list[str] = []
+
+        def worker() -> None:
+            result.append(gated.compress(_TEXT, max_chars=200, context_query="alpha"))
+
+        t = threading.Thread(target=worker)
+        t.start()
+        try:
+            assert gated.started.wait(timeout=10), "scoring never started"
+            for n in range(swaps):
+                stub._rebuild_selective_compressor(SelectiveConfig(max_pending=10 + n))
+        finally:
+            gate.set()
+        t.join(timeout=10)
+        assert result, "compress never returned"
+        return result[0]
+
+    def test_key_lands_in_the_generation_the_reader_consults(self):
+        """The issue's sequence: G1 pinned and compressing, G2 published, G1
+        finishes. The key it hands the client must resolve through G2 — the
+        instance ``select_chunks`` reads off the manager's slot."""
+        stub = _barrier_stub()
+        gate = threading.Event()
+        gated = _publish_gated(stub, gate)
+
+        key = _key_of(self._swap_during_compress(stub, gated, gate, swaps=1))
+
+        live = stub._selective_compressor
+        assert live is not gated, "the swap did not happen"
+        assert live.select(key, ["Alpha"]) == "a" * 400, (
+            "the key was minted into the retired store — the client holds a "
+            "key that was never reachable (#898)"
+        )
+        assert gated._store.get(key) is None, "the write should not touch the retired store"
+
+    def test_key_follows_repeated_swaps(self):
+        """G1 → G2 → G3 while one compress is in flight: the write resolves at
+        put time, so it lands in whichever generation is current then."""
+        stub = _barrier_stub()
+        gate = threading.Event()
+        gated = _publish_gated(stub, gate)
+
+        key = _key_of(self._swap_during_compress(stub, gated, gate, swaps=2))
+
+        assert stub._selective_compressor.select(key, ["Beta"]) == "b" * 400
+
+    def test_a_rebuild_cannot_interleave_with_the_write(self):
+        """The window the scorer gate cannot reach: a rebuild arriving AFTER the
+        target is resolved and WHILE its store write is running.
+
+        Resolving the target under the lock and then writing outside it would
+        let that rebuild retire the target mid-write — the key would land in a
+        store the reader no longer consults, and the retired generation's
+        eviction policy would run over a shared path. Both are the defect this
+        change exists to close, so the write has to stay inside the lock. What
+        that guarantees, and what this pins, is serialization: the rebuild does
+        not complete until the write has.
+        """
+        stub = _barrier_stub()
+        g1 = stub._rebuild_selective_compressor(SelectiveConfig(max_pending=5))
+        in_put = threading.Event()
+        release = threading.Event()
+        real_put = g1._store.put
+
+        def gated_put(key, pending):
+            in_put.set()
+            assert release.wait(timeout=10), "test gate never released"
+            real_put(key, pending)
+
+        g1._store.put = gated_put  # type: ignore[method-assign]
+
+        published: list[str] = []
+        rebuilt = threading.Event()
+
+        def publisher() -> None:
+            published.append(_key_of(g1.compress(_TEXT, max_chars=200)))
+
+        def rebuilder() -> None:
+            stub._rebuild_selective_compressor(SelectiveConfig(max_pending=9))
+            rebuilt.set()
+
+        pt = threading.Thread(target=publisher)
+        pt.start()
+        assert in_put.wait(timeout=10), "the write never started"
+        rt = threading.Thread(target=rebuilder)
+        rt.start()
+        try:
+            # The rebuild is on the other side of the publish mutex; it must not
+            # be able to swap the slot out from under the in-flight write.
+            assert not rebuilt.wait(timeout=0.5), (
+                "a rebuild completed while a selection write was in flight — "
+                "the write is no longer protected by the publish lock"
+            )
+            assert stub._selective_compressor is g1, "the slot was swapped mid-write"
+        finally:
+            release.set()
+        pt.join(timeout=10)
+        rt.join(timeout=10)
+
+        assert rebuilt.is_set(), "the rebuild never completed after the write drained"
+        assert g1._store.get(published[0]) is not None, (
+            "the write did not land in the generation that was live when it started"
+        )
+
+    def test_restart_recovery_cannot_install_over_an_in_flight_write(self, tmp_path):
+        """The other writer of the slot: ``select_chunks`` restart recovery.
+
+        It fills a COLD slot (#583), and its pre-#898 argument for needing no
+        lock — no await between the check and the assignment — only ever covered
+        the event loop. An off-thread compress now reads the same slot to pick
+        its write target, so an unguarded install can land between that read and
+        the worker's put and leave the returned key behind. Recovery takes the
+        publish mutex for the install, which serializes the two.
+        """
+        from memtomem_stm.proxy.config import (
+            ProxyConfig,
+            SelectiveConfig,
+            UpstreamServerConfig,
+        )
+
+        db = tmp_path / "pending.db"
+        sel_cfg = SelectiveConfig(pending_store="sqlite", pending_store_path=db)
+        cfg = ProxyConfig(
+            upstream_servers={"srv": UpstreamServerConfig(prefix="test", selective=sel_cfg)}
+        )
+
+        stub = _barrier_stub()
+        stub._config = cfg
+        # The scorer cache is not what this test is about; the stub's single
+        # BM25 instance stands in for the per-generation resolution.
+        stub._relevance_scorer_for = lambda _cfg: stub._relevance_scorer
+        for name in (
+            "select_chunks",
+            "_distinct_sqlite_selective_cfgs",
+            "_sqlite_cfg_holding_key",
+            "_is_recovery_miss",
+        ):
+            setattr(stub, name, MethodType(getattr(ProxyManager, name), stub))
+
+        # A compressor on the configured store, published as the live one, then
+        # the slot goes cold the way stop() leaves it.
+        writer = stub._rebuild_selective_compressor(sel_cfg)
+        in_put = threading.Event()
+        release = threading.Event()
+        real_put = writer._store.put
+
+        def gated_put(k, pending):
+            in_put.set()
+            assert release.wait(timeout=10), "test gate never released"
+            real_put(k, pending)
+
+        writer._store.put = gated_put  # type: ignore[method-assign]
+        stub._selective_compressor = None
+        stub._selective_compressor_cfg = None
+
+        published: list[str] = []
+        recovered = threading.Event()
+
+        def publisher() -> None:
+            published.append(_key_of(writer.compress(_TEXT, max_chars=200)))
+
+        def recoverer() -> None:
+            stub.select_chunks("does-not-exist", ["Alpha"])
+            recovered.set()
+
+        pt = threading.Thread(target=publisher)
+        pt.start()
+        assert in_put.wait(timeout=10), "the write never started"
+        rt = threading.Thread(target=recoverer)
+        rt.start()
+        try:
+            assert not recovered.wait(timeout=0.5), (
+                "restart recovery installed a compressor while a selection write "
+                "was in flight — the install bypasses the publish mutex"
+            )
+        finally:
+            release.set()
+        pt.join(timeout=10)
+        rt.join(timeout=10)
+        assert recovered.is_set(), "recovery never completed after the write drained"
+
+        # Same configured path, so the recovered generation serves the key the
+        # worker published while the slot was cold.
+        assert stub._selective_compressor is not None
+        assert stub._selective_compressor.select(published[0], ["Alpha"]) == "a" * 400
+
+    def test_hybrid_tail_write_follows_the_live_generation(self):
+        """HYBRID compresses its tail through the SAME shared selective
+        instance, so its TOC key has the same exposure."""
+        from memtomem_stm.proxy.compression import HybridCompressor
+
+        stub = _barrier_stub()
+        gate = threading.Event()
+        gated = _publish_gated(stub, gate)
+        hybrid = HybridCompressor(head_chars=100, selective_compressor=gated)
+
+        result: list[str] = []
+
+        def worker() -> None:
+            result.append(hybrid.compress(_TEXT, max_chars=400, context_query="alpha"))
+
+        t = threading.Thread(target=worker)
+        t.start()
+        try:
+            assert gated.started.wait(timeout=10)
+            stub._rebuild_selective_compressor(SelectiveConfig(max_pending=11))
+        finally:
+            gate.set()
+        t.join(timeout=10)
+
+        match = re.search(r'"selection_key":\s*"([0-9a-f]+)"', result[0])
+        assert match is not None, f"no TOC key in the hybrid output: {result[0][:200]}"
+        key = match.group(1)
+        assert stub._selective_compressor._store.get(key) is not None, (
+            "the hybrid tail's key was stranded in the retired store"
+        )
+
+    def test_cleared_slot_falls_back_to_the_pinned_store(self):
+        """``stop()`` clears the slot while a worker is still compressing. The
+        write falls back to the pinned instance's own store — still open,
+        because its close defers to the last end_use (#628) — rather than
+        raising into the caller's result."""
+        stub = _barrier_stub()
+        gate = threading.Event()
+        gated = _publish_gated(stub, gate)
+        gated.begin_use()
+
+        result: list[str] = []
+
+        def worker() -> None:
+            result.append(gated.compress(_TEXT, max_chars=200, context_query="alpha"))
+
+        t = threading.Thread(target=worker)
+        t.start()
+        try:
+            assert gated.started.wait(timeout=10)
+            with stub._selective_publish_mu:
+                gated.close()
+                stub._selective_compressor = None
+        finally:
+            gate.set()
+        t.join(timeout=10)
+
+        key = _key_of(result[0])
+        assert gated.select(key, ["Alpha"]) == "a" * 400
+        gated.end_use()
+
+    def test_single_generation_writes_to_its_own_store(self):
+        """A standalone compressor (no manager, no provider) keeps the plain
+        put-then-evict path."""
+        comp = SelectiveCompressor()
+        key = _key_of(comp.compress(_TEXT, max_chars=200))
+        assert comp._store.get(key) is not None
 
 
 # ── fallback_count under concurrent worker threads ────────────────────

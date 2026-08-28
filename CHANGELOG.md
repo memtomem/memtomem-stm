@@ -272,16 +272,9 @@ changes inline only. See the deprecation policy in
   is still refused to a superseded pin, which carries a policy that could
   delete the current generation's live keys.
 
-  This covers the request that DECIDES which store to use. It does not close a
-  narrower pre-existing race: a SELECTIVE/HYBRID compress runs off-thread while
-  holding its compressor pinned (`begin_use`, which defers the retired
-  instance's `close`), so a config change landing mid-compress lets that worker
-  finish and write its key into a store `select_chunks` no longer consults, and
-  lets its own `_evict` apply a superseded `max_pending`/TTL to a shared SQLite
-  path. That predates this work — the pin and the deferred close are unchanged
-  — and closing it needs retired stores to stay reachable until their keys
-  expire, the same explicit-lease lifecycle #890 carries for the fact
-  extractor. Tracked as #898 rather than smuggled in here.
+  This covers the request that DECIDES which store to use. It did not close a
+  narrower pre-existing race — a worker that had already decided and was still
+  running — which is tracked as #898 and fixed by the entry below.
 
   A request stays on the 2-read baseline even when it constructs the selective
   compressor: the build publishes under one resolved generation and takes its
@@ -347,6 +340,66 @@ changes inline only. See the deprecation policy in
   external.
 
 ### Fixed
+
+- **A selection key minted off-thread lands in the generation the reader
+  consults** (#898). A SELECTIVE/HYBRID compress can run on a worker thread for
+  as long as its embedding scorer takes, and `begin_use` (#628) only keeps that
+  compressor ALIVE — not reachable. `stm_proxy_select_chunks` reads the
+  manager's current slot, so a selective-config change landing mid-compress let
+  the worker finish and write its selection into the retired store: the client
+  got a key back and then `Selection key '…' not found or expired` when it used
+  it. The key was never reachable. #889 fixed the request that DECIDES which
+  store to use; this is the worker that had already decided.
+
+  The write now resolves the live generation at put time rather than at start
+  time. Two things make that resolution meaningful. The query-aware scoring pass
+  moved AHEAD of the write, because an embedding scorer is a network round trip
+  — the reason this compress is off-loaded at all — and publishing before it
+  would resolve a generation and then sit through that entire call while a
+  reload retired it. And the resolve, the put and the eviction all happen under
+  a lock the rebuild and `stop()` also hold across their slot swap and the
+  superseded close, so the target cannot be retired underneath a write in
+  progress. Resolving under the lock and writing outside it is not equivalent
+  and was tried: keeping the target open is not keeping it current, so a rebuild
+  landing between the two put the key in a store the reader no longer consults
+  and ran a superseded eviction policy over a shared path. The cost of holding
+  the lock is that a reload on the event loop waits for one put and two eviction
+  passes against a local SQLite file — bounded, and the same synchronous
+  store-on-the-loop pattern every sibling write here already has (#879).
+
+  `select_chunks`'s restart recovery (#583) takes that lock too. It is the third
+  writer of the slot, filling it when no compress has run yet this process, and
+  its standing argument for needing no lock — nothing awaits between its check
+  and its assignment — only ever covered the event loop. With a worker thread
+  now reading the same slot to pick its write target, an unguarded install could
+  land between that read and the write. It builds outside the lock, then
+  re-checks under it and installs only if the slot is still empty, closing the
+  candidate that lost rather than leaking its connection.
+
+  Eviction follows the same target, which closes the second half. `_evict`
+  reads instance policy (`max_pending`, TTL) and applies it store-WIDE, so when
+  two generations share one `pending_store_path` a compress that started before
+  the swap ran a superseded policy over the live store and could delete the
+  current generation's keys — a lowered `max_pending` in the old generation was
+  enough. The current owner's policy is now the only one that runs. **Behavior
+  change**: a TOC's `ttl_seconds_remaining` reports the TTL of the generation
+  that will actually enforce it, which after a mid-compress reload is the new
+  one rather than the value the retired instance was built with. A second
+  **behavior change** comes from the reordering: a selection's TTL now starts
+  after the scoring call rather than before it, so under a slow embedding
+  endpoint the key lives its full TTL from the moment it exists instead of
+  spending part of it waiting for the scorer. A scorer that raises now leaves no
+  orphan key behind, where it previously stored one first. Keys minted BEFORE a
+  swap into an in-memory store still die with their generation; only the SQLite
+  backend survives a rebuild, unchanged from #583.
+
+  What remains is a window this shape of fix cannot close: a reload landing
+  after the write still strands the key the client is holding. What the
+  reordering removed from that window is the scoring round trip — the long,
+  network-bound part; what is left is the store write, its two eviction passes
+  and building the TOC string. Closing it completely needs retired stores to
+  stay readable until their keys expire, which is the lease lifecycle #890
+  carries for the fact extractor.
 
 - **An unseeded loader with an unreadable config file answers, and honors
   `MEMTOMEM_STM_PROXY__*`** (#897). `ProxyConfigLoader.get()` returned `None`
