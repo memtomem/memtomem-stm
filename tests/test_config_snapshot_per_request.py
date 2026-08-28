@@ -823,6 +823,26 @@ class TestPerRequestSnapshot:
         outcomes = mgr.index_observability.snapshot()["outcomes"]["tool"]
         assert outcomes.get("error") == 1, f"the refusal was not recorded: {outcomes}"
 
+    async def test_a_contended_lock_timeout_is_not_absorbed_by_the_stage(self, extract_mgr):
+        """The one failure here the stage does NOT own.
+
+        ``_get_extractor`` re-raises a timeout with no teardown behind it on
+        purpose, ``_locks`` propagates it so a stuck holder stays visible, and
+        ``call_tool`` has a LOCK_TIMEOUT classifier that only runs if it
+        arrives. The broad catch that keeps a construction failure from
+        discarding the response must not turn that diagnostic into a quiet
+        degraded outcome.
+        """
+        mgr = extract_mgr
+        await mgr._get_extractor(cfg_snap=mgr._config)
+        snap = mgr._config.model_copy(update={"lock_timeout_seconds": 0.01})
+
+        async with mgr._extractor_lock:
+            with pytest.raises(LockTimeoutError):
+                await mgr._extract_and_store(
+                    "srv", "tool", {}, "a long enough response body" * 4, cfg_snap=snap
+                )
+
     async def test_extraction_records_a_shed_outcome_when_the_manager_is_stopping(
         self, extract_mgr
     ):

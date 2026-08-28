@@ -251,12 +251,13 @@ class ToolgraphStartupError(RuntimeError):
 
 
 class ManagerStoppingError(RuntimeError):
-    """A long-lived component was asked for after teardown reclaimed it (#890).
+    """A long-lived component could not be obtained because teardown owns it (#890).
 
     ``stop()`` owns the manager's cached components from the moment it starts.
-    A request still running then can reach one whose slot teardown has already
-    cleared, and building a replacement there would be an object no teardown
-    pass is guaranteed to close — ``stop()`` may already have made its last one.
+    A request still running then can find the slot already cleared — building a
+    replacement there would be an object no teardown pass is guaranteed to
+    close, since ``stop()`` may already have made its last one — or can exhaust
+    its own lock budget while teardown holds the lock across a drain.
     Refusing is the honest answer, and the pipeline turns it into a recorded
     per-stage failure rather than a broken response (mirroring how #868 sheds
     background work once teardown starts).
@@ -3793,6 +3794,14 @@ class ProxyManager:
             self.index_observability.record_attempt(tool, "extract")
             self.index_observability.record_outcome(tool, "shed")
             return ExtractOutcome(ok=False, facts_stored=0, error="manager_stopping")
+        except LockTimeoutError:
+            # A contended timeout with no teardown behind it is the one failure
+            # here that is NOT this stage's to absorb: ``_get_extractor``
+            # deliberately re-raises it, ``_locks`` propagates it so a stuck
+            # holder stays visible, and ``call_tool`` has a LOCK_TIMEOUT
+            # classifier that only runs if it arrives. Swallowing it would turn
+            # the diagnostic the lock exists for into a quiet degraded outcome.
+            raise
         except Exception as exc:
             logger.warning(
                 "Extraction unavailable for %s/%s (%s): %s",
