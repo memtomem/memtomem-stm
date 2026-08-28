@@ -61,11 +61,9 @@ from typing import Literal
 #   the same answer either way. (1) A background stage was never scheduled
 #   because the fire-and-forget backlog was at capacity or ``stop()`` was
 #   draining (#868) — both paths, background variants only. (2) An INLINE
-#   extraction could not obtain a fact extractor because the manager was
-#   stopping (#890) — teardown had already reclaimed it, or was still holding
-#   it long enough that the request's own lock budget expired; the stage
-#   records the refusal on the extractor's behalf, exactly as the shed
-#   background branch does. Distinct from
+#   extraction reached a manager whose teardown had already reclaimed the
+#   fact extractor (#890); the stage records the refusal on the extractor's
+#   behalf, exactly as the shed background branch does. Distinct from
 #   ``error`` (a run that failed) and from a NULL ``index_ok`` /
 #   ``extract_ok``, which records no outcome at all: ``shed`` says the work
 #   was refused, so nothing ran and nothing will.
@@ -98,8 +96,8 @@ IndexOutcome = Literal[
     "privacy_skip",
     # The stage was refused before it ran: a background one never scheduled
     # because the fire-and-forget backlog was at capacity or the manager was
-    # stopping (#868), or an inline extraction that could not obtain an
-    # extractor because the manager was stopping (#890). Distinct from "error" (a run that
+    # stopping (#868), or an inline extraction that found the extractor
+    # already reclaimed by teardown (#890). Distinct from "error" (a run that
     # failed) and from a NULL index_ok, which records no outcome at all.
     "shed",
     "error",

@@ -97,8 +97,6 @@ class TestBoundedLock:
             holder_released.set()
             await holder
 
-
-
     @pytest.mark.asyncio
     async def test_lock_released_when_block_raises(self) -> None:
         lock = asyncio.Lock()

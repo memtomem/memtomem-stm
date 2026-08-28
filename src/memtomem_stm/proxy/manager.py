@@ -3753,7 +3753,8 @@ class ProxyManager:
         ``shed`` outcome, mirroring what #868 records for background work
         refused at the spawn point (the same situation through the inline
         route); anything else is an ``error``, and the next request retries
-        against the still-installed instance.
+        against the still-installed instance. A lock timeout is neither: it
+        means a genuinely stuck holder, so it propagates.
         """
         try:
             extractor = await self._get_extractor(cfg_snap=cfg_snap)

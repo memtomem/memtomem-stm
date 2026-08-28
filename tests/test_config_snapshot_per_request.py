@@ -581,9 +581,7 @@ class TestPerRequestSnapshot:
         # the drain runs. Publishing before the drain is not enough on its own —
         # a close awaited inside ``_extractor_lock`` would satisfy every
         # assertion above and still block this one until the gate is released.
-        concurrent = await asyncio.wait_for(
-            mgr._get_extractor(cfg_snap=mgr._config), timeout=5
-        )
+        concurrent = await asyncio.wait_for(mgr._get_extractor(cfg_snap=mgr._config), timeout=5)
         assert concurrent is mgr._extractor, "a concurrent caller was served the retired instance"
         assert not rebuild.done(), "the drain ended early; the concurrency check proved nothing"
 
@@ -735,8 +733,6 @@ class TestPerRequestSnapshot:
         assert mgr._extractor_cfg is None
         assert mgr._retiring_extractors == set(), "the refusal still built something"
 
-
-
     async def test_a_failed_rebuild_does_not_discard_the_upstream_response(
         self, extract_mgr, tmp_path, monkeypatch
     ):
@@ -765,7 +761,6 @@ class TestPerRequestSnapshot:
         assert mgr._extractor is installed, "the working extractor was dropped"
         outcomes = mgr.index_observability.snapshot()["outcomes"]["tool"]
         assert outcomes.get("error") == 1, f"the refusal was not recorded: {outcomes}"
-
 
     async def test_a_contended_lock_timeout_is_not_absorbed_by_the_stage(self, extract_mgr):
         """The one failure here the stage does NOT own.
