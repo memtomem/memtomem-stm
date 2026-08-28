@@ -684,7 +684,14 @@ class TestPerRequestSnapshot:
 
         installed._gate.leave(token)
         await asyncio.wait_for(stopping, timeout=10)
-        published = await asyncio.wait_for(rebuild, timeout=10)
+        try:
+            published = await asyncio.wait_for(rebuild, timeout=10)
+        except ManagerStoppingError:
+            # The declining branch the docstring describes: the lock came free
+            # after teardown cleared the slot but before it reopened the spawn
+            # path. Legitimate, and which side the rebuild lands on is exactly
+            # what this test refuses to pin.
+            published = None
 
         assert installed._client is None, "teardown did not close the installed extractor"
         # Which side of teardown the rebuild lands on is a genuine race — the
@@ -692,7 +699,7 @@ class TestPerRequestSnapshot:
         # ownership invariant, not an ordering: whatever comes back is closed,
         # installed (and so closed by the next stop), or registered as
         # retiring. An open extractor that is none of the three is the leak.
-        assert published._client is None or published is mgr._extractor, (
+        assert published is None or published._client is None or published is mgr._extractor, (
             "the rebuild handed out an open extractor that nothing owns"
         )
 
@@ -746,16 +753,24 @@ class TestPerRequestSnapshot:
         mgr._background_closed = True
         try:
             outcome = await mgr._extract_and_store(
-                "srv", "tool", {}, "a long enough response body to extract from"
-                * 4, cfg_snap=mgr._config
+                "srv",
+                "tool",
+                {},
+                "a long enough response body to extract from" * 4,
+                cfg_snap=mgr._config,
             )
+            # And through the real inline pipeline: the exception must not
+            # reach call_tool, which would turn a teardown race into a failed
+            # tool response. This fixture runs extraction with background=False,
+            # so the stage awaits _extract_and_store on the response path.
+            assert isinstance(await mgr.call_tool("srv", "tool", {"a": 1}), str)
         finally:
             mgr._background_closed = False
 
         assert outcome.ok is False
         assert outcome.error == "manager_stopping"
         snap = mgr.index_observability.snapshot()
-        assert snap["outcomes"]["tool"] == {"shed": 1}
+        assert snap["outcomes"]["tool"] == {"shed": 2}, "the stage did not record the refusal"
 
     async def test_config_edit_lands_on_the_next_request(self, mgr, tmp_path):
         """Snapshotting moves hot-reload to a request boundary; it must not

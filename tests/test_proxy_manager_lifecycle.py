@@ -416,9 +416,10 @@ class TestStop:
         """Teardown drains retiring instances INSIDE ``_extractor_lock``.
 
         Outside it, the pass would snapshot the set, await, and return without
-        closing an entry a waiting rebuild registered in the meantime — the
-        transient-instance path is the only writer, and it writes under this
-        lock. Pinned by observing the lock while a slow close is in flight."""
+        closing an entry a rebuild registered in the meantime: rebuilds add to
+        the set under this lock, so holding it across the drain is what makes
+        teardown's pass the last word. Pinned by observing the lock while a
+        slow close is in flight."""
         mgr = _make_manager(servers={})
         released = asyncio.Event()
         observed: list[bool] = []
