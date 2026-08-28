@@ -668,15 +668,14 @@ class TestPerRequestSnapshot:
         stopping = asyncio.create_task(mgr.stop())
         # Wait for an OBSERVABLE teardown signal, not a sleep: close() flips the
         # gate as its first step, so this pins that stop() is inside the
-        # extractor close — and therefore holding _extractor_lock — before the
-        # rebuild starts. A bare sleep would also pass if stop() were still
-        # awaiting something earlier and the lock were free.
+        # extractor drain before the rebuild starts. A bare sleep would also
+        # pass if stop() were still awaiting something earlier entirely.
         for _ in range(200):
             if installed._gate.closed:
                 break
             await asyncio.sleep(0.01)
         assert installed._gate.closed, "stop() never reached the extractor close"
-        assert mgr._extractor_lock.locked(), "the extractor close did not hold the lock"
+        assert mgr._extractor is None, "teardown had not detached the slot yet"
         assert not stopping.done()
 
         _reload_with_max_facts(mgr, tmp_path, 3)
@@ -736,63 +735,7 @@ class TestPerRequestSnapshot:
         assert mgr._extractor_cfg is None
         assert mgr._retiring_extractors == set(), "the refusal still built something"
 
-    async def test_a_lock_timeout_during_teardown_reads_as_the_stopping_refusal(
-        self, extract_mgr
-    ):
-        """Teardown holds the extractor lock across two awaits, so a caller can
-        time out on the lock before it ever reads ``_background_closed``.
 
-        That has to surface as the same refusal: a raw lock error would put a
-        bare timeout on the response path for what is an orderly shutdown, and
-        would bypass the recorded stage failure the caller produces. Forced by
-        holding the lock while the flag is set and giving the caller a timeout
-        far shorter than the hold.
-        """
-        mgr = extract_mgr
-        await mgr._get_extractor(cfg_snap=mgr._config)
-        snap = mgr._config.model_copy(update={"lock_timeout_seconds": 0.01})
-        mgr._background_closed = True
-        try:
-            async with mgr._extractor_lock:
-                with pytest.raises(ManagerStoppingError):
-                    await mgr._get_extractor(cfg_snap=snap)
-        finally:
-            mgr._background_closed = False
-
-        # Without teardown running, the same contention is still a lock error:
-        # this translation is scoped to shutdown, not a blanket swallow.
-        async with mgr._extractor_lock:
-            with pytest.raises(LockTimeoutError):
-                await mgr._get_extractor(cfg_snap=snap)
-
-    async def test_a_teardown_that_finishes_during_the_timeout_still_reads_as_stopping(
-        self, extract_mgr
-    ):
-        """The flag is a point sample; the span is what matters.
-
-        ``stop()`` clears ``_background_closed`` at its very end, so a caller
-        whose acquisition expired ON teardown's lock hold can resume to find it
-        already False and misreport its own timeout as ordinary contention —
-        putting a raw lock error on the response path for a shutdown that did
-        happen. The epoch captured on entry answers for the whole call. Forced
-        by leaving the flag CLEAR and bumping the epoch, which is exactly the
-        state a finished teardown leaves behind.
-        """
-        import asyncio
-
-        mgr = extract_mgr
-        await mgr._get_extractor(cfg_snap=mgr._config)
-        snap = mgr._config.model_copy(update={"lock_timeout_seconds": 0.01})
-
-        async with mgr._extractor_lock:
-            waiting = asyncio.ensure_future(mgr._get_extractor(cfg_snap=snap))
-            await asyncio.sleep(0)
-            # Teardown starts and finishes while the caller is queued: the
-            # epoch moves, the flag ends where it began.
-            mgr._teardown_epoch += 1
-            assert mgr._background_closed is False
-            with pytest.raises(ManagerStoppingError):
-                await asyncio.wait_for(waiting, timeout=5)
 
     async def test_a_failed_rebuild_does_not_discard_the_upstream_response(
         self, extract_mgr, tmp_path, monkeypatch
@@ -823,37 +766,6 @@ class TestPerRequestSnapshot:
         outcomes = mgr.index_observability.snapshot()["outcomes"]["tool"]
         assert outcomes.get("error") == 1, f"the refusal was not recorded: {outcomes}"
 
-    async def test_a_teardown_already_running_on_entry_still_reads_as_stopping(
-        self, extract_mgr
-    ):
-        """The third observation the span needs.
-
-        An epoch captured on entry cannot see a teardown that was ALREADY
-        running when the call began — the bump happened before the read — and
-        by the time the lock wait expires the flag may be clear again. That is
-        the request most likely to hit this: it arrived mid-teardown, so its
-        wait is the one teardown's hold expires. Forced by setting the flag
-        before the call and clearing it while the call is queued, without
-        touching the epoch.
-        """
-        import asyncio
-
-        mgr = extract_mgr
-        await mgr._get_extractor(cfg_snap=mgr._config)
-        snap = mgr._config.model_copy(update={"lock_timeout_seconds": 0.05})
-
-        mgr._background_closed = True
-        try:
-            async with mgr._extractor_lock:
-                waiting = asyncio.ensure_future(mgr._get_extractor(cfg_snap=snap))
-                await asyncio.sleep(0)
-                # Teardown finishes while the caller is queued: the flag goes
-                # back to False and the epoch never moves for this caller.
-                mgr._background_closed = False
-                with pytest.raises(ManagerStoppingError):
-                    await asyncio.wait_for(waiting, timeout=5)
-        finally:
-            mgr._background_closed = False
 
     async def test_a_contended_lock_timeout_is_not_absorbed_by_the_stage(self, extract_mgr):
         """The one failure here the stage does NOT own.

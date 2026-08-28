@@ -97,70 +97,7 @@ class TestBoundedLock:
             holder_released.set()
             await holder
 
-    @pytest.mark.asyncio
-    async def test_an_expected_timeout_downgrades_the_alarm_not_the_error(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """A caller that knows the hold is legitimate suppresses the ALARM only.
 
-        Shutdown holds some of these locks across awaits by design (#890), and
-        reporting that as a likely deadlock spends the ERROR's credibility on
-        an event that is not one. The exception is unchanged — callers still
-        see the timeout and decide what it means.
-        """
-        lock = asyncio.Lock()
-        released = asyncio.Event()
-
-        async def _hold() -> None:
-            async with lock:
-                await released.wait()
-
-        holder = asyncio.create_task(_hold(), name="orderly_holder")
-        try:
-            await asyncio.sleep(0.01)
-            caplog.clear()
-            with caplog.at_level(logging.INFO, logger="memtomem_stm.proxy._locks"):
-                with pytest.raises(LockTimeoutError):
-                    async with bounded_lock(
-                        lock, timeout=0.05, name="stopping_lock", expected=lambda: True
-                    ):
-                        pass
-            assert not [r for r in caplog.records if r.levelno >= logging.ERROR], (
-                "an anticipated hold still raised a deadlock alarm"
-            )
-            assert any("stopping_lock" in r.getMessage() for r in caplog.records)
-        finally:
-            released.set()
-            await holder
-
-    @pytest.mark.asyncio
-    async def test_a_false_expected_predicate_keeps_the_error(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """The suppression is scoped to what the caller vouches for; an
-        ordinary contended timeout is still an ERROR even when the parameter
-        is wired up."""
-        lock = asyncio.Lock()
-        released = asyncio.Event()
-
-        async def _hold() -> None:
-            async with lock:
-                await released.wait()
-
-        holder = asyncio.create_task(_hold(), name="stuck_holder")
-        try:
-            await asyncio.sleep(0.01)
-            caplog.clear()
-            with caplog.at_level(logging.ERROR, logger="memtomem_stm.proxy._locks"):
-                with pytest.raises(LockTimeoutError):
-                    async with bounded_lock(
-                        lock, timeout=0.05, name="contended_lock", expected=lambda: False
-                    ):
-                        pass
-            assert [r for r in caplog.records if r.levelno >= logging.ERROR]
-        finally:
-            released.set()
-            await holder
 
     @pytest.mark.asyncio
     async def test_lock_released_when_block_raises(self) -> None:

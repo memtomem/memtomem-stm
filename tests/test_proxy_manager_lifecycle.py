@@ -412,14 +412,15 @@ class TestStop:
         stubborn.close.assert_awaited_once()
         assert stubborn in mgr._retiring_extractors, "a failed close dropped the last reference"
 
-    async def test_stop_holds_the_extractor_lock_across_the_retirement_drain(self):
-        """Teardown drains retiring instances INSIDE ``_extractor_lock``.
+    async def test_stop_detaches_under_the_lock_and_drains_outside_it(self):
+        """Teardown must not hold ``_extractor_lock`` across an await.
 
-        Outside it, the pass would snapshot the set, await, and return without
-        closing an entry a rebuild registered in the meantime: rebuilds add to
-        the set under this lock, so holding it across the drain is what makes
-        teardown's pass the last word. Pinned by observing the lock while a
-        slow close is in flight."""
+        Every holder of this lock does synchronous work under it, which is what
+        lets an ordinary timeout on it mean "stuck holder" rather than "someone
+        is shutting down". Teardown keeps that property by transferring the
+        installed instance into the retirement set — which is what gives it an
+        owner — and closing it after releasing. Pinned by observing the lock
+        from inside a slow close."""
         mgr = _make_manager(servers={})
         released = asyncio.Event()
         observed: list[bool] = []
@@ -431,7 +432,8 @@ class TestStop:
             await released.wait()
 
         slow.close.side_effect = slow_close
-        mgr._retiring_extractors.add(slow)
+        mgr._extractor = slow
+        mgr._extractor_cfg = mgr._config.extraction
 
         stopping = asyncio.create_task(mgr.stop())
         for _ in range(200):
@@ -441,7 +443,9 @@ class TestStop:
         released.set()
         await asyncio.wait_for(stopping, timeout=10)
 
-        assert observed == [True], f"the retirement drain ran without the lock: {observed}"
+        assert observed == [False], f"teardown drained while holding the lock: {observed}"
+        assert mgr._extractor is None
+        assert mgr._extractor_cfg is None
         assert mgr._retiring_extractors == set()
 
     async def test_overlapping_retirement_passes_close_each_instance_once(self):
@@ -471,6 +475,36 @@ class TestStop:
 
         assert slow.close.await_count == 1, "the same instance was closed by both passes"
         assert mgr._retiring_extractors == set()
+
+    async def test_a_cold_rebuild_after_stop_retries_a_failed_retirement(self):
+        """The retry gate is publication, not displacement.
+
+        After stop() the slot is deliberately None while the retirement set may
+        still hold an instance whose close failed. The first post-stop lookup
+        publishes into an empty slot — displacing nothing — so a gate written as
+        "only when this call replaced something" skips cleanup, and every warm
+        lookup after it skips too: the transport stays open for the whole
+        restarted lifecycle. That entry is the one that has been waiting
+        longest, so a cold publication is exactly when to retry it.
+        """
+        mgr = _make_manager(servers={})
+        stubborn = AsyncMock()
+        stubborn.close.side_effect = [RuntimeError("transport wedged"), None]
+        mgr._extractor = stubborn
+        mgr._extractor_cfg = mgr._config.extraction
+
+        await mgr.stop()
+        assert stubborn in mgr._retiring_extractors, "the failed close lost its owner"
+        assert mgr._extractor is None
+
+        # Cold rebuild: nothing to displace, but something to retry.
+        rebuilt = await mgr._get_extractor(cfg_snap=mgr._config)
+        try:
+            assert rebuilt is not stubborn
+            assert stubborn.close.await_count == 2, "the cold rebuild skipped the retry"
+            assert mgr._retiring_extractors == set()
+        finally:
+            await rebuilt.close()
 
     async def test_a_cancelled_retirement_pass_hands_the_entry_back(self):
         """Cancellation must not consume a claimed entry.
