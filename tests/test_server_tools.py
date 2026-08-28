@@ -2808,6 +2808,299 @@ class TestAdvertiseOrder:
         )
 
 
+# ── lifespan teardown symmetry (#891) ────────────────────────────────────
+
+
+class TestLifespanTeardownSymmetry:
+    """#891: teardown must remove exactly the tools registration added.
+
+    ``get_proxy_tools()`` is a live re-derivation (it re-reads ``conn.tools``,
+    refreshes the toolgraph bundle, and rewrites the advertisement telemetry
+    snapshot), so calling it a second time at teardown removes whatever the
+    session looks like *then*, not what was registered."""
+
+    @staticmethod
+    def _mock_config(MockConfig):
+        mock_cfg = MockConfig.return_value
+        mock_cfg.proxy = MagicMock()
+        mock_cfg.proxy.enabled = True
+        mock_cfg.proxy.config_path = Path("/tmp/proxy.json")
+        mock_cfg.proxy.metrics.enabled = False
+        mock_cfg.proxy.compression_feedback.enabled = False
+        mock_cfg.proxy.progressive_reads.enabled = False
+        mock_cfg.proxy.selection_telemetry.enabled = False
+        mock_cfg.proxy.cache.enabled = False
+        mock_cfg.surfacing = MagicMock()
+        mock_cfg.surfacing.enabled = False
+        mock_cfg.langfuse = MagicMock()
+        mock_cfg.langfuse.enabled = False
+        mock_cfg.otlp = MagicMock()
+        mock_cfg.otlp.enabled = False
+        return mock_cfg
+
+    @staticmethod
+    def _infos(*names):
+        from memtomem_stm.proxy.manager import ProxyToolInfo
+
+        return [
+            ProxyToolInfo(
+                prefixed_name=name,
+                description="fake proxied tool",
+                input_schema={"type": "object", "properties": {}},
+                server="fake",
+                original_name=name.split("__", 1)[1],
+            )
+            for name in names
+        ]
+
+    async def test_teardown_removes_the_registered_set_not_a_fresh_derivation(self):
+        """Upstream catalog drift between startup and shutdown (a
+        ``tools/list_changed`` reassigns ``conn.tools``) must not change what
+        teardown removes. The second, divergent advertisement is wired as a
+        ``side_effect`` value that a correct teardown never consumes: the
+        registry must come back to its pre-lifespan state — ``fake__alpha``
+        removed even though it vanished upstream, and ``fake__gamma`` (never
+        registered) never attempted. The removals are spied rather than only
+        read off the registry, because a removal for an unregistered name
+        raises ``ToolError`` and the guard would otherwise hide it."""
+        from memtomem_stm.server import app_lifespan, mcp
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.side_effect = [
+            self._infos("fake__alpha", "fake__beta"),
+            self._infos("fake__beta", "fake__gamma"),
+        ]
+
+        tools_dict = mcp._tool_manager._tools
+        snapshot = dict(tools_dict)
+        removed: list[str] = []
+        real_remove = type(mcp).remove_tool
+
+        def _remove(self_, name: str) -> None:
+            removed.append(name)
+            real_remove(self_, name)
+
+        try:
+            with (
+                patch("memtomem_stm.server.STMConfig") as MockConfig,
+                patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+                patch.object(type(mcp), "remove_tool", _remove),
+            ):
+                self._mock_config(MockConfig)
+                async with app_lifespan(mcp) as _ctx:
+                    assert {"fake__alpha", "fake__beta"} <= set(tools_dict)
+
+            assert sorted(removed) == ["fake__alpha", "fake__beta"], (
+                f"teardown must remove exactly the registered names, got {removed}"
+            )
+            assert tools_dict == snapshot, (
+                "teardown must remove exactly the registered proxied tools; "
+                f"leftover={set(tools_dict) - set(snapshot)}"
+            )
+            assert mock_pm_instance.get_proxy_tools.call_count == 1, (
+                "teardown re-derived the advertisement — that rewrites the "
+                "snapshot stm_proxy_health and the ranker read, during shutdown"
+            )
+        finally:
+            tools_dict.clear()
+            tools_dict.update(snapshot)
+
+    async def test_stop_runs_when_a_second_advertisement_pass_would_raise(self):
+        """The teardown ``get_proxy_tools()`` call was the one statement in the
+        cleanup block outside a guard, so anything it raised skipped
+        ``proxy_manager.stop()``. Freezing the registered names removes the call
+        and with it the failure mode; the raising second value is wired as a
+        ``side_effect`` a correct teardown never reaches. The exception here
+        stands for any escape from that pass, not for a specific live trigger —
+        bundle loading has its own catch-all barrier."""
+        from memtomem_stm.server import app_lifespan, mcp
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.side_effect = [
+            self._infos("fake__alpha"),
+            RuntimeError("advertisement pass failed"),
+        ]
+
+        tools_dict = mcp._tool_manager._tools
+        snapshot = dict(tools_dict)
+        try:
+            with (
+                patch("memtomem_stm.server.STMConfig") as MockConfig,
+                patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+            ):
+                self._mock_config(MockConfig)
+                async with app_lifespan(mcp) as _ctx:
+                    assert "fake__alpha" in tools_dict
+
+            mock_pm_instance.stop.assert_awaited_once()
+            assert set(tools_dict) == set(snapshot)
+        finally:
+            tools_dict.clear()
+            tools_dict.update(snapshot)
+
+    async def test_stop_runs_even_when_a_removal_raises(self):
+        """A failing ``remove_tool`` must not skip ``proxy_manager.stop()``.
+        Holds on the pre-#891 code too, through its ``except Exception: pass``;
+        kept as a guard on the replacement loop, whose per-item handler is the
+        only thing standing between a removal failure and the rest of
+        teardown."""
+        from memtomem_stm.server import app_lifespan, mcp
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.return_value = self._infos("fake__alpha")
+
+        tools_dict = mcp._tool_manager._tools
+        snapshot = dict(tools_dict)
+
+        def _boom(self_, name: str) -> None:
+            raise RuntimeError("remove_tool exploded")
+
+        try:
+            with (
+                patch("memtomem_stm.server.STMConfig") as MockConfig,
+                patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+                patch.object(type(mcp), "remove_tool", _boom),
+            ):
+                self._mock_config(MockConfig)
+                async with app_lifespan(mcp) as _ctx:
+                    assert "fake__alpha" in tools_dict
+
+            mock_pm_instance.stop.assert_awaited_once()
+        finally:
+            tools_dict.clear()
+            tools_dict.update(snapshot)
+
+    async def test_failed_registration_is_not_removed_at_teardown(self):
+        """``register_proxy_tool`` degrades (warns and returns) when
+        ``add_tool`` raises, so the frozen list must hold only the names that
+        actually landed — otherwise teardown removes a name it never
+        registered, which under a stricter SDK is an error, not a no-op."""
+        from memtomem_stm.server import app_lifespan, mcp
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.return_value = self._infos("fake__alpha", "fake__beta")
+
+        tools_dict = mcp._tool_manager._tools
+        snapshot = dict(tools_dict)
+        removed: list[str] = []
+        real_add = type(mcp).add_tool
+        real_remove = type(mcp).remove_tool
+
+        def _add(self_, fn, **kwargs):
+            if kwargs.get("name") == "fake__alpha":
+                raise RuntimeError("add_tool exploded")
+            return real_add(self_, fn, **kwargs)
+
+        def _remove(self_, name: str) -> None:
+            removed.append(name)
+            real_remove(self_, name)
+
+        try:
+            with (
+                patch("memtomem_stm.server.STMConfig") as MockConfig,
+                patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+                patch.object(type(mcp), "add_tool", _add),
+                patch.object(type(mcp), "remove_tool", _remove),
+            ):
+                self._mock_config(MockConfig)
+                async with app_lifespan(mcp) as _ctx:
+                    assert "fake__alpha" not in tools_dict
+                    assert "fake__beta" in tools_dict
+
+            assert removed == ["fake__beta"], (
+                f"teardown must skip the tool whose registration failed, got {removed}"
+            )
+            assert tools_dict == snapshot
+        finally:
+            tools_dict.clear()
+            tools_dict.update(snapshot)
+
+    async def test_disabled_proxy_never_builds_an_advertisement(self):
+        """With the proxy disabled nothing is registered, so teardown has
+        nothing to remove. The old teardown still called ``get_proxy_tools()``
+        unconditionally, entering the advertisement build path for a server that
+        proxies nothing."""
+        from memtomem_stm.server import app_lifespan, mcp
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.return_value = []
+
+        tools_dict = mcp._tool_manager._tools
+        snapshot = dict(tools_dict)
+        try:
+            with (
+                patch("memtomem_stm.server.STMConfig") as MockConfig,
+                patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+            ):
+                mock_cfg = self._mock_config(MockConfig)
+                mock_cfg.proxy.enabled = False
+                async with app_lifespan(mcp) as _ctx:
+                    pass
+
+            mock_pm_instance.get_proxy_tools.assert_not_called()
+            assert tools_dict == snapshot
+        finally:
+            tools_dict.clear()
+            tools_dict.update(snapshot)
+
+    async def test_a_name_already_registered_is_neither_patched_nor_removed(self):
+        """The SDK's ``add_tool`` treats a duplicate name as a successful no-op:
+        it returns the tool already registered under that name instead of
+        inserting the new handler, and ``MCPServer.add_tool`` drops that return
+        value — so a collision is invisible at the call site. Claiming it would
+        mean overwriting a caller's schema and then deleting their tool at
+        teardown, which is exactly the embedded/library reuse #891 is about.
+        Registration must decline the name, leave the existing tool byte-alike,
+        and keep it out of the frozen removal list."""
+        from memtomem_stm.server import app_lifespan, mcp
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.return_value = self._infos("fake__alpha")
+
+        tools_dict = mcp._tool_manager._tools
+        snapshot = dict(tools_dict)
+        try:
+
+            @mcp.tool(name="fake__alpha")
+            def _host_owned(path: str) -> str:  # pragma: no cover - never invoked
+                return path
+
+            incumbent = tools_dict["fake__alpha"]
+            before = (incumbent.description, incumbent.parameters, incumbent.fn_metadata)
+
+            with (
+                patch("memtomem_stm.server.STMConfig") as MockConfig,
+                patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+            ):
+                self._mock_config(MockConfig)
+                async with app_lifespan(mcp) as _ctx:
+                    assert tools_dict["fake__alpha"] is incumbent
+
+            assert tools_dict.get("fake__alpha") is incumbent, (
+                "teardown deleted a tool this lifespan never registered"
+            )
+            assert (
+                incumbent.description,
+                incumbent.parameters,
+                incumbent.fn_metadata,
+            ) == before, "registration overwrote a tool it does not own"
+        finally:
+            tools_dict.clear()
+            tools_dict.update(snapshot)
+
+
 # ── main() exception barrier (#209) ──────────────────────────────────────
 
 

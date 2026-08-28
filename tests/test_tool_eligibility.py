@@ -620,8 +620,14 @@ class TestManagerWireIn:
         assert selection["reject_reasons"] == {}
 
     async def test_advertisement_is_stable_across_calls(self, tmp_path):
-        """Teardown calls get_proxy_tools() again — same session state must
-        produce the identical advertisement and verdict."""
+        """``get_proxy_tools()`` re-derives on every call and each pass
+        rewrites the advertisement snapshot that ``stm_proxy_health`` reports
+        per upstream and the relevance ranker scores against. Unchanged session
+        state must therefore produce the identical advertised names and reject
+        reasons: a pass that reshuffled or dropped tools on its own would make
+        that shared snapshot depend on how often something happened to ask for
+        the tool list. (Teardown no longer calls it — see #891 — so this is
+        snapshot determinism, not a removal contract.)"""
         mgr, _log = _make_manager(tmp_path, unhealthy=frozenset({("srv", "read_file")}))
         first = [i.prefixed_name for i in mgr.get_proxy_tools()]
         rejects = dict(mgr._advertised_reject_reasons)

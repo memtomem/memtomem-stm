@@ -223,6 +223,9 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
     tracker = TokenTracker()
     proxy_manager: ProxyManager | None = None
     warmup_task: asyncio.Task[None] | None = None
+    # Prefixed names this lifespan actually registered, frozen at registration
+    # time so teardown removes that set and not a fresh derivation (#891).
+    registered_proxy_tools: list[str] = []
 
     # Wrap init + yield in a single try/finally so a failure between
     # resource acquisition and yield (e.g. proxy_cache.initialize() or
@@ -476,11 +479,12 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                 return proxy_tool
 
             for info in proxy_manager.get_proxy_tools():
-                register_proxy_tool(
+                if register_proxy_tool(
                     server,
                     _make_proxy_handler(proxy_manager, info.server, info.original_name),
                     info,
-                )
+                ):
+                    registered_proxy_tools.append(info.prefixed_name)
 
             # Proxied tools are now in front; re-insert STM utility tools at
             # the end so ``tools/list`` yields domain tools first (#228).
@@ -498,12 +502,20 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
         )
         yield ctx
     finally:
+        # Remove exactly what registration took ownership of (#891). Re-deriving
+        # the set with ``get_proxy_tools()`` here would remove whatever the
+        # session advertises *now*: a ``tools/list_changed`` or a republished
+        # toolgraph bundle mid-session leaves registrations behind and asks for
+        # removals of names never registered, and the pass rewrites the
+        # advertisement snapshot that health and ranking read during shutdown.
+        # It was also the one call in this block outside a guard, so anything it
+        # raised skipped ``stop()`` and every cleanup below.
+        for name in registered_proxy_tools:
+            try:
+                server.remove_tool(name)
+            except Exception:
+                logger.debug("Failed to remove proxy tool '%s'", name, exc_info=True)
         if proxy_manager is not None:
-            for info in proxy_manager.get_proxy_tools():
-                try:
-                    server.remove_tool(info.prefixed_name)
-                except Exception:
-                    pass
             try:
                 await proxy_manager.stop()
             except Exception:
