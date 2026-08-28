@@ -3638,41 +3638,62 @@ class ProxyManager:
         replacement there instead would produce an object no teardown pass is
         guaranteed to close — ``stop()`` may already have made its last one —
         and the caller turns the refusal into a recorded per-stage failure.
+
+        Teardown holds the lock across two awaits, so a caller can hit its own
+        ``lock_timeout_seconds`` before ever reading the flag. That timeout is
+        translated into the same refusal: failing on the lock rather than on
+        the reason would put a raw lock error on the response path for what is
+        an orderly shutdown. A contended timeout with no teardown running still
+        surfaces as itself.
         """
         old: FactExtractor | None = None
-        async with bounded_lock(
-            self._extractor_lock,
-            timeout=cfg_snap.lock_timeout_seconds,
-            name="extractor_lock",
-        ):
-            # One loader read: the property stats the config file per access,
-            # and the predicate must judge the same generation it builds from.
-            ext_live = self._config.extraction
-            installed = self._extractor
-            if installed is not None and self._extractor_cfg == ext_live:
-                current = installed
-            elif self._background_closed:
-                # Teardown owns the slot: an instance published here is one
-                # stop() has already walked past, and the config it would track
-                # stops mattering the moment teardown finishes. A stale
-                # installed instance is still served — its gate sends the work
-                # to the local heuristic — but once teardown has cleared the
-                # slot there is nothing to hand back. Building one anyway is
-                # what this refuses: no pass would be guaranteed to close it,
-                # since stop() may already have made its last one.
-                if installed is None:
-                    raise ManagerStoppingError(
-                        "proxy manager is stopping; no fact extractor is available"
-                    )
-                current = installed
-            else:
-                replacement = FactExtractor(ext_live)
-                old = self._extractor
-                self._extractor = replacement
-                self._extractor_cfg = ext_live
-                if old is not None:
-                    self._retiring_extractors.add(old)
-                current = replacement
+        try:
+            async with bounded_lock(
+                self._extractor_lock,
+                timeout=cfg_snap.lock_timeout_seconds,
+                name="extractor_lock",
+            ):
+                # One loader read: the property stats the config file per access,
+                # and the predicate must judge the same generation it builds from.
+                ext_live = self._config.extraction
+                installed = self._extractor
+                if installed is not None and self._extractor_cfg == ext_live:
+                    current = installed
+                elif self._background_closed:
+                    # Teardown owns the slot: an instance published here is one
+                    # stop() has already walked past, and the config it would track
+                    # stops mattering the moment teardown finishes. A stale
+                    # installed instance is still served — its gate sends the work
+                    # to the local heuristic — but once teardown has cleared the
+                    # slot there is nothing to hand back. Building one anyway is
+                    # what this refuses: no pass would be guaranteed to close it,
+                    # since stop() may already have made its last one.
+                    if installed is None:
+                        raise ManagerStoppingError(
+                            "proxy manager is stopping; no fact extractor is available"
+                        )
+                    current = installed
+                else:
+                    replacement = FactExtractor(ext_live)
+                    old = self._extractor
+                    self._extractor = replacement
+                    self._extractor_cfg = ext_live
+                    if old is not None:
+                        self._retiring_extractors.add(old)
+                    current = replacement
+        except LockTimeoutError:
+            # Teardown holds this lock across the installed extractor's drain
+            # and the retirement pass, either of which can outlast a caller's
+            # lock_timeout_seconds. Without this the request would fail on the
+            # lock rather than on the reason — and the stopping branch below,
+            # which the caller turns into a recorded stage failure, would never
+            # be reached. Only while teardown actually owns the lock: an
+            # ordinary contended timeout is still the caller's to see.
+            if self._background_closed:
+                raise ManagerStoppingError(
+                    "proxy manager is stopping; the fact extractor is being torn down"
+                ) from None
+            raise
         if old is not None:
             # Retries the whole retiring set, not just this call's own instance:
             # a close that failed or was cancelled has no other retry point

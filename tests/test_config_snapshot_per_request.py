@@ -35,6 +35,7 @@ from memtomem_stm.proxy.config import (
     RelevanceScorerConfig,
     UpstreamServerConfig,
 )
+from memtomem_stm.proxy._locks import LockTimeoutError
 from memtomem_stm.proxy.manager import ManagerStoppingError, ProxyManager
 from memtomem_stm.proxy.metrics_store import MetricsStore
 from helpers import (
@@ -696,9 +697,9 @@ class TestPerRequestSnapshot:
         assert installed._client is None, "teardown did not close the installed extractor"
         # Which side of teardown the rebuild lands on is a genuine race — the
         # lock is released before stop() finishes — so the assertion is the
-        # ownership invariant, not an ordering: whatever comes back is closed,
-        # installed (and so closed by the next stop), or registered as
-        # retiring. An open extractor that is none of the three is the leak.
+        # ownership invariant, not an ordering: it either declined (handled
+        # above) or returned something closed or currently installed, and so
+        # closed by the next stop. An open extractor that is neither is the leak.
         assert published is None or published._client is None or published is mgr._extractor, (
             "the rebuild handed out an open extractor that nothing owns"
         )
@@ -734,6 +735,35 @@ class TestPerRequestSnapshot:
         assert mgr._extractor is None, "a rebuild published into a slot teardown owns"
         assert mgr._extractor_cfg is None
         assert mgr._retiring_extractors == set(), "the refusal still built something"
+
+    async def test_a_lock_timeout_during_teardown_reads_as_the_stopping_refusal(
+        self, extract_mgr
+    ):
+        """Teardown holds the extractor lock across two awaits, so a caller can
+        time out on the lock before it ever reads ``_background_closed``.
+
+        That has to surface as the same refusal: a raw lock error would put a
+        bare timeout on the response path for what is an orderly shutdown, and
+        would bypass the recorded stage failure the caller produces. Forced by
+        holding the lock while the flag is set and giving the caller a timeout
+        far shorter than the hold.
+        """
+        mgr = extract_mgr
+        await mgr._get_extractor(cfg_snap=mgr._config)
+        snap = mgr._config.model_copy(update={"lock_timeout_seconds": 0.01})
+        mgr._background_closed = True
+        try:
+            async with mgr._extractor_lock:
+                with pytest.raises(ManagerStoppingError):
+                    await mgr._get_extractor(cfg_snap=snap)
+        finally:
+            mgr._background_closed = False
+
+        # Without teardown running, the same contention is still a lock error:
+        # this translation is scoped to shutdown, not a blanket swallow.
+        async with mgr._extractor_lock:
+            with pytest.raises(LockTimeoutError):
+                await mgr._get_extractor(cfg_snap=snap)
 
     async def test_extraction_records_a_shed_outcome_when_the_manager_is_stopping(
         self, extract_mgr
