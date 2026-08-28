@@ -765,6 +765,35 @@ class TestPerRequestSnapshot:
             with pytest.raises(LockTimeoutError):
                 await mgr._get_extractor(cfg_snap=snap)
 
+    async def test_a_teardown_that_finishes_during_the_timeout_still_reads_as_stopping(
+        self, extract_mgr
+    ):
+        """The flag is a point sample; the span is what matters.
+
+        ``stop()`` clears ``_background_closed`` at its very end, so a caller
+        whose acquisition expired ON teardown's lock hold can resume to find it
+        already False and misreport its own timeout as ordinary contention —
+        putting a raw lock error on the response path for a shutdown that did
+        happen. The epoch captured on entry answers for the whole call. Forced
+        by leaving the flag CLEAR and bumping the epoch, which is exactly the
+        state a finished teardown leaves behind.
+        """
+        import asyncio
+
+        mgr = extract_mgr
+        await mgr._get_extractor(cfg_snap=mgr._config)
+        snap = mgr._config.model_copy(update={"lock_timeout_seconds": 0.01})
+
+        async with mgr._extractor_lock:
+            waiting = asyncio.ensure_future(mgr._get_extractor(cfg_snap=snap))
+            await asyncio.sleep(0)
+            # Teardown starts and finishes while the caller is queued: the
+            # epoch moves, the flag ends where it began.
+            mgr._teardown_epoch += 1
+            assert mgr._background_closed is False
+            with pytest.raises(ManagerStoppingError):
+                await asyncio.wait_for(waiting, timeout=5)
+
     async def test_extraction_records_a_shed_outcome_when_the_manager_is_stopping(
         self, extract_mgr
     ):

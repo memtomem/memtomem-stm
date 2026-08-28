@@ -689,6 +689,13 @@ class ProxyManager:
         # reference to it exists — it would leak its httpx client with nothing
         # left to retry the teardown. ``stop()`` closes whatever is still here.
         self._retiring_extractors: set[FactExtractor] = set()
+        # Bumped once per ``stop()``. ``_background_closed`` alone cannot answer
+        # "did teardown run during this call?" — it is cleared at the end of
+        # stop(), so a caller that timed out ON teardown's lock hold can resume
+        # after the flag is already back to False and misread its own timeout as
+        # ordinary contention. Comparing an epoch captured on entry answers it
+        # for the whole span rather than at one instant.
+        self._teardown_epoch: int = 0
         # In-memory counters for both INDEX-pipeline write paths
         # (auto_index_response + extract_and_store). Always instantiated for
         # library callers that inspect ``index_observability.snapshot()``.
@@ -2322,6 +2329,7 @@ class ProxyManager:
         # Close the spawn path first: a stage that schedules its replacement
         # while unwinding would otherwise outrun the drain loop forever (#868).
         self._background_closed = True
+        self._teardown_epoch += 1
         # Cancel and drain background tasks (extraction, etc.). Loop until
         # the set is empty — a concurrent call_tool may schedule a new
         # extraction task during our gather await (``call_tool`` adds to
@@ -3647,11 +3655,25 @@ class ProxyManager:
         surfaces as itself.
         """
         old: FactExtractor | None = None
+        entry_epoch = self._teardown_epoch
+
+        def teardown_ran() -> bool:
+            """True if teardown was running at any point during this call.
+
+            Reading ``_background_closed`` alone is a point sample of a flag
+            stop() clears at its very end, so a caller whose acquisition
+            expired ON teardown's hold can resume to find it already False.
+            The epoch closes that: it is bumped once per stop() and never
+            cleared, so a mismatch reports the whole span.
+            """
+            return self._background_closed or self._teardown_epoch != entry_epoch
+
         try:
             async with bounded_lock(
                 self._extractor_lock,
                 timeout=cfg_snap.lock_timeout_seconds,
                 name="extractor_lock",
+                expected=teardown_ran,
             ):
                 # One loader read: the property stats the config file per access,
                 # and the predicate must judge the same generation it builds from.
@@ -3687,9 +3709,9 @@ class ProxyManager:
             # lock_timeout_seconds. Without this the request would fail on the
             # lock rather than on the reason — and the stopping branch below,
             # which the caller turns into a recorded stage failure, would never
-            # be reached. Only while teardown actually owns the lock: an
+            # be reached. Only when teardown actually ran during this call: an
             # ordinary contended timeout is still the caller's to see.
-            if self._background_closed:
+            if teardown_ran():
                 raise ManagerStoppingError(
                     "proxy manager is stopping; the fact extractor is being torn down"
                 ) from None

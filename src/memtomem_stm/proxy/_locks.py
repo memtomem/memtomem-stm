@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 
 logger = logging.getLogger(__name__)
@@ -41,24 +41,46 @@ class LockTimeoutError(asyncio.TimeoutError):
 
 
 @asynccontextmanager
-async def bounded_lock(lock: asyncio.Lock, *, timeout: float, name: str) -> AsyncIterator[None]:
+async def bounded_lock(
+    lock: asyncio.Lock,
+    *,
+    timeout: float,
+    name: str,
+    expected: Callable[[], bool] | None = None,
+) -> AsyncIterator[None]:
     """Acquire *lock* within *timeout* seconds or raise ``LockTimeoutError``.
 
     Intended for internal state locks where a timeout indicates a bug
     (deadlock, stuck holder), not a slow dependency. Emits
     ``logger.error`` with current-task diagnostics on timeout so the
     deadlocked holder is visible in production logs.
+
+    ``expected`` lets a caller that knows of a LEGITIMATE long hold say so:
+    it is consulted only on timeout, and a true answer downgrades the ERROR
+    to INFO. The exception is unchanged — only the operational alarm is.
+    Shutdown is the motivating case: teardown holds some of these locks
+    across awaits by design, and reporting that as a likely deadlock spends
+    the alarm's credibility on an event that is not one.
     """
     try:
         await asyncio.wait_for(lock.acquire(), timeout=timeout)
     except asyncio.TimeoutError as exc:
         current = asyncio.current_task()
         current_name = current.get_name() if current else "<no-task>"
-        logger.error(
-            "bounded_lock timeout acquiring %r after %.1fs — "
-            "likely deadlock or stuck holder (current task: %s)",
+        anticipated = False
+        if expected is not None:
+            try:
+                anticipated = bool(expected())
+            except Exception:  # pragma: no cover - predicate must not mask the timeout
+                logger.debug("bounded_lock 'expected' predicate raised", exc_info=True)
+        log = logger.info if anticipated else logger.error
+        log(
+            "bounded_lock timeout acquiring %r after %.1fs — %s (current task: %s)",
             name,
             timeout,
+            "holder is shutting down, as anticipated by the caller"
+            if anticipated
+            else "likely deadlock or stuck holder",
             current_name,
         )
         raise LockTimeoutError(name, timeout) from exc

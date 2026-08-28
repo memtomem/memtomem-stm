@@ -55,13 +55,18 @@ from typing import Literal
 #   auto_index scans the exact markdown it would persist; extract scans
 #   the response text + rendered arguments before the extractor runs.
 #
-# - ``shed``: per call, terminal — the background stage was never
-#   scheduled because the fire-and-forget backlog was at capacity or
-#   ``stop()`` was draining (#868). Distinct from ``error`` (a run that
-#   failed) and from a NULL ``index_ok`` / ``extract_ok``, which records no
-#   outcome at all: ``shed`` says a background stage was refused, so
-#   nothing ran and nothing will. Fires from both paths, and only on their
-#   background variants.
+# - ``shed``: per call, terminal — the stage was REFUSED BEFORE IT RAN.
+#   Two sites produce it, and the label deliberately covers both because
+#   the operator question ("did this response get a write attempt?") has
+#   the same answer either way. (1) A background stage was never scheduled
+#   because the fire-and-forget backlog was at capacity or ``stop()`` was
+#   draining (#868) — both paths, background variants only. (2) An INLINE
+#   extraction reached a manager whose teardown had already reclaimed the
+#   fact extractor (#890); the stage records the refusal on the extractor's
+#   behalf, exactly as the shed background branch does. Distinct from
+#   ``error`` (a run that failed) and from a NULL ``index_ok`` /
+#   ``extract_ok``, which records no outcome at all: ``shed`` says the work
+#   was refused, so nothing ran and nothing will.
 #
 # Both write paths share this 6-label outcome set deliberately. auto_index
 # only fires ``stored``, ``error``, ``privacy_skip``, and ``shed``;
