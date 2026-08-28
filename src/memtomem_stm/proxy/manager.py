@@ -689,6 +689,17 @@ class ProxyManager:
         # reference to it exists — it would leak its httpx client with nothing
         # left to retry the teardown. ``stop()`` closes whatever is still here.
         self._retiring_extractors: set[FactExtractor] = set()
+        # Entries a teardown pass has claimed and is awaiting the close of.
+        # Marking them here rather than removing them from the set above is what
+        # keeps a claim from making its instance invisible for the length of a
+        # close — which is how a ``stop()`` landing in that window used to walk
+        # past one, leaving its late hand-back with no retry point (#904).
+        self._retiring_inflight: set[FactExtractor] = set()
+        # Entries a pass wanted to close but had to skip because they were
+        # claimed. The skipping pass spends its trigger without an attempt, so
+        # the request carries that attempt forward to whoever releases the
+        # claim without having closed it.
+        self._retiring_retry_requested: set[FactExtractor] = set()
         # In-memory counters for both INDEX-pipeline write paths
         # (auto_index_response + extract_and_store). Always instantiated for
         # library callers that inspect ``index_observability.snapshot()``.
@@ -2412,6 +2423,12 @@ class ProxyManager:
         # are dropped INDIVIDUALLY on success: one that fails again keeps its
         # owner, since clearing wholesale would drop the manager's last
         # reference to a transport that is still open.
+        # An instance another pass has claimed is skipped, but stays in the set
+        # and leaves a retry request behind, so teardown neither waits on that
+        # close nor loses the instance the way it used to when a claim removed
+        # it from the set entirely (#904). Not waiting is deliberate: that is
+        # the coupling detaching-then-draining exists to avoid, and it would put
+        # someone else's unbounded close on the shutdown path.
         await self._close_retiring_extractors()
         # Close the #494 consult disk cache (re-opened lazily on the next start).
         # Always null the handle so a failed close cannot leave a stale closed
@@ -3705,29 +3722,114 @@ class ProxyManager:
         open transport with nothing left to retry it. The next rebuild — or
         ``stop()`` — tries again.
 
-        Entries are CLAIMED by removing them before the await, and handed back
-        only if the close fails. Both the rebuild path and ``stop()`` call this,
-        so two passes can overlap; the claim is what keeps them from awaiting
-        ``close()`` on the same instance concurrently. Removing and re-adding is
-        atomic against other tasks because it spans no await.
+        Both the rebuild path and ``stop()`` call this, so two passes can
+        overlap, and neither may await ``close()`` on an instance the other is
+        already tearing down. A claim says so in ``_retiring_inflight`` and
+        LEAVES THE ENTRY IN THE SET; an entry is dropped only by the close that
+        succeeds. Claiming by removal instead — the shape this replaced — made
+        the entry invisible to every other pass for the length of a close,
+        including ``stop()``'s, so a ``stop()`` landing in that window walked
+        past it and its late hand-back had no retry point left (#904).
+
+        Keeping it in the set is necessary but not sufficient, because a pass
+        that finds an entry claimed cannot close it — it can only skip. Drains
+        run on triggers (a publication, or ``stop()``), and the trigger is spent
+        whether or not an attempt was possible, so a skip RECORDS a retry
+        request. Before returning, a pass honours the requests whose claims have
+        since been released, which is normally the pass that just failed its own
+        close — it gives the entry the attempt its trigger paid for instead of
+        leaving the failure to land after every trigger that would have retried
+        it (#904).
+
+        The catch-up makes at most ONE attempt per instance, so a pass does not
+        chase a request that keeps being re-recorded; with instances arriving
+        continuously the loop can still keep finding new ones, which is the same
+        bound the main loop has. Two cases are deliberately left owed to the
+        next trigger: a request recorded while this pass was already retrying
+        that same instance, and any request outstanding when the task holding
+        the claim is CANCELLED, since a cancelled task cannot go on to honour
+        it — the entry keeps both its owner and its request there.
+
+        Each state transition is synchronous, so no other task observes a
+        half-applied claim.
         """
         for retiring in list(self._retiring_extractors):
+            if retiring in self._retiring_inflight:
+                # Claimed by an overlapping pass. Record the attempt this pass
+                # could not make: the claim may still FAIL, and that failure
+                # lands after every trigger that would have retried it (#904).
+                self._retiring_retry_requested.add(retiring)
+                continue
             if retiring not in self._retiring_extractors:
-                continue  # claimed by an overlapping pass
+                continue  # dropped by an overlapping pass that closed it
+            await self._attempt_retiring_close(retiring)
+        # Requests whose claim has since been released. Re-scanned rather than
+        # snapshotted: a claim released while this loop awaits an earlier entry
+        # becomes honourable only after that await. ``retried`` is what bounds
+        # the loop — one attempt per instance — and every membership test is
+        # re-done immediately before the call, with no await in between, since
+        # an overlapping pass may have closed, claimed, or already honoured the
+        # entry meanwhile. The request test is what keeps a stale candidate from
+        # being retried a second time on this pass's behalf.
+        retried: set[FactExtractor] = set()
+        while True:
+            pending = [
+                retiring
+                for retiring in self._retiring_retry_requested & self._retiring_extractors
+                if retiring not in self._retiring_inflight and retiring not in retried
+            ]
+            if not pending:
+                break
+            for retiring in pending:
+                retried.add(retiring)
+                if retiring in self._retiring_inflight:
+                    continue
+                if retiring not in self._retiring_retry_requested:
+                    continue  # honoured by another pass while this one awaited
+                if retiring not in self._retiring_extractors:
+                    self._retiring_retry_requested.discard(retiring)
+                    continue
+                await self._attempt_retiring_close(retiring)
+        # A request outlives its instance if the entry was closed by an
+        # overlapping pass — nothing owes an attempt to something already gone,
+        # and holding the key here would keep a closed extractor referenced.
+        self._retiring_retry_requested &= self._retiring_extractors
+
+    async def _attempt_retiring_close(self, retiring: FactExtractor) -> None:
+        """Claim ``retiring``, close it, and drop it from the set if that works.
+
+        Callers must have checked that it is neither already claimed nor
+        already gone; the check and the claim below must stay in one
+        await-free window, or two passes could claim the same instance.
+
+        An outstanding retry request is spent by the ATTEMPT, not by its
+        outcome: this close satisfies whatever skip recorded it. A request
+        recorded WHILE the close is in flight is a new one, and outlives this
+        attempt only if it fails or is cancelled — a success drops the entry
+        and every request against it, since nothing is owed to an instance that
+        is closed. Cancellation restores the spent request too, as a cancelled
+        attempt satisfies nothing and cannot make another.
+        """
+        owed = retiring in self._retiring_retry_requested
+        self._retiring_retry_requested.discard(retiring)
+        self._retiring_inflight.add(retiring)
+        try:
+            await retiring.close()
+        except Exception:
+            logger.debug("Failed to close retiring fact extractor", exc_info=True)
+        except BaseException:
+            if owed:
+                self._retiring_retry_requested.add(retiring)
+            raise
+        else:
             self._retiring_extractors.discard(retiring)
-            closed = False
-            try:
-                await retiring.close()
-                closed = True
-            except Exception:
-                logger.debug("Failed to close retiring fact extractor", exc_info=True)
-            finally:
-                # Also covers CANCELLATION, which is a BaseException and would
-                # otherwise unwind past an ``except Exception`` with the entry
-                # already claimed — losing the manager's last reference to an
-                # open transport, which is the case this set exists for.
-                if not closed:
-                    self._retiring_extractors.add(retiring)
+            self._retiring_retry_requested.discard(retiring)
+        finally:
+            # A ``finally``, so CANCELLATION releases the claim too: it is a
+            # BaseException and would otherwise unwind past an
+            # ``except Exception`` leaving the entry marked in flight forever,
+            # which no later pass would then ever retry.
+            self._retiring_inflight.discard(retiring)
 
     async def _extract_and_store(
         self,
