@@ -506,14 +506,14 @@ class TestStop:
         finally:
             await rebuilt.close()
 
-    async def test_a_cancelled_retirement_pass_hands_the_entry_back(self):
-        """Cancellation must not consume a claimed entry.
+    async def test_a_cancelled_retirement_pass_releases_its_claim(self):
+        """Cancellation must not leave an entry claimed forever.
 
-        The claim removes the instance from the set before awaiting its close,
-        and ``CancelledError`` is a BaseException — so an ``except Exception``
-        handler unwinds with the entry already gone, losing the manager's last
-        reference to an open transport. That is precisely what the set exists
-        to prevent, so the hand-back runs in a ``finally``."""
+        ``CancelledError`` is a BaseException, so it unwinds past an
+        ``except Exception`` — and every other pass skips an entry that is
+        marked in flight. Releasing the claim only on the non-cancelled paths
+        would therefore strand the instance permanently: still owned, still
+        open, and never again eligible for a close. Hence the ``finally``."""
         mgr = _make_manager(servers={})
         entered = asyncio.Event()
 
@@ -527,14 +527,400 @@ class TestStop:
         mgr._retiring_extractors.add(blocked)
 
         pass_task = asyncio.create_task(mgr._close_retiring_extractors())
-        await asyncio.wait_for(entered.wait(), timeout=5)
-        assert mgr._retiring_extractors == set(), "the entry was not claimed"
-
-        pass_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await pass_task
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            assert blocked in mgr._retiring_inflight, "the entry was not claimed"
+            assert blocked in mgr._retiring_extractors, "a claim removed the entry from the set"
+        finally:
+            # In a finally: the close above never returns, so an assertion
+            # failure would otherwise leave this task pending into loop teardown.
+            pass_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pass_task
 
         assert blocked in mgr._retiring_extractors, "cancellation consumed the claimed entry"
+        assert mgr._retiring_inflight == set(), "the cancelled claim was never released"
+
+    async def test_a_claimed_retirement_survives_stop_in_the_set(self):
+        """A claim must never make its instance invisible to a teardown pass.
+
+        Claiming by REMOVAL — the shape this replaced — meant a ``stop()``
+        landing while a rebuild's close was in flight saw nothing to drain and
+        walked past the instance. The late hand-back then had no retry point
+        left: the first post-stop lookup publishes into an empty slot while the
+        set still reads empty, and warm lookups never publish at all, so the
+        transport stayed open for the whole restarted lifecycle (#904).
+
+        The entry now stays in the set for the length of the close, and the
+        skip records the attempt teardown could not make, so the failure is
+        collected by the pass that produced it rather than by nothing."""
+        mgr = _make_manager(servers={})
+        entered = asyncio.Event()
+        released = asyncio.Event()
+
+        stubborn = AsyncMock()
+        attempts = 0
+
+        async def fails_then_succeeds():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                entered.set()
+                await released.wait()
+                raise RuntimeError("transport wedged")
+
+        stubborn.close.side_effect = fails_then_succeeds
+        mgr._retiring_extractors.add(stubborn)
+
+        pass_task = asyncio.create_task(mgr._close_retiring_extractors())
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        try:
+            # stop() must not wait on another task's close — that is the
+            # coupling detaching-then-draining exists to avoid — so what has to
+            # hold is that it cannot LOSE the instance either.
+            await asyncio.wait_for(mgr.stop(), timeout=10)
+            assert stubborn in mgr._retiring_extractors, (
+                "stop() walked past a claimed entry: it is in neither the set "
+                "nor the slot, so nothing will retry its close"
+            )
+            assert stubborn.close.await_count == 1, "stop() raced the in-flight close"
+        finally:
+            released.set()
+            await asyncio.wait_for(pass_task, timeout=10)
+
+        # stop() was the trigger here, and it spent itself on a skip. The
+        # request it left behind is honoured by the pass that releases the
+        # claim, so no post-stop lookup is needed at all.
+        assert stubborn.close.await_count == 2, "the skipped attempt was not carried forward"
+        assert mgr._retiring_extractors == set(), "the retried close did not drop its entry"
+        assert mgr._retiring_inflight == set()
+        assert mgr._retiring_retry_requested == set()
+
+    async def test_a_trigger_spent_on_a_claimed_entry_is_carried_to_its_failure(self):
+        """The exact #904 ordering: the retry trigger arrives DURING the claim.
+
+        A drain runs on a trigger — a publication, or ``stop()`` — and the
+        trigger is spent whether or not an attempt was possible, since a pass
+        that finds the entry claimed can only skip. So the claim's failure, when
+        it comes, lands after the trigger that would have retried it, and warm
+        lookups never publish again. Keeping the entry visible is not enough on
+        its own: the skip has to carry the attempt forward, and the pass that
+        releases the claim without closing has to make it.
+
+        Ordered deliberately: publish while the close is still in flight, and
+        make no further publication afterwards."""
+        mgr = _make_manager(servers={})
+        entered = asyncio.Event()
+        released = asyncio.Event()
+
+        stubborn = AsyncMock()
+        attempts = 0
+
+        async def fails_then_succeeds():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                entered.set()
+                await released.wait()
+                raise RuntimeError("transport wedged")
+
+        stubborn.close.side_effect = fails_then_succeeds
+        mgr._retiring_extractors.add(stubborn)
+
+        pass_task = asyncio.create_task(mgr._close_retiring_extractors())
+        await asyncio.wait_for(entered.wait(), timeout=5)
+
+        rebuilt = None
+        try:
+            # The trigger. Bounded: an implementation that made this wait for
+            # the in-flight claim would hang the suite rather than fail.
+            rebuilt = await asyncio.wait_for(mgr._get_extractor(cfg_snap=mgr._config), timeout=10)
+            assert stubborn in mgr._retiring_extractors, (
+                "the publication saw an empty set while the instance was still owned"
+            )
+            assert stubborn.close.await_count == 1, (
+                "the gate closed an instance another pass was already closing"
+            )
+        finally:
+            # Unconditional, so a timeout or a failed assertion above cannot
+            # leave ``pass_task`` blocked on ``released`` into loop teardown.
+            released.set()
+            await asyncio.wait_for(pass_task, timeout=10)
+            if rebuilt is not None:
+                await asyncio.wait_for(rebuilt.close(), timeout=10)
+
+        assert stubborn.close.await_count == 2, (
+            "the failure landed after the only trigger it had, and nothing "
+            "carried that attempt forward — the transport stays open"
+        )
+        assert mgr._retiring_extractors == set(), "the retried close did not drop its entry"
+        assert mgr._retiring_inflight == set()
+        assert mgr._retiring_retry_requested == set(), "the honoured request was not cleared"
+
+    async def test_a_pass_rechecks_membership_before_closing(self):
+        """A pass iterates a snapshot; the set moves under it.
+
+        While the pass awaits one entry, another pass can close a later
+        candidate and drop it. Closing it again from the stale snapshot would
+        break the protocol's single-close rule — and the concrete extractor
+        tolerating a second call is not the guarantee, the recheck is. The
+        request recorded for that entry has to go with it, or the registry
+        keeps a closed instance referenced."""
+        mgr = _make_manager(servers={})
+        entered = asyncio.Event()
+        released = asyncio.Event()
+        parked: list[AsyncMock] = []
+
+        def make_blocking() -> AsyncMock:
+            instance = AsyncMock()
+
+            async def close():
+                parked.append(instance)
+                entered.set()
+                await released.wait()
+
+            instance.close.side_effect = close
+            return instance
+
+        # Two entries in one snapshot. Which one the pass reaches first depends
+        # on set iteration order, so the test drops whichever it did NOT park
+        # on rather than assuming an order.
+        pair = [make_blocking(), make_blocking()]
+        mgr._retiring_extractors.update(pair)
+        mgr._retiring_retry_requested.update(pair)
+
+        pass_task = asyncio.create_task(mgr._close_retiring_extractors())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            dropped = next(instance for instance in pair if instance not in parked)
+            # Someone else closes it and drops it while the pass is parked on
+            # the other one, leaving the pass holding a stale snapshot.
+            mgr._retiring_extractors.discard(dropped)
+        finally:
+            released.set()
+            await asyncio.wait_for(pass_task, timeout=10)
+
+        assert dropped.close.await_count == 0, (
+            "the pass closed an entry that had already been dropped from the set"
+        )
+        assert mgr._retiring_retry_requested == set(), "a stale request outlived its entry"
+
+    async def _carried_retry_fixture(self, mgr, owed_close, extra=()):
+        """Seed a pass that reaches the catch-up loop with owed candidates.
+
+        The catch-up exists for entries that become honourable only after the
+        main loop's snapshot was taken, so the blocker below produces them from
+        inside its own close — standing in for the overlapping passes that
+        would record and release them in production."""
+        owed = AsyncMock()
+        owed.close.side_effect = owed_close
+        owed_entries = [owed, *extra]
+
+        blocker = AsyncMock()
+        entered = asyncio.Event()
+        released = asyncio.Event()
+
+        async def blocker_close():
+            entered.set()
+            await released.wait()
+            # The overlapping passes settle here — after this pass took its main
+            # loop's snapshot, so these reach it only through the catch-up.
+            for instance in owed_entries:
+                mgr._retiring_extractors.add(instance)
+                mgr._retiring_retry_requested.add(instance)
+
+        blocker.close.side_effect = blocker_close
+        mgr._retiring_extractors.add(blocker)
+        return owed, entered, released
+
+    async def test_a_carried_retry_is_skipped_once_its_request_is_spent(self):
+        """The catch-up list is built before the awaits it then performs.
+
+        While this pass is parked on one candidate, another pass can spend a
+        later candidate's request on an attempt of its own. If that attempt
+        fails, the entry is still in the set and still unclaimed — so rechecking
+        only those two would close it again for a request that no longer exists.
+        That is an over-retry, and it lands on the shutdown path when the pass
+        holding the stale list is ``stop()``."""
+        other = await self._stale_catch_up_candidate(
+            lambda mgr, entry: mgr._retiring_retry_requested.discard(entry)
+        )
+        assert other.close.await_count == 0, (
+            "a stale catch-up candidate was retried for a request that had "
+            "already been spent"
+        )
+
+    async def test_a_carried_retry_is_skipped_once_another_pass_claims_it(self):
+        """The same stale list, with the candidate CLAIMED rather than spent.
+
+        A third pass can re-record the request while a second one claims the
+        entry, so the request and set checks both pass and only the in-flight
+        recheck stands between the stale list and two tasks closing one
+        instance at the same time."""
+        other = await self._stale_catch_up_candidate(
+            lambda mgr, entry: mgr._retiring_inflight.add(entry)
+        )
+        assert other.close.await_count == 0, (
+            "a stale catch-up candidate was closed while another pass held its claim"
+        )
+
+    async def _stale_catch_up_candidate(self, make_stale):
+        """Park a pass inside its catch-up, then stale the candidate it has not
+        reached yet with ``make_stale``. Returns that candidate."""
+        mgr = _make_manager(servers={})
+        entered_retry = asyncio.Event()
+        release_retry = asyncio.Event()
+
+        async def owed_close():
+            entered_retry.set()
+            await release_retry.wait()
+            raise RuntimeError("transport wedged")
+
+        # Two catch-up candidates whose closes are interchangeable, so the test
+        # can act on whichever one the pass does NOT reach first.
+        second = AsyncMock()
+        second.close.side_effect = owed_close
+        owed, entered, released = await self._carried_retry_fixture(
+            mgr, owed_close, extra=(second,)
+        )
+        pair = [owed, second]
+
+        pass_task = asyncio.create_task(mgr._close_retiring_extractors())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            released.set()
+            # The pass is now in its catch-up, parked on one of the pair.
+            await asyncio.wait_for(entered_retry.wait(), timeout=5)
+            parked_on = next(x for x in pair if x.close.await_count)
+            other = next(x for x in pair if x is not parked_on)
+            make_stale(mgr, other)
+        finally:
+            release_retry.set()
+            released.set()
+            await asyncio.wait_for(pass_task, timeout=10)
+
+        assert other in mgr._retiring_extractors, "the skipped candidate lost its owner"
+        return other
+
+    async def test_a_cancelled_carried_retry_keeps_the_attempt_owed(self):
+        """Cancellation must not consume the request it was honouring.
+
+        The request is taken before the retry's ``close()`` is awaited, so a
+        cancellation there would otherwise leave the entry in the set with no
+        record that an attempt is still owed to it — the next trigger would
+        treat it as an ordinary entry rather than one whose trigger was already
+        spent on a skip."""
+        mgr = _make_manager(servers={})
+
+        async def owed_close():
+            await asyncio.Event().wait()
+
+        owed, entered, released = await self._carried_retry_fixture(mgr, owed_close)
+
+        pass_task = asyncio.create_task(mgr._close_retiring_extractors())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            released.set()
+            # Let the pass finish the blocker and park inside the carried retry,
+            # probed by the close actually starting.
+            for _ in range(200):
+                if owed.close.await_count:
+                    break
+                await asyncio.sleep(0.01)
+            assert owed.close.await_count == 1, "the pass never reached the carried retry"
+        finally:
+            released.set()
+            pass_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pass_task
+
+        assert owed in mgr._retiring_extractors, "the cancelled retry lost its owner"
+        assert mgr._retiring_inflight == set(), "the cancelled retry kept its claim"
+        assert owed in mgr._retiring_retry_requested, (
+            "the cancelled retry consumed the request it could not honour"
+        )
+
+    async def test_a_cancelled_claim_leaves_its_request_to_the_next_trigger(self):
+        """The documented residual, pinned so it cannot change silently.
+
+        The pass holding a claim is normally the one that honours the requests
+        left by passes it made skip. A cancelled task cannot: it unwinds from
+        the close. The entry therefore keeps its owner and its outstanding
+        request, and waits for the next trigger — the same footing as any close
+        that failed with no request pending, which is the baseline this design
+        restores rather than exceeds."""
+        mgr = _make_manager(servers={})
+        entered = asyncio.Event()
+
+        blocked = AsyncMock()
+
+        async def never_finishes():
+            entered.set()
+            await asyncio.Event().wait()
+
+        blocked.close.side_effect = never_finishes
+        mgr._retiring_extractors.add(blocked)
+
+        claim_task = asyncio.create_task(mgr._close_retiring_extractors())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            # A trigger that can only skip, and so records the attempt it owes.
+            await asyncio.wait_for(mgr._close_retiring_extractors(), timeout=10)
+            assert blocked in mgr._retiring_retry_requested
+        finally:
+            claim_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await claim_task
+
+        assert blocked in mgr._retiring_extractors, "the cancelled claim lost its owner"
+        assert mgr._retiring_inflight == set(), "the cancelled claim was never released"
+        assert blocked in mgr._retiring_retry_requested, (
+            "the attempt owed to this entry was dropped, leaving the next "
+            "trigger unaware that one is outstanding"
+        )
+
+        # The next trigger honours it, without the entry having been touched in
+        # between: nothing about the residual is lost, only deferred.
+        blocked.close.side_effect = None
+        await asyncio.wait_for(mgr._close_retiring_extractors(), timeout=10)
+        assert mgr._retiring_extractors == set()
+        assert mgr._retiring_retry_requested == set()
+
+    async def test_stop_does_not_wait_on_a_wedged_claimed_close(self):
+        """A close that never returns must not hold shutdown open.
+
+        ``stop()`` skips what another pass has claimed instead of waiting on it:
+        waiting would put an unbounded close belonging to someone else on the
+        shutdown path. The instance keeps its owner and stays in the set, and
+        its claim — along with the request this skip records — stays live until
+        that close resolves or the task holding it is cancelled."""
+        mgr = _make_manager(servers={})
+        entered = asyncio.Event()
+
+        wedged = AsyncMock()
+
+        async def never_finishes():
+            entered.set()
+            await asyncio.Event().wait()
+
+        wedged.close.side_effect = never_finishes
+        mgr._retiring_extractors.add(wedged)
+
+        pass_task = asyncio.create_task(mgr._close_retiring_extractors())
+        await asyncio.wait_for(entered.wait(), timeout=5)
+
+        stop_task = asyncio.create_task(mgr.stop())
+        try:
+            done, _ = await asyncio.wait({stop_task}, timeout=10.0)
+            assert done, "stop() waited on a close claimed by another pass"
+            await stop_task
+            assert wedged in mgr._retiring_extractors, "the wedged claim lost its owner"
+        finally:
+            for task in (stop_task, pass_task):
+                if not task.done():
+                    task.cancel()
+                with contextlib.suppress(BaseException):
+                    await asyncio.wait_for(task, timeout=5.0)
 
     async def test_stop_closes_connection_stacks(self):
         """stop() closes per-connection stacks and clears _connections."""
