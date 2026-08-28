@@ -410,6 +410,65 @@ class TestStop:
         stubborn.close.assert_awaited_once()
         assert stubborn in mgr._retiring_extractors, "a failed close dropped the last reference"
 
+    async def test_stop_holds_the_extractor_lock_across_the_retirement_drain(self):
+        """Teardown drains retiring instances INSIDE ``_extractor_lock``.
+
+        Outside it, the pass would snapshot the set, await, and return without
+        closing an entry a waiting rebuild registered in the meantime — the
+        transient-instance path is the only writer, and it writes under this
+        lock. Pinned by observing the lock while a slow close is in flight."""
+        mgr = _make_manager(servers={})
+        released = asyncio.Event()
+        observed: list[bool] = []
+
+        slow = AsyncMock()
+
+        async def slow_close():
+            observed.append(mgr._extractor_lock.locked())
+            await released.wait()
+
+        slow.close.side_effect = slow_close
+        mgr._retiring_extractors.add(slow)
+
+        stopping = asyncio.create_task(mgr.stop())
+        for _ in range(200):
+            if observed:
+                break
+            await asyncio.sleep(0.01)
+        released.set()
+        await asyncio.wait_for(stopping, timeout=10)
+
+        assert observed == [True], f"the retirement drain ran without the lock: {observed}"
+        assert mgr._retiring_extractors == set()
+
+    async def test_overlapping_retirement_passes_close_each_instance_once(self):
+        """The rebuild path and ``stop()`` both drain the set, so two passes can
+        overlap. Entries are claimed before the await, so neither awaits
+        ``close()`` on an instance the other is already tearing down."""
+        mgr = _make_manager(servers={})
+        released = asyncio.Event()
+        entered = asyncio.Event()
+
+        slow = AsyncMock()
+
+        async def slow_close():
+            entered.set()
+            await released.wait()
+
+        slow.close.side_effect = slow_close
+        mgr._retiring_extractors.add(slow)
+
+        first = asyncio.create_task(mgr._close_retiring_extractors())
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        second = asyncio.create_task(mgr._close_retiring_extractors())
+        await asyncio.sleep(0.05)
+
+        released.set()
+        await asyncio.wait_for(asyncio.gather(first, second), timeout=10)
+
+        assert slow.close.await_count == 1, "the same instance was closed by both passes"
+        assert mgr._retiring_extractors == set()
+
     async def test_stop_closes_connection_stacks(self):
         """stop() closes per-connection stacks and clears _connections."""
         mgr = _make_manager(servers={})

@@ -2389,14 +2389,16 @@ class ProxyManager:
                 # behind it would be a claim about an instance that is gone.
                 self._extractor = None
                 self._extractor_cfg = None
-        # Instances whose own close never completed — a rebuilding task
-        # cancelled mid-drain, a close that raised, or one handed out during
-        # this teardown. Closing is idempotent (the transport teardown is
-        # guarded on the client handle), so overlapping a drain still running
-        # elsewhere is safe. Entries are dropped INDIVIDUALLY on success: one
-        # that fails again keeps its owner, since clearing wholesale would drop
-        # the manager's last reference to a transport that is still open.
-        await self._close_retiring_extractors()
+            # Instances whose own close never completed — a rebuilding task
+            # cancelled mid-drain, a close that raised, or one handed out
+            # during this teardown. Inside the lock, because that is the only
+            # place a transient one can be registered: draining outside it
+            # would snapshot the set, await, and return without closing an
+            # entry a waiting rebuild added in the meantime. Entries are
+            # dropped INDIVIDUALLY on success — one that fails again keeps its
+            # owner, since clearing wholesale would drop the manager's last
+            # reference to a transport that is still open.
+            await self._close_retiring_extractors()
         # Close the #494 consult disk cache (re-opened lazily on the next start).
         # Always null the handle so a failed close cannot leave a stale closed
         # connection that the next start() would reuse.
@@ -3671,14 +3673,22 @@ class ProxyManager:
         reference to that instance, so discarding it wholesale would strand an
         open transport with nothing left to retry it. The next rebuild — or
         ``stop()`` — tries again.
+
+        Entries are CLAIMED by removing them before the await, and handed back
+        only if the close fails. Both the rebuild path and ``stop()`` call this,
+        so two passes can overlap; the claim is what keeps them from awaiting
+        ``close()`` on the same instance concurrently. Removing and re-adding is
+        atomic against other tasks because it spans no await.
         """
         for retiring in list(self._retiring_extractors):
+            if retiring not in self._retiring_extractors:
+                continue  # claimed by an overlapping pass
+            self._retiring_extractors.discard(retiring)
             try:
                 await retiring.close()
             except Exception:
                 logger.debug("Failed to close retiring fact extractor", exc_info=True)
-            else:
-                self._retiring_extractors.discard(retiring)
+                self._retiring_extractors.add(retiring)
 
     async def _extract_and_store(
         self,

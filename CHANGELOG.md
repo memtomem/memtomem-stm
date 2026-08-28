@@ -370,10 +370,12 @@ changes inline only. See the deprecation policy in
 
   **Behavior change**: `extraction` edits take effect without a restart, from
   the next lookup that observes them. Two costs come with that. The task that
-  observes the change absorbs the drain of the instance it replaces, bounded by
-  the in-flight calls' own `llm_timeout_seconds` plus a two-second grace; with
-  the default `extraction.background: true` that task is a background one, not
-  the tool-response path. And the rebuild check reads the live config once per
+  observes the change absorbs the drain of the instance it replaces — normally
+  one drain, bounded by that instance's in-flight calls' own
+  `llm_timeout_seconds` plus a two-second grace, and more only when an earlier
+  close failed or was cancelled and is being retried alongside it. With the
+  default `extraction.background: true` that task is a background one, not the
+  tool-response path. And the rebuild check reads the live config once per
   extraction rather than only on the first, which is one additional `stat()`
   on the config file per extracting request.
 
