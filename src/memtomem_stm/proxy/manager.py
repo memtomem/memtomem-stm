@@ -9,6 +9,7 @@ import inspect
 import json
 import logging
 import sqlite3
+import threading
 import time as _time
 import uuid
 from collections import Counter
@@ -655,6 +656,16 @@ class ProxyManager:
         self._selective_compressor: SelectiveCompressor | None = None
         self._selective_compressor_cfg: SelectiveConfig | None = None
         self._selective_lock = asyncio.Lock()
+        # Publication barrier for the off-thread selective write (#898). A
+        # WORKER THREAD holds this while it resolves the live compressor and
+        # writes its selection key into that generation's store; the event loop
+        # holds it across a rebuild's slot swap and the superseded close, so the
+        # target cannot be retired underneath a write in progress. Not the
+        # asyncio ``_selective_lock``: this one is taken from a non-loop thread.
+        # A rebuild therefore waits for one put and two eviction passes against
+        # a local SQLite file — see ``SelectiveCompressor._publish`` for why
+        # resolving under the lock and writing outside it is not equivalent.
+        self._selective_publish_mu = threading.Lock()
         self._extractor: FactExtractor | None = None
         self._extractor_lock = asyncio.Lock()
         # In-memory counters for both INDEX-pipeline write paths
@@ -2392,13 +2403,18 @@ class ProxyManager:
         # recovery or a SELECTIVE/HYBRID/progressive call may have opened a
         # SQLite-backed store that ``_connections`` cleanup never touches, so
         # without this the connection leaks across stop()/reuse.
-        if self._selective_compressor is not None:
-            try:
-                self._selective_compressor.close()
-            except Exception:
-                logger.debug("Failed to close selective compressor on stop", exc_info=True)
-            self._selective_compressor = None
-            self._selective_compressor_cfg = None
+        # Under the publish mutex (#898) for the same reason as the rebuild: a
+        # worker mid-publish completes its write before the slot clears, and one
+        # that arrives after falls back to its own store — still open, since the
+        # compress path pins the instance it runs on — instead of this one.
+        with self._selective_publish_mu:
+            if self._selective_compressor is not None:
+                try:
+                    self._selective_compressor.close()
+                except Exception:
+                    logger.debug("Failed to close selective compressor on stop", exc_info=True)
+                self._selective_compressor = None
+                self._selective_compressor_cfg = None
         if self._progressive_store is not None:
             try:
                 self._progressive_store.close()
@@ -2819,16 +2835,24 @@ class ProxyManager:
         fails to open the new SQLite store it raises here, leaving the still-open
         old compressor cached and usable rather than a closed store behind the
         cfg-equality fast path.
+
+        The swap and the superseded close run under ``_selective_publish_mu``
+        (#898) so an off-thread worker's selection write either lands in this
+        generation before it is retired or resolves the replacement — never into
+        a store this call is about to close. The build stays outside the lock —
+        it can open SQLite and construct a scorer, and the other side of this
+        mutex is a worker thread.
         """
         new = self._create_selective(sel_cfg, cfg=cfg)
-        old = self._selective_compressor
-        self._selective_compressor = new
-        self._selective_compressor_cfg = sel_cfg
-        if old is not None:
-            try:
-                old.close()
-            except Exception:
-                logger.debug("Failed to close superseded selective compressor", exc_info=True)
+        with self._selective_publish_mu:
+            old = self._selective_compressor
+            self._selective_compressor = new
+            self._selective_compressor_cfg = sel_cfg
+            if old is not None:
+                try:
+                    old.close()
+                except Exception:
+                    logger.debug("Failed to close superseded selective compressor", exc_info=True)
         return new
 
     def _create_selective(
@@ -2871,6 +2895,15 @@ class ProxyManager:
         kwargs["scorer"] = (
             self._relevance_scorer_for(cfg) if cfg is not None else self._relevance_scorer
         )
+        # Write-time publication barrier (#898): a compress that runs off-thread
+        # publishes its selection key into whatever generation is CURRENT when
+        # the write happens, not the one it was built under, so the key is
+        # reachable from ``select_chunks`` and the eviction that follows applies
+        # the live instance's policy rather than a superseded one. Inert on the
+        # throwaway instances ``select_chunks``/``read_more`` build for their
+        # multi-store probe — those only ``select()``, never compress.
+        kwargs["live_provider"] = lambda: self._selective_compressor
+        kwargs["publish_lock"] = self._selective_publish_mu
         return SelectiveCompressor(**kwargs)
 
     def _resolve_tool_config(
@@ -3154,7 +3187,9 @@ class ProxyManager:
                 # end_use defer that close to the last in-flight user, so
                 # concurrent SELECTIVE calls run in parallel instead of
                 # queueing on the lock (which would surface as spurious
-                # LOCK_TIMEOUT under a slow embedding endpoint).
+                # LOCK_TIMEOUT under a slow embedding endpoint). The pin keeps
+                # this instance USABLE, not reachable — the selection key is
+                # published into the live generation at write time (#898).
                 _begin = getattr(sel_compressor, "begin_use", None)
                 if _begin is not None:
                     _begin()
@@ -3466,7 +3501,9 @@ class ProxyManager:
             # path writes through its pending store. The scorer gate reads
             # the selective compressor's captured scorer (HybridCompressor
             # has no scorer of its own; its truncate tail mode is
-            # query-blind).
+            # query-blind). As in the SELECTIVE branch the pin is about the
+            # instance staying usable; the write itself follows the live
+            # generation (#898), through the same shared instance.
             _begin = getattr(sel_compressor, "begin_use", None)
             if _begin is not None:
                 _begin()
@@ -3593,10 +3630,18 @@ class ProxyManager:
             # SELECTIVE/HYBRID compress with the same cfg reuses it via the
             # cfg-equality check. If nothing configures SQLite, or the store
             # can't be opened, degrade to the existing sentinel and cache NOTHING
-            # (a failed open must not pin a bad state). No await runs between the
-            # check and the assignment, and neither do the lock-holding compress
-            # paths, so this can't interleave with them on the event loop — no
-            # _selective_lock needed here.
+            # (a failed open must not pin a bad state).
+            #
+            # The install goes through ``_selective_publish_mu`` (#898). No await
+            # runs between the check and the assignment, which used to be the
+            # whole argument — but the other writer is no longer only the event
+            # loop: an off-thread compress reads this slot to pick its write
+            # target. Publishing here unguarded lets that worker resolve the
+            # still-cold slot to its own store, this recovery install a different
+            # generation, and the key the worker then returns be unreachable —
+            # the very defect this mutex exists to prevent. The build stays
+            # outside the lock (it opens SQLite), so the slot is re-checked under
+            # it and a candidate that lost the race is closed rather than leaked.
             sel_cfg = self._sqlite_cfg_holding_key(key, cfg_live) or (cfgs[0] if cfgs else None)
             if sel_cfg is None:
                 return "Selective compression not active — no pending TOC selections."
@@ -3608,9 +3653,24 @@ class ProxyManager:
                     exc_info=True,
                 )
                 return "Selective compression not active — no pending TOC selections."
-            self._selective_compressor = compressor
-            self._selective_compressor_cfg = sel_cfg
-        result = self._selective_compressor.select(key, sections)
+            with self._selective_publish_mu:
+                installed = self._selective_compressor is None
+                if installed:
+                    self._selective_compressor = compressor
+                    self._selective_compressor_cfg = sel_cfg
+            if not installed:
+                try:
+                    compressor.close()
+                except Exception:
+                    logger.debug("Failed to close unused recovery compressor", exc_info=True)
+        # Read the slot ONCE. It is no longer only the event loop's to change:
+        # a concurrent ``stop()`` can clear it between the recovery install and
+        # here, and re-reading would turn that into an AttributeError instead of
+        # the endpoint's own sentinel.
+        active = self._selective_compressor
+        if active is None:
+            return "Selective compression not active — no pending TOC selections."
+        result = active.select(key, sections)
         if len(cfgs) > 1 and self._is_recovery_miss(result):
             # The cached compressor's store did not hold the key, but with
             # multiple distinct stores configured an earlier call may have

@@ -798,3 +798,155 @@ class TestLoneSurrogateDefenseInDepth:
             assert got is not None and got.chunks == chunks
         finally:
             store.close()
+
+
+# ── the retired generation's eviction policy (#898) ─────────────────────
+
+
+class TestSupersededEvictionPolicy:
+    """A pending write resolves the LIVE generation before it evicts.
+
+    ``SelectiveCompressor._evict`` reads instance policy (``max_pending``,
+    TTL) and applies it store-WIDE. When two generations share one
+    ``pending_store_path`` — the common case for a config edit that leaves the
+    path alone — a compress that started before the swap would otherwise run
+    the superseded policy over the store the live generation is using and
+    delete its keys.
+    """
+
+    def _shared_pair(
+        self,
+        tmp_path: Path,
+        *,
+        old_max: int = 1,
+        old_ttl: float = 300.0,
+        live_max: int = 100,
+        live_ttl: float = 300.0,
+    ):
+        """G1 (superseded) and G2 (live), one SQLite file.
+
+        Both policies are parameters: asserting only that the live keys SURVIVE
+        would pass just as well if the publish skipped eviction altogether, so
+        the tests below also give the live generation a policy tight enough to
+        bite and check that it actually ran.
+        """
+        path = tmp_path / "pending.db"
+        stores = []
+        for _ in range(2):
+            store = SQLitePendingStore(path)
+            store.initialize()
+            stores.append(store)
+
+        live: list[SelectiveCompressor] = []
+        g1 = SelectiveCompressor(
+            max_pending=old_max,
+            pending_ttl_seconds=old_ttl,
+            store=stores[0],
+            live_provider=lambda: live[0],
+            publish_lock=threading.Lock(),
+        )
+        g2 = SelectiveCompressor(
+            max_pending=live_max, pending_ttl_seconds=live_ttl, store=stores[1]
+        )
+        live.append(g2)
+        return g1, g2
+
+    def test_superseded_max_pending_does_not_evict_the_live_keys(self, tmp_path: Path):
+        g1, g2 = self._shared_pair(tmp_path, old_max=1)
+        try:
+            for i in range(3):
+                g2._store.put(f"live{i}", _make_selection())
+
+            # G1's late write: on the retired instance's own policy this
+            # evicts down to a single key across the shared file.
+            g1.compress("## S\n" + "s" * 400, max_chars=200)
+
+            survivors = [k for k in ("live0", "live1", "live2") if g2._store.get(k) is not None]
+            assert survivors == ["live0", "live1", "live2"], (
+                "a superseded max_pending evicted the live generation's keys"
+            )
+        finally:
+            g1._store.close()
+            g2._store.close()
+
+    def test_superseded_ttl_does_not_expire_the_live_keys(self, tmp_path: Path):
+        """The TTL half of the same policy: an old generation configured with a
+        tiny ``pending_ttl_seconds`` must not expire keys the live generation
+        still considers fresh."""
+        g1, g2 = self._shared_pair(tmp_path, old_max=100, old_ttl=0.01)
+        try:
+            g2._store.put("live", _make_selection())
+            time.sleep(0.05)
+
+            g1.compress("## S\n" + "s" * 400, max_chars=200)
+
+            assert g2._store.get("live") is not None, (
+                "a superseded TTL expired a key the live generation still holds"
+            )
+        finally:
+            g1._store.close()
+            g2._store.close()
+
+    def test_the_live_max_pending_is_the_one_that_runs(self, tmp_path: Path):
+        """The positive half: the publish must APPLY the live generation's
+        policy, not merely spare the live keys. With eviction dropped from the
+        publish entirely, the surviving-keys assertions above would still pass —
+        here G2's tight ``max_pending`` has to bite on its own store."""
+        g1, g2 = self._shared_pair(tmp_path, old_max=100, live_max=2)
+        try:
+            # Eviction orders by ``created_at`` alone, which the store stamps
+            # with wall time. Three rapid puts can therefore tie on a coarse
+            # clock (~15.6 ms on Windows) and make WHICH rows survive arbitrary,
+            # so the ages are written explicitly rather than raced for.
+            for i in range(3):
+                g2._store.put(f"live{i}", _make_selection())
+                g2._store._get_db().execute(
+                    "UPDATE pending_selections SET created_at = ? WHERE key = ?",
+                    (time.time() - (30 - i), f"live{i}"),
+                )
+            g2._store._get_db().commit()
+
+            key = json.loads(g1.compress("## S\n" + "s" * 400, max_chars=200))["selection_key"]
+
+            assert g2._store.get(key) is not None, "the new key must survive its own eviction"
+            survivors = [k for k in ("live0", "live1", "live2") if g2._store.get(k) is not None]
+            assert survivors == ["live2"], (
+                f"expected G2's max_pending=2 to trim the store to the newest key "
+                f"plus the one just published, got survivors={survivors}"
+            )
+        finally:
+            g1._store.close()
+            g2._store.close()
+
+    def test_the_live_ttl_is_the_one_that_runs(self, tmp_path: Path):
+        """The TTL twin of the test above: a live generation with a tiny TTL
+        must expire its own stale keys when a retired generation publishes."""
+        # The margins are deliberately wide: the store expires on wall time,
+        # and Windows' clock granularity is ~15.6 ms. The stale key must age
+        # well past the TTL while the key published below stays far short of it.
+        g1, g2 = self._shared_pair(tmp_path, old_ttl=300.0, live_ttl=0.2)
+        try:
+            g2._store.put("stale", _make_selection())
+            time.sleep(0.3)
+
+            key = json.loads(g1.compress("## S\n" + "s" * 400, max_chars=200))["selection_key"]
+
+            assert g2._store.get("stale") is None, "the live generation's TTL never ran"
+            assert g2._store.get(key) is not None
+        finally:
+            g1._store.close()
+            g2._store.close()
+
+    def test_lone_generation_still_applies_its_own_policy(self, tmp_path: Path):
+        """No provider (standalone construction) keeps the historical
+        put-then-evict — the eviction must not become a no-op."""
+        store = SQLitePendingStore(tmp_path / "pending.db")
+        store.initialize()
+        comp = SelectiveCompressor(max_pending=1, store=store)
+        try:
+            store.put("old", _make_selection())
+            key = json.loads(comp.compress("## S\n" + "s" * 400, max_chars=200))["selection_key"]
+            assert store.get("old") is None, "max_pending stopped being enforced"
+            assert store.get(key) is not None
+        finally:
+            store.close()
