@@ -560,7 +560,9 @@ class TestSelectiveWriteBarrier:
 
         db = tmp_path / "pending.db"
         sel_cfg = SelectiveConfig(pending_store="sqlite", pending_store_path=db)
-        cfg = ProxyConfig(upstream_servers={"srv": UpstreamServerConfig(prefix="test", selective=sel_cfg)})
+        cfg = ProxyConfig(
+            upstream_servers={"srv": UpstreamServerConfig(prefix="test", selective=sel_cfg)}
+        )
 
         stub = _barrier_stub()
         stub._config = cfg

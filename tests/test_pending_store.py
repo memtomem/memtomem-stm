@@ -945,6 +945,16 @@ class TestSupersededEvictionPolicy:
         comp = SelectiveCompressor(max_pending=1, store=store)
         try:
             store.put("old", _make_selection())
+            # Age the row explicitly. Eviction orders on wall-clock
+            # ``created_at`` with no tie-breaker (#901), so on a coarse clock
+            # this row and the one published below can tie and the trim can
+            # discard EITHER — including the key just handed to the caller.
+            # Observed on the Windows runner (~15.6 ms granularity).
+            store._get_db().execute(
+                "UPDATE pending_selections SET created_at = ? WHERE key = ?",
+                (time.time() - 30, "old"),
+            )
+            store._get_db().commit()
             key = json.loads(comp.compress("## S\n" + "s" * 400, max_chars=200))["selection_key"]
             assert store.get("old") is None, "max_pending stopped being enforced"
             assert store.get(key) is not None
