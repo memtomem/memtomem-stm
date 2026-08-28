@@ -405,7 +405,7 @@ changes inline only. See the deprecation policy in
   file at the same time could fail to start on a file that was busy for a
   millisecond. The migration transaction above widens that window enough to
   make it reproducible (3 of 8 runs of the new concurrent-opener test before
-  the retry; 12 of 12 after), but the gap is not new to it. Only `SQLITE_BUSY`
+  the retry; 25 of 25 after), but the gap is not new to it. Only `SQLITE_BUSY`
   is retried, read from `sqlite_errorcode` rather than matched on the message,
   so a permanent failure such as a read-only file still surfaces at once. The
   wait is bounded by the caller's lock budget, which `tune_connection` now
