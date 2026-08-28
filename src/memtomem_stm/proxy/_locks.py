@@ -6,8 +6,10 @@ module provides a diagnostic-friendly bounded acquisition helper.
 
 Semantically distinct from #207's LLM compression timeout: that one
 degrades gracefully (falls back to truncate). A lock timeout here
-indicates a bug and propagates as an MCP error so the stuck holder is
-visible in logs + metrics.
+propagates as an MCP error so the stuck holder is visible in logs +
+metrics. It USUALLY indicates a bug — the exception to that is a hold a
+caller knows to be legitimate, such as shutdown, which it declares through
+``expected`` so the timeout is not reported as a likely deadlock.
 """
 
 from __future__ import annotations
@@ -50,10 +52,11 @@ async def bounded_lock(
 ) -> AsyncIterator[None]:
     """Acquire *lock* within *timeout* seconds or raise ``LockTimeoutError``.
 
-    Intended for internal state locks where a timeout indicates a bug
-    (deadlock, stuck holder), not a slow dependency. Emits
+    Intended for internal state locks where a timeout ordinarily indicates a
+    bug (deadlock, stuck holder), not a slow dependency. Emits
     ``logger.error`` with current-task diagnostics on timeout so the
-    deadlocked holder is visible in production logs.
+    deadlocked holder is visible in production logs — unless the caller
+    declares the hold legitimate through ``expected``, below.
 
     ``expected`` lets a caller that knows of a LEGITIMATE long hold say so:
     it is consulted only on timeout, and a true answer downgrades the ERROR

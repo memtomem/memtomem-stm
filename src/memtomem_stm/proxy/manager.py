@@ -3772,11 +3772,19 @@ class ProxyManager:
     ) -> ExtractOutcome:
         """Extract facts from response and store as individual memory entries.
 
-        A request that reaches here mid-teardown gets a recorded failure rather
-        than an exception on the response path: the extractor is gone and is not
-        coming back for this manager (#890). This mirrors the ``background_shed``
-        outcome #868 records for work refused at the spawn point — the same
-        situation, arriving through the inline route.
+        Acquiring the extractor is inside the stage's failure contract, not in
+        front of it. ``extract_and_store`` already turns every failure past this
+        point into ``ok=False``; the lookup used to be the one step that could
+        raise instead, and with a per-config rebuild (#890) it can now fail on
+        any request rather than only the first. Discarding an upstream response
+        that already succeeded because the extraction that follows it could not
+        start is the wrong trade — this stage is an enrichment.
+
+        Two recorded shapes: teardown refuses with ``manager_stopping`` and the
+        ``shed`` outcome, mirroring what #868 records for background work
+        refused at the spawn point (the same situation through the inline
+        route); anything else is an ``error``, and the next request retries
+        against the still-installed instance.
         """
         try:
             extractor = await self._get_extractor(cfg_snap=cfg_snap)
@@ -3785,6 +3793,17 @@ class ProxyManager:
             self.index_observability.record_attempt(tool, "extract")
             self.index_observability.record_outcome(tool, "shed")
             return ExtractOutcome(ok=False, facts_stored=0, error="manager_stopping")
+        except Exception as exc:
+            logger.warning(
+                "Extraction unavailable for %s/%s (%s): %s",
+                server,
+                tool,
+                type(exc).__name__,
+                exc,
+            )
+            self.index_observability.record_attempt(tool, "extract")
+            self.index_observability.record_outcome(tool, "error")
+            return ExtractOutcome(ok=False, facts_stored=0, error=f"{type(exc).__name__}: {exc}")
         return await extract_and_store(
             index_engine=self._index_engine,
             extractor=extractor,

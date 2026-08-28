@@ -94,10 +94,11 @@ IndexOutcome = Literal[
     "dedup_skip",
     "extracted_zero_facts",
     "privacy_skip",
-    # The background stage was never scheduled: the fire-and-forget backlog
-    # was at capacity, or the manager was stopping (#868). Distinct from
-    # "error" (a run that failed) and from a NULL index_ok, which records no
-    # outcome at all.
+    # The stage was refused before it ran: a background one never scheduled
+    # because the fire-and-forget backlog was at capacity or the manager was
+    # stopping (#868), or an inline extraction that found the extractor
+    # already reclaimed by teardown (#890). Distinct from "error" (a run that
+    # failed) and from a NULL index_ok, which records no outcome at all.
     "shed",
     "error",
 ]

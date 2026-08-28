@@ -794,6 +794,35 @@ class TestPerRequestSnapshot:
             with pytest.raises(ManagerStoppingError):
                 await asyncio.wait_for(waiting, timeout=5)
 
+    async def test_a_failed_rebuild_does_not_discard_the_upstream_response(
+        self, extract_mgr, tmp_path, monkeypatch
+    ):
+        """Acquiring the extractor is inside the stage's failure contract.
+
+        The upstream call has already succeeded by the time extraction runs, so
+        a constructor that raises must not take the response with it — every
+        other failure past this point is already turned into ``ok=False``. This
+        matters more since #890: construction used to happen once per process
+        and now happens on any config edit.
+        """
+        import memtomem_stm.proxy.manager as manager_mod
+
+        mgr = extract_mgr
+        await mgr.call_tool("srv", "tool", {"a": 1})
+        installed = mgr._extractor
+        _reload_with_max_facts(mgr, tmp_path, 3)
+
+        def boom(_cfg):
+            raise RuntimeError("extractor build failed")
+
+        monkeypatch.setattr(manager_mod, "FactExtractor", boom)
+        response = await mgr.call_tool("srv", "tool", {"b": 2})
+
+        assert isinstance(response, str) and response, "a failed rebuild broke the response"
+        assert mgr._extractor is installed, "the working extractor was dropped"
+        outcomes = mgr.index_observability.snapshot()["outcomes"]["tool"]
+        assert outcomes.get("error") == 1, f"the refusal was not recorded: {outcomes}"
+
     async def test_extraction_records_a_shed_outcome_when_the_manager_is_stopping(
         self, extract_mgr
     ):
