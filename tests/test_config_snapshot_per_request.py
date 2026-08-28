@@ -823,6 +823,38 @@ class TestPerRequestSnapshot:
         outcomes = mgr.index_observability.snapshot()["outcomes"]["tool"]
         assert outcomes.get("error") == 1, f"the refusal was not recorded: {outcomes}"
 
+    async def test_a_teardown_already_running_on_entry_still_reads_as_stopping(
+        self, extract_mgr
+    ):
+        """The third observation the span needs.
+
+        An epoch captured on entry cannot see a teardown that was ALREADY
+        running when the call began — the bump happened before the read — and
+        by the time the lock wait expires the flag may be clear again. That is
+        the request most likely to hit this: it arrived mid-teardown, so its
+        wait is the one teardown's hold expires. Forced by setting the flag
+        before the call and clearing it while the call is queued, without
+        touching the epoch.
+        """
+        import asyncio
+
+        mgr = extract_mgr
+        await mgr._get_extractor(cfg_snap=mgr._config)
+        snap = mgr._config.model_copy(update={"lock_timeout_seconds": 0.05})
+
+        mgr._background_closed = True
+        try:
+            async with mgr._extractor_lock:
+                waiting = asyncio.ensure_future(mgr._get_extractor(cfg_snap=snap))
+                await asyncio.sleep(0)
+                # Teardown finishes while the caller is queued: the flag goes
+                # back to False and the epoch never moves for this caller.
+                mgr._background_closed = False
+                with pytest.raises(ManagerStoppingError):
+                    await asyncio.wait_for(waiting, timeout=5)
+        finally:
+            mgr._background_closed = False
+
     async def test_a_contended_lock_timeout_is_not_absorbed_by_the_stage(self, extract_mgr):
         """The one failure here the stage does NOT own.
 

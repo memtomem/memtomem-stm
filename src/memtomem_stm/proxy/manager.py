@@ -3657,6 +3657,7 @@ class ProxyManager:
         """
         old: FactExtractor | None = None
         entry_epoch = self._teardown_epoch
+        entry_stopping = self._background_closed
 
         def teardown_ran() -> bool:
             """True if teardown was running at any point during this call.
@@ -3664,10 +3665,20 @@ class ProxyManager:
             Reading ``_background_closed`` alone is a point sample of a flag
             stop() clears at its very end, so a caller whose acquisition
             expired ON teardown's hold can resume to find it already False.
-            The epoch closes that: it is bumped once per stop() and never
-            cleared, so a mismatch reports the whole span.
+            Three observations are needed to cover the span, not one:
+
+            * it is set NOW — teardown is still running;
+            * the epoch moved — a teardown started after this call did, and
+              may already have finished;
+            * it was set on ENTRY — this call began inside a teardown that has
+              since finished, which moves no epoch (the bump happened before
+              the entry read) and leaves the flag clear.
+
+            Dropping the third is the case that bites hardest: a request
+            arriving mid-teardown is exactly the one whose lock wait is most
+            likely to expire on teardown's hold.
             """
-            return self._background_closed or self._teardown_epoch != entry_epoch
+            return self._background_closed or self._teardown_epoch != entry_epoch or entry_stopping
 
         try:
             async with bounded_lock(

@@ -72,9 +72,11 @@ class TestIndexObservabilityCounters:
         (``stored``), from "content was refused before any write"
         (``privacy_skip``, #453), and from "the stage was refused before it
         ran" (``shed`` — a background stage never scheduled, #868, or an
-        inline extraction that found the extractor already reclaimed by
-        teardown, #890; either way nothing ran and nothing will, unlike a
-        NULL ok column, which only says no outcome was recorded)."""
+        inline extraction that could not obtain an extractor because the
+        manager was stopping, #890 — reclaimed already, or still held by
+        teardown past the request's own budget; either way nothing ran and
+        nothing will, unlike a NULL ok column, which only says no outcome was
+        recorded)."""
         obs = IndexObservability()
         obs.record_outcome("t", "stored")
         obs.record_outcome("t", "dedup_skip")
