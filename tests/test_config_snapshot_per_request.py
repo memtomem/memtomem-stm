@@ -35,7 +35,7 @@ from memtomem_stm.proxy.config import (
     RelevanceScorerConfig,
     UpstreamServerConfig,
 )
-from memtomem_stm.proxy.manager import ProxyManager
+from memtomem_stm.proxy.manager import ManagerStoppingError, ProxyManager
 from memtomem_stm.proxy.metrics_store import MetricsStore
 from helpers import (
     FakeSurfacingEngine,
@@ -692,11 +692,9 @@ class TestPerRequestSnapshot:
         # ownership invariant, not an ordering: whatever comes back is closed,
         # installed (and so closed by the next stop), or registered as
         # retiring. An open extractor that is none of the three is the leak.
-        assert (
-            published._client is None
-            or published is mgr._extractor
-            or published in mgr._retiring_extractors
-        ), "the rebuild handed out an open extractor that nothing owns"
+        assert published._client is None or published is mgr._extractor, (
+            "the rebuild handed out an open extractor that nothing owns"
+        )
 
     async def test_a_rebuild_during_teardown_does_not_publish(self, extract_mgr, tmp_path):
         """The deterministic half of the race above.
@@ -704,28 +702,60 @@ class TestPerRequestSnapshot:
         Teardown owns the slot from the moment ``_background_closed`` is set —
         including after it has cleared the slot, which is the window a guard
         written as "decline only while an instance is installed" leaves open.
-        An extractor published there is one ``stop()`` has already walked past.
-        Driven by setting the flag directly, so the outcome does not depend on
-        where the event loop happens to resume.
+        Anything built there is an object no teardown pass is guaranteed to
+        close, since ``stop()`` may already have made its last one, so the
+        rebuild refuses instead. Driven by setting the flag directly, so the
+        outcome does not depend on where the event loop happens to resume.
         """
         mgr = extract_mgr
-        await mgr._get_extractor(cfg_snap=mgr._config)
+        first = await mgr._get_extractor(cfg_snap=mgr._config)
         _reload_with_max_facts(mgr, tmp_path, 3)
 
         # Exactly the state stop() is in between clearing the slot and its
-        # final reopen of the spawn path.
+        # final reopen of the spawn path. The instance it would have closed is
+        # closed here by hand, so nothing is left holding a transport.
+        await first.close()
         mgr._extractor = None
         mgr._extractor_cfg = None
         mgr._background_closed = True
         try:
-            handed_out = await mgr._get_extractor(cfg_snap=mgr._config)
+            with pytest.raises(ManagerStoppingError):
+                await mgr._get_extractor(cfg_snap=mgr._config)
         finally:
             mgr._background_closed = False
 
         assert mgr._extractor is None, "a rebuild published into a slot teardown owns"
         assert mgr._extractor_cfg is None
-        assert handed_out in mgr._retiring_extractors, "the transient instance has no owner"
-        assert handed_out._cfg.max_facts == 3
+        assert mgr._retiring_extractors == set(), "the refusal still built something"
+
+    async def test_extraction_records_a_shed_outcome_when_the_manager_is_stopping(
+        self, extract_mgr
+    ):
+        """The refusal is a recorded stage failure, not an exception on the
+        response path.
+
+        ``_get_extractor`` raising mid-teardown must land the way #868's
+        ``background_shed`` does — same situation, arriving through the inline
+        route — rather than escaping into ``call_tool``.
+        """
+        mgr = extract_mgr
+        first = await mgr._get_extractor(cfg_snap=mgr._config)
+        await first.close()
+        mgr._extractor = None
+        mgr._extractor_cfg = None
+        mgr._background_closed = True
+        try:
+            outcome = await mgr._extract_and_store(
+                "srv", "tool", {}, "a long enough response body to extract from"
+                * 4, cfg_snap=mgr._config
+            )
+        finally:
+            mgr._background_closed = False
+
+        assert outcome.ok is False
+        assert outcome.error == "manager_stopping"
+        snap = mgr.index_observability.snapshot()
+        assert snap["outcomes"]["tool"] == {"shed": 1}
 
     async def test_config_edit_lands_on_the_next_request(self, mgr, tmp_path):
         """Snapshotting moves hot-reload to a request boundary; it must not

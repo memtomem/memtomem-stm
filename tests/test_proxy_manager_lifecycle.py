@@ -9,6 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from memtomem_stm.proxy.config import (
     ProxyConfig,
     TransportType,
@@ -468,6 +470,36 @@ class TestStop:
 
         assert slow.close.await_count == 1, "the same instance was closed by both passes"
         assert mgr._retiring_extractors == set()
+
+    async def test_a_cancelled_retirement_pass_hands_the_entry_back(self):
+        """Cancellation must not consume a claimed entry.
+
+        The claim removes the instance from the set before awaiting its close,
+        and ``CancelledError`` is a BaseException — so an ``except Exception``
+        handler unwinds with the entry already gone, losing the manager's last
+        reference to an open transport. That is precisely what the set exists
+        to prevent, so the hand-back runs in a ``finally``."""
+        mgr = _make_manager(servers={})
+        entered = asyncio.Event()
+
+        blocked = AsyncMock()
+
+        async def never_finishes():
+            entered.set()
+            await asyncio.Event().wait()
+
+        blocked.close.side_effect = never_finishes
+        mgr._retiring_extractors.add(blocked)
+
+        pass_task = asyncio.create_task(mgr._close_retiring_extractors())
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert mgr._retiring_extractors == set(), "the entry was not claimed"
+
+        pass_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pass_task
+
+        assert blocked in mgr._retiring_extractors, "cancellation consumed the claimed entry"
 
     async def test_stop_closes_connection_stacks(self):
         """stop() closes per-connection stacks and clears _connections."""

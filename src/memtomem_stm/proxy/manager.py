@@ -250,6 +250,19 @@ class ToolgraphStartupError(RuntimeError):
     """
 
 
+class ManagerStoppingError(RuntimeError):
+    """A long-lived component was asked for after teardown reclaimed it (#890).
+
+    ``stop()`` owns the manager's cached components from the moment it starts.
+    A request still running then can reach one whose slot teardown has already
+    cleared, and building a replacement there would be an object no teardown
+    pass is guaranteed to close — ``stop()`` may already have made its last one.
+    Refusing is the honest answer, and the pipeline turns it into a recorded
+    per-stage failure rather than a broken response (mirroring how #868 sheds
+    background work once teardown starts).
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class ProxyToolInfo:
     prefixed_name: str
@@ -2376,9 +2389,10 @@ class ProxyManager:
         # into the slot between this close and the clear — that instance would
         # be neither shared nor closed. ``_background_closed`` is already set,
         # so a rebuild that takes the lock from here on does not touch the slot
-        # at all: it hands its caller an instance registered as retiring, which
-        # this manager still owns. The lock is only ever held across a
-        # synchronous build, so waiting for it here is bounded.
+        # at all: it serves the installed instance, or refuses once teardown has
+        # cleared it. Every OTHER holder of this lock does only a synchronous
+        # build under it, so waiting for it here is bounded by whatever is
+        # already draining; teardown itself is the one holder that awaits.
         async with self._extractor_lock:
             if self._extractor is not None:
                 await self._extractor.close()
@@ -2390,14 +2404,12 @@ class ProxyManager:
                 self._extractor = None
                 self._extractor_cfg = None
             # Instances whose own close never completed — a rebuilding task
-            # cancelled mid-drain, a close that raised, or one handed out
-            # during this teardown. Inside the lock, because that is the only
-            # place a transient one can be registered: draining outside it
-            # would snapshot the set, await, and return without closing an
-            # entry a waiting rebuild added in the meantime. Entries are
-            # dropped INDIVIDUALLY on success — one that fails again keeps its
-            # owner, since clearing wholesale would drop the manager's last
-            # reference to a transport that is still open.
+            # cancelled mid-drain, or a close that raised. Inside the lock, so
+            # a rebuild cannot register one behind this pass's snapshot and
+            # have it miss teardown entirely. Entries are dropped INDIVIDUALLY
+            # on success: one that fails again keeps its owner, since clearing
+            # wholesale would drop the manager's last reference to a transport
+            # that is still open.
             await self._close_retiring_extractors()
         # Close the #494 consult disk cache (re-opened lazily on the next start).
         # Always null the handle so a failed close cannot leave a stale closed
@@ -3620,10 +3632,12 @@ class ProxyManager:
 
         ``stop()`` sets ``_background_closed`` before taking the same lock, so
         from the moment teardown begins the slot belongs to it: a rebuild that
-        takes the lock while the flag is set publishes nothing. It returns the
-        installed instance if there still is one, and otherwise builds a
-        transient one registered as retiring, so even the extractor handed out
-        mid-teardown has an owner that closes it.
+        takes the lock while the flag is set publishes nothing. It serves the
+        installed instance while there still is one, and raises
+        :class:`ManagerStoppingError` once teardown has cleared it. Building a
+        replacement there instead would produce an object no teardown pass is
+        guaranteed to close — ``stop()`` may already have made its last one —
+        and the caller turns the refusal into a recorded per-stage failure.
         """
         old: FactExtractor | None = None
         async with bounded_lock(
@@ -3638,14 +3652,19 @@ class ProxyManager:
             if installed is not None and self._extractor_cfg == ext_live:
                 current = installed
             elif self._background_closed:
-                # Teardown owns the slot. An instance published here would be
-                # one stop() has already walked past, and the config it would
-                # track stops mattering the moment teardown finishes.
-                if installed is not None:
-                    current = installed
-                else:
-                    current = FactExtractor(ext_live)
-                    self._retiring_extractors.add(current)
+                # Teardown owns the slot: an instance published here is one
+                # stop() has already walked past, and the config it would track
+                # stops mattering the moment teardown finishes. A stale
+                # installed instance is still served — its gate sends the work
+                # to the local heuristic — but once teardown has cleared the
+                # slot there is nothing to hand back. Building one anyway is
+                # what this refuses: no pass would be guaranteed to close it,
+                # since stop() may already have made its last one.
+                if installed is None:
+                    raise ManagerStoppingError(
+                        "proxy manager is stopping; no fact extractor is available"
+                    )
+                current = installed
             else:
                 replacement = FactExtractor(ext_live)
                 old = self._extractor
@@ -3684,11 +3703,19 @@ class ProxyManager:
             if retiring not in self._retiring_extractors:
                 continue  # claimed by an overlapping pass
             self._retiring_extractors.discard(retiring)
+            closed = False
             try:
                 await retiring.close()
+                closed = True
             except Exception:
                 logger.debug("Failed to close retiring fact extractor", exc_info=True)
-                self._retiring_extractors.add(retiring)
+            finally:
+                # Also covers CANCELLATION, which is a BaseException and would
+                # otherwise unwind past an ``except Exception`` with the entry
+                # already claimed — losing the manager's last reference to an
+                # open transport, which is the case this set exists for.
+                if not closed:
+                    self._retiring_extractors.add(retiring)
 
     async def _extract_and_store(
         self,
@@ -3700,8 +3727,21 @@ class ProxyManager:
         context_query: str | None = None,
         cfg_snap: ProxyConfig,
     ) -> ExtractOutcome:
-        """Extract facts from response and store as individual memory entries."""
-        extractor = await self._get_extractor(cfg_snap=cfg_snap)
+        """Extract facts from response and store as individual memory entries.
+
+        A request that reaches here mid-teardown gets a recorded failure rather
+        than an exception on the response path: the extractor is gone and is not
+        coming back for this manager (#890). This mirrors the ``background_shed``
+        outcome #868 records for work refused at the spawn point — the same
+        situation, arriving through the inline route.
+        """
+        try:
+            extractor = await self._get_extractor(cfg_snap=cfg_snap)
+        except ManagerStoppingError:
+            logger.info("Extraction skipped for %s/%s: proxy manager is stopping", server, tool)
+            self.index_observability.record_attempt(tool, "extract")
+            self.index_observability.record_outcome(tool, "shed")
+            return ExtractOutcome(ok=False, facts_stored=0, error="manager_stopping")
         return await extract_and_store(
             index_engine=self._index_engine,
             extractor=extractor,
