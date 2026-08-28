@@ -9,6 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from memtomem_stm.proxy.config import (
     ProxyConfig,
     TransportType,
@@ -368,13 +370,171 @@ class TestStop:
     async def test_stop_nulls_extractor_so_restart_rebuilds(self):
         """stop() nulls _extractor (like _llm_compressor) — _get_extractor()
         rebuilds on None, so a stop->start cycle gets a fresh httpx client
-        instead of the closed instance whose extract() would AssertionError."""
+        instead of a closed instance, whose gate would send every extract() to
+        the local heuristic for the rest of the process (#867).
+
+        The #890 cfg stamp is cleared with it: a stamp left behind describes an
+        instance that no longer exists, and the rebuild predicate reads both."""
         mgr = _make_manager(servers={})
         mgr._extractor = AsyncMock()
+        mgr._extractor_cfg = mgr._config.extraction
 
         await mgr.stop()
 
         assert mgr._extractor is None
+        assert mgr._extractor_cfg is None
+
+    async def test_stop_closes_retiring_extractors(self):
+        """A rebuild whose own close never completed leaves its instance in
+        ``_retiring_extractors``; stop() is the retry, and a success drops it."""
+        mgr = _make_manager(servers={})
+        retiring = AsyncMock()
+        mgr._retiring_extractors.add(retiring)
+
+        await mgr.stop()
+
+        retiring.close.assert_awaited_once()
+        assert mgr._retiring_extractors == set()
+
+    async def test_stop_keeps_a_retiring_extractor_whose_close_fails(self):
+        """A failed retry must NOT drop the entry.
+
+        The set is the manager's last reference to that instance — clearing it
+        wholesale strands an open transport with nothing left to retry it. The
+        entry stays so the next rebuild or stop() tries again."""
+        mgr = _make_manager(servers={})
+        stubborn = AsyncMock()
+        stubborn.close.side_effect = RuntimeError("transport wedged")
+        mgr._retiring_extractors.add(stubborn)
+
+        await mgr.stop()
+
+        stubborn.close.assert_awaited_once()
+        assert stubborn in mgr._retiring_extractors, "a failed close dropped the last reference"
+
+    async def test_stop_detaches_under_the_lock_and_drains_outside_it(self):
+        """Teardown must not hold ``_extractor_lock`` across an await.
+
+        Every holder of this lock does synchronous work under it, which is what
+        lets an ordinary timeout on it mean "stuck holder" rather than "someone
+        is shutting down". Teardown keeps that property by transferring the
+        installed instance into the retirement set — which is what gives it an
+        owner — and closing it after releasing. Pinned by observing the lock
+        from inside a slow close."""
+        mgr = _make_manager(servers={})
+        released = asyncio.Event()
+        observed: list[bool] = []
+
+        slow = AsyncMock()
+
+        async def slow_close():
+            observed.append(mgr._extractor_lock.locked())
+            await released.wait()
+
+        slow.close.side_effect = slow_close
+        mgr._extractor = slow
+        mgr._extractor_cfg = mgr._config.extraction
+
+        stopping = asyncio.create_task(mgr.stop())
+        for _ in range(200):
+            if observed:
+                break
+            await asyncio.sleep(0.01)
+        released.set()
+        await asyncio.wait_for(stopping, timeout=10)
+
+        assert observed == [False], f"teardown drained while holding the lock: {observed}"
+        assert mgr._extractor is None
+        assert mgr._extractor_cfg is None
+        assert mgr._retiring_extractors == set()
+
+    async def test_overlapping_retirement_passes_close_each_instance_once(self):
+        """The rebuild path and ``stop()`` both drain the set, so two passes can
+        overlap. Entries are claimed before the await, so neither awaits
+        ``close()`` on an instance the other is already tearing down."""
+        mgr = _make_manager(servers={})
+        released = asyncio.Event()
+        entered = asyncio.Event()
+
+        slow = AsyncMock()
+
+        async def slow_close():
+            entered.set()
+            await released.wait()
+
+        slow.close.side_effect = slow_close
+        mgr._retiring_extractors.add(slow)
+
+        first = asyncio.create_task(mgr._close_retiring_extractors())
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        second = asyncio.create_task(mgr._close_retiring_extractors())
+        await asyncio.sleep(0.05)
+
+        released.set()
+        await asyncio.wait_for(asyncio.gather(first, second), timeout=10)
+
+        assert slow.close.await_count == 1, "the same instance was closed by both passes"
+        assert mgr._retiring_extractors == set()
+
+    async def test_a_cold_rebuild_after_stop_retries_a_failed_retirement(self):
+        """The retry gate is publication, not displacement.
+
+        After stop() the slot is deliberately None while the retirement set may
+        still hold an instance whose close failed. The first post-stop lookup
+        publishes into an empty slot — displacing nothing — so a gate written as
+        "only when this call replaced something" skips cleanup, and every warm
+        lookup after it skips too: the transport stays open for the whole
+        restarted lifecycle. That entry is the one that has been waiting
+        longest, so a cold publication is exactly when to retry it.
+        """
+        mgr = _make_manager(servers={})
+        stubborn = AsyncMock()
+        stubborn.close.side_effect = [RuntimeError("transport wedged"), None]
+        mgr._extractor = stubborn
+        mgr._extractor_cfg = mgr._config.extraction
+
+        await mgr.stop()
+        assert stubborn in mgr._retiring_extractors, "the failed close lost its owner"
+        assert mgr._extractor is None
+
+        # Cold rebuild: nothing to displace, but something to retry.
+        rebuilt = await mgr._get_extractor(cfg_snap=mgr._config)
+        try:
+            assert rebuilt is not stubborn
+            assert stubborn.close.await_count == 2, "the cold rebuild skipped the retry"
+            assert mgr._retiring_extractors == set()
+        finally:
+            await rebuilt.close()
+
+    async def test_a_cancelled_retirement_pass_hands_the_entry_back(self):
+        """Cancellation must not consume a claimed entry.
+
+        The claim removes the instance from the set before awaiting its close,
+        and ``CancelledError`` is a BaseException — so an ``except Exception``
+        handler unwinds with the entry already gone, losing the manager's last
+        reference to an open transport. That is precisely what the set exists
+        to prevent, so the hand-back runs in a ``finally``."""
+        mgr = _make_manager(servers={})
+        entered = asyncio.Event()
+
+        blocked = AsyncMock()
+
+        async def never_finishes():
+            entered.set()
+            await asyncio.Event().wait()
+
+        blocked.close.side_effect = never_finishes
+        mgr._retiring_extractors.add(blocked)
+
+        pass_task = asyncio.create_task(mgr._close_retiring_extractors())
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert mgr._retiring_extractors == set(), "the entry was not claimed"
+
+        pass_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pass_task
+
+        assert blocked in mgr._retiring_extractors, "cancellation consumed the claimed entry"
 
     async def test_stop_closes_connection_stacks(self):
         """stop() closes per-connection stacks and clears _connections."""

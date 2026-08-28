@@ -35,7 +35,8 @@ from memtomem_stm.proxy.config import (
     RelevanceScorerConfig,
     UpstreamServerConfig,
 )
-from memtomem_stm.proxy.manager import ProxyManager
+from memtomem_stm.proxy._locks import LockTimeoutError
+from memtomem_stm.proxy.manager import ManagerStoppingError, ProxyManager
 from memtomem_stm.proxy.metrics_store import MetricsStore
 from helpers import (
     FakeSurfacingEngine,
@@ -159,6 +160,30 @@ def _build_mgr(
     )
     assert cache is not None
     return mgr, store, cache
+
+
+def _reload_with_max_facts(manager: ProxyManager, tmp_path: Path, max_facts: int) -> None:
+    """Publish a new ``extraction`` generation on disk and make it visible.
+
+    The loader gates on mtime, and tmp files written twice in the same tick can
+    share one — so the timestamp is pushed past what the loader has already
+    seen rather than left to the filesystem clock.
+    """
+    import os
+
+    cfg_file = tmp_path / "proxy.json"
+    cfg_file.write_text(
+        json.dumps(
+            _file_config(
+                tmp_path,
+                compression=CompressionStrategy.TRUNCATE,
+                extraction=True,
+                extraction_overrides={"max_facts": max_facts},
+            )
+        )
+    )
+    seen = manager._config_loader._mtime
+    os.utime(cfg_file, (seen + 10, seen + 10))
 
 
 @pytest.fixture
@@ -295,9 +320,12 @@ class TestPerRequestSnapshot:
         """The extraction path's cost, warm and cold, pinned separately.
 
         ``_get_extractor`` splits by lifetime: the lock timeout rides the
-        snapshot, the extractor is built LIVE. So a cold extraction request
-        pays one extra read for that construction and a warm one pays none —
-        counting only the compression build would have missed this entirely.
+        snapshot, the extractor is built LIVE. Warm and cold cost the SAME one
+        extra read, because the rebuild predicate (#890) reads the live
+        ``extraction`` block on every call and the build reuses that read
+        rather than taking a second — pinned here so a predicate that starts
+        reading twice, or one that goes back to skipping the check when the
+        slot is filled, moves the count.
         """
         mgr = extract_mgr
         calls = count_loader_reads(mgr)
@@ -309,16 +337,18 @@ class TestPerRequestSnapshot:
         await mgr.call_tool("srv", "tool", {"b": 2})
         warm = calls[0]
 
-        assert warm == 2, f"expected the 2-read baseline for a warm request, got {warm}"
-        # baseline + 1 live extractor build. TRUNCATE here, so no selective
+        # baseline + 1 live extractor read. TRUNCATE here, so no selective
         # compressor is constructed; the combined case is covered below.
+        assert warm == 3, f"expected 2 baseline + 1 live predicate read, got {warm}"
         assert cold == 3, f"expected 2 baseline + 1 live build read, got {cold}"
 
     async def test_combined_construction_read_count(self, tmp_path):
         """Both build paths on one request: the reads add, they do not multiply.
 
         Only the fact extractor still costs a read of its own — it is built
-        from LIVE config by design and has no publication generation to ride.
+        from LIVE config by design and has no publication generation to ride,
+        and since #890 its rebuild predicate re-reads that block on every call.
+        So this one is the same warm and cold, unlike the compressor build.
         Pinned so a component that starts taking its own read again, or a third
         one, moves the count here.
         """
@@ -335,7 +365,9 @@ class TestPerRequestSnapshot:
 
             calls[0] = 0
             await mgr.call_tool("srv", "tool", {"b": 2})
-            assert calls[0] == 2, f"expected the 2-read baseline once built, got {calls[0]}"
+            assert calls[0] == 3, (
+                f"expected 2 baseline + 1 extractor predicate read, got {calls[0]}"
+            )
         finally:
             await _drain(mgr)
             cache.close()
@@ -396,13 +428,14 @@ class TestPerRequestSnapshot:
     async def test_extractor_is_built_from_live_config_not_the_snapshot(
         self, extract_mgr, tmp_path
     ):
-        """A never-rebuilt singleton takes the FRESHEST config, not the pinned one.
+        """The long-lived instance takes the FRESHEST config, not the pinned one.
 
         Everything else on the request path reads ``cfg_snap``, because those
-        are decisions scoped to one call. This instance outlives every request,
-        so whichever generation builds it wins until restart — and pinning it to
-        a snapshot captured before the upstream call would freeze the PRE-edit
-        generation whenever a reload lands mid-call.
+        are decisions scoped to one call. This instance outlives the request
+        that builds it, so pinning it to a snapshot captured before the upstream
+        call would freeze the PRE-edit generation whenever a reload lands
+        mid-call — and the rebuild predicate would then compare against a
+        generation nobody is running.
 
         The reload is driven from inside the mocked upstream call so the two
         candidate implementations diverge: a live read sees the post-reload
@@ -438,40 +471,353 @@ class TestPerRequestSnapshot:
         assert mgr._config.extraction.max_facts == 3, "the reload did not land"
         assert mgr._extractor._cfg.max_facts == 3, "extractor used the stale snapshot"
 
-    async def test_extractor_is_not_rebuilt_on_config_change(self, extract_mgr, tmp_path):
-        """Pins #890's KNOWN GAP so the follow-up has a red-to-green target.
+    async def test_extractor_is_rebuilt_on_config_change(self, extract_mgr, tmp_path):
+        """An edit to the ``extraction`` block reaches the extractor itself (#890).
 
-        The extractor is a process-lifetime singleton with no rebuild, so an
-        edit to the extraction block needs a restart. That predates this PR and
-        is unchanged by it; a safe swap needs an explicit lease, since callers
-        can already be holding the instance when a replacement is published.
+        The stage gate and ``ext_cfg`` at the call site always saw the new
+        generation; the cached instance kept the old strategy/provider/limits
+        until restart. That is the worst of both — the config LOOKS live while
+        the behavior it names is not — so the instance now tracks the block it
+        was built from and is replaced when they diverge.
         """
-        import os
+        mgr = extract_mgr
+        await mgr.call_tool("srv", "tool", {"a": 1})
+        first = mgr._extractor
+        assert first is not None
+        assert first._cfg.max_facts == 10
+
+        _reload_with_max_facts(mgr, tmp_path, 3)
+        await mgr.call_tool("srv", "tool", {"b": 2})
+
+        # The new generation reaches ext_cfg at the call site...
+        assert mgr._config.extraction.max_facts == 3
+        # ...and the cached extractor with it.
+        assert mgr._extractor is not first, "the slot still holds the pre-edit instance"
+        assert mgr._extractor._cfg.max_facts == 3
+        assert mgr._extractor_cfg == mgr._config.extraction
+
+    async def test_superseded_extractor_is_closed_on_rebuild(self, extract_mgr, tmp_path):
+        """The replaced instance is closed, not dropped on the floor.
+
+        It owns an httpx client, so a rebuild that only reassigns the slot
+        leaks a transport per config edit. Closing also flips the #867 gate,
+        which is what makes the swap safe for a caller still holding the old
+        reference: it takes the local heuristic instead of the provider.
+        """
+        mgr = extract_mgr
+        await mgr.call_tool("srv", "tool", {"a": 1})
+        old = mgr._extractor
+        assert old is not None, "extraction stage did not run"
+        assert old._client is not None
+
+        _reload_with_max_facts(mgr, tmp_path, 3)
+        await mgr.call_tool("srv", "tool", {"b": 2})
+
+        assert mgr._extractor is not old, "the extractor was not rebuilt"
+        assert old._gate.closed is True, "superseded extractor still admits callers"
+        assert old._client is None, "superseded extractor leaked its httpx client"
+
+    async def test_extractor_rebuild_failure_leaves_old_usable(
+        self, extract_mgr, tmp_path, monkeypatch
+    ):
+        """A failed rebuild leaves the working instance installed and OPEN.
+
+        Building before touching the slot is what buys this: closing first, or
+        stamping the new cfg before the build succeeds, would park a closed
+        extractor behind the equality fast path and take extraction down until
+        the next config edit. Mirrors
+        ``test_rebuild_selective_failure_leaves_old_usable``.
+        """
+        import memtomem_stm.proxy.manager as manager_mod
+
+        mgr = extract_mgr
+        old = await mgr._get_extractor(cfg_snap=mgr._config)
+        assert mgr._extractor_cfg == old._cfg
+
+        _reload_with_max_facts(mgr, tmp_path, 3)
+
+        def boom(_cfg):
+            raise RuntimeError("extractor build failed")
+
+        monkeypatch.setattr(manager_mod, "FactExtractor", boom)
+        with pytest.raises(RuntimeError, match="extractor build failed"):
+            await mgr._get_extractor(cfg_snap=mgr._config)
+
+        assert mgr._extractor is old, "a failed rebuild dropped the working extractor"
+        assert mgr._extractor_cfg == old._cfg, "a failed rebuild restamped the cache"
+        assert old._gate.closed is False, "old instance closed before a replacement existed"
+        assert old._client is not None
+
+        monkeypatch.undo()
+        new = await mgr._get_extractor(cfg_snap=mgr._config)
+        assert new is not old, "the retry did not rebuild"
+        assert new._cfg.max_facts == 3
+
+    async def test_rebuild_drains_the_in_flight_extractor(self, extract_mgr, tmp_path):
+        """The superseded close waits out live callers, and does it AFTER
+        publishing the replacement.
+
+        Two properties in one: the transport is not torn down under a
+        registered call (#867's drain), and the drain does not sit inside
+        ``_extractor_lock`` — the new instance is visible while it runs, so a
+        concurrent request is not queued behind another caller's shutdown.
+        """
+        import asyncio
+
+        mgr = extract_mgr
+        old = await mgr._get_extractor(cfg_snap=mgr._config)
+        token = old._gate.try_enter(30.0)
+        assert token is not None
+
+        _reload_with_max_facts(mgr, tmp_path, 3)
+        rebuild = asyncio.create_task(mgr._get_extractor(cfg_snap=mgr._config))
+        await asyncio.sleep(0.05)
+
+        assert not rebuild.done(), "the rebuild did not wait for the in-flight caller"
+        assert old._client is not None, "transport closed under a registered call"
+        assert mgr._extractor is not old, "the replacement was not published before the drain"
+
+        # The load-bearing half: a second caller must get the replacement WHILE
+        # the drain runs. Publishing before the drain is not enough on its own —
+        # a close awaited inside ``_extractor_lock`` would satisfy every
+        # assertion above and still block this one until the gate is released.
+        concurrent = await asyncio.wait_for(mgr._get_extractor(cfg_snap=mgr._config), timeout=5)
+        assert concurrent is mgr._extractor, "a concurrent caller was served the retired instance"
+        assert not rebuild.done(), "the drain ended early; the concurrency check proved nothing"
+
+        old._gate.leave(token)
+        new = await asyncio.wait_for(rebuild, timeout=5)
+
+        assert new is mgr._extractor
+        assert old._client is None, "the drained instance was never closed"
+
+    async def test_the_rebuild_predicate_reads_live_config_under_the_lock(self, extract_mgr):
+        """WHERE the live read happens is the whole argument, so pin it.
+
+        Reading before acquiring the lock would let a caller observe an older
+        generation, block, and then stamp the shared slot backward over a newer
+        rebuild — the race ``_relevance_scorer_for`` needs an explicit stale-pin
+        guard for. Under the lock, that ordering is impossible and no guard is
+        needed. Counting reads cannot tell the two apart; recording whether the
+        lock is held at the moment of the read can, and fails deterministically
+        against a pre-lock implementation.
+        """
+        mgr = extract_mgr
+        cfg_snap = mgr._config
+        held: list[bool] = []
+        real_get = mgr._config_loader.get
+
+        def recording_get():
+            held.append(mgr._extractor_lock.locked())
+            return real_get()
+
+        mgr._config_loader.get = recording_get  # type: ignore[method-assign]
+        try:
+            await mgr._get_extractor(cfg_snap=cfg_snap)
+        finally:
+            mgr._config_loader.get = real_get  # type: ignore[method-assign]
+
+        assert held, "_get_extractor took no live read at all"
+        assert all(held), f"the live read ran outside the lock: {held}"
+
+    async def test_an_unstamped_slot_is_rebuilt(self, extract_mgr):
+        """``None`` in the cfg stamp is not a wildcard.
+
+        A predicate that only compares when a stamp exists would keep any
+        externally installed instance forever — which is the pre-#890 behavior
+        wearing the new field. The stamp is the claim "this instance was built
+        from that block"; absent, there is no such claim to honor.
+        """
+        mgr = extract_mgr
+        installed = await mgr._get_extractor(cfg_snap=mgr._config)
+        mgr._extractor_cfg = None
+
+        rebuilt = await mgr._get_extractor(cfg_snap=mgr._config)
+
+        assert rebuilt is not installed, "an unstamped slot was treated as current"
+        assert mgr._extractor_cfg == mgr._config.extraction
+
+    async def test_stop_does_not_strand_a_replacement_published_mid_teardown(
+        self, extract_mgr, tmp_path
+    ):
+        """``stop()`` and a rebuild contend for one slot; neither may drop an
+        open instance on the floor.
+
+        Teardown closes the extractor and clears the slot. A rebuild running
+        concurrently used to be able to publish its replacement between those
+        two steps, leaving an open httpx client that was neither shared nor
+        closed. Driven through the real contention: the in-flight gate holds
+        ``stop()`` inside its close while the rebuild tries to publish.
+
+        The invariant is ownership, not ordering. Either outcome is legitimate
+        — the rebuild declines while teardown owns the slot, or it lands after
+        teardown finished and is indistinguishable from a post-stop request —
+        so what is asserted is that whatever it returns is either installed
+        (and so closed by the next stop) or already closed. An instance that is
+        neither is the leak.
+        """
+        import asyncio
+
+        mgr = extract_mgr
+        installed = await mgr._get_extractor(cfg_snap=mgr._config)
+        token = installed._gate.try_enter(30.0)
+        assert token is not None
+
+        stopping = asyncio.create_task(mgr.stop())
+        # Wait for an OBSERVABLE teardown signal, not a sleep: close() flips the
+        # gate as its first step, so this pins that stop() is inside the
+        # extractor drain before the rebuild starts. A bare sleep would also
+        # pass if stop() were still awaiting something earlier entirely.
+        for _ in range(200):
+            if installed._gate.closed:
+                break
+            await asyncio.sleep(0.01)
+        assert installed._gate.closed, "stop() never reached the extractor close"
+        assert mgr._extractor is None, "teardown had not detached the slot yet"
+        assert not stopping.done()
+
+        _reload_with_max_facts(mgr, tmp_path, 3)
+        rebuild = asyncio.create_task(mgr._get_extractor(cfg_snap=mgr._config))
+        await asyncio.sleep(0.05)
+
+        installed._gate.leave(token)
+        await asyncio.wait_for(stopping, timeout=10)
+        try:
+            published = await asyncio.wait_for(rebuild, timeout=10)
+        except ManagerStoppingError:
+            # The declining branch the docstring describes: the lock came free
+            # after teardown cleared the slot but before it reopened the spawn
+            # path. Legitimate, and which side the rebuild lands on is exactly
+            # what this test refuses to pin.
+            published = None
+
+        assert installed._client is None, "teardown did not close the installed extractor"
+        # Which side of teardown the rebuild lands on is a genuine race — the
+        # lock is released before stop() finishes — so the assertion is the
+        # ownership invariant, not an ordering: it either declined (handled
+        # above) or returned something closed or currently installed, and so
+        # closed by the next stop. An open extractor that is neither is the leak.
+        assert published is None or published._client is None or published is mgr._extractor, (
+            "the rebuild handed out an open extractor that nothing owns"
+        )
+
+    async def test_a_rebuild_during_teardown_does_not_publish(self, extract_mgr, tmp_path):
+        """The deterministic half of the race above.
+
+        Teardown owns the slot from the moment ``_background_closed`` is set —
+        including after it has cleared the slot, which is the window a guard
+        written as "decline only while an instance is installed" leaves open.
+        Anything built there is an object no teardown pass is guaranteed to
+        close, since ``stop()`` may already have made its last one, so the
+        rebuild refuses instead. Driven by setting the flag directly, so the
+        outcome does not depend on where the event loop happens to resume.
+        """
+        mgr = extract_mgr
+        first = await mgr._get_extractor(cfg_snap=mgr._config)
+        _reload_with_max_facts(mgr, tmp_path, 3)
+
+        # Exactly the state stop() is in between clearing the slot and its
+        # final reopen of the spawn path. The instance it would have closed is
+        # closed here by hand, so nothing is left holding a transport.
+        await first.close()
+        mgr._extractor = None
+        mgr._extractor_cfg = None
+        mgr._background_closed = True
+        try:
+            with pytest.raises(ManagerStoppingError):
+                await mgr._get_extractor(cfg_snap=mgr._config)
+        finally:
+            mgr._background_closed = False
+
+        assert mgr._extractor is None, "a rebuild published into a slot teardown owns"
+        assert mgr._extractor_cfg is None
+        assert mgr._retiring_extractors == set(), "the refusal still built something"
+
+    async def test_a_failed_rebuild_does_not_discard_the_upstream_response(
+        self, extract_mgr, tmp_path, monkeypatch
+    ):
+        """Acquiring the extractor is inside the stage's failure contract.
+
+        The upstream call has already succeeded by the time extraction runs, so
+        a constructor that raises must not take the response with it — every
+        other failure past this point is already turned into ``ok=False``. This
+        matters more since #890: construction used to happen once per process
+        and now happens on any config edit.
+        """
+        import memtomem_stm.proxy.manager as manager_mod
 
         mgr = extract_mgr
         await mgr.call_tool("srv", "tool", {"a": 1})
-        assert mgr._extractor is not None
-        assert mgr._extractor._cfg.max_facts == 10
+        installed = mgr._extractor
+        _reload_with_max_facts(mgr, tmp_path, 3)
 
-        cfg_file = tmp_path / "proxy.json"
-        cfg_file.write_text(
-            json.dumps(
-                _file_config(
-                    tmp_path,
-                    compression=CompressionStrategy.TRUNCATE,
-                    extraction=True,
-                    extraction_overrides={"max_facts": 3},
+        def boom(_cfg):
+            raise RuntimeError("extractor build failed")
+
+        monkeypatch.setattr(manager_mod, "FactExtractor", boom)
+        response = await mgr.call_tool("srv", "tool", {"b": 2})
+
+        assert isinstance(response, str) and response, "a failed rebuild broke the response"
+        assert mgr._extractor is installed, "the working extractor was dropped"
+        outcomes = mgr.index_observability.snapshot()["outcomes"]["tool"]
+        assert outcomes.get("error") == 1, f"the refusal was not recorded: {outcomes}"
+
+    async def test_a_contended_lock_timeout_is_not_absorbed_by_the_stage(self, extract_mgr):
+        """The one failure here the stage does NOT own.
+
+        ``_get_extractor`` re-raises a timeout with no teardown behind it on
+        purpose, ``_locks`` propagates it so a stuck holder stays visible, and
+        ``call_tool`` has a LOCK_TIMEOUT classifier that only runs if it
+        arrives. The broad catch that keeps a construction failure from
+        discarding the response must not turn that diagnostic into a quiet
+        degraded outcome.
+        """
+        mgr = extract_mgr
+        await mgr._get_extractor(cfg_snap=mgr._config)
+        snap = mgr._config.model_copy(update={"lock_timeout_seconds": 0.01})
+
+        async with mgr._extractor_lock:
+            with pytest.raises(LockTimeoutError):
+                await mgr._extract_and_store(
+                    "srv", "tool", {}, "a long enough response body" * 4, cfg_snap=snap
                 )
-            )
-        )
-        seen = mgr._config_loader._mtime
-        os.utime(cfg_file, (seen + 10, seen + 10))
 
-        await mgr.call_tool("srv", "tool", {"b": 2})
-        # The new generation reaches ext_cfg at the call site...
-        assert mgr._config.extraction.max_facts == 3
-        # ...but not the cached extractor. When #890 lands, this flips to 3.
-        assert mgr._extractor._cfg.max_facts == 10
+    async def test_extraction_records_a_shed_outcome_when_the_manager_is_stopping(
+        self, extract_mgr
+    ):
+        """The refusal is a recorded stage failure, not an exception on the
+        response path.
+
+        ``_get_extractor`` raising mid-teardown must land the way #868's
+        ``background_shed`` does — same situation, arriving through the inline
+        route — rather than escaping into ``call_tool``.
+        """
+        mgr = extract_mgr
+        first = await mgr._get_extractor(cfg_snap=mgr._config)
+        await first.close()
+        mgr._extractor = None
+        mgr._extractor_cfg = None
+        mgr._background_closed = True
+        try:
+            outcome = await mgr._extract_and_store(
+                "srv",
+                "tool",
+                {},
+                "a long enough response body to extract from" * 4,
+                cfg_snap=mgr._config,
+            )
+            # And through the real inline pipeline: the exception must not
+            # reach call_tool, which would turn a teardown race into a failed
+            # tool response. This fixture runs extraction with background=False,
+            # so the stage awaits _extract_and_store on the response path.
+            assert isinstance(await mgr.call_tool("srv", "tool", {"a": 1}), str)
+        finally:
+            mgr._background_closed = False
+
+        assert outcome.ok is False
+        assert outcome.error == "manager_stopping"
+        snap = mgr.index_observability.snapshot()
+        assert snap["outcomes"]["tool"] == {"shed": 2}, "the stage did not record the refusal"
 
     async def test_config_edit_lands_on_the_next_request(self, mgr, tmp_path):
         """Snapshotting moves hot-reload to a request boundary; it must not

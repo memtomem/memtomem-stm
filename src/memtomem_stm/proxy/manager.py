@@ -58,6 +58,7 @@ from memtomem_stm.proxy.config import (
     CompressionStrategy,
     EnvOverlayResult,
     ExposureProfile,
+    ExtractionConfig,
     ExtractionStrategy,
     HybridConfig,
     LLMCompressorConfig,
@@ -246,6 +247,19 @@ class ToolgraphStartupError(RuntimeError):
     the proxy up — loud and recoverable, never a silent fail-open. The operator
     sets the knob to ``open`` (degrade) or ``closed`` (withhold all) to choose
     a different posture.
+    """
+
+
+class ManagerStoppingError(RuntimeError):
+    """A long-lived component could not be obtained because teardown owns it (#890).
+
+    ``stop()`` owns the manager's cached components from the moment it starts.
+    A request still running then can find the slot already cleared, and building
+    a replacement there would be an object no teardown pass is guaranteed to
+    close, since ``stop()`` may already have made its last one.
+    Refusing is the honest answer, and the pipeline turns it into a recorded
+    per-stage failure rather than a broken response (mirroring how #868 sheds
+    background work once teardown starts).
     """
 
 
@@ -667,7 +681,14 @@ class ProxyManager:
         # resolving under the lock and writing outside it is not equivalent.
         self._selective_publish_mu = threading.Lock()
         self._extractor: FactExtractor | None = None
+        self._extractor_cfg: ExtractionConfig | None = None
         self._extractor_lock = asyncio.Lock()
+        # Extractors replaced by a rebuild and not yet confirmed closed. The
+        # rebuilding task awaits the close itself, but that await can be
+        # cancelled or raise, and once the instance is out of the slot no other
+        # reference to it exists — it would leak its httpx client with nothing
+        # left to retry the teardown. ``stop()`` closes whatever is still here.
+        self._retiring_extractors: set[FactExtractor] = set()
         # In-memory counters for both INDEX-pipeline write paths
         # (auto_index_response + extract_and_store). Always instantiated for
         # library callers that inspect ``index_observability.snapshot()``.
@@ -2364,12 +2385,34 @@ class ProxyManager:
         if self._llm_compressor is not None:
             await self._llm_compressor.close()
             self._llm_compressor = None
-        if self._extractor is not None:
-            await self._extractor.close()
-            # Null it like _llm_compressor above: _get_extractor() rebuilds on
-            # None, so a stop->start cycle gets a fresh httpx client instead of
-            # the closed instance (whose extract() asserts _client is not None).
-            self._extractor = None
+        # DETACH under the lock, DRAIN outside it. The lock exists to keep the
+        # slot and its cfg stamp consistent, and every operation that needs it —
+        # here and in every rebuild — is synchronous, so no caller ever waits on
+        # this lock across an await. Holding it across the drain instead is what
+        # made an ordinary request time out on an orderly shutdown, and what the
+        # epoch-and-translation machinery that grew around that was for.
+        #
+        # Transferring the instance into the retirement set before releasing is
+        # what makes detaching enough: teardown owns it from that moment, and
+        # ``_background_closed`` is already set, so a rebuild taking the lock
+        # from here on refuses rather than publishing into a slot teardown has
+        # claimed.
+        async with self._extractor_lock:
+            if self._extractor is not None:
+                # Null it like _llm_compressor above: _get_extractor() rebuilds
+                # on None, so a stop->start cycle gets a fresh httpx client
+                # instead of a closed instance (whose extract() would take the
+                # heuristic path forever). The cfg stamp goes with it — left
+                # behind it would be a claim about an instance that is gone.
+                self._retiring_extractors.add(self._extractor)
+                self._extractor = None
+                self._extractor_cfg = None
+        # The detached instance, plus any whose own close never completed — a
+        # rebuilding task cancelled mid-drain, or a close that raised. Entries
+        # are dropped INDIVIDUALLY on success: one that fails again keeps its
+        # owner, since clearing wholesale would drop the manager's last
+        # reference to a transport that is still open.
+        await self._close_retiring_extractors()
         # Close the #494 consult disk cache (re-opened lazily on the next start).
         # Always null the handle so a failed close cannot leave a stale closed
         # connection that the next start() would reuse.
@@ -3552,32 +3595,139 @@ class ProxyManager:
         )
 
     async def _get_extractor(self, *, cfg_snap: ProxyConfig) -> FactExtractor:
-        """The lazily-built ``FactExtractor``, never rebuilt when ``extraction``
-        changes (#890).
+        """The cached ``FactExtractor``, rebuilt when ``extraction`` changes.
 
         Split by LIFETIME, the rule this class applies throughout: the lock
         timeout is a decision scoped to THIS acquisition, so it rides the
-        request snapshot; the extractor itself outlives every request, so it is
-        constructed from LIVE config. Whichever generation builds that instance
-        wins until restart, and pinning it to a snapshot captured before the
-        upstream call would freeze the PRE-edit generation whenever a reload
-        lands mid-call — trading one call's internal consistency for a
-        permanently staler singleton. Freshness wins for something that never
-        rebuilds.
+        request snapshot; the extractor outlives every request, so both the
+        rebuild predicate and the construction read LIVE config. Pinning it to
+        a snapshot captured before the upstream call would freeze the PRE-edit
+        generation whenever a reload lands mid-call, trading one call's
+        internal consistency for a staler singleton.
 
-        Rebuilding on change would remove the trade entirely, but it needs the
-        superseded instance to stay usable by callers already holding it — an
-        explicit lease. That is lifecycle work in its own right; #890 carries
-        the analysis.
+        That live read happens INSIDE the lock, which is why this needs none of
+        ``_relevance_scorer_for``'s stale-pin guard: every rebuild decision
+        therefore sees a generation at or after the one the previous rebuild
+        used, so a caller cannot stamp the shared slot backward. Reading live
+        before the lock would reintroduce exactly that race.
+
+        Build before publish, close after releasing: a construction failure
+        leaves the working instance installed, open, and stamped with its own
+        cfg, so the next call retries instead of fast-pathing onto a broken
+        state (#890). The superseded close drains in-flight LLM calls, so it is
+        awaited OUTSIDE the lock — inside, that drain would hold the lock for
+        as long as the in-flight calls run, so any concurrent caller whose
+        ``lock_timeout_seconds`` is shorter than the drain would fail rather
+        than take the replacement that is already published. The task that
+        triggers the rebuild absorbs that wait; with ``extraction.background=
+        True`` (the default) it is a background task rather than the response
+        path. A caller still holding the old reference keeps working: its gate
+        is closed, so ``extract()`` takes the local heuristic (#867).
+
+        Because the drain runs unlocked, a SECOND rebuild can retire the
+        instance this call published while this call is still draining the
+        first — so the return value is re-read from the slot afterwards rather
+        than handed back from the local capture. That narrows the window but
+        does not close it: without a lease, any reference can be retired the
+        moment its holder stops looking, which is exactly the case the gate's
+        heuristic fallback covers.
+
+        ``stop()`` sets ``_background_closed`` before taking the same lock, so
+        from the moment teardown begins the slot belongs to it: a rebuild that
+        takes the lock while the flag is set publishes nothing. It serves the
+        installed instance while there still is one, and raises
+        :class:`ManagerStoppingError` once teardown has cleared it. Building a
+        replacement there instead would produce an object no teardown pass is
+        guaranteed to close — ``stop()`` may already have made its last one —
+        and the caller turns the refusal into a recorded per-stage failure.
+
+        Every holder of this lock — teardown included — does only synchronous
+        work under it, so no caller ever waits on it across an await and a
+        timeout here means what it says. Teardown detaches the installed
+        instance into the retirement set and drains it after releasing.
         """
+        old: FactExtractor | None = None
+        published = False
         async with bounded_lock(
             self._extractor_lock,
             timeout=cfg_snap.lock_timeout_seconds,
             name="extractor_lock",
         ):
-            if self._extractor is None:
-                self._extractor = FactExtractor(self._config.extraction)
-            return self._extractor
+            # One loader read: the property stats the config file per access,
+            # and the predicate must judge the same generation it builds from.
+            ext_live = self._config.extraction
+            installed = self._extractor
+            if installed is not None and self._extractor_cfg == ext_live:
+                current = installed
+            elif self._background_closed:
+                # Teardown owns the slot: an instance published here is one
+                # stop() has already walked past, and the config it would track
+                # stops mattering the moment teardown finishes. A stale
+                # installed instance is still served — its gate sends the work
+                # to the local heuristic — but once teardown has cleared the
+                # slot there is nothing to hand back. Building one anyway is
+                # what this refuses: no pass would be guaranteed to close it,
+                # since stop() may already have made its last one.
+                if installed is None:
+                    raise ManagerStoppingError(
+                        "proxy manager is stopping; no fact extractor is available"
+                    )
+                current = installed
+            else:
+                replacement = FactExtractor(ext_live)
+                old = self._extractor
+                self._extractor = replacement
+                self._extractor_cfg = ext_live
+                if old is not None:
+                    self._retiring_extractors.add(old)
+                current = replacement
+                published = True
+        if published and self._retiring_extractors:
+            # Retries the whole retiring set, not just this call's own
+            # displaced instance: a close that failed or was cancelled has no
+            # other retry point before stop(), so without this the set — and
+            # the transports it holds open — would grow one entry per rebuild.
+            # Gated on publication rather than on displacing something, since a
+            # COLD publication after a stop() (slot None, set non-empty) is the
+            # case where a failed teardown close has been waiting longest.
+            await self._close_retiring_extractors()
+            # Re-read: another rebuild may have retired ``current`` while this
+            # task was draining, and handing back a closed instance would send
+            # the caller to the heuristic for a reason it cannot see.
+            current = self._extractor or current
+        return current
+
+    async def _close_retiring_extractors(self) -> None:
+        """Close every extractor awaiting teardown, dropping the ones that make it.
+
+        A failure keeps its entry: the set is the manager's only remaining
+        reference to that instance, so discarding it wholesale would strand an
+        open transport with nothing left to retry it. The next rebuild — or
+        ``stop()`` — tries again.
+
+        Entries are CLAIMED by removing them before the await, and handed back
+        only if the close fails. Both the rebuild path and ``stop()`` call this,
+        so two passes can overlap; the claim is what keeps them from awaiting
+        ``close()`` on the same instance concurrently. Removing and re-adding is
+        atomic against other tasks because it spans no await.
+        """
+        for retiring in list(self._retiring_extractors):
+            if retiring not in self._retiring_extractors:
+                continue  # claimed by an overlapping pass
+            self._retiring_extractors.discard(retiring)
+            closed = False
+            try:
+                await retiring.close()
+                closed = True
+            except Exception:
+                logger.debug("Failed to close retiring fact extractor", exc_info=True)
+            finally:
+                # Also covers CANCELLATION, which is a BaseException and would
+                # otherwise unwind past an ``except Exception`` with the entry
+                # already claimed — losing the manager's last reference to an
+                # open transport, which is the case this set exists for.
+                if not closed:
+                    self._retiring_extractors.add(retiring)
 
     async def _extract_and_store(
         self,
@@ -3589,8 +3739,49 @@ class ProxyManager:
         context_query: str | None = None,
         cfg_snap: ProxyConfig,
     ) -> ExtractOutcome:
-        """Extract facts from response and store as individual memory entries."""
-        extractor = await self._get_extractor(cfg_snap=cfg_snap)
+        """Extract facts from response and store as individual memory entries.
+
+        Acquiring the extractor is inside the stage's failure contract, not in
+        front of it. ``extract_and_store`` already turns every failure past this
+        point into ``ok=False``; the lookup used to be the one step that could
+        raise instead, and with a per-config rebuild (#890) it can now fail on
+        any request rather than only the first. Discarding an upstream response
+        that already succeeded because the extraction that follows it could not
+        start is the wrong trade — this stage is an enrichment.
+
+        Two recorded shapes: teardown refuses with ``manager_stopping`` and the
+        ``shed`` outcome, mirroring what #868 records for background work
+        refused at the spawn point (the same situation through the inline
+        route); anything else is an ``error``, and the next request retries
+        against the still-installed instance. A lock timeout is neither: it
+        means a genuinely stuck holder, so it propagates.
+        """
+        try:
+            extractor = await self._get_extractor(cfg_snap=cfg_snap)
+        except ManagerStoppingError:
+            logger.info("Extraction skipped for %s/%s: proxy manager is stopping", server, tool)
+            self.index_observability.record_attempt(tool, "extract")
+            self.index_observability.record_outcome(tool, "shed")
+            return ExtractOutcome(ok=False, facts_stored=0, error="manager_stopping")
+        except LockTimeoutError:
+            # The one failure here that is NOT this stage's to absorb: ``_locks``
+            # propagates it so a stuck holder stays visible, and ``call_tool``
+            # has a LOCK_TIMEOUT classifier that only runs if it arrives.
+            # Swallowing it would turn the diagnostic the lock exists for into a
+            # quiet degraded outcome. Nothing holds this lock across an await,
+            # so a timeout here is a real stuck holder rather than shutdown.
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Extraction unavailable for %s/%s (%s): %s",
+                server,
+                tool,
+                type(exc).__name__,
+                exc,
+            )
+            self.index_observability.record_attempt(tool, "extract")
+            self.index_observability.record_outcome(tool, "error")
+            return ExtractOutcome(ok=False, facts_stored=0, error=f"{type(exc).__name__}: {exc}")
         return await extract_and_store(
             index_engine=self._index_engine,
             extractor=extractor,
@@ -5538,13 +5729,12 @@ class ProxyManager:
         cap or during ``stop()`` — reports ``False`` / ``background_shed``
         instead (#868). Like the index stage, gate and ``_extract_and_store``
         both read the request's ``cfg_snap`` snapshot for ``ext_cfg`` (#871).
-        The ``FactExtractor`` itself is built from LIVE config and never
-        rebuilt (#890), so the two can split in one direction on the call that
-        constructs it — a reload landing mid-call gives the extractor the NEW
-        generation while storage keeps the snapshot — and permanently in the
-        other afterwards, storage moving on while the extractor does not. That
-        is the deliberate trade: one call's split costs one call, a stale
-        singleton costs every later one.
+        The ``FactExtractor`` itself is built from LIVE config (#890), so the
+        two can still split on the call that constructs or rebuilds it — a
+        reload landing mid-call gives the extractor the NEW generation while
+        storage keeps the snapshot. That split now lasts one call rather than
+        until restart: the next ``_get_extractor`` sees the changed block and
+        rebuilds.
         """
         extract_ok: bool | None = None
         extract_error: str | None = None
