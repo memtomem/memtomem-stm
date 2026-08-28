@@ -161,6 +161,30 @@ def _build_mgr(
     return mgr, store, cache
 
 
+def _reload_with_max_facts(manager: ProxyManager, tmp_path: Path, max_facts: int) -> None:
+    """Publish a new ``extraction`` generation on disk and make it visible.
+
+    The loader gates on mtime, and tmp files written twice in the same tick can
+    share one — so the timestamp is pushed past what the loader has already
+    seen rather than left to the filesystem clock.
+    """
+    import os
+
+    cfg_file = tmp_path / "proxy.json"
+    cfg_file.write_text(
+        json.dumps(
+            _file_config(
+                tmp_path,
+                compression=CompressionStrategy.TRUNCATE,
+                extraction=True,
+                extraction_overrides={"max_facts": max_facts},
+            )
+        )
+    )
+    seen = manager._config_loader._mtime
+    os.utime(cfg_file, (seen + 10, seen + 10))
+
+
 @pytest.fixture
 def mgr(tmp_path):
     manager, store, cache = _build_mgr(tmp_path)
@@ -295,9 +319,12 @@ class TestPerRequestSnapshot:
         """The extraction path's cost, warm and cold, pinned separately.
 
         ``_get_extractor`` splits by lifetime: the lock timeout rides the
-        snapshot, the extractor is built LIVE. So a cold extraction request
-        pays one extra read for that construction and a warm one pays none —
-        counting only the compression build would have missed this entirely.
+        snapshot, the extractor is built LIVE. Warm and cold cost the SAME one
+        extra read, because the rebuild predicate (#890) reads the live
+        ``extraction`` block on every call and the build reuses that read
+        rather than taking a second — pinned here so a predicate that starts
+        reading twice, or one that goes back to skipping the check when the
+        slot is filled, moves the count.
         """
         mgr = extract_mgr
         calls = count_loader_reads(mgr)
@@ -309,16 +336,18 @@ class TestPerRequestSnapshot:
         await mgr.call_tool("srv", "tool", {"b": 2})
         warm = calls[0]
 
-        assert warm == 2, f"expected the 2-read baseline for a warm request, got {warm}"
-        # baseline + 1 live extractor build. TRUNCATE here, so no selective
+        # baseline + 1 live extractor read. TRUNCATE here, so no selective
         # compressor is constructed; the combined case is covered below.
+        assert warm == 3, f"expected 2 baseline + 1 live predicate read, got {warm}"
         assert cold == 3, f"expected 2 baseline + 1 live build read, got {cold}"
 
     async def test_combined_construction_read_count(self, tmp_path):
         """Both build paths on one request: the reads add, they do not multiply.
 
         Only the fact extractor still costs a read of its own — it is built
-        from LIVE config by design and has no publication generation to ride.
+        from LIVE config by design and has no publication generation to ride,
+        and since #890 its rebuild predicate re-reads that block on every call.
+        So this one is the same warm and cold, unlike the compressor build.
         Pinned so a component that starts taking its own read again, or a third
         one, moves the count here.
         """
@@ -335,7 +364,9 @@ class TestPerRequestSnapshot:
 
             calls[0] = 0
             await mgr.call_tool("srv", "tool", {"b": 2})
-            assert calls[0] == 2, f"expected the 2-read baseline once built, got {calls[0]}"
+            assert calls[0] == 3, (
+                f"expected 2 baseline + 1 extractor predicate read, got {calls[0]}"
+            )
         finally:
             await _drain(mgr)
             cache.close()
@@ -396,13 +427,14 @@ class TestPerRequestSnapshot:
     async def test_extractor_is_built_from_live_config_not_the_snapshot(
         self, extract_mgr, tmp_path
     ):
-        """A never-rebuilt singleton takes the FRESHEST config, not the pinned one.
+        """The long-lived instance takes the FRESHEST config, not the pinned one.
 
         Everything else on the request path reads ``cfg_snap``, because those
-        are decisions scoped to one call. This instance outlives every request,
-        so whichever generation builds it wins until restart — and pinning it to
-        a snapshot captured before the upstream call would freeze the PRE-edit
-        generation whenever a reload lands mid-call.
+        are decisions scoped to one call. This instance outlives the request
+        that builds it, so pinning it to a snapshot captured before the upstream
+        call would freeze the PRE-edit generation whenever a reload lands
+        mid-call — and the rebuild predicate would then compare against a
+        generation nobody is running.
 
         The reload is driven from inside the mocked upstream call so the two
         candidate implementations diverge: a live read sees the post-reload
@@ -438,40 +470,117 @@ class TestPerRequestSnapshot:
         assert mgr._config.extraction.max_facts == 3, "the reload did not land"
         assert mgr._extractor._cfg.max_facts == 3, "extractor used the stale snapshot"
 
-    async def test_extractor_is_not_rebuilt_on_config_change(self, extract_mgr, tmp_path):
-        """Pins #890's KNOWN GAP so the follow-up has a red-to-green target.
+    async def test_extractor_is_rebuilt_on_config_change(self, extract_mgr, tmp_path):
+        """An edit to the ``extraction`` block reaches the extractor itself (#890).
 
-        The extractor is a process-lifetime singleton with no rebuild, so an
-        edit to the extraction block needs a restart. That predates this PR and
-        is unchanged by it; a safe swap needs an explicit lease, since callers
-        can already be holding the instance when a replacement is published.
+        The stage gate and ``ext_cfg`` at the call site always saw the new
+        generation; the cached instance kept the old strategy/provider/limits
+        until restart. That is the worst of both — the config LOOKS live while
+        the behavior it names is not — so the instance now tracks the block it
+        was built from and is replaced when they diverge.
         """
-        import os
-
         mgr = extract_mgr
         await mgr.call_tool("srv", "tool", {"a": 1})
-        assert mgr._extractor is not None
-        assert mgr._extractor._cfg.max_facts == 10
+        first = mgr._extractor
+        assert first is not None
+        assert first._cfg.max_facts == 10
 
-        cfg_file = tmp_path / "proxy.json"
-        cfg_file.write_text(
-            json.dumps(
-                _file_config(
-                    tmp_path,
-                    compression=CompressionStrategy.TRUNCATE,
-                    extraction=True,
-                    extraction_overrides={"max_facts": 3},
-                )
-            )
-        )
-        seen = mgr._config_loader._mtime
-        os.utime(cfg_file, (seen + 10, seen + 10))
-
+        _reload_with_max_facts(mgr, tmp_path, 3)
         await mgr.call_tool("srv", "tool", {"b": 2})
+
         # The new generation reaches ext_cfg at the call site...
         assert mgr._config.extraction.max_facts == 3
-        # ...but not the cached extractor. When #890 lands, this flips to 3.
-        assert mgr._extractor._cfg.max_facts == 10
+        # ...and the cached extractor with it.
+        assert mgr._extractor is not first, "the slot still holds the pre-edit instance"
+        assert mgr._extractor._cfg.max_facts == 3
+        assert mgr._extractor_cfg == mgr._config.extraction
+
+    async def test_superseded_extractor_is_closed_on_rebuild(self, extract_mgr, tmp_path):
+        """The replaced instance is closed, not dropped on the floor.
+
+        It owns an httpx client, so a rebuild that only reassigns the slot
+        leaks a transport per config edit. Closing also flips the #867 gate,
+        which is what makes the swap safe for a caller still holding the old
+        reference: it takes the local heuristic instead of the provider.
+        """
+        mgr = extract_mgr
+        await mgr.call_tool("srv", "tool", {"a": 1})
+        old = mgr._extractor
+        assert old is not None, "extraction stage did not run"
+        assert old._client is not None
+
+        _reload_with_max_facts(mgr, tmp_path, 3)
+        await mgr.call_tool("srv", "tool", {"b": 2})
+
+        assert mgr._extractor is not old, "the extractor was not rebuilt"
+        assert old._gate.closed is True, "superseded extractor still admits callers"
+        assert old._client is None, "superseded extractor leaked its httpx client"
+
+    async def test_extractor_rebuild_failure_leaves_old_usable(
+        self, extract_mgr, tmp_path, monkeypatch
+    ):
+        """A failed rebuild leaves the working instance installed and OPEN.
+
+        Building before touching the slot is what buys this: closing first, or
+        stamping the new cfg before the build succeeds, would park a closed
+        extractor behind the equality fast path and take extraction down until
+        the next config edit. Mirrors
+        ``test_rebuild_selective_failure_leaves_old_usable``.
+        """
+        import memtomem_stm.proxy.manager as manager_mod
+
+        mgr = extract_mgr
+        old = await mgr._get_extractor(cfg_snap=mgr._config)
+        assert mgr._extractor_cfg == old._cfg
+
+        _reload_with_max_facts(mgr, tmp_path, 3)
+
+        def boom(_cfg):
+            raise RuntimeError("extractor build failed")
+
+        monkeypatch.setattr(manager_mod, "FactExtractor", boom)
+        with pytest.raises(RuntimeError, match="extractor build failed"):
+            await mgr._get_extractor(cfg_snap=mgr._config)
+
+        assert mgr._extractor is old, "a failed rebuild dropped the working extractor"
+        assert mgr._extractor_cfg == old._cfg, "a failed rebuild restamped the cache"
+        assert old._gate.closed is False, "old instance closed before a replacement existed"
+        assert old._client is not None
+
+        monkeypatch.undo()
+        new = await mgr._get_extractor(cfg_snap=mgr._config)
+        assert new is not old, "the retry did not rebuild"
+        assert new._cfg.max_facts == 3
+
+    async def test_rebuild_drains_the_in_flight_extractor(self, extract_mgr, tmp_path):
+        """The superseded close waits out live callers, and does it AFTER
+        publishing the replacement.
+
+        Two properties in one: the transport is not torn down under a
+        registered call (#867's drain), and the drain does not sit inside
+        ``_extractor_lock`` — the new instance is visible while it runs, so a
+        concurrent request is not queued behind another caller's shutdown.
+        """
+        import asyncio
+
+        mgr = extract_mgr
+        old = await mgr._get_extractor(cfg_snap=mgr._config)
+        token = old._gate.try_enter(30.0)
+        assert token is not None
+
+        _reload_with_max_facts(mgr, tmp_path, 3)
+        rebuild = asyncio.create_task(mgr._get_extractor(cfg_snap=mgr._config))
+        await asyncio.sleep(0.05)
+
+        assert not rebuild.done(), "the rebuild did not wait for the in-flight caller"
+        assert old._client is not None, "transport closed under a registered call"
+        assert mgr._extractor is not old, "the replacement was not published before the drain"
+
+        old._gate.leave(token)
+        new = await asyncio.wait_for(rebuild, timeout=5)
+
+        assert new is mgr._extractor
+        assert old._client is None, "the drained instance was never closed"
 
     async def test_config_edit_lands_on_the_next_request(self, mgr, tmp_path):
         """Snapshotting moves hot-reload to a request boundary; it must not

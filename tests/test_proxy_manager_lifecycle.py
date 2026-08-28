@@ -368,13 +368,18 @@ class TestStop:
     async def test_stop_nulls_extractor_so_restart_rebuilds(self):
         """stop() nulls _extractor (like _llm_compressor) — _get_extractor()
         rebuilds on None, so a stop->start cycle gets a fresh httpx client
-        instead of the closed instance whose extract() would AssertionError."""
+        instead of the closed instance whose extract() would AssertionError.
+
+        The #890 cfg stamp is cleared with it: a stamp left behind describes an
+        instance that no longer exists, and the rebuild predicate reads both."""
         mgr = _make_manager(servers={})
         mgr._extractor = AsyncMock()
+        mgr._extractor_cfg = mgr._config.extraction
 
         await mgr.stop()
 
         assert mgr._extractor is None
+        assert mgr._extractor_cfg is None
 
     async def test_stop_closes_connection_stacks(self):
         """stop() closes per-connection stacks and clears _connections."""

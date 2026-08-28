@@ -58,6 +58,7 @@ from memtomem_stm.proxy.config import (
     CompressionStrategy,
     EnvOverlayResult,
     ExposureProfile,
+    ExtractionConfig,
     ExtractionStrategy,
     HybridConfig,
     LLMCompressorConfig,
@@ -667,6 +668,7 @@ class ProxyManager:
         # resolving under the lock and writing outside it is not equivalent.
         self._selective_publish_mu = threading.Lock()
         self._extractor: FactExtractor | None = None
+        self._extractor_cfg: ExtractionConfig | None = None
         self._extractor_lock = asyncio.Lock()
         # In-memory counters for both INDEX-pipeline write paths
         # (auto_index_response + extract_and_store). Always instantiated for
@@ -2369,7 +2371,10 @@ class ProxyManager:
             # Null it like _llm_compressor above: _get_extractor() rebuilds on
             # None, so a stop->start cycle gets a fresh httpx client instead of
             # the closed instance (whose extract() asserts _client is not None).
+            # The cfg stamp goes with it — left behind it would be a claim about
+            # an instance that no longer exists.
             self._extractor = None
+            self._extractor_cfg = None
         # Close the #494 consult disk cache (re-opened lazily on the next start).
         # Always null the handle so a failed close cannot leave a stale closed
         # connection that the next start() would reuse.
@@ -3552,32 +3557,54 @@ class ProxyManager:
         )
 
     async def _get_extractor(self, *, cfg_snap: ProxyConfig) -> FactExtractor:
-        """The lazily-built ``FactExtractor``, never rebuilt when ``extraction``
-        changes (#890).
+        """The cached ``FactExtractor``, rebuilt when ``extraction`` changes.
 
         Split by LIFETIME, the rule this class applies throughout: the lock
         timeout is a decision scoped to THIS acquisition, so it rides the
-        request snapshot; the extractor itself outlives every request, so it is
-        constructed from LIVE config. Whichever generation builds that instance
-        wins until restart, and pinning it to a snapshot captured before the
-        upstream call would freeze the PRE-edit generation whenever a reload
-        lands mid-call — trading one call's internal consistency for a
-        permanently staler singleton. Freshness wins for something that never
-        rebuilds.
+        request snapshot; the extractor outlives every request, so both the
+        rebuild predicate and the construction read LIVE config. Pinning it to
+        a snapshot captured before the upstream call would freeze the PRE-edit
+        generation whenever a reload lands mid-call, trading one call's
+        internal consistency for a staler singleton.
 
-        Rebuilding on change would remove the trade entirely, but it needs the
-        superseded instance to stay usable by callers already holding it — an
-        explicit lease. That is lifecycle work in its own right; #890 carries
-        the analysis.
+        That live read happens INSIDE the lock, which is why this needs none of
+        ``_relevance_scorer_for``'s stale-pin guard: every rebuild decision
+        therefore sees a generation at or after the one the previous rebuild
+        used, so a caller cannot stamp the shared slot backward. Reading live
+        before the lock would reintroduce exactly that race.
+
+        Build before publish, close after releasing: a construction failure
+        leaves the working instance installed, open, and stamped with its own
+        cfg, so the next call retries instead of fast-pathing onto a broken
+        state (#890). The superseded close drains in-flight LLM calls, so it is
+        awaited OUTSIDE the lock — inside, a drain would time out every
+        concurrent ``bounded_lock`` waiter. The task that triggers the rebuild
+        absorbs that one wait; with ``extraction.background=True`` (the
+        default) it is a background task rather than the response path. A
+        caller still holding the old reference keeps working: its gate is
+        closed, so ``extract()`` takes the local heuristic (#867).
         """
+        old: FactExtractor | None = None
         async with bounded_lock(
             self._extractor_lock,
             timeout=cfg_snap.lock_timeout_seconds,
             name="extractor_lock",
         ):
-            if self._extractor is None:
-                self._extractor = FactExtractor(self._config.extraction)
-            return self._extractor
+            # One loader read: the property stats the config file per access,
+            # and the predicate must judge the same generation it builds from.
+            ext_live = self._config.extraction
+            if self._extractor is None or self._extractor_cfg != ext_live:
+                replacement = FactExtractor(ext_live)
+                old = self._extractor
+                self._extractor = replacement
+                self._extractor_cfg = ext_live
+            current = self._extractor
+        if old is not None:
+            try:
+                await old.close()
+            except Exception:
+                logger.debug("Failed to close superseded fact extractor", exc_info=True)
+        return current
 
     async def _extract_and_store(
         self,
@@ -5538,13 +5565,12 @@ class ProxyManager:
         cap or during ``stop()`` — reports ``False`` / ``background_shed``
         instead (#868). Like the index stage, gate and ``_extract_and_store``
         both read the request's ``cfg_snap`` snapshot for ``ext_cfg`` (#871).
-        The ``FactExtractor`` itself is built from LIVE config and never
-        rebuilt (#890), so the two can split in one direction on the call that
-        constructs it — a reload landing mid-call gives the extractor the NEW
-        generation while storage keeps the snapshot — and permanently in the
-        other afterwards, storage moving on while the extractor does not. That
-        is the deliberate trade: one call's split costs one call, a stale
-        singleton costs every later one.
+        The ``FactExtractor`` itself is built from LIVE config (#890), so the
+        two can still split on the call that constructs or rebuilds it — a
+        reload landing mid-call gives the extractor the NEW generation while
+        storage keeps the snapshot. That split now lasts one call rather than
+        until restart: the next ``_get_extractor`` sees the changed block and
+        rebuilds.
         """
         extract_ok: bool | None = None
         extract_error: str | None = None

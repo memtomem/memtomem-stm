@@ -1036,6 +1036,11 @@ class TestExtractAndStore:
             dedup_threshold=0.9,
         )
         mgr._extractor = mock_extractor
+        # Stamp the slot with the cfg the patched ``_config`` below serves:
+        # ``_get_extractor`` rebuilds whenever the stamp and the live block
+        # disagree (#890), and an unstamped slot would discard this mock for a
+        # real heuristic extractor on the first call.
+        mgr._extractor_cfg = ext_cfg
 
         with patch.object(
             type(mgr),

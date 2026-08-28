@@ -341,6 +341,39 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **An edit to `extraction` now reaches the extractor, not just the stage
+  around it** (#890). `ProxyManager` built its `FactExtractor` once and kept
+  that instance for the life of the process. After a hot reload of
+  `stm_proxy.json`, the stage gate and the config the extracted facts were
+  stored under both moved to the new generation, while the extractor itself
+  kept running the old `strategy`, provider, `model`, `max_facts` and input
+  limits. An operator editing `extraction.provider` therefore saw the
+  enable/disable flag take effect and the behavior it names silently not —
+  worse than either extreme, because the config appeared live. The instance now
+  carries the block it was built from and is rebuilt when the two diverge,
+  matching the two sibling caches on the same class that already worked this
+  way (the relevance scorer and the selective compressor).
+
+  The replacement is built before the slot is touched, so a construction
+  failure leaves the working extractor installed, open, and stamped with its
+  own config — the next call retries rather than fast-pathing onto a closed
+  instance. The superseded one is then closed, which drains its in-flight LLM
+  calls before the HTTP transport goes away (#867); that close is awaited after
+  the build lock is released, so a concurrent request sees the replacement
+  immediately instead of queueing behind another caller's shutdown. A caller
+  still holding the old reference keeps working: its gate is closed, so
+  extraction falls back to the local heuristic rather than crossing the
+  provider boundary on a torn-down client.
+
+  **Behavior change**: `extraction` edits take effect without a restart, from
+  the next extraction onward. Two costs come with that. The task that observes
+  the change absorbs the drain of the instance it replaces, bounded by the
+  in-flight calls' own `llm_timeout_seconds` plus a two-second grace; with the
+  default `extraction.background: true` that task is a background one, not the
+  tool-response path. And the rebuild check reads the live config once per
+  extraction rather than only on the first, which is one additional `stat()`
+  on the config file per extracting request.
+
 - **Pending eviction no longer discards a key just handed to a client** (#902,
   issue #901). `SQLitePendingStore.evict_oldest` ranked rows by `created_at`,
   which is a wall-clock reading standing in for the order the operations
