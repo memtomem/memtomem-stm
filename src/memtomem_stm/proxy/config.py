@@ -1723,12 +1723,14 @@ class ExposureConfig(BaseModel):
     resurrected by ranking.
 
     Health signals are evaluated once at proxy startup from the persisted
-    metrics store (``proxy_metrics.db``), so the advertised set is stable
-    for the lifetime of the session — MCP clients are not guaranteed to
-    re-list tools, and a mid-session change would make telemetry lie about
-    what the client saw. A tool hidden for health is re-evaluated at the
-    next startup: once its failures age out of ``health_window_hours`` it
-    is advertised again (startup-grained half-open probing).
+    metrics store (``proxy_metrics.db``), so a tool does not slide in and out
+    of the advertisement as calls fail. A tool hidden for health is
+    re-evaluated at the next startup: once its failures age out of
+    ``health_window_hours`` it is advertised again (startup-grained half-open
+    probing). What the upstream declares is re-read when it changes: a
+    reconnect or a ``tools/list_changed`` re-runs the filter, reconciles what
+    is registered, and — when that actually changed the registry — asks the
+    clients it can reach to re-list (#917).
     """
 
     profile: ExposureProfile = ExposureProfile.STRICT
@@ -1763,9 +1765,13 @@ class ToolgraphConfig(BaseModel):
     over the MCP protocol via :class:`~memtomem_stm.proxy.toolgraph_provider.ToolgraphConsultAdapter`
     (stdio transport), mirroring the surfacing LTM-consult pattern.
 
-    Default-off: when ``enabled`` is ``True`` the consult runs once at
-    proxy startup so the advertised tool set stays session-stable, exactly
-    like the health-flag precompute. The verdict feeds
+    Default-off: when ``enabled`` is ``True`` the stdio consult runs once at
+    proxy startup, exactly like the health-flag precompute. If an upstream
+    later replaces its catalogue the advertisement is rebuilt (#917) but the
+    consult is not re-run, so a tool the graph never saw gets a
+    ``toolgraph_unconsulted`` reason instead of defaulting to allowed —
+    profile-gated like the rest of the family, so ``strict`` withholds it,
+    ``review`` demotes it and ``explore`` ignores it (#918). The verdict feeds
     ``tool_eligibility.filter_tools`` via per-candidate ``toolgraph_*`` reject
     codes (profile-gated, like the native signal rules) or a whole-call
     fail-closed withhold, and pins ``graph_generation`` into selection

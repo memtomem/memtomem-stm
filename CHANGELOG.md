@@ -375,6 +375,59 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **A mid-session upstream catalogue change now re-decides exposure instead of
+  being ignored** (#917). The exposure filter's verdict was registered exactly
+  once, at startup, while an upstream can replace its catalogue at any time —
+  on a reconnect, or by sending `tools/list_changed`. Both swapped
+  `conn.tools` and stopped there, so a tool that only *then* earned a
+  rejection kept the advertisement it already had, and one that became
+  eligible never got registered. The gap was general to every rule in the
+  filter, and worst for `task_required` (#892), where the client is left
+  holding a tool it can see and can never successfully call. Health said as
+  much and nobody could act on it: `stm_proxy_health` counted a live
+  `tools` against an `advertised_tools` frozen at startup, and the two
+  silently diverged.
+
+  **Behavior change**: a catalogue change now re-runs the filter and
+  reconciles the registration — withdrawing tools that lost eligibility,
+  registering ones that gained it, and re-registering a survivor whose
+  advertised metadata moved so the registry cannot describe a different tool
+  than ranking and telemetry do. Clients are told to re-list (a
+  `notifications/tools/list_changed` on the subscription bus, the seam that
+  works from the background task a catalogue change arrives on), since
+  re-advertising to a client that never re-lists would be half a fix.
+  Ownership from #891/#908 is unchanged and is the constraint the reconcile
+  respects: only names this lifespan actually claimed are removed, every claim
+  goes back through the same probe, and a name an embedding host owns keeps
+  being declined rather than stolen. Teardown still removes exactly what is
+  owned — that set is simply no longer frozen at startup.
+
+  The manager still registers nothing itself; it announces, and the lifespan
+  that owns the registry reacts (`ProxyManager.set_advertisement_listener`). A
+  library caller that never sets a listener keeps the previous behavior. A
+  failed re-advertisement is contained and logged: the cost is a stale tool
+  list, where an escaping error would leave the reconnect or refresh that
+  triggered it half-applied.
+
+  Two limits worth stating. Only clients that negotiated the 2026-07-28
+  revision and opened a `subscriptions/listen` stream get the notification —
+  `MCPServer.run` exposes no `NotificationOptions`, so on the legacy protocol
+  the capability is not advertised and such a client keeps its list until it
+  re-lists; what it can no longer do is call a tool the reconcile actually
+  removed, because the registry is already correct. (A removal the SDK refuses
+  is the one exception — the tool stays installed and stays owned, so teardown
+  still removes it, rather than being silently disowned.) And with the `toolgraph` policy gateway on its
+  default `stdio` source, the consult still runs once at startup, so a tool an
+  upstream adds afterwards has no graph verdict: rather than let
+  re-advertisement expose it as though the graph had approved it, it gets a new
+  `toolgraph_unconsulted` reject reason, which rides the same profile ladder as
+  every other `toolgraph_*` code — `strict` withholds it, `review` advertises
+  it with a risk penalty, `explore` ignores it (#918 tracks re-consulting
+  instead). Bundle mode rebinds its decisions against the live
+  catalogue on every refresh, so it has no unconsulted state of its own — and
+  a live switch from `stdio` to `bundle` retires the old coverage with the
+  rest of that source's verdict.
+
 - **Tools that only run as async tasks are withheld instead of advertised
   unusable** (#892). MCP revision 2025-11-25 added `Tool.execution`
   (`taskSupport: "forbidden" | "optional" | "required"`), which the pinned SDK

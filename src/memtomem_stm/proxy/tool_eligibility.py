@@ -73,6 +73,12 @@ then the remaining rules apply per tool in this order, first match wins:
     once at startup and maps upstream reasons to codes). Signal rule, ranked
     above ``unhealthy`` but below ``sensitive_metadata``.
 
+    ``toolgraph_unconsulted`` is the same family but the absence of a verdict
+    rather than one: the stdio consult runs once per session, so a candidate
+    that appeared afterwards (an upstream added a tool and #917 rebuilt the
+    advertisement) was never put to the graph, and must not read the same as
+    one it approved (#918).
+
 A whole-call ``toolgraph_*`` outcome (``toolgraph_unreachable`` /
 ``toolgraph_agent_not_found`` / ``toolgraph_protocol_error``) is a SEPARATE
 mechanism: when the consult itself fails under a ``closed`` knob, the manager
@@ -96,27 +102,29 @@ Three invariants this module exists to uphold:
   withholds every multi-occurrence name outright, so no name can be both
   advertised and recorded as withheld (and no advertised metadata can
   diverge from the callable entity behind the name).
-- **The advertised set is stable for the session.** Health flags are
-  computed once at proxy startup (``compute_health_flags``) from the
-  persisted metrics store, not per call: MCP clients are not guaranteed to
-  re-list tools, and a mid-session eligibility change would make selection
-  telemetry lie about the candidate set the client actually saw. A tool
-  hidden for health gets re-evaluated at the next startup; once its
+- **STM's own signals are stable for the session; the upstream catalogue is
+  not.** Health flags are computed once at proxy startup
+  (``compute_health_flags``) from the persisted metrics store, not per call,
+  so a tool does not slide in and out of the advertisement as calls fail. A
+  tool hidden for health gets re-evaluated at the next startup; once its
   failures age out of the window it is advertised again (startup-grained
-  half-open probing — recovery is possible because hiding stops new
-  failures from accruing, and the window forgets old ones).
+  half-open probing — recovery is possible because hiding stops new failures
+  from accruing, and the window forgets old ones).
 
-  Session stability cuts the other way too, and the bundled server registers
-  the verdict once at startup: an upstream that replaces its catalogue
-  mid-session (a reconnect, or ``tools/list_changed``) swaps ``conn.tools``
-  without re-running this filter or re-registering anything, so a tool that
-  only NOW earns a rejection keeps whatever advertisement it already had.
-  That is general to every rule here, not specific to any one of them, and
-  it is the accepted cost of an advertised set the client can rely on. The
-  consequence does differ by rule: a tool that drifts into ``task_required``
-  stays advertised AND fails every call, which is the very shape #892 is
-  about. Closing that needs a re-advertisement mechanism this module does
-  not own — tracked in #917, deliberately not patched per-rule here.
+  What the upstream declares is a different matter, and until #917 it was
+  treated the same way: the bundled server registered this verdict once at
+  startup, while an upstream can replace its catalogue at any time (a
+  reconnect, or ``tools/list_changed``). A tool that only THEN earned a
+  rejection kept whatever advertisement it already had — general to every
+  rule here, and worst for ``task_required``, where the client is left
+  holding a tool it can see and can never successfully call. So a catalogue
+  change now re-runs this filter and reconciles the registration
+  (``ProxyManager.set_advertisement_listener`` → the lifespan's
+  re-advertisement in ``server.py``, which asks the clients it can reach to
+  re-list whenever that changed the registry).
+  The verdict is still a pure function of its inputs; what changed is that
+  the inputs are re-read when the upstream moves them, rather than only at
+  startup.
 
 Reject reasons flow into the selection log's ``reject_reasons`` field
 (#467) via ``ProxyManager``; they are reason *codes* only — no tool
@@ -186,6 +194,13 @@ REASON_TOOLGRAPH_TOOL_NOT_FOUND = "toolgraph_tool_not_found"
 # recognize still results in a withhold (never a silent advertise of a tool
 # the graph wanted blocked), just under a generic code.
 REASON_TOOLGRAPH_REJECTED = "toolgraph_rejected"
+# Not a verdict but the absence of one: the stdio consult runs once per session
+# and this candidate appeared afterwards (an upstream added a tool, and #917
+# re-advertised), so the graph was never asked about it — which must not read
+# the same as "consulted and allowed" to a policy gateway. A signal rule like
+# the rest of the family: ``strict`` withholds, ``review`` demotes, ``explore``
+# ignores (#918).
+REASON_TOOLGRAPH_UNCONSULTED = "toolgraph_unconsulted"
 
 # WHOLE-CALL — the consult itself failed (or aborted) and the operator's
 # ``on_*`` knob resolved to ``closed``. These are profile-INDEPENDENT and

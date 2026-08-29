@@ -3407,6 +3407,316 @@ class TestLifespanTeardownSymmetry:
             tools_dict.clear()
             tools_dict.update(snapshot)
 
+    async def _readvertise(self, mock_pm_instance):
+        """Run the listener the lifespan handed the manager (#917)."""
+        listener = mock_pm_instance.set_advertisement_listener.call_args[0][0]
+        await listener()
+
+    async def test_catalogue_change_adds_newly_eligible_and_drops_withheld(self):
+        """#917: the verdict used to be registered once. An upstream that
+        replaces its catalogue mid-session (reconnect, ``tools/list_changed``)
+        left a tool the filter would now reject advertised and callable, and a
+        newly eligible one absent. Re-advertising reconciles both directions,
+        and re-narrows the snapshot ranking and telemetry read — unconditionally,
+        because the fresh ``get_proxy_tools()`` pass rebuilt it from scratch."""
+        from memtomem_stm.server import app_lifespan, mcp
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.side_effect = [
+            self._infos("fake__alpha", "fake__beta"),
+            self._infos("fake__beta", "fake__gamma"),
+        ]
+
+        tools_dict = mcp._tool_manager._tools
+        snapshot = dict(tools_dict)
+        try:
+            with (
+                patch("memtomem_stm.server.STMConfig") as MockConfig,
+                patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+            ):
+                self._mock_config(MockConfig)
+                async with app_lifespan(mcp) as _ctx:
+                    assert {"fake__alpha", "fake__beta"} <= set(tools_dict)
+
+                    await self._readvertise(mock_pm_instance)
+
+                    assert "fake__alpha" not in tools_dict, "withheld tool stayed callable"
+                    assert {"fake__beta", "fake__gamma"} <= set(tools_dict)
+                    assert mock_pm_instance.retain_registered_advertisement.call_args[0][0] == [
+                        "fake__beta",
+                        "fake__gamma",
+                    ]
+        finally:
+            tools_dict.clear()
+            tools_dict.update(snapshot)
+
+    async def test_readvertisement_notifies_clients_only_when_something_moved(self):
+        """A re-advertisement the client is never told about is half a fix —
+        clients are not required to poll ``tools/list``. The converse matters
+        as much: a refresh that changed nothing must not wake every client."""
+        from memtomem_stm.server import app_lifespan, mcp
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.side_effect = [
+            self._infos("fake__alpha"),
+            self._infos("fake__alpha"),
+            self._infos("fake__beta"),
+        ]
+
+        tools_dict = mcp._tool_manager._tools
+        snapshot = dict(tools_dict)
+        published: list[object] = []
+        # Subscribed on the REAL bus, the same seam ``subscriptions/listen``
+        # uses to feed a client stream — patching ``publish`` would only prove
+        # the helper called the method the test chose to patch.
+        unsubscribe = mcp._subscriptions.subscribe(published.append)
+        try:
+            with (
+                patch("memtomem_stm.server.STMConfig") as MockConfig,
+                patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+            ):
+                self._mock_config(MockConfig)
+                async with app_lifespan(mcp) as _ctx:
+                    await self._readvertise(mock_pm_instance)
+                    assert published == [], "an unchanged advertisement woke every client"
+
+                    await self._readvertise(mock_pm_instance)
+                    assert len(published) == 1
+                    from mcp.server.subscriptions import ToolsListChanged
+
+                    assert isinstance(published[0], ToolsListChanged)
+        finally:
+            unsubscribe()
+            tools_dict.clear()
+            tools_dict.update(snapshot)
+
+    async def test_readvertisement_leaves_a_host_owned_name_alone(self):
+        """Ownership is the constraint (#891/#908): a prefixed name an
+        embedding host registered was declined at startup, so it is not ours to
+        remove when the tool behind it goes away upstream — nor to claim."""
+        from memtomem_stm.server import app_lifespan, mcp
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.side_effect = [
+            self._infos("fake__alpha", "fake__beta"),
+            self._infos("fake__beta"),
+        ]
+
+        tools_dict = mcp._tool_manager._tools
+        snapshot = dict(tools_dict)
+        removed: list[str] = []
+        real_remove = type(mcp).remove_tool
+
+        def _remove(self_, name: str) -> None:
+            removed.append(name)
+            real_remove(self_, name)
+
+        try:
+            # The host owns the name before the lifespan runs, so registration
+            # declines it and it never enters the owned set.
+            def _host_tool() -> str:
+                return "host"
+
+            mcp.add_tool(_host_tool, name="fake__alpha")
+            host_entry = tools_dict["fake__alpha"]
+
+            with (
+                patch("memtomem_stm.server.STMConfig") as MockConfig,
+                patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+                patch.object(type(mcp), "remove_tool", _remove),
+            ):
+                self._mock_config(MockConfig)
+                async with app_lifespan(mcp) as _ctx:
+                    await self._readvertise(mock_pm_instance)
+
+                    assert "fake__alpha" not in removed, "re-advertising stole a host's name"
+                    assert tools_dict["fake__alpha"] is host_entry
+        finally:
+            tools_dict.clear()
+            tools_dict.update(snapshot)
+
+    async def test_teardown_after_readvertisement_removes_what_is_owned_now(self):
+        """The frozen-set rule from #891 still holds, but the set is no longer
+        frozen at startup — it tracks what re-advertisement took and gave back.
+        Teardown must remove the tool added mid-session and must not attempt
+        the one already removed (``remove_tool`` raises on an unknown name)."""
+        from memtomem_stm.server import app_lifespan, mcp
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.side_effect = [
+            self._infos("fake__alpha", "fake__beta"),
+            self._infos("fake__beta", "fake__gamma"),
+        ]
+
+        tools_dict = mcp._tool_manager._tools
+        snapshot = dict(tools_dict)
+        removed: list[str] = []
+        real_remove = type(mcp).remove_tool
+
+        def _remove(self_, name: str) -> None:
+            removed.append(name)
+            real_remove(self_, name)
+
+        try:
+            with (
+                patch("memtomem_stm.server.STMConfig") as MockConfig,
+                patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+                patch.object(type(mcp), "remove_tool", _remove),
+            ):
+                self._mock_config(MockConfig)
+                async with app_lifespan(mcp) as _ctx:
+                    await self._readvertise(mock_pm_instance)
+
+            assert removed.count("fake__alpha") == 1, "removed at re-advertisement, then again"
+            assert sorted(removed) == ["fake__alpha", "fake__beta", "fake__gamma"]
+            assert tools_dict == snapshot
+        finally:
+            tools_dict.clear()
+            tools_dict.update(snapshot)
+
+    async def test_a_removal_that_fails_keeps_the_name_owned(self):
+        """Ownership follows the registry, not the attempt. If ``remove_tool``
+        raises with the tool still installed (an embedding subclass, SDK
+        drift), dropping the ownership entry strands it: the re-registration
+        probe sees the name occupied and declines, and teardown no longer knows
+        it is ours. The stock SDK only raises for an already-absent name, which
+        is the other branch — and that one must still release ownership."""
+        from memtomem_stm.server import app_lifespan, mcp
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.side_effect = [
+            self._infos("fake__alpha", "fake__beta"),
+            self._infos("fake__beta"),
+        ]
+
+        tools_dict = mcp._tool_manager._tools
+        snapshot = dict(tools_dict)
+        removed: list[str] = []
+        real_remove = type(mcp).remove_tool
+
+        def _remove(self_, name: str) -> None:
+            removed.append(name)
+            if name == "fake__alpha" and len(removed) == 1:
+                # Fails without removing anything — the shape the guard is for.
+                raise RuntimeError("subclass refused the removal")
+            real_remove(self_, name)
+
+        try:
+            with (
+                patch("memtomem_stm.server.STMConfig") as MockConfig,
+                patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+                patch.object(type(mcp), "remove_tool", _remove),
+            ):
+                self._mock_config(MockConfig)
+                async with app_lifespan(mcp) as _ctx:
+                    await self._readvertise(mock_pm_instance)
+
+                    assert "fake__alpha" in tools_dict, "test premise: removal did not happen"
+                    assert mock_pm_instance.retain_registered_advertisement.call_args[0][0] == [
+                        "fake__alpha",
+                        "fake__beta",
+                    ], "a name still installed was dropped from the owned set"
+
+            assert removed.count("fake__alpha") == 2, (
+                "teardown must retry the name re-advertisement failed to remove"
+            )
+            assert tools_dict == snapshot
+        finally:
+            tools_dict.clear()
+            tools_dict.update(snapshot)
+
+    async def test_a_name_declined_at_startup_is_claimed_once_the_host_frees_it(self):
+        """The other half of ownership: a declined name is not ours, but it is
+        not permanently forfeited either. Once the host's tool is gone, the
+        next re-advertisement claims it through the same probe."""
+        from memtomem_stm.server import app_lifespan, mcp
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.side_effect = [
+            self._infos("fake__alpha"),
+            self._infos("fake__alpha"),
+        ]
+
+        tools_dict = mcp._tool_manager._tools
+        snapshot = dict(tools_dict)
+        try:
+
+            def _host_tool() -> str:
+                return "host"
+
+            mcp.add_tool(_host_tool, name="fake__alpha")
+
+            with (
+                patch("memtomem_stm.server.STMConfig") as MockConfig,
+                patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+            ):
+                self._mock_config(MockConfig)
+                async with app_lifespan(mcp) as _ctx:
+                    # Declined at startup: the name is the host's.
+                    assert mock_pm_instance.retain_registered_advertisement.call_args[0][0] == []
+
+                    type(mcp).remove_tool(mcp, "fake__alpha")  # the host withdraws it
+                    await self._readvertise(mock_pm_instance)
+
+                    assert mock_pm_instance.retain_registered_advertisement.call_args[0][0] == [
+                        "fake__alpha"
+                    ]
+                    assert "fake__alpha" in tools_dict
+        finally:
+            tools_dict.clear()
+            tools_dict.update(snapshot)
+
+    async def test_readvertisement_refreshes_a_tool_whose_metadata_moved(self):
+        """A surviving tool is not automatically unchanged. ``get_proxy_tools``
+        has already rewritten the snapshot the ranker scores and telemetry
+        records, so a registry still describing the old description would make
+        the two disagree about the same name."""
+        from memtomem_stm.server import app_lifespan, mcp
+
+        moved = self._infos("fake__alpha")[0]
+        moved = type(moved)(
+            prefixed_name="fake__alpha",
+            description="a different description",
+            input_schema=moved.input_schema,
+            server=moved.server,
+            original_name=moved.original_name,
+        )
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.side_effect = [self._infos("fake__alpha"), [moved]]
+
+        tools_dict = mcp._tool_manager._tools
+        snapshot = dict(tools_dict)
+        try:
+            with (
+                patch("memtomem_stm.server.STMConfig") as MockConfig,
+                patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+            ):
+                self._mock_config(MockConfig)
+                async with app_lifespan(mcp) as _ctx:
+                    before = tools_dict["fake__alpha"].description
+
+                    await self._readvertise(mock_pm_instance)
+
+                    assert tools_dict["fake__alpha"].description != before
+                    assert "a different description" in tools_dict["fake__alpha"].description
+        finally:
+            tools_dict.clear()
+            tools_dict.update(snapshot)
+
     async def test_stop_runs_when_a_second_advertisement_pass_would_raise(self):
         """The teardown ``get_proxy_tools()`` call was the one statement in the
         cleanup block outside a guard, so anything it raised skipped

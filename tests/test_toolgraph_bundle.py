@@ -169,6 +169,33 @@ def test_scale_zero_records_no_bundle_penalty(tmp_path: Path):
     assert manager._toolgraph_risk_penalties == {("srv", live_tool.name): 0.8}
 
 
+def test_switching_from_stdio_to_bundle_drops_the_stdio_coverage(tmp_path: Path):
+    """#918 round 3: a live source switch must retire the OLD source's coverage.
+
+    Bundle decisions are rebound against the live catalog on every refresh, so
+    a bundle covers whatever exists now and "unconsulted" is not a state it can
+    produce. Leaving a previous stdio consult's coverage in place would make
+    the bundle's own approvals unreachable: a tool the bundle explicitly allows
+    but the retired stdio consult never saw would be withheld under strict as
+    ``toolgraph_unconsulted``, with no verdict of the bundle's disagreeing.
+    """
+    manager, bundle_path, live_tool = _manager(tmp_path)
+    # A previous stdio consult, covering only a tool that no longer matters.
+    manager._toolgraph_state_owner = "stdio"
+    manager._toolgraph_consulted_keys = frozenset({("srv", "something-else")})
+
+    _write_bundle(bundle_path, _bundle(live_tool))
+    manager._refresh_toolgraph_bundle(startup=True)
+
+    assert manager._toolgraph_state_owner == "bundle"
+    assert manager._toolgraph_consulted_keys is None
+    advertised = [i.prefixed_name for i in manager.get_proxy_tools()]
+    assert advertised == [f"srv__{live_tool.name}"], (
+        "a bundle-approved tool was withheld by the retired stdio consult's coverage"
+    )
+    assert manager._advertised_reject_reasons == {}
+
+
 def test_parser_accepts_additive_fields_and_pins_exact_bytes():
     doc = _bundle(_tool())
     doc["future"] = {"safe": True}
