@@ -2960,60 +2960,54 @@ class TestAdvertiseObservabilityFlagEndToEnd:
 # ── client-activity instrumentation for the #914 backstop ─────────────────
 
 
-async def _async_none(sink):
-    sink.append(1)
-
-
 @pytest.mark.real_client_activity
 class TestClientActivityInstrumentation:
     """The parent-liveness backstop only refrains from shutting a live session
-    down because it can see the client still speaking. That evidence comes from
-    wrapping the low-level server's handler registries, so what those look like
-    is load-bearing and pinned here against the real SDK."""
+    down because it can see the client still speaking, so what counts as
+    "speaking" is load-bearing and pinned here against the real SDK."""
 
-    async def test_every_inbound_message_stamps_the_activity_clock(self):
-        """Against a real ``MCPServer``: the wrap has to survive the SDK's own
-        dispatch, which reads ``HandlerEntry.handler`` and calls it with the
-        request context and typed params."""
+    async def test_the_stamp_sits_on_the_seam_that_sees_every_frame(self):
+        """Against a real ``MCPServer``. Registered handlers are the wrong set:
+        ``initialize`` never reaches the request registry (the SDK reserves it
+        and says so by refusing to register one), and a notification with no
+        handler is dropped before one. Both are a client demonstrably still
+        there. ``Server.middleware`` is the documented seam that both
+        ``_on_request`` and ``_on_notify`` compose above validation and lookup,
+        which is why the stamp lives there."""
+        import mcp.types as types
         from mcp.server.mcpserver import MCPServer
 
         from memtomem_stm.server import _instrument_client_activity
 
         server = MCPServer("pin")
-
-        @server.tool()
-        def echo(value: str) -> str:
-            return value
-
         low = server._lowlevel_server
-        before = {m: e.handler for m, e in low._request_handlers.items()}
-        assert "tools/call" in before and "ping" in before, sorted(before)
+        # The reason this cannot be done handler-side, stated by the SDK itself.
+        with pytest.raises(ValueError, match="cannot be overridden"):
+            low.add_request_handler("initialize", types.RequestParams, lambda _c, _p: None)
 
-        notified = []
-        low.add_notification_handler(
-            "notifications/pinned",
-            ping_params := low.get_request_handler("ping").params_type,
-            lambda _ctx, _params: _async_none(notified),
-        )
-        assert ping_params is not None
-
+        before = list(low.middleware)
         stamps = []
         assert _instrument_client_activity(server, lambda: stamps.append(1)) is True
+        assert len(low.middleware) == len(before) + 1
+        assert low.middleware[: len(before)] == before  # appended, innermost
 
-        # Every registry entry is now a different callable, and calling one
-        # stamps and still returns what the original returned.
-        for method, entry in low._request_handlers.items():
-            assert entry.handler is not before[method], method
-        ping = low.get_request_handler("ping")
-        result = await ping.handler(SimpleNamespace(), ping.params_type())
+        # It stamps, delegates, and returns what the chain returned.
+        sentinel = object()
+
+        async def _call_next(ctx):
+            return sentinel
+
+        assert await low.middleware[-1](SimpleNamespace(method="ping"), _call_next) is sentinel
         assert stamps == [1]
-        assert result is not None
-        # Notifications are liveness too. Nothing registers one today, so this
-        # covers the registry rather than a live handler.
-        assert notified == [] and low._notification_handlers
-        entry = low._notification_handlers["notifications/pinned"]
-        await entry.handler(SimpleNamespace(), entry.params_type())
-        assert notified == [1] and stamps == [1, 1]
+
+        # A failing frame still arrived, so it is still evidence of a live
+        # client: the stamp happens before delegation and the error propagates.
+        async def _boom(ctx):
+            raise RuntimeError("method not found")
+
+        with pytest.raises(RuntimeError):
+            await low.middleware[-1](SimpleNamespace(method="nope"), _boom)
+        assert stamps == [1, 1]
 
     async def test_a_moved_sdk_surface_degrades_to_a_warning(self, caplog):
         """A wrong warning here costs the operator a weaker veto; raising would

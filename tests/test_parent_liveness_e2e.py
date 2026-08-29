@@ -13,6 +13,7 @@ costing a live session.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -114,6 +115,23 @@ def _ping(proc: subprocess.Popen[bytes], request_id: int) -> None:
     assert b'"result"' in (line := _read_line_or_fail(proc)), line
 
 
+def _notify(proc: subprocess.Popen[bytes]) -> None:
+    """Send a notification the server registers no handler for.
+
+    The dispatcher drops it before any handler, and it draws no response — so
+    it is exactly the traffic a veto built on registered handlers cannot see,
+    and it is still a client that is demonstrably there.
+    """
+    assert proc.stdin is not None
+    try:
+        proc.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}\n')
+        proc.stdin.flush()
+    except BrokenPipeError:
+        # The server already exited. Not this helper's assertion to make — the
+        # liveness check below says so with the evidence attached.
+        pass
+
+
 def _alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -162,7 +180,8 @@ def _cleanup(proc: subprocess.Popen[bytes], pid: int | None = None) -> None:
         proc.wait(timeout=10.0)
     for stream in (proc.stdin, proc.stdout, proc.stderr):
         if stream is not None:
-            stream.close()
+            with contextlib.suppress(BrokenPipeError):
+                stream.close()
 
 
 def test_a_server_whose_launcher_exits_shuts_itself_down(tmp_path: Path) -> None:
@@ -189,6 +208,36 @@ def test_a_server_whose_launcher_exits_shuts_itself_down(tmp_path: Path) -> None
         # Confirmation poll plus grace, with room for a slow CI box.
         assert elapsed < 10.0
         assert any(b"Parent gone" in line for line in stderr_lines), b"".join(stderr_lines)[-2000:]
+    finally:
+        _cleanup(proc, server_pid)
+
+
+def test_a_reparented_client_that_only_sends_notifications_is_kept(tmp_path: Path) -> None:
+    """The false positive the veto exists to prevent, in its hardest form: the
+    launcher really is gone, so the only thing standing between a live client
+    and a shutdown is being seen. A notification with no registered handler is
+    dropped by the dispatcher and answered with nothing, so a veto that watched
+    handlers would not see it and would end this session."""
+    proc = _start_behind(
+        'exec 3<&0; "$PY" -m memtomem_stm.server <&3 & echo "SERVERPID $!" >&2; wait $!', tmp_path
+    )
+    server_pid = None
+    try:
+        server_pid = _server_pid(proc)
+        _initialize(proc)
+        stderr_lines = _drain_stderr(proc)
+        proc.kill()
+        proc.wait(timeout=10.0)
+
+        # Well past the grace, on notifications alone.
+        deadline = time.monotonic() + _GRACE_SECONDS * 6
+        while time.monotonic() < deadline:
+            _notify(proc)
+            time.sleep(_GRACE_SECONDS / 4)
+        assert _alive(server_pid), b"".join(stderr_lines)[-2000:]
+
+        # And the deferral is only a deferral: silence still ends it.
+        assert _wait_gone(server_pid, _EXIT_BUDGET_SECONDS) is not None
     finally:
         _cleanup(proc, server_pid)
 

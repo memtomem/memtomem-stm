@@ -9,11 +9,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 
 import pytest
 
 from memtomem_stm.utils import parent_liveness
 from memtomem_stm.utils.parent_liveness import ParentLivenessWatcher
+
+# The watcher returns immediately on Windows by design — reparenting semantics
+# differ there and pids are reused — so every assertion here about it doing
+# something is a POSIX assertion. The guard itself is pinned below.
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only backstop")
 
 _POLL = 0.01
 

@@ -10,7 +10,7 @@ import os
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, replace as dataclass_replace
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -830,19 +830,28 @@ def _instrument_client_activity(server: MCPServer, note: Callable[[], None]) -> 
     the pipe cannot tell it: in the leak this guards against, and in the
     wrapper-launcher shape it must not act on, somebody still holds the write
     end. What separates them is that one of them still speaks MCP. This is where
-    that shows up for *all* of it — proxied tools, STM tools, ``tools/list``,
-    ``ping`` — rather than at each handler. The notification registry is covered
-    too; nothing registers one today, so that is only future-proofing.
+    that shows up, and it has to be *every* frame rather than every handled one.
+    A registered handler is not the same set: ``initialize`` is dispatched
+    inline and never reaches the request registry, a notification with no
+    registered handler is dropped before one (this server registers none), and
+    an unknown method is answered ``METHOD_NOT_FOUND`` without a handler. All of
+    those are a client that is demonstrably still there, and a veto that missed
+    them could shut a live session down.
 
-    Wraps the entries in the low-level server's handler registries, the same
-    private surface the proxy already reaches into (``_fastmcp_compat.py``).
-    Returns whether it worked: an SDK that moved these leaves the veto running
-    on the startup timestamp alone, which is a weaker guard against a false
-    positive but not a broken server, so it warns rather than raises.
+    So this registers a ``ServerMiddleware`` — the SDK's documented seam for
+    exactly this, composed by both ``_on_request`` and ``_on_notify`` above
+    validation, lookup and the handshake. It stamps and delegates, and never
+    swallows: a middleware sees a failing request as a raised ``MCPError``, and
+    the frame arriving is the evidence either way.
+
+    Returns whether it worked. The low-level server is reached through a private
+    attribute, the same surface the proxy already uses
+    (``_fastmcp_compat.py``); an SDK that moved it leaves the veto timing from
+    startup instead — a weaker guard against a false positive, but not a broken
+    server, so this warns rather than raises.
     """
     try:
-        low = server._lowlevel_server
-        registries = (low._request_handlers, low._notification_handlers)
+        middleware = server._lowlevel_server.middleware
     except AttributeError:
         logger.warning(
             "Cannot observe client activity — MCPServer internal API changed. The "
@@ -852,16 +861,11 @@ def _instrument_client_activity(server: MCPServer, note: Callable[[], None]) -> 
         )
         return False
 
-    def _wrap(handler: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
-        async def stamped(*args: Any, **kwargs: Any) -> Any:
-            note()
-            return await handler(*args, **kwargs)
+    async def _stamp_activity(ctx: Any, call_next: Callable[[Any], Awaitable[Any]]) -> Any:
+        note()
+        return await call_next(ctx)
 
-        return stamped
-
-    for registry in registries:
-        for method, entry in list(registry.items()):
-            registry[method] = dataclass_replace(entry, handler=_wrap(entry.handler))
+    middleware.append(_stamp_activity)
     return True
 
 
