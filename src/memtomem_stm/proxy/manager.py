@@ -139,6 +139,7 @@ from memtomem_stm.proxy.tool_relevance import (
     penalty_source,
 )
 from memtomem_stm.proxy.tool_metadata import (
+    PROXIED_PREFIX,
     convention_suffix,
     distill_schema,
     truncate_description,
@@ -2744,17 +2745,23 @@ class ProxyManager:
 
                 suffix = self._convention_suffix(effective_compression, effective_hybrid)
 
-                # Resolve description (reduce budget by suffix length)
+                # Resolve description. ``max_description_chars`` caps what the
+                # CLIENT sees, so every fixed cost comes out of the budget
+                # here: the ``[proxied] `` prefix registration prepends later,
+                # and the convention suffix. Truncation owns its own ellipsis.
+                # A suffix that cannot fit is dropped whole rather than cut — a
+                # cut hint is incomplete, and depending on where it lands may
+                # not name its tool at all — and otherwise wins over upstream
+                # text, since it is what tells the client which follow-up tool
+                # to call (#893).
                 desc = t.description or ""
                 if override is not None and override.description_override is not None:
                     desc = override.description_override
-                budget = min(max_desc, global_max_desc)
-                if suffix:
-                    # Reserve room for suffix + possible "..." from truncation
-                    budget = max(budget - len(suffix) - 3, 40)
-                desc = self._truncate_description(desc, budget)
-                if suffix:
-                    desc = desc + suffix
+                budget = min(max_desc, global_max_desc) - len(PROXIED_PREFIX)
+                if suffix and len(suffix) <= budget:
+                    desc = self._truncate_description(desc, budget - len(suffix)) + suffix
+                else:
+                    desc = self._truncate_description(desc, budget)
 
                 # Resolve schema
                 schema = t.input_schema or {"type": "object"}

@@ -37,6 +37,22 @@ _PROXY_ENV_BARE = _PROXY_ENV_PREFIX[:-2]  # the block's own name, one JSON paylo
 _MISSING = object()
 
 
+#: Floor for ``max_description_chars`` at both the global and the per-server
+#: level. ``max_description_chars`` caps the client-visible description, out of
+#: which the ``[proxied] `` prefix (10) and a truncation ellipsis (3) are fixed
+#: costs; the floor leaves ~19 characters for upstream text (#893).
+#:
+#: 32 is a usability choice, not the arithmetic minimum. That minimum is 10:
+#: registration prepends the prefix unconditionally, so a cap below its length
+#: cannot be met at all, while every cap of 10 or more is met exactly. The
+#: floor is set where a surviving description can still say something, and it
+#: does NOT guarantee one — an upstream that supplies no description
+#: contributes no text at any cap, leaving only the prefix and, where it fits,
+#: the convention suffix (#896). Not imported from ``tool_metadata``, which
+#: imports this module.
+MIN_DESCRIPTION_CHARS = 32
+
+
 @dataclass(frozen=True)
 class EnvOverlayResult:
     """The resolved proxy env overlay plus the raw variables that produced it.
@@ -1559,7 +1575,16 @@ class UpstreamServerConfig(BaseModel):
     """
     circuit_reset_seconds: float = Field(default=60.0, gt=0.0)
     """Seconds an open circuit breaker waits before allowing a probe call."""
-    max_description_chars: int = Field(default=200, gt=0)
+    max_description_chars: int = Field(default=200, ge=MIN_DESCRIPTION_CHARS)
+    """Cap on the CLIENT-VISIBLE description, ``[proxied] `` prefix included.
+
+    Composes with the global setting as ``min(server, global)``, not as an
+    override. Read from the connect-time snapshot like the other per-server
+    fields here, so an edit takes effect when this upstream next connects — a
+    restart or a reconnect — not on a config hot-reload, and not on a
+    ``tools/list_changed`` refresh, which replaces the catalogue but not the
+    config it is advertised under (#893).
+    """
     strip_schema_descriptions: bool = False
     origin: UpstreamOrigin | None = None
     """Import provenance (#475) — see :class:`UpstreamOrigin`. CLI-owned
@@ -2122,7 +2147,15 @@ class ProxyConfig(BaseModel):
     Default 0.65 ensures at least 65% of every response survives compression.
     Set to 0 to disable and use fixed budgets only.
     """
-    max_description_chars: int = Field(default=200, gt=0)
+    max_description_chars: int = Field(default=200, ge=MIN_DESCRIPTION_CHARS)
+    """Cap on the CLIENT-VISIBLE description, ``[proxied] `` prefix included.
+
+    The effective budget for an upstream is ``min(server, global)``, so raising
+    only this one does not widen a stricter per-server value. Read live, but
+    applied only where a tool is advertised, so a description already
+    registered keeps the length it was given until the next registration — a
+    restart, or an upstream catalogue change (#893).
+    """
     strip_schema_descriptions: bool = False
     advertise_context_query: bool = False
     """Advertise the proxy-only ``_context_query`` string in every upstream

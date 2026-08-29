@@ -20,6 +20,8 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase, FuncMetadata
 from mcp.types import CallToolResult, TextContent
 
+from memtomem_stm.proxy.tool_metadata import PROXIED_PREFIX
+
 
 def to_call_tool_result(result: str | list | CallToolResult) -> CallToolResult:
     """Normalize a ``ProxyManager.call_tool`` return into a ``CallToolResult``.
@@ -170,7 +172,8 @@ def register_proxy_tool(
     # guards what a client receives if a future SDK grows one.
     add_tool_kwargs: dict[str, Any] = {
         "name": info.prefixed_name,
-        "description": f"[proxied] {info.description}",
+        # The description arrives already budgeted for this prefix (#893).
+        "description": f"{PROXIED_PREFIX}{info.description}",
         "annotations": tagged_annotations,
     }
     if tool_meta is not None:

@@ -6,8 +6,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
+from pydantic import ValidationError
 
 from memtomem_stm.proxy.config import (
+    MIN_DESCRIPTION_CHARS,
     CompressionStrategy,
     HybridConfig,
     ProxyConfig,
@@ -17,6 +20,13 @@ from memtomem_stm.proxy.config import (
 )
 from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
 from memtomem_stm.proxy.metrics import TokenTracker
+from memtomem_stm.proxy.tool_metadata import (
+    PROXIED_PREFIX,
+    convention_suffix,
+    truncate_description,
+)
+
+SELECTIVE_SUFFIX = " | TOC response: use stm_proxy_select_chunks"
 
 
 # ── _truncate_description ────────────────────────────────────────────────
@@ -42,17 +52,45 @@ class TestTruncateDescription:
         text = "one two three four five six seven eight nine ten"
         result = ProxyManager._truncate_description(text, 25)
         assert result.endswith("...")
-        assert len(result) <= 28  # 25 + "..."
+        # The ellipsis is inside the budget, not added on top of it (#893).
+        assert len(result) <= 25
 
     def test_no_space_fallback(self):
         text = "a" * 300
         result = ProxyManager._truncate_description(text, 100)
-        assert result == "a" * 100 + "..."
+        assert result == "a" * 97 + "..."
+        assert len(result) == 100
 
     def test_question_mark_boundary(self):
         text = "What is this? This is a tool. It does things."
         result = ProxyManager._truncate_description(text, 20)
         assert result == "What is this?"
+
+    def test_budget_too_small_for_an_ellipsis(self):
+        """Under four chars there is no room for text plus ``...``, so the
+        result is a hard slice rather than an over-budget ellipsis (#893)."""
+        for max_chars in (0, 1, 3):
+            result = ProxyManager._truncate_description("hello world", max_chars)
+            assert result == "hello world"[:max_chars]
+            assert "..." not in result
+
+    def test_negative_budget_yields_empty(self):
+        """A negative budget must not slice from the end of the string."""
+        assert ProxyManager._truncate_description("hello world", -5) == ""
+
+    def test_never_exceeds_budget(self):
+        """The cap holds for every input shape and every branch (#893)."""
+        texts = [
+            "one two three four five six seven eight nine ten eleven twelve",
+            "a" * 300,
+            "First sentence. Second sentence. Third sentence that runs long.",
+            "What is this? This is a tool. It does things and more things.",
+            "no-spaces-at-all-in-this-quite-long-hyphenated-description-here",
+        ]
+        for max_chars in (4, 10, 25, 100):
+            for text in texts:
+                result = ProxyManager._truncate_description(text, max_chars)
+                assert len(result) <= max_chars, (max_chars, text, result)
 
 
 # ── _distill_schema ──────────────────────────────────────────────────────
@@ -191,7 +229,9 @@ class TestGetProxyToolsDescription:
         tools = [_fake_tool("tool", description=long_desc)]
         mgr = _make_manager_with_tools(tools, max_description_chars=50)
         proxy_tools = mgr.get_proxy_tools()
-        assert len(proxy_tools[0].description) <= 55  # 50 + "..."
+        # The budget the manager hands the client reserves the registration
+        # prefix, so what it stores is the cap minus that prefix (#893).
+        assert len(proxy_tools[0].description) <= 50 - len(PROXIED_PREFIX)
 
     def test_description_override(self):
         tools = [_fake_tool("tool", description="Original long description.")]
@@ -208,7 +248,24 @@ class TestGetProxyToolsDescription:
         mgr = _make_manager_with_tools(tools, server_max_desc=100, max_description_chars=300)
         proxy_tools = mgr.get_proxy_tools()
         # min(server=100, global=300) = 100
-        assert len(proxy_tools[0].description) <= 105
+        assert len(proxy_tools[0].description) <= 100 - len(PROXIED_PREFIX)
+
+    def test_global_max_desc_used_when_it_is_the_stricter(self):
+        """The other direction of the ``min`` composition (#893)."""
+        tools = [_fake_tool("tool", description="x" * 500)]
+        mgr = _make_manager_with_tools(tools, server_max_desc=300, max_description_chars=100)
+        assert len(mgr.get_proxy_tools()[0].description) <= 100 - len(PROXIED_PREFIX)
+
+    def test_raising_only_the_global_does_not_widen_the_server_budget(self):
+        """``min`` composition, not override: the stricter side still binds."""
+        tools = [_fake_tool("tool", description="x" * 500)]
+        tight = _make_manager_with_tools(tools, server_max_desc=100, max_description_chars=100)
+        raised = _make_manager_with_tools(tools, server_max_desc=100, max_description_chars=500)
+        assert (
+            len(raised.get_proxy_tools()[0].description)
+            == len(tight.get_proxy_tools()[0].description)
+            <= 100 - len(PROXIED_PREFIX)
+        )
 
 
 class TestGetProxyToolsSchema:
@@ -366,11 +423,12 @@ class TestConventionSuffix:
             max_description_chars=200,
         )
         desc = mgr.get_proxy_tools()[0].description
-        assert len(desc) <= 200
-        assert desc.endswith(" | TOC response: use stm_proxy_select_chunks")
+        assert len(desc) <= 200 - len(PROXIED_PREFIX)
+        assert desc.endswith(SELECTIVE_SUFFIX)
 
-    def test_suffix_budget_floor(self):
-        """Very tight budget still leaves ≥ 40 chars for upstream description."""
+    def test_tight_budget_keeps_the_suffix_and_starves_the_body(self):
+        """The suffix is functional — it names the follow-up tool — so it wins
+        over upstream text whenever it fits inside the cap (#893)."""
         tools = [_fake_tool("t", description="A" * 100)]
         mgr = _make_manager_with_tools(
             tools,
@@ -378,7 +436,188 @@ class TestConventionSuffix:
             max_description_chars=60,
         )
         desc = mgr.get_proxy_tools()[0].description
-        suffix = " | TOC response: use stm_proxy_select_chunks"
-        # The upstream part should be at least 40 chars (floor)
-        upstream_part = desc[: -len(suffix)]
-        assert len(upstream_part) >= 40
+        assert desc.endswith(SELECTIVE_SUFFIX)
+        assert len(desc) <= 60 - len(PROXIED_PREFIX)
+
+    def test_budget_too_small_for_the_suffix_drops_it_whole(self):
+        """A suffix that cannot fit is dropped, never truncated — a cut hint is
+        incomplete, and may not name its tool at all (#893)."""
+        tools = [_fake_tool("t", description="A" * 100)]
+        mgr = _make_manager_with_tools(
+            tools,
+            compression=CompressionStrategy.SELECTIVE,
+            max_description_chars=32,
+        )
+        desc = mgr.get_proxy_tools()[0].description
+        # Equality, not absence of the tool name: a regression that cut the
+        # suffix mid-string would still hide "stm_proxy_select_chunks" and stay
+        # within budget, so only the exact no-suffix result rules it out.
+        assert desc == truncate_description("A" * 100, 32 - len(PROXIED_PREFIX))
+        assert len(desc) <= 32 - len(PROXIED_PREFIX)
+
+    def test_the_suffix_fits_exactly_at_its_own_boundary(self):
+        """The cap that fits the suffix and nothing else keeps it, and one
+        character less drops it.
+
+        Straddling caps alone would pass a ``<``-for-``<=`` mutation of the fit
+        test; these two pin the boundary itself (#893).
+        """
+        boundary = len(SELECTIVE_SUFFIX) + len(PROXIED_PREFIX)  # 54
+        tools = [_fake_tool("t", description="A" * 100)]
+
+        fits = _make_manager_with_tools(
+            tools, compression=CompressionStrategy.SELECTIVE, max_description_chars=boundary
+        ).get_proxy_tools()[0]
+        assert fits.description == SELECTIVE_SUFFIX  # whole suffix, zero body
+
+        just_short = _make_manager_with_tools(
+            tools, compression=CompressionStrategy.SELECTIVE, max_description_chars=boundary - 1
+        ).get_proxy_tools()[0]
+        assert "stm_proxy_select_chunks" not in just_short.description
+
+    def test_description_override_is_capped_like_upstream_text(self):
+        """An explicit override is budgeted on the same path (#893)."""
+        tools = [_fake_tool("t", description="short")]
+        mgr = _make_manager_with_tools(
+            tools,
+            compression=CompressionStrategy.SELECTIVE,
+            max_description_chars=60,
+            tool_overrides={"t": ToolOverrideConfig(description_override="B" * 300)},
+        )
+        desc = mgr.get_proxy_tools()[0].description
+        # The retained body must come from the override, not from the short
+        # upstream text — otherwise a length-only assertion passes either way.
+        body = desc[: -len(SELECTIVE_SUFFIX)]
+        assert body.startswith("B")
+        assert "short" not in desc
+        assert len(desc) <= 60 - len(PROXIED_PREFIX)
+
+    def test_empty_description_contributes_no_text(self):
+        """An upstream that sets no description contributes none.
+
+        With no suffix that leaves the bare prefix once registration adds it —
+        not a cap violation, but the shape the floor does NOT prevent, pinned
+        so the claim stays honest (polish tracked in #896). Where a suffix
+        fits, that is what the client sees instead of a bare prefix.
+        """
+        bare = _make_manager_with_tools([_fake_tool("t", description="")])
+        assert bare.get_proxy_tools()[0].description == ""
+
+        suffixed = _make_manager_with_tools(
+            [_fake_tool("t", description="")],
+            compression=CompressionStrategy.SELECTIVE,
+        )
+        assert suffixed.get_proxy_tools()[0].description == SELECTIVE_SUFFIX
+
+
+# ── Client-visible cap, end to end ─────────────────────────────────────
+
+
+class TestClientVisibleCap:
+    """``max_description_chars`` is an exact cap on what the client receives.
+
+    The manager's own budgeting is only half the story: registration prepends
+    ``[proxied] `` afterwards, so the invariant is only real when measured on
+    the description a ``ClientSession`` decodes from ``tools/list`` (#893).
+    """
+
+    @pytest.mark.parametrize("cap", [32, 53, 54, 60, 200])
+    @pytest.mark.parametrize(
+        "compression",
+        [
+            CompressionStrategy.NONE,
+            CompressionStrategy.SELECTIVE,
+            CompressionStrategy.PROGRESSIVE,
+            CompressionStrategy.HYBRID,
+        ],
+    )
+    async def test_listed_description_never_exceeds_the_cap(self, cap, compression):
+        from mcp import ClientSession
+        from mcp.client._memory import InMemoryTransport
+        from mcp.server.mcpserver import MCPServer
+
+        from memtomem_stm.proxy._fastmcp_compat import register_proxy_tool
+
+        # Four shapes, so that across the cap range every composition the
+        # advertisement can produce is measured: a sentence-boundary cut, an
+        # unbroken run that spends an ellipsis, an override, and an upstream
+        # that supplies no description at all. Which branch a given shape takes
+        # varies with the cap — that is the point of sweeping caps.
+        tools = [
+            _fake_tool("sentences", description="A long upstream description. " * 20),
+            _fake_tool("unbroken", description="A" * 500),
+            _fake_tool("overridden", description="short upstream text"),
+            _fake_tool("empty", description=""),
+        ]
+        mgr = _make_manager_with_tools(
+            tools,
+            compression=compression,
+            max_description_chars=cap,
+            server_max_desc=cap,
+            tool_overrides={"overridden": ToolOverrideConfig(description_override="B" * 300)},
+        )
+        server = MCPServer("description-cap-test")
+        for info in mgr.get_proxy_tools():
+
+            async def proxy_tool(**kwargs: object) -> str:
+                return "ok"
+
+            register_proxy_tool(server, proxy_tool, info)
+
+        async with InMemoryTransport(server) as streams:
+            async with ClientSession(streams[0], streams[1]) as session:
+                await session.initialize()
+                listed = await session.list_tools()
+
+        assert len(listed.tools) == 4
+        suffix = convention_suffix(compression, None)
+        for tool in listed.tools:
+            assert tool.description is not None
+            assert tool.description.startswith(PROXIED_PREFIX)
+            assert len(tool.description) <= cap, (tool.name, tool.description)
+            if suffix and len(suffix) <= cap - len(PROXIED_PREFIX):
+                assert tool.description.endswith(suffix)
+            elif suffix:
+                # Dropped whole: not one fragment of the suffix may survive,
+                # which absence of "stm_proxy_" alone would not catch. Only the
+                # one-character fragment is excluded — it is a bare space, and
+                # a prefix-only description legitimately ends with one.
+                fragments = [suffix[:n] for n in range(2, len(suffix) + 1)]
+                assert not any(tool.description.endswith(f) for f in fragments)
+            if tool.name.endswith("overridden"):
+                # The override, not the short upstream text, supplied the body.
+                assert "short upstream text" not in tool.description
+
+
+# ── Config validation ──────────────────────────────────────────────────
+
+
+class TestMaxDescriptionCharsValidation:
+    """The cap must leave room for the fixed prefix plus real text (#893)."""
+
+    def test_global_rejects_a_budget_below_the_floor(self):
+        with pytest.raises(ValidationError):
+            ProxyConfig(
+                config_path=Path("/tmp/proxy.json"),
+                max_description_chars=MIN_DESCRIPTION_CHARS - 1,
+            )
+
+    def test_server_rejects_a_budget_below_the_floor(self):
+        with pytest.raises(ValidationError):
+            UpstreamServerConfig(prefix="test", max_description_chars=MIN_DESCRIPTION_CHARS - 1)
+
+    def test_floor_itself_is_accepted(self):
+        server = UpstreamServerConfig(prefix="test", max_description_chars=MIN_DESCRIPTION_CHARS)
+        proxy = ProxyConfig(
+            config_path=Path("/tmp/proxy.json"), max_description_chars=MIN_DESCRIPTION_CHARS
+        )
+        # Assert the stored value, not the model's truthiness: a constructed
+        # pydantic model is always truthy, so ``assert Model(...)`` would pass
+        # even against a field that silently coerced the value away.
+        assert server.max_description_chars == MIN_DESCRIPTION_CHARS
+        assert proxy.max_description_chars == MIN_DESCRIPTION_CHARS
+
+    def test_the_floor_leaves_room_for_the_prefix_and_an_ellipsis(self):
+        """The floor is a usability choice, but it must at least clear the
+        costs the budget charges before any upstream text survives."""
+        assert MIN_DESCRIPTION_CHARS > len(PROXIED_PREFIX) + len("...")
