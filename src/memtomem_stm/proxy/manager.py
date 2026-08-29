@@ -15,7 +15,7 @@ import uuid
 from collections import Counter
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
-from collections.abc import Collection, Coroutine
+from collections.abc import Awaitable, Callable, Collection, Coroutine
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -99,6 +99,7 @@ from memtomem_stm.proxy.tool_eligibility import (
     REASON_TOOLGRAPH_AGENT_NOT_FOUND,
     REASON_TOOLGRAPH_DRIFTED,
     REASON_TOOLGRAPH_PROTOCOL_ERROR,
+    REASON_TOOLGRAPH_UNCONSULTED,
     REASON_TOOLGRAPH_UNMAPPED,
     REASON_TOOLGRAPH_UNREACHABLE,
     ExposureCandidate,
@@ -579,6 +580,14 @@ class ProxyManager:
         self._advertised_tools: list[str] = []
         self._advertised_infos: list[ProxyToolInfo] = []
         self._advertised_reject_reasons: dict[str, str] = {}
+        # Called after an upstream replaces its tool catalogue mid-session so
+        # the owner of the downstream registry can re-derive the verdict and
+        # reconcile what it registered (#917). The manager deliberately knows
+        # nothing about the MCP server object — registration lives in
+        # ``server.py`` — so this is the whole seam. ``None`` (a library caller
+        # that never sets it, or the CLI paths) keeps the pre-#917 behavior:
+        # the catalogue moves, the advertisement does not.
+        self._advertisement_listener: Callable[[], Awaitable[None]] | None = None
         # Composed ranking demotions for the advertised set (#466), keyed by
         # prefixed name: the #465 review demotion stacked with the #493 graph
         # risk penalty (``compose_risk_penalty``). ``_sources`` records each
@@ -590,15 +599,17 @@ class ProxyManager:
         # Recorded into each ranked candidate; never scored.
         self._advertised_graph_facts: dict[str, dict[str, Any]] = {}
         # Health flags for the #465 filter, computed ONCE per start() from
-        # the persisted metrics store and held for the session — exposure
-        # must not drift between the startup advertisement (what the client
-        # registered) and later get_proxy_tools() calls, or telemetry would
+        # the persisted metrics store and held for the session — a tool must
+        # not slide in and out of the advertisement as calls fail (what the
+        # upstream declares IS re-read when it changes, #917), or telemetry
+        # would
         # lie about the candidate set the client saw.
         self._unhealthy_tools: frozenset[tuple[str, str]] = frozenset()
         # #465 optional external tool-graph eligibility provider. Consulted
-        # ONCE per start() (beside the health-flag precompute) so the
-        # advertised set stays session-stable; the snapshots below feed every
-        # get_proxy_tools() pass. ``_toolgraph_external_rejects`` are
+        # ONCE per start(), beside the health-flag precompute; the snapshots
+        # below feed every get_proxy_tools() pass, including one a catalogue
+        # change triggers (#917) — which is why the consult also records what
+        # it covered, so a tool it never saw is not read as approved (#918). ``_toolgraph_external_rejects`` are
         # per-candidate verdicts (profile-gated in filter_tools);
         # ``_toolgraph_withhold_all`` is the whole-call fail-closed code (a
         # ``closed`` knob fired); ``_graph_generation`` pins selection
@@ -607,6 +618,11 @@ class ProxyManager:
         # SKIPPED — surfaced loudly so a one-time ``open`` cannot silently
         # become a permanent enforcement blind spot.
         self._toolgraph_external_rejects: dict[tuple[str, str], str] = {}
+        # ``(server, tool)`` keys the stdio consult covered, or ``None`` when no
+        # stdio consult has run (disabled, bundle source, or a failure that took
+        # the whole-call path). ``None`` means "do not judge coverage"; a set
+        # means anything outside it is unconsulted (#918).
+        self._toolgraph_consulted_keys: frozenset[tuple[str, str]] | None = None
         # #493 per-candidate graph ``risk_score`` mapped to a relevance
         # ``risk_penalty`` (scaled by ``risk_penalty_scale``), keyed by
         # ``(server, original_name)``. A best-effort enrichment of the consult:
@@ -942,8 +958,8 @@ class ProxyManager:
                 self._failed_servers[name] = redacted
 
         # #465: evaluate per-tool health once per session, before the first
-        # advertisement. get_proxy_tools() applies this cached snapshot so
-        # the advertised set stays stable for the session; the next start()
+        # advertisement. get_proxy_tools() applies this cached snapshot, so a
+        # tool does not slide in and out as calls fail; the next start()
         # re-evaluates (startup-grained half-open probing — see
         # proxy/tool_eligibility.py). Without a metrics store (metrics
         # disabled) there is no health signal and the filter runs on
@@ -1302,6 +1318,13 @@ class ProxyManager:
                 # format change upstream.
                 facts[key] = sanitize_graph_facts_row({"risk_score": decision.risk_score})
         self._toolgraph_external_rejects = rejects
+        # Bundle decisions are rebound against the LIVE catalog every time this
+        # runs, so a bundle covers whatever exists now — there is no such thing
+        # as an unconsulted candidate here. Any coverage a previous stdio
+        # consult recorded must go with the owner change, or a live
+        # stdio → bundle switch would keep rejecting bundle-APPROVED tools as
+        # ``toolgraph_unconsulted`` (#918).
+        self._toolgraph_consulted_keys = None
         self._toolgraph_risk_penalties = penalties
         self._toolgraph_graph_facts = facts
         self._toolgraph_bind_stats = {
@@ -1438,7 +1461,13 @@ class ProxyManager:
         """Run the one-shot startup consult and cache its verdict (#465).
 
         Mirrors :func:`compute_health_flags`: consult once, hold the snapshot
-        for the session so the advertised set stays stable. The adapter is
+        for the session. Since #917 the advertisement can be rebuilt when an
+        upstream replaces its catalogue, so the snapshot also records WHICH
+        candidates it covered (``_toolgraph_consulted_keys``) — a tool that
+        appears later was never put to the graph and takes a
+        ``toolgraph_unconsulted`` reason rather than being read as approved —
+        profile-gated, so ``strict`` withholds it while ``review`` demotes and
+        ``explore`` ignores (#918). The adapter is
         started, consulted, and stopped here — there is no per-request lazy
         start, so nothing holds the stdio child past startup. Failures are
         classified onto the configured ``on_*`` knobs; ``fail_start`` raises
@@ -1455,6 +1484,11 @@ class ProxyManager:
                 "Tool-graph provider enabled but no upstream tools were discovered "
                 "— consult skipped"
             )
+            # A successful consult of nothing still covers nothing, which is a
+            # different statement from "no consult happened" (#918). Leaving
+            # coverage unknown here would fail OPEN for the upstream that comes
+            # up with an empty catalogue and grows its first tool later.
+            self._toolgraph_consulted_keys = frozenset()
             return
 
         adapter = ToolgraphConsultAdapter(cfg)
@@ -1507,6 +1541,15 @@ class ProxyManager:
         self._toolgraph_external_rejects = {
             key: code for ref, code in rejects.items() for key in ref_to_keys.get(ref, ())
         }
+        # Every candidate this consult actually covered. The stdio consult runs
+        # once per session, so a tool an upstream adds afterwards was never put
+        # to the graph — and since #917 re-advertises, it would otherwise be
+        # exposed with no verdict at all. Recorded here so ``get_proxy_tools``
+        # can withhold what the graph has not seen instead of defaulting it to
+        # allowed (#918).
+        self._toolgraph_consulted_keys = frozenset(
+            key for keys in ref_to_keys.values() for key in keys
+        )
         if self._toolgraph_external_rejects:
             logger.info(
                 "Tool-graph consult: %d candidate(s) rejected by the graph (generation %s)",
@@ -1548,6 +1591,12 @@ class ProxyManager:
     def _reset_toolgraph_verdict_state(self) -> None:
         """Clear the shared stdio/bundle verdict fields before a consult."""
         self._toolgraph_external_rejects = {}
+        # Coverage is part of the verdict, not a fact about the catalogue: a
+        # retired source, a switch to bundle mode, or a reused manager must not
+        # leave a previous stdio consult judging candidates it never saw — in
+        # either direction (stale approvals, or `toolgraph_unconsulted` from a
+        # provider that is now off) (#918).
+        self._toolgraph_consulted_keys = None
         self._toolgraph_risk_penalties = {}
         self._toolgraph_graph_facts = {}
         self._toolgraph_withhold_all = None
@@ -2079,7 +2128,23 @@ class ProxyManager:
             conn.stack = None
             conn.tools = tools
             self._tool_catalog_revision += 1
-            conn.config = cfg
+            # ``prefix`` composes the client-visible tool name, which is the
+            # handle registration ownership is keyed on (#891/#908) and which
+            # the hot-reload contract promises is restart-only. Now that a
+            # reconnect can re-advertise (#917), installing the caller's fresh
+            # config wholesale would let a pending prefix edit rename every
+            # tool of this upstream mid-session — silently, for a client that
+            # never re-lists. Carry the connect-time prefix forward so the
+            # advertisement's identity is still decided once. Only a prefix
+            # edit is neutralized: every other field is installed as the caller
+            # resolved it. With no prefix edit the caller's object is installed
+            # as-is, so a config it holds stays identical to the connection's;
+            # an edit copies, replacing that one field.
+            conn.config = (
+                cfg
+                if cfg.prefix == conn.config.prefix
+                else cfg.model_copy(update={"prefix": conn.config.prefix})
+            )
             # Any successful reconnect proves the current config connects —
             # clear the config-change damper so detection resumes normally.
             conn.last_failed_connection_fp = None
@@ -2100,6 +2165,13 @@ class ProxyManager:
                         self._redacted_error(cleanup_exc, old_url),
                     )
             logger.info("Reconnected to '%s' (%s tools discovered)", name, len(conn.tools))
+            # The reconnect replaced the catalogue this upstream advertises, so
+            # the exposure verdict standing downstream was decided against tools
+            # that may no longer exist — or may now break a rule (#917). Announce
+            # after the old resources are closed: the listener re-derives from
+            # ``conn.tools``, which is already the new snapshot, and nothing
+            # below depends on it.
+            await self._announce_catalogue_change(name)
 
     def _make_message_handler(self, name: str) -> Any:
         """Per-upstream MCP message handler wired into ``ClientSession``.
@@ -2109,7 +2181,9 @@ class ProxyManager:
         from the ``conn.tools`` snapshot, which is otherwise populated only at
         connect/reconnect — so an upstream that re-declares a tool from
         read-only to may-mutate at runtime would keep replaying the pre-flip
-        cached response until the next error-driven reconnect (#557). Every
+        cached response until the next error-driven reconnect (#557). The same
+        snapshot is what exposure was decided from, so the refresh also
+        announces the change for re-advertisement (#917). Every
         other message (server->client requests, other notifications, stream
         exceptions) falls through untouched, matching the SDK's default
         handler behavior.
@@ -2244,6 +2318,9 @@ class ProxyManager:
             invalidated,
             len(stale),
         )
+        # Cache rows are only half of what the old catalogue decided; the other
+        # half is the exposure verdict standing downstream (#917).
+        await self._announce_catalogue_change(name)
 
     def _spawn_background(
         self,
@@ -2634,7 +2711,7 @@ class ProxyManager:
         # read is a loader ``stat()``, so this is also the cheap shape.
         # Per-server fields below deliberately stay on the connect-time
         # ``conn.config`` instead, so an advertisement mixes one live global
-        # read with session-stable server snapshots — see the loop head for why.
+        # read with connect-time server snapshots — see the loop head for why.
         cfg_snap = self._config
         self._refresh_toolgraph_bundle(cfg_live=cfg_snap)
         candidates: list[ExposureCandidate] = []
@@ -2642,10 +2719,13 @@ class ProxyManager:
         global_strip = cfg_snap.strip_schema_descriptions
 
         for conn in self._connections.values():
-            # Deliberately the connect-time snapshot: the advertisement is
-            # session-stable (``prefix`` is restart-only, and the exposed set
-            # must not drift between startup registration and later calls),
-            # unlike per-call tool-config resolution which hot-reloads.
+            # Deliberately the connect-time snapshot. ``prefix`` is
+            # restart-only — it composes the client-visible name, and a
+            # reconnect carries the connect-time value forward for exactly
+            # that reason (#917) — and the rest must not drift with a config
+            # edit alone, unlike per-call tool-config resolution which
+            # hot-reloads. What DOES rebuild this is the upstream replacing
+            # its catalogue.
             cfg = conn.config
             max_desc = cfg.max_description_chars
             strip = cfg.strip_schema_descriptions or global_strip
@@ -2721,7 +2801,7 @@ class ProxyManager:
             candidates,
             cfg_snap.exposure,
             self._unhealthy_tools,
-            external_rejects=self._toolgraph_external_rejects or None,
+            external_rejects=self._external_rejects_with_coverage(candidates),
             withhold_all=self._toolgraph_withhold_all,
         )
         if verdict.reject_reasons != self._advertised_reject_reasons:
@@ -2739,6 +2819,79 @@ class ProxyManager:
             is not None
         }
         return verdict.eligible
+
+    def _external_rejects_with_coverage(
+        self, candidates: list[ExposureCandidate]
+    ) -> dict[tuple[str, str], str] | None:
+        """The graph's per-candidate verdicts, plus a reject for anything it
+        never saw (#918).
+
+        The stdio consult runs once per session (``_consult_toolgraph``), so
+        before #917 the advertisement it fed was the only one there would be
+        and every candidate in it had been put to the graph. Re-advertising
+        breaks that pairing: an upstream can add a tool after the consult, and
+        with no entry in ``_toolgraph_external_rejects`` it would read exactly
+        like a tool the graph approved. For a policy gateway those must not be
+        the same answer. The code rides the profile ladder with the rest of the
+        ``toolgraph_*`` family rather than withholding outright, so ``strict``
+        — the profile a gateway runs — refuses it, while ``review`` still shows
+        the operator what strict would hide.
+
+        Coverage is only judged when a consult actually recorded what it
+        covered — ``None`` (toolgraph off, bundle source, or a consult that
+        failed onto the whole-call path) leaves the verdict map untouched.
+        Bundle mode is deliberately excluded: its decisions are rebound
+        whenever the catalogue moves, so a new tool is already classified
+        (UNMAPPED / DRIFTED) rather than unjudged.
+        """
+        covered = self._toolgraph_consulted_keys
+        if covered is None:
+            return self._toolgraph_external_rejects or None
+        rejects = dict(self._toolgraph_external_rejects)
+        for candidate in candidates:
+            key = (candidate.info.server, candidate.info.original_name)
+            if key not in covered and key not in rejects:
+                rejects[key] = REASON_TOOLGRAPH_UNCONSULTED
+        return rejects or None
+
+    def set_advertisement_listener(self, listener: Callable[[], Awaitable[None]] | None) -> None:
+        """Register the callback that re-advertises after a catalogue change.
+
+        Called by whoever owns the downstream tool registry (``server.py``'s
+        lifespan). The manager decides exposure but registers nothing, so it
+        can only announce that its inputs moved; the listener re-runs
+        :meth:`get_proxy_tools` and reconciles registrations (#917). Setting
+        ``None`` restores the pre-#917 behavior of leaving a stale
+        advertisement in place.
+        """
+        self._advertisement_listener = listener
+
+    async def _announce_catalogue_change(self, name: str) -> None:
+        """Tell the registry owner an upstream catalogue moved (#917).
+
+        Exceptions are contained here: the listener re-enters registration and
+        MCP-notification code, and a failure there must not abort the
+        reconnect or the ``tools/list_changed`` refresh that called it — the
+        cost of a failed re-advertisement is a stale tool list, the cost of an
+        escaping error is a connection left half-updated.
+
+        No re-entrancy guard: the listener does its registry work
+        synchronously and only awaits at the end, so on the single-threaded
+        event loop a second announcement cannot interleave with the first's
+        mutations, and each pass re-derives from live state.
+        """
+        listener = self._advertisement_listener
+        if listener is None or self._background_closed:
+            return
+        try:
+            await listener()
+        except Exception:
+            logger.warning(
+                "Re-advertisement after a catalogue change failed for '%s'; "
+                "the advertised tool list may be stale until restart",
+                name,
+                exc_info=True,
+            )
 
     def retain_registered_advertisement(self, registered: Collection[str]) -> list[str]:
         """Narrow the advertisement snapshot to what the server registered (#908).
@@ -2761,10 +2914,11 @@ class ProxyManager:
 
         The narrowing is not durable against a later ``get_proxy_tools()``,
         which rebuilds every one of these fields from a fresh filter verdict
-        and would restore the declined tool. The bundled server advertises once
-        at startup and never re-derives, so this does not arise there; a
-        library caller that re-advertises must call this again with the names
-        that survived, exactly as the registration loop does.
+        and would restore the declined tool. Since #917 the bundled server does
+        re-derive — on a catalogue change — so its re-advertisement calls this
+        again unconditionally with the names that survived, exactly as the
+        registration loop does, and so must any library caller that
+        re-advertises.
         """
         keep = set(registered)
         dropped = [name for name in self._advertised_tools if name not in keep]
@@ -4287,10 +4441,13 @@ class ProxyManager:
         listed — since #465 ``conn.tools`` is no longer pre-filtered at
         connect time); ``advertised_tools`` counts how many of them are
         exposed, so operators can tell a withheld tool from a missing one. It
-        reflects the most recent ``get_proxy_tools()`` pass — in the server it
-        runs at startup registration, before any health probe can observe it —
-        narrowed to the names registration actually took (#908), so a tool the
-        registration layer declined reads as withheld rather than as advertised.
+        reflects the most recent ``get_proxy_tools()`` pass — in the server that
+        is startup registration, plus any re-advertisement a catalogue change
+        triggered (#917), so both counts move together instead of ``tools``
+        tracking a live catalogue while ``advertised_tools`` describes the one
+        that existed at startup — narrowed to the names registration actually
+        took (#908), so a tool the registration layer declined reads as
+        withheld rather than as advertised.
 
         A configured server that FAILED to connect at startup (#580) has no
         ``_connections`` entry, so it is reported here from ``_failed_servers``

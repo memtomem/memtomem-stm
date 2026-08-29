@@ -353,3 +353,131 @@ class TestSessionWiring:
             assert "self._establish_connection(name, cfg)" in src, method.__name__
         owner_src = inspect.getsource(ProxyManager._run_connection_owner)
         assert "message_handler=self._make_message_handler(name)" in owner_src
+
+
+# ── Re-advertisement announcement (#917) ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestCatalogueChangeAnnouncement:
+    """A catalogue replacement must reach whoever owns the downstream registry.
+
+    The exposure verdict was decided from ``conn.tools``; replacing that
+    snapshot without re-deciding leaves a tool the filter would now reject
+    advertised and callable (#917). The manager registers nothing itself, so
+    all it can do is announce — these tests pin that it does, and that the
+    announcement cannot damage the path that triggered it.
+    """
+
+    async def test_refresh_announces_after_the_catalogue_moves(self, build):
+        mgr, _, _ = build(tools=[_tool("old")])
+        conn = mgr._connections["srv"]
+        conn.session.list_tools.return_value = _list_result(_tool("new"))
+        seen: list[list[str]] = []
+
+        async def _listener() -> None:
+            # Recorded from inside the listener: the announcement is only
+            # useful if the new catalogue is already visible when it fires.
+            seen.append([t.name for t in mgr._connections["srv"].tools])
+
+        mgr.set_advertisement_listener(_listener)
+
+        await mgr._refresh_server_tools("srv")
+
+        assert seen == [["new"]]
+
+    async def test_no_listener_is_a_no_op(self, build):
+        """The manager is usable without a registry owner — a library caller
+        that never sets one keeps the pre-#917 behavior instead of crashing."""
+        mgr, _, _ = build(tools=[_tool("old")])
+        mgr._connections["srv"].session.list_tools.return_value = _list_result(_tool("new"))
+
+        await mgr._refresh_server_tools("srv")
+
+        assert [t.name for t in mgr._connections["srv"].tools] == ["new"]
+
+    async def test_listener_failure_does_not_break_the_refresh(self, build, caplog):
+        """Re-advertisement re-enters registration and MCP notification code.
+        A failure there costs a stale tool list; letting it escape would abort
+        the refresh that already reassigned ``conn.tools`` and cleared cache
+        rows, leaving the connection half-updated."""
+        mgr, _, _ = build(tools=[_tool("old")])
+        mgr._connections["srv"].session.list_tools.return_value = _list_result(_tool("new"))
+
+        async def _boom() -> None:
+            raise RuntimeError("registry is on fire")
+
+        mgr.set_advertisement_listener(_boom)
+
+        await mgr._refresh_server_tools("srv")
+
+        assert [t.name for t in mgr._connections["srv"].tools] == ["new"]
+        assert "may be stale" in caplog.text
+
+    async def test_announcement_is_suppressed_once_background_is_closed(self, build):
+        """Teardown detaches the listener, but a refresh already in flight can
+        reach the announcement afterwards; re-registering into a server being
+        dismantled is worse than a stale list nobody will read."""
+        mgr, _, _ = build(tools=[_tool("old")])
+        mgr._connections["srv"].session.list_tools.return_value = _list_result(_tool("new"))
+        called = False
+
+        async def _listener() -> None:
+            nonlocal called
+            called = True
+
+        mgr.set_advertisement_listener(_listener)
+        mgr._background_closed = True
+
+        await mgr._refresh_server_tools("srv")
+
+        assert called is False
+
+    async def test_reconnect_does_not_let_a_prefix_edit_rename_the_advertisement(self, build):
+        """``prefix`` composes the client-visible name, which is the handle
+        registration ownership is keyed on and which the hot-reload contract
+        promises is restart-only. Once a reconnect can re-advertise (#917),
+        installing the caller's fresh config wholesale would let a pending
+        prefix edit rename every tool of this upstream mid-session — silently,
+        for a client that never re-lists."""
+        mgr, _, _ = build(tools=[_tool("old")])
+        conn = mgr._connections["srv"]
+        edited = conn.config.model_copy(update={"prefix": "renamed"})
+        new_session = AsyncMock()
+
+        async def _establish(name, cfg):
+            return new_session, None, [
+                SimpleNamespace(name="old", annotations=None, description="", input_schema={})
+            ]
+
+        mgr._establish_connection = _establish  # type: ignore[method-assign]
+
+        await mgr._reconnect_server("srv", edited)
+
+        assert conn.config.prefix == "t", "a prefix edit renamed the advertisement"
+        assert [i.prefixed_name for i in mgr.get_proxy_tools()] == ["t__old"]
+
+    async def test_reconnect_announces_after_committing_the_new_catalogue(self, build):
+        """The other door onto the same swap. A reconnect replaces the whole
+        catalogue, so the verdict standing downstream was decided against tools
+        that may be gone — and the announcement has to land AFTER the swap, or
+        the listener re-derives from the catalogue it is meant to replace."""
+        mgr, _, _ = build(tools=[_tool("old")])
+        conn = mgr._connections["srv"]
+        new_session = AsyncMock()
+        seen: list[list[str]] = []
+
+        async def _listener() -> None:
+            seen.append([t.name for t in mgr._connections["srv"].tools])
+
+        mgr.set_advertisement_listener(_listener)
+
+        async def _establish(name, cfg):
+            return new_session, None, [_tool("fresh")]
+
+        mgr._establish_connection = _establish  # type: ignore[method-assign]
+
+        await mgr._reconnect_server("srv", conn.config)
+
+        assert [t.name for t in conn.tools] == ["fresh"]
+        assert seen == [["fresh"]]

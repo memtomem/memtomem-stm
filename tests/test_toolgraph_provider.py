@@ -43,6 +43,7 @@ from memtomem_stm.proxy.tool_eligibility import (
     GRAPH_FACT_KEYS,
     REASON_TOOLGRAPH_AGENT_NOT_FOUND,
     REASON_TOOLGRAPH_NOT_GRANTED,
+    REASON_TOOLGRAPH_UNCONSULTED,
     REASON_TOOLGRAPH_PROTOCOL_ERROR,
     REASON_TOOLGRAPH_TOOL_NOT_FOUND,
     REASON_TOOLGRAPH_UNREACHABLE,
@@ -711,6 +712,91 @@ class TestToolgraphConsultWiring:
         assert status["degraded"] is False
         assert status["withholding_all"] is None
         assert status["external_reject_count"] == 1
+
+    async def test_a_tool_added_after_the_consult_is_withheld(self, tmp_path):
+        """#918: the stdio consult runs once per session. Before #917 that was
+        the only advertisement there would be, so every candidate in it had
+        been put to the graph. Re-advertising after an upstream adds a tool
+        breaks that pairing — and a tool with no entry in the verdict map reads
+        exactly like one the graph approved. For a policy gateway those cannot
+        be the same answer, so an unconsulted candidate is withheld."""
+        mgr, _ = _tg_manager(tmp_path)  # tools: read_file, blocked
+        await mgr._consult_toolgraph()
+        assert [i.prefixed_name for i in mgr.get_proxy_tools()] == ["srv__read_file"]
+
+        # The upstream grows a tool the consult never saw.
+        conn = mgr._connections["srv"]
+        conn.tools = [*conn.tools, SimpleNamespace(name="sneaked", description="", input_schema={"type": "object"})]
+
+        advertised = [i.prefixed_name for i in mgr.get_proxy_tools()]
+
+        assert advertised == ["srv__read_file"], "an unconsulted tool reached the client"
+        assert mgr._advertised_reject_reasons["srv__sneaked"] == REASON_TOOLGRAPH_UNCONSULTED
+
+    async def test_coverage_is_not_judged_without_a_stdio_consult(self, tmp_path):
+        """``None`` coverage means "do not judge" — with toolgraph off there is
+        no graph to be unconsulted by, and withholding on that basis would hide
+        every tool from operators who never enabled the gateway."""
+        mgr, _ = _tg_manager(tmp_path)
+        assert mgr._toolgraph_consulted_keys is None
+
+        advertised = [i.prefixed_name for i in mgr.get_proxy_tools()]
+
+        assert advertised == ["srv__read_file", "srv__blocked"]
+        assert mgr._advertised_reject_reasons == {}
+
+    async def test_an_explicit_verdict_outranks_the_coverage_reject(self, tmp_path):
+        """Coverage fills a gap; it must not overwrite an answer the graph gave.
+
+        Every reject the consult produces is keyed by a ref it covered, so the
+        two sets cannot overlap by construction — driving the state directly is
+        the only way to exercise the branch rather than a case where coverage
+        would never have fired anyway.
+        """
+        mgr, _ = _tg_manager(tmp_path)
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_external_rejects == {("srv", "blocked"): REASON_TOOLGRAPH_NOT_GRANTED}
+        mgr._toolgraph_consulted_keys = frozenset()  # the reject now sits outside coverage
+
+        mgr.get_proxy_tools()
+
+        assert mgr._advertised_reject_reasons == {
+            "srv__read_file": REASON_TOOLGRAPH_UNCONSULTED,
+            "srv__blocked": REASON_TOOLGRAPH_NOT_GRANTED,
+        }
+
+    async def test_an_empty_catalogue_still_records_coverage(self, tmp_path):
+        """#918 round 2: a consult that finds no tools covers NOTHING, which is
+        a different statement from "no consult happened". Leaving coverage
+        unknown fails open for the upstream that comes up empty and grows its
+        first tool later — the exact shape the guard exists for."""
+        mgr, _ = _tg_manager(tmp_path, servers={"srv": []})
+
+        await mgr._consult_toolgraph()
+
+        assert mgr._toolgraph_consulted_keys == frozenset()
+
+        conn = mgr._connections["srv"]
+        conn.tools = [SimpleNamespace(name="first", description="", input_schema={"type": "object"})]
+
+        assert [i.prefixed_name for i in mgr.get_proxy_tools()] == []
+        assert mgr._advertised_reject_reasons == {"srv__first": REASON_TOOLGRAPH_UNCONSULTED}
+
+    async def test_retiring_the_provider_retires_its_coverage(self, tmp_path):
+        """Coverage is part of the verdict, not a fact about the catalogue.
+        A source the operator turned off must stop judging in BOTH directions —
+        it may not go on rejecting new keys as unconsulted any more than it may
+        go on approving old ones."""
+        mgr, _ = _tg_manager(tmp_path)
+        await mgr._consult_toolgraph()
+        assert mgr._toolgraph_consulted_keys is not None
+
+        mgr._reset_toolgraph_verdict_state()
+
+        assert mgr._toolgraph_consulted_keys is None
+        conn = mgr._connections["srv"]
+        conn.tools = [*conn.tools, SimpleNamespace(name="new", description="", input_schema={})]
+        assert "srv__new" in [i.prefixed_name for i in mgr.get_proxy_tools()]
 
     async def test_review_demotes_external_reject(self, tmp_path):
         mgr, _ = _tg_manager(tmp_path, exposure=ExposureConfig(profile=ExposureProfile.REVIEW))

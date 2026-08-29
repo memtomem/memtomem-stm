@@ -32,8 +32,9 @@ can attribute the demotion. Calls stamp :data:`RANKER_VERSION_BM25_GRAPH_RISK`
 when any graph-derived penalty contributed, :data:`RANKER_VERSION_BM25_RISK`
 when only native review demotions did, else :data:`RANKER_VERSION_BM25` — the
 math is identical, but the cohorts must not pool. The penalties themselves
-are session-stable (health flags + the graph consult both run once at
-startup), making records deterministic within a session and self-describing
+are stable as long as the advertisement is (health flags and the stdio graph
+consult both run once at startup; an upstream that replaces its catalogue
+rebuilds the advertisement, #917), making records self-describing
 across sessions (each candidate carries the penalty and source that shaped
 its score). A hard-rejected tool never reaches this module at all — ranking
 runs over the filter's output, so it can never resurrect a reject.

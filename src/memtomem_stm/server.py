@@ -35,7 +35,7 @@ from memtomem_stm.proxy.config import (
     model_upstream_inert_state,
     warn_if_upstreams_inert,
 )
-from memtomem_stm.proxy.manager import ProxyManager
+from memtomem_stm.proxy.manager import ProxyManager, ProxyToolInfo
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
 from memtomem_stm.proxy.selection_log import aggregate_selection_log
@@ -294,9 +294,11 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
     tracker = TokenTracker()
     proxy_manager: ProxyManager | None = None
     warmup_task: asyncio.Task[None] | None = None
-    # Prefixed names this lifespan actually registered, frozen at registration
-    # time so teardown removes that set and not a fresh derivation (#891).
-    registered_proxy_tools: list[str] = []
+    # Prefixed names this lifespan actually registered, mapped to the info each
+    # was registered from. Teardown removes exactly these keys rather than a
+    # fresh derivation (#891); the values let re-advertisement tell a tool whose
+    # advertised metadata moved from one that did not (#917).
+    registered_proxy_tools: dict[str, ProxyToolInfo] = {}
 
     # Wrap init + yield in a single try/finally so a failure between
     # resource acquisition and yield (e.g. proxy_cache.initialize() or
@@ -549,24 +551,96 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
 
                 return proxy_tool
 
-            for info in proxy_manager.get_proxy_tools():
-                if register_proxy_tool(
-                    server,
-                    _make_proxy_handler(proxy_manager, info.server, info.original_name),
-                    info,
-                ):
-                    registered_proxy_tools.append(info.prefixed_name)
+            manager = proxy_manager
+
+            def _register_advertisement(pm: ProxyManager, infos: list[ProxyToolInfo]) -> None:
+                """Claim every name in *infos* this lifespan does not hold yet."""
+                for info in infos:
+                    if info.prefixed_name in registered_proxy_tools:
+                        continue
+                    if register_proxy_tool(
+                        server,
+                        _make_proxy_handler(pm, info.server, info.original_name),
+                        info,
+                    ):
+                        registered_proxy_tools[info.prefixed_name] = info
+
+            _register_advertisement(proxy_manager, proxy_manager.get_proxy_tools())
 
             # The advertisement snapshot was committed when exposure was
             # decided, before any of the above could decline a name. Narrow it
             # to what actually registered so health counts, relevance ranking
             # and selection telemetry describe the tools a client can call
             # (#908).
-            proxy_manager.retain_registered_advertisement(registered_proxy_tools)
+            proxy_manager.retain_registered_advertisement(list(registered_proxy_tools))
 
             # Proxied tools are now in front; re-insert STM utility tools at
             # the end so ``tools/list`` yields domain tools first (#228).
             _move_stm_tools_to_end(server)
+
+            async def _readvertise_proxy_tools() -> None:
+                """Re-decide exposure and reconcile the registry (#917).
+
+                The verdict used to be registered once, here, while an upstream
+                can replace its catalogue at any time — on a reconnect, or by
+                sending ``tools/list_changed``. A tool that only then earned a
+                rejection stayed advertised and callable, which for a
+                ``task_required`` upstream (#892) means a tool the client can
+                see and can never successfully call.
+
+                Ownership is the constraint (#891/#908): only names this
+                lifespan actually claimed may be removed, and a name an
+                embedding host owns must go on being declined rather than
+                stolen — so removal reads ``registered_proxy_tools`` and every
+                claim goes back through ``register_proxy_tool``'s own probe.
+                A surviving tool whose advertised metadata moved is
+                re-registered too, because ``get_proxy_tools`` has already
+                rewritten the snapshot that ranking and telemetry read and the
+                registry would otherwise describe a different tool than they do.
+                """
+                desired = {info.prefixed_name: info for info in manager.get_proxy_tools()}
+                changed = False
+                for name, registered in list(registered_proxy_tools.items()):
+                    if desired.get(name) == registered:
+                        continue
+                    try:
+                        server.remove_tool(name)
+                    except Exception:
+                        # Ownership follows the registry, not the attempt. The
+                        # stock SDK raises here only when the name is already
+                        # gone, but an embedding subclass or SDK drift can fail
+                        # with the tool still installed — and dropping the entry
+                        # then would strand it: the re-registration probe sees
+                        # the name occupied and declines, while teardown no
+                        # longer knows it is ours to remove.
+                        if _is_registered(server, name):
+                            logger.warning(
+                                "Could not remove proxy tool '%s' while re-advertising; "
+                                "keeping ownership of it so teardown still removes it",
+                                name,
+                                exc_info=True,
+                            )
+                            continue
+                        logger.debug(
+                            "Proxy tool '%s' was already absent while re-advertising",
+                            name,
+                            exc_info=True,
+                        )
+                    del registered_proxy_tools[name]
+                    changed = True
+                before = len(registered_proxy_tools)
+                _register_advertisement(manager, list(desired.values()))
+                changed = changed or len(registered_proxy_tools) != before
+                # Unconditional: ``get_proxy_tools`` rebuilt every ``_advertised_*``
+                # field from scratch, so a name the registry declined is back in
+                # the snapshot until this narrows it out again.
+                manager.retain_registered_advertisement(list(registered_proxy_tools))
+                if not changed:
+                    return
+                _move_stm_tools_to_end(server)
+                await _publish_tools_list_changed(server)
+
+            proxy_manager.set_advertisement_listener(_readvertise_proxy_tools)
 
         ctx = STMContext(
             config=config,
@@ -608,12 +682,24 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
             shutdown_signals.entering_teardown()
             # Remove exactly what registration took ownership of (#891). Re-deriving
             # the set with ``get_proxy_tools()`` here would remove whatever the
-            # session advertises *now*: a ``tools/list_changed`` or a republished
-            # toolgraph bundle mid-session leaves registrations behind and asks for
-            # removals of names never registered, and the pass rewrites the
+            # session advertises *now*. Re-advertisement (#917) keeps the owned
+            # set current for the changes it handles, but not for the ones it
+            # cannot — a republished toolgraph bundle moves the verdict with no
+            # catalogue change to announce, and a re-advertisement that failed
+            # or was never wired leaves the set behind — so a fresh derivation
+            # here would still ask for removals of names never registered, and
+            # the pass rewrites the
             # advertisement snapshot that health and ranking read during shutdown.
             # It was also the one call in this block outside a guard, so anything it
             # raised skipped ``stop()`` and every cleanup below.
+            #
+            # Detach the re-advertisement listener first (#917): a catalogue
+            # change racing teardown would otherwise re-register names into a
+            # server being dismantled, after this loop has read the set to
+            # remove. ``stop()`` below also closes the background paths that
+            # announce, but this is the cheap half and it runs first.
+            if proxy_manager is not None:
+                proxy_manager.set_advertisement_listener(None)
             for name in registered_proxy_tools:
                 try:
                     server.remove_tool(name)
@@ -892,6 +978,60 @@ def _instrument_client_activity(server: MCPServer, watcher: ParentLivenessWatche
     # above everything that can reject.
     middleware.insert(0, _stamp_activity)
     return True
+
+
+def _is_registered(server: MCPServer, name: str) -> bool:
+    """Whether *name* is currently installed in the SDK's tool registry.
+
+    Reads the same private ``_tool_manager._tools`` the proxy already depends
+    on. An SDK that moves it answers ``True`` — the conservative direction for
+    the one caller: keeping ownership of a name that turns out to be gone costs
+    a failed removal at teardown, which is already guarded, while giving it up
+    while the tool is still installed strands it for the life of the process.
+    """
+    try:
+        return name in server._tool_manager._tools
+    except AttributeError:
+        return True
+
+
+async def _publish_tools_list_changed(server: MCPServer) -> None:
+    """Tell connected clients the tool list moved (#917).
+
+    A re-advertisement the client is never told about is half a fix: MCP
+    clients are not required to poll ``tools/list``, so without this the model
+    goes on offering a tool that is no longer registered (and stops being
+    offered one that now is) until it reconnects.
+
+    Reaches clients that negotiated the 2026-07-28 revision and opened a
+    ``subscriptions/listen`` stream — the bus feeds those, and that is also
+    where the SDK derives ``tools.listChanged`` from. A client on the legacy
+    protocol is told nothing (``MCPServer.run`` exposes no
+    ``NotificationOptions``, so the capability is not advertised there either)
+    and keeps its list until it re-lists or reconnects; what it CANNOT do any
+    more is call a tool the reconcile actually removed, because the registry is
+    already correct by the time this runs.
+
+    The bus is the seam that works from a background task —
+    ``ServerSession.send_tool_list_changed`` needs a live session and
+    ``Context.notify_tools_changed`` needs a Context, while a catalogue change
+    arrives on the upstream's message handler with neither.
+    The bus is a private attribute, so it is guarded like every other SDK
+    internal this server reaches into: an SDK that moves it costs the
+    notification, not the re-advertisement that already happened.
+    """
+    try:
+        from mcp.server.subscriptions import ToolsListChanged
+
+        bus = server._subscriptions
+    except (AttributeError, ImportError):
+        logger.warning(
+            "Cannot notify clients that the tool list changed — MCPServer "
+            "internal API changed. Tools were re-advertised, but clients keep "
+            "the previous list until they re-list (#917)."
+        )
+        return
+    await bus.publish(ToolsListChanged())
 
 
 def _move_stm_tools_to_end(server: MCPServer) -> None:

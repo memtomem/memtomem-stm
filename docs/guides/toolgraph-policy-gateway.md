@@ -111,7 +111,8 @@ dispatch.
 
 An already running STM process checks the bundle before each proxied call, so
 a new strict denial blocks immediately and cannot be bypassed by a warm cache.
-The external MCP `tools/list` registry is session-stable in this release; its
+The external MCP `tools/list` registry is rebuilt only when an upstream
+replaces its own catalogue (#917) — a bundle change alone does not rebuild it; its
 visibility change appears after restart. A malformed or missing strict bundle
 causes startup to fail closed. Review keeps the last known good snapshot and
 surfaces degraded status instead.

@@ -194,9 +194,11 @@ query signal and recorded in `candidate_features`:
   eligible-but-risky tool, demoted in *every* profile). `risk_penalty_source`
   records which contributed — `none` / `review` / `graph` / `review+graph` —
   so replay can attribute the demotion (the combined value alone can't). The
-  penalties are session-stable (health flags + the graph consult both run once
-  at startup), so records stay deterministic within a session and
-  self-describing across sessions. A graph-derived penalty stamps the pair
+  penalties are stable as long as the advertisement is: health flags and the
+  stdio graph consult both run once at startup, and a bundle's decisions are
+  rebound when an upstream replaces its catalogue and the advertisement is
+  rebuilt (#917), so each record describes the advertisement in force for that
+  call and stays self-describing across sessions. A graph-derived penalty stamps the pair
   `"v3-bm25-graph-risk-penalty"`; a native-review-only penalty stamps
   `"v2-bm25-risk-penalty"`.
 - `graph_facts` carries the external tool-graph's per-candidate
@@ -248,6 +250,7 @@ and the registration layer then declined:
 | `sensitive_metadata` | credential-pattern match in the tool's description/schema | rejects under `strict`; demotes under `review` |
 | `unhealthy` | upstream-attributable error rate over the recent metrics window crossed the threshold | rejects under `strict`; demotes under `review` |
 | `toolgraph_not_granted`, `toolgraph_deny_violation`, `toolgraph_deny_governed`, `toolgraph_drifted`, `toolgraph_ambiguous`, `toolgraph_unmapped`, `toolgraph_tool_not_found`, `toolgraph_rejected` | per-candidate verdict from the optional external tool-graph provider (the `toolgraph` block — one code per upstream reason, `toolgraph_rejected` is the forward-compatible fallback for an unrecognized reason) | rejects under `strict`; demotes under `review` |
+| `toolgraph_unconsulted` | the tool appeared after the one-per-session stdio consult (an upstream added it and the advertisement was rebuilt, #917/#918), so the graph was never asked about it — assigned a profile-gated reason rather than defaulted to allowed | rejects under `strict`; demotes under `review` |
 | `toolgraph_unreachable`, `toolgraph_agent_not_found`, `toolgraph_protocol_error` | whole-call fail-closed: the consult failed under a `closed` knob, so **every** tool is withheld under one code | all (profile-independent) |
 | `registration_declined` | not an exposure decision (#908): the tool passed every filter above, and the server then could not register it — `add_tool` failed, or the composed name already belonged to a tool registered by an embedding host | all |
 
