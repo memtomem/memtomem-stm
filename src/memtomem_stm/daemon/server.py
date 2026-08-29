@@ -38,8 +38,6 @@ import math
 import os
 import secrets
 import signal
-import subprocess
-import sys
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -49,6 +47,7 @@ from memtomem_stm.cli.hook_cmd import run_surfacing_hook
 from memtomem_stm.config import STMConfig, _is_loopback_host, log_stm_config_failure
 from memtomem_stm.daemon import discovery, locking
 from memtomem_stm.daemon.latency import DaemonLatencyTracker, LatencyKind, LatencyOutcome
+from memtomem_stm.utils import child_reaper
 from memtomem_stm.utils.anyio_shutdown import is_clean_cancel_scope_shutdown
 from memtomem_stm.daemon.protocol import (
     MAX_CONTEXT_COMPOSE_SCHEMA,
@@ -90,32 +89,22 @@ async def _quiet(coro: Any, what: str) -> None:
         logger.debug("%s failed", what, exc_info=True)
 
 
-def _direct_child_pids() -> set[int]:
-    """Best-effort set of this process's direct child pids (POSIX only).
-
-    Used by the teardown leak sweep. Returns an empty set on Windows or when
-    ``pgrep`` is unavailable/fails, degrading the sweep to a no-op rather
-    than blocking shutdown. ``pgrep`` never reports its own pid, so the
-    probe doesn't observe itself.
-    """
-    if sys.platform == "win32":
-        return set()
-    try:
-        out = subprocess.run(
-            ["pgrep", "-P", str(os.getpid())],
-            capture_output=True,
-            text=True,
-            timeout=5.0,
-            check=False,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return set()
-    return {int(tok) for tok in out.split() if tok.isdigit()}
+# The sweep itself lives in ``utils.child_reaper`` — the stdio MCP server needs
+# the same machinery (#906) and must not import this module to get it. Aliased
+# under the private names this module has always used so call sites (and the
+# tests that monkeypatch them by attribute) are unchanged.
+_direct_child_pids = child_reaper.direct_child_pids
+_signal_pid = child_reaper.signal_pid
+_LEAK_KILL_ESCALATE_SECONDS = child_reaper.LEAK_KILL_ESCALATE_SECONDS
 
 
-# Grace window between SIGTERM and SIGKILL for a leaked LTM child — matches
-# the escalation timeout mcp's own stdio shutdown sequence uses.
-_LEAK_KILL_ESCALATE_SECONDS = 2.0
+async def _terminate_leaked_children(pids: set[int]) -> None:
+    """SIGTERM each leaked child's process group, then SIGKILL stragglers."""
+    # Reads the module constant per call rather than binding the shared default
+    # at import, so shrinking ``_LEAK_KILL_ESCALATE_SECONDS`` still shortens the
+    # escalation the way it did when the body lived here.
+    await child_reaper.terminate_leaked_children(pids, escalate_seconds=_LEAK_KILL_ESCALATE_SECONDS)
+
 
 # Reserved out of the client's deadline for encoding + the loopback write/read
 # of the response. The engine's deadline is the client's minus this margin, so
@@ -131,38 +120,6 @@ _DEADLINE_RESPONSE_MARGIN_SECONDS = 0.15
 # cancels the adapter mid-RPC — which forces a stdio child respawn on the next
 # call (#290/#296) and buys nothing. Skip instead.
 _MIN_SURFACE_BUDGET_SECONDS = 0.25
-
-
-def _signal_pid(pid: int, sig: int) -> None:
-    """Best-effort signal to *pid*'s process group, or *pid* alone when it
-    shares the daemon's group (never signal our own group). The stdio LTM
-    child is spawned with ``start_new_session=True``, so the group kill also
-    reaches grandchildren (e.g. ``uv run memtomem`` wrappers)."""
-    if sys.platform == "win32":  # pragma: no cover — unreachable: no pgrep pids
-        return
-    try:
-        pgid = os.getpgid(pid)
-        if pgid != os.getpgid(0):
-            os.killpg(pgid, sig)
-        else:
-            os.kill(pid, sig)
-    except (ProcessLookupError, PermissionError):
-        pass
-
-
-async def _terminate_leaked_children(pids: set[int]) -> None:
-    """SIGTERM each leaked child's process group, then SIGKILL stragglers."""
-    if sys.platform == "win32":  # pragma: no cover — _direct_child_pids is empty
-        return
-    for pid in pids:
-        _signal_pid(pid, signal.SIGTERM)
-    deadline = asyncio.get_running_loop().time() + _LEAK_KILL_ESCALATE_SECONDS
-    remaining = {pid for pid in pids if discovery.is_pid_alive(pid)}
-    while remaining and asyncio.get_running_loop().time() < deadline:
-        await asyncio.sleep(0.05)
-        remaining = {pid for pid in remaining if discovery.is_pid_alive(pid)}
-    for pid in remaining:
-        _signal_pid(pid, signal.SIGKILL)
 
 
 def _usable_deadline(req: dict[str, Any]) -> float | None:

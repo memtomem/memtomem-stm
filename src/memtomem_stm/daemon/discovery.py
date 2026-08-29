@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from memtomem_stm.daemon.protocol import PROTOCOL_VERSION
+from memtomem_stm.utils import child_reaper
 from memtomem_stm.utils.fileio import atomic_write_text
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 
@@ -227,27 +228,7 @@ def remove_handshake_if_owner(path: Path, *, pid: int, token: str) -> None:
             logger.debug("failed to remove handshake file %s", path, exc_info=True)
 
 
-def is_pid_alive(pid: int) -> bool:
-    """Best-effort liveness probe for a PID. Liveness for *daemon* decisions
-    should prefer a socket ``ping``; this is a secondary signal for status/stop.
-    """
-    if pid <= 0:
-        return False
-    if os.name == "nt":  # pragma: no cover - exercised on Windows CI only
-        # No portable signal-0 on Windows; assume alive and let the ping decide.
-        return True
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # exists but owned by another user
-    except OSError:
-        return False
-    except OverflowError:
-        # A pid beyond the platform's pid_t range (e.g. a huge integer from
-        # a hand-edited handshake) raises OverflowError before ESRCH — it
-        # cannot name a live process. Not an OSError subclass, so it needs
-        # its own arm.
-        return False
-    return True
+# Re-exported: the probe moved to ``utils.child_reaper`` with the leaked-child
+# sweep that is its main consumer (#906). Callers here keep importing it from
+# this module.
+is_pid_alive = child_reaper.is_pid_alive

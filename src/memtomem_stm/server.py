@@ -51,6 +51,7 @@ from memtomem_stm.surfacing.observability import (
 from memtomem_stm.observability.tracing import traced
 from memtomem_stm.surfacing.feedback import FeedbackTracker
 from memtomem_stm.utils.anyio_shutdown import is_clean_cancel_scope_shutdown
+from memtomem_stm.utils.child_reaper import direct_child_pids, terminate_leaked_children
 from memtomem_stm.utils.json_out import escape_lone_surrogates, require_utf8_identifier
 
 logger = logging.getLogger(__name__)
@@ -576,6 +577,24 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                 shutdown_otlp(otlp_emitter, timeout_seconds=config.otlp.flush_timeout_seconds)
             except Exception:
                 logger.warning("Failed to shut down OTLP export", exc_info=True)
+        # Every child this process spawned belongs to a component stopped above,
+        # and each is owned by a context manager that kills it *if the context is
+        # actually exited*. A stop() that returns while abandoning one — an owner
+        # task lost mid-lifetime, a bounded join that gave up (see
+        # ``McpClientSearchAdapter.stop``, which names the daemon's sweep as its
+        # backstop) — leaves a live child of a process about to exit, which then
+        # outlives us as an orphan (#906). So sweep whatever is still a direct
+        # child here. Unlike the daemon's mid-lifetime sweep this does not
+        # intersect with a pre-stop snapshot: nothing surviving *full* teardown is
+        # legitimate, and the intersection would miss a child spawned by a
+        # reconnect racing shutdown.
+        try:
+            leaked = direct_child_pids()
+            if leaked:
+                logger.warning("Terminating leaked child process(es): %s", sorted(leaked))
+                await terminate_leaked_children(leaked)
+        except Exception:
+            logger.warning("Leaked-child sweep failed", exc_info=True)
 
 
 # ``version=`` pins ``serverInfo.version`` in the ``initialize`` response to
