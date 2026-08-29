@@ -153,4 +153,46 @@ def _no_real_shutdown_signals(monkeypatch: pytest.MonkeyPatch) -> None:
         def remove(self) -> None:
             pass
 
+        def trigger(self, reason: str) -> None:
+            pass
+
     monkeypatch.setattr("memtomem_stm.server.ShutdownSignals", _InertSignals)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_parent_liveness(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Never let a test watch the test runner's own parent.
+
+    ``app_lifespan`` can start a poller that shuts the process down when it is
+    reparented (#914). Under pytest the parent is whatever launched the run, and
+    the shutdown it asks for cancels the loop's tasks. The feature gate is not
+    enough on its own: lifespan tests build their config from a MagicMock, which
+    has to spell the interval out (comparing one to ``0`` raises), so a test that
+    forgets would otherwise decide this by accident. Instrumentation is stubbed
+    too, since the server object those tests pass is the shared module-level one
+    and the wrapping would outlive the test. Behaviour is pinned in tests/test_parent_liveness.py, the
+    wiring by the tests that replace these doubles with recording ones. A test
+    marked ``real_client_activity`` gets the real instrumentation, which is how
+    the SDK surface it reaches into stays pinned.
+    """
+
+    class _InertWatcher:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def run(self) -> None:
+            pass
+
+        def note_activity(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr("memtomem_stm.server.ParentLivenessWatcher", _InertWatcher)
+    if not request.node.get_closest_marker("real_client_activity"):
+        monkeypatch.setattr(
+            "memtomem_stm.server._instrument_client_activity", lambda _server, _watcher: True
+        )

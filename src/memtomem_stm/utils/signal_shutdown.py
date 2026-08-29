@@ -40,9 +40,10 @@ from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
-# Set once, process-wide, by the first shutdown signal. ``main`` reads it to
-# classify the CancelledError that the resulting unwind delivers: identical in
-# shape to a crash, opposite in meaning.
+# Set once, process-wide, by the first deliberate shutdown — a signal, or the
+# parent-liveness backstop calling ``ShutdownSignals.trigger`` (#914). ``main``
+# reads it to classify the CancelledError that the resulting unwind delivers:
+# identical in shape to a crash, opposite in meaning.
 _signalled = False
 
 
@@ -86,7 +87,11 @@ def exit_after_signal_shutdown() -> None:
 
 
 def shutdown_was_signalled() -> bool:
-    """True once a shutdown signal has been handled in this process.
+    """True once a deliberate shutdown has been started in this process.
+
+    A signal, or :meth:`ShutdownSignals.trigger` — the name predates the second
+    caller and is kept because what it answers has not changed: was this unwind
+    asked for.
 
     ``mcp.run()`` may return normally after the cancellation unwind rather than
     raising — measured: it does exactly that when the proxy owns an upstream
@@ -96,11 +101,12 @@ def shutdown_was_signalled() -> bool:
 
 
 def was_signal_shutdown(exc: BaseException) -> bool:
-    """True when *exc* is the unwind a shutdown signal asked for.
+    """True when *exc* is the unwind a deliberate shutdown asked for.
 
-    Requires both halves: a signal was delivered, and the exception is nothing
-    but cancellation. A real failure that happens to arrive after a signal is
-    still a failure, and cancellation with no signal behind it is not this.
+    Requires both halves: a shutdown was started here (a signal, or
+    :meth:`ShutdownSignals.trigger`), and the exception is nothing but
+    cancellation. A real failure that happens to arrive afterwards is still a
+    failure, and cancellation with nothing behind it is not this.
 
     anyio's strict task groups deliver the unwind as a ``BaseExceptionGroup``
     (``CancelledError`` is a ``BaseException``, so the group cannot be a plain
@@ -198,22 +204,42 @@ class ShutdownSignals:
                 logger.debug("Could not remove the handler for %s", sig, exc_info=True)
         self._installed.clear()
 
+    def trigger(self, reason: str) -> None:
+        """Start the same shutdown a first signal starts, without a signal.
+
+        For a backstop that *infers* the client is gone (#914) rather than being
+        told: the mechanism it needs is exactly this one, and routing it here is
+        also what makes ``main`` read the resulting ``CancelledError`` as a
+        deliberate shutdown instead of a crash.
+
+        Idempotent, and inert once a shutdown or teardown is under way. Unlike a
+        second signal it never takes the immediate-exit path: a signal repeated
+        is an operator saying it again, while an inference repeated is only the
+        same inference.
+        """
+        if self._signalled or self._tearing_down:
+            return
+        self._begin_shutdown(reason)
+
     def _on_signal(self, sig: int) -> None:
-        global _signalled
         if self._signalled or self._tearing_down:
             # Either a second signal, or one arriving while we are already
             # shutting down. Both mean the same thing: stop waiting.
             self._exit_now(sig)
             return
+        self._begin_shutdown(
+            f"Received {signal.Signals(sig).name} — shutting down. "
+            "Signal again to exit immediately."
+        )
+
+    def _begin_shutdown(self, message: str) -> None:
+        global _signalled
         self._signalled = True
         _signalled = True
         # Armed before anything that can block — a wedged logging handler must
         # not be able to cost us the backstop.
         self._arm_watchdog()
-        logger.info(
-            "Received %s — shutting down. Signal again to exit immediately.",
-            signal.Signals(sig).name,
-        )
+        logger.info("%s", message)
         self._cancel_everything()
 
     def _cancel_everything(self) -> None:

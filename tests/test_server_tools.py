@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sqlite3
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1907,6 +1908,8 @@ class TestLifespan:
             mock_cfg.langfuse.enabled = False
             mock_cfg.otlp = MagicMock()
             mock_cfg.otlp.enabled = False
+            mock_cfg.parent_liveness_poll_seconds = 0.0
+            mock_cfg.parent_liveness_grace_seconds = 900.0
 
             async with app_lifespan(mcp) as _ctx:
                 # ProxyManager.start() should NOT be called when proxy is disabled
@@ -1950,6 +1953,8 @@ class TestLifespan:
                 mock_cfg.langfuse.enabled = False
                 mock_cfg.otlp = MagicMock()
                 mock_cfg.otlp.enabled = False
+                mock_cfg.parent_liveness_poll_seconds = 0.0
+                mock_cfg.parent_liveness_grace_seconds = 900.0
 
                 with caplog.at_level("WARNING", logger="memtomem_stm.server"):
                     async with app_lifespan(mcp) as _ctx:
@@ -2013,15 +2018,23 @@ class TestLifespan:
             mock_cfg.langfuse.enabled = False
             mock_cfg.otlp = MagicMock()
             mock_cfg.otlp.enabled = False
+            mock_cfg.parent_liveness_poll_seconds = 0.0
+            mock_cfg.parent_liveness_grace_seconds = 900.0
 
             async with app_lifespan(mcp) as ctx:
                 assert ctx.feedback_tracker is None
                 assert captured_engine_kwargs.get("feedback_tracker") is None
 
-    async def _run_minimal_lifespan(self, *, pm_stop=None):
+    async def _run_minimal_lifespan(
+        self, *, pm_stop=None, parent_liveness_poll=0.0, parent_liveness_grace=900.0, settle=False
+    ):
         """Drive app_lifespan with everything optional off — enough config for
         startup, so a teardown-only assertion is all the test carries.
-        *pm_stop* replaces ProxyManager.stop's side effect."""
+        *pm_stop* replaces ProxyManager.stop's side effect.
+
+        *parent_liveness_poll* is spelled out rather than left to the MagicMock
+        because ``MagicMock() > 0`` is truthy, which would silently turn the
+        #914 backstop on in every one of these."""
         from memtomem_stm.server import app_lifespan, mcp
 
         mock_pm_instance = MagicMock()
@@ -2043,9 +2056,122 @@ class TestLifespan:
             mock_cfg.langfuse.enabled = False
             mock_cfg.otlp = MagicMock()
             mock_cfg.otlp.enabled = False
+            mock_cfg.parent_liveness_poll_seconds = parent_liveness_poll
+            mock_cfg.parent_liveness_grace_seconds = parent_liveness_grace
 
             async with app_lifespan(mcp) as _ctx:
+                if settle:
+                    # Give the lifespan's own tasks a turn, so a test asserting
+                    # on one is not asserting on a task that never started.
+                    await asyncio.sleep(0)
+
+    async def _recording_parent_liveness(self, monkeypatch):
+        """Replace conftest's inert doubles with ones that remember (#914)."""
+        built = []
+        tasks = []
+        instrumented = []
+
+        class _RecordingWatcher:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.stopped = False
+                built.append(self)
+
+            async def run(self):
+                tasks.append(asyncio.current_task())
+                await asyncio.sleep(30)  # outlives the lifespan unless cancelled
+
+            def note_activity(self):
                 pass
+
+            def stop(self):
+                self.stopped = True
+
+        monkeypatch.setattr("memtomem_stm.server.ParentLivenessWatcher", _RecordingWatcher)
+        monkeypatch.setattr(
+            "memtomem_stm.server._instrument_client_activity",
+            lambda server, watcher: instrumented.append((server, watcher)) or True,
+        )
+        return built, tasks, instrumented
+
+    async def test_the_parent_liveness_backstop_is_off_unless_configured(self, monkeypatch):
+        """It infers rather than observes, and a wrong inference costs a live
+        session — so nothing is watched, and no handler is wrapped, until an
+        operator asks for it."""
+        built, tasks, instrumented = await self._recording_parent_liveness(monkeypatch)
+
+        await self._run_minimal_lifespan()
+
+        assert (built, tasks, instrumented) == ([], [], [])
+
+    async def test_the_configured_backstop_is_wired_to_the_shutdown_and_joined(self, monkeypatch):
+        """Its shutdown has to be the one a signal starts — anything else is
+        classified as a crash — and its task has to be cancellable by that very
+        shutdown, which is why it is created after the signal handlers snapshot
+        the tasks they will spare."""
+        built, tasks, instrumented = await self._recording_parent_liveness(monkeypatch)
+        signals = []
+
+        class _RecordingSignals:
+            def __init__(self, **_kwargs):
+                self.foreign = None
+                signals.append(self)
+
+            def install(self):
+                self.foreign = set(asyncio.all_tasks())
+
+            def entering_teardown(self):
+                pass
+
+            def remove(self):
+                pass
+
+            def trigger(self, reason):
+                pass
+
+        monkeypatch.setattr("memtomem_stm.server.ShutdownSignals", _RecordingSignals)
+
+        await self._run_minimal_lifespan(parent_liveness_poll=30.0, settle=True)
+
+        assert len(built) == 1
+        watcher = built[0]
+        assert watcher.kwargs["poll_seconds"] == 30.0
+        assert watcher.kwargs["grace_seconds"] == 900.0
+        assert watcher.kwargs["on_parent_gone"] == signals[0].trigger
+        assert len(instrumented) == 1 and instrumented[0][1] is watcher
+        # Created after install(), or the shutdown it asks for would spare it as
+        # somebody else's task and it would outlive the teardown it started.
+        assert tasks[0] not in signals[0].foreign
+        assert watcher.stopped and tasks[0].cancelled()
+
+    async def test_a_backstop_that_cannot_see_the_client_does_not_start(self, monkeypatch):
+        """Without the activity feed the veto has nothing to weigh, so the
+        watcher would end a live session a grace period after startup on any
+        reparent. A missed leak costs what it cost before this feature existed;
+        a wrong shutdown costs a working session."""
+        built, tasks, _ = await self._recording_parent_liveness(monkeypatch)
+        monkeypatch.setattr(
+            "memtomem_stm.server._instrument_client_activity", lambda _server, _watcher: False
+        )
+
+        await self._run_minimal_lifespan(parent_liveness_poll=30.0, settle=True)
+
+        assert len(built) == 1  # constructed, then deliberately not run
+        assert tasks == []
+
+    async def test_a_zero_grace_backstop_runs_without_the_activity_feed(self, monkeypatch):
+        # A zero grace asks for the reparent alone and never consults activity,
+        # so losing the feed costs it nothing.
+        built, tasks, _ = await self._recording_parent_liveness(monkeypatch)
+        monkeypatch.setattr(
+            "memtomem_stm.server._instrument_client_activity", lambda _server, _watcher: False
+        )
+
+        await self._run_minimal_lifespan(
+            parent_liveness_poll=30.0, parent_liveness_grace=0.0, settle=True
+        )
+
+        assert len(built) == 1 and len(tasks) == 1
 
     async def test_teardown_terminates_a_child_that_survived_every_stop(self, monkeypatch, caplog):
         """A stop() can return while abandoning a live stdio child (owner task
@@ -2320,6 +2446,8 @@ class TestLifespan:
             mock_cfg.langfuse.enabled = False
             mock_cfg.otlp = MagicMock()
             mock_cfg.otlp.enabled = False
+            mock_cfg.parent_liveness_poll_seconds = 0.0
+            mock_cfg.parent_liveness_grace_seconds = 900.0
 
             async with app_lifespan(mcp) as ctx:
                 # Server came up; the tracker just has no backing store.
@@ -2366,6 +2494,8 @@ class TestLifespan:
             mock_cfg.langfuse.enabled = False
             mock_cfg.otlp = MagicMock()
             mock_cfg.otlp.enabled = False
+            mock_cfg.parent_liveness_poll_seconds = 0.0
+            mock_cfg.parent_liveness_grace_seconds = 900.0
 
             async with app_lifespan(mcp) as _ctx:
                 assert captured_pm_kwargs.get("cache") is None
@@ -2423,6 +2553,8 @@ class TestLifespan:
             mock_cfg.langfuse.enabled = False
             mock_cfg.otlp = MagicMock()
             mock_cfg.otlp.enabled = False
+            mock_cfg.parent_liveness_poll_seconds = 0.0
+            mock_cfg.parent_liveness_grace_seconds = 900.0
 
             with pytest.raises(RuntimeError, match="upstream down"):
                 async with app_lifespan(mcp) as _ctx:
@@ -2472,6 +2604,8 @@ class TestLifespan:
             mock_cfg.langfuse.enabled = False
             mock_cfg.otlp = MagicMock()
             mock_cfg.otlp.enabled = False
+            mock_cfg.parent_liveness_poll_seconds = 0.0
+            mock_cfg.parent_liveness_grace_seconds = 900.0
 
             async with app_lifespan(mcp) as _ctx:
                 # Give the spawned warm-up task a turn to run.
@@ -2524,6 +2658,8 @@ class TestLifespan:
             mock_cfg.langfuse.enabled = False
             mock_cfg.otlp = MagicMock()
             mock_cfg.otlp.enabled = False
+            mock_cfg.parent_liveness_poll_seconds = 0.0
+            mock_cfg.parent_liveness_grace_seconds = 900.0
 
             async with app_lifespan(mcp) as _ctx:
                 pass
@@ -2853,6 +2989,101 @@ class TestAdvertiseObservabilityFlagEndToEnd:
         assert _hidden_obs_tools_hint() is None
 
 
+# ── client-activity instrumentation for the #914 backstop ─────────────────
+
+
+@pytest.mark.real_client_activity
+class TestClientActivityInstrumentation:
+    """The parent-liveness backstop only refrains from shutting a live session
+    down because it can see the client still speaking, so what counts as
+    "speaking" is load-bearing and pinned here against the real SDK."""
+
+    async def test_the_stamp_sits_on_the_seam_that_sees_every_frame(self):
+        """Against a real ``MCPServer``. Registered handlers are the wrong set:
+        ``initialize`` never reaches the request registry (the SDK reserves it
+        and says so by refusing to register one), and a notification with no
+        handler is dropped before one. Both are a client demonstrably still
+        there. ``Server.middleware`` is the documented seam that both
+        ``_on_request`` and ``_on_notify`` compose above validation and lookup,
+        which is why the stamp lives there."""
+        import mcp.types as types
+        from mcp.server.mcpserver import MCPServer
+
+        from memtomem_stm.server import _instrument_client_activity
+
+        server = MCPServer("pin")
+        low = server._lowlevel_server
+        # The reason this cannot be done handler-side, stated by the SDK itself.
+        with pytest.raises(ValueError, match="cannot be overridden"):
+            low.add_request_handler("initialize", types.RequestParams, lambda _c, _p: None)
+
+        before = list(low.middleware)
+        assert before, "the SDK installs its own middleware, so position matters"
+        stamps: list[int] = []
+
+        class _Watcher:
+            """Records that the frame was held for its whole duration."""
+
+            def __init__(self):
+                self.held = []
+                self.depth = 0
+
+            @contextlib.contextmanager
+            def serving(self):
+                self.depth += 1
+                stamps.append(1)
+                try:
+                    yield
+                finally:
+                    self.held.append(self.depth)
+                    self.depth -= 1
+
+        watcher = _Watcher()
+        assert _instrument_client_activity(server, watcher) is True
+        assert len(low.middleware) == len(before) + 1
+        # Outermost, not appended: the list runs outermost-first and the SDK
+        # already installs middleware that answers a frame without delegating
+        # (RequestStateBoundary raises on an expired requestState before its
+        # call_next). Observation has to sit above everything that can reject.
+        assert low.middleware[1:] == before
+
+        # It stamps, delegates, and returns what the chain returned.
+        sentinel = object()
+
+        async def _call_next(ctx):
+            return sentinel
+
+        assert await low.middleware[0](SimpleNamespace(method="ping"), _call_next) is sentinel
+        assert stamps == [1]
+        # The whole frame is held, not just its arrival: a call that outlasts
+        # the grace must not read as silence while the client waits for it.
+        assert watcher.held == [1]
+
+        # A failing frame still arrived, so it is still evidence of a live
+        # client: the stamp happens before delegation and the error propagates.
+        async def _boom(ctx):
+            raise RuntimeError("method not found")
+
+        with pytest.raises(RuntimeError):
+            await low.middleware[0](SimpleNamespace(method="nope"), _boom)
+        assert stamps == [1, 1]
+        assert watcher.depth == 0  # a failing frame releases its hold
+
+    async def test_a_moved_sdk_surface_degrades_to_a_warning(self, caplog):
+        """A wrong warning here costs the operator a weaker veto; raising would
+        cost them the server. The startup timestamp still bounds the backstop,
+        and the line says how to turn it off."""
+        import logging
+
+        from memtomem_stm.server import _instrument_client_activity
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="memtomem_stm.server"):
+            assert _instrument_client_activity(SimpleNamespace(), object()) is False
+        assert any("MCPServer internal API changed" in r.message for r in caplog.records)
+        assert any("PARENT_LIVENESS_POLL_SECONDS=0" in r.message for r in caplog.records)
+
+
 # ── advertise order — proxied before STM utility tools (#228) ─────────────
 
 
@@ -3042,6 +3273,8 @@ class TestAdvertiseOrder:
                 mock_cfg.langfuse.enabled = False
                 mock_cfg.otlp = MagicMock()
                 mock_cfg.otlp.enabled = False
+                mock_cfg.parent_liveness_poll_seconds = 0.0
+                mock_cfg.parent_liveness_grace_seconds = 900.0
 
                 async with app_lifespan(mcp) as _ctx:
                     advertised = [t.name for t in await mcp.list_tools()]
@@ -3101,6 +3334,8 @@ class TestLifespanTeardownSymmetry:
         mock_cfg.langfuse.enabled = False
         mock_cfg.otlp = MagicMock()
         mock_cfg.otlp.enabled = False
+        mock_cfg.parent_liveness_poll_seconds = 0.0
+        mock_cfg.parent_liveness_grace_seconds = 900.0
         return mock_cfg
 
     @staticmethod

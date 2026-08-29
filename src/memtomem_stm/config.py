@@ -510,6 +510,41 @@ class STMConfig(BaseSettings):
     by a slow-but-healthy teardown and is not a safe backstop. ``+inf`` is
     rejected rather than admitted as "never": it is not a bound, and it would
     silently turn the guarantee off."""
+    parent_liveness_poll_seconds: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
+    """Interval for the parent-liveness backstop (#914), set via
+    ``MEMTOMEM_STM_PARENT_LIVENESS_POLL_SECONDS``; ``0`` (the default) turns it
+    off. POSIX-only. 30 is a sensible value where it is wanted.
+
+    Every other shutdown path acts on an event — stdin EOF, a signal, a
+    deadline. This one infers that the client is gone from being reparented,
+    because a client that exits having leaked the stdin pipe's write end into a
+    surviving descendant produces no event at all (#906 branch (b)).
+
+    Off by default because the inference can be wrong and being wrong is
+    expensive: a launcher that ``exec``-replaces itself keeps its pid and is
+    safe, but a short-lived wrapper shell that spawns this server and exits
+    reparents it while the real client is alive, and shutting down there costs a
+    working session — worse than the leak it prevents. Prefer ``exec`` in the
+    launcher over lowering this. The detached daemon runs its own lifespan and
+    is unaffected either way."""
+    parent_liveness_grace_seconds: float = Field(default=900.0, ge=0.0, allow_inf_nan=False)
+    """How long the connection must have been silent before the parent-liveness
+    backstop acts on a reparent, via
+    ``MEMTOMEM_STM_PARENT_LIVENESS_GRACE_SECONDS``; ``0`` acts on the reparent
+    alone. Ignored unless ``parent_liveness_poll_seconds`` is positive.
+
+    This is what separates a leaked descriptor from a live client behind a
+    wrapper launcher — the pipe cannot, since in both cases somebody still holds
+    the write end. A live client keeps speaking MCP; a descendant that merely
+    inherited a descriptor never does. A request in flight vetoes on its own,
+    so a call longer than this window does not read as silence. The cost of the
+    delay is nothing here: the failure being prevented is measured in days.
+
+    It is also the only thing holding a server that was *born* reparented — one
+    whose launcher backgrounded it and exited before it could look. There the
+    baseline is already the reaper, so the change comparison can never fire and
+    this window is the whole decision. A client that is quiet for all of it,
+    including one that is itself PID 1, is shut down."""
     proxy: ProxyConfig = Field(default_factory=ProxyConfig)
     surfacing: SurfacingConfig = Field(default_factory=SurfacingConfig)
     formation: FormationConfig = Field(default_factory=FormationConfig)

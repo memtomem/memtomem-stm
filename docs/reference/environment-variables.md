@@ -49,6 +49,8 @@ Status meanings:
 | `MEMTOMEM_STM_LOG_LEVEL` | `DEBUG / INFO / WARNING / ERROR / CRITICAL` | `WARNING` | Process log level. | Startup |
 | `MEMTOMEM_STM_LOG_FILE` | path or `null` | — | Optional rotating log file in addition to stderr. | Startup |
 | `MEMTOMEM_STM_TEARDOWN_WATCHDOG_SECONDS` | finite non-negative float | `60.0` | Ceiling on shutdown before the process exits the hard way; `0` disables the backstop. | Startup |
+| `MEMTOMEM_STM_PARENT_LIVENESS_POLL_SECONDS` | finite non-negative float | `0.0` | Poll interval for the parent-liveness backstop, which shuts down when the client goes away without closing stdin; `0` disables it. POSIX-only. | Startup |
+| `MEMTOMEM_STM_PARENT_LIVENESS_GRACE_SECONDS` | finite non-negative float | `900.0` | How long the connection must be silent before that backstop acts on a reparent; `0` acts on the reparent alone. | Startup |
 | `MEMTOMEM_STM_PROXY__ENABLED` | boolean | `false` | Enable proxy serving; new CLI configs normally persist this in JSON. | Bundled |
 | `MEMTOMEM_STM_PROXY__CONFIG_PATH` | path | `~/.memtomem/stm_proxy.json` | Proxy JSON location; CLI commands honor it too when `--config` is not typed. | Bundled |
 | `MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS` | JSON object | `{}` | Complete map of upstream MCP definitions. | Bundled |
