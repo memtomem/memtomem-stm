@@ -242,6 +242,31 @@ def test_a_reparented_client_that_only_sends_notifications_is_kept(tmp_path: Pat
         _cleanup(proc, server_pid)
 
 
+def test_a_launcher_that_exits_before_the_server_looks_is_still_caught(tmp_path: Path) -> None:
+    """The reparent can beat the watcher to the baseline. A shell that
+    backgrounds the server and exits immediately does so long before Python
+    reaches the constructor, so `getppid()` already answers with the reaper —
+    and comparing against that would agree forever, leaving the orphan running
+    for exactly the launch shape this feature is for."""
+    proc = _start_behind(
+        'exec 3<&0; "$PY" -m memtomem_stm.server <&3 & echo "SERVERPID $!" >&2', tmp_path
+    )
+    server_pid = None
+    try:
+        server_pid = _server_pid(proc)
+        stderr_lines = _drain_stderr(proc)
+        proc.wait(timeout=10.0)  # the launcher is already gone
+
+        assert _wait_gone(server_pid, _EXIT_BUDGET_SECONDS) is not None, b"".join(stderr_lines)[
+            -2000:
+        ]
+        assert any(b"no parent but the reaper" in line.lower() for line in stderr_lines), b"".join(
+            stderr_lines
+        )[-2000:]
+    finally:
+        _cleanup(proc, server_pid)
+
+
 def test_a_server_behind_an_exec_launcher_is_left_alone(tmp_path: Path) -> None:
     """An ``exec``-replacing launcher keeps its pid, so there is no reparent and
     nothing to infer. A shutdown here would cost a live session — the cost this

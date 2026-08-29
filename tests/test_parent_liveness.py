@@ -239,11 +239,48 @@ async def test_a_zero_grace_asks_only_for_the_confirmed_change() -> None:
     await asyncio.wait_for(task, timeout=1.0)
 
 
-async def test_being_a_child_of_pid_1_is_not_being_orphaned() -> None:
-    """The detached daemon is reparented to init at birth, and on macOS every
-    reparent lands on launchd — so ``== 1`` says nothing. Only a change from the
-    recorded value does."""
+async def test_starting_with_no_parent_but_the_reaper_counts_as_gone() -> None:
+    """A launcher that backgrounds this server and exits does so long before
+    Python can look, so the baseline is already the reaper and comparing against
+    it would agree forever — blind to the very launch shape the backstop exists
+    for. It counts as gone from the start instead, and the veto decides.
+
+    (The detached daemon is legitimately PPID 1, and runs its own lifespan in
+    daemon/server.py — this watcher never sees it.)"""
     parent, clock, reasons = _Parent(1), _Clock(), []
+    watcher = _watcher(parent, clock, reasons)
+    task = asyncio.create_task(watcher.run())
+    for _ in range(60):
+        if reasons:
+            break
+        await asyncio.sleep(_POLL)
+    assert reasons == ["No parent process but the reaper (ppid 1)"]
+    await asyncio.wait_for(task, timeout=1.0)
+
+
+async def test_a_born_orphan_with_a_live_client_is_still_spared() -> None:
+    """Which is what keeps that from being a licence to kill: the same grace and
+    in-flight veto apply, so a client still talking to us through the launcher's
+    corpse keeps its session."""
+    parent, clock, reasons = _Parent(1), _Clock(), []
+    watcher = _watcher(parent, clock, reasons, grace_seconds=900.0)
+    task = asyncio.create_task(watcher.run())
+    for _ in range(10):
+        watcher.note_activity()
+        await asyncio.sleep(_POLL)
+    assert reasons == []
+    clock.now += 901.0
+    for _ in range(60):
+        if reasons:
+            break
+        await asyncio.sleep(_POLL)
+    assert reasons  # and it is collected once the talking stops
+    await asyncio.wait_for(task, timeout=1.0)
+
+
+async def test_a_stable_ordinary_parent_is_never_orphaned() -> None:
+    # The value of the pid says nothing on its own; only losing it does.
+    parent, clock, reasons = _Parent(4242), _Clock(), []
     watcher = _watcher(parent, clock, reasons)
     task = asyncio.create_task(watcher.run())
     await asyncio.sleep(_POLL * 10)

@@ -257,8 +257,17 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
             grace_seconds=config.parent_liveness_grace_seconds,
             on_parent_gone=shutdown_signals.trigger,
         )
-        _instrument_client_activity(server, parent_watcher)
-        parent_watcher_task = asyncio.create_task(parent_watcher.run(), name="parent-liveness")
+        observed = _instrument_client_activity(server, parent_watcher)
+        if observed or config.parent_liveness_grace_seconds <= 0:
+            parent_watcher_task = asyncio.create_task(parent_watcher.run(), name="parent-liveness")
+        else:
+            # Without the activity feed the veto has nothing to weigh, so the
+            # watcher would end a live session a grace period after startup on
+            # any reparent. A missed leak costs what it cost before this feature
+            # existed; a wrong shutdown costs a working session. So it does not
+            # start — except under a zero grace, which asks for the reparent
+            # alone and never consults activity.
+            parent_watcher = None
     # Daemon discovery/spawn must use the same env/default-only basis the
     # detached daemon loads. The proxy file may later propagate a file-only
     # consumer_model into surfacing; using that mutated config for discovery
@@ -847,10 +856,18 @@ def _instrument_client_activity(server: MCPServer, watcher: ParentLivenessWatche
     arriving is evidence either way.
 
     Returns whether it worked. The low-level server is reached through a private
-    attribute, the same surface the proxy already uses
-    (``_fastmcp_compat.py``); an SDK that moved it leaves the veto timing from
-    startup instead — a weaker guard against a false positive, but not a broken
-    server, so this warns rather than raises.
+    attribute, the same surface the proxy already uses (``_fastmcp_compat.py``);
+    an SDK that moved it leaves the backstop with no way to tell a live client
+    from a departed one, which the caller answers by not starting it at all.
+
+    What this still cannot see, because it is above ``ServerRunner`` rather than
+    inside it: frames arriving before the client's first request (the SDK's
+    era-peeker holds at most eight and dispatches none until an opening request
+    arrives), protocol-era rejections, malformed frames the dispatcher drops,
+    and responses to server-initiated requests. Each is a live client this would
+    miss; each is also traffic that no real client produces *exclusively* for a
+    whole grace period, which is why the answer is a documented boundary rather
+    than a lower-level hook.
     """
     try:
         middleware = server._lowlevel_server.middleware
@@ -867,7 +884,13 @@ def _instrument_client_activity(server: MCPServer, watcher: ParentLivenessWatche
         with watcher.serving():
             return await call_next(ctx)
 
-    middleware.append(_stamp_activity)
+    # Outermost, not appended. The list runs outermost-first, and the SDK
+    # already installs middleware that can answer a frame without delegating —
+    # ``RequestStateBoundary`` raises "Invalid or expired requestState" before
+    # its ``call_next``. A client retrying such a call is demonstrably there,
+    # and from behind those layers this would not see it. Observation belongs
+    # above everything that can reject.
+    middleware.insert(0, _stamp_activity)
     return True
 
 

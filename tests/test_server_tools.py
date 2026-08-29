@@ -2025,7 +2025,9 @@ class TestLifespan:
                 assert ctx.feedback_tracker is None
                 assert captured_engine_kwargs.get("feedback_tracker") is None
 
-    async def _run_minimal_lifespan(self, *, pm_stop=None, parent_liveness_poll=0.0, settle=False):
+    async def _run_minimal_lifespan(
+        self, *, pm_stop=None, parent_liveness_poll=0.0, parent_liveness_grace=900.0, settle=False
+    ):
         """Drive app_lifespan with everything optional off — enough config for
         startup, so a teardown-only assertion is all the test carries.
         *pm_stop* replaces ProxyManager.stop's side effect.
@@ -2055,7 +2057,7 @@ class TestLifespan:
             mock_cfg.otlp = MagicMock()
             mock_cfg.otlp.enabled = False
             mock_cfg.parent_liveness_poll_seconds = parent_liveness_poll
-            mock_cfg.parent_liveness_grace_seconds = 900.0
+            mock_cfg.parent_liveness_grace_seconds = parent_liveness_grace
 
             async with app_lifespan(mcp) as _ctx:
                 if settle:
@@ -2141,6 +2143,35 @@ class TestLifespan:
         # somebody else's task and it would outlive the teardown it started.
         assert tasks[0] not in signals[0].foreign
         assert watcher.stopped and tasks[0].cancelled()
+
+    async def test_a_backstop_that_cannot_see_the_client_does_not_start(self, monkeypatch):
+        """Without the activity feed the veto has nothing to weigh, so the
+        watcher would end a live session a grace period after startup on any
+        reparent. A missed leak costs what it cost before this feature existed;
+        a wrong shutdown costs a working session."""
+        built, tasks, _ = await self._recording_parent_liveness(monkeypatch)
+        monkeypatch.setattr(
+            "memtomem_stm.server._instrument_client_activity", lambda _server, _watcher: False
+        )
+
+        await self._run_minimal_lifespan(parent_liveness_poll=30.0, settle=True)
+
+        assert len(built) == 1  # constructed, then deliberately not run
+        assert tasks == []
+
+    async def test_a_zero_grace_backstop_runs_without_the_activity_feed(self, monkeypatch):
+        # A zero grace asks for the reparent alone and never consults activity,
+        # so losing the feed costs it nothing.
+        built, tasks, _ = await self._recording_parent_liveness(monkeypatch)
+        monkeypatch.setattr(
+            "memtomem_stm.server._instrument_client_activity", lambda _server, _watcher: False
+        )
+
+        await self._run_minimal_lifespan(
+            parent_liveness_poll=30.0, parent_liveness_grace=0.0, settle=True
+        )
+
+        assert len(built) == 1 and len(tasks) == 1
 
     async def test_teardown_terminates_a_child_that_survived_every_stop(self, monkeypatch, caplog):
         """A stop() can return while abandoning a live stdio child (owner task
@@ -2987,6 +3018,7 @@ class TestClientActivityInstrumentation:
             low.add_request_handler("initialize", types.RequestParams, lambda _c, _p: None)
 
         before = list(low.middleware)
+        assert before, "the SDK installs its own middleware, so position matters"
         stamps: list[int] = []
 
         class _Watcher:
@@ -3009,7 +3041,11 @@ class TestClientActivityInstrumentation:
         watcher = _Watcher()
         assert _instrument_client_activity(server, watcher) is True
         assert len(low.middleware) == len(before) + 1
-        assert low.middleware[: len(before)] == before  # appended, innermost
+        # Outermost, not appended: the list runs outermost-first and the SDK
+        # already installs middleware that answers a frame without delegating
+        # (RequestStateBoundary raises on an expired requestState before its
+        # call_next). Observation has to sit above everything that can reject.
+        assert low.middleware[1:] == before
 
         # It stamps, delegates, and returns what the chain returned.
         sentinel = object()
@@ -3017,7 +3053,7 @@ class TestClientActivityInstrumentation:
         async def _call_next(ctx):
             return sentinel
 
-        assert await low.middleware[-1](SimpleNamespace(method="ping"), _call_next) is sentinel
+        assert await low.middleware[0](SimpleNamespace(method="ping"), _call_next) is sentinel
         assert stamps == [1]
         # The whole frame is held, not just its arrival: a call that outlasts
         # the grace must not read as silence while the client waits for it.
@@ -3029,7 +3065,7 @@ class TestClientActivityInstrumentation:
             raise RuntimeError("method not found")
 
         with pytest.raises(RuntimeError):
-            await low.middleware[-1](SimpleNamespace(method="nope"), _boom)
+            await low.middleware[0](SimpleNamespace(method="nope"), _boom)
         assert stamps == [1, 1]
         assert watcher.depth == 0  # a failing frame releases its hold
 

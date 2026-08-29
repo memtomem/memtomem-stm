@@ -536,8 +536,15 @@ class STMConfig(BaseSettings):
     This is what separates a leaked descriptor from a live client behind a
     wrapper launcher — the pipe cannot, since in both cases somebody still holds
     the write end. A live client keeps speaking MCP; a descendant that merely
-    inherited a descriptor never does. The cost of the delay is nothing here:
-    the failure being prevented is measured in days."""
+    inherited a descriptor never does. A request in flight vetoes on its own,
+    so a call longer than this window does not read as silence. The cost of the
+    delay is nothing here: the failure being prevented is measured in days.
+
+    It is also the only thing holding a server that was *born* reparented — one
+    whose launcher backgrounded it and exited before it could look. There the
+    baseline is already the reaper, so the change comparison can never fire and
+    this window is the whole decision. A client that is quiet for all of it,
+    including one that is itself PID 1, is shut down."""
     proxy: ProxyConfig = Field(default_factory=ProxyConfig)
     surfacing: SurfacingConfig = Field(default_factory=SurfacingConfig)
     formation: FormationConfig = Field(default_factory=FormationConfig)

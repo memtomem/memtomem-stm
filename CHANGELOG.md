@@ -36,8 +36,13 @@ changes inline only. See the deprecation policy in
   write end in both, but the traffic can, so the shutdown also requires no
   inbound MCP message for `MEMTOMEM_STM_PARENT_LIVENESS_GRACE_SECONDS` (default
   900). A request inside that window defers the shutdown rather than cancelling
-  it. Residual risk, stated plainly: a wrapper-launched client that is
-  completely silent for the whole grace period is shut down. Prefer `exec` in
+  it, and one still in flight vetoes on its own, so a call longer than the
+  window does not read as silence. That window is also the whole decision for a
+  server that was *born* reparented — a launcher that backgrounded it and exited
+  before it could look leaves the reaper as the baseline, where the change
+  comparison can never fire. Residual risk, stated plainly: a wrapper-launched
+  client completely silent for the whole grace period is shut down, including a
+  client that is itself PID 1. Prefer `exec` in
   the launcher — a launcher that replaces itself keeps its pid and this never
   fires — or leave the feature off. POSIX-only; the detached daemon runs its own
   lifespan and is unaffected.

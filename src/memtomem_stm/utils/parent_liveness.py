@@ -91,6 +91,17 @@ class ParentLivenessWatcher:
         # with it. The watcher would then be permanently blind to precisely the
         # orphaning it exists to catch.
         self._recorded_ppid = getppid()
+        # Born already reparented. A launcher that backgrounds this server and
+        # exits does so long before Python reaches this line, so there is no
+        # earlier place to look: by the time we can ask, the answer is the
+        # reaper. Comparing against it would then agree forever and the backstop
+        # would never fire — for exactly the launch shape it exists to catch.
+        # So this counts as gone from the start, and the veto below decides:
+        # a live client behind such a launcher keeps talking and keeps the
+        # process, while a truly orphaned one goes quiet and is collected.
+        # (Note for the stdio server only. The detached daemon is legitimately
+        # PPID 1 and runs its own lifespan, never this watcher.)
+        self._born_orphaned = self._recorded_ppid <= 1
         self._in_flight = 0
 
     def note_activity(self) -> None:
@@ -141,8 +152,11 @@ class ParentLivenessWatcher:
 
         recorded = self._recorded_ppid
         logger.info(
-            "Parent-liveness backstop watching ppid %d (poll %gs, grace %gs) — #914",
-            recorded,
+            "Parent-liveness backstop %s (poll %gs, grace %gs) — #914",
+            f"started with no parent but the reaper (ppid {recorded}), so only the "
+            f"grace and in-flight veto hold it"
+            if self._born_orphaned
+            else f"watching ppid {recorded}",
             self._poll_seconds,
             self._grace_seconds,
         )
@@ -162,7 +176,7 @@ class ParentLivenessWatcher:
                 return
 
             current = self._getppid()
-            if current == recorded:
+            if current == recorded and not self._born_orphaned:
                 if confirmations:
                     logger.info(
                         "Parent pid is %d again — the earlier change was a bad sample.",
@@ -175,10 +189,10 @@ class ParentLivenessWatcher:
             confirmations += 1
             if confirmations < _CONFIRM_POLLS:
                 logger.warning(
-                    "Parent changed: recorded ppid %d, now %d — confirming at the next "
-                    "poll before acting (#914).",
-                    recorded,
-                    current,
+                    "%s — confirming at the next poll before acting (#914).",
+                    f"Started with no parent but the reaper (ppid {current})"
+                    if self._born_orphaned
+                    else f"Parent changed: recorded ppid {recorded}, now {current}",
                 )
                 continue
 
@@ -199,14 +213,22 @@ class ParentLivenessWatcher:
                     vetoed = True
                 continue
 
+            what = (
+                f"No parent but the reaper (ppid {current}) since startup"
+                if self._born_orphaned
+                else f"Parent gone: recorded ppid {recorded}, now {current}"
+            )
             logger.warning(
-                "Parent gone: recorded ppid %d, now %d, no request for %.0fs "
-                "(grace %.0fs) — shutting down (#914).",
-                recorded,
-                current,
+                "%s, no request for %.0fs (grace %.0fs) — shutting down (#914).",
+                what,
                 idle,
                 self._grace_seconds,
             )
             # Nothing may be awaited after this: the shutdown cancels this task.
-            self._on_parent_gone(f"Parent process gone (ppid {recorded} -> {current})")
+            reason = (
+                f"No parent process but the reaper (ppid {current})"
+                if self._born_orphaned
+                else f"Parent process gone (ppid {recorded} -> {current})"
+            )
+            self._on_parent_gone(reason)
             return
