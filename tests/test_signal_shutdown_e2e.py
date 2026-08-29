@@ -13,6 +13,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -24,16 +25,25 @@ pytestmark = [
 ]
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+_FAKE_UPSTREAM = Path(__file__).resolve().parent / "_fake_memtomem_server.py"
 _EXIT_BUDGET_SECONDS = 30.0
+_HANDSHAKE_BUDGET_SECONDS = 30.0
 
 
-def _start_server(tmp_path: Path) -> subprocess.Popen[bytes]:
+def _start_server(tmp_path: Path, *, log_level: str = "WARNING") -> subprocess.Popen[bytes]:
+    # A real proxied upstream, so the server owns a real stdio child: without
+    # one the "leaves nothing behind" assertion has nothing to assert on.
+    upstreams = {
+        "fake": {"prefix": "fake", "command": sys.executable, "args": [str(_FAKE_UPSTREAM)]}
+    }
     env = dict(
         os.environ,
         MEMTOMEM_STM_DATA_DIR=str(tmp_path),
-        MEMTOMEM_STM_PROXY__ENABLED="false",
+        MEMTOMEM_STM_PROXY__ENABLED="true",
+        MEMTOMEM_STM_PROXY__CONFIG_PATH=str(tmp_path / "proxy.json"),
+        MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS=json.dumps(upstreams),
         MEMTOMEM_STM_SURFACING__ENABLED="false",
-        MEMTOMEM_STM_LOG_LEVEL="WARNING",
+        MEMTOMEM_STM_LOG_LEVEL=log_level,
         # Short enough that a hung teardown fails this test rather than the CI job.
         MEMTOMEM_STM_TEARDOWN_WATCHDOG_SECONDS="10",
         PYTHONPATH=str(_REPO_ROOT / "src"),
@@ -46,6 +56,18 @@ def _start_server(tmp_path: Path) -> subprocess.Popen[bytes]:
         env=env,
         cwd=str(_REPO_ROOT),
     )
+
+
+def _read_line_or_fail(proc: subprocess.Popen[bytes]) -> bytes:
+    """Read one line under a deadline, so a stalled startup fails this test
+    rather than hanging the CI job with no budget of its own."""
+    assert proc.stdout is not None
+    result: list[bytes] = []
+    reader = threading.Thread(target=lambda: result.append(proc.stdout.readline()), daemon=True)
+    reader.start()
+    reader.join(timeout=_HANDSHAKE_BUDGET_SECONDS)
+    assert result, "server produced no response within the handshake budget"
+    return result[0]
 
 
 def _initialize(proc: subprocess.Popen[bytes]) -> None:
@@ -63,10 +85,28 @@ def _initialize(proc: subprocess.Popen[bytes]) -> None:
     }
     proc.stdin.write((json.dumps(request) + "\n").encode())
     proc.stdin.flush()
-    line = proc.stdout.readline()
+    line = _read_line_or_fail(proc)
     assert b'"result"' in line, line
     proc.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
     proc.stdin.flush()
+
+
+def _wait_for_stderr(proc: subprocess.Popen[bytes], needle: bytes) -> bool:
+    """Wait until *needle* appears on the child's stderr, under a deadline."""
+    assert proc.stderr is not None
+    seen: list[bool] = []
+
+    def _scan() -> None:
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            if needle in line:
+                seen.append(True)
+                return
+
+    scanner = threading.Thread(target=_scan, daemon=True)
+    scanner.start()
+    scanner.join(timeout=_HANDSHAKE_BUDGET_SECONDS)
+    return bool(seen)
 
 
 def _children(pid: int) -> set[int]:
@@ -93,6 +133,9 @@ def test_a_signalled_server_exits_and_leaves_nothing_behind(
     try:
         _initialize(proc)
         before = _children(proc.pid)
+        # The proxied upstream is a real stdio child; without one this test
+        # would assert nothing about cleanup.
+        assert before, "expected the proxied upstream to be running as a child"
 
         proc.send_signal(sig)
         started = time.monotonic()
@@ -117,18 +160,23 @@ def test_a_signalled_server_exits_and_leaves_nothing_behind(
 
 
 def test_a_twice_signalled_server_exits_with_the_signal_status(tmp_path: Path) -> None:
-    # The conventional 128+signum, so a supervisor reading the status sees what
-    # actually happened rather than a generic failure.
-    proc = _start_server(tmp_path)
+    """The conventional 128+signum, so a supervisor reading the status sees what
+    actually happened rather than a generic failure.
+
+    The second signal is sent only once the first has been *handled* — POSIX
+    does not queue signals, so firing both immediately can collapse into one
+    delivery and let the graceful path satisfy the assertion, which would hide
+    a broken second-signal handler entirely.
+    """
+    proc = _start_server(tmp_path, log_level="INFO")
     try:
         _initialize(proc)
         proc.send_signal(signal.SIGINT)
+        assert _wait_for_stderr(proc, b"Signal again to exit immediately"), (
+            "the first signal was never handled"
+        )
         proc.send_signal(signal.SIGINT)
-        returncode = proc.wait(timeout=_EXIT_BUDGET_SECONDS)
-        # Two signals can also collapse into one delivery (POSIX does not queue
-        # them), in which case the graceful path wins the race — so accept that
-        # too. What must never happen is the process surviving both.
-        assert returncode in (0, 128 + int(signal.SIGINT))
+        assert proc.wait(timeout=_EXIT_BUDGET_SECONDS) == 128 + int(signal.SIGINT)
     finally:
         if proc.poll() is None:
             proc.kill()

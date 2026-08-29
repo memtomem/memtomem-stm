@@ -46,6 +46,15 @@ logger = logging.getLogger(__name__)
 _signalled = False
 
 
+_teardown_completed = False
+
+
+def teardown_completed() -> None:
+    """Record that the lifespan teardown ran to the end."""
+    global _teardown_completed
+    _teardown_completed = True
+
+
 def exit_after_signal_shutdown() -> None:
     """End the process now that a signalled teardown has finished.
 
@@ -56,15 +65,34 @@ def exit_after_signal_shutdown() -> None:
     complete perfectly and the process still never goes away, which is the #906
     shape this whole change is about.
 
-    Everything that needed to happen has happened: the teardown ran, the
-    children were swept. All that is left is the exit, so take it.
+    The status says which of those two things happened. A teardown that ran to
+    the end earned a 0; one cut short — a ``CancelledError`` out of a step whose
+    guard only catches ``Exception`` skips every later close — did not, and
+    reporting success there would be this code asserting something it does not
+    know. ``os._exit`` skips atexit hooks and finalizers either way, so the
+    difference is exactly whether the explicit close sequence completed.
     """
+    if not _teardown_completed:
+        logger.warning(
+            "Shutdown was signalled but teardown did not run to the end — "
+            "exiting anyway; some resources were closed by the OS, not by us"
+        )
     for handler in logging.getLogger().handlers:
         try:
             handler.flush()
         except Exception:  # pragma: no cover — a handler that cannot flush
             pass
-    os._exit(0)
+    os._exit(0 if _teardown_completed else 1)
+
+
+def shutdown_was_signalled() -> bool:
+    """True once a shutdown signal has been handled in this process.
+
+    ``mcp.run()`` may return normally after the cancellation unwind rather than
+    raising — measured: it does exactly that when the proxy owns an upstream
+    connection — so the exit cannot be hung off the exception alone.
+    """
+    return _signalled
 
 
 def was_signal_shutdown(exc: BaseException) -> bool:
@@ -73,13 +101,25 @@ def was_signal_shutdown(exc: BaseException) -> bool:
     Requires both halves: a signal was delivered, and the exception is nothing
     but cancellation. A real failure that happens to arrive after a signal is
     still a failure, and cancellation with no signal behind it is not this.
+
+    anyio's strict task groups deliver the unwind as a ``BaseExceptionGroup``
+    (``CancelledError`` is a ``BaseException``, so the group cannot be a plain
+    ``ExceptionGroup``), and those nest, hence the recursion — with the
+    requirement that something actually matched, since ``all([])`` would
+    otherwise read an empty group as a clean shutdown.
     """
     if not _signalled:
         return False
+    return _is_only_cancellation(exc)
+
+
+def _is_only_cancellation(exc: BaseException) -> bool:
     if isinstance(exc, asyncio.CancelledError):
         return True
     if isinstance(exc, BaseExceptionGroup):
-        return all(was_signal_shutdown(inner) for inner in exc.exceptions)
+        return bool(exc.exceptions) and all(
+            _is_only_cancellation(inner) for inner in exc.exceptions
+        )
     return False
 
 
@@ -107,11 +147,22 @@ class ShutdownSignals:
         self._arm_watchdog = arm_watchdog
         self._hard_exit_cleanup = hard_exit_cleanup
         self._signalled = False
+        self._tearing_down = False
         self._installed: list[int] = []
+        self._foreign_tasks: frozenset[asyncio.Task[object]] = frozenset()
 
     def install(self) -> None:
         """Take over SIGTERM/SIGINT. Never raises: a server that cannot install
         a handler still has to serve."""
+        global _signalled
+        _signalled = False  # per-run: a previous run's signal is not ours
+        # Tasks that predate us belong to whoever is hosting this lifespan, the
+        # same way children that predate us do. Cancelling those would be this
+        # module reaching outside its own process ownership.
+        try:
+            self._foreign_tasks = frozenset(asyncio.all_tasks())
+        except RuntimeError:  # pragma: no cover — no running loop
+            self._foreign_tasks = frozenset()
         loop = asyncio.get_running_loop()
         for sig in _SHUTDOWN_SIGNALS:
             try:
@@ -123,10 +174,22 @@ class ShutdownSignals:
                 continue
             self._installed.append(sig)
 
+    def entering_teardown(self) -> None:
+        """Teardown has begun: from here a signal means "stop waiting".
+
+        Deliberately not a ``remove()``. Handing the signals back would put the
+        default disposition in charge for the whole of teardown — SIGTERM
+        killing the process mid-sweep, SIGINT raising into a main thread that
+        unwinds nothing — which is precisely the window this shutdown exists to
+        survive. Instead the next signal takes the immediate-exit path, and a
+        signal that started this teardown does not re-enter it.
+        """
+        self._tearing_down = True
+
     def remove(self) -> None:
-        """Give the signals back. Called as teardown begins, so a signal
-        arriving mid-teardown gets the default disposition rather than a
-        second, re-entrant shutdown."""
+        """Give the signals back — for a lifespan that ends without exiting the
+        process (a host unmounting us), where leaving handlers installed would
+        outlive what they were guarding."""
         loop = asyncio.get_running_loop()
         for sig in self._installed:
             try:
@@ -137,30 +200,35 @@ class ShutdownSignals:
 
     def _on_signal(self, sig: int) -> None:
         global _signalled
-        if self._signalled:
+        if self._signalled or self._tearing_down:
+            # Either a second signal, or one arriving while we are already
+            # shutting down. Both mean the same thing: stop waiting.
             self._exit_now(sig)
             return
         self._signalled = True
         _signalled = True
+        # Armed before anything that can block — a wedged logging handler must
+        # not be able to cost us the backstop.
+        self._arm_watchdog()
         logger.info(
             "Received %s — shutting down. Signal again to exit immediately.",
             signal.Signals(sig).name,
         )
-        # Armed first: cancellation is the mechanism, this is the guarantee.
-        self._arm_watchdog()
         self._cancel_everything()
 
-    @staticmethod
-    def _cancel_everything() -> None:
+    def _cancel_everything(self) -> None:
         """Unwind the SDK's task group so the lifespan's ``finally`` runs.
 
-        Cancelling every task rather than one we own, because the task doing
-        the blocking read belongs to the SDK and there is no handle to it here.
-        Never raises: the watchdog is what has to survive this.
+        Cancelling tasks rather than one we own, because the task doing the
+        blocking read belongs to the SDK and there is no handle to it here —
+        but not tasks that predate us, which belong to a host that mounted this
+        lifespan rather than to this shutdown. Never raises: the watchdog is
+        what has to survive this.
         """
         try:
             for task in asyncio.all_tasks():
-                task.cancel()
+                if task not in self._foreign_tasks:
+                    task.cancel()
         except RuntimeError:  # pragma: no cover — no running loop
             logger.debug("Could not cancel tasks to start shutdown", exc_info=True)
 

@@ -147,6 +147,9 @@ def _no_real_shutdown_signals(monkeypatch: pytest.MonkeyPatch) -> None:
         def install(self) -> None:
             pass
 
+        def entering_teardown(self) -> None:
+            pass
+
         def remove(self) -> None:
             pass
 

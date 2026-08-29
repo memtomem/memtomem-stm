@@ -55,6 +55,8 @@ from memtomem_stm.utils import child_reaper
 from memtomem_stm.utils.signal_shutdown import (
     ShutdownSignals,
     exit_after_signal_shutdown,
+    shutdown_was_signalled,
+    teardown_completed,
     was_signal_shutdown,
 )
 from memtomem_stm.utils.teardown_watchdog import TeardownWatchdog
@@ -569,9 +571,11 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
         # ``ShutdownSignals``) simply keeps its countdown.
         watchdog.arm()
         try:
-            # First, so a signal arriving mid-teardown gets the default
-            # disposition rather than re-entering a shutdown already underway.
-            shutdown_signals.remove()
+            # Not a ``remove()``: handing the signals back would put the
+            # default disposition in charge for the whole of teardown, which is
+            # the window this exists to survive. From here a signal means
+            # "stop waiting" and takes the immediate-exit path.
+            shutdown_signals.entering_teardown()
             # Remove exactly what registration took ownership of (#891). Re-deriving
             # the set with ``get_proxy_tools()`` here would remove whatever the
             # session advertises *now*: a ``tools/list_changed`` or a republished
@@ -655,7 +659,16 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
             try:
                 child_reaper.sweep_leaked_children(baseline=children_at_startup)
             finally:
+                teardown_completed()
                 watchdog.disarm()
+                if shutdown_was_signalled():
+                    # Here, not in ``main``: cancelling the lifespan does not
+                    # make ``mcp.run()`` return — the SDK's ``anyio.run`` is
+                    # still waiting on the stdin reader, blocked on a pipe the
+                    # client (alive; it only signalled us) still holds open. So
+                    # this is the last line of ours that runs, and everything
+                    # that had to happen has happened. Does not return.
+                    exit_after_signal_shutdown()
 
 
 # ``version=`` pins ``serverInfo.version`` in the ``initialize`` response to
@@ -2425,18 +2438,24 @@ def main() -> None:
     # after logging so the process still terminates; we only add observability.
     try:
         mcp.run()
-    except asyncio.CancelledError as e:
-        # A shutdown signal unwinds the SDK's task group by cancelling it, so
-        # the "failure" that arrives here is the shutdown working (#906). It is
-        # indistinguishable in shape from a crash, hence the flag rather than
-        # the exception type.
-        if not was_signal_shutdown(e):
-            logger.exception("STM MCP server terminated with an unhandled exception")
-            raise
-        logger.info("STM MCP server shut down on a signal")
-        exit_after_signal_shutdown()
-    except (RuntimeError, ExceptionGroup) as e:
+        if shutdown_was_signalled():
+            # Reached only when the lifespan never got to its own exit — a
+            # signal before startup finished, say. The unwind can also come
+            # back as a clean return rather than an exception, so this cannot
+            # hang off the exception alone.
+            logger.info("STM MCP server shut down on a signal")
+            exit_after_signal_shutdown()
+    except BaseException as e:
+        # ``BaseException``, not ``Exception``: a shutdown signal unwinds the
+        # SDK's task group by cancelling it, ``CancelledError`` is a
+        # ``BaseException``, and so anyio's strict task groups deliver that
+        # unwind as a ``BaseExceptionGroup`` — which no ``Exception`` arm ever
+        # sees. Missing it meant the shutdown path was skipped and the process
+        # exited on a traceback instead (#906).
         if was_signal_shutdown(e):
+            # The "failure" here is the shutdown working. It is
+            # indistinguishable in shape from a crash, hence the flag rather
+            # than the exception type. Does not return.
             logger.info("STM MCP server shut down on a signal")
             exit_after_signal_shutdown()
         # The bare RuntimeError occurs when the cancel-scope error escapes
@@ -2447,10 +2466,11 @@ def main() -> None:
                 "STM MCP server ignored a known AnyIO cancel-scope cleanup condition: %s", e
             )
             return
-        logger.exception("STM MCP server terminated with an unhandled exception")
-        raise
-    except Exception:
-        logger.exception("STM MCP server terminated with an unhandled exception")
+        # Anything that is not an ``Exception`` — an interrupt, a SystemExit —
+        # is the process being asked to stop, and propagates as it always has,
+        # unlogged.
+        if isinstance(e, Exception):
+            logger.exception("STM MCP server terminated with an unhandled exception")
         raise
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import signal
 
 import pytest
@@ -36,6 +37,7 @@ def rec(monkeypatch: pytest.MonkeyPatch) -> _Recorder:
         staticmethod(lambda: setattr(recorder, "cancelled", recorder.cancelled + 1)),
     )
     monkeypatch.setattr(signal_shutdown, "_signalled", False)
+    monkeypatch.setattr(signal_shutdown, "_teardown_completed", False)
     return recorder
 
 
@@ -103,6 +105,9 @@ def test_a_signalled_unwind_is_not_a_crash(rec: _Recorder) -> None:
     _signals(rec)._on_signal(signal.SIGTERM)
     assert signal_shutdown.was_signal_shutdown(cancelled) is True
     assert signal_shutdown.was_signal_shutdown(BaseExceptionGroup("g", [cancelled])) is True
+    # anyio nests groups, so the walk has to recurse rather than look one deep.
+    nested = BaseExceptionGroup("outer", [BaseExceptionGroup("inner", [cancelled])])
+    assert signal_shutdown.was_signal_shutdown(nested) is True
     # A real failure that merely arrives after a signal is still a failure.
     assert signal_shutdown.was_signal_shutdown(RuntimeError("boom")) is False
     mixed = BaseExceptionGroup("g", [cancelled, RuntimeError("boom")])
@@ -146,11 +151,61 @@ async def test_install_never_fails_startup(rec: _Recorder, monkeypatch: pytest.M
     handler.remove()  # symmetric: removing what was never installed is fine
 
 
+def test_a_signal_during_teardown_stops_the_waiting(rec: _Recorder) -> None:
+    """Handing the signals back at the start of teardown would put the default
+    disposition in charge for the whole of it — SIGTERM killing the process
+    mid-sweep, SIGINT raising into a main thread that unwinds nothing. That is
+    the window this exists to survive, so a signal arriving there means "stop
+    waiting" instead."""
+    handler = _signals(rec)
+    handler.entering_teardown()
+    handler._on_signal(signal.SIGTERM)
+    assert rec.exits == [128 + int(signal.SIGTERM)]
+    assert rec.cancelled == 0  # not a second, re-entrant shutdown
+
+
+def test_tasks_that_predate_us_are_not_ours_to_cancel(
+    rec: _Recorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A host mounting this lifespan owns its own tasks, the same way it owns
+    # children that predate us. Cancelling those reaches outside this process's
+    # ownership of itself.
+    monkeypatch.undo()  # the fixture stubs _cancel_everything; test the real one
+
+    async def _drive() -> None:
+        foreign = asyncio.ensure_future(asyncio.sleep(30))
+        handler = _signals(rec)
+        handler.install()
+        try:
+            mine = asyncio.ensure_future(asyncio.sleep(30))
+            await asyncio.sleep(0)
+            handler._cancel_everything()
+            with contextlib.suppress(asyncio.CancelledError):
+                await mine
+            assert mine.cancelled()
+            assert not foreign.cancelled() and not foreign.done()
+        finally:
+            handler.remove()
+            for task in (foreign, mine):
+                task.cancel()
+
+    asyncio.run(_drive())
+
+
+def test_a_truncated_teardown_does_not_report_success(rec: _Recorder) -> None:
+    """A CancelledError out of a teardown step whose guard only catches
+    Exception skips every later close. Exiting 0 there would be this code
+    asserting something it does not know."""
+    signal_shutdown.exit_after_signal_shutdown()
+    assert rec.exits == [1]
+
+
 def test_a_finished_signal_shutdown_takes_the_exit(rec: _Recorder) -> None:
     """Returning from main is not enough: the SDK reads stdin on a non-daemon
     thread, still blocked on a pipe whose write end the client — alive, it only
     signalled us — still holds. The interpreter waits for that thread, so a
     perfect teardown can still leave the process running, which is the #906
     shape itself. Measured: without this the process sat there until killed."""
+    signal_shutdown.teardown_completed()
     signal_shutdown.exit_after_signal_shutdown()
     assert rec.exits == [0]
