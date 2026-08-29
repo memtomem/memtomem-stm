@@ -2018,14 +2018,15 @@ class TestLifespan:
                 assert ctx.feedback_tracker is None
                 assert captured_engine_kwargs.get("feedback_tracker") is None
 
-    async def _run_minimal_lifespan(self):
+    async def _run_minimal_lifespan(self, *, pm_stop=None):
         """Drive app_lifespan with everything optional off — enough config for
-        startup, so a teardown-only assertion is all the test carries."""
+        startup, so a teardown-only assertion is all the test carries.
+        *pm_stop* replaces ProxyManager.stop's side effect."""
         from memtomem_stm.server import app_lifespan, mcp
 
         mock_pm_instance = MagicMock()
         mock_pm_instance.start = AsyncMock()
-        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.stop = AsyncMock(side_effect=pm_stop)
         mock_pm_instance.get_proxy_tools.return_value = []
 
         with (
@@ -2055,8 +2056,12 @@ class TestLifespan:
         direct child after full teardown is that leak, so it must be
         terminated, and visibly."""
         killed = []
-        monkeypatch.setattr("memtomem_stm.utils.child_reaper.direct_child_pids", lambda: {4242})
-        monkeypatch.setattr("memtomem_stm.utils.child_reaper._has_exited", lambda _pid: False)
+        # Empty at startup, so 4242 is not in the baseline: it appeared during
+        # the session, which is what makes it ours to sweep.
+        probes = iter([set(), {4242}])
+        monkeypatch.setattr(
+            "memtomem_stm.utils.child_reaper.probe_child_pids", lambda: next(probes)
+        )
         monkeypatch.setattr(
             "memtomem_stm.utils.child_reaper.terminate_leaked_children", killed.append
         )
@@ -2081,42 +2086,21 @@ class TestLifespan:
         assert killed == []
         assert not any("leaked child process" in r.getMessage() for r in caplog.records)
 
-    async def test_teardown_sweeps_even_when_a_stop_is_cancelled(self, monkeypatch, caplog):
+    async def test_teardown_sweeps_even_when_a_stop_is_cancelled(self, monkeypatch):
         """A cancelled teardown is precisely when a stop() abandons its child,
         and CancelledError is not an Exception — it propagates past every
         `except Exception` guard in the teardown. The sweep must still run."""
-        from memtomem_stm.server import app_lifespan, mcp
-
         killed = []
-        monkeypatch.setattr("memtomem_stm.utils.child_reaper.direct_child_pids", lambda: {4242})
-        monkeypatch.setattr("memtomem_stm.utils.child_reaper._has_exited", lambda _pid: False)
+        probes = iter([set(), {4242}])
+        monkeypatch.setattr(
+            "memtomem_stm.utils.child_reaper.probe_child_pids", lambda: next(probes)
+        )
         monkeypatch.setattr(
             "memtomem_stm.utils.child_reaper.terminate_leaked_children", killed.append
         )
 
-        mock_pm_instance = MagicMock()
-        mock_pm_instance.start = AsyncMock()
-        mock_pm_instance.stop = AsyncMock(side_effect=asyncio.CancelledError())
-        mock_pm_instance.get_proxy_tools.return_value = []
-
-        with (
-            patch("memtomem_stm.server.STMConfig") as MockConfig,
-            patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
-        ):
-            mock_cfg = MockConfig.return_value
-            mock_cfg.proxy = MagicMock()
-            mock_cfg.proxy.enabled = False
-            mock_cfg.proxy.config_path = Path("/tmp/proxy.json")
-            mock_cfg.surfacing = MagicMock()
-            mock_cfg.surfacing.enabled = False
-            mock_cfg.langfuse = MagicMock()
-            mock_cfg.langfuse.enabled = False
-            mock_cfg.otlp = MagicMock()
-            mock_cfg.otlp.enabled = False
-
-            with pytest.raises(asyncio.CancelledError):
-                async with app_lifespan(mcp) as _ctx:
-                    pass
+        with pytest.raises(asyncio.CancelledError):
+            await self._run_minimal_lifespan(pm_stop=asyncio.CancelledError())
 
         assert killed == [{4242}]
 

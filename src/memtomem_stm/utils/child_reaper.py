@@ -17,8 +17,8 @@ code cost before the sweep existed; a process it kills wrongly is new damage
 this module inflicted — the shared daemon's whole session, or a host's worker.
 The two mistakes are not symmetric, so every ambiguity resolves toward leaving
 the process alone: children that predate us, children claimed via
-:func:`spawning_detached_child`, and pids that have already exited are all
-skipped, and none of those exclusions is re-litigated later to try to recover a
+:func:`spawn_claimed` are skipped, an unanswerable probe sweeps
+nothing, and none of those exclusions is re-litigated later to try to recover a
 leak. What it cannot do is attribute a child a *host* process spawned after we
 started; a host embedding this lifespan and spawning its own subprocesses
 should claim them the way ``daemon/spawn.py`` does.
@@ -37,8 +37,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -49,13 +48,18 @@ LEAK_KILL_ESCALATE_SECONDS = 2.0
 _ESCALATION_POLL_SECONDS = 0.05
 
 # Pids of children deliberately spawned to outlive us — see
-# :func:`spawning_detached_child`. The lock spans the spawn itself, not just the
+# :func:`spawn_claimed`. The lock spans the spawn itself, not just the
 # bookkeeping, so a sweep can never observe a child that exists but is not yet
 # claimed. Claims are never expired: a pid could be recycled onto a child we
 # later leak, but chasing that would trade the cheap mistake (a missed leak) for
 # the expensive one (killing the live daemon whose pid we misjudged).
 _detached_pids: set[int] = set()
 _detached_lock = threading.Lock()
+
+# Ceiling on waiting for a detached spawn to finish claiming. Long enough that a
+# healthy Popen never trips it, short enough that a wedged one cannot park a
+# shutdown — the sweep answers "unknown" and sweeps nothing instead.
+_CLAIM_LOCK_WAIT_SECONDS = 5.0
 
 # Ceiling on the `pgrep` probe. It is on the shutdown path, so a wedged process
 # table must not become the new reason we never exit.
@@ -88,16 +92,18 @@ def is_pid_alive(pid: int) -> bool:
     return True
 
 
-def direct_child_pids() -> set[int]:
-    """Best-effort set of this process's direct child pids (POSIX only).
+def probe_child_pids() -> set[int] | None:
+    """This process's direct child pids, or ``None`` when the probe failed.
 
-    Used by the teardown leak sweep. Returns an empty set on Windows or when
-    ``pgrep`` is unavailable/fails, degrading the sweep to a no-op rather
-    than blocking shutdown. ``pgrep`` never reports its own pid, so the
-    probe doesn't observe itself.
+    The distinction matters wherever the answer is used as a *spare* list: an
+    empty set there means "nothing to protect" and arms the sweep against
+    everything, so a transient ``pgrep`` failure would invert this module's
+    bias. Callers that use the answer as a kill list want the empty set — see
+    :func:`direct_child_pids`. ``pgrep`` never reports its own pid, so the probe
+    doesn't observe itself.
     """
     if sys.platform == "win32":
-        return set()
+        return None
     try:
         out = subprocess.run(
             ["pgrep", "-P", str(os.getpid())],
@@ -107,19 +113,40 @@ def direct_child_pids() -> set[int]:
             check=False,
         ).stdout
     except (OSError, subprocess.SubprocessError):
-        return set()
+        return None
     return {int(tok) for tok in out.split() if tok.isdigit()}
+
+
+def direct_child_pids() -> set[int]:
+    """Best-effort set of this process's direct child pids (POSIX only).
+
+    A failed or unavailable probe answers "no children", degrading the sweep to
+    a no-op rather than blocking shutdown. Never use this where the answer
+    spares processes — see :func:`probe_child_pids`.
+    """
+    return probe_child_pids() or set()
 
 
 def signal_pid(pid: int, sig: int) -> None:
     """Best-effort signal to *pid*'s process group, or *pid* alone when it
-    shares our own group (never signal our own group). A stdio child is
-    spawned with ``start_new_session=True``, so the group kill also reaches
-    grandchildren (e.g. ``uv run memtomem`` wrappers)."""
+    shares our own group (never signal our own group).
+
+    A stdio child is spawned with ``start_new_session=True``, so it leads its
+    own session and the group kill also reaches grandchildren — an abandoned
+    ``uv run memtomem`` wrapper's live server is only reachable this way.
+
+    That is also why a failed ``getpgid`` is not the end: it raises ESRCH for a
+    zombie leader on some platforms, and a zombie leader is exactly the case
+    where the group still holds the live grandchild we are trying to reach.
+    ``start_new_session`` makes the leader's pid its pgid, so fall back to that.
+    """
     if sys.platform == "win32":  # pragma: no cover — unreachable: no pgrep pids
         return
     try:
         pgid = os.getpgid(pid)
+    except (ProcessLookupError, PermissionError):
+        pgid = pid  # zombie leader (or gone); by construction it leads its group
+    try:
         if pgid != os.getpgid(0):
             os.killpg(pgid, sig)
         else:
@@ -185,53 +212,73 @@ def terminate_leaked_children(
         signal_pid(pid, signal.SIGKILL)
 
 
-@contextmanager
-def spawning_detached_child() -> Iterator[Callable[[int], None]]:
-    """Spawn a child meant to outlive us, without a sweep racing the spawn.
+def spawn_claimed(spawn: Callable[[], int]) -> None:
+    """Run *spawn* and claim its pid as meant to outlive us, atomically.
 
     The shared surfacing daemon is spawned detached but is still a direct child
     of whoever launched it (:mod:`memtomem_stm.daemon.spawn` does not
     double-fork), so a sweep that treats every surviving child as a leak takes
     down the daemon — and the LTM it holds for every other consumer — on each
-    shutdown. Registering the pid after the fact is not enough: the spawn runs
-    on a worker thread (``request_spawn`` under ``asyncio.to_thread``), so a
-    teardown landing between ``Popen`` returning and the registration would see
-    a pid nothing claims and kill it.
+    shutdown. Claiming the pid afterwards is not enough: the spawn runs on a
+    worker thread (``request_spawn`` under ``asyncio.to_thread``), so a teardown
+    landing between the spawn returning and the claim would see a pid nothing
+    claims and kill it.
 
-    Holding the lock across both means a concurrent sweep either runs entirely
-    before the spawn — when the pid does not exist yet, so it cannot be swept —
-    or entirely after it is claimed.
+    Taking *spawn* rather than yielding a claim callable is deliberate: a
+    caller cannot forget to claim what it spawned, and the lock provably spans
+    both. Holding the lock across a spawn is why the sweep's read of the claims
+    is bounded — see :func:`leaked_child_pids`.
     """
     with _detached_lock:
-        yield _detached_pids.add
+        _detached_pids.add(spawn())
 
 
-def leaked_child_pids(baseline: set[int] | None = None) -> set[int]:
-    """Direct children that are ours, alive, and were not meant to outlive us.
+def leaked_child_pids(baseline: set[int]) -> set[int] | None:
+    """Direct children that are ours and were not meant to outlive us.
+
+    ``None`` means the question could not be answered — a failed probe, or a
+    detached spawn holding the claim lock longer than we are willing to wait —
+    and the caller must then sweep nothing.
 
     *baseline* is the set of children that existed before we started: they
     predate us, so they are somebody else's (this lifespan can be hosted in a
-    process with its own subprocesses).
+    process with its own subprocesses). :func:`sweep_leaked_children` is what
+    turns "we never learned the baseline" into sweeping nothing.
 
     The probe runs *before* the claim set is read, and that order is the whole
-    guarantee. :func:`spawning_detached_child` holds the same lock across its
-    spawn, so a pid this probe saw was either claimed before the probe ran or
-    belongs to a spawn that had not started — read the claims the other way
-    round and a spawn completing between the two reads yields a live child that
-    the stale claim snapshot does not cover.
+    guarantee. :func:`spawn_claimed` holds the same lock across its spawn, so a
+    pid this probe saw was either claimed before the probe ran or belongs to a
+    spawn that had not started — read the claims the other way round and a spawn
+    completing between the two reads yields a live child that the stale claim
+    snapshot does not cover.
 
-    Pids that have already exited are dropped as well: a fire-and-forget child
-    nobody reaped lingers as a zombie that ``pgrep`` still lists, and signalling
-    it would mean group-signalling a session that is no longer ours.
+    A pid that has already exited stays in the answer. An unreaped zombie
+    *leader* still pins its pid, so its pgid cannot have been recycled, and the
+    live grandchild in that group is reachable only by signalling it. Skipping
+    the corpse would skip the leak.
     """
-    seen = direct_child_pids() - (baseline or set())
-    with _detached_lock:
-        seen -= _detached_pids
-    return {pid for pid in seen if not _has_exited(pid)}
+    seen = probe_child_pids()
+    if seen is None:
+        return None
+    seen -= baseline
+    if not _detached_lock.acquire(timeout=_CLAIM_LOCK_WAIT_SECONDS):
+        # A spawn is wedged mid-Popen. This is the one wait on the shutdown path
+        # that has no other ceiling, and the sweep must never be the reason the
+        # process fails to exit.
+        return None
+    try:
+        return seen - _detached_pids
+    finally:
+        _detached_lock.release()
 
 
-def sweep_leaked_children(*, baseline: set[int] | None = None) -> None:
+def sweep_leaked_children(*, baseline: set[int] | None) -> None:
     """Terminate every direct child that is ours and outlived its owner.
+
+    *baseline* is the children that existed at startup, or ``None`` if that
+    probe failed — and ``None`` sweeps nothing. An empty set would say "there
+    was nothing to protect" and arm the sweep against every pre-existing
+    process; a failed probe knows no such thing.
 
     Logs under this module rather than the caller's, so one logger name covers
     every leak this process reports regardless of which teardown swept.
@@ -239,6 +286,9 @@ def sweep_leaked_children(*, baseline: set[int] | None = None) -> None:
     Best-effort and never raises: it is the last step of a teardown, so a
     failure here must not replace one leak with a different one.
     """
+    if baseline is None:
+        logger.debug("Leaked-child sweep skipped: no startup baseline to compare against")
+        return
     try:
         leaked = leaked_child_pids(baseline)
         if not leaked:

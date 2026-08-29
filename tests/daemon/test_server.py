@@ -25,6 +25,7 @@ from uuid import uuid4
 import pytest
 
 import memtomem_stm.daemon.server as daemon_server
+from memtomem_stm.utils import child_reaper
 from memtomem_stm.config import STMConfig
 from memtomem_stm.daemon import client
 from memtomem_stm.daemon.discovery import (
@@ -979,17 +980,12 @@ async def test_teardown_sweeps_leaked_child_on_normal_stop_return(
     assert killed == [{222}]
 
 
-@pytest.mark.real_child_sweep
-@pytest.mark.skipif(sys.platform == "win32", reason="pgrep-based probe is POSIX-only")
-def test_direct_child_pids_sees_spawned_child() -> None:
-    child = _sleeping_child()
-    try:
-        assert child.pid in daemon_server._direct_child_pids()
-    finally:
-        child.terminate()
-        child.wait(timeout=5.0)
-    # Reaped → no longer listed.
-    assert child.pid not in daemon_server._direct_child_pids()
+@pytest.mark.real_child_sweep  # the stub replaces this very alias
+def test_direct_child_pids_is_the_shared_probe() -> None:
+    # The behaviour lives in tests/test_child_reaper.py; what the daemon needs
+    # pinned is that its own name still resolves to that probe, since its sweep
+    # and the tests that stub it both go through this alias.
+    assert daemon_server._direct_child_pids is child_reaper.direct_child_pids
 
 
 @pytest.mark.real_child_sweep

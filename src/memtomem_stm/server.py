@@ -51,7 +51,7 @@ from memtomem_stm.surfacing.observability import (
 from memtomem_stm.observability.tracing import traced
 from memtomem_stm.surfacing.feedback import FeedbackTracker
 from memtomem_stm.utils.anyio_shutdown import is_clean_cancel_scope_shutdown
-from memtomem_stm.utils.child_reaper import direct_child_pids, sweep_leaked_children
+from memtomem_stm.utils import child_reaper
 from memtomem_stm.utils.json_out import escape_lone_surrogates, require_utf8_identifier
 
 logger = logging.getLogger(__name__)
@@ -199,10 +199,11 @@ def _build_ltm_adapter(config: STMConfig, daemon_config: STMConfig) -> Any:
 async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
     # Children that predate us are somebody else's — this lifespan does not
     # always own the process it runs in. The teardown sweep (#906) subtracts
-    # them. A host that spawns its own subprocesses *after* mounting us cannot
-    # be told apart from a leak by this probe, and should claim them with
-    # ``child_reaper.spawning_detached_child``.
-    children_at_startup = direct_child_pids()
+    # them, and ``None`` (the probe failed) makes it sweep nothing rather than
+    # treat every pre-existing child as a leak. A host that spawns its own
+    # subprocesses *after* mounting us cannot be told apart from a leak by this
+    # probe, and should claim them with ``child_reaper.spawn_claimed``.
+    children_at_startup = child_reaper.probe_child_pids()
     config = STMConfig()
     # Daemon discovery/spawn must use the same env/default-only basis the
     # detached daemon loads. The proxy file may later propagate a file-only
@@ -594,7 +595,7 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                 except Exception:
                     logger.warning("Failed to shut down OTLP export", exc_info=True)
         finally:
-            sweep_leaked_children(baseline=children_at_startup)
+            child_reaper.sweep_leaked_children(baseline=children_at_startup)
 
 
 # ``version=`` pins ``serverInfo.version`` in the ``initialize`` response to

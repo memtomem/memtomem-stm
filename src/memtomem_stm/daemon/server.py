@@ -378,20 +378,24 @@ class DaemonServer:
         """
         before = _direct_child_pids()
         try:
-            await self._adapter.stop()
-        except Exception as exc:
-            if is_clean_cancel_scope_shutdown(exc):
-                logger.debug(
-                    "LTM adapter stop hit a known AnyIO cancel-scope cleanup condition — "
-                    "sweeping for a leaked LTM child"
-                )
-            else:
-                logger.debug("LTM adapter stop failed", exc_info=True)
-        leaked = before & _direct_child_pids()
-        if not leaked:
-            return
-        logger.warning("terminating leaked LTM child process(es): %s", sorted(leaked))
-        await _terminate_leaked_children(leaked)
+            try:
+                await self._adapter.stop()
+            except Exception as exc:
+                if is_clean_cancel_scope_shutdown(exc):
+                    logger.debug(
+                        "LTM adapter stop hit a known AnyIO cancel-scope cleanup condition — "
+                        "sweeping for a leaked LTM child"
+                    )
+                else:
+                    logger.debug("LTM adapter stop failed", exc_info=True)
+        finally:
+            # In a finally so a CancelledError out of stop() cannot skip the
+            # sweep — that is the unwind most likely to abandon a child, and
+            # it is why the escalation below blocks rather than awaits.
+            leaked = before & _direct_child_pids()
+            if leaked:
+                logger.warning("terminating leaked LTM child process(es): %s", sorted(leaked))
+                await _terminate_leaked_children(leaked)
 
     # ── connection handling ──────────────────────────────────────────────
 
