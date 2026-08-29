@@ -54,14 +54,15 @@ def test_a_finished_teardown_is_left_alone(no_real_exit: _Exits) -> None:
     assert no_real_exit.codes == []
 
 
-def test_a_timeout_that_is_not_a_bound_does_not_disable_the_backstop(
+def test_a_timeout_that_is_not_a_bound_degrades_to_off_not_to_a_dead_thread(
     no_real_exit: _Exits,
 ) -> None:
-    """`+inf` and NaN are not "never" — they are non-answers that would kill the
-    watchdog thread inside its own wait (Event.wait raises past TIMEOUT_MAX,
-    NaN compares False against every check) and silently take the guarantee
-    with them. The config field rejects both, but these models are mutable and
-    assignment is not re-validated."""
+    """Neither `+inf` nor NaN is a deadline, so neither can be honoured — what
+    matters is that they read as "off" rather than as a thread that died inside
+    its own wait while appearing to stand guard (Event.wait raises past
+    TIMEOUT_MAX; NaN compares False against every check). The config field
+    rejects both, but these models are mutable and assignment is not
+    re-validated."""
     assert TeardownWatchdog(float("inf"))._timeout == threading.TIMEOUT_MAX
     nan_watchdog = TeardownWatchdog(float("nan"))
     nan_watchdog.arm()
@@ -130,9 +131,10 @@ def test_a_failing_pre_exit_hook_still_exits(no_real_exit: _Exits, failure: Base
     assert no_real_exit.codes == [1]
 
 
-def test_a_wedged_logger_still_exits(no_real_exit: _Exits, monkeypatch: pytest.MonkeyPatch) -> None:
-    # The diagnostics are best-effort too: a handler stuck on its own lock, or
-    # one that raises, must not swallow the exit.
+def test_a_raising_logger_still_exits(
+    no_real_exit: _Exits, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The diagnostics are best-effort too: they must not swallow the exit.
     def _boom(*_args: object, **_kwargs: object) -> None:
         raise OSError("log target gone")
 
@@ -140,6 +142,40 @@ def test_a_wedged_logger_still_exits(no_real_exit: _Exits, monkeypatch: pytest.M
     TeardownWatchdog(0.05).arm()
     assert no_real_exit.wait()
     assert no_real_exit.codes == [1]
+
+
+def test_a_hung_pre_exit_step_still_exits(
+    no_real_exit: _Exits, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Swallowing errors does not bound a *hang*: a logging handler can block on
+    its own lock and the sweep shells out to pgrep. If the diagnostics could
+    park, the backstop would just be another way of not exiting."""
+    monkeypatch.setattr(teardown_watchdog, "_PRE_EXIT_BUDGET_SECONDS", 0.1)
+    released = threading.Event()
+
+    def _hangs() -> None:
+        released.wait(30.0)
+
+    try:
+        TeardownWatchdog(0.05, before_exit=_hangs).arm()
+        assert no_real_exit.wait()
+        assert no_real_exit.codes == [1]
+    finally:
+        released.set()
+
+
+def test_arming_survives_a_thread_constructor_failure(
+    no_real_exit: _Exits, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Construction, not just start(), and not just RuntimeError: whatever the
+    # failure, the teardown this was guarding still has to run.
+    def _cannot_construct(*_args: object, **_kwargs: object) -> None:
+        raise OSError("out of resources")
+
+    monkeypatch.setattr(teardown_watchdog.threading, "Thread", _cannot_construct)
+    watchdog = TeardownWatchdog(0.05)
+    watchdog.arm()  # must not raise
+    assert watchdog._thread is None
 
 
 def test_it_reports_why_before_exiting(

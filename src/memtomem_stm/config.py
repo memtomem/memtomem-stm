@@ -497,9 +497,12 @@ class STMConfig(BaseSettings):
     ``MEMTOMEM_STM_TEARDOWN_WATCHDOG_SECONDS``; ``0`` disables the backstop.
 
     Bounding the individual teardown steps is not the same as guaranteeing an
-    exit — cancelling a wait does not stop work that awaits a shielded task —
-    so this is the guarantee, armed only for the window between teardown
-    starting and finishing.
+    exit: cancelling a wait does not stop the work, and a ``stop()`` that
+    swallows cancellation outlives the wait itself. So this is the guarantee,
+    armed only for the window between teardown starting and finishing.
+
+    It ends the whole process. Set it to ``0`` when this server is embedded in
+    a process it does not own, where that is not yours to do.
 
     The default clears the worst legitimate shutdown with room to spare: the
     proxy/engine/warm-up ceilings total 20s, the LTM adapter's own bounded join

@@ -60,10 +60,10 @@ logger = logging.getLogger(__name__)
 # Per-step ceilings on the teardown. Each is far above a healthy stop() and far
 # below ``teardown_watchdog_seconds``, so the watchdog stays what it is meant to
 # be — the backstop for a wedge these did not recover, not the first thing to
-# fire. Bounding the wait does not stop the work (an owner ``close()`` awaits a
-# shielded task), so what these buy is a shutdown that continues, and a named
-# line saying which stop() to look at; the leaked-child sweep collects whatever
-# the abandoned step left behind.
+# fire. Bounding the wait does not stop the work, and for a stop() that swallows
+# cancellation it does not even bound the wait, so what these buy is a shutdown
+# that continues and a named line saying which stop() to look at; the
+# leaked-child sweep collects whatever the abandoned step left behind.
 _PROXY_STOP_BUDGET_SECONDS = 10.0
 _ENGINE_STOP_BUDGET_SECONDS = 5.0
 _WARMUP_JOIN_BUDGET_SECONDS = 5.0
@@ -539,11 +539,11 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
         # from any step below propagates past their ``except Exception`` guards,
         # and the leak is exactly what a cancelled teardown leaves behind.
         #
-        # The watchdog outranks both. Bounding the steps below cancels the
-        # *wait*, not the work — ``ProxyManager.stop()`` reaches an owner
-        # ``close()`` that awaits a shielded task — so a wedged stop() can still
-        # park a process that has nothing left to do but exit. Armed only for
-        # this window, it cannot fire during normal operation.
+        # The watchdog outranks both. The ceilings below cancel the *wait*, not
+        # the work, and a stop() that swallows cancellation outlives even the
+        # wait — so a wedged one can still park a process that has nothing left
+        # to do but exit. Armed only for this window, it cannot fire during
+        # normal operation.
         watchdog = TeardownWatchdog(
             config.teardown_watchdog_seconds,
             before_exit=lambda: child_reaper.sweep_leaked_children(baseline=children_at_startup),
