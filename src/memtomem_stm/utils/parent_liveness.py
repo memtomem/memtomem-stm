@@ -104,7 +104,7 @@ class ParentLivenessWatcher:
         recorded = self._getppid()
         self._last_activity = self._clock()
         logger.info(
-            "Parent-liveness backstop watching ppid %d (poll %.0fs, grace %.0fs) — #914",
+            "Parent-liveness backstop watching ppid %d (poll %gs, grace %gs) — #914",
             recorded,
             self._poll_seconds,
             self._grace_seconds,
