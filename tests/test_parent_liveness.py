@@ -116,6 +116,25 @@ async def test_a_reparented_process_with_no_traffic_shuts_down() -> None:
     assert len(reasons) == 1  # and never fires twice
 
 
+async def test_the_baseline_is_the_parent_at_construction_not_at_first_poll() -> None:
+    """The task does not start until the lifespan next awaits, and its startup
+    awaits for as long as the upstream connections take. A client that exits
+    inside that window would otherwise *be* the baseline, and every later poll
+    would agree with it — leaving the watcher blind to exactly the orphaning it
+    exists to catch."""
+    parent, clock, reasons = _Parent(4242), _Clock(), []
+    watcher = _watcher(parent, clock, reasons)
+    parent.pid = 1  # the client exits before the task gets its first turn
+
+    task = asyncio.create_task(watcher.run())
+    for _ in range(60):
+        if reasons:
+            break
+        await asyncio.sleep(_POLL)
+    assert reasons == ["Parent process gone (ppid 4242 -> 1)"]
+    await asyncio.wait_for(task, timeout=1.0)
+
+
 async def test_a_single_bad_sample_is_not_evidence() -> None:
     """A pid observed mid-reparent must not cost a live session, so a change has
     to survive a second poll."""

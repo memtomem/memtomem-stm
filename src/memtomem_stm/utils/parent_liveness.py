@@ -61,6 +61,10 @@ class ParentLivenessWatcher:
     *on_parent_gone* is the shutdown to start — :meth:`ShutdownSignals.trigger`
     in the server — called at most once, with a reason for the log. *getppid*
     and *clock* are injection points for tests; nothing else should pass them.
+
+    Construct this synchronously at the point the parent is still known to be
+    the client: the baseline is taken in ``__init__``, not when the task first
+    runs.
     """
 
     def __init__(
@@ -79,6 +83,13 @@ class ParentLivenessWatcher:
         self._clock = clock
         self._stop_event = asyncio.Event()
         self._last_activity = clock()
+        # Sampled here, not in ``run()``. The task does not start until the
+        # lifespan next awaits, and its startup awaits for as long as the
+        # upstream connections take — a client that exits inside that window
+        # would be recorded as the baseline, and every later poll would agree
+        # with it. The watcher would then be permanently blind to precisely the
+        # orphaning it exists to catch.
+        self._recorded_ppid = getppid()
 
     def note_activity(self) -> None:
         """Record that the client just spoke to us.
@@ -101,8 +112,7 @@ class ParentLivenessWatcher:
         if self._poll_seconds <= 0:
             return
 
-        recorded = self._getppid()
-        self._last_activity = self._clock()
+        recorded = self._recorded_ppid
         logger.info(
             "Parent-liveness backstop watching ppid %d (poll %gs, grace %gs) — #914",
             recorded,
