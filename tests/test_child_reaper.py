@@ -14,6 +14,7 @@ import threading
 import time
 
 import pytest
+from unittest import mock
 
 from memtomem_stm.utils import child_reaper
 
@@ -50,6 +51,39 @@ def _sigterm_ignoring_child() -> subprocess.Popen[bytes]:
     assert child.stdout is not None
     assert child.stdout.readline() == b"ready\n"
     return child
+
+
+_STUBBORN_CHILD_CODE = (
+    "import signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+    "sys.stdout.write('ready\\n'); sys.stdout.flush(); time.sleep(60)"
+)
+
+_LEADER_CODE = (
+    "import subprocess, sys;"
+    "c = subprocess.Popen([sys.executable, '-c', sys.argv[1]], stdout=subprocess.PIPE);"
+    "print(c.pid, flush=True);"
+    "print(c.stdout.readline().decode(), end='', flush=True)"
+)
+
+
+def _departed_leader_with_stubborn_child() -> tuple[subprocess.Popen[bytes], int]:
+    """A session leader that exits leaving a SIGTERM-ignoring child in its
+    process group — the abandoned ``uv run memtomem`` wrapper shape. The group
+    outlives the leader either way, whether it is reaped or lingers as a
+    zombie, and the pgid number cannot be recycled while it has members."""
+    leader = subprocess.Popen(
+        [sys.executable, "-c", _LEADER_CODE, _STUBBORN_CHILD_CODE],
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+    )
+    assert leader.stdout is not None
+    grandchild_pid = int(leader.stdout.readline())
+    assert leader.stdout.readline() == b"ready\n"
+    # Wait for the leader itself to go; only the grandchild is left in the group.
+    deadline = time.monotonic() + 5.0
+    while leader.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return leader, grandchild_pid
 
 
 def _reap(child: subprocess.Popen[bytes]) -> None:
@@ -131,18 +165,42 @@ def test_terminate_leaked_children_escalates_to_sigkill() -> None:
         _reap(child)
 
 
-def test_terminate_leaked_children_skips_escalation_for_pids_that_exited(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # A pid that died on SIGTERM must not be signalled again: pids are reused,
-    # so a late SIGKILL can land on an unrelated process.
+def test_a_child_that_died_on_sigterm_is_not_signalled_again() -> None:
+    # Pids are reused, so a late SIGKILL can land on an unrelated process. Uses
+    # a real child so the decision goes through the waitid branch that the
+    # production path actually takes, not the not-ours fallback.
+    child = _sleeping_child()
     signalled: list[tuple[int, int]] = []
-    monkeypatch.setattr(
-        child_reaper, "signal_pid", lambda pid, sig: signalled.append((pid, int(sig)))
-    )
-    monkeypatch.setattr(child_reaper, "is_pid_alive", lambda _pid: False)
-    child_reaper.terminate_leaked_children({111}, escalate_seconds=0.05)
-    assert signalled == [(111, int(signal.SIGTERM))]
+    real_signal = child_reaper.signal_pid
+
+    def _record(pid: int, sig: int) -> None:
+        signalled.append((pid, int(sig)))
+        real_signal(pid, sig)
+
+    try:
+        with mock.patch.object(child_reaper, "signal_pid", _record):
+            child_reaper.terminate_leaked_children({child.pid}, escalate_seconds=1.0)
+        assert child.wait(timeout=5.0) == -signal.SIGTERM
+        assert signalled == [(child.pid, int(signal.SIGTERM))]
+    finally:
+        _reap(child)
+
+
+def test_a_departed_leaders_group_still_gets_the_escalation() -> None:
+    """The sweep signals a process *group*, so the escalation has to ask about
+    the group. An abandoned wrapper's server keeps running in the group of a
+    leader that is already gone: judging by the leader alone drops it from the
+    escalation and leaks exactly the child the sweep exists to reach."""
+    leader, grandchild_pid = _departed_leader_with_stubborn_child()
+    try:
+        child_reaper.terminate_leaked_children({leader.pid}, escalate_seconds=0.3)
+        deadline = time.monotonic() + 5.0
+        while child_reaper.is_pid_alive(grandchild_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not child_reaper.is_pid_alive(grandchild_pid)
+    finally:
+        child_reaper.signal_pid(grandchild_pid, signal.SIGKILL)
+        _reap(leader)
 
 
 def test_escalation_does_not_wait_out_a_child_nobody_reaped() -> None:

@@ -980,12 +980,14 @@ async def test_teardown_sweeps_leaked_child_on_normal_stop_return(
     assert killed == [{222}]
 
 
-@pytest.mark.real_child_sweep  # the stub replaces this very alias
-def test_direct_child_pids_is_the_shared_probe() -> None:
+def test_direct_child_pids_delegates_to_the_shared_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # The behaviour lives in tests/test_child_reaper.py; what the daemon needs
-    # pinned is that its own name still resolves to that probe, since its sweep
-    # and the tests that stub it both go through this alias.
-    assert daemon_server._direct_child_pids is child_reaper.direct_child_pids
+    # pinned is that its own name is a live delegation rather than a value
+    # captured at import, so stubbing the shared probe reaches its sweep too.
+    monkeypatch.setattr(child_reaper, "probe_child_pids", lambda: {4242})
+    assert daemon_server._direct_child_pids() == {4242}
 
 
 @pytest.mark.real_child_sweep

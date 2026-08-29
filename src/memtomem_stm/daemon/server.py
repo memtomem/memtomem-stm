@@ -95,8 +95,14 @@ async def _quiet(coro: Any, what: str) -> None:
 # its call sites and the tests that monkeypatch them by attribute are unchanged.
 # ``signal_pid`` is deliberately not re-aliased: the escalation resolves it
 # inside ``child_reaper``, so an alias here would look patchable and silently
-# not be.
-_direct_child_pids = child_reaper.direct_child_pids
+# not be. For the same reason the probe is a wrapper rather than a value alias
+# — a value alias is patchable here but blind to a patch of the implementation
+# it came from, which is two truths for one probe.
+def _direct_child_pids() -> set[int]:
+    """This process's direct child pids — see ``child_reaper``."""
+    return child_reaper.direct_child_pids()
+
+
 _LEAK_KILL_ESCALATE_SECONDS = child_reaper.LEAK_KILL_ESCALATE_SECONDS
 
 

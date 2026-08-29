@@ -144,8 +144,14 @@ def signal_pid(pid: int, sig: int) -> None:
         return
     try:
         pgid = os.getpgid(pid)
-    except (ProcessLookupError, PermissionError):
-        pgid = pid  # zombie leader (or gone); by construction it leads its group
+    except ProcessLookupError:
+        # A zombie leader answers ESRCH here on some platforms, and that is the
+        # case where the group still holds the live grandchild. ``PermissionError``
+        # is NOT folded in: it means the process exists but is not ours, so its
+        # pid is no evidence about which group that number names.
+        pgid = pid  # by construction a stdio child leads its own group
+    except PermissionError:
+        return
     try:
         if pgid != os.getpgid(0):
             os.killpg(pgid, sig)
@@ -186,6 +192,31 @@ def _has_exited(pid: int) -> bool:
     return info is not None
 
 
+def _group_has_survivors(pid: int) -> bool:
+    """True when *pid*'s process group still holds someone other than *pid*.
+
+    A stdio child leads its own session, so its group is exactly the wrapper
+    plus whatever it spawned. Asking this only makes sense once *pid* itself is
+    gone, and it is a ``pgrep`` round trip, so callers must keep it out of any
+    poll. Answers ``False`` when it cannot tell — the sweep has already sent
+    SIGTERM, and escalating on a guess would aim SIGKILL at a group we could
+    not confirm is ours.
+    """
+    if sys.platform == "win32":  # pragma: no cover — no process groups
+        return False
+    try:
+        out = subprocess.run(
+            ["pgrep", "-g", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=_PGREP_TIMEOUT_SECONDS,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return any(int(tok) != pid for tok in out.split() if tok.isdigit())
+
+
 def terminate_leaked_children(
     pids: set[int], *, escalate_seconds: float = LEAK_KILL_ESCALATE_SECONDS
 ) -> None:
@@ -208,6 +239,14 @@ def terminate_leaked_children(
     while remaining and time.monotonic() < deadline:
         time.sleep(_ESCALATION_POLL_SECONDS)
         remaining = {pid for pid in remaining if not _has_exited(pid)}
+    # What we signal is the process *group*, so what the escalation has to ask
+    # about is the group — not the pid we happen to name it by. An exited leader
+    # leaves that loop immediately, which is right when its group went with it
+    # and wrong when it did not: an abandoned wrapper's server keeps running in
+    # the group of a leader that is now a zombie, and would never see the
+    # SIGKILL. The re-check is a subprocess, so it runs once, at the end, only
+    # for leaders that exited — never in the poll.
+    remaining |= {pid for pid in pids - remaining if _group_has_survivors(pid)}
     for pid in remaining:
         signal_pid(pid, signal.SIGKILL)
 
@@ -259,12 +298,17 @@ def leaked_child_pids(baseline: set[int]) -> set[int] | None:
     """
     seen = probe_child_pids()
     if seen is None:
+        logger.warning("Leaked-child sweep skipped: could not enumerate this process's children")
         return None
     seen -= baseline
     if not _detached_lock.acquire(timeout=_CLAIM_LOCK_WAIT_SECONDS):
         # A spawn is wedged mid-Popen. This is the one wait on the shutdown path
         # that has no other ceiling, and the sweep must never be the reason the
         # process fails to exit.
+        logger.warning(
+            "Leaked-child sweep skipped: a detached spawn held the claim lock for over %.1fs",
+            _CLAIM_LOCK_WAIT_SECONDS,
+        )
         return None
     try:
         return seen - _detached_pids
@@ -287,7 +331,7 @@ def sweep_leaked_children(*, baseline: set[int] | None) -> None:
     failure here must not replace one leak with a different one.
     """
     if baseline is None:
-        logger.debug("Leaked-child sweep skipped: no startup baseline to compare against")
+        logger.warning("Leaked-child sweep skipped: no startup baseline to compare against")
         return
     try:
         leaked = leaked_child_pids(baseline)

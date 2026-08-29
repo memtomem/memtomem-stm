@@ -100,7 +100,3 @@ def _no_real_child_sweep(request: pytest.FixtureRequest, monkeypatch: pytest.Mon
     if request.node.get_closest_marker("real_child_sweep"):
         return
     monkeypatch.setattr("memtomem_stm.utils.child_reaper.probe_child_pids", lambda: set())
-    # The daemon binds the probe to its own module name at import, so patching
-    # only child_reaper leaves its teardown sweep running the real pgrep. Every
-    # other consumer calls through the module attribute for exactly this reason.
-    monkeypatch.setattr("memtomem_stm.daemon.server._direct_child_pids", lambda: set())
