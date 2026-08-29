@@ -43,6 +43,7 @@ from memtomem_stm.proxy.tool_eligibility import (
     REASON_NAME_OVERFLOW,
     REASON_PROFILE_EXCLUDED,
     REASON_SENSITIVE_METADATA,
+    REASON_TASK_REQUIRED,
     REASON_TOOLGRAPH_AMBIGUOUS,
     REASON_TOOLGRAPH_DENY_GOVERNED,
     REASON_TOOLGRAPH_DENY_VIOLATION,
@@ -84,6 +85,7 @@ def _cand(
     raw_desc: str | None = None,
     schema: dict[str, Any] | None = None,
     server: str = "srv",
+    task_support: str | None = None,
 ) -> ExposureCandidate:
     schema = schema if schema is not None else {"type": "object"}
     return ExposureCandidate(
@@ -97,6 +99,7 @@ def _cand(
         raw_description=raw_desc if raw_desc is not None else desc,
         raw_schema=schema,
         server_config=server_cfg,
+        raw_task_support=task_support,
     )
 
 
@@ -169,6 +172,42 @@ class TestStructuralRules:
             result = filter_tools(cands, exposure)
             assert _names(result) == ["test__ok"]
             assert result.reject_reasons == {f"test__{long_name}": REASON_NAME_OVERFLOW}
+
+    def test_task_required_rejected_in_every_profile(self):
+        # ``execution.taskSupport: "required"`` names a tool the synchronous
+        # call path cannot serve, so every profile withholds it — there is
+        # nothing for review to observe when the failure is certain (#892).
+        cfg = _server_cfg()
+        cands = [_cand("bg", cfg, task_support="required"), _cand("ok", cfg)]
+        for exposure in (STRICT, REVIEW, EXPLORE):
+            result = filter_tools(cands, exposure)
+            assert _names(result) == ["test__ok"]
+            assert result.reject_reasons == {"test__bg": REASON_TASK_REQUIRED}
+            assert result.risk_penalties == {}
+
+    def test_task_optional_forbidden_and_absent_are_advertised(self):
+        # ``optional`` is the deliberate downgrade: advertised, and (pinned
+        # in test_fastmcp_compat) without ``execution``. ``forbidden`` and an
+        # absent ``execution`` were never in question.
+        cfg = _server_cfg()
+        cands = [
+            _cand("opt", cfg, task_support="optional"),
+            _cand("forb", cfg, task_support="forbidden"),
+            _cand("absent", cfg),
+        ]
+        for exposure in (STRICT, REVIEW, EXPLORE):
+            result = filter_tools(cands, exposure)
+            assert _names(result) == ["test__opt", "test__forb", "test__absent"]
+            assert result.reject_reasons == {}
+            assert result.risk_penalties == {}
+
+    def test_config_hidden_outranks_task_required(self):
+        # Config rules run before the structural block: an operator-hidden
+        # tool reports the operator's intent, not the task-support fact.
+        cfg = _server_cfg(tool_overrides={"bg": ToolOverrideConfig(hidden=True)})
+        result = filter_tools([_cand("bg", cfg, task_support="required")], STRICT)
+        assert result.eligible == []
+        assert result.reject_reasons == {"test__bg": REASON_CONFIG_HIDDEN}
 
     def test_duplicate_name_withholds_the_whole_group(self):
         # A composed name carried by 2+ candidates is one callable entity
@@ -325,6 +364,7 @@ class TestResultInvariants:
             _cand("scoped", cfg),
             _cand("creds", cfg, raw_desc="secret_key: sk-" + "b" * 30),
             _cand("flaky", cfg),
+            _cand("bg", cfg, task_support="required"),
             _cand("ok", cfg),
         ]
         return filter_tools(cands, exposure, unhealthy=frozenset({("srv", "flaky")}))
@@ -372,11 +412,15 @@ class TestResultInvariants:
             "test__scoped": REASON_PROFILE_EXCLUDED,
             "test__creds": REASON_SENSITIVE_METADATA,
             "test__flaky": REASON_UNHEALTHY,
+            "test__bg": REASON_TASK_REQUIRED,
         }
 
     def test_review_keeps_signal_flagged_tools_with_penalties(self):
+        # ``bg`` stays withheld here: task_required is structural, so review
+        # has no demoted-but-advertised variant of it.
         result = self._mixed_result(REVIEW)
         assert _names(result) == ["test__creds", "test__flaky", "test__ok"]
+        assert result.reject_reasons["test__bg"] == REASON_TASK_REQUIRED
         assert result.risk_penalties == {
             "test__creds": REVIEW.review_risk_penalty,
             "test__flaky": REVIEW.review_risk_penalty,
@@ -511,6 +555,7 @@ def _make_manager(
     exposure: ExposureConfig | None = None,
     tool_overrides: dict[str, ToolOverrideConfig] | None = None,
     unhealthy: frozenset[tuple[str, str]] = frozenset(),
+    task_supports: dict[str, str] | None = None,
 ) -> tuple[ProxyManager, SelectionTelemetryLog]:
     server_cfg = UpstreamServerConfig(
         prefix="test",
@@ -540,6 +585,12 @@ def _make_manager(
             input_schema={"type": "object"},
         ),
     ]
+    # Only the named tools grow an ``execution``; any tool a caller leaves
+    # unnamed stays bare, so a caller that names none of them exercises the
+    # pre-field shape (an SDK, or a fake, without ``execution`` at all).
+    for tool in tools:
+        if task_supports and tool.name in task_supports:
+            tool.execution = SimpleNamespace(task_support=task_supports[tool.name])
     session = AsyncMock()
     session.call_tool.return_value = _make_result("ok!")
     mgr._connections["srv"] = UpstreamConnection(
@@ -570,6 +621,83 @@ class TestManagerWireIn:
         assert selection["reject_reasons"] == {"test__read_file": REASON_CONFIG_HIDDEN}
         ranked = selection["candidate_features"]["ranked_candidates"]
         assert {r["tool"] for r in ranked} == {"test__send_message"}
+
+    async def test_task_required_reject_reaches_telemetry_and_never_ranks(self, tmp_path):
+        """#892 end-to-end: the upstream's ``execution.taskSupport`` reaches
+        the filter, a ``required`` tool is withheld under the new code, and an
+        ``optional`` one is still advertised and callable synchronously."""
+        mgr, log = _make_manager(
+            tmp_path,
+            task_supports={"read_file": "required", "send_message": "optional"},
+        )
+        assert [i.prefixed_name for i in mgr.get_proxy_tools()] == ["test__send_message"]
+
+        # The optional-task tool is not merely listed: it answers on the
+        # synchronous call path the downgrade promises.
+        assert "ok!" in await mgr.call_tool(
+            "srv", "send_message", {"_context_query": "read a file"}
+        )
+        selection, _execution = _events(log)
+        assert selection["candidate_tools"] == ["test__send_message"]
+        assert selection["reject_reasons"] == {"test__read_file": REASON_TASK_REQUIRED}
+        ranked = selection["candidate_features"]["ranked_candidates"]
+        assert {r["tool"] for r in ranked} == {"test__send_message"}
+
+    async def test_optional_task_upstream_reaches_the_client_without_execution(self, tmp_path):
+        """The optional-task downgrade, end to end (#892).
+
+        The eligibility test above proves an ``optional`` candidate survives
+        the filter; this one carries such an upstream tool through the real
+        advertisement path — ``get_proxy_tools`` → ``register_proxy_tool`` →
+        a real ``ClientSession`` over an in-memory transport — and pins what
+        the client actually receives: a tool it decodes with no ``execution``
+        — the spec's "forbidden" — which answers an ordinary non-task call.
+        The assertion is on the decoded model, so it pins the ABSENCE the
+        client observes, not which wire shape produced it (today the server
+        supplies no value and the serializer excludes ``None``, so the field
+        is omitted; an explicit ``null`` would decode the same and is equally
+        acceptable).
+        ``read_file`` is left bare here, which also pins that a tool object
+        carrying no ``execution`` at all still advertises.
+
+        This is a forward pin, not a red-first test: in the pinned SDK the
+        registration path has no seam that could express task support at all
+        — ``add_tool`` takes no such kwarg and the server-side ``Tool`` model
+        has no such field — so nothing here can be made to fail by forwarding
+        today. It fails the day an SDK grows that seam and something fills it
+        from an upstream tool, which is the regression worth catching.
+        """
+        from mcp import ClientSession
+        from mcp.client._memory import InMemoryTransport
+        from mcp.server.mcpserver import MCPServer
+
+        from memtomem_stm.proxy._fastmcp_compat import register_proxy_tool, to_call_tool_result
+
+        mgr, _log = _make_manager(tmp_path, task_supports={"send_message": "optional"})
+        server = MCPServer("task-support-test")
+
+        def _handler(info):
+            async def proxy_tool(**kwargs: object):
+                return to_call_tool_result(
+                    await mgr.call_tool(info.server, info.original_name, dict(kwargs))
+                )
+
+            return proxy_tool
+
+        advertised = mgr.get_proxy_tools()
+        assert [i.prefixed_name for i in advertised] == ["test__send_message", "test__read_file"]
+        for info in advertised:
+            register_proxy_tool(server, _handler(info), info)
+
+        async with InMemoryTransport(server) as streams:
+            async with ClientSession(streams[0], streams[1]) as session:
+                await session.initialize()
+                listed = await session.list_tools()
+                (tool,) = [t for t in listed.tools if t.name == "test__send_message"]
+                assert tool.execution is None
+                result = await session.call_tool("test__send_message", {"channel": "#general"})
+
+        assert result.is_error is not True
 
     async def test_unhealthy_strict_rejected_and_recorded(self, tmp_path):
         mgr, log = _make_manager(tmp_path, unhealthy=frozenset({("srv", "read_file")}))

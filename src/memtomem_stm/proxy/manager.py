@@ -276,6 +276,12 @@ class ProxyToolInfo:
     # budgeting and schema distillation apply to the INPUT side only).
     output_schema: dict[str, Any] | None = None
     meta: dict[str, Any] | None = None  # tool-level ``_meta``
+    # Deliberately NOT carried: ``execution`` (MCP 2025-11-25 task support).
+    # The proxy's call path is synchronous-only, so forwarding it would
+    # advertise task support nothing here can bridge. ``taskSupport:
+    # "required"`` tools are withheld instead (``task_required``, #892) and
+    # ``optional`` ones are advertised as plain synchronous tools — the
+    # downgrade is structural, since this type has no field to fill.
 
 
 @dataclass(frozen=True, slots=True)
@@ -2677,6 +2683,12 @@ class ProxyManager:
                 if cfg_snap.advertise_context_query:
                     schema = self._with_context_query_schema(schema)
 
+                # ``execution`` never reaches ``ProxyToolInfo``; it is a
+                # judgment input only (#892). ``getattr`` twice so an SDK
+                # without the field — it is scoped to the 2025-11-25
+                # revision — reads as absent, i.e. forbidden, i.e. advertise.
+                execution = getattr(t, "execution", None)
+
                 candidates.append(
                     ExposureCandidate(
                         info=ProxyToolInfo(
@@ -2692,6 +2704,7 @@ class ProxyManager:
                         raw_description=t.description or "",
                         raw_schema=t.input_schema,
                         server_config=cfg,
+                        raw_task_support=getattr(execution, "task_support", None),
                     )
                 )
 

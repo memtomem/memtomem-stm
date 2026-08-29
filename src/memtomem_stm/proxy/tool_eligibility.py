@@ -27,6 +27,18 @@ then the remaining rules apply per tool in this order, first match wins:
     path logs the prefix-shortening guidance but keeps the tool in
     ``conn.tools``, so connect and reconnect get identical treatment and
     the verdict reaches telemetry on the normal startup path (codex R2).
+``task_required``
+    The upstream declared ``execution.taskSupport: "required"`` (MCP
+    revision 2025-11-25) — the tool runs only as an async task, and this
+    proxy's call path is synchronous-only, so every call against it would
+    fail. Advertising one is strictly worse than rejecting it, the same
+    posture as ``name_overflow``, and unlike the signal rules there is
+    nothing for ``review`` to observe: the failures are certain, not
+    heuristic, and would only accrue against the tool's own health. Every
+    profile. ``optional`` is the deliberate inverse — advertised WITHOUT
+    ``execution``, i.e. as a plain synchronous tool; ``ProxyToolInfo``
+    carries no ``execution`` field, so the downgrade is structural rather
+    than a strip. ``forbidden`` and an absent ``execution`` are unchanged.
 ``duplicate_name``
     More than one candidate carries the same composed name, so the ENTIRE
     group is withheld (ambiguity pre-pass, evaluated before every other
@@ -94,6 +106,18 @@ Three invariants this module exists to uphold:
   half-open probing — recovery is possible because hiding stops new
   failures from accruing, and the window forgets old ones).
 
+  Session stability cuts the other way too, and the bundled server registers
+  the verdict once at startup: an upstream that replaces its catalogue
+  mid-session (a reconnect, or ``tools/list_changed``) swaps ``conn.tools``
+  without re-running this filter or re-registering anything, so a tool that
+  only NOW earns a rejection keeps whatever advertisement it already had.
+  That is general to every rule here, not specific to any one of them, and
+  it is the accepted cost of an advertised set the client can rely on. The
+  consequence does differ by rule: a tool that drifts into ``task_required``
+  stays advertised AND fails every call, which is the very shape #892 is
+  about. Closing that needs a re-advertisement mechanism this module does
+  not own — tracked in #917, deliberately not patched per-rule here.
+
 Reject reasons flow into the selection log's ``reject_reasons`` field
 (#467) via ``ProxyManager``; they are reason *codes* only — no tool
 metadata, no error text — so the telemetry redaction contract is untouched.
@@ -132,6 +156,7 @@ logger = logging.getLogger(__name__)
 REASON_CONFIG_HIDDEN = "config_hidden"
 REASON_PROFILE_EXCLUDED = "profile_excluded"
 REASON_NAME_OVERFLOW = "name_overflow"
+REASON_TASK_REQUIRED = "task_required"
 REASON_DUPLICATE_NAME = "duplicate_name"
 REASON_SENSITIVE_METADATA = "sensitive_metadata"
 REASON_UNHEALTHY = "unhealthy"
@@ -230,6 +255,12 @@ class ExposureCandidate:
     raw_description: str
     raw_schema: dict[str, Any] | None
     server_config: UpstreamServerConfig
+    # Normalized ``Tool.execution.task_support`` ("forbidden" / "optional" /
+    # "required"; ``None`` — an absent ``execution`` — means forbidden, per
+    # spec). A raw artifact, never advertisement data: ``ProxyToolInfo`` has
+    # no ``execution`` field, so the proxy structurally cannot forward task
+    # support it has no call path for (#892).
+    raw_task_support: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -700,6 +731,12 @@ def filter_tools(
         # ── structural rules (every profile) ─────────────────────────────
         if tool_name_budget.overflows(server_cfg.prefix, info.original_name):
             reject_reasons[info.prefixed_name] = REASON_NAME_OVERFLOW
+            continue
+        # A task-required tool cannot be served by the synchronous call path,
+        # so advertising it promises a call that always fails — withheld in
+        # every profile, ``optional`` deliberately downgraded (#892).
+        if candidate.raw_task_support == "required":
+            reject_reasons[info.prefixed_name] = REASON_TASK_REQUIRED
             continue
 
         # ── signal rules (profile-dependent) ─────────────────────────────
