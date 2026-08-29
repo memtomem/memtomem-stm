@@ -13,6 +13,35 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- **Opt-in backstop for a client that goes away without closing stdin** (#914,
+  the last of #906's four directions). #910-#913 hardened every path where
+  *something* tells the server to stop — EOF, a signal, a deadline. A client
+  that exits having leaked the stdin pipe's write end into a surviving
+  descendant tells it nothing: no EOF, no signal, and none of that teardown is
+  ever entered. That is how the incident's 57 proxies held their LTM children
+  for up to eight days. The only evidence left is the process tree, so setting
+  `MEMTOMEM_STM_PARENT_LIVENESS_POLL_SECONDS` (a poll interval in seconds; `30`
+  is a reasonable value) starts a watcher that records `getppid()` and shuts the
+  server down through the same path a signal takes when it changes. An
+  end-to-end test reproduces the shape against a real server: with the feature
+  off the process is still running when the 30-second budget expires.
+
+  **Off by default**, because unlike the other three this *infers* that the
+  client is gone and a wrong inference costs a live session, which is worse than
+  the leak it prevents. Three things narrow it. The comparison is against the
+  recorded pid, never `== 1` — a detached daemon is born reparented, and macOS
+  reparents to launchd regardless. A change must survive two consecutive polls.
+  And it must coincide with silence: the pipe cannot separate a leaked
+  descriptor from a live client behind a wrapper shell, since somebody holds the
+  write end in both, but the traffic can, so the shutdown also requires no
+  inbound MCP message for `MEMTOMEM_STM_PARENT_LIVENESS_GRACE_SECONDS` (default
+  900). A request inside that window defers the shutdown rather than cancelling
+  it. Residual risk, stated plainly: a wrapper-launched client that is
+  completely silent for the whole grace period is shut down. Prefer `exec` in
+  the launcher — a launcher that replaces itself keeps its pid and this never
+  fires — or leave the feature off. POSIX-only; the detached daemon runs its own
+  lifespan and is unaffected.
+
 - **`stm_surfacing_stats` opens with a health verdict** (#363, part of #351).
   The output starts with raw counts and grows past 50 lines once skip reasons,
   outcomes and cache buckets fill in, so the operator's first question — "is
