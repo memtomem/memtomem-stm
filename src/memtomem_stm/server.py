@@ -52,6 +52,11 @@ from memtomem_stm.observability.tracing import traced
 from memtomem_stm.surfacing.feedback import FeedbackTracker
 from memtomem_stm.utils.anyio_shutdown import await_or_warn, is_clean_cancel_scope_shutdown
 from memtomem_stm.utils import child_reaper
+from memtomem_stm.utils.signal_shutdown import (
+    ShutdownSignals,
+    exit_after_signal_shutdown,
+    was_signal_shutdown,
+)
 from memtomem_stm.utils.teardown_watchdog import TeardownWatchdog
 from memtomem_stm.utils.json_out import escape_lone_surrogates, require_utf8_identifier
 
@@ -217,6 +222,20 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
     # probe, and should claim them with ``child_reaper.spawn_claimed``.
     children_at_startup = child_reaper.probe_child_pids()
     config = STMConfig()
+
+    def sweep() -> None:
+        child_reaper.sweep_leaked_children(baseline=children_at_startup)
+
+    watchdog = TeardownWatchdog(config.teardown_watchdog_seconds, before_exit=sweep)
+    # Without these, SIGTERM kills the process where it stands: the teardown
+    # below never runs and every stdio child is reparented — #906's end state,
+    # reached by the first command an operator reaches for. They route the
+    # signal into the same EOF shutdown a departing client produces, with the
+    # watchdog as the guarantee when closing stdin does not wake the read
+    # (#906). Installed after the config so the watchdog they arm is the
+    # configured one.
+    shutdown_signals = ShutdownSignals(arm_watchdog=watchdog.arm, hard_exit_cleanup=sweep)
+    shutdown_signals.install()
     # Daemon discovery/spawn must use the same env/default-only basis the
     # detached daemon loads. The proxy file may later propagate a file-only
     # consumer_model into surfacing; using that mutated config for discovery
@@ -544,15 +563,15 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
         # wait — so a wedged one can still park a process that has nothing left
         # to do but exit. Armed only for this window, it cannot fire during
         # normal operation.
-        watchdog = TeardownWatchdog(
-            config.teardown_watchdog_seconds,
-            before_exit=lambda: child_reaper.sweep_leaked_children(baseline=children_at_startup),
-        )
         # ``arm`` never raises: thread exhaustion is exactly the state a wedged
         # process reaches, and the answer there is a shutdown with no backstop,
-        # not no shutdown.
+        # not no shutdown. Idempotent, so a signal that already armed it (see
+        # ``ShutdownSignals``) simply keeps its countdown.
         watchdog.arm()
         try:
+            # First, so a signal arriving mid-teardown gets the default
+            # disposition rather than re-entering a shutdown already underway.
+            shutdown_signals.remove()
             # Remove exactly what registration took ownership of (#891). Re-deriving
             # the set with ``get_proxy_tools()`` here would remove whatever the
             # session advertises *now*: a ``tools/list_changed`` or a republished
@@ -2406,7 +2425,20 @@ def main() -> None:
     # after logging so the process still terminates; we only add observability.
     try:
         mcp.run()
+    except asyncio.CancelledError as e:
+        # A shutdown signal unwinds the SDK's task group by cancelling it, so
+        # the "failure" that arrives here is the shutdown working (#906). It is
+        # indistinguishable in shape from a crash, hence the flag rather than
+        # the exception type.
+        if not was_signal_shutdown(e):
+            logger.exception("STM MCP server terminated with an unhandled exception")
+            raise
+        logger.info("STM MCP server shut down on a signal")
+        exit_after_signal_shutdown()
     except (RuntimeError, ExceptionGroup) as e:
+        if was_signal_shutdown(e):
+            logger.info("STM MCP server shut down on a signal")
+            exit_after_signal_shutdown()
         # The bare RuntimeError occurs when the cancel-scope error escapes
         # outside any task group; the ExceptionGroup shape is what anyio's
         # strict task groups actually deliver on stdio EOF (#410 follow-up).

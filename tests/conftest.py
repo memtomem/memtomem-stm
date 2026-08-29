@@ -125,3 +125,29 @@ def _no_real_teardown_watchdog(monkeypatch: pytest.MonkeyPatch) -> None:
             pass
 
     monkeypatch.setattr("memtomem_stm.server.TeardownWatchdog", _InertWatchdog)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_shutdown_signals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let a test take over the test runner's SIGTERM/SIGINT.
+
+    ``app_lifespan`` installs handlers that close fd 0 and, on a second signal,
+    ``os._exit`` (#906). pytest-asyncio runs its loop on the main thread, so
+    those install for real: a Ctrl-C during the run would close pytest's own
+    stdin instead of interrupting it, and a lifespan that raised before its
+    teardown would leave them installed for every later test. The behaviour is
+    pinned in tests/test_signal_shutdown.py, the wiring by the tests that
+    replace this double with a recording one.
+    """
+
+    class _InertSignals:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def install(self) -> None:
+            pass
+
+        def remove(self) -> None:
+            pass
+
+    monkeypatch.setattr("memtomem_stm.server.ShutdownSignals", _InertSignals)

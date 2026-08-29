@@ -2167,6 +2167,52 @@ class TestLifespan:
         hooks[0]()
         assert killed == [{222}]  # the startup baseline was carried into the hook
 
+    async def test_signal_handlers_are_installed_and_given_back(self, monkeypatch):
+        """Without them SIGTERM kills the process where it stands and every
+        stdio child is reparented — #906's end state via the first command an
+        operator reaches for. They are given back as teardown begins, so a
+        signal arriving mid-shutdown does not re-enter it."""
+        events = []
+
+        class _RecordingSignals:
+            def __init__(self, *, arm_watchdog, hard_exit_cleanup=None):
+                events.append(("built", arm_watchdog, hard_exit_cleanup))
+
+            def install(self):
+                events.append(("installed",))
+
+            def remove(self):
+                events.append(("removed",))
+
+        monkeypatch.setattr("memtomem_stm.server.ShutdownSignals", _RecordingSignals)
+        await self._run_minimal_lifespan()
+
+        assert [e[0] for e in events] == ["built", "installed", "removed"]
+        built = events[0]
+        assert built[1] is not None and built[2] is not None  # watchdog + sweep wired
+
+    async def test_signal_handlers_are_given_back_before_the_teardown_runs(self, monkeypatch):
+        # Ordering, not just presence: a signal handler still installed while
+        # teardown is unwinding would arm a second shutdown on top of this one.
+        order = []
+
+        class _RecordingSignals:
+            def __init__(self, **_kwargs):
+                pass
+
+            def install(self):
+                pass
+
+            def remove(self):
+                order.append("signals-removed")
+
+        async def _note_stop():
+            order.append("proxy-stopped")
+
+        monkeypatch.setattr("memtomem_stm.server.ShutdownSignals", _RecordingSignals)
+        await self._run_minimal_lifespan(pm_stop=_note_stop)
+        assert order == ["signals-removed", "proxy-stopped"]
+
     async def test_the_watchdog_is_armed_for_teardown_and_stood_down_after(self, monkeypatch):
         """It is the guarantee that the process exits — bounding the steps only
         cancels waits, not work — so it must cover the whole teardown window and
