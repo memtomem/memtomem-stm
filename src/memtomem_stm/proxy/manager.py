@@ -15,7 +15,7 @@ import uuid
 from collections import Counter
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
-from collections.abc import Coroutine
+from collections.abc import Collection, Coroutine
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -95,6 +95,7 @@ from memtomem_stm.proxy.token_estimate import approx_tokens, tokens_to_chars
 from memtomem_stm.proxy.tool_eligibility import (
     REASON_CONFIG_HIDDEN,
     REASON_PROFILE_EXCLUDED,
+    REASON_REGISTRATION_DECLINED,
     REASON_TOOLGRAPH_AGENT_NOT_FOUND,
     REASON_TOOLGRAPH_DRIFTED,
     REASON_TOOLGRAPH_PROTOCOL_ERROR,
@@ -562,12 +563,12 @@ class ProxyManager:
         self._progressive_reads_tracker = progressive_reads_tracker
         self._selection_log = selection_log
         # Snapshots of the advertisement last returned by
-        # ``get_proxy_tools()`` — the candidate set that passed exposure
-        # filtering, which the registration step can still decline for
-        # individual names without that showing up here (#908):
-        # names go into selection telemetry (#467), the full infos
-        # feed tool-relevance ranking (#466), the hard filter's verdict
-        # (#465) rides along as reject reasons + review-profile risk
+        # ``get_proxy_tools()``, narrowed by
+        # ``retain_registered_advertisement()`` to the names the server
+        # actually registered (#908): names go into selection telemetry
+        # (#467), the full infos feed tool-relevance ranking (#466), and
+        # the reject reasons carry the hard filter's verdict (#465) plus any
+        # registration decline (#908), alongside review-profile risk
         # penalties. Empty until the first advertisement.
         self._advertised_tools: list[str] = []
         self._advertised_infos: list[ProxyToolInfo] = []
@@ -2615,9 +2616,9 @@ class ProxyManager:
         advertisement so selection telemetry (#467) and relevance ranking
         (#466) describe exactly this exposure decision. The snapshot is taken
         before the caller registers anything, so it records what passed
-        exposure filtering, not what the server ended up registering — a
-        distinction that only matters when registration declines a name
-        (#908).
+        exposure filtering; a caller that registers the result must then call
+        ``retain_registered_advertisement()`` with the names it took, so a
+        declined name does not stay described as advertised (#908).
         """
         # ONE read for the whole advertisement build, threaded down — the same
         # rule the enforcement path follows (#871). It serves the GLOBAL fields
@@ -2725,6 +2726,52 @@ class ProxyManager:
             is not None
         }
         return verdict.eligible
+
+    def retain_registered_advertisement(self, registered: Collection[str]) -> list[str]:
+        """Narrow the advertisement snapshot to what the server registered (#908).
+
+        ``get_proxy_tools()`` commits the snapshot when it decides exposure,
+        which is necessarily before the caller has tried to register anything.
+        Registration can still decline a name — ``add_tool`` failing, or the
+        name already belonging to a tool an embedding host registered — and
+        those declines used to leave the snapshot describing a tool absent from
+        ``tools/list``: counted by ``get_upstream_health``, scored by the
+        relevance ranker, and recorded as a candidate in selection telemetry.
+
+        Call this once after the registration loop with the names that were
+        actually taken. Declined names move from the advertised set to
+        ``registration_declined`` rejects, so they stay *visible* as a withhold
+        rather than silently vanishing. Returns the dropped names.
+
+        No-op when everything registered, which is the normal path. Not called
+        at all when the proxy is disabled — the snapshot is empty either way.
+
+        The narrowing is not durable against a later ``get_proxy_tools()``,
+        which rebuilds every one of these fields from a fresh filter verdict
+        and would restore the declined tool. The bundled server advertises once
+        at startup and never re-derives, so this does not arise there; a
+        library caller that re-advertises must call this again with the names
+        that survived, exactly as the registration loop does.
+        """
+        keep = set(registered)
+        dropped = [name for name in self._advertised_tools if name not in keep]
+        if not dropped:
+            return []
+        # The registration site already logged a warning per decline, with the
+        # reason it saw; re-logging here would double-report one event.
+        self._advertised_infos = [
+            info for info in self._advertised_infos if info.prefixed_name in keep
+        ]
+        self._advertised_tools = [name for name in self._advertised_tools if name in keep]
+        self._advertised_reject_reasons = {
+            **self._advertised_reject_reasons,
+            **{name: REASON_REGISTRATION_DECLINED for name in dropped},
+        }
+        for name in dropped:
+            self._advertised_risk_penalties.pop(name, None)
+            self._advertised_risk_penalty_sources.pop(name, None)
+            self._advertised_graph_facts.pop(name, None)
+        return dropped
 
     @staticmethod
     def _with_context_query_schema(schema: dict[str, Any]) -> dict[str, Any]:
@@ -4225,13 +4272,12 @@ class ProxyManager:
 
         ``tools`` counts the DISCOVERED catalogue (everything the upstream
         listed — since #465 ``conn.tools`` is no longer pre-filtered at
-        connect time); ``advertised_tools`` counts how many of them passed
-        exposure filtering, so operators can tell a withheld tool from a
-        missing one. It reflects the most recent ``get_proxy_tools()`` pass —
-        in the server it runs at startup registration, before any health probe
-        can observe it — and counts a name the registration step then declined
-        (#908), so it is the exposure decision rather than a read of the live
-        tool registry.
+        connect time); ``advertised_tools`` counts how many of them are
+        exposed, so operators can tell a withheld tool from a missing one. It
+        reflects the most recent ``get_proxy_tools()`` pass — in the server it
+        runs at startup registration, before any health probe can observe it —
+        narrowed to the names registration actually took (#908), so a tool the
+        registration layer declined reads as withheld rather than as advertised.
 
         A configured server that FAILED to connect at startup (#580) has no
         ``_connections`` entry, so it is reported here from ``_failed_servers``

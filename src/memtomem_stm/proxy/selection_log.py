@@ -4,9 +4,9 @@ The proxy is the one component in the call path, so it can record what an
 advisory analyzer never sees: which tool the client model actually called,
 out of which advertised candidate set, and how the call went. This log is
 the substrate for offline replay/eval (#468) and every later learning stage
-(#469/#470) — and the landing zone for the STM-native hard filter's (#465)
-``reject_reasons``, so replay sees the tools that were withheld, not just
-the ones advertised.
+(#469/#470) — and the landing zone for ``reject_reasons``, the STM-native
+hard filter's rejects (#465) plus registration's declines (#908), so replay
+sees the tools that were withheld, not just the ones advertised.
 
 Schema v1 — three event types, every record self-describing via
 ``schema_version`` + ``ranker_version``; one JSON object per line, keys
@@ -24,9 +24,10 @@ ones, because it numbers records for ordering:
     ``candidate_tools``), ``candidate_tools`` (what the proxy last
     advertised — today the client model does the selecting),
     ``candidate_count``, ``reject_reasons`` (prefixed tool → reason code
-    for every tool the #465 hard filter withheld from that advertisement;
-    ``{}`` when nothing was rejected or the filter never ran — reason
-    vocabulary in ``proxy/tool_eligibility.py``), ``candidate_features``
+    for every tool missing from that advertisement — the #465 hard filter's
+    withholds plus registration's declines (#908); ``{}`` when nothing was
+    rejected or the filter never ran — reason vocabulary in
+    ``proxy/tool_eligibility.py``), ``candidate_features``
     (#466 ranking output) / ``graph_generation`` (reserved ``null`` until
     toolgraph#13/#15), ``args_sha256`` + ``args_chars`` (canonical-JSON
     hash — see redaction below), ``ts``.
@@ -355,8 +356,10 @@ class SelectionTelemetryLog:
         is the ranker's output object (#466) — the caller guarantees it
         carries no raw text, only scores/hashes; ``ranker_version`` stamps
         which ranker produced it (``None`` = the unranked default).
-        ``reject_reasons`` is the #465 hard filter's verdict for the
-        advertisement this call selected from — reason codes only, no tool
+        ``reject_reasons`` is why each withheld name is not in the
+        advertisement this call selected from — the #465 hard filter's verdict,
+        plus ``registration_declined`` for a tool that passed the filter and
+        the server could not register (#908). Reason codes only, no tool
         metadata (``None`` records the empty map). ``graph_generation`` pins
         the external tool-graph generation the advertisement was filtered
         under (#465/#468 replay) — ``None`` when the provider is disabled,

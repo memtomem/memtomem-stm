@@ -1122,7 +1122,7 @@ Eight observability/admin tools are hidden unless
 | `stm_proxy_cache_clear` | `server?`, `tool?` | Clear response cache (all, by server, by tool, or by server+tool) |
 | `stm_proxy_health` | — | Upstream server connectivity and circuit breaker status |
 | `stm_surfacing_stats` | `tool?`, `since?`, `limit=10` | Top-line health verdict, surfacing event counts, feedback breakdown, helpfulness %, plus per-tool skip reasons / outcomes / cache hit ratio |
-| `stm_selection_stats` | — | Tool-selection telemetry: live write-path counters plus persisted selections by ranker version, server/tool, execution outcomes, and hard-filter reject reasons |
+| `stm_selection_stats` | — | Tool-selection telemetry: live write-path counters plus persisted selections by ranker version, server/tool, execution outcomes, and reject reasons |
 | `stm_compression_stats` | `tool?` | Compression feedback counts by kind and tool |
 | `stm_progressive_stats` | `tool?` | Progressive-delivery follow-up rate, coverage, and per-tool breakdown |
 | `stm_tuning_recommendations` | `since_hours?`, `tool?` | Per-tool compression tuning recommendations from the auto-tuner (apply them with [`mms tune --apply`](#tune)) |

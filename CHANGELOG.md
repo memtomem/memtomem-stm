@@ -341,6 +341,30 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **Health, ranking and selection telemetry no longer count a tool the server
+  could not register** (#908). Exposure is decided — and snapshotted into
+  `_advertised_*` — inside `get_proxy_tools()`, which necessarily runs before
+  the caller has tried to register anything. Registration can still decline a
+  name: `add_tool` raising for any reason, or the prefixed name already
+  belonging to a tool an embedding host registered (the case #891 added). Those
+  declines left the snapshot describing a tool absent from `tools/list` —
+  `stm_proxy_health` counted it in the per-upstream `advertised_tools`, the
+  relevance ranker scored its description and schema, and selection telemetry
+  recorded it as a candidate the model chose from. For the collision case the
+  mismatch was not just a count: the callable reachable under that name was the
+  host's tool while the snapshot described the upstream proxy tool.
+
+  The lifespan now hands the names it registered back to the manager, which
+  narrows the snapshot to them. A declined name is recorded as a
+  `registration_declined` reject rather than silently vanishing, so it stays
+  visible as a withhold in the same place every other withhold appears. The
+  reason code is additive to the selection log's closed vocabulary, and it is
+  the only one that is not an exposure decision — the tool passed every gate
+  and the registration layer declined it. The narrowing applies to the snapshot as it
+  stands; a caller that re-derives the advertisement afterwards rebuilds all of
+  it from a fresh filter verdict and must narrow again. The bundled server
+  advertises once at startup, so this only concerns library use.
+
 - **Server shutdown unregisters the tools it registered, not the ones it would
   advertise now** (#891). The lifespan registered one `get_proxy_tools()` pass
   and, at teardown, called `get_proxy_tools()` a second time and removed *that*
@@ -364,7 +388,7 @@ changes inline only. See the deprecation policy in
   advertisement left it. (That snapshot records what passed exposure filtering,
   which is not the same set as what the server registered — a candidate the
   registration step then declines still counts toward it. That divergence
-  predates this change and is tracked in #908.)
+  was fixed separately in #908.)
 
   Registration also stops claiming a name that was already taken. The MCP SDK
   treats a duplicate `add_tool` as a successful no-op — it returns the existing

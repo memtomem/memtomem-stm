@@ -136,6 +136,13 @@ REASON_DUPLICATE_NAME = "duplicate_name"
 REASON_SENSITIVE_METADATA = "sensitive_metadata"
 REASON_UNHEALTHY = "unhealthy"
 
+# Assigned AFTER the filter, by the manager, for a candidate this filter found
+# eligible that the server then could not register — a failed ``add_tool`` or a
+# prefixed name already owned by something else in an embedding host (#908).
+# It is the one reason code that is not an exposure decision: the tool passed
+# every gate here and the registration layer declined it, not policy.
+REASON_REGISTRATION_DECLINED = "registration_declined"
+
 # External tool-graph eligibility provider codes (#465). Two families:
 #
 # PER-CANDIDATE — a successful consult's ``rejected`` rows, one STM code per

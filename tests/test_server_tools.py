@@ -1845,7 +1845,7 @@ class TestSelectionStats:
         assert "Execution outcomes:" in result
         assert "ok: 1" in result
         assert "cache hit/miss: 1 / 0" in result
-        assert "Reject reasons (#465 hard filter):" in result
+        assert "Reject reasons (withheld from the advertisement):" in result
         assert "config_hidden: 1" in result
 
     async def test_sampled_out_still_renders_live_counters(self, tmp_path):
@@ -3049,6 +3049,45 @@ class TestLifespanTeardownSymmetry:
 
             mock_pm_instance.get_proxy_tools.assert_not_called()
             assert tools_dict == snapshot
+        finally:
+            tools_dict.clear()
+            tools_dict.update(snapshot)
+
+    async def test_declined_names_are_narrowed_out_of_the_advertisement(self):
+        """#908 lifespan seam: a real ``ProxyManager`` would have committed both
+        names at exposure time; the collision below means only one of them is the
+        proxy's — the host keeps its own tool under the other name — so the
+        lifespan must hand the registered set back for narrowing. This
+        pins the wiring and the list it passes — that the list is derived from a
+        real collision is what keeps it from being tautological. What the
+        narrowing then does to health, ranking and telemetry is pinned against a
+        real manager in ``test_tool_eligibility``."""
+        from memtomem_stm.server import app_lifespan, mcp
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.return_value = self._infos("fake__alpha", "fake__beta")
+
+        tools_dict = mcp._tool_manager._tools
+        snapshot = dict(tools_dict)
+        try:
+
+            @mcp.tool(name="fake__alpha")
+            def _host_owned(path: str) -> str:  # pragma: no cover - never invoked
+                return path
+
+            with (
+                patch("memtomem_stm.server.STMConfig") as MockConfig,
+                patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+            ):
+                self._mock_config(MockConfig)
+                async with app_lifespan(mcp) as _ctx:
+                    pass
+
+            mock_pm_instance.retain_registered_advertisement.assert_called_once_with(
+                ["fake__beta"]
+            )
         finally:
             tools_dict.clear()
             tools_dict.update(snapshot)

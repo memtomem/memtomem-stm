@@ -486,6 +486,13 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                 ):
                     registered_proxy_tools.append(info.prefixed_name)
 
+            # The advertisement snapshot was committed when exposure was
+            # decided, before any of the above could decline a name. Narrow it
+            # to what actually registered so health counts, relevance ranking
+            # and selection telemetry describe the tools a client can call
+            # (#908).
+            proxy_manager.retain_registered_advertisement(registered_proxy_tools)
+
             # Proxied tools are now in front; re-insert STM utility tools at
             # the end so ``tools/list`` yields domain tools first (#228).
             _move_stm_tools_to_end(server)
@@ -1956,7 +1963,7 @@ async def stm_selection_stats(
     - **Persisted aggregate** — read back off the active JSONL log: event
       counts, selections by ranker version (the #468 cohort split), by
       server and tool, execution ok/error + latency percentiles, and the
-      #465 hard-filter reject-reason tally.
+      reject-reason tally (#465 withholds and #908 declines).
 
     Takes no arguments. Rotated backups are noted but not parsed (the
     active log only).
@@ -2061,7 +2068,7 @@ def _format_selection_stats_sections(agg: dict, live: dict[str, int]) -> list[st
     )
     _append_top_section(
         lines,
-        "Reject reasons (#465 hard filter)",
+        "Reject reasons (withheld from the advertisement)",
         agg["reject_reasons"],
         agg["reject_reasons_distinct"],
     )
