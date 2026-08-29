@@ -635,6 +635,70 @@ class TestManagerWireIn:
         assert first == second
         assert mgr._advertised_reject_reasons == rejects
 
+    async def test_retain_registered_moves_declines_out_of_the_advertisement(self, tmp_path):
+        """#908: exposure is decided — and snapshotted — before the server tries
+        to register anything, so a name registration then declines used to stay
+        in the snapshot that health counts, the ranker scores and selection
+        telemetry records as a candidate. Narrowing must drop it from all of
+        those and account for it as a ``registration_declined`` reject rather
+        than letting it disappear unexplained."""
+        mgr, _log = _make_manager(tmp_path)
+        advertised = list(mgr._advertised_tools)
+        assert {"test__send_message", "test__read_file"} == set(advertised)
+        mgr._advertised_risk_penalties["test__read_file"] = 0.5
+        mgr._advertised_risk_penalty_sources["test__read_file"] = "graph"
+        mgr._advertised_graph_facts["test__read_file"] = {"tier": "governed"}
+
+        dropped = mgr.retain_registered_advertisement(["test__send_message"])
+
+        assert dropped == ["test__read_file"]
+        assert mgr._advertised_tools == ["test__send_message"]
+        assert [i.prefixed_name for i in mgr._advertised_infos] == ["test__send_message"]
+        assert mgr._advertised_reject_reasons["test__read_file"] == "registration_declined"
+        assert "test__read_file" not in mgr._advertised_risk_penalties
+        assert "test__read_file" not in mgr._advertised_risk_penalty_sources
+        assert "test__read_file" not in mgr._advertised_graph_facts
+        assert mgr.get_upstream_health()["srv"]["advertised_tools"] == 1
+
+    async def test_declined_tool_reaches_the_selection_log_as_a_reject(self, tmp_path):
+        """The narrowing has to land in the recorded telemetry, not just in the
+        in-memory maps: a declined name must leave ``candidate_tools`` and
+        appear in ``reject_reasons``, so replay sees a withhold with a cause
+        instead of a tool that quietly stopped being a candidate."""
+        mgr, log = _make_manager(tmp_path)
+        mgr.retain_registered_advertisement(["test__send_message"])
+
+        await mgr.call_tool("srv", "send_message", {"_context_query": "send a message"})
+
+        (selection, _execution) = _events(log)
+        assert selection["candidate_tools"] == ["test__send_message"]
+        assert selection["reject_reasons"] == {"test__read_file": "registration_declined"}
+
+    async def test_retain_registered_is_a_no_op_when_everything_registered(self, tmp_path):
+        """The normal path must not touch the snapshot — in particular it must
+        not invent reject reasons for tools that registered fine, since those
+        values are a closed vocabulary the selection log records."""
+        mgr, _log = _make_manager(tmp_path)
+        mgr._advertised_risk_penalties["test__read_file"] = 0.5
+        mgr._advertised_risk_penalty_sources["test__read_file"] = "graph"
+        mgr._advertised_graph_facts["test__read_file"] = {"tier": "governed"}
+
+        def snapshot():
+            return (
+                list(mgr._advertised_tools),
+                list(mgr._advertised_infos),
+                dict(mgr._advertised_reject_reasons),
+                dict(mgr._advertised_risk_penalties),
+                dict(mgr._advertised_risk_penalty_sources),
+                dict(mgr._advertised_graph_facts),
+            )
+
+        before = snapshot()
+
+        assert mgr.retain_registered_advertisement(list(mgr._advertised_tools)) == []
+
+        assert snapshot() == before
+
     async def test_start_computes_health_flags_from_metrics_store(self, tmp_path):
         store = MetricsStore(tmp_path / "metrics.db")
         store.initialize()

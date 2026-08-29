@@ -11,9 +11,9 @@ proxy sits in the call path, so it can record what an advisory analyzer never
 sees: which tool the client model actually called, out of which advertised
 candidate set, and how the call went. This log is the substrate for offline
 replay/eval (#468) and later learning stages (#469/#470), and the landing
-zone for the STM-native hard filter's reject reasons (#465) — replay sees
-the tools that were withheld from the advertisement, not just the ones in
-it.
+zone for the reasons tools are missing from an advertisement — the
+STM-native hard filter's rejects (#465) and registration's declines (#908)
+— so replay sees the tools that were withheld, not just the ones in it.
 
 Off by default — it is a new disk write path, so the operator opts in:
 
@@ -84,7 +84,7 @@ stamp.
 | `trace_id` | joins `proxy_metrics.db` for per-stage diagnostics |
 | `server`, `selected_tool` | prefixed name, same vocabulary as `candidate_tools` |
 | `candidate_tools`, `candidate_count` | what the proxy last advertised (`get_proxy_tools()` snapshot) |
-| `reject_reasons` | prefixed tool → reason code for every tool the #465 filter withheld from that advertisement (see [Hard-filter reject reasons](#hard-filter-reject-reasons-465)); `{}` when nothing was rejected |
+| `reject_reasons` | prefixed tool → reason code for every tool missing from that advertisement — withheld by the #465 filter, or declined by registration (see [Reject reasons](#reject-reasons-465-908)); `{}` when nothing was rejected |
 | `candidate_features` | ranking output object when #466 ranking ran (shape below); `null` otherwise |
 | `graph_generation` | the external tool-graph generation the advertisement was filtered under (#465), pinning replay to a graph state; `null` when the `toolgraph` provider is disabled, unconsulted, or the consult failed without a usable verdict (unreachable / protocol error). On an agent-not-found degrade the graph still responded, so the generation is recorded |
 | `args_sha256`, `args_chars` | canonical-JSON hash + length of the call arguments |
@@ -228,13 +228,15 @@ query signal and recorded in `candidate_features`:
 - `top_n` (default 20) bounds `ranked_candidates`; the full advertised set
   is already in `candidate_tools`.
 
-## Hard-filter reject reasons (#465)
+## Reject reasons (#465, #908)
 
 The exposure filter (`proxy/tool_eligibility.py`, configured by the
 `exposure` block — see [configuration.md](configuration.md)) decides at
 advertisement time which discovered tools the client model gets to see.
 Every withheld tool appears in `reject_reasons` as `prefixed_name →
-reason code`:
+reason code`. All but the last code below are that filter's verdict;
+`registration_declined` is added afterwards, for a tool the filter passed
+and the registration layer then declined:
 
 | code | meaning | profiles |
 |---|---|---|
@@ -246,20 +248,24 @@ reason code`:
 | `unhealthy` | upstream-attributable error rate over the recent metrics window crossed the threshold | rejects under `strict`; demotes under `review` |
 | `toolgraph_not_granted`, `toolgraph_deny_violation`, `toolgraph_deny_governed`, `toolgraph_drifted`, `toolgraph_ambiguous`, `toolgraph_unmapped`, `toolgraph_tool_not_found`, `toolgraph_rejected` | per-candidate verdict from the optional external tool-graph provider (the `toolgraph` block — one code per upstream reason, `toolgraph_rejected` is the forward-compatible fallback for an unrecognized reason) | rejects under `strict`; demotes under `review` |
 | `toolgraph_unreachable`, `toolgraph_agent_not_found`, `toolgraph_protocol_error` | whole-call fail-closed: the consult failed under a `closed` knob, so **every** tool is withheld under one code | all (profile-independent) |
+| `registration_declined` | not an exposure decision (#908): the tool passed every filter above, and the server then could not register it — `add_tool` failed, or the composed name already belonged to a tool registered by an embedding host | all |
 
-Reason codes are the only #465 payload in the log — no tool metadata, no
+Reason codes are the only reject payload in the log — no tool metadata, no
 error text — so the redaction policy below is untouched. `reject_reasons`
 keys are **disjoint from `candidate_tools` by construction**: an entry
-means that composed name was withheld from the client entirely. Ambiguous
+means the proxy advertises nothing under that composed name. (For
+`registration_declined` that is a statement about the proxy, not about the
+name: a host that already owned it keeps its own tool there.) Ambiguous
 names are never auto-exposed in any profile: upstream calls route by raw
 tool name, so same-named occurrences (a pathological state — config
 validation rejects duplicate upstream prefixes, so this needs a
 misbehaving upstream or a bypassed config) are one callable entity wearing
 several metadata claims, and advertising a "clean" copy would attach
 metadata that does not bind to what executes. A rejected tool never
-appears in `candidate_tools` or `ranked_candidates`: ranking runs over the
-filter's eligible output and can never resurrect a reject (both pinned by
-`tests/test_tool_eligibility.py`). The codes are additive vocabulary:
+appears in `candidate_tools` or `ranked_candidates`: filter rejects are
+excluded before ranking and registration declines are removed when the
+advertisement is narrowed, and ranking can resurrect neither (both
+exclusions pinned by `tests/test_tool_eligibility.py`). The codes are additive vocabulary:
 replay tooling should treat unknown codes as opaque.
 
 ## Redaction policy
