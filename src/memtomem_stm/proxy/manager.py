@@ -562,8 +562,10 @@ class ProxyManager:
         self._progressive_reads_tracker = progressive_reads_tracker
         self._selection_log = selection_log
         # Snapshots of the advertisement last returned by
-        # ``get_proxy_tools()`` — the candidate set the client model picked
-        # from: names go into selection telemetry (#467), the full infos
+        # ``get_proxy_tools()`` — the candidate set that passed exposure
+        # filtering, which the registration step can still decline for
+        # individual names without that showing up here (#908):
+        # names go into selection telemetry (#467), the full infos
         # feed tool-relevance ranking (#466), the hard filter's verdict
         # (#465) rides along as reject reasons + review-profile risk
         # penalties. Empty until the first advertisement.
@@ -583,8 +585,8 @@ class ProxyManager:
         # Health flags for the #465 filter, computed ONCE per start() from
         # the persisted metrics store and held for the session — exposure
         # must not drift between the startup advertisement (what the client
-        # registered) and later get_proxy_tools() calls (teardown, tests),
-        # or telemetry would lie about the candidate set the client saw.
+        # registered) and later get_proxy_tools() calls, or telemetry would
+        # lie about the candidate set the client saw.
         self._unhealthy_tools: frozenset[tuple[str, str]] = frozenset()
         # #465 optional external tool-graph eligibility provider. Consulted
         # ONCE per start() (beside the health-flag precompute) so the
@@ -1141,7 +1143,8 @@ class ProxyManager:
             # raises RuntimeError, not OSError, and must reject, not escape.
             path = cfg.bundle_path.expanduser()
             # Deliberate O(1) syscall on every proxied tools/call and each
-            # advertisement build (startup registration / lifespan cleanup): a
+            # advertisement build (startup, call-time enforcement,
+            # get_proxy_tools): a
             # freshly published denial must take effect before cache lookup or
             # upstream dispatch. Catalog hashing remains revision-gated, so
             # freshness does not become O(tool count).
@@ -2607,10 +2610,14 @@ class ProxyManager:
         ones included — they used to be skipped inline here, and now become
         structured ``config_hidden`` rejects instead) and hands the set to
         ``tool_eligibility.filter_tools``, the single exposure choke point.
-        Only the filter's eligible output is returned/registered; the
-        reject reasons and review-profile risk penalties are snapshotted
-        alongside the advertisement so selection telemetry (#467) and
-        relevance ranking (#466) describe exactly this exposure decision.
+        Only the filter's eligible output is returned; the reject reasons and
+        review-profile risk penalties are snapshotted alongside the
+        advertisement so selection telemetry (#467) and relevance ranking
+        (#466) describe exactly this exposure decision. The snapshot is taken
+        before the caller registers anything, so it records what passed
+        exposure filtering, not what the server ended up registering — a
+        distinction that only matters when registration declines a name
+        (#908).
         """
         # ONE read for the whole advertisement build, threaded down — the same
         # rule the enforcement path follows (#871). It serves the GLOBAL fields
@@ -4218,11 +4225,13 @@ class ProxyManager:
 
         ``tools`` counts the DISCOVERED catalogue (everything the upstream
         listed — since #465 ``conn.tools`` is no longer pre-filtered at
-        connect time); ``advertised_tools`` counts how many of them the
-        last advertisement actually exposed, so operators can tell a
-        withheld tool from a missing one. ``advertised_tools`` reflects
-        the most recent ``get_proxy_tools()`` pass — in the server it runs
-        at startup registration, before any health probe can observe it.
+        connect time); ``advertised_tools`` counts how many of them passed
+        exposure filtering, so operators can tell a withheld tool from a
+        missing one. It reflects the most recent ``get_proxy_tools()`` pass —
+        in the server it runs at startup registration, before any health probe
+        can observe it — and counts a name the registration step then declined
+        (#908), so it is the exposure decision rather than a read of the live
+        tool registry.
 
         A configured server that FAILED to connect at startup (#580) has no
         ``_connections`` entry, so it is reported here from ``_failed_servers``

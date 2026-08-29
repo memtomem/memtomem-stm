@@ -341,6 +341,38 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **Server shutdown unregisters the tools it registered, not the ones it would
+  advertise now** (#891). The lifespan registered one `get_proxy_tools()` pass
+  and, at teardown, called `get_proxy_tools()` a second time and removed *that*
+  result. That call is a live re-derivation, so any catalog movement during the
+  session made the two disagree: a tool an upstream withdrew via
+  `tools/list_changed` stayed registered on the server, and a tool that appeared
+  after startup produced a removal for a name never registered — the resulting
+  error was discarded by a catch-all `except Exception: pass`, so neither was
+  visible. A toolgraph bundle republished or failing under the STRICT profile
+  mid-session could shrink the teardown set to nothing and remove nothing at
+  all. The registration loop now records the prefixed names it took ownership of
+  and teardown removes exactly those.
+
+  Two consequences follow from dropping the second pass. That call was the only
+  statement in the cleanup block sitting outside a guard, so anything it raised
+  skipped `proxy_manager.stop()` and every later resource release; the path no
+  longer exists. And because each pass rewrites the advertisement snapshot that
+  `stm_proxy_health` reports per upstream and the relevance ranker scores
+  against, a divergent teardown pass used to redefine "this session's
+  advertisement" during shutdown; the snapshot now stays as the startup
+  advertisement left it. (That snapshot records what passed exposure filtering,
+  which is not the same set as what the server registered — a candidate the
+  registration step then declines still counts toward it. That divergence
+  predates this change and is tracked in #908.)
+
+  Registration also stops claiming a name that was already taken. The MCP SDK
+  treats a duplicate `add_tool` as a successful no-op — it returns the existing
+  tool rather than inserting the new handler — so the proxy previously
+  overwrote that tool's schema and then deleted it at teardown. It now leaves
+  the existing tool untouched and logs a warning. Removal failures are logged
+  at debug level instead of discarded.
+
 - **An edit to `extraction` now reaches the extractor, not just the stage
   around it** (#890). `ProxyManager` built its `FactExtractor` once and kept
   that instance for the life of the process. After a hot reload of

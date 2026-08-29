@@ -134,8 +134,22 @@ def register_proxy_tool(
     server: MCPServer,
     handler: Any,
     info: Any,  # ProxyToolInfo
-) -> None:
-    """Register a proxy tool with the upstream's actual schema and annotations."""
+) -> bool:
+    """Register a proxy tool with the upstream's actual schema and annotations.
+
+    Returns whether this call took ownership of the name; the caller removes
+    exactly the names that returned True at teardown (#891). False when
+    ``add_tool`` fails or the name is already occupied — note that the schema
+    overrides further down degrade without giving up ownership, since the tool
+    is registered either way. True means the name was free immediately before a
+    successful ``add_tool`` — or, when the SDK internals needed to establish
+    that are absent, that ``add_tool`` reported success and ownership had to be
+    assumed. That fallback is the pre-#891 posture: in an SDK where the name
+    cannot be probed, claiming risks removing a tool that was already there,
+    while declining would leak every proxied registration in a host that
+    outlives the session. Neither is provable, and the leak is the larger of
+    the two.
+    """
     tagged_annotations = _tag_annotations_title(info.annotations, info.server)
     # ``getattr`` + dict narrowing (not attribute access) so a pre-envelope
     # ``ProxyToolInfo`` shape — the degradation tests' SimpleNamespace and
@@ -157,6 +171,32 @@ def register_proxy_tool(
         # that drops the kwarg fails only meta-bearing tools into the
         # version-drift warning below instead of all of them.
         add_tool_kwargs["meta"] = tool_meta
+    # The SDK treats a duplicate ``add_tool`` as a successful no-op: it returns
+    # the tool already under that name without inserting the new handler, and
+    # ``MCPServer.add_tool`` discards that return value, so a collision is
+    # indistinguishable from a fresh registration at the call site. Claiming it
+    # would mean overwriting a caller's schema and then deleting their tool at
+    # teardown — the embedded/library reuse case #891 is about. Check first and
+    # decline the name instead. Guarded like the two version-drift accesses
+    # below: an SDK without this internal falls through to ``add_tool``, which
+    # is exactly the pre-#891 behavior. When the probe DOES run, reaching it
+    # and then a non-raising ``add_tool`` is what makes the ``True`` returned
+    # below a fact rather than an assumption — and it stays a fact even if the
+    # schema lookup further down fails or comes back empty, because nothing
+    # between the two can hand the name to someone else.
+    try:
+        already_registered = info.prefixed_name in server._tool_manager._tools
+    except AttributeError:
+        already_registered = False
+    if already_registered:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Not registering proxy tool '%s' — a tool is already registered "
+            "under that name; leaving the existing one untouched",
+            info.prefixed_name,
+        )
+        return False
     try:
         server.add_tool(handler, **add_tool_kwargs)
     except Exception:
@@ -167,7 +207,7 @@ def register_proxy_tool(
             info.prefixed_name,
             exc_info=True,
         )
-        return
+        return False
     try:
         registered = server._tool_manager._tools.get(info.prefixed_name)
     except AttributeError:
@@ -178,7 +218,7 @@ def register_proxy_tool(
             "Tool is registered but may show incorrect parameter schema.",
             info.prefixed_name,
         )
-        return
+        return True
     if registered is not None:
         # Same version-drift posture as the two guards above: a future
         # fastmcp that renames/removes these pydantic fields raises on
@@ -213,3 +253,4 @@ def register_proxy_tool(
                 info.prefixed_name,
                 exc_info=True,
             )
+    return True
