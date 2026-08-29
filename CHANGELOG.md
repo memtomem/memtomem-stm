@@ -375,6 +375,46 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **`max_description_chars` is now an exact cap on the client-visible
+  description** (#893, PR #921). It read as a cap but did not bound the string
+  that reached the client, three ways that compound: truncation appended its ellipsis *after* slicing (+3),
+  the convention-suffix budget floored at 40 regardless of the configured
+  value, and registration prepended `[proxied] ` (+10) after all budgeting — so
+  a configured 60 could advertise 97 characters. For a client that resends tool
+  definitions with each request, that overshoot is a recurring token cost the
+  knob claimed to bound. Every fixed cost now comes out of the budget, and the
+  invariant is pinned where it is real: on the description a real
+  `ClientSession` decodes from `tools/list`, swept across five caps and four
+  compression strategies.
+
+  **Behavior change**: the budget for upstream text narrows, and long
+  descriptions can get shorter. At the default 200 the narrowing is the 10
+  characters the prefix now costs, rising to 13 for a suffix-free description
+  that also spends an ellipsis truncation previously appended on top; with a
+  convention suffix it stays 10, because the old path already reserved three
+  characters for that ellipsis. Those are budget reductions, not guaranteed
+  shortening: a description that already fits the narrowed window is untouched,
+  and a truncated one
+  is unchanged whenever both windows land on the same boundary. Where the
+  visible length does move it can move by much more, because truncation prefers
+  a sentence boundary and a narrower window can fall back to a much earlier one
+  — a description that advertised 204 characters can now advertise 79. The
+  convention suffix — the hint naming the follow-up tool — wins over upstream
+  text when it fits, and is now **dropped whole** at a cap too small to hold it
+  (below 54 for `selective`); previously it was appended whole and simply
+  overflowed the cap. The compressed response envelope still
+  carries the follow-up instructions. `max_description_chars` also gains a
+  floor of 32 at both the global and per-server level (was `> 0`); 32 is a
+  usability choice rather than the arithmetic minimum, which is 10 — the length
+  of the prefix — and a config below the floor now fails loud at load.
+
+  The cap describes what registration produces. The global setting is read
+  live but applied only where a tool is advertised, so it takes effect on the
+  next registration — a restart, or an upstream catalogue change. The
+  per-server setting is read from the connect-time snapshot, so it takes effect
+  when that upstream next connects; a `tools/list_changed` refresh replaces the
+  catalogue but not the config it is advertised under.
+
 - **A mid-session upstream catalogue change now re-decides exposure instead of
   being ignored** (#917). The exposure filter's verdict was registered exactly
   once, at startup, while an upstream can replace its catalogue at any time —
