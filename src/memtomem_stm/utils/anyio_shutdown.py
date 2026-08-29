@@ -18,7 +18,8 @@ import asyncio
 import logging
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +200,34 @@ async def drain_or_warn(idle: asyncio.Event, *, timeout: float, what: str) -> bo
         logger.warning(
             "%s.close(): in-flight calls did not drain within %.1fs — "
             "closing the client anyway; an in-flight call may see a closed transport",
+            what,
+            timeout,
+        )
+        return False
+
+
+async def await_or_warn(awaitable: Awaitable[Any], *, timeout: float, what: str) -> bool:
+    """Await *awaitable* with a ceiling; log and proceed when it is hit.
+
+    The teardown counterpart to :func:`drain_or_warn`, which waits on an event.
+    A ``stop()`` that never returns is the difference between a process that
+    exits and one that lives for days holding a child (#906), and every step of
+    a teardown is on the critical path of process exit.
+
+    Cancelling the wait does not guarantee the work stops — a ``stop()`` that
+    awaits a shielded task keeps running — so this bounds *the teardown*, not
+    the operation. What guarantees the exit is the watchdog; this makes the
+    common wedge recoverable and leaves a named trail when it happens.
+
+    Returns True when it completed, False when the ceiling was hit.
+    """
+    try:
+        await asyncio.wait_for(awaitable, timeout=timeout)
+        return True
+    except TimeoutError:
+        logger.warning(
+            "%s did not finish within %.1fs — continuing shutdown without it; "
+            "any child it owns is left to the leaked-child sweep",
             what,
             timeout,
         )

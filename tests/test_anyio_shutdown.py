@@ -13,9 +13,13 @@ count as a clean shutdown.
 
 from __future__ import annotations
 
+import asyncio
+import logging
+
 import pytest
 
 from memtomem_stm.utils.anyio_shutdown import (
+    await_or_warn,
     _CANCEL_SCOPE_SHUTDOWN_MESSAGES,
     is_anyio_cancel_scope_shutdown_error,
     is_clean_cancel_scope_shutdown,
@@ -180,6 +184,26 @@ class TestDrainOrWarn:
 
         idle = asyncio.Event()
         idle.set()
-        assert await asyncio.wait_for(
-            drain_or_warn(idle, timeout=30.0, what="probe"), timeout=5.0
-        ) is True
+        assert (
+            await asyncio.wait_for(drain_or_warn(idle, timeout=30.0, what="probe"), timeout=5.0)
+            is True
+        )
+
+
+async def test_await_or_warn_returns_true_when_the_step_finishes():
+    async def _quick() -> None:
+        return None
+
+    assert await await_or_warn(_quick(), timeout=5.0, what="Quick stop") is True
+
+
+async def test_await_or_warn_gives_up_and_names_the_step(caplog):
+    # A stop() that never returns is the difference between a process that
+    # exits and one that lives for days holding a child (#906). Shutdown has to
+    # continue, and the log has to say which stop() to look at.
+    async def _wedged() -> None:
+        await asyncio.sleep(30)
+
+    with caplog.at_level(logging.WARNING, logger="memtomem_stm.utils.anyio_shutdown"):
+        assert await await_or_warn(_wedged(), timeout=0.05, what="Proxy manager stop") is False
+    assert any("Proxy manager stop did not finish" in r.getMessage() for r in caplog.records)

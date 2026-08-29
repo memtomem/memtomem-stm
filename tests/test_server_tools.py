@@ -2104,6 +2104,72 @@ class TestLifespan:
 
         assert killed == [{4242}]
 
+    async def test_a_wedged_stop_does_not_park_the_rest_of_teardown(self, monkeypatch, caplog):
+        """Teardown is on the critical path of process exit, so one stop() that
+        never returns used to take the whole shutdown with it. The step is
+        abandoned, the rest runs, and the sweep collects what it left."""
+        killed = []
+        probes = iter([set(), {4242}])
+        monkeypatch.setattr(
+            "memtomem_stm.utils.child_reaper.probe_child_pids", lambda: next(probes)
+        )
+        monkeypatch.setattr(
+            "memtomem_stm.utils.child_reaper.terminate_leaked_children", killed.append
+        )
+        monkeypatch.setattr("memtomem_stm.server._PROXY_STOP_BUDGET_SECONDS", 0.05)
+
+        async def _never_returns():
+            await asyncio.sleep(30)
+
+        with caplog.at_level("WARNING"):
+            await asyncio.wait_for(
+                self._run_minimal_lifespan(pm_stop=_never_returns), timeout=10.0
+            )
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("Proxy manager stop did not finish" in m for m in messages)
+        assert killed == [{4242}]  # the abandoned step's child still swept
+
+    async def test_the_watchdog_is_armed_for_teardown_and_stood_down_after(self, monkeypatch):
+        """It is the guarantee that the process exits — bounding the steps only
+        cancels waits, not work — so it must cover the whole teardown window and
+        nothing else, or it fires on a healthy shutdown."""
+        events = []
+
+        class _RecordingWatchdog:
+            def __init__(self, timeout_seconds, *, before_exit=None):
+                events.append(("built", timeout_seconds))
+
+            def arm(self):
+                events.append(("armed",))
+
+            def disarm(self):
+                events.append(("disarmed",))
+
+        monkeypatch.setattr("memtomem_stm.server.TeardownWatchdog", _RecordingWatchdog)
+        await self._run_minimal_lifespan()
+        assert [e[0] for e in events] == ["built", "armed", "disarmed"]
+
+    async def test_the_watchdog_is_stood_down_even_when_teardown_raises(self, monkeypatch):
+        # A disarm skipped on the error path would leave a live countdown that
+        # kills the process moments after a shutdown that actually completed.
+        disarmed = []
+
+        class _RecordingWatchdog:
+            def __init__(self, timeout_seconds, *, before_exit=None):
+                pass
+
+            def arm(self):
+                pass
+
+            def disarm(self):
+                disarmed.append(1)
+
+        monkeypatch.setattr("memtomem_stm.server.TeardownWatchdog", _RecordingWatchdog)
+        with pytest.raises(asyncio.CancelledError):
+            await self._run_minimal_lifespan(pm_stop=asyncio.CancelledError())
+        assert disarmed == [1]
+
     async def test_metrics_store_init_failure_degrades_gracefully(self):
         """A corrupt/locked metrics DB (or a lost migration race) raising at
         init must log and fall back to no metrics rather than crashing the

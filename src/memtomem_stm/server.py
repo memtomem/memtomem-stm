@@ -50,11 +50,23 @@ from memtomem_stm.surfacing.observability import (
 )
 from memtomem_stm.observability.tracing import traced
 from memtomem_stm.surfacing.feedback import FeedbackTracker
-from memtomem_stm.utils.anyio_shutdown import is_clean_cancel_scope_shutdown
+from memtomem_stm.utils.anyio_shutdown import await_or_warn, is_clean_cancel_scope_shutdown
 from memtomem_stm.utils import child_reaper
+from memtomem_stm.utils.teardown_watchdog import TeardownWatchdog
 from memtomem_stm.utils.json_out import escape_lone_surrogates, require_utf8_identifier
 
 logger = logging.getLogger(__name__)
+
+# Per-step ceilings on the teardown. Each is far above a healthy stop() and far
+# below ``teardown_watchdog_seconds``, so the watchdog stays what it is meant to
+# be — the backstop for a wedge these did not recover, not the first thing to
+# fire. Bounding the wait does not stop the work (an owner ``close()`` awaits a
+# shielded task), so what these buy is a shutdown that continues, and a named
+# line saying which stop() to look at; the leaked-child sweep collects whatever
+# the abandoned step left behind.
+_PROXY_STOP_BUDGET_SECONDS = 10.0
+_ENGINE_STOP_BUDGET_SECONDS = 5.0
+_WARMUP_JOIN_BUDGET_SECONDS = 5.0
 
 _HASHED_QUERY_PREVIEW_RE = re.compile(r"sha256:[0-9a-f]{16}")
 """Exact shape of the opaque ID `FeedbackStore.get_stats` passes through
@@ -526,6 +538,17 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
         # backstop, so it runs in a ``finally`` of its own: a ``CancelledError``
         # from any step below propagates past their ``except Exception`` guards,
         # and the leak is exactly what a cancelled teardown leaves behind.
+        #
+        # The watchdog outranks both. Bounding the steps below cancels the
+        # *wait*, not the work — ``ProxyManager.stop()`` reaches an owner
+        # ``close()`` that awaits a shielded task — so a wedged stop() can still
+        # park a process that has nothing left to do but exit. Armed only for
+        # this window, it cannot fire during normal operation.
+        watchdog = TeardownWatchdog(
+            config.teardown_watchdog_seconds,
+            before_exit=lambda: child_reaper.sweep_leaked_children(baseline=children_at_startup),
+        )
+        watchdog.arm()
         try:
             # Remove exactly what registration took ownership of (#891). Re-deriving
             # the set with ``get_proxy_tools()`` here would remove whatever the
@@ -542,12 +565,20 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                     logger.debug("Failed to remove proxy tool '%s'", name, exc_info=True)
             if proxy_manager is not None:
                 try:
-                    await proxy_manager.stop()
+                    await await_or_warn(
+                        proxy_manager.stop(),
+                        timeout=_PROXY_STOP_BUDGET_SECONDS,
+                        what="Proxy manager stop",
+                    )
                 except Exception:
                     logger.warning("Failed to stop proxy manager", exc_info=True)
             if surfacing_engine is not None:
                 try:
-                    await surfacing_engine.stop()
+                    await await_or_warn(
+                        surfacing_engine.stop(),
+                        timeout=_ENGINE_STOP_BUDGET_SECONDS,
+                        what="Surfacing engine stop",
+                    )
                 except Exception:
                     logger.warning("Failed to stop surfacing engine", exc_info=True)
             for resource, name in [
@@ -569,7 +600,11 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                 # closes or cancels it in-task.
                 warmup_task.cancel()
                 try:
-                    await warmup_task
+                    await await_or_warn(
+                        warmup_task,
+                        timeout=_WARMUP_JOIN_BUDGET_SECONDS,
+                        what="Warm-up task join",
+                    )
                 except (asyncio.CancelledError, Exception):
                     pass
             if mcp_adapter is not None:
@@ -595,7 +630,10 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                 except Exception:
                     logger.warning("Failed to shut down OTLP export", exc_info=True)
         finally:
-            child_reaper.sweep_leaked_children(baseline=children_at_startup)
+            try:
+                child_reaper.sweep_leaked_children(baseline=children_at_startup)
+            finally:
+                watchdog.disarm()
 
 
 # ``version=`` pins ``serverInfo.version`` in the ``initialize`` response to
