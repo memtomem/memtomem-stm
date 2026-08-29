@@ -51,7 +51,7 @@ from memtomem_stm.surfacing.observability import (
 from memtomem_stm.observability.tracing import traced
 from memtomem_stm.surfacing.feedback import FeedbackTracker
 from memtomem_stm.utils.anyio_shutdown import is_clean_cancel_scope_shutdown
-from memtomem_stm.utils.child_reaper import direct_child_pids, terminate_leaked_children
+from memtomem_stm.utils.child_reaper import sweep_leaked_children
 from memtomem_stm.utils.json_out import escape_lone_surrogates, require_utf8_identifier
 
 logger = logging.getLogger(__name__)
@@ -510,91 +510,85 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
         )
         yield ctx
     finally:
-        # Remove exactly what registration took ownership of (#891). Re-deriving
-        # the set with ``get_proxy_tools()`` here would remove whatever the
-        # session advertises *now*: a ``tools/list_changed`` or a republished
-        # toolgraph bundle mid-session leaves registrations behind and asks for
-        # removals of names never registered, and the pass rewrites the
-        # advertisement snapshot that health and ranking read during shutdown.
-        # It was also the one call in this block outside a guard, so anything it
-        # raised skipped ``stop()`` and every cleanup below.
-        for name in registered_proxy_tools:
-            try:
-                server.remove_tool(name)
-            except Exception:
-                logger.debug("Failed to remove proxy tool '%s'", name, exc_info=True)
-        if proxy_manager is not None:
-            try:
-                await proxy_manager.stop()
-            except Exception:
-                logger.warning("Failed to stop proxy manager", exc_info=True)
-        if surfacing_engine is not None:
-            try:
-                await surfacing_engine.stop()
-            except Exception:
-                logger.warning("Failed to stop surfacing engine", exc_info=True)
-        for resource, name in [
-            (proxy_cache, "proxy_cache"),
-            (metrics_store, "metrics_store"),
-            (feedback_tracker, "feedback_tracker"),
-            (compression_feedback_tracker, "compression_feedback_tracker"),
-            (progressive_reads_tracker, "progressive_reads_tracker"),
-            (selection_log, "selection_log"),
-        ]:
-            if resource is not None:
-                try:
-                    resource.close()
-                except Exception:
-                    logger.warning("Failed to close %s", name, exc_info=True)
-        if warmup_task is not None:
-            # Cancelling mid-start abandons the op (#664) — it finishes in
-            # the adapter's owner task, and ``stop()``'s bounded join below
-            # closes or cancels it in-task.
-            warmup_task.cancel()
-            try:
-                await warmup_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        if mcp_adapter is not None:
-            try:
-                await mcp_adapter.stop()
-            except Exception:
-                logger.warning("Failed to stop MCP adapter", exc_info=True)
-        if langfuse_client is not None:
-            try:
-                from memtomem_stm.observability.tracing import shutdown_langfuse
-
-                shutdown_langfuse(langfuse_client)
-            except Exception:
-                pass
-        if otlp_emitter is not None:
-            # Last: every span-producing component above has stopped, so the
-            # drain has a finite set to wait on. Bounded by its own config —
-            # a hung collector delays shutdown by at most that budget.
-            try:
-                from memtomem_stm.observability.otlp import shutdown_otlp
-
-                shutdown_otlp(otlp_emitter, timeout_seconds=config.otlp.flush_timeout_seconds)
-            except Exception:
-                logger.warning("Failed to shut down OTLP export", exc_info=True)
-        # Every child this process spawned belongs to a component stopped above,
-        # and each is owned by a context manager that kills it *if the context is
-        # actually exited*. A stop() that returns while abandoning one — an owner
-        # task lost mid-lifetime, a bounded join that gave up (see
-        # ``McpClientSearchAdapter.stop``, which names the daemon's sweep as its
-        # backstop) — leaves a live child of a process about to exit, which then
-        # outlives us as an orphan (#906). So sweep whatever is still a direct
-        # child here. Unlike the daemon's mid-lifetime sweep this does not
-        # intersect with a pre-stop snapshot: nothing surviving *full* teardown is
-        # legitimate, and the intersection would miss a child spawned by a
-        # reconnect racing shutdown.
+        # Each component below owns stdio children that its ``stop()`` kills
+        # *if the context is actually exited*. A stop() that returns while
+        # abandoning one — owner task lost mid-lifetime, bounded join that gave
+        # up (see ``McpClientSearchAdapter.stop``, which names the daemon's
+        # sweep as its backstop) — leaves a live child of a process about to
+        # exit, which then outlives us as an orphan (#906). The sweep is that
+        # backstop, so it runs in a ``finally`` of its own: a ``CancelledError``
+        # from any step below propagates past their ``except Exception`` guards,
+        # and the leak is exactly what a cancelled teardown leaves behind.
         try:
-            leaked = direct_child_pids()
-            if leaked:
-                logger.warning("Terminating leaked child process(es): %s", sorted(leaked))
-                await terminate_leaked_children(leaked)
-        except Exception:
-            logger.warning("Leaked-child sweep failed", exc_info=True)
+            # Remove exactly what registration took ownership of (#891). Re-deriving
+            # the set with ``get_proxy_tools()`` here would remove whatever the
+            # session advertises *now*: a ``tools/list_changed`` or a republished
+            # toolgraph bundle mid-session leaves registrations behind and asks for
+            # removals of names never registered, and the pass rewrites the
+            # advertisement snapshot that health and ranking read during shutdown.
+            # It was also the one call in this block outside a guard, so anything it
+            # raised skipped ``stop()`` and every cleanup below.
+            for name in registered_proxy_tools:
+                try:
+                    server.remove_tool(name)
+                except Exception:
+                    logger.debug("Failed to remove proxy tool '%s'", name, exc_info=True)
+            if proxy_manager is not None:
+                try:
+                    await proxy_manager.stop()
+                except Exception:
+                    logger.warning("Failed to stop proxy manager", exc_info=True)
+            if surfacing_engine is not None:
+                try:
+                    await surfacing_engine.stop()
+                except Exception:
+                    logger.warning("Failed to stop surfacing engine", exc_info=True)
+            for resource, name in [
+                (proxy_cache, "proxy_cache"),
+                (metrics_store, "metrics_store"),
+                (feedback_tracker, "feedback_tracker"),
+                (compression_feedback_tracker, "compression_feedback_tracker"),
+                (progressive_reads_tracker, "progressive_reads_tracker"),
+                (selection_log, "selection_log"),
+            ]:
+                if resource is not None:
+                    try:
+                        resource.close()
+                    except Exception:
+                        logger.warning("Failed to close %s", name, exc_info=True)
+            if warmup_task is not None:
+                # Cancelling mid-start abandons the op (#664) — it finishes in
+                # the adapter's owner task, and ``stop()``'s bounded join below
+                # closes or cancels it in-task.
+                warmup_task.cancel()
+                try:
+                    await warmup_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if mcp_adapter is not None:
+                try:
+                    await mcp_adapter.stop()
+                except Exception:
+                    logger.warning("Failed to stop MCP adapter", exc_info=True)
+            if langfuse_client is not None:
+                try:
+                    from memtomem_stm.observability.tracing import shutdown_langfuse
+
+                    shutdown_langfuse(langfuse_client)
+                except Exception:
+                    pass
+            if otlp_emitter is not None:
+                # Last: every span-producing component above has stopped, so the
+                # drain has a finite set to wait on. Bounded by its own config —
+                # a hung collector delays shutdown by at most that budget.
+                try:
+                    from memtomem_stm.observability.otlp import shutdown_otlp
+
+                    shutdown_otlp(otlp_emitter, timeout_seconds=config.otlp.flush_timeout_seconds)
+                except Exception:
+                    logger.warning("Failed to shut down OTLP export", exc_info=True)
+        finally:
+            sweep_leaked_children(logger)
 
 
 # ``version=`` pins ``serverInfo.version`` in the ``initialize`` response to

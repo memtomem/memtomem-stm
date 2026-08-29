@@ -1884,14 +1884,6 @@ class TestTuningRecommendations:
 
 
 class TestLifespan:
-    @pytest.fixture(autouse=True)
-    def _no_real_child_sweep(self, monkeypatch):
-        """Teardown sweeps this process's direct children (#906) — under pytest
-        that is the test runner's own, so every lifespan test must report none.
-        The sweep's own behavior is pinned by the two tests below (which
-        override this) and by tests/test_child_reaper.py."""
-        monkeypatch.setattr("memtomem_stm.server.direct_child_pids", lambda: set())
-
     async def test_proxy_disabled(self):
         """When proxy is disabled, ProxyManager.start() should not be called."""
         from memtomem_stm.server import app_lifespan, mcp
@@ -2062,15 +2054,15 @@ class TestLifespan:
         process as an orphan holding its own LTM (#906). Anything still a
         direct child after full teardown is that leak, so it must be
         terminated, and visibly."""
-        killed: list[set[int]] = []
+        killed = []
+        monkeypatch.setattr(
+            "memtomem_stm.utils.child_reaper.direct_child_pids", lambda: {4242}
+        )
+        monkeypatch.setattr(
+            "memtomem_stm.utils.child_reaper.terminate_leaked_children_sync", killed.append
+        )
 
-        async def _record(pids):
-            killed.append(pids)
-
-        monkeypatch.setattr("memtomem_stm.server.direct_child_pids", lambda: {4242})
-        monkeypatch.setattr("memtomem_stm.server.terminate_leaked_children", _record)
-
-        with caplog.at_level("WARNING", logger="memtomem_stm.server"):
+        with caplog.at_level("WARNING", logger="memtomem_stm.utils.child_reaper"):
             await self._run_minimal_lifespan()
 
         assert killed == [{4242}]
@@ -2079,18 +2071,56 @@ class TestLifespan:
     async def test_teardown_with_no_surviving_children_kills_nothing(self, monkeypatch, caplog):
         """The common case: every component reaped its own child, so the sweep
         finds nothing and stays silent — no warning for a clean shutdown."""
-        killed: list[set[int]] = []
+        killed = []
+        monkeypatch.setattr(
+            "memtomem_stm.utils.child_reaper.terminate_leaked_children_sync", killed.append
+        )
 
-        async def _record(pids):
-            killed.append(pids)
-
-        monkeypatch.setattr("memtomem_stm.server.terminate_leaked_children", _record)
-
-        with caplog.at_level("WARNING", logger="memtomem_stm.server"):
+        with caplog.at_level("WARNING", logger="memtomem_stm.utils.child_reaper"):
             await self._run_minimal_lifespan()
 
         assert killed == []
         assert not any("leaked child process" in r.getMessage() for r in caplog.records)
+
+    async def test_teardown_sweeps_even_when_a_stop_is_cancelled(self, monkeypatch, caplog):
+        """A cancelled teardown is precisely when a stop() abandons its child,
+        and CancelledError is not an Exception — it propagates past every
+        `except Exception` guard in the teardown. The sweep must still run."""
+        from memtomem_stm.server import app_lifespan, mcp
+
+        killed = []
+        monkeypatch.setattr(
+            "memtomem_stm.utils.child_reaper.direct_child_pids", lambda: {4242}
+        )
+        monkeypatch.setattr(
+            "memtomem_stm.utils.child_reaper.terminate_leaked_children_sync", killed.append
+        )
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock(side_effect=asyncio.CancelledError())
+        mock_pm_instance.get_proxy_tools.return_value = []
+
+        with (
+            patch("memtomem_stm.server.STMConfig") as MockConfig,
+            patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+        ):
+            mock_cfg = MockConfig.return_value
+            mock_cfg.proxy = MagicMock()
+            mock_cfg.proxy.enabled = False
+            mock_cfg.proxy.config_path = Path("/tmp/proxy.json")
+            mock_cfg.surfacing = MagicMock()
+            mock_cfg.surfacing.enabled = False
+            mock_cfg.langfuse = MagicMock()
+            mock_cfg.langfuse.enabled = False
+            mock_cfg.otlp = MagicMock()
+            mock_cfg.otlp.enabled = False
+
+            with pytest.raises(asyncio.CancelledError):
+                async with app_lifespan(mcp) as _ctx:
+                    pass
+
+        assert killed == [{4242}]
 
     async def test_metrics_store_init_failure_degrades_gracefully(self):
         """A corrupt/locked metrics DB (or a lost migration race) raising at

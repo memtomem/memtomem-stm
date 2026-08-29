@@ -90,11 +90,13 @@ async def _quiet(coro: Any, what: str) -> None:
 
 
 # The sweep itself lives in ``utils.child_reaper`` — the stdio MCP server needs
-# the same machinery (#906) and must not import this module to get it. Aliased
-# under the private names this module has always used so call sites (and the
-# tests that monkeypatch them by attribute) are unchanged.
+# the same machinery (#906) and must not import this module to get it. What the
+# daemon's own sweep varies is kept here under the names it has always used, so
+# its call sites and the tests that monkeypatch them by attribute are unchanged.
+# ``signal_pid`` is deliberately not re-aliased: the escalation resolves it
+# inside ``child_reaper``, so an alias here would look patchable and silently
+# not be.
 _direct_child_pids = child_reaper.direct_child_pids
-_signal_pid = child_reaper.signal_pid
 _LEAK_KILL_ESCALATE_SECONDS = child_reaper.LEAK_KILL_ESCALATE_SECONDS
 
 

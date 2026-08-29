@@ -6,15 +6,21 @@ children; everything about *which* pids get signalled is exercised with fakes.
 
 from __future__ import annotations
 
+import logging
 import signal
 import subprocess
 import sys
+import time
 
 import pytest
 
 from memtomem_stm.utils import child_reaper
 
-pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals/process groups")
+pytestmark = [
+    pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals/process groups"),
+    # These spawn and reap their own children, so they need the real probe.
+    pytest.mark.real_child_sweep,
+]
 
 
 def _sleeping_child() -> subprocess.Popen[bytes]:
@@ -136,3 +142,59 @@ async def test_terminate_leaked_children_skips_escalation_for_pids_that_exited(
     monkeypatch.setattr(child_reaper, "is_pid_alive", lambda _pid: False)
     await child_reaper.terminate_leaked_children({111}, escalate_seconds=0.05)
     assert signalled == [(111, int(signal.SIGTERM))]
+
+
+async def test_escalation_does_not_wait_out_a_child_nobody_reaped() -> None:
+    # A fire-and-forget child (Popen discarded, as daemon spawn does) that dies
+    # on SIGTERM stays a zombie: a signal-0 probe still calls it alive, so the
+    # poll would burn the whole window and then SIGKILL a corpse. The escalation
+    # window is a ceiling on real stragglers, not a fixed shutdown tax.
+    child = _sleeping_child()
+    started = time.monotonic()
+    await child_reaper.terminate_leaked_children({child.pid}, escalate_seconds=5.0)
+    assert time.monotonic() - started < 2.0
+    assert child.wait(timeout=5.0) == -signal.SIGTERM
+
+
+def test_sweep_spares_a_child_meant_to_outlive_us(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The shared surfacing daemon is spawned detached but is still a direct
+    # child (nothing double-forks), and it is meant to outlive us. Sweeping it
+    # would take down the daemon and the LTM it holds for every other consumer.
+    monkeypatch.setattr(child_reaper, "_detached_pids", set())
+    monkeypatch.setattr(child_reaper, "direct_child_pids", lambda: {111, 222})
+    killed: list[set[int]] = []
+    monkeypatch.setattr(child_reaper, "terminate_leaked_children_sync", killed.append)
+
+    child_reaper.note_detached_child(222)
+    assert child_reaper.leaked_child_pids() == {111}
+
+    with caplog.at_level(logging.WARNING, logger=child_reaper.__name__):
+        child_reaper.sweep_leaked_children()
+    assert killed == [{111}]
+    assert "222" not in "".join(r.getMessage() for r in caplog.records)
+
+
+def test_sweep_never_raises_into_teardown(monkeypatch: pytest.MonkeyPatch) -> None:
+    # It is the last step of shutdown: a failure here must not replace one leak
+    # with a different one.
+    def _boom() -> set[int]:
+        raise RuntimeError("probe exploded")
+
+    monkeypatch.setattr(child_reaper, "direct_child_pids", _boom)
+    child_reaper.sweep_leaked_children()
+
+
+def test_sync_escalation_terminates_and_escalates() -> None:
+    # The sync twin is what the server's teardown calls, so it carries the same
+    # guarantee as the async one.
+    plain = _sleeping_child()
+    stubborn = _sigterm_ignoring_child()
+    try:
+        child_reaper.terminate_leaked_children_sync({plain.pid, stubborn.pid}, escalate_seconds=0.3)
+        assert plain.wait(timeout=5.0) == -signal.SIGTERM
+        assert stubborn.wait(timeout=5.0) == -signal.SIGKILL
+    finally:
+        _reap(plain)
+        _reap(stubborn)

@@ -979,6 +979,7 @@ async def test_teardown_sweeps_leaked_child_on_normal_stop_return(
     assert killed == [{222}]
 
 
+@pytest.mark.real_child_sweep
 @pytest.mark.skipif(sys.platform == "win32", reason="pgrep-based probe is POSIX-only")
 def test_direct_child_pids_sees_spawned_child() -> None:
     child = _sleeping_child()
