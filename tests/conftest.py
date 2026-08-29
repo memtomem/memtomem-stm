@@ -100,3 +100,28 @@ def _no_real_child_sweep(request: pytest.FixtureRequest, monkeypatch: pytest.Mon
     if request.node.get_closest_marker("real_child_sweep"):
         return
     monkeypatch.setattr("memtomem_stm.utils.child_reaper.probe_child_pids", lambda: set())
+
+
+@pytest.fixture(autouse=True)
+def _no_real_teardown_watchdog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let a test arm the real hard-exit backstop.
+
+    ``app_lifespan`` arms a watchdog that calls ``os._exit`` if teardown does
+    not finish in time (#906) — in a test that is the pytest process, killed
+    mid-run with no report. Lifespan tests also build their config from a
+    MagicMock, so the timeout would not even be a number. The watchdog's own
+    behaviour is pinned in tests/test_teardown_watchdog.py, and its wiring by
+    the tests that replace this double with a recording one.
+    """
+
+    class _InertWatchdog:
+        def __init__(self, timeout_seconds: object, *, before_exit: object = None) -> None:
+            pass
+
+        def arm(self) -> None:
+            pass
+
+        def disarm(self) -> None:
+            pass
+
+    monkeypatch.setattr("memtomem_stm.server.TeardownWatchdog", _InertWatchdog)

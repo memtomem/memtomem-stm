@@ -2047,9 +2047,7 @@ class TestLifespan:
             async with app_lifespan(mcp) as _ctx:
                 pass
 
-    async def test_teardown_terminates_a_child_that_survived_every_stop(
-        self, monkeypatch, caplog
-    ):
+    async def test_teardown_terminates_a_child_that_survived_every_stop(self, monkeypatch, caplog):
         """A stop() can return while abandoning a live stdio child (owner task
         lost, bounded join given up) — the child then outlives the exiting
         process as an orphan holding its own LTM (#906). Anything still a
@@ -2103,6 +2101,111 @@ class TestLifespan:
             await self._run_minimal_lifespan(pm_stop=asyncio.CancelledError())
 
         assert killed == [{4242}]
+
+    async def test_a_wedged_stop_does_not_park_the_rest_of_teardown(self, monkeypatch, caplog):
+        """Teardown is on the critical path of process exit, so one stop() that
+        never returns used to take the whole shutdown with it. The step is
+        abandoned, the rest runs, and the sweep collects what it left."""
+        killed = []
+        probes = iter([set(), {4242}])
+        monkeypatch.setattr(
+            "memtomem_stm.utils.child_reaper.probe_child_pids", lambda: next(probes)
+        )
+        monkeypatch.setattr(
+            "memtomem_stm.utils.child_reaper.terminate_leaked_children", killed.append
+        )
+        monkeypatch.setattr("memtomem_stm.server._PROXY_STOP_BUDGET_SECONDS", 0.05)
+
+        async def _never_returns():
+            await asyncio.sleep(30)
+
+        with caplog.at_level("WARNING"):
+            await asyncio.wait_for(self._run_minimal_lifespan(pm_stop=_never_returns), timeout=10.0)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("Proxy manager stop did not finish" in m for m in messages)
+        assert killed == [{4242}]  # the abandoned step's child still swept
+
+    async def test_the_watchdog_would_reap_the_children_a_wedged_teardown_left(self, monkeypatch):
+        """The watchdog exits with os._exit, which runs no finally blocks — so
+        whatever the wedged teardown abandoned is gone for good unless the
+        watchdog itself sweeps. Pins that the server actually wires that hook up
+        with its own startup baseline, not just that the watchdog supports one."""
+        killed = []
+        probes = iter([{111}, {111, 222}])  # 111 predates us; 222 is ours
+        monkeypatch.setattr(
+            "memtomem_stm.utils.child_reaper.probe_child_pids", lambda: next(probes)
+        )
+        monkeypatch.setattr(
+            "memtomem_stm.utils.child_reaper.terminate_leaked_children", killed.append
+        )
+        hooks = []
+
+        class _CapturingWatchdog:
+            def __init__(self, timeout_seconds, *, before_exit=None):
+                hooks.append(before_exit)
+
+            def arm(self):
+                pass
+
+            def disarm(self):
+                pass
+
+        monkeypatch.setattr("memtomem_stm.server.TeardownWatchdog", _CapturingWatchdog)
+        # Suppress the teardown's own sweep so the assertion is about the hook.
+        monkeypatch.setattr(
+            "memtomem_stm.server.child_reaper.sweep_leaked_children", lambda **_: None
+        )
+        await self._run_minimal_lifespan()
+
+        assert hooks and hooks[0] is not None
+        monkeypatch.undo()
+        monkeypatch.setattr("memtomem_stm.utils.child_reaper.probe_child_pids", lambda: {111, 222})
+        monkeypatch.setattr(
+            "memtomem_stm.utils.child_reaper.terminate_leaked_children", killed.append
+        )
+        hooks[0]()
+        assert killed == [{222}]  # the startup baseline was carried into the hook
+
+    async def test_the_watchdog_is_armed_for_teardown_and_stood_down_after(self, monkeypatch):
+        """It is the guarantee that the process exits — bounding the steps only
+        cancels waits, not work — so it must cover the whole teardown window and
+        nothing else, or it fires on a healthy shutdown."""
+        events = []
+
+        class _RecordingWatchdog:
+            def __init__(self, timeout_seconds, *, before_exit=None):
+                events.append(("built", timeout_seconds))
+
+            def arm(self):
+                events.append(("armed",))
+
+            def disarm(self):
+                events.append(("disarmed",))
+
+        monkeypatch.setattr("memtomem_stm.server.TeardownWatchdog", _RecordingWatchdog)
+        await self._run_minimal_lifespan()
+        assert [e[0] for e in events] == ["built", "armed", "disarmed"]
+
+    async def test_the_watchdog_is_stood_down_even_when_teardown_raises(self, monkeypatch):
+        # A disarm skipped on the error path would leave a live countdown that
+        # kills the process moments after a shutdown that actually completed.
+        disarmed = []
+
+        class _RecordingWatchdog:
+            def __init__(self, timeout_seconds, *, before_exit=None):
+                pass
+
+            def arm(self):
+                pass
+
+            def disarm(self):
+                disarmed.append(1)
+
+        monkeypatch.setattr("memtomem_stm.server.TeardownWatchdog", _RecordingWatchdog)
+        with pytest.raises(asyncio.CancelledError):
+            await self._run_minimal_lifespan(pm_stop=asyncio.CancelledError())
+        assert disarmed == [1]
 
     async def test_metrics_store_init_failure_degrades_gracefully(self):
         """A corrupt/locked metrics DB (or a lost migration race) raising at
@@ -2397,9 +2500,7 @@ class TestApplyProxyFileConfig:
         assert config.proxy.enabled is True  # env wins over the file's False
         assert set(config.proxy.upstream_servers) == {"gh"}  # file fields survive
 
-    def test_env_only_inert_upstreams_warn_on_the_no_swap_path(
-        self, tmp_path, monkeypatch, caplog
-    ):
+    def test_env_only_inert_upstreams_warn_on_the_no_swap_path(self, tmp_path, monkeypatch, caplog):
         """The env-only startup has no file, and `missing_ok=False` means the
         loader returns before it can warn about anything — so the advisory
         (#831) has to come from here, against the pydantic-settings config
@@ -3171,9 +3272,7 @@ class TestLifespanTeardownSymmetry:
                 async with app_lifespan(mcp) as _ctx:
                     pass
 
-            mock_pm_instance.retain_registered_advertisement.assert_called_once_with(
-                ["fake__beta"]
-            )
+            mock_pm_instance.retain_registered_advertisement.assert_called_once_with(["fake__beta"])
         finally:
             tools_dict.clear()
             tools_dict.update(snapshot)
