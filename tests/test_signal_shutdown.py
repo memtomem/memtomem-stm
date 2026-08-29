@@ -96,6 +96,42 @@ def test_a_failing_cancellation_still_leaves_the_watchdog(
     assert rec.armed == 1
 
 
+def test_trigger_starts_the_same_shutdown_a_signal_starts(rec: _Recorder) -> None:
+    # The parent-liveness backstop (#914) has no signal to route: it infers the
+    # client is gone. What it needs is this exact mechanism, including the
+    # global that keeps the resulting CancelledError out of the crash path.
+    handler = _signals(rec)
+    handler.trigger("Parent process gone")
+    assert (rec.cancelled, rec.armed, rec.exits) == (1, 1, [])
+    assert signal_shutdown.was_signal_shutdown(asyncio.CancelledError()) is True
+
+
+def test_trigger_never_takes_the_immediate_exit_path(rec: _Recorder) -> None:
+    """A signal repeated is an operator saying it again; an inference repeated
+    is only the same inference. So a second trigger — and one arriving during
+    teardown, where a signal means "stop waiting" — is inert, not a hard exit."""
+    handler = _signals(rec)
+    handler.trigger("Parent process gone")
+    handler.trigger("Parent process gone")
+    assert (rec.cancelled, rec.exits) == (1, [])
+
+    tearing_down = _signals(rec)
+    tearing_down.entering_teardown()
+    tearing_down.trigger("Parent process gone")
+    assert rec.exits == []
+    assert rec.cancelled == 1  # unchanged: no second, re-entrant shutdown
+
+
+def test_a_signal_after_a_trigger_still_exits_immediately(rec: _Recorder) -> None:
+    # The two entry points share the state, so an operator who signals a
+    # process already shutting itself down gets the same "stop waiting" a
+    # second signal gets.
+    handler = _signals(rec)
+    handler.trigger("Parent process gone")
+    handler._on_signal(signal.SIGTERM)
+    assert rec.exits == [128 + int(signal.SIGTERM)]
+
+
 def test_a_signalled_unwind_is_not_a_crash(rec: _Recorder) -> None:
     """The unwind arrives as a CancelledError, identical in shape to a real
     failure and opposite in meaning. Both halves are required: a signal, and
