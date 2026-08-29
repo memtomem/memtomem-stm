@@ -375,6 +375,33 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **Tools that only run as async tasks are withheld instead of advertised
+  unusable** (#892). MCP revision 2025-11-25 added `Tool.execution`
+  (`taskSupport: "forbidden" | "optional" | "required"`), which the pinned SDK
+  models and the proxy dropped on the floor. For a `required` upstream tool
+  that was worse than a metadata gap: the re-advertised tool looked like an
+  ordinary synchronous one, while the proxy's handler and its upstream call
+  path have no task bridging at all, so every call against it failed on a
+  promise the advertisement had made.
+
+  **Behavior change**: such a tool is now withheld at eligibility time under a
+  new `task_required` reject reason, so selection telemetry records why it is
+  missing instead of the client holding a broken advertisement. (The relevance
+  ranker scores only the eligible set, so it drops the tool; `stm_proxy_health`
+  goes on counting it as discovered, just no longer as advertised.) The rule is
+  structural, applying in every exposure profile like `name_overflow`: the failure is certain rather
+  than heuristic, so there is nothing for `review` to observe, and advertising
+  it there would only accrue guaranteed failures against the tool's own health.
+  A `taskSupport: "optional"` tool keeps being advertised and stays callable,
+  deliberately *without* `execution` — the synchronous downgrade the proxy can
+  actually serve, now stated in the contract and pinned end to end (an
+  optional-task upstream carried through registration to a real client, which
+  decodes a tool with no `execution` and calls it normally) rather than
+  resting on an
+  accident of the field never having been copied. `forbidden`
+  and an absent `execution` are unchanged. Forwarding `execution` verbatim was
+  never an option: it would advertise task support nothing here can bridge.
+
 - **Health, ranking and selection telemetry no longer count a tool the server
   could not register** (#908). Exposure is decided — and snapshotted into
   `_advertised_*` — inside `get_proxy_tools()`, which necessarily runs before

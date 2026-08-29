@@ -159,6 +159,15 @@ def register_proxy_tool(
     raw_meta = getattr(info, "meta", None)
     output_schema = raw_output_schema if isinstance(raw_output_schema, dict) else None
     tool_meta = raw_meta if isinstance(raw_meta, dict) else None
+    # No ``execution`` kwarg, deliberately: the proxy serves every tool
+    # synchronously, so the advertised tool declares no task support (#892).
+    # Upstream tools that *require* it are withheld one layer up, in
+    # ``tool_eligibility``; the rest advertise as plain sync tools. The pinned
+    # SDK offers no seam to forward it through even deliberately — ``add_tool``
+    # takes no such kwarg and the server-side ``Tool`` model has no such field
+    # — so this comment guards the intent, and
+    # ``test_optional_task_upstream_reaches_the_client_without_execution``
+    # guards what a client receives if a future SDK grows one.
     add_tool_kwargs: dict[str, Any] = {
         "name": info.prefixed_name,
         "description": f"[proxied] {info.description}",
