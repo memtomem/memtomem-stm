@@ -548,6 +548,9 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
             config.teardown_watchdog_seconds,
             before_exit=lambda: child_reaper.sweep_leaked_children(baseline=children_at_startup),
         )
+        # ``arm`` never raises: thread exhaustion is exactly the state a wedged
+        # process reaches, and the answer there is a shutdown with no backstop,
+        # not no shutdown.
         watchdog.arm()
         try:
             # Remove exactly what registration took ownership of (#891). Re-deriving

@@ -214,10 +214,15 @@ async def await_or_warn(awaitable: Awaitable[Any], *, timeout: float, what: str)
     exits and one that lives for days holding a child (#906), and every step of
     a teardown is on the critical path of process exit.
 
-    Cancelling the wait does not guarantee the work stops — a ``stop()`` that
-    awaits a shielded task keeps running — so this bounds *the teardown*, not
-    the operation. What guarantees the exit is the watchdog; this makes the
-    common wedge recoverable and leaves a named trail when it happens.
+    The ceiling is real only for work that takes cancellation. ``wait_for``
+    cancels the awaitable and then *waits for that cancellation to land*, so a
+    ``stop()`` that swallows ``CancelledError``, or that is stuck in a
+    synchronous call the loop cannot interrupt, parks here regardless of the
+    timeout. (A ``stop()`` awaiting a shielded task does return: the shield
+    keeps the inner task alive, but the coroutine awaiting it is cancelled
+    normally.) So this is not the exit guarantee — the watchdog is. What it
+    buys is that the recoverable wedge, which is most of them, stops taking the
+    rest of the shutdown down with it, and leaves a line naming the culprit.
 
     Returns True when it completed, False when the ceiling was hit.
     """

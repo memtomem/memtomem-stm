@@ -492,16 +492,21 @@ class STMConfig(BaseSettings):
     backups), file ``0o600`` / parent ``0o700`` per the data-at-rest
     convention. ``None`` (default) keeps stderr-only logging. Stored raw;
     ``expanduser()`` happens at the use site (like ``data_dir``)."""
-    teardown_watchdog_seconds: float = Field(default=30.0, ge=0.0)
+    teardown_watchdog_seconds: float = Field(default=60.0, ge=0.0, allow_inf_nan=False)
     """Ceiling on shutdown before the process exits the hard way (#906), set via
     ``MEMTOMEM_STM_TEARDOWN_WATCHDOG_SECONDS``; ``0`` disables the backstop.
 
     Bounding the individual teardown steps is not the same as guaranteeing an
     exit — cancelling a wait does not stop work that awaits a shielded task —
     so this is the guarantee, armed only for the window between teardown
-    starting and finishing. The default sits well above the sum of those step
-    budgets, so a healthy shutdown never approaches it and reaching it means a
-    ``stop()`` is genuinely wedged."""
+    starting and finishing.
+
+    The default clears the worst legitimate shutdown with room to spare: the
+    proxy/engine/warm-up ceilings total 20s, the LTM adapter's own bounded join
+    adds 5s and the OTLP flush another 5s (its own default), so 30s is reachable
+    by a slow-but-healthy teardown and is not a safe backstop. ``+inf`` is
+    rejected rather than admitted as "never": it is not a bound, and it would
+    silently turn the guarantee off."""
     proxy: ProxyConfig = Field(default_factory=ProxyConfig)
     surfacing: SurfacingConfig = Field(default_factory=SurfacingConfig)
     formation: FormationConfig = Field(default_factory=FormationConfig)

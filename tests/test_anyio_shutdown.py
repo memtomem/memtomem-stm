@@ -207,3 +207,39 @@ async def test_await_or_warn_gives_up_and_names_the_step(caplog):
     with caplog.at_level(logging.WARNING, logger="memtomem_stm.utils.anyio_shutdown"):
         assert await await_or_warn(_wedged(), timeout=0.05, what="Proxy manager stop") is False
     assert any("Proxy manager stop did not finish" in r.getMessage() for r in caplog.records)
+
+
+async def test_await_or_warn_returns_for_a_stop_that_awaits_a_shielded_task():
+    # A shield keeps the inner task alive; it does not protect the coroutine
+    # awaiting it, which is cancelled normally. So this shape — the one the
+    # proxy manager's connection owner uses — is bounded.
+    forever = asyncio.get_running_loop().create_future()
+
+    async def _owner_close() -> None:
+        await asyncio.shield(forever)
+
+    assert await await_or_warn(_owner_close(), timeout=0.05, what="Owner close") is False
+    forever.cancel()
+
+
+async def test_await_or_warn_cannot_bound_work_that_refuses_cancellation():
+    """The honest limit, pinned so nobody mistakes the ceiling for a guarantee:
+    wait_for cancels the awaitable and then waits for that cancellation to
+    land, so a stop() that swallows CancelledError parks here regardless of the
+    timeout. That is why the teardown watchdog exists."""
+    resumed = asyncio.Event()
+
+    async def _swallows_cancellation() -> None:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            resumed.set()
+            await asyncio.sleep(0.3)  # keeps going past its own cancellation
+
+    task = asyncio.ensure_future(
+        await_or_warn(_swallows_cancellation(), timeout=0.05, what="Stubborn stop")
+    )
+    await asyncio.wait_for(resumed.wait(), timeout=5.0)
+    await asyncio.sleep(0.1)
+    assert not task.done()  # still parked, well past its 0.05s ceiling
+    await asyncio.wait_for(task, timeout=5.0)
