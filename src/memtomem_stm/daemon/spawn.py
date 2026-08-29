@@ -19,7 +19,7 @@ import subprocess
 import sys
 from typing import TYPE_CHECKING, Any
 
-from memtomem_stm.utils.child_reaper import note_detached_child
+from memtomem_stm.utils.child_reaper import spawning_detached_child
 
 if TYPE_CHECKING:
     from memtomem_stm.config import STMConfig
@@ -43,11 +43,12 @@ def _spawn_detached() -> None:
         kwargs["creationflags"] = flags
     else:
         kwargs["start_new_session"] = True
-    child = subprocess.Popen(cmd, **kwargs)
-    # Detached, but still our direct child — nothing double-forks here. Say so,
-    # or a caller's teardown leaked-child sweep reads the shared daemon as a
-    # leak and kills it (and the LTM it holds for everyone else) on exit (#906).
-    note_detached_child(child.pid)
+    # Detached, but still our direct child — nothing double-forks here. Claim it
+    # under the sweep's lock, or a caller's teardown leaked-child sweep reads the
+    # shared daemon as a leak and kills it (with the LTM it holds for everyone
+    # else) on exit (#906).
+    with spawning_detached_child() as claim:
+        claim(subprocess.Popen(cmd, **kwargs).pid)
 
 
 def request_spawn(config: STMConfig) -> bool:

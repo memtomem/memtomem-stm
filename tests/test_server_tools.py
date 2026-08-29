@@ -2059,7 +2059,7 @@ class TestLifespan:
             "memtomem_stm.utils.child_reaper.direct_child_pids", lambda: {4242}
         )
         monkeypatch.setattr(
-            "memtomem_stm.utils.child_reaper.terminate_leaked_children_sync", killed.append
+            "memtomem_stm.utils.child_reaper.terminate_leaked_children", killed.append
         )
 
         with caplog.at_level("WARNING", logger="memtomem_stm.utils.child_reaper"):
@@ -2073,7 +2073,7 @@ class TestLifespan:
         finds nothing and stays silent — no warning for a clean shutdown."""
         killed = []
         monkeypatch.setattr(
-            "memtomem_stm.utils.child_reaper.terminate_leaked_children_sync", killed.append
+            "memtomem_stm.utils.child_reaper.terminate_leaked_children", killed.append
         )
 
         with caplog.at_level("WARNING", logger="memtomem_stm.utils.child_reaper"):
@@ -2093,7 +2093,7 @@ class TestLifespan:
             "memtomem_stm.utils.child_reaper.direct_child_pids", lambda: {4242}
         )
         monkeypatch.setattr(
-            "memtomem_stm.utils.child_reaper.terminate_leaked_children_sync", killed.append
+            "memtomem_stm.utils.child_reaper.terminate_leaked_children", killed.append
         )
 
         mock_pm_instance = MagicMock()

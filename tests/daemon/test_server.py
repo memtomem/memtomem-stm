@@ -992,6 +992,7 @@ def test_direct_child_pids_sees_spawned_child() -> None:
     assert child.pid not in daemon_server._direct_child_pids()
 
 
+@pytest.mark.real_child_sweep
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process probes")
 async def test_real_teardown_reaps_warm_ltm_child(tmp_path: Path) -> None:
     # E-3 end-to-end: real engine wiring with a stdio LTM (the fake memtomem

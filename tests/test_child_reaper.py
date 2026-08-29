@@ -10,6 +10,7 @@ import logging
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -110,27 +111,27 @@ def test_is_pid_alive() -> None:
     assert child_reaper.is_pid_alive(-1) is False
 
 
-async def test_terminate_leaked_children_terminates_a_real_child() -> None:
+def test_terminate_leaked_children_terminates_a_real_child() -> None:
     child = _sleeping_child()
     try:
-        await child_reaper.terminate_leaked_children({child.pid}, escalate_seconds=0.2)
+        child_reaper.terminate_leaked_children({child.pid}, escalate_seconds=0.2)
         assert child.wait(timeout=5.0) == -signal.SIGTERM
     finally:
         _reap(child)
 
 
-async def test_terminate_leaked_children_escalates_to_sigkill() -> None:
+def test_terminate_leaked_children_escalates_to_sigkill() -> None:
     # The escalation is the whole reason the sweep is a backstop rather than a
     # polite request: a child that ignores SIGTERM must still die.
     child = _sigterm_ignoring_child()
     try:
-        await child_reaper.terminate_leaked_children({child.pid}, escalate_seconds=0.3)
+        child_reaper.terminate_leaked_children({child.pid}, escalate_seconds=0.3)
         assert child.wait(timeout=5.0) == -signal.SIGKILL
     finally:
         _reap(child)
 
 
-async def test_terminate_leaked_children_skips_escalation_for_pids_that_exited(
+def test_terminate_leaked_children_skips_escalation_for_pids_that_exited(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # A pid that died on SIGTERM must not be signalled again: pids are reused,
@@ -140,18 +141,18 @@ async def test_terminate_leaked_children_skips_escalation_for_pids_that_exited(
         child_reaper, "signal_pid", lambda pid, sig: signalled.append((pid, int(sig)))
     )
     monkeypatch.setattr(child_reaper, "is_pid_alive", lambda _pid: False)
-    await child_reaper.terminate_leaked_children({111}, escalate_seconds=0.05)
+    child_reaper.terminate_leaked_children({111}, escalate_seconds=0.05)
     assert signalled == [(111, int(signal.SIGTERM))]
 
 
-async def test_escalation_does_not_wait_out_a_child_nobody_reaped() -> None:
+def test_escalation_does_not_wait_out_a_child_nobody_reaped() -> None:
     # A fire-and-forget child (Popen discarded, as daemon spawn does) that dies
     # on SIGTERM stays a zombie: a signal-0 probe still calls it alive, so the
     # poll would burn the whole window and then SIGKILL a corpse. The escalation
     # window is a ceiling on real stragglers, not a fixed shutdown tax.
     child = _sleeping_child()
     started = time.monotonic()
-    await child_reaper.terminate_leaked_children({child.pid}, escalate_seconds=5.0)
+    child_reaper.terminate_leaked_children({child.pid}, escalate_seconds=5.0)
     assert time.monotonic() - started < 2.0
     assert child.wait(timeout=5.0) == -signal.SIGTERM
 
@@ -163,11 +164,13 @@ def test_sweep_spares_a_child_meant_to_outlive_us(
     # child (nothing double-forks), and it is meant to outlive us. Sweeping it
     # would take down the daemon and the LTM it holds for every other consumer.
     monkeypatch.setattr(child_reaper, "_detached_pids", set())
+    monkeypatch.setattr(child_reaper, "_has_exited", lambda _pid: False)
     monkeypatch.setattr(child_reaper, "direct_child_pids", lambda: {111, 222})
     killed: list[set[int]] = []
-    monkeypatch.setattr(child_reaper, "terminate_leaked_children_sync", killed.append)
+    monkeypatch.setattr(child_reaper, "terminate_leaked_children", killed.append)
 
-    child_reaper.note_detached_child(222)
+    with child_reaper.spawning_detached_child() as claim:
+        claim(222)
     assert child_reaper.leaked_child_pids() == {111}
 
     with caplog.at_level(logging.WARNING, logger=child_reaper.__name__):
@@ -186,15 +189,78 @@ def test_sweep_never_raises_into_teardown(monkeypatch: pytest.MonkeyPatch) -> No
     child_reaper.sweep_leaked_children()
 
 
-def test_sync_escalation_terminates_and_escalates() -> None:
-    # The sync twin is what the server's teardown calls, so it carries the same
-    # guarantee as the async one.
+def test_escalation_handles_a_mixed_batch() -> None:
+    # One child dies on SIGTERM, one has to be killed — the batch must not let
+    # either outcome hide the other.
     plain = _sleeping_child()
     stubborn = _sigterm_ignoring_child()
     try:
-        child_reaper.terminate_leaked_children_sync({plain.pid, stubborn.pid}, escalate_seconds=0.3)
+        child_reaper.terminate_leaked_children({plain.pid, stubborn.pid}, escalate_seconds=0.3)
         assert plain.wait(timeout=5.0) == -signal.SIGTERM
         assert stubborn.wait(timeout=5.0) == -signal.SIGKILL
     finally:
         _reap(plain)
         _reap(stubborn)
+
+
+def test_a_sweep_cannot_run_between_the_spawn_and_its_claim() -> None:
+    """The detached spawn happens on a worker thread (``request_spawn`` under
+    ``asyncio.to_thread``), so registering the pid after ``Popen`` returns
+    leaves a window where the child exists and nothing claims it. The claim
+    holds the sweep's lock across the spawn, so a concurrent sweep sees either
+    no child or a claimed one — never an unclaimed live one."""
+    observed: list[set[int]] = []
+    ready = threading.Event()
+    release = threading.Event()
+
+    def _spawn() -> None:
+        with child_reaper.spawning_detached_child() as claim:
+            ready.set()
+            release.wait(5.0)  # the "Popen" is still in flight here
+            claim(777)
+
+    worker = threading.Thread(target=_spawn)
+    worker.start()
+    try:
+        assert ready.wait(5.0)
+        sweeper = threading.Thread(
+            target=lambda: observed.append(child_reaper.leaked_child_pids())
+        )
+        sweeper.start()
+        # The sweep must block on the claim rather than read a half-registered
+        # set: it is still waiting while the spawn is mid-flight.
+        sweeper.join(timeout=0.2)
+        assert sweeper.is_alive()
+        release.set()
+        sweeper.join(timeout=5.0)
+    finally:
+        release.set()
+        worker.join(timeout=5.0)
+    assert observed == [set()]  # 777 was claimed before the sweep could read
+
+
+def test_a_claim_is_dropped_once_that_process_is_gone(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Pids are recycled. A claim kept forever would spare a genuinely leaked
+    # child that later lands on the detached daemon's old pid — the one case
+    # the sweep exists for, silently skipped.
+    monkeypatch.setattr(child_reaper, "_detached_pids", set())
+    monkeypatch.setattr(child_reaper, "direct_child_pids", lambda: {555})
+    with child_reaper.spawning_detached_child() as claim:
+        claim(555)
+
+    monkeypatch.setattr(child_reaper, "_has_exited", lambda _pid: False)
+    assert child_reaper.leaked_child_pids() == set()  # daemon still running
+
+    monkeypatch.setattr(child_reaper, "_has_exited", lambda _pid: True)
+    assert child_reaper.leaked_child_pids() == {555}  # pid reused by a leak
+
+
+def test_children_that_predate_us_are_not_ours_to_kill(monkeypatch: pytest.MonkeyPatch) -> None:
+    # app_lifespan does not always own the process it runs in; a host's own
+    # subprocesses must survive our teardown.
+    monkeypatch.setattr(child_reaper, "_detached_pids", set())
+    monkeypatch.setattr(child_reaper, "direct_child_pids", lambda: {10, 20})
+    killed: list[set[int]] = []
+    monkeypatch.setattr(child_reaper, "terminate_leaked_children", killed.append)
+    child_reaper.sweep_leaked_children(baseline={10})
+    assert killed == [{20}]

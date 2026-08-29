@@ -104,8 +104,10 @@ async def _terminate_leaked_children(pids: set[int]) -> None:
     """SIGTERM each leaked child's process group, then SIGKILL stragglers."""
     # Reads the module constant per call rather than binding the shared default
     # at import, so shrinking ``_LEAK_KILL_ESCALATE_SECONDS`` still shortens the
-    # escalation the way it did when the body lived here.
-    await child_reaper.terminate_leaked_children(pids, escalate_seconds=_LEAK_KILL_ESCALATE_SECONDS)
+    # escalation the way it did when the body lived here. The escalation itself
+    # blocks: awaiting between the SIGTERM and the SIGKILL is where a cancelled
+    # teardown strands the child the escalation is for.
+    child_reaper.terminate_leaked_children(pids, escalate_seconds=_LEAK_KILL_ESCALATE_SECONDS)
 
 
 # Reserved out of the client's deadline for encoding + the loopback write/read

@@ -19,13 +19,15 @@ machinery and must not import the daemon server to get it.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
@@ -36,20 +38,11 @@ LEAK_KILL_ESCALATE_SECONDS = 2.0
 _ESCALATION_POLL_SECONDS = 0.05
 
 # Pids of children deliberately spawned to outlive us — see
-# :func:`note_detached_child`. Written from a worker thread (``request_spawn``
-# runs under ``asyncio.to_thread``) and read on the shutdown path; a bare set
-# is enough, since ``add`` is atomic and a missed entry is impossible (the
-# spawn returns before its pid can be swept).
+# :func:`spawning_detached_child`. The lock spans the spawn itself, not just the
+# bookkeeping, so a sweep can never observe a child that exists but is not yet
+# claimed.
 _detached_pids: set[int] = set()
-
-# Looked up rather than called directly: typeshed gates ``os.waitid`` to Linux,
-# but every POSIX target here provides it (macOS included), and it is absent
-# only on Windows — where the sweep is already a no-op. ``WNOWAIT`` peeks at the
-# exit status without consuming it, so probing never steals a child from an
-# owner still holding a ``Popen``.
-_waitid = getattr(os, "waitid", None)
-_P_PID = getattr(os, "P_PID", 0)
-_WAITID_PEEK = getattr(os, "WEXITED", 0) | getattr(os, "WNOHANG", 0) | getattr(os, "WNOWAIT", 0)
+_detached_lock = threading.Lock()
 
 # Ceiling on the `pgrep` probe. It is on the shutdown path, so a wedged process
 # table must not become the new reason we never exit.
@@ -129,15 +122,23 @@ def _has_exited(pid: int) -> bool:
     nobody reaped stays visible as a zombie, so polling with
     :func:`is_pid_alive` alone reports every terminated fire-and-forget child as
     still running, burns the whole escalation window, and then SIGKILLs a
-    corpse. ``waitid`` answers correctly — and ``WNOWAIT`` leaves the child
+    corpse. ``waitid`` answers correctly — and ``WNOWAIT`` peeks at the exit
+    status without consuming it, so the probe leaves the child
     waitable, so detecting its exit never steals it from an owner still holding
     a ``Popen``. Falls back to the signal probe for a pid that is not ours to
     wait on.
     """
-    if _waitid is None:  # pragma: no cover — Windows; the sweep is a no-op there
+    if sys.platform == "win32":  # pragma: no cover — no waitid; sweep is a no-op
         return not is_pid_alive(pid)
     try:
-        info = _waitid(_P_PID, pid, _WAITID_PEEK)
+        # The ignores are for typeshed gating waitid to Linux; every POSIX
+        # target here has it (macOS included), and the win32 guard above is the
+        # real platform bound.
+        info = os.waitid(  # type: ignore[attr-defined]
+            os.P_PID,  # type: ignore[attr-defined]
+            pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,  # type: ignore[attr-defined]
+        )
     except ChildProcessError:
         return not is_pid_alive(pid)  # not ours to wait on, or already reaped
     except OSError:  # pragma: no cover — EINVAL/EPERM are not "it exited"
@@ -145,35 +146,18 @@ def _has_exited(pid: int) -> bool:
     return info is not None
 
 
-async def terminate_leaked_children(
+def terminate_leaked_children(
     pids: set[int], *, escalate_seconds: float = LEAK_KILL_ESCALATE_SECONDS
 ) -> None:
-    """SIGTERM each leaked child's process group, then SIGKILL stragglers."""
-    if sys.platform == "win32":  # pragma: no cover — direct_child_pids is empty
-        return
-    for pid in pids:
-        signal_pid(pid, signal.SIGTERM)
-    deadline = asyncio.get_running_loop().time() + escalate_seconds
-    remaining = {pid for pid in pids if not _has_exited(pid)}
-    while remaining and asyncio.get_running_loop().time() < deadline:
-        await asyncio.sleep(_ESCALATION_POLL_SECONDS)
-        remaining = {pid for pid in remaining if not _has_exited(pid)}
-    for pid in remaining:
-        signal_pid(pid, signal.SIGKILL)
+    """SIGTERM each leaked child's process group, then SIGKILL stragglers.
 
-
-def terminate_leaked_children_sync(
-    pids: set[int], *, escalate_seconds: float = LEAK_KILL_ESCALATE_SECONDS
-) -> None:
-    """Blocking twin of :func:`terminate_leaked_children`.
-
-    The escalation must not be cancellable. This runs at the very end of a
-    teardown that may itself be unwinding under cancellation, where an
-    ``await`` between the SIGTERM and the SIGKILL is exactly where a
-    ``CancelledError`` lands — leaving a SIGTERM-ignoring child alive, which is
-    the case the escalation exists for. Blocking the loop is free here: the
-    process has nothing left to run, and the wait only happens when a child
-    actually survived its stop().
+    Blocking, and deliberately not a coroutine. This is the last thing a
+    teardown does, and that teardown may itself be unwinding under
+    cancellation: an ``await`` between the SIGTERM and the SIGKILL is exactly
+    where a ``CancelledError`` lands, which strands the SIGTERM-ignoring child
+    the escalation exists for. Blocking costs nothing here — the process has
+    nothing left to run, and the wait only happens when a child actually
+    survived its ``stop()``.
     """
     if sys.platform == "win32":  # pragma: no cover — direct_child_pids is empty
         return
@@ -188,35 +172,57 @@ def terminate_leaked_children_sync(
         signal_pid(pid, signal.SIGKILL)
 
 
-def note_detached_child(pid: int) -> None:
-    """Record a child deliberately spawned to outlive this process.
+@contextmanager
+def spawning_detached_child() -> Iterator[Callable[[int], None]]:
+    """Spawn a child meant to outlive us, without a sweep racing the spawn.
 
     The shared surfacing daemon is spawned detached but is still a direct child
     of whoever launched it (:mod:`memtomem_stm.daemon.spawn` does not
-    double-fork), so a sweep that treats every surviving child as a leak would
-    take down the daemon — and the LTM it holds for every other consumer — on
-    each shutdown. Registered pids are excluded from :func:`leaked_child_pids`.
+    double-fork), so a sweep that treats every surviving child as a leak takes
+    down the daemon — and the LTM it holds for every other consumer — on each
+    shutdown. Registering the pid after the fact is not enough: the spawn runs
+    on a worker thread (``request_spawn`` under ``asyncio.to_thread``), so a
+    teardown landing between ``Popen`` returning and the registration would see
+    a pid nothing claims and kill it.
+
+    Holding the lock across both means a concurrent sweep either runs entirely
+    before the spawn — when the pid does not exist yet, so it cannot be swept —
+    or entirely after it is claimed.
     """
-    _detached_pids.add(pid)
+    with _detached_lock:
+        yield _detached_pids.add
 
 
-def leaked_child_pids() -> set[int]:
-    """Direct children that were *not* meant to outlive us."""
-    return direct_child_pids() - _detached_pids
+def leaked_child_pids(baseline: set[int] | None = None) -> set[int]:
+    """Direct children that are ours and were not meant to outlive us.
+
+    *baseline* is the set of children that existed before we started: they
+    predate us, so they are somebody else's (this lifespan can be hosted in a
+    process with its own subprocesses). Pids claimed as deliberately detached
+    are excluded too, and claims for processes that have since exited are
+    dropped — pids are recycled, and a stale claim would spare the very leak
+    this exists to catch.
+    """
+    with _detached_lock:
+        _detached_pids.difference_update({pid for pid in _detached_pids if _has_exited(pid)})
+        spared = set(_detached_pids)
+    return direct_child_pids() - spared - (baseline or set())
 
 
-def sweep_leaked_children(log: logging.Logger | None = None) -> None:
-    """Terminate every direct child that was not meant to outlive us.
+def sweep_leaked_children(
+    log: logging.Logger | None = None, *, baseline: set[int] | None = None
+) -> None:
+    """Terminate every direct child that is ours and outlived its owner.
 
     Best-effort and never raises: it is the last step of a teardown, so a
     failure here must not replace one leak with a different one.
     """
     at = log or logger
     try:
-        leaked = leaked_child_pids()
+        leaked = leaked_child_pids(baseline)
         if not leaked:
             return
         at.warning("Terminating leaked child process(es): %s", sorted(leaked))
-        terminate_leaked_children_sync(leaked)
+        terminate_leaked_children(leaked)
     except Exception:
         at.warning("Leaked-child sweep failed", exc_info=True)
