@@ -194,5 +194,5 @@ def _no_real_parent_liveness(
     monkeypatch.setattr("memtomem_stm.server.ParentLivenessWatcher", _InertWatcher)
     if not request.node.get_closest_marker("real_client_activity"):
         monkeypatch.setattr(
-            "memtomem_stm.server._instrument_client_activity", lambda _server, _note: True
+            "memtomem_stm.server._instrument_client_activity", lambda _server, _watcher: True
         )

@@ -75,7 +75,7 @@ async def _run_until(
     """Start the watcher and give it up to *polls* intervals to reach *done*."""
     task = asyncio.create_task(watcher.run())
     for _ in range(polls):
-        if (done() if callable(done) else done):
+        if done() if callable(done) else done:
             break
         await asyncio.sleep(_POLL)
     return task
@@ -170,6 +170,57 @@ async def test_recent_traffic_defers_the_shutdown_rather_than_cancelling_it() ->
             break
         await asyncio.sleep(_POLL)
     assert reasons == ["Parent process gone (ppid 4242 -> 1)"]
+    await asyncio.wait_for(task, timeout=1.0)
+
+
+async def test_a_request_in_flight_vetoes_on_its_own() -> None:
+    """A stamp records that a frame *arrived*, so the clock stands still while
+    the frame is being served: one call that outlasts the grace would look like
+    silence with the client sitting there waiting for its answer. A request in
+    flight is the strongest evidence of a live client there is, so it vetoes by
+    itself — and the completion re-stamps, so the grace runs from when the
+    client last heard from us."""
+    parent, clock, reasons = _Parent(4242), _Clock(), []
+    watcher = _watcher(parent, clock, reasons, grace_seconds=900.0)
+    task = asyncio.create_task(watcher.run())
+    await asyncio.sleep(_POLL * 2)
+    parent.pid = 1
+
+    with watcher.serving():
+        clock.now += 10_000.0  # a call far longer than the grace
+        await asyncio.sleep(_POLL * 10)
+        assert reasons == []
+
+    # Out of the call, the grace restarts from its completion rather than from
+    # its arrival — so still no shutdown until real silence.
+    await asyncio.sleep(_POLL * 10)
+    assert reasons == []
+    clock.now += 901.0
+    for _ in range(60):
+        if reasons:
+            break
+        await asyncio.sleep(_POLL)
+    assert reasons == ["Parent process gone (ppid 4242 -> 1)"]
+    await asyncio.wait_for(task, timeout=1.0)
+
+
+async def test_the_in_flight_count_survives_a_failing_frame() -> None:
+    # A handler that raises still had a client behind it, and a counter that
+    # leaked would veto for the life of the process.
+    parent, clock, reasons = _Parent(4242), _Clock(), []
+    watcher = _watcher(parent, clock, reasons, grace_seconds=900.0)
+    with pytest.raises(RuntimeError), watcher.serving():
+        raise RuntimeError("handler failed")
+    assert watcher._in_flight == 0
+
+    parent.pid = 1
+    clock.now += 901.0
+    task = asyncio.create_task(watcher.run())
+    for _ in range(60):
+        if reasons:
+            break
+        await asyncio.sleep(_POLL)
+    assert reasons  # not vetoed forever by a leaked count
     await asyncio.wait_for(task, timeout=1.0)
 
 

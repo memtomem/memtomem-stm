@@ -44,7 +44,8 @@ import logging
 import os
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
@@ -90,15 +91,41 @@ class ParentLivenessWatcher:
         # with it. The watcher would then be permanently blind to precisely the
         # orphaning it exists to catch.
         self._recorded_ppid = getppid()
+        self._in_flight = 0
 
     def note_activity(self) -> None:
         """Record that the client just spoke to us.
 
-        Called from the event loop on every inbound request, so it stays a
-        single attribute write — the grace window is minutes wide and does not
-        need better resolution than the poll interval.
+        Called from the event loop for every inbound frame, so it stays a single
+        attribute write — the grace window is minutes wide and does not need
+        better resolution than the poll interval.
         """
         self._last_activity = self._clock()
+
+    @contextmanager
+    def serving(self) -> Iterator[None]:
+        """Hold the veto open for as long as a frame is being served.
+
+        A stamp records that a frame *arrived*, which leaves the clock standing
+        still through the handling of it: a single call that outlasts the grace
+        would look like silence while the client sits there waiting for its
+        answer. So a request in flight vetoes on its own — the strongest
+        evidence of a live client there is — and the completion re-stamps, so
+        the grace measures from when the client last heard from us.
+
+        This is the daemon idle-watch's rule (``_active_requests == 0 and
+        idle >= timeout``, ``daemon/server.py``) applied to the same question.
+        It means a handler that never returns keeps the process alive even after
+        the client is gone; that is the conservative direction, and #911's
+        teardown watchdog still bounds the shutdown once one starts.
+        """
+        self._in_flight += 1
+        self.note_activity()
+        try:
+            yield
+        finally:
+            self._in_flight -= 1
+            self.note_activity()
 
     def stop(self) -> None:
         """End the loop at its next wake-up, for a teardown we did not start."""
@@ -156,16 +183,18 @@ class ParentLivenessWatcher:
                 continue
 
             idle = self._clock() - self._last_activity
-            if self._grace_seconds > 0 and idle < self._grace_seconds:
+            serving = self._in_flight > 0
+            if serving or (self._grace_seconds > 0 and idle < self._grace_seconds):
                 if not vetoed:
                     logger.info(
-                        "Parent changed (ppid %d -> %d) but a request arrived %.0fs ago, "
-                        "inside the %.0fs grace — a live client behind a wrapper launcher "
-                        "looks exactly like this, so not shutting down yet (#914).",
+                        "Parent changed (ppid %d -> %d) but the client is still here "
+                        "(%s) — a live client behind a wrapper launcher looks exactly "
+                        "like this, so not shutting down yet (#914).",
                         recorded,
                         current,
-                        idle,
-                        self._grace_seconds,
+                        f"{self._in_flight} request(s) in flight"
+                        if serving
+                        else f"a frame {idle:.0f}s ago, inside the {self._grace_seconds:.0f}s grace",
                     )
                     vetoed = True
                 continue

@@ -257,7 +257,7 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
             grace_seconds=config.parent_liveness_grace_seconds,
             on_parent_gone=shutdown_signals.trigger,
         )
-        _instrument_client_activity(server, parent_watcher.note_activity)
+        _instrument_client_activity(server, parent_watcher)
         parent_watcher_task = asyncio.create_task(parent_watcher.run(), name="parent-liveness")
     # Daemon discovery/spawn must use the same env/default-only basis the
     # detached daemon loads. The proxy file may later propagate a file-only
@@ -823,7 +823,7 @@ _STM_UTILITY_TOOL_NAMES: tuple[str, ...] = (
 ) + (("stm_memory_propose",) if _should_advertise_formation_tool() else ())
 
 
-def _instrument_client_activity(server: MCPServer, note: Callable[[], None]) -> bool:
+def _instrument_client_activity(server: MCPServer, watcher: ParentLivenessWatcher) -> bool:
     """Stamp *note* on every inbound request and notification (#914).
 
     The parent-liveness backstop needs to know the client is still there, and
@@ -840,9 +840,11 @@ def _instrument_client_activity(server: MCPServer, note: Callable[[], None]) -> 
 
     So this registers a ``ServerMiddleware`` — the SDK's documented seam for
     exactly this, composed by both ``_on_request`` and ``_on_notify`` above
-    validation, lookup and the handshake. It stamps and delegates, and never
-    swallows: a middleware sees a failing request as a raised ``MCPError``, and
-    the frame arriving is the evidence either way.
+    validation, lookup and the handshake. It holds the veto open for the whole of
+    the frame rather than stamping its arrival, so a single call that outlasts
+    the grace does not read as silence; and it never swallows, since a
+    middleware sees a failing request as a raised ``MCPError`` and the frame
+    arriving is evidence either way.
 
     Returns whether it worked. The low-level server is reached through a private
     attribute, the same surface the proxy already uses
@@ -862,8 +864,8 @@ def _instrument_client_activity(server: MCPServer, note: Callable[[], None]) -> 
         return False
 
     async def _stamp_activity(ctx: Any, call_next: Callable[[Any], Awaitable[Any]]) -> Any:
-        note()
-        return await call_next(ctx)
+        with watcher.serving():
+            return await call_next(ctx)
 
     middleware.append(_stamp_activity)
     return True

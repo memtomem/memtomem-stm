@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sqlite3
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -2087,7 +2088,7 @@ class TestLifespan:
         monkeypatch.setattr("memtomem_stm.server.ParentLivenessWatcher", _RecordingWatcher)
         monkeypatch.setattr(
             "memtomem_stm.server._instrument_client_activity",
-            lambda server, note: instrumented.append((server, note)) or True,
+            lambda server, watcher: instrumented.append((server, watcher)) or True,
         )
         return built, tasks, instrumented
 
@@ -2135,7 +2136,7 @@ class TestLifespan:
         assert watcher.kwargs["poll_seconds"] == 30.0
         assert watcher.kwargs["grace_seconds"] == 900.0
         assert watcher.kwargs["on_parent_gone"] == signals[0].trigger
-        assert len(instrumented) == 1 and instrumented[0][1] == watcher.note_activity
+        assert len(instrumented) == 1 and instrumented[0][1] is watcher
         # Created after install(), or the shutdown it asks for would spare it as
         # somebody else's task and it would outlive the teardown it started.
         assert tasks[0] not in signals[0].foreign
@@ -2986,8 +2987,27 @@ class TestClientActivityInstrumentation:
             low.add_request_handler("initialize", types.RequestParams, lambda _c, _p: None)
 
         before = list(low.middleware)
-        stamps = []
-        assert _instrument_client_activity(server, lambda: stamps.append(1)) is True
+        stamps: list[int] = []
+
+        class _Watcher:
+            """Records that the frame was held for its whole duration."""
+
+            def __init__(self):
+                self.held = []
+                self.depth = 0
+
+            @contextlib.contextmanager
+            def serving(self):
+                self.depth += 1
+                stamps.append(1)
+                try:
+                    yield
+                finally:
+                    self.held.append(self.depth)
+                    self.depth -= 1
+
+        watcher = _Watcher()
+        assert _instrument_client_activity(server, watcher) is True
         assert len(low.middleware) == len(before) + 1
         assert low.middleware[: len(before)] == before  # appended, innermost
 
@@ -2999,6 +3019,9 @@ class TestClientActivityInstrumentation:
 
         assert await low.middleware[-1](SimpleNamespace(method="ping"), _call_next) is sentinel
         assert stamps == [1]
+        # The whole frame is held, not just its arrival: a call that outlasts
+        # the grace must not read as silence while the client waits for it.
+        assert watcher.held == [1]
 
         # A failing frame still arrived, so it is still evidence of a live
         # client: the stamp happens before delegation and the error propagates.
@@ -3008,6 +3031,7 @@ class TestClientActivityInstrumentation:
         with pytest.raises(RuntimeError):
             await low.middleware[-1](SimpleNamespace(method="nope"), _boom)
         assert stamps == [1, 1]
+        assert watcher.depth == 0  # a failing frame releases its hold
 
     async def test_a_moved_sdk_surface_degrades_to_a_warning(self, caplog):
         """A wrong warning here costs the operator a weaker veto; raising would
@@ -3019,7 +3043,7 @@ class TestClientActivityInstrumentation:
 
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger="memtomem_stm.server"):
-            assert _instrument_client_activity(SimpleNamespace(), lambda: None) is False
+            assert _instrument_client_activity(SimpleNamespace(), object()) is False
         assert any("MCPServer internal API changed" in r.message for r in caplog.records)
         assert any("PARENT_LIVENESS_POLL_SECONDS=0" in r.message for r in caplog.records)
 
