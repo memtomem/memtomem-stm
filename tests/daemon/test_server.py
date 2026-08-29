@@ -25,6 +25,7 @@ from uuid import uuid4
 import pytest
 
 import memtomem_stm.daemon.server as daemon_server
+from memtomem_stm.utils import child_reaper
 from memtomem_stm.config import STMConfig
 from memtomem_stm.daemon import client
 from memtomem_stm.daemon.discovery import (
@@ -979,18 +980,17 @@ async def test_teardown_sweeps_leaked_child_on_normal_stop_return(
     assert killed == [{222}]
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="pgrep-based probe is POSIX-only")
-def test_direct_child_pids_sees_spawned_child() -> None:
-    child = _sleeping_child()
-    try:
-        assert child.pid in daemon_server._direct_child_pids()
-    finally:
-        child.terminate()
-        child.wait(timeout=5.0)
-    # Reaped → no longer listed.
-    assert child.pid not in daemon_server._direct_child_pids()
+def test_direct_child_pids_delegates_to_the_shared_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The behaviour lives in tests/test_child_reaper.py; what the daemon needs
+    # pinned is that its own name is a live delegation rather than a value
+    # captured at import, so stubbing the shared probe reaches its sweep too.
+    monkeypatch.setattr(child_reaper, "probe_child_pids", lambda: {4242})
+    assert daemon_server._direct_child_pids() == {4242}
 
 
+@pytest.mark.real_child_sweep
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process probes")
 async def test_real_teardown_reaps_warm_ltm_child(tmp_path: Path) -> None:
     # E-3 end-to-end: real engine wiring with a stdio LTM (the fake memtomem

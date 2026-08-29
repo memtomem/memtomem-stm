@@ -6,6 +6,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -483,6 +484,22 @@ def test_request_spawn_skips_when_lock_held(tmp_path: Path, monkeypatch: pytest.
         assert held is True
         assert spawn.request_spawn(cfg) is False  # a live same-config owner → defer
     assert calls == []  # no duplicate spawn launched
+
+
+def test_spawn_detached_registers_the_child_as_meant_to_outlive_us(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The detached daemon is still a direct child — nothing double-forks here.
+    A caller's teardown leaked-child sweep must be told, or it reads the shared
+    daemon as a leak and kills it (with the LTM it holds for everyone) on exit
+    (#906)."""
+    from memtomem_stm.daemon import spawn
+    from memtomem_stm.utils import child_reaper
+
+    monkeypatch.setattr(child_reaper, "_detached_pids", set())
+    monkeypatch.setattr(spawn.subprocess, "Popen", lambda *_a, **_kw: SimpleNamespace(pid=31337))
+    spawn._spawn_detached()
+    assert 31337 in child_reaper._detached_pids
 
 
 def test_request_spawn_spawns_when_lock_free(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

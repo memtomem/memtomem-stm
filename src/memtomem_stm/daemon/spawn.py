@@ -19,6 +19,8 @@ import subprocess
 import sys
 from typing import TYPE_CHECKING, Any
 
+from memtomem_stm.utils.child_reaper import spawn_claimed
+
 if TYPE_CHECKING:
     from memtomem_stm.config import STMConfig
 
@@ -41,7 +43,11 @@ def _spawn_detached() -> None:
         kwargs["creationflags"] = flags
     else:
         kwargs["start_new_session"] = True
-    subprocess.Popen(cmd, **kwargs)
+    # Detached, but still our direct child — nothing double-forks here. Claim it
+    # under the sweep's lock, or a caller's teardown leaked-child sweep reads the
+    # shared daemon as a leak and kills it (with the LTM it holds for everyone
+    # else) on exit (#906).
+    spawn_claimed(lambda: subprocess.Popen(cmd, **kwargs).pid)
 
 
 def request_spawn(config: STMConfig) -> bool:

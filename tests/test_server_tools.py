@@ -2018,6 +2018,92 @@ class TestLifespan:
                 assert ctx.feedback_tracker is None
                 assert captured_engine_kwargs.get("feedback_tracker") is None
 
+    async def _run_minimal_lifespan(self, *, pm_stop=None):
+        """Drive app_lifespan with everything optional off — enough config for
+        startup, so a teardown-only assertion is all the test carries.
+        *pm_stop* replaces ProxyManager.stop's side effect."""
+        from memtomem_stm.server import app_lifespan, mcp
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock(side_effect=pm_stop)
+        mock_pm_instance.get_proxy_tools.return_value = []
+
+        with (
+            patch("memtomem_stm.server.STMConfig") as MockConfig,
+            patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+        ):
+            mock_cfg = MockConfig.return_value
+            mock_cfg.proxy = MagicMock()
+            mock_cfg.proxy.enabled = False
+            mock_cfg.proxy.config_path = Path("/tmp/proxy.json")
+            mock_cfg.surfacing = MagicMock()
+            mock_cfg.surfacing.enabled = False
+            mock_cfg.langfuse = MagicMock()
+            mock_cfg.langfuse.enabled = False
+            mock_cfg.otlp = MagicMock()
+            mock_cfg.otlp.enabled = False
+
+            async with app_lifespan(mcp) as _ctx:
+                pass
+
+    async def test_teardown_terminates_a_child_that_survived_every_stop(
+        self, monkeypatch, caplog
+    ):
+        """A stop() can return while abandoning a live stdio child (owner task
+        lost, bounded join given up) — the child then outlives the exiting
+        process as an orphan holding its own LTM (#906). Anything still a
+        direct child after full teardown is that leak, so it must be
+        terminated, and visibly."""
+        killed = []
+        # Empty at startup, so 4242 is not in the baseline: it appeared during
+        # the session, which is what makes it ours to sweep.
+        probes = iter([set(), {4242}])
+        monkeypatch.setattr(
+            "memtomem_stm.utils.child_reaper.probe_child_pids", lambda: next(probes)
+        )
+        monkeypatch.setattr(
+            "memtomem_stm.utils.child_reaper.terminate_leaked_children", killed.append
+        )
+
+        with caplog.at_level("WARNING", logger="memtomem_stm.utils.child_reaper"):
+            await self._run_minimal_lifespan()
+
+        assert killed == [{4242}]
+        assert any("leaked child process" in r.getMessage() for r in caplog.records)
+
+    async def test_teardown_with_no_surviving_children_kills_nothing(self, monkeypatch, caplog):
+        """The common case: every component reaped its own child, so the sweep
+        finds nothing and stays silent — no warning for a clean shutdown."""
+        killed = []
+        monkeypatch.setattr(
+            "memtomem_stm.utils.child_reaper.terminate_leaked_children", killed.append
+        )
+
+        with caplog.at_level("WARNING", logger="memtomem_stm.utils.child_reaper"):
+            await self._run_minimal_lifespan()
+
+        assert killed == []
+        assert not any("leaked child process" in r.getMessage() for r in caplog.records)
+
+    async def test_teardown_sweeps_even_when_a_stop_is_cancelled(self, monkeypatch):
+        """A cancelled teardown is precisely when a stop() abandons its child,
+        and CancelledError is not an Exception — it propagates past every
+        `except Exception` guard in the teardown. The sweep must still run."""
+        killed = []
+        probes = iter([set(), {4242}])
+        monkeypatch.setattr(
+            "memtomem_stm.utils.child_reaper.probe_child_pids", lambda: next(probes)
+        )
+        monkeypatch.setattr(
+            "memtomem_stm.utils.child_reaper.terminate_leaked_children", killed.append
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await self._run_minimal_lifespan(pm_stop=asyncio.CancelledError())
+
+        assert killed == [{4242}]
+
     async def test_metrics_store_init_failure_degrades_gracefully(self):
         """A corrupt/locked metrics DB (or a lost migration race) raising at
         init must log and fall back to no metrics rather than crashing the

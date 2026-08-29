@@ -83,3 +83,20 @@ def proxy_cache(tmp_path: Path) -> ProxyCache:
 @pytest.fixture
 def token_tracker() -> TokenTracker:
     return TokenTracker(metrics_store=None)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_child_sweep(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let a test's teardown sweep the test runner's own children.
+
+    ``app_lifespan``'s teardown terminates this process's direct children as
+    the #906 backstop. Under pytest "this process" is the test runner, whose
+    children are xdist workers and whatever subprocess a fixture spawned — so
+    any test driving the lifespan to teardown would kill them, machine- and
+    ordering-dependently. Report none by default; a test that needs the real
+    probe marks itself ``real_child_sweep`` and is then responsible for its own
+    children.
+    """
+    if request.node.get_closest_marker("real_child_sweep"):
+        return
+    monkeypatch.setattr("memtomem_stm.utils.child_reaper.probe_child_pids", lambda: set())
