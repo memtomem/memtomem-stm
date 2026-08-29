@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import signal
+import sys
 
 import pytest
 
@@ -114,6 +115,10 @@ def test_a_signalled_unwind_is_not_a_crash(rec: _Recorder) -> None:
     assert signal_shutdown.was_signal_shutdown(mixed) is False
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="no add_signal_handler there — the degradation is pinned by the test below",
+)
 async def test_install_and_remove_take_and_return_both_signals(rec: _Recorder) -> None:
     handler = _signals(rec)
     loop = asyncio.get_running_loop()
