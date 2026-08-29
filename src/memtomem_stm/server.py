@@ -199,7 +199,9 @@ def _build_ltm_adapter(config: STMConfig, daemon_config: STMConfig) -> Any:
 async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
     # Children that predate us are somebody else's — this lifespan does not
     # always own the process it runs in. The teardown sweep (#906) subtracts
-    # them, so it can only ever reach children something here spawned.
+    # them. A host that spawns its own subprocesses *after* mounting us cannot
+    # be told apart from a leak by this probe, and should claim them with
+    # ``child_reaper.spawning_detached_child``.
     children_at_startup = direct_child_pids()
     config = STMConfig()
     # Daemon discovery/spawn must use the same env/default-only basis the
@@ -592,7 +594,7 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                 except Exception:
                     logger.warning("Failed to shut down OTLP export", exc_info=True)
         finally:
-            sweep_leaked_children(logger, baseline=children_at_startup)
+            sweep_leaked_children(baseline=children_at_startup)
 
 
 # ``version=`` pins ``serverInfo.version`` in the ``initialize`` response to

@@ -12,6 +12,17 @@ children, signal their process groups, escalate to ``SIGKILL``. It degrades to a
 no-op on Windows and wherever ``pgrep`` is unavailable rather than blocking
 shutdown, so it can never be the reason a process fails to exit.
 
+**It is deliberately biased toward sparing.** A leak it misses costs what the
+code cost before the sweep existed; a process it kills wrongly is new damage
+this module inflicted — the shared daemon's whole session, or a host's worker.
+The two mistakes are not symmetric, so every ambiguity resolves toward leaving
+the process alone: children that predate us, children claimed via
+:func:`spawning_detached_child`, and pids that have already exited are all
+skipped, and none of those exclusions is re-litigated later to try to recover a
+leak. What it cannot do is attribute a child a *host* process spawned after we
+started; a host embedding this lifespan and spawning its own subprocesses
+should claim them the way ``daemon/spawn.py`` does.
+
 Extracted from ``daemon/server.py``, which has carried this sweep since the
 daemon's own leaked-LTM-child incident; the stdio MCP server needs the same
 machinery and must not import the daemon server to get it.
@@ -40,7 +51,9 @@ _ESCALATION_POLL_SECONDS = 0.05
 # Pids of children deliberately spawned to outlive us — see
 # :func:`spawning_detached_child`. The lock spans the spawn itself, not just the
 # bookkeeping, so a sweep can never observe a child that exists but is not yet
-# claimed.
+# claimed. Claims are never expired: a pid could be recycled onto a child we
+# later leak, but chasing that would trade the cheap mistake (a missed leak) for
+# the expensive one (killing the live daemon whose pid we misjudged).
 _detached_pids: set[int] = set()
 _detached_lock = threading.Lock()
 
@@ -194,35 +207,43 @@ def spawning_detached_child() -> Iterator[Callable[[int], None]]:
 
 
 def leaked_child_pids(baseline: set[int] | None = None) -> set[int]:
-    """Direct children that are ours and were not meant to outlive us.
+    """Direct children that are ours, alive, and were not meant to outlive us.
 
     *baseline* is the set of children that existed before we started: they
     predate us, so they are somebody else's (this lifespan can be hosted in a
-    process with its own subprocesses). Pids claimed as deliberately detached
-    are excluded too, and claims for processes that have since exited are
-    dropped — pids are recycled, and a stale claim would spare the very leak
-    this exists to catch.
+    process with its own subprocesses).
+
+    The probe runs *before* the claim set is read, and that order is the whole
+    guarantee. :func:`spawning_detached_child` holds the same lock across its
+    spawn, so a pid this probe saw was either claimed before the probe ran or
+    belongs to a spawn that had not started — read the claims the other way
+    round and a spawn completing between the two reads yields a live child that
+    the stale claim snapshot does not cover.
+
+    Pids that have already exited are dropped as well: a fire-and-forget child
+    nobody reaped lingers as a zombie that ``pgrep`` still lists, and signalling
+    it would mean group-signalling a session that is no longer ours.
     """
+    seen = direct_child_pids() - (baseline or set())
     with _detached_lock:
-        _detached_pids.difference_update({pid for pid in _detached_pids if _has_exited(pid)})
-        spared = set(_detached_pids)
-    return direct_child_pids() - spared - (baseline or set())
+        seen -= _detached_pids
+    return {pid for pid in seen if not _has_exited(pid)}
 
 
-def sweep_leaked_children(
-    log: logging.Logger | None = None, *, baseline: set[int] | None = None
-) -> None:
+def sweep_leaked_children(*, baseline: set[int] | None = None) -> None:
     """Terminate every direct child that is ours and outlived its owner.
+
+    Logs under this module rather than the caller's, so one logger name covers
+    every leak this process reports regardless of which teardown swept.
 
     Best-effort and never raises: it is the last step of a teardown, so a
     failure here must not replace one leak with a different one.
     """
-    at = log or logger
     try:
         leaked = leaked_child_pids(baseline)
         if not leaked:
             return
-        at.warning("Terminating leaked child process(es): %s", sorted(leaked))
+        logger.warning("Terminating leaked child process(es): %s", sorted(leaked))
         terminate_leaked_children(leaked)
     except Exception:
-        at.warning("Leaked-child sweep failed", exc_info=True)
+        logger.warning("Leaked-child sweep failed", exc_info=True)

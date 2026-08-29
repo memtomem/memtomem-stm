@@ -2055,9 +2055,8 @@ class TestLifespan:
         direct child after full teardown is that leak, so it must be
         terminated, and visibly."""
         killed = []
-        monkeypatch.setattr(
-            "memtomem_stm.utils.child_reaper.direct_child_pids", lambda: {4242}
-        )
+        monkeypatch.setattr("memtomem_stm.utils.child_reaper.direct_child_pids", lambda: {4242})
+        monkeypatch.setattr("memtomem_stm.utils.child_reaper._has_exited", lambda _pid: False)
         monkeypatch.setattr(
             "memtomem_stm.utils.child_reaper.terminate_leaked_children", killed.append
         )
@@ -2089,9 +2088,8 @@ class TestLifespan:
         from memtomem_stm.server import app_lifespan, mcp
 
         killed = []
-        monkeypatch.setattr(
-            "memtomem_stm.utils.child_reaper.direct_child_pids", lambda: {4242}
-        )
+        monkeypatch.setattr("memtomem_stm.utils.child_reaper.direct_child_pids", lambda: {4242})
+        monkeypatch.setattr("memtomem_stm.utils.child_reaper._has_exited", lambda _pid: False)
         monkeypatch.setattr(
             "memtomem_stm.utils.child_reaper.terminate_leaked_children", killed.append
         )

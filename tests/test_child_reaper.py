@@ -203,62 +203,71 @@ def test_escalation_handles_a_mixed_batch() -> None:
         _reap(stubborn)
 
 
-def test_a_sweep_cannot_run_between_the_spawn_and_its_claim() -> None:
+def test_a_sweep_cannot_run_between_the_spawn_and_its_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The detached spawn happens on a worker thread (``request_spawn`` under
-    ``asyncio.to_thread``), so registering the pid after ``Popen`` returns
-    leaves a window where the child exists and nothing claims it. The claim
-    holds the sweep's lock across the spawn, so a concurrent sweep sees either
-    no child or a claimed one — never an unclaimed live one."""
-    observed: list[set[int]] = []
-    ready = threading.Event()
-    release = threading.Event()
+    ``asyncio.to_thread``), so a sweep must never observe a child that exists
+    but is not yet claimed. The claim holds the lock across the spawn — and the
+    sweep probes *before* taking that lock, so a spawn completing between the
+    two reads still lands on the sparing side."""
+    monkeypatch.setattr(child_reaper, "_detached_pids", set())
+    monkeypatch.setattr(child_reaper, "_has_exited", lambda _pid: False)
+    spawn_started = threading.Event()
+    probed = threading.Event()
+
+    def _probe() -> set[int]:
+        # The probe is a pgrep round trip; simulate the spawn completing during
+        # it, which is the ordering that a claims-first read gets wrong.
+        probed.set()
+        assert spawn_started.wait(5.0)
+        worker.join(timeout=5.0)
+        return {777}
 
     def _spawn() -> None:
+        assert probed.wait(5.0)
         with child_reaper.spawning_detached_child() as claim:
-            ready.set()
-            release.wait(5.0)  # the "Popen" is still in flight here
+            spawn_started.set()
             claim(777)
 
+    monkeypatch.setattr(child_reaper, "direct_child_pids", _probe)
     worker = threading.Thread(target=_spawn)
     worker.start()
     try:
-        assert ready.wait(5.0)
-        sweeper = threading.Thread(
-            target=lambda: observed.append(child_reaper.leaked_child_pids())
-        )
-        sweeper.start()
-        # The sweep must block on the claim rather than read a half-registered
-        # set: it is still waiting while the spawn is mid-flight.
-        sweeper.join(timeout=0.2)
-        assert sweeper.is_alive()
-        release.set()
-        sweeper.join(timeout=5.0)
+        assert child_reaper.leaked_child_pids() == set()
     finally:
-        release.set()
         worker.join(timeout=5.0)
-    assert observed == [set()]  # 777 was claimed before the sweep could read
 
 
-def test_a_claim_is_dropped_once_that_process_is_gone(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Pids are recycled. A claim kept forever would spare a genuinely leaked
-    # child that later lands on the detached daemon's old pid — the one case
-    # the sweep exists for, silently skipped.
+def test_a_claim_is_never_expired(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pids are recycled, so a claim could in principle outlive its process and
+    spare a later leak that lands on the same pid. Expiring claims to recover
+    that leak trades the cheap mistake for the expensive one: the check would
+    also mis-sentence the live daemon whose Popen something else already
+    reaped. The sweep is biased toward sparing, so the claim stands."""
     monkeypatch.setattr(child_reaper, "_detached_pids", set())
     monkeypatch.setattr(child_reaper, "direct_child_pids", lambda: {555})
+    monkeypatch.setattr(child_reaper, "_has_exited", lambda _pid: False)
     with child_reaper.spawning_detached_child() as claim:
         claim(555)
+    assert child_reaper.leaked_child_pids() == set()
 
-    monkeypatch.setattr(child_reaper, "_has_exited", lambda _pid: False)
-    assert child_reaper.leaked_child_pids() == set()  # daemon still running
 
+def test_a_corpse_is_not_signalled(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A child nobody reaped lingers as a zombie that pgrep still lists.
+    # Signalling it means group-signalling a session that is no longer ours,
+    # and warning about it blames a corpse on an otherwise clean shutdown.
+    monkeypatch.setattr(child_reaper, "_detached_pids", set())
+    monkeypatch.setattr(child_reaper, "direct_child_pids", lambda: {666})
     monkeypatch.setattr(child_reaper, "_has_exited", lambda _pid: True)
-    assert child_reaper.leaked_child_pids() == {555}  # pid reused by a leak
+    assert child_reaper.leaked_child_pids() == set()
 
 
 def test_children_that_predate_us_are_not_ours_to_kill(monkeypatch: pytest.MonkeyPatch) -> None:
     # app_lifespan does not always own the process it runs in; a host's own
     # subprocesses must survive our teardown.
     monkeypatch.setattr(child_reaper, "_detached_pids", set())
+    monkeypatch.setattr(child_reaper, "_has_exited", lambda _pid: False)
     monkeypatch.setattr(child_reaper, "direct_child_pids", lambda: {10, 20})
     killed: list[set[int]] = []
     monkeypatch.setattr(child_reaper, "terminate_leaked_children", killed.append)
