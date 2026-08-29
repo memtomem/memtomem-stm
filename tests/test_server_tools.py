@@ -2167,6 +2167,84 @@ class TestLifespan:
         hooks[0]()
         assert killed == [{222}]  # the startup baseline was carried into the hook
 
+    async def test_signal_handlers_are_installed_and_stay_through_teardown(self, monkeypatch):
+        """Without them SIGTERM kills the process where it stands and every
+        stdio child is reparented — #906's end state via the first command an
+        operator reaches for. They are NOT handed back as teardown begins:
+        that would put the default disposition in charge for the whole of it.
+        They switch to meaning "stop waiting" instead."""
+        events = []
+
+        class _RecordingSignals:
+            def __init__(self, *, arm_watchdog, hard_exit_cleanup=None):
+                events.append(("built", arm_watchdog, hard_exit_cleanup))
+
+            def install(self):
+                events.append(("installed",))
+
+            def entering_teardown(self):
+                events.append(("handed-over",))
+
+            def remove(self):
+                events.append(("removed",))
+
+        monkeypatch.setattr("memtomem_stm.server.ShutdownSignals", _RecordingSignals)
+        await self._run_minimal_lifespan()
+
+        assert [e[0] for e in events] == ["built", "installed", "handed-over"]
+        built = events[0]
+        assert built[1] is not None and built[2] is not None  # watchdog + sweep wired
+
+    async def test_signals_switch_to_stop_waiting_before_the_teardown_runs(self, monkeypatch):
+        # Ordering, not just presence: until this fires, a second signal would
+        # re-enter the shutdown that is already unwinding.
+        order = []
+
+        class _RecordingSignals:
+            def __init__(self, **_kwargs):
+                pass
+
+            def install(self):
+                pass
+
+            def entering_teardown(self):
+                order.append("signals-handed-over")
+
+            def remove(self):
+                pass
+
+        async def _note_stop():
+            order.append("proxy-stopped")
+
+        monkeypatch.setattr("memtomem_stm.server.ShutdownSignals", _RecordingSignals)
+        await self._run_minimal_lifespan(pm_stop=_note_stop)
+        assert order == ["signals-handed-over", "proxy-stopped"]
+
+    async def test_a_signalled_teardown_ends_the_process_itself(self, monkeypatch):
+        """Cancelling the lifespan does not make mcp.run() return — the SDK's
+        anyio.run is still waiting on a stdin reader blocked on a pipe the
+        client (alive; it only signalled us) still holds. So the end of teardown
+        is the last line of ours that runs, and it has to take the exit or the
+        process stays up: #906's shape, one layer in."""
+        exits = []
+        monkeypatch.setattr("memtomem_stm.server.shutdown_was_signalled", lambda: True)
+        monkeypatch.setattr(
+            "memtomem_stm.server.exit_after_signal_shutdown", lambda: exits.append(1)
+        )
+        await self._run_minimal_lifespan()
+        assert exits == [1]
+
+    async def test_an_ordinary_teardown_does_not_end_the_process(self, monkeypatch):
+        # A client that simply went away needs no help exiting, and calling
+        # os._exit on that path would skip the interpreter's own shutdown for
+        # nothing.
+        exits = []
+        monkeypatch.setattr(
+            "memtomem_stm.server.exit_after_signal_shutdown", lambda: exits.append(1)
+        )
+        await self._run_minimal_lifespan()
+        assert exits == []
+
     async def test_the_watchdog_is_armed_for_teardown_and_stood_down_after(self, monkeypatch):
         """It is the guarantee that the process exits — bounding the steps only
         cancels waits, not work — so it must cover the whole teardown window and
