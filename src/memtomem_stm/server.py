@@ -8,9 +8,9 @@ import json
 import logging
 import os
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from datetime import datetime
 from typing import Any
 
@@ -52,6 +52,7 @@ from memtomem_stm.observability.tracing import traced
 from memtomem_stm.surfacing.feedback import FeedbackTracker
 from memtomem_stm.utils.anyio_shutdown import await_or_warn, is_clean_cancel_scope_shutdown
 from memtomem_stm.utils import child_reaper
+from memtomem_stm.utils.parent_liveness import ParentLivenessWatcher
 from memtomem_stm.utils.signal_shutdown import (
     ShutdownSignals,
     exit_after_signal_shutdown,
@@ -74,6 +75,9 @@ logger = logging.getLogger(__name__)
 _PROXY_STOP_BUDGET_SECONDS = 10.0
 _ENGINE_STOP_BUDGET_SECONDS = 5.0
 _WARMUP_JOIN_BUDGET_SECONDS = 5.0
+# The parent-liveness watcher is a poll loop with nothing to flush, so its join
+# only has to outlast one wake-up.
+_PARENT_LIVENESS_JOIN_BUDGET_SECONDS = 2.0
 
 _HASHED_QUERY_PREVIEW_RE = re.compile(r"sha256:[0-9a-f]{16}")
 """Exact shape of the opaque ID `FeedbackStore.get_stats` passes through
@@ -238,6 +242,23 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
     # configured one.
     shutdown_signals = ShutdownSignals(arm_watchdog=watchdog.arm, hard_exit_cleanup=sweep)
     shutdown_signals.install()
+    # The one shape none of the above reaches: a client that exits having leaked
+    # the stdin pipe's write end into a surviving descendant sends no EOF and no
+    # signal, so nothing here is ever entered (#906 branch (b), #914). Off unless
+    # configured, because unlike the others this infers rather than observes.
+    # Created after ``install()`` on purpose — the snapshot it takes there is
+    # what the shutdown spares, and this task must be cancellable by the very
+    # shutdown it asks for.
+    parent_watcher: ParentLivenessWatcher | None = None
+    parent_watcher_task: asyncio.Task[None] | None = None
+    if config.parent_liveness_poll_seconds > 0:
+        parent_watcher = ParentLivenessWatcher(
+            poll_seconds=config.parent_liveness_poll_seconds,
+            grace_seconds=config.parent_liveness_grace_seconds,
+            on_parent_gone=shutdown_signals.trigger,
+        )
+        _instrument_client_activity(server, parent_watcher.note_activity)
+        parent_watcher_task = asyncio.create_task(parent_watcher.run(), name="parent-liveness")
     # Daemon discovery/spawn must use the same env/default-only basis the
     # detached daemon loads. The proxy file may later propagate a file-only
     # consumer_model into surfacing; using that mutated config for discovery
@@ -620,6 +641,20 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                         resource.close()
                     except Exception:
                         logger.warning("Failed to close %s", name, exc_info=True)
+            if parent_watcher_task is not None and parent_watcher is not None:
+                # A teardown is under way, so there is nothing left for the
+                # watcher to notice — and if it started this one, it is already
+                # cancelled and this join just collects it.
+                parent_watcher.stop()
+                parent_watcher_task.cancel()
+                try:
+                    await await_or_warn(
+                        parent_watcher_task,
+                        timeout=_PARENT_LIVENESS_JOIN_BUDGET_SECONDS,
+                        what="Parent-liveness watcher join",
+                    )
+                except (asyncio.CancelledError, Exception):
+                    pass
             if warmup_task is not None:
                 # Cancelling mid-start abandons the op (#664) — it finishes in
                 # the adapter's owner task, and ``stop()``'s bounded join below
@@ -786,6 +821,48 @@ _STM_UTILITY_TOOL_NAMES: tuple[str, ...] = (
     "stm_progressive_stats",
     "stm_tuning_recommendations",
 ) + (("stm_memory_propose",) if _should_advertise_formation_tool() else ())
+
+
+def _instrument_client_activity(server: MCPServer, note: Callable[[], None]) -> bool:
+    """Stamp *note* on every inbound request and notification (#914).
+
+    The parent-liveness backstop needs to know the client is still there, and
+    the pipe cannot tell it: in the leak this guards against, and in the
+    wrapper-launcher shape it must not act on, somebody still holds the write
+    end. What separates them is that one of them still speaks MCP. This is where
+    that shows up for *all* of it — proxied tools, STM tools, ``tools/list``,
+    ``ping`` — rather than at each handler. The notification registry is covered
+    too; nothing registers one today, so that is only future-proofing.
+
+    Wraps the entries in the low-level server's handler registries, the same
+    private surface the proxy already reaches into (``_fastmcp_compat.py``).
+    Returns whether it worked: an SDK that moved these leaves the veto running
+    on the startup timestamp alone, which is a weaker guard against a false
+    positive but not a broken server, so it warns rather than raises.
+    """
+    try:
+        low = server._lowlevel_server
+        registries = (low._request_handlers, low._notification_handlers)
+    except AttributeError:
+        logger.warning(
+            "Cannot observe client activity — MCPServer internal API changed. The "
+            "parent-liveness backstop (#914) falls back to timing from startup, so a "
+            "quiet-but-live client is likelier to be shut down; set "
+            "MEMTOMEM_STM_PARENT_LIVENESS_POLL_SECONDS=0 to turn it off."
+        )
+        return False
+
+    def _wrap(handler: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+        async def stamped(*args: Any, **kwargs: Any) -> Any:
+            note()
+            return await handler(*args, **kwargs)
+
+        return stamped
+
+    for registry in registries:
+        for method, entry in list(registry.items()):
+            registry[method] = dataclass_replace(entry, handler=_wrap(entry.handler))
+    return True
 
 
 def _move_stm_tools_to_end(server: MCPServer) -> None:
