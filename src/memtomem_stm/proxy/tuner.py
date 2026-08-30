@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 from memtomem_stm.proxy.compression_feedback_store import CompressionFeedbackStore
 from memtomem_stm.proxy.config import (
+    CompressionStrategy,
     ProxyConfig,
     effective_compression_pair,
     effective_max_result_chars,
@@ -36,6 +37,15 @@ OVER_GENEROUS_RATIO = 0.95
 STRATEGY_PIN_THRESHOLD = 0.80
 """Recommend pinning strategy when one dominates above this fraction."""
 
+SETTABLE_STRATEGIES = frozenset(s.value for s in CompressionStrategy)
+"""Labels a ``compression`` key accepts.
+
+The metrics column records the strategy a call *ran under*, which is not
+always one of these: a degraded call records the path it took
+(``hybrid→progressive_fallback``). Recommending one of those would be advice
+no config can accept.
+"""
+
 
 # ── Data types ──────────────────────────────────────────────────────────
 
@@ -51,8 +61,24 @@ class ToolProfile:
     p95_original_chars: int
     dominant_strategy: str | None
     error_count: int
+    dominant_strategy_count: int = 0
+    strategy_count: int = 0
     feedback_count: int = 0
     feedback_dominant_kind: str | None = None
+
+    @property
+    def dominant_strategy_share(self) -> float:
+        """Fraction of calls with a recorded strategy won by ``dominant_strategy``.
+
+        The denominator excludes calls that recorded none, so this is a
+        dominance measurement over the calls the pin can be judged on rather
+        than over ``call_count``. A recorded strategy is not quite the same
+        as a resolved one — a stage that throws after the upstream returns
+        records the row without it — but it is what the column can attest.
+        """
+        if self.strategy_count <= 0:
+            return 0.0
+        return self.dominant_strategy_count / self.strategy_count
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +147,8 @@ class CompressionTuner:
                     p95_original_chars=r["p95_original_chars"],
                     dominant_strategy=r["dominant_strategy"],
                     error_count=r["error_count"],
+                    dominant_strategy_count=r["dominant_strategy_count"],
+                    strategy_count=r["strategy_count"],
                     feedback_count=fb_total,
                     feedback_dominant_kind=fb_dominant,
                 )
@@ -141,11 +169,11 @@ class CompressionTuner:
             if p.call_count < MIN_CALLS:
                 continue
 
-            actions = self._analyze_profile(p)
+            actions, evidence = self._analyze_profile(p)
             if not actions:
                 continue
 
-            confidence = _confidence(p.call_count)
+            confidence = _confidence(evidence)
             recommendations.append(
                 TuningRecommendation(
                     server=p.server,
@@ -158,8 +186,18 @@ class CompressionTuner:
 
     # -- heuristics -------------------------------------------------------
 
-    def _analyze_profile(self, p: ToolProfile) -> list[TuningAction]:
+    def _analyze_profile(self, p: ToolProfile) -> tuple[list[TuningAction], int]:
+        """Actions for this tool, and the call count to label them with.
+
+        The confidence label covers the whole recommendation, so an action
+        derived from a narrower population than ``call_count`` has to pull it
+        down. Only H3 does so here: it reads calls with a recorded strategy,
+        which can be far fewer. H2 and H4 rest on narrower populations of
+        their own (rows eligible for ``avg_ratio``, and feedback reports) and
+        do not yet narrow this — see #934.
+        """
         actions: list[TuningAction] = []
+        evidence = p.call_count
         current_max, token_governed = self._current_budget(p.server, p.tool)
 
         # H1: High violation rate → increase budget
@@ -205,11 +243,16 @@ class CompressionTuner:
                     )
                 )
 
-        # H3: Strategy pinning — dominant strategy > 80%
+        # H3: Strategy pinning — one settable strategy dominates > 80%.
+        # The volume gate counts calls with a recorded strategy, the same
+        # population the share is over: gating on call_count would let one
+        # recorded call among nine without report a 100% share.
         if (
             p.dominant_strategy
             and p.dominant_strategy != "none"
-            and p.call_count >= MEDIUM_CONFIDENCE_CALLS
+            and p.dominant_strategy in SETTABLE_STRATEGIES
+            and p.strategy_count >= MEDIUM_CONFIDENCE_CALLS
+            and p.dominant_strategy_share > STRATEGY_PIN_THRESHOLD
         ):
             current_strat = self._current_strategy(p.server, p.tool)
             if current_strat in ("auto", None) and p.dominant_strategy != "auto":
@@ -219,12 +262,15 @@ class CompressionTuner:
                         current=current_strat,
                         recommended=p.dominant_strategy,
                         reason=(
-                            f"AUTO resolves to {p.dominant_strategy} in "
-                            f">{STRATEGY_PIN_THRESHOLD:.0%} of calls — "
+                            f"{p.dominant_strategy_count} of {p.strategy_count} "
+                            f"calls with a recorded strategy ran "
+                            f"{p.dominant_strategy} "
+                            f"({p.dominant_strategy_share:.1%}) — "
                             "pin to skip detection overhead"
                         ),
                     )
                 )
+                evidence = min(evidence, p.strategy_count)
 
         # H4: Feedback-driven — dominant kind informs strategy
         if p.feedback_count >= 3 and p.feedback_dominant_kind:
@@ -236,7 +282,7 @@ class CompressionTuner:
             if fb_action and not (token_governed and fb_action.field == "max_result_chars"):
                 actions.append(fb_action)
 
-        return actions
+        return actions, evidence
 
     # -- config lookups ---------------------------------------------------
 

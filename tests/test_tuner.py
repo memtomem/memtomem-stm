@@ -16,6 +16,7 @@ from memtomem_stm.proxy.config import (
 from memtomem_stm.proxy.metrics import CallMetrics
 from memtomem_stm.proxy.metrics_store import MetricsStore
 from memtomem_stm.proxy.tuner import (
+    STRATEGY_PIN_THRESHOLD,
     CompressionTuner,
     TuningAction,
     format_recommendations,
@@ -33,9 +34,10 @@ def _seed_metrics(
     *,
     original_chars: int = 5000,
     compressed_chars: int = 3000,
-    strategy: str = "truncate",
+    strategy: str | None = "truncate",
     violation: bool = False,
 ) -> None:
+    """Record ``count`` identical calls; ``strategy=None`` seeds NULL-strategy rows."""
     for _ in range(count):
         store.record(
             CallMetrics(
@@ -84,6 +86,9 @@ class TestGetProfiles:
         assert p.tool == "t1"
         assert p.call_count == 10
         assert p.dominant_strategy == "hybrid"
+        assert p.dominant_strategy_count == 10
+        assert p.strategy_count == 10
+        assert p.dominant_strategy_share == 1.0
         assert p.feedback_count == 0
         assert p.feedback_dominant_kind is None
 
@@ -182,6 +187,183 @@ class TestAnalyze:
         recs = tuner.analyze()
         strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
         assert any(a.recommended == "hybrid" for a in strat_actions)
+
+    def test_plurality_below_threshold_does_not_recommend_pinning(
+        self, metrics_store: MetricsStore
+    ):
+        """A plurality is not dominance (#928).
+
+        7 of 10 calls resolve `hybrid` — a plurality, as in the issue's 7 of
+        12, at a higher share (70% against 58.3%) that is still short of the
+        threshold.  H3 used to fire on the mere presence of a dominant label,
+        so it recommended pinning a strategy that 30% of calls do not want,
+        and said ">80% of calls" to justify it.
+        """
+        cfg = ProxyConfig(
+            upstream_servers={
+                "srv": UpstreamServerConfig(prefix="test", compression=CompressionStrategy.AUTO)
+            }
+        )
+        _seed_metrics(metrics_store, "srv", "t1", 7, strategy="hybrid")
+        _seed_metrics(metrics_store, "srv", "t1", 3, strategy="truncate")
+        tuner = CompressionTuner(metrics_store, config=cfg)
+        recs = tuner.analyze()
+        strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
+        assert strat_actions == []
+
+    def test_dominant_above_threshold_reports_the_measured_share(
+        self, metrics_store: MetricsStore
+    ):
+        """The reason states what was measured, not the threshold (#928)."""
+        cfg = ProxyConfig(
+            upstream_servers={
+                "srv": UpstreamServerConfig(prefix="test", compression=CompressionStrategy.AUTO)
+            }
+        )
+        _seed_metrics(metrics_store, "srv", "t1", 9, strategy="hybrid")
+        _seed_metrics(metrics_store, "srv", "t1", 1, strategy="truncate")
+        tuner = CompressionTuner(metrics_store, config=cfg)
+        recs = tuner.analyze()
+        strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
+        assert len(strat_actions) == 1
+        assert strat_actions[0].recommended == "hybrid"
+        assert "9 of 10 calls with a recorded strategy" in strat_actions[0].reason
+        assert "90.0%" in strat_actions[0].reason
+
+    def test_a_share_exactly_at_the_threshold_does_not_fire(self, metrics_store: MetricsStore):
+        """`STRATEGY_PIN_THRESHOLD` is a floor to exceed, not to reach (#928)."""
+        cfg = ProxyConfig(
+            upstream_servers={
+                "srv": UpstreamServerConfig(prefix="test", compression=CompressionStrategy.AUTO)
+            }
+        )
+        _seed_metrics(metrics_store, "srv", "t1", 8, strategy="hybrid")
+        _seed_metrics(metrics_store, "srv", "t1", 2, strategy="truncate")
+        tuner = CompressionTuner(metrics_store, config=cfg)
+        assert tuner.get_profiles()[0].dominant_strategy_share == STRATEGY_PIN_THRESHOLD
+        recs = tuner.analyze()
+        strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
+        assert strat_actions == []
+
+    def test_calls_that_resolved_no_strategy_stay_out_of_the_denominator(
+        self, metrics_store: MetricsStore
+    ):
+        """The share is over calls with a recorded strategy, not `call_count` (#928).
+
+        A call that recorded no strategy cannot be in the numerator, so
+        counting it in the denominator would withhold a pin the resolving
+        calls do support.  Here 9 of 11 resolving calls are `hybrid` (82%,
+        fires); over all 13 calls it would read 69% and stay silent.
+        """
+        cfg = ProxyConfig(
+            upstream_servers={
+                "srv": UpstreamServerConfig(prefix="test", compression=CompressionStrategy.AUTO)
+            }
+        )
+        _seed_metrics(metrics_store, "srv", "t1", 9, strategy="hybrid")
+        _seed_metrics(metrics_store, "srv", "t1", 2, strategy="truncate")
+        _seed_metrics(metrics_store, "srv", "t1", 2, strategy=None)
+        tuner = CompressionTuner(metrics_store, config=cfg)
+        p = tuner.get_profiles()[0]
+        assert p.call_count == 13
+        assert p.strategy_count == 11
+        recs = tuner.analyze()
+        strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
+        assert len(strat_actions) == 1
+        assert "9 of 11 calls with a recorded strategy" in strat_actions[0].reason
+
+    def test_the_volume_gate_counts_the_same_calls_as_the_share(
+        self, metrics_store: MetricsStore
+    ):
+        """One resolved call is not evidence, whatever share it holds (#928).
+
+        Gating volume on `call_count` while measuring the share over
+        calls with a recorded strategy lets a single recorded call among nine that
+        recorded none report a 100% share at medium confidence.
+        """
+        cfg = ProxyConfig(
+            upstream_servers={
+                "srv": UpstreamServerConfig(prefix="test", compression=CompressionStrategy.AUTO)
+            }
+        )
+        _seed_metrics(metrics_store, "srv", "t1", 1, strategy="hybrid")
+        _seed_metrics(metrics_store, "srv", "t1", 9, strategy=None)
+        tuner = CompressionTuner(metrics_store, config=cfg)
+        p = tuner.get_profiles()[0]
+        assert p.call_count == 10
+        assert p.strategy_count == 1
+        assert p.dominant_strategy_share == 1.0
+        recs = tuner.analyze()
+        strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
+        assert strat_actions == []
+
+    def test_confidence_follows_the_calls_the_action_rests_on(
+        self, metrics_store: MetricsStore
+    ):
+        """A label read off `call_count` overstates an H3-only recommendation.
+
+        10 resolved calls and 15 that recorded none: the sole action rests on
+        10 observations, but `call_count` of 25 would label it `high`.
+        """
+        cfg = ProxyConfig(
+            upstream_servers={
+                "srv": UpstreamServerConfig(prefix="test", compression=CompressionStrategy.AUTO)
+            }
+        )
+        _seed_metrics(metrics_store, "srv", "t1", 10, strategy="hybrid")
+        _seed_metrics(metrics_store, "srv", "t1", 15, strategy=None)
+        tuner = CompressionTuner(metrics_store, config=cfg)
+        p = tuner.get_profiles()[0]
+        assert p.call_count == 25
+        assert p.strategy_count == 10
+        recs = tuner.analyze()
+        assert len(recs) == 1
+        assert [a.field for a in recs[0].actions] == ["compression"]
+        assert recs[0].confidence == "medium"
+
+    def test_a_fallback_label_is_never_recommended_as_a_pin(self, metrics_store: MetricsStore):
+        """A degraded call records the path it took, which no config accepts.
+
+        `compression_strategy` holds the strategy a call *ran under*, and a
+        fallback records `hybrid→progressive_fallback`.  Recommending that as
+        a `compression` value is advice the operator cannot apply — `mms tune
+        --apply` fails schema validation on it.
+        """
+        cfg = ProxyConfig(
+            upstream_servers={
+                "srv": UpstreamServerConfig(prefix="test", compression=CompressionStrategy.AUTO)
+            }
+        )
+        _seed_metrics(metrics_store, "srv", "t1", 12, strategy="hybrid→progressive_fallback")
+        tuner = CompressionTuner(metrics_store, config=cfg)
+        assert tuner.get_profiles()[0].dominant_strategy_share == 1.0
+        recs = tuner.analyze()
+        strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
+        assert strat_actions == []
+
+    def test_the_reason_carries_counts_a_rounded_percent_would_blur(
+        self, metrics_store: MetricsStore
+    ):
+        """Near the boundary a rounded percent reads as the threshold itself.
+
+        81 of 101 is 80.198%, which clears the strict gate but renders as
+        "80%" at zero decimals — the gate and its stated reason would disagree
+        again, which is the whole defect #928 is about.
+        """
+        cfg = ProxyConfig(
+            upstream_servers={
+                "srv": UpstreamServerConfig(prefix="test", compression=CompressionStrategy.AUTO)
+            }
+        )
+        _seed_metrics(metrics_store, "srv", "t1", 81, strategy="hybrid")
+        _seed_metrics(metrics_store, "srv", "t1", 20, strategy="truncate")
+        tuner = CompressionTuner(metrics_store, config=cfg)
+        recs = tuner.analyze()
+        strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
+        assert len(strat_actions) == 1
+        reason = strat_actions[0].reason
+        assert "81 of 101 calls with a recorded strategy" in reason
+        assert "80.2%" in reason
 
     def test_budget_advice_measures_against_the_global_default(self, metrics_store: MetricsStore):
         """H1 must not "increase" a budget to less than it already is (#926).
