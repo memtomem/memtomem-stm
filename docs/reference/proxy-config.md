@@ -99,9 +99,11 @@ Three parts compose it, in this order:
   accurate for every call — it can select `hybrid`, whose default
   `tail_mode: "toc"` returns a TOC the agent has to retrieve from. Under `auto`
   that TOC names `stm_proxy_select_chunks` in the response text itself, which is
-  what carries the instruction there. Every response that needs retrieval names
-  its follow-up tool inline this way; the suffix is what says so *before* the
-  call, where it can inform the decision to make one.
+  what carries the instruction there. A response that needs retrieval generally
+  carries such an inline hint — though a TOC fitted to a tight `max_chars`
+  abbreviates it to `select_chunks key=…`, dropping the registered tool name.
+  The suffix is what says so *before* the call, where it can inform the
+  decision to make one at all.
 
   Unlike the fields above, the suffix resolves off the **live** config at each
   rebuild rather than the connect-time snapshot, since it predicts what a call

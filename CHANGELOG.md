@@ -421,7 +421,7 @@ changes inline only. See the deprecation policy in
   per-server field alone — which is `auto` for exactly that configuration, and
   `auto` emits no suffix. An operator who configured compression globally got
   `selective`, `progressive` or `hybrid` responses described as if they were
-  ordinary text. The responses themselves do name the follow-up tool inline, so
+  ordinary text. Such a response usually carries an inline hint of its own, so
   what was missing is the part that arrives *before* the call: the description
   is what a client reads when deciding whether and how to call a tool, and it
   described a retrieval-bearing response as a plain one. The two paths
@@ -429,10 +429,17 @@ changes inline only. See the deprecation policy in
   function now holds it, and the call path, the #610 privacy warning, and the
   advertisement all read it.
 
-  **Behavior change**: such upstreams gain the suffix for their strategy, which
-  under a tight `max_description_chars` costs upstream text — the suffix wins
-  the budget, by the rule #893 established. Servers that set `compression`
-  themselves, and deployments leaving the global at `auto`, are unaffected.
+  **Behavior change**, in two parts. Such upstreams gain the suffix for their
+  strategy, which under a tight `max_description_chars` costs upstream text —
+  the suffix wins the budget, by the rule #893 established. And because the
+  suffix predicts what a *call* will do, it is now resolved from the live
+  config at each advertisement rebuild rather than the connect-time snapshot:
+  an edit to `compression`, `hybrid`, or a per-tool override of either reaches
+  a client at the next rebuild instead of requiring a reconnect. That second
+  part applies to servers that set `compression` themselves too; the
+  advertisement they produce for an unedited config is unchanged, as it is for
+  deployments leaving the global at `auto`. Every other advertised-metadata
+  field keeps the lifetime `docs/configuration.md` documents.
 
   `auto` still advertises no suffix. It picks a strategy per response and can
   select `hybrid`, whose default `tail_mode: "toc"` needs retrieval, so no

@@ -221,13 +221,16 @@ def _effective_compression_pair(
 
     Both fields resolve together because the convention suffix reads them
     together: ``hybrid`` decides whether the HYBRID strategy needs a retrieval
-    hint at all. One function for both readers (#924) — the advertisement
+    hint at all. One function for every reader (#924) — the advertisement
     duplicating this precedence beside the call path is what let the two
     disagree, and a partial copy is how they would disagree again.
 
-    All three arguments must come from ONE config generation; pairing a
-    connect-time server config with a live global can name a follow-up tool the
-    call will not use.
+    Callers must not pair a server config from one reload generation with a
+    global from another: resolving a connect-time omission against a newer
+    global can name a follow-up tool the call will not use. Deliberately
+    passing a retired ``conn.config`` for a server the file no longer defines
+    is fine — ``_server_cfg`` does exactly that, and the call path resolves the
+    same retired object against the same global.
     """
     compression = _effective_compression(cfg, proxy_cfg)
     hybrid = cfg.hybrid
@@ -937,14 +940,14 @@ class ProxyManager:
         # and this default are still two reads of the same path; that pairing
         # predates #924 and is untouched here.)
         for srv_name, srv_cfg in servers.items():
-            srv_comp = _effective_compression(srv_cfg, cfg_snap)
+            srv_comp, _ = _effective_compression_pair(srv_cfg, None, cfg_snap)
             srv_llm = srv_cfg.llm
             srv_leaks = _llm_compression_leaks(srv_comp, srv_llm)
             if srv_leaks and srv_llm is not None:
                 comp_leak_paths.append(f"server '{srv_name}'")
                 comp_dests.add(_describe_llm_destination(srv_llm))
             for tool_name, override in srv_cfg.tool_overrides.items():
-                tool_comp = override.compression if override.compression is not None else srv_comp
+                tool_comp, _ = _effective_compression_pair(srv_cfg, override, cfg_snap)
                 tool_llm = override.llm or srv_llm
                 # A tool that inherits both strategy and llm from the server is
                 # already covered by the server-level entry — don't double-list.
@@ -2790,18 +2793,19 @@ class ProxyManager:
             cfg = conn.config
             max_desc = cfg.max_description_chars
             strip = cfg.strip_schema_descriptions or global_strip
-            # The convention suffix is the one part of the description that is
-            # a PREDICTION about a call rather than a fact about this
-            # connection, so it resolves off the live snapshot while everything
-            # around it stays connect-time (#924). Calls resolve compression,
-            # hybrid and the per-tool override live, and a rebuild can happen
-            # without a reconnect — ``tools/list_changed`` refreshes
-            # ``conn.tools`` and re-advertises while ``conn.config`` keeps its
-            # connect-time value — so a suffix built from the connect-time
-            # config can name a follow-up tool the call will not use. Naming
-            # the WRONG tool is worse than naming none, which is what the
-            # connect-time read would do here. All three inputs come from this
-            # one snapshot; mixing generations is what produces the wrong name.
+            # The convention suffix is proxy-authored text that PREDICTS what a
+            # call will do, not a fact about this connection, so its per-server
+            # inputs come off the live snapshot (#924) — unlike the per-server
+            # inputs above, which stay connect-time. (The globals above are
+            # already live; what the connect-time rule governs is the
+            # per-server side of each field.) Calls resolve compression, hybrid
+            # and the per-tool override live, and a rebuild can happen without a
+            # reconnect — ``tools/list_changed`` refreshes ``conn.tools`` and
+            # re-advertises while ``conn.config`` keeps its connect-time value —
+            # so a suffix built from the connect-time config can name a
+            # follow-up tool the call will not use. Naming the WRONG tool is
+            # worse than naming none, which is what the connect-time read would
+            # do here.
             live_cfg = self._server_cfg(conn, cfg_snap)
 
             for t in conn.tools:
