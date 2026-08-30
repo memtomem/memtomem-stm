@@ -415,6 +415,47 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **The credential scan covers the whole advertised surface** (#894). The
+  `sensitive_metadata` gate exists so that no secret-class string reaches the
+  client's context through `tools/list`, but it read only the description (raw
+  and advertised) and the input schema. Everything else a successful
+  registration serves was unscanned: the composed `name` (the upstream's raw
+  name, embedded verbatim — and MCP's name charset admits the prefix-anchored
+  token patterns) and the forwarded `annotations` / `outputSchema` / `_meta`.
+  All of them are scanned now, every text separately so a pattern cannot bridge
+  two fields, with `annotations` taken in the tagged form registration sends —
+  the server name is prepended to a non-empty `title`, so a credential-shaped
+  server name is caught exactly where it would actually reach the client, and a
+  server whose name merely looks that way does not hide its annotation-less
+  tools.
+
+  Each structured field (the schemas, `annotations`, `_meta`) contributes two
+  kinds of text: its JSON serialization, which the quoted-key patterns need,
+  and every decoded string inside it. `json.dumps` escapes a newline to a
+  literal `\n` while the credential labels match on real whitespace before
+  their `:`, so `{"note": "api_key\n: …"}` scanned clean while the client
+  received the decoded text.
+
+  Those fields are rendered as state, not as prose. `str(value)` and a
+  `json.dumps(default=str)` hook both handed the rendering decision to the
+  object being scanned, so a benign-looking `__str__` cleared the very field
+  the client then received in full. A pydantic model is dumped through the
+  unbound `BaseModel.model_dump`, so an instance override decides only what the
+  gate sees and never what MCP sends; any other pydantic object is refused,
+  since a `field_serializer` can put on the wire what no attribute holds; and
+  anything embedded inside a field that is not plain JSON fails that field
+  closed, because its wire form comes from a serializer this gate does not run.
+  A value it cannot read is one it cannot clear. The exception barrier now
+  covers the attribute lookup too: a raising `model_dump` property used to
+  abort the whole filter pass.
+
+  **Behavior change**: a tool that reaches the signal rule — one no config,
+  structural, or duplicate-name rule already withheld — and matches a
+  credential pattern in any of those fields is now withheld under the `strict`
+  exposure profile and demoted under `review`, as one matching in its
+  description already was. `explore` is unaffected — it never consults this
+  signal.
+
 - **The tuner measures a tool's strategy and budget the way a call resolves
   them** (#926). Both of its config lookups stopped one level short of the
   runtime resolution, and both turned that into advice an operator could act on

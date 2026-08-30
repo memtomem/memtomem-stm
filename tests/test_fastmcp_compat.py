@@ -1,6 +1,6 @@
 """Unit tests for the MCPServer compatibility layer.
 
-Focused on the ``_tag_annotations_title`` helper that prepends a ``[server]``
+Focused on the ``tag_annotations_title`` helper that prepends a ``[server]``
 scope tag to ``ToolAnnotations.title`` for ``/mcp`` picker disambiguation.
 """
 
@@ -11,12 +11,12 @@ from __future__ import annotations
 # the SDK's func_metadata eval's it.
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
 
-from memtomem_stm.proxy._fastmcp_compat import _tag_annotations_title
+from memtomem_stm.proxy.tool_metadata import tag_annotations_title
 
 
 def test_tag_title_prepends_server_when_title_present() -> None:
     annotations = ToolAnnotations(title="Close browser", destructive_hint=True)
-    tagged = _tag_annotations_title(annotations, "playwright")
+    tagged = tag_annotations_title(annotations, "playwright")
     assert tagged is not annotations  # copy-on-write
     assert tagged.title == "[playwright] Close browser"
 
@@ -29,7 +29,7 @@ def test_tag_title_preserves_other_hint_fields() -> None:
         idempotent_hint=True,
         open_world_hint=False,
     )
-    tagged = _tag_annotations_title(annotations, "fs")
+    tagged = tag_annotations_title(annotations, "fs")
     assert tagged.read_only_hint is True
     assert tagged.destructive_hint is False
     assert tagged.idempotent_hint is True
@@ -37,18 +37,18 @@ def test_tag_title_preserves_other_hint_fields() -> None:
 
 
 def test_tag_title_returns_none_unchanged_when_annotations_is_none() -> None:
-    assert _tag_annotations_title(None, "playwright") is None
+    assert tag_annotations_title(None, "playwright") is None
 
 
 def test_tag_title_passthrough_when_title_missing() -> None:
     annotations = ToolAnnotations(read_only_hint=True)
-    tagged = _tag_annotations_title(annotations, "Context7")
+    tagged = tag_annotations_title(annotations, "Context7")
     assert tagged is annotations
 
 
 def test_tag_title_passthrough_when_title_empty_string() -> None:
     annotations = ToolAnnotations(title="", read_only_hint=True)
-    tagged = _tag_annotations_title(annotations, "Context7")
+    tagged = tag_annotations_title(annotations, "Context7")
     assert tagged is annotations
 
 
@@ -57,7 +57,7 @@ def test_tag_title_passthrough_on_unknown_shape() -> None:
         title = "Close browser"
 
     opaque = _Opaque()
-    tagged = _tag_annotations_title(opaque, "playwright")
+    tagged = tag_annotations_title(opaque, "playwright")
     assert tagged is opaque
 
 
@@ -69,7 +69,7 @@ def test_tag_title_falls_back_to_original_when_model_copy_raises() -> None:
             raise RuntimeError("simulated copy failure")
 
     broken = _BrokenCopy()
-    tagged = _tag_annotations_title(broken, "playwright")
+    tagged = tag_annotations_title(broken, "playwright")
     assert tagged is broken
 
 
