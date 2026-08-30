@@ -69,6 +69,7 @@ from memtomem_stm.proxy.config import (
     SelectiveConfig,
     TokenEstimationMode,
     ToolgraphConfig,
+    ToolOverrideConfig,
     TransportType,
     UpstreamServerConfig,
 )
@@ -187,6 +188,63 @@ def _describe_llm_destination(llm: LLMCompressorConfig) -> str:
     if llm.base_url:
         return f"{llm.provider.value} ({llm.base_url})"
     return llm.provider.value
+
+
+def _effective_compression(
+    cfg: UpstreamServerConfig, proxy_cfg: ProxyConfig
+) -> CompressionStrategy:
+    """Resolve an upstream's compression strategy against the global default.
+
+    #292: ``ProxyConfig.default_compression`` was previously unread, so an
+    operator setting it in ``stm_proxy.json`` saw no effect on any upstream —
+    every server fell back to its own default of AUTO. ``model_fields_set``
+    distinguishes "operator omitted compression" (→ honour the global default)
+    from "operator explicitly typed ``compression: auto``" (→ honour their
+    explicit choice).
+
+    Shared by every reader in this module, through
+    ``_effective_compression_pair`` (#924): the call path and the advertisement
+    path resolving this differently is what let a global-only configuration
+    compress responses without advertising the convention suffix those
+    responses require.
+    """
+    if "compression" in cfg.model_fields_set:
+        return cfg.compression
+    return proxy_cfg.default_compression
+
+
+def _effective_compression_pair(
+    cfg: UpstreamServerConfig,
+    override: ToolOverrideConfig | None,
+    proxy_cfg: ProxyConfig,
+) -> tuple[CompressionStrategy, HybridConfig | None]:
+    """Full per-tool precedence: tool override → per-server → global default.
+
+    Both fields resolve together because the convention suffix reads them
+    together: ``hybrid`` decides whether the HYBRID strategy needs a retrieval
+    hint at all. One function for all three readers in this module — the call
+    path, the advertisement and the #610 privacy warning (#924). The
+    advertisement duplicating this precedence beside the call path is what let
+    the two disagree, and a partial copy is how they would disagree again.
+    Readers outside this module still carry their own copies (``cli/proxy.py``
+    for the #610 CLI check, ``proxy/tuner.py``, whose copy omits the global
+    fallback and recommends a pin the operator already made) — #926.
+
+    Callers must not pair a server config from one reload generation with a
+    global from another: resolving a connect-time omission against a newer
+    global can name a follow-up tool the call will not use. Deliberately
+    passing a retired ``conn.config`` for a server the file no longer defines
+    is fine — ``_server_cfg`` does exactly that, and the call path resolves the
+    same retired object against the same global.
+    """
+    compression = _effective_compression(cfg, proxy_cfg)
+    hybrid = cfg.hybrid
+    if override is not None:
+        if override.compression is not None:
+            compression = override.compression
+        if override.hybrid is not None:
+            hybrid = override.hybrid
+    return compression, hybrid
 
 
 def _llm_compression_leaks(
@@ -847,17 +905,23 @@ class ProxyManager:
         self._reset_toolgraph_session_state()
         self._stack = AsyncExitStack()
 
-        servers = self._config.upstream_servers
+        # ONE loader read for everything this startup path derives. ``_config``
+        # is a property over the hot-reload loader, so each access can return a
+        # newer generation than the last; taking the snapshot here is what lets
+        # the servers, the global compression default and the extraction config
+        # below describe the same file.
+        cfg_snap = self._config
+        servers = cfg_snap.upstream_servers
         if not servers:
             # Fallback re-load of a file the server startup path typically
             # already loaded (env-enabled proxy, upstreams only in the file).
             # log_warnings=False so the advisory permissive-mode /
             # unknown-key warnings don't fire twice per startup (#611);
             # a parse *failure* still logs.
-            loaded = ProxyConfig.load_from_file(self._config.config_path, log_warnings=False)
+            loaded = ProxyConfig.load_from_file(cfg_snap.config_path, log_warnings=False)
             servers = loaded.upstream_servers if loaded else {}
 
-        ext_cfg = self._config.extraction
+        ext_cfg = cfg_snap.extraction
 
         # #610: warn loudly when an LLM path will send raw upstream responses
         # UNSCANNED to an external provider (privacy_scan_enabled=false). The
@@ -873,18 +937,22 @@ class ProxyManager:
         # there — its warning is gated on the same condition to stay accurate.
         comp_leak_paths: list[str] = []
         comp_dests: set[str] = set()
-        default_comp = self._config.default_compression
+        # Resolved against the snapshot taken above, so every server in the
+        # sweep is judged under one global default — reading ``self._config``
+        # per server would let a reload land mid-loop and warn about the first
+        # servers under the old default and the rest under the new one. (When
+        # ``servers`` came from the fallback file re-load above, its entries
+        # and this default are still two reads of the same path; that pairing
+        # predates #924 and is untouched here.)
         for srv_name, srv_cfg in servers.items():
-            srv_comp = (
-                srv_cfg.compression if "compression" in srv_cfg.model_fields_set else default_comp
-            )
+            srv_comp, _ = _effective_compression_pair(srv_cfg, None, cfg_snap)
             srv_llm = srv_cfg.llm
             srv_leaks = _llm_compression_leaks(srv_comp, srv_llm)
             if srv_leaks and srv_llm is not None:
                 comp_leak_paths.append(f"server '{srv_name}'")
                 comp_dests.add(_describe_llm_destination(srv_llm))
             for tool_name, override in srv_cfg.tool_overrides.items():
-                tool_comp = override.compression if override.compression is not None else srv_comp
+                tool_comp, _ = _effective_compression_pair(srv_cfg, override, cfg_snap)
                 tool_llm = override.llm or srv_llm
                 # A tool that inherits both strategy and llm from the server is
                 # already covered by the server-level entry — don't double-list.
@@ -2730,19 +2798,33 @@ class ProxyManager:
             cfg = conn.config
             max_desc = cfg.max_description_chars
             strip = cfg.strip_schema_descriptions or global_strip
+            # The convention suffix is proxy-authored text that PREDICTS what a
+            # call will do, not a fact about this connection, so its per-server
+            # inputs come off the live snapshot (#924) — unlike the per-server
+            # inputs above, which stay connect-time. (The globals above are
+            # already live; what the connect-time rule governs is the
+            # per-server side of each field.) Calls resolve compression, hybrid
+            # and the per-tool override live, and a rebuild can happen without a
+            # reconnect — ``tools/list_changed`` refreshes ``conn.tools`` and
+            # re-advertises while ``conn.config`` keeps its connect-time value —
+            # so a suffix built from the connect-time config can name a
+            # follow-up tool the call will not use. Naming the WRONG tool is
+            # worse than naming none, which is what the connect-time read would
+            # do here.
+            live_cfg = self._server_cfg(conn, cfg_snap)
 
             for t in conn.tools:
-                override = cfg.tool_overrides.get(t.name)
+                # Two overrides, by role: the connect-time one supplies
+                # ``description_override`` (advertised text, which follows the
+                # identity/budget fields above and the metadata lifetime
+                # documented in docs/configuration.md), the live one feeds the
+                # suffix prediction.
+                advert_override = cfg.tool_overrides.get(t.name)
+                suffix_override = live_cfg.tool_overrides.get(t.name)
 
-                # Resolve effective compression + hybrid config for convention suffix
-                effective_compression = cfg.compression
-                effective_hybrid = cfg.hybrid
-                if override is not None:
-                    if override.compression is not None:
-                        effective_compression = override.compression
-                    if override.hybrid is not None:
-                        effective_hybrid = override.hybrid
-
+                effective_compression, effective_hybrid = _effective_compression_pair(
+                    live_cfg, suffix_override, cfg_snap
+                )
                 suffix = self._convention_suffix(effective_compression, effective_hybrid)
 
                 # Resolve description. ``max_description_chars`` caps what the
@@ -2755,8 +2837,8 @@ class ProxyManager:
                 # text, since it is what tells the client which follow-up tool
                 # to call (#893).
                 desc = t.description or ""
-                if override is not None and override.description_override is not None:
-                    desc = override.description_override
+                if advert_override is not None and advert_override.description_override is not None:
+                    desc = advert_override.description_override
                 budget = min(max_desc, global_max_desc) - len(PROXIED_PREFIX)
                 if suffix and len(suffix) <= budget:
                     desc = self._truncate_description(desc, budget - len(suffix)) + suffix
@@ -3204,17 +3286,6 @@ class ProxyManager:
         # without a reconnect (the behavior docs/configuration.md promises).
         cfg = self._server_cfg(conn, config)
 
-        # #292: ``ProxyConfig.default_compression`` was previously unread, so
-        # an operator setting it in ``stm_proxy.json`` saw no effect on any
-        # upstream — every server fell back to its own default of AUTO. Use
-        # ``model_fields_set`` to distinguish "operator omitted compression"
-        # (→ honour the global default) from "operator explicitly typed
-        # compression: auto" (→ honour their explicit choice). The pattern
-        # mirrors the auto_index / extraction overrides above and below.
-        if "compression" in cfg.model_fields_set:
-            compression = cfg.compression
-        else:
-            compression = config.default_compression
         # Token-equivalent budget takes precedence over char budget when set.
         # Resolution order for chars_per_token: tool override → server → proxy default.
         # Resolution order for max_result_tokens: tool override → server.
@@ -3232,7 +3303,6 @@ class ProxyManager:
             max_chars = cfg.max_result_chars
         llm_cfg = cfg.llm
         sel_cfg = cfg.selective
-        hybrid_cfg = cfg.hybrid
         cleaning_cfg = cfg.cleaning or CleaningConfig()
 
         auto_index_enabled = config.auto_index.enabled
@@ -3247,9 +3317,10 @@ class ProxyManager:
         retention_floor = cfg.retention_floor
 
         override = cfg.tool_overrides.get(tool)
+        # #292/#924: compression and hybrid resolve together, through the same
+        # function the advertisement uses, so the two cannot drift apart.
+        compression, hybrid_cfg = _effective_compression_pair(cfg, override, config)
         if override is not None:
-            if override.compression is not None:
-                compression = override.compression
             # Per-tool budget override. Token override wins over char override
             # if both are set. Resolution order for chars_per_token (when token
             # budget is used): tool override → server → proxy default.
@@ -3274,8 +3345,6 @@ class ProxyManager:
                 llm_cfg = override.llm
             if override.selective is not None:
                 sel_cfg = override.selective
-            if override.hybrid is not None:
-                hybrid_cfg = override.hybrid
             if override.progressive is not None:
                 progressive_cfg = override.progressive
             if override.cleaning is not None:

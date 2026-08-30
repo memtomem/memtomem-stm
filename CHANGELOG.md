@@ -290,9 +290,10 @@ changes inline only. See the deprecation policy in
   the table also stops promising that every `tool_overrides` field reaches a
   client on the next call, which holds for how a response is compressed but not
   for the fields that shape the advertisement. Review of this
-  documentation turned up a real mismatch, filed as #924 and documented here
-  rather than papered over: a global-only `default_compression` drives calls but
-  not the advertisement, so such an upstream advertises no convention suffix.
+  documentation turned up a real mismatch, filed as #924 and documented rather
+  than papered over: a global-only `default_compression` drove calls but not the
+  advertisement, so such an upstream advertised no convention suffix. That is
+  fixed below in the same release, and the section describes the fixed behavior.
   Also corrects `tool_relevance`'s claim that the
   ranked document is "what the client actually saw": it omits the prefix and
   caps serialized schemas at 2000 characters, and since BM25 normalizes by
@@ -413,6 +414,42 @@ changes inline only. See the deprecation policy in
   external.
 
 ### Fixed
+
+- **A global-only `default_compression` now advertises its convention suffix**
+  (#924, PR #925). Calls resolve compression through the global default when a
+  server omits the `compression` key (#292), but the advertisement read the
+  per-server field alone — which is `auto` for exactly that configuration, and
+  `auto` emits no suffix. An operator who configured compression globally got
+  `selective`, `progressive` or `hybrid` responses described as if they were
+  ordinary text. Such a response usually carries an inline hint of its own, so
+  what was missing is the part that arrives *before* the call: the description
+  is what a client reads when deciding whether and how to call a tool, and it
+  described a retrieval-bearing response as a plain one. The two paths
+  disagreed because each carried its own copy of the resolution rule; one
+  function now holds it, and all three readers in the proxy manager — the call
+  path, the advertisement, and the #610 privacy warning — read it. Two copies
+  outside that module remain, one of them wrong in its own way; #926 tracks
+  folding them in.
+
+  **Behavior change**, in two parts. For the three strategies that carry a
+  suffix at all — `selective`, `progressive`, and `hybrid` under its default
+  `tail_mode: "toc"`, a `truncate` tail being self-contained — such upstreams
+  gain it whenever it fits the effective description budget, costing upstream
+  text since the suffix wins that budget; where it cannot fit, #893's
+  whole-suffix drop still applies and nothing is advertised. And because the
+  suffix predicts what a *call* will do, it is now resolved from the live
+  config at each advertisement rebuild rather than the connect-time snapshot:
+  an edit to `compression`, `hybrid`, or a per-tool override of either reaches
+  a client at the next rebuild instead of requiring a reconnect. That second
+  part applies to servers that set `compression` themselves too; the
+  advertisement they produce for an unedited config is unchanged, as it is for
+  deployments leaving the global at `auto`. Every other advertised-metadata
+  field keeps the lifetime `docs/configuration.md` documents.
+
+  `auto` still advertises no suffix. It picks a strategy per response and can
+  select `hybrid`, whose default `tail_mode: "toc"` needs retrieval, so no
+  static description is accurate for every call; that instruction rides the
+  response instead.
 
 - **`max_description_chars` is now an exact cap on the client-visible
   description** (#893, PR #921). It read as a cap but did not bound the string
