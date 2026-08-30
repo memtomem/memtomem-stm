@@ -69,9 +69,10 @@ from memtomem_stm.proxy.config import (
     SelectiveConfig,
     TokenEstimationMode,
     ToolgraphConfig,
-    ToolOverrideConfig,
     TransportType,
     UpstreamServerConfig,
+    effective_compression_pair,
+    effective_max_result_chars,
 )
 from memtomem_stm.proxy.extraction import FactExtractor
 from memtomem_stm.proxy.index_observability import IndexObservability
@@ -92,7 +93,7 @@ from memtomem_stm.proxy.pipeline_stages import (
     ShapePassthrough,
 )
 from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS as PRIVACY_CREDENTIAL_PATTERNS
-from memtomem_stm.proxy.token_estimate import approx_tokens, tokens_to_chars
+from memtomem_stm.proxy.token_estimate import approx_tokens
 from memtomem_stm.proxy.tool_eligibility import (
     REASON_CONFIG_HIDDEN,
     REASON_PROFILE_EXCLUDED,
@@ -188,63 +189,6 @@ def _describe_llm_destination(llm: LLMCompressorConfig) -> str:
     if llm.base_url:
         return f"{llm.provider.value} ({llm.base_url})"
     return llm.provider.value
-
-
-def _effective_compression(
-    cfg: UpstreamServerConfig, proxy_cfg: ProxyConfig
-) -> CompressionStrategy:
-    """Resolve an upstream's compression strategy against the global default.
-
-    #292: ``ProxyConfig.default_compression`` was previously unread, so an
-    operator setting it in ``stm_proxy.json`` saw no effect on any upstream —
-    every server fell back to its own default of AUTO. ``model_fields_set``
-    distinguishes "operator omitted compression" (→ honour the global default)
-    from "operator explicitly typed ``compression: auto``" (→ honour their
-    explicit choice).
-
-    Shared by every reader in this module, through
-    ``_effective_compression_pair`` (#924): the call path and the advertisement
-    path resolving this differently is what let a global-only configuration
-    compress responses without advertising the convention suffix those
-    responses require.
-    """
-    if "compression" in cfg.model_fields_set:
-        return cfg.compression
-    return proxy_cfg.default_compression
-
-
-def _effective_compression_pair(
-    cfg: UpstreamServerConfig,
-    override: ToolOverrideConfig | None,
-    proxy_cfg: ProxyConfig,
-) -> tuple[CompressionStrategy, HybridConfig | None]:
-    """Full per-tool precedence: tool override → per-server → global default.
-
-    Both fields resolve together because the convention suffix reads them
-    together: ``hybrid`` decides whether the HYBRID strategy needs a retrieval
-    hint at all. One function for all three readers in this module — the call
-    path, the advertisement and the #610 privacy warning (#924). The
-    advertisement duplicating this precedence beside the call path is what let
-    the two disagree, and a partial copy is how they would disagree again.
-    Readers outside this module still carry their own copies (``cli/proxy.py``
-    for the #610 CLI check, ``proxy/tuner.py``, whose copy omits the global
-    fallback and recommends a pin the operator already made) — #926.
-
-    Callers must not pair a server config from one reload generation with a
-    global from another: resolving a connect-time omission against a newer
-    global can name a follow-up tool the call will not use. Deliberately
-    passing a retired ``conn.config`` for a server the file no longer defines
-    is fine — ``_server_cfg`` does exactly that, and the call path resolves the
-    same retired object against the same global.
-    """
-    compression = _effective_compression(cfg, proxy_cfg)
-    hybrid = cfg.hybrid
-    if override is not None:
-        if override.compression is not None:
-            compression = override.compression
-        if override.hybrid is not None:
-            hybrid = override.hybrid
-    return compression, hybrid
 
 
 def _llm_compression_leaks(
@@ -945,14 +889,14 @@ class ProxyManager:
         # and this default are still two reads of the same path; that pairing
         # predates #924 and is untouched here.)
         for srv_name, srv_cfg in servers.items():
-            srv_comp, _ = _effective_compression_pair(srv_cfg, None, cfg_snap)
+            srv_comp, _ = effective_compression_pair(srv_cfg, None, cfg_snap)
             srv_llm = srv_cfg.llm
             srv_leaks = _llm_compression_leaks(srv_comp, srv_llm)
             if srv_leaks and srv_llm is not None:
                 comp_leak_paths.append(f"server '{srv_name}'")
                 comp_dests.add(_describe_llm_destination(srv_llm))
             for tool_name, override in srv_cfg.tool_overrides.items():
-                tool_comp, _ = _effective_compression_pair(srv_cfg, override, cfg_snap)
+                tool_comp, _ = effective_compression_pair(srv_cfg, override, cfg_snap)
                 tool_llm = override.llm or srv_llm
                 # A tool that inherits both strategy and llm from the server is
                 # already covered by the server-level entry — don't double-list.
@@ -2822,7 +2766,7 @@ class ProxyManager:
                 advert_override = cfg.tool_overrides.get(t.name)
                 suffix_override = live_cfg.tool_overrides.get(t.name)
 
-                effective_compression, effective_hybrid = _effective_compression_pair(
+                effective_compression, effective_hybrid = effective_compression_pair(
                     live_cfg, suffix_override, cfg_snap
                 )
                 suffix = self._convention_suffix(effective_compression, effective_hybrid)
@@ -3290,17 +3234,7 @@ class ProxyManager:
         # Resolution order for chars_per_token: tool override → server → proxy default.
         # Resolution order for max_result_tokens: tool override → server.
         # Falls back to existing char-budget paths when neither override is set.
-        _default_server_max = UpstreamServerConfig.model_fields["max_result_chars"].default
-        server_token_budget = cfg.max_result_tokens
-        token_budget = server_token_budget
         token_estimation_mode = cfg.token_estimation_mode or config.token_estimation_mode
-        if server_token_budget is not None:
-            cpt = cfg.chars_per_token if cfg.chars_per_token is not None else config.chars_per_token
-            max_chars = tokens_to_chars(server_token_budget, cpt)
-        elif cfg.max_result_chars == _default_server_max:
-            max_chars = config.effective_max_result_chars()
-        else:
-            max_chars = cfg.max_result_chars
         llm_cfg = cfg.llm
         sel_cfg = cfg.selective
         cleaning_cfg = cfg.cleaning or CleaningConfig()
@@ -3317,26 +3251,14 @@ class ProxyManager:
         retention_floor = cfg.retention_floor
 
         override = cfg.tool_overrides.get(tool)
-        # #292/#924: compression and hybrid resolve together, through the same
-        # function the advertisement uses, so the two cannot drift apart.
-        compression, hybrid_cfg = _effective_compression_pair(cfg, override, config)
+        # #292/#924/#926: strategy and budget both resolve through the same
+        # functions every other reader uses, so no two can drift apart. Token
+        # budget takes precedence over char budget at each level; a server
+        # leaving ``max_result_chars`` at its default defers to the model-aware
+        # global.
+        compression, hybrid_cfg = effective_compression_pair(cfg, override, config)
+        max_chars, token_budget = effective_max_result_chars(cfg, override, config)
         if override is not None:
-            # Per-tool budget override. Token override wins over char override
-            # if both are set. Resolution order for chars_per_token (when token
-            # budget is used): tool override → server → proxy default.
-            if override.max_result_tokens is not None:
-                token_budget = override.max_result_tokens
-                cpt = (
-                    override.chars_per_token
-                    if override.chars_per_token is not None
-                    else cfg.chars_per_token
-                    if cfg.chars_per_token is not None
-                    else config.chars_per_token
-                )
-                max_chars = tokens_to_chars(override.max_result_tokens, cpt)
-            elif override.max_result_chars is not None:
-                token_budget = None
-                max_chars = override.max_result_chars
             if override.token_estimation_mode is not None:
                 token_estimation_mode = override.token_estimation_mode
             if override.retention_floor is not None:

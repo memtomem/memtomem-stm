@@ -13806,9 +13806,13 @@ class TestTune:
 
     @staticmethod
     def _seed_metrics(metrics_db: Path, *, server: str = "srv", tool: str = "big_tool") -> None:
-        """Six calls, four ratio violations at 30000 chars → deterministic H1:
-        current server-level budget 8000 → recommended max(24000, 10000) = 24000.
-        Call count 6 stays below MEDIUM_CONFIDENCE_CALLS so H3 cannot fire."""
+        """Six calls, four ratio violations at 30000 chars → deterministic H1.
+
+        The server omits ``max_result_chars``, so its effective budget is the
+        global ``default_max_result_chars`` of 16000, not the server field's own
+        default of 8000 — which is what the tuner used to report (#926). H1
+        recommends max(24000, 16000 + 2000) = 24000. Call count 6 stays below
+        MEDIUM_CONFIDENCE_CALLS so H3 cannot fire."""
         from memtomem_stm.proxy.metrics import CallMetrics
         from memtomem_stm.proxy.metrics_store import MetricsStore
 
@@ -13846,7 +13850,7 @@ class TestTune:
         result = runner.invoke(cli, ["tune", *_cfg_args(config)])
         assert result.exit_code == 0, result.output
         assert "srv/big_tool" in result.output
-        assert "max_result_chars: 8000 -> 24000" in result.output
+        assert "max_result_chars: 16000 -> 24000" in result.output
         assert "violation rate" in result.output
         assert "confidence" in result.output
         assert "--apply" in result.output
@@ -13903,7 +13907,7 @@ class TestTune:
         assert change["server"] == "srv"
         assert change["tool"] == "big_tool"
         assert change["field"] == "max_result_chars"
-        assert change["current"] == "8000"
+        assert change["current"] == "16000"
         assert change["recommended"] == "24000"
         assert change["confidence"] == "low"
 
