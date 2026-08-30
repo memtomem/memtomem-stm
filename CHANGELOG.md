@@ -426,11 +426,15 @@ changes inline only. See the deprecation policy in
   is what a client reads when deciding whether and how to call a tool, and it
   described a retrieval-bearing response as a plain one. The two paths
   disagreed because each carried its own copy of the resolution rule; one
-  function now holds it, and the call path, the #610 privacy warning, and the
-  advertisement all read it.
+  function now holds it, and all three readers in the proxy manager — the call
+  path, the advertisement, and the #610 privacy warning — read it. Two copies
+  outside that module remain, one of them wrong in its own way; #926 tracks
+  folding them in.
 
   **Behavior change**, in two parts. Such upstreams gain the suffix for their
-  strategy, which under a tight `max_description_chars` costs upstream text —
+  strategy — for `hybrid` only under its default `tail_mode: "toc"`, since a
+  `truncate` tail is self-contained and carries none — which
+  under a tight `max_description_chars` costs upstream text —
   the suffix wins the budget, by the rule #893 established. And because the
   suffix predicts what a *call* will do, it is now resolved from the live
   config at each advertisement rebuild rather than the connect-time snapshot:

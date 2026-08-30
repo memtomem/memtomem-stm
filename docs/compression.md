@@ -154,8 +154,10 @@ truncation instead of raw-slicing the TOC mid-object.
 
 With `tail_mode: "toc"` the proxied tool description also carries a convention
 suffix (`| Head+TOC: use stm_proxy_select_chunks`), since the response can
-require retrieval just as the selective path does — regardless of how `hybrid`
-was selected, including through a global `default_compression`.
+require retrieval just as the selective path does — however `hybrid` was
+*configured*, including through a global `default_compression`. (`auto`
+resolving to hybrid at runtime is not configuration and carries no suffix; see
+[Advertised tool descriptions](reference/proxy-config.md#advertised-tool-descriptions).)
 `tail_mode: "truncate"` gets
 no suffix — that response is self-contained. As on the other paths the suffix is
 budgeted with the description and dropped whole under a cap too small to hold

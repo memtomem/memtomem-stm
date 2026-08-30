@@ -202,7 +202,8 @@ def _effective_compression(
     from "operator explicitly typed ``compression: auto``" (→ honour their
     explicit choice).
 
-    One function for every reader (#924): the call path and the advertisement
+    Shared by every reader in this module, through
+    ``_effective_compression_pair`` (#924): the call path and the advertisement
     path resolving this differently is what let a global-only configuration
     compress responses without advertising the convention suffix those
     responses require.
@@ -221,9 +222,13 @@ def _effective_compression_pair(
 
     Both fields resolve together because the convention suffix reads them
     together: ``hybrid`` decides whether the HYBRID strategy needs a retrieval
-    hint at all. One function for every reader (#924) — the advertisement
-    duplicating this precedence beside the call path is what let the two
-    disagree, and a partial copy is how they would disagree again.
+    hint at all. One function for all three readers in this module — the call
+    path, the advertisement and the #610 privacy warning (#924). The
+    advertisement duplicating this precedence beside the call path is what let
+    the two disagree, and a partial copy is how they would disagree again.
+    Readers outside this module still carry their own copies (``cli/proxy.py``
+    for the #610 CLI check, ``proxy/tuner.py``, whose copy omits the global
+    fallback and recommends a pin the operator already made) — #926.
 
     Callers must not pair a server config from one reload generation with a
     global from another: resolving a connect-time omission against a newer
