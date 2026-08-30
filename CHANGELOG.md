@@ -415,6 +415,41 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **The tuner measures a tool's strategy and budget the way a call resolves
+  them** (#926). Both of its config lookups stopped one level short of the
+  runtime resolution, and both turned that into advice an operator could act on
+  to no effect or to harm:
+
+  `_current_strategy` read per-tool override → per-server `compression` and
+  stopped, so a server omitting the key looked like `auto` even under a global
+  `default_compression`. H3 gates on exactly that value, so an operator who had
+  pinned `selective` globally was told to pin `selective`, reasoned as "AUTO
+  resolves to selective in >80% of calls" — a claim about their configuration
+  that was not true, since calls were never running `auto`.
+
+  `_current_max_chars` read the nominal `max_result_chars`, missing both the
+  model-aware global a server's default defers to and any token budget. Against
+  a global `default_max_result_chars: 16000` it saw 8000, so H1 could
+  "increase" the budget to 14400 — a cut — and H2 "reduce" one to more than it
+  was. Where a *per-tool* `max_result_tokens` is set it outranks the per-tool
+  `max_result_chars` that `mms tune --apply` writes, so every heuristic that
+  recommends that field — H1, H2 and H4's `missing_example` branch — now stays
+  quiet there rather than advise an edit with no effect. A server-level token
+  budget does not suppress them: the per-tool write clears it.
+
+  Root cause is the one #924 fixed for the advertisement: each reader carried
+  its own copy of the precedence, and the tuner's copies each omitted the last
+  step. `effective_compression`, `effective_compression_pair` and
+  `effective_max_result_chars` now live in `proxy/config.py`, beside the models
+  they read, and the proxy manager, the tuner, and the `mms doctor` / `mms
+  config` Ollama-dependency check resolve through them — the CLI's copy was
+  correct but was the third one. Moving them out of the manager is what lets
+  the tuner share them without importing it.
+
+  H3 has a second, unrelated defect that this does not address: it never
+  compares against `STRATEGY_PIN_THRESHOLD` at all, because the metrics query
+  drops the dominant strategy's count. #928.
+
 - **A global-only `default_compression` now advertises its convention suffix**
   (#924, PR #925). Calls resolve compression through the global default when a
   server omits the `compression` key (#292), but the advertisement read the
@@ -427,9 +462,10 @@ changes inline only. See the deprecation policy in
   described a retrieval-bearing response as a plain one. The two paths
   disagreed because each carried its own copy of the resolution rule; one
   function now holds it, and all three readers in the proxy manager — the call
-  path, the advertisement, and the #610 privacy warning — read it. Two copies
-  outside that module remain, one of them wrong in its own way; #926 tracks
-  folding them in.
+  path, the advertisement, and the #610 privacy warning — resolve through it.
+  Two copies outside that module remained at the time, one of them wrong in its
+  own way; #926 above folds them in and moves the function to
+  `proxy/config.py`.
 
   **Behavior change**, in two parts. For the three strategies that carry a
   suffix at all — `selective`, `progressive`, and `hybrid` under its default

@@ -17,6 +17,8 @@ from typing import Annotated, Any, Literal, Self, Union, get_args, get_origin
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 from pydantic.fields import FieldInfo
+
+from memtomem_stm.proxy.token_estimate import tokens_to_chars
 from pydantic_core import ErrorDetails
 from pydantic_settings import (
     BaseSettings,
@@ -2432,6 +2434,103 @@ class ProxyConfig(BaseModel):
             return ConfigLoadResult(
                 config=None, error=_sanitized_load_error(exc), unknown_keys=unknown_keys
             )
+
+
+def effective_compression(cfg: UpstreamServerConfig, proxy_cfg: ProxyConfig) -> CompressionStrategy:
+    """Resolve an upstream's compression strategy against the global default.
+
+    #292: ``ProxyConfig.default_compression`` was previously unread, so an
+    operator setting it in ``stm_proxy.json`` saw no effect on any upstream —
+    every server fell back to its own default of AUTO. ``model_fields_set``
+    distinguishes "operator omitted compression" (→ honour the global default)
+    from "operator explicitly typed ``compression: auto``" (→ honour their
+    explicit choice).
+
+    Lives here, beside the models it reads, so every reader shares it (#926):
+    the proxy manager, the tuner and the CLI each held their own copy, and
+    #924 was two of those copies disagreeing.
+    """
+    if "compression" in cfg.model_fields_set:
+        return cfg.compression
+    return proxy_cfg.default_compression
+
+
+def effective_compression_pair(
+    cfg: UpstreamServerConfig,
+    override: ToolOverrideConfig | None,
+    proxy_cfg: ProxyConfig,
+) -> tuple[CompressionStrategy, HybridConfig | None]:
+    """Full per-tool precedence: tool override → per-server → global default.
+
+    Both fields resolve together because the convention suffix reads them
+    together: ``hybrid`` decides whether the HYBRID strategy needs a retrieval
+    hint at all. Every reader that needs a tool's effective strategy calls this
+    (#926) — a partial copy is how the advertisement and the call path drifted
+    apart in #924, and how the tuner came to recommend pinning a strategy the
+    global default had already selected.
+
+    Callers must not pair a server config from one reload generation with a
+    global from another: resolving a connect-time omission against a newer
+    global can name a follow-up tool the call will not use. Deliberately
+    passing a retired connect-time config for a server the file no longer
+    defines is fine, as long as every reader resolves that same object against
+    the same global.
+    """
+    compression = effective_compression(cfg, proxy_cfg)
+    hybrid = cfg.hybrid
+    if override is not None:
+        if override.compression is not None:
+            compression = override.compression
+        if override.hybrid is not None:
+            hybrid = override.hybrid
+    return compression, hybrid
+
+
+def effective_max_result_chars(
+    cfg: UpstreamServerConfig,
+    override: ToolOverrideConfig | None,
+    proxy_cfg: ProxyConfig,
+) -> tuple[int, int | None]:
+    """The char budget a call runs under, and the token budget behind it.
+
+    Mirrors the strategy precedence above, for the other field a reader is
+    likely to want: a token budget takes precedence over a char budget at the
+    same level, and a server that leaves ``max_result_chars`` at its default
+    defers to the model-aware global (``effective_max_result_chars()``) rather
+    than to that literal default. The second element is the token budget when
+    one is in force, so a caller can tell "1000 chars because 400 tokens" from
+    "1000 chars" — the two differ for a caller reasoning about what an edit to
+    a char field would do, and at which level it would have to be written.
+
+    Shared for the same reason as the strategy pair (#926): the tuner reading
+    the nominal ``max_result_chars`` saw 8000 where a call ran under a global
+    16000, and recommended an "increase" that was a cut.
+    """
+    default_server_max = UpstreamServerConfig.model_fields["max_result_chars"].default
+    token_budget = cfg.max_result_tokens
+    if token_budget is not None:
+        cpt = cfg.chars_per_token if cfg.chars_per_token is not None else proxy_cfg.chars_per_token
+        max_chars = tokens_to_chars(token_budget, cpt)
+    elif cfg.max_result_chars == default_server_max:
+        max_chars = proxy_cfg.effective_max_result_chars()
+    else:
+        max_chars = cfg.max_result_chars
+
+    if override is not None:
+        if override.max_result_tokens is not None:
+            token_budget = override.max_result_tokens
+            cpt = (
+                override.chars_per_token
+                if override.chars_per_token is not None
+                else cfg.chars_per_token
+                if cfg.chars_per_token is not None
+                else proxy_cfg.chars_per_token
+            )
+            max_chars = tokens_to_chars(override.max_result_tokens, cpt)
+        elif override.max_result_chars is not None:
+            token_budget = None
+            max_chars = override.max_result_chars
+    return max_chars, token_budget
 
 
 def _resolve_config_path_for_completion(
