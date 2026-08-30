@@ -70,7 +70,7 @@ Responses that already fit the budget still pass through unchanged.
 
 The `ttl_seconds_remaining` field tells the agent how many seconds it has to retrieve sections before the stored content expires. Each call to `stm_proxy_select_chunks` resets the TTL.
 
-The proxied tool description automatically includes a convention suffix (`| TOC response: use stm_proxy_select_chunks`) so the agent knows to expect a TOC and which tool to call.
+When `compression` is set on the server or the tool, the proxied tool description includes a convention suffix (`| TOC response: use stm_proxy_select_chunks`) so the agent knows to expect a TOC and which tool to call — a global-only `default_compression` does not currently reach the advertisement (#924). The suffix is part of the advertised description and is budgeted with it: under a `max_description_chars` too small to hold it — below 54 for this suffix — it is dropped whole rather than cut. See [Advertised tool descriptions](reference/proxy-config.md#advertised-tool-descriptions).
 
 The TOC is budget-aware on the standalone SELECTIVE path. When the full
 80-character previews would exceed `max_chars`, STM shrinks only the per-entry
@@ -152,6 +152,15 @@ tries to fit the TOC tail structurally so any surviving JSON envelope remains
 parseable. If no valid fitted TOC can be produced, it falls back to whole-response
 truncation instead of raw-slicing the TOC mid-object.
 
+With `tail_mode: "toc"` the proxied tool description also carries a convention
+suffix (`| Head+TOC: use stm_proxy_select_chunks`), since the response can
+require retrieval just as the selective path does — again only when
+`compression` is set on the server or the tool (#924). `tail_mode: "truncate"` gets
+no suffix — that response is self-contained. As on the other paths the suffix is
+budgeted with the description and dropped whole under a cap too small to hold
+it; see [Advertised tool
+descriptions](reference/proxy-config.md#advertised-tool-descriptions).
+
 ## Progressive Delivery (cursor-based)
 
 Inspired by how Claude Code reads files progressively (150 lines at a time), progressive delivery stores the full cleaned content and delivers it in chunks on demand — **zero information loss**.
@@ -210,7 +219,7 @@ Each call to `stm_proxy_read_more` resets the TTL. The `ttl` field is omitted on
 
 The `progressive` block is **optional**: setting `"compression": "progressive"` without it applies the defaults shown above (`chunk_size` 4000, `max_stored` 200, `ttl_seconds` 1800, `include_structure_hint` true).
 
-Progressive is **opt-in only** — `auto` strategy never selects it because it changes the agent interaction pattern (requires calling `stm_proxy_read_more`). When configured, the proxied tool description includes a convention suffix (`| Chunked: use stm_proxy_read_more for more`) so the agent knows to expect chunked delivery.
+Progressive is **opt-in only** — `auto` strategy never selects it because it changes the agent interaction pattern (requires calling `stm_proxy_read_more`). When set on the server or the tool, the proxied tool description includes a convention suffix (`| Chunked: use stm_proxy_read_more for more`) so the agent knows to expect chunked delivery; a global-only `default_compression` does not currently reach the advertisement (#924). Like the selective suffix, it is budgeted with the description and dropped whole under a cap too small to hold it — see [Advertised tool descriptions](reference/proxy-config.md#advertised-tool-descriptions).
 
 > **Note**: Memory surfacing (Stage 3) on progressive delivery is **mode-aware**. It runs on the first chunk when `injection_mode` is `append` or `section` — both modes preserve the `PROGRESSIVE_FOOTER_TOKEN` concat invariant that `stm_proxy_read_more` relies on. It is **skipped only for `prepend`**, which would shift character offsets for subsequent `stm_proxy_read_more` calls.
 

@@ -497,7 +497,7 @@ class TestConventionSuffix:
 
         With no suffix that leaves the bare prefix once registration adds it —
         not a cap violation, but the shape the floor does NOT prevent, pinned
-        so the claim stays honest (polish tracked in #896). Where a suffix
+        so the claim stays honest (polish tracked in #922). Where a suffix
         fits, that is what the client sees instead of a bare prefix.
         """
         bare = _make_manager_with_tools([_fake_tool("t", description="")])
