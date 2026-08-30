@@ -259,6 +259,45 @@ changes inline only. See the deprecation policy in
 
 ### Changed
 
+- **Documented how an advertised tool description is assembled** (#896, PR
+  #923). No STM-native surface renders the assembled description —
+  `stm_proxy_stats` and `stm_proxy_health` report counts, and the `mms` commands
+  report configuration and health but never the description text. Listing tools
+  from the client shows the exact result; understanding how it was built was
+  left to the docs, and on this subject they were wrong. The proxy-config
+  reference
+  stated flatly that "per-server and per-tool values override global proxy
+  settings". `max_description_chars` composes as `min(server, global)` instead,
+  so raising only the global value does nothing whenever a per-server value is
+  the stricter one — and nothing reports that. (`strip_schema_descriptions`
+  composes too, as `server or global`; both are now named.) The same paragraph
+  described `description_override` as replacing the advertised description, when
+  the override supplies the *source text* and is truncated and suffixed like any
+  upstream text. Across all of `docs/`, the `[proxied] ` prefix every proxied
+  tool carries was named in exactly one table cell — the environment-variable
+  row #921 had just rewritten — and explained nowhere.
+  `docs/compression.md` documented the
+  selective and progressive convention suffixes while omitting the `hybrid` +
+  `tail_mode: "toc"` one entirely.
+
+  A new **Advertised tool descriptions** section in the proxy-config reference
+  now owns this explanation — the three parts that compose the string, the exact
+  cap and its `32` floor, the `min` composition, the suffix-wins-then-dropped
+  rule, what an empty source text produces (a shape #922 proposes improving),
+  and the fact that the cap is applied at registration rather than on hot
+  reload. The compression guide and the configuration hot-reload table keep only
+  what a reader needs where they stand and link to that section for the rest;
+  the table also stops promising that every `tool_overrides` field reaches a
+  client on the next call, which holds for how a response is compressed but not
+  for the fields that shape the advertisement. Review of this
+  documentation turned up a real mismatch, filed as #924 and documented here
+  rather than papered over: a global-only `default_compression` drives calls but
+  not the advertisement, so such an upstream advertises no convention suffix.
+  Also corrects `tool_relevance`'s claim that the
+  ranked document is "what the client actually saw": it omits the prefix and
+  caps serialized schemas at 2000 characters, and since BM25 normalizes by
+  document length, neither divergence can be waved off as a constant.
+
 - **One config snapshot per proxied request** (#889, closes #871).
   `ProxyManager._config` is a property over the hot-reload loader, so each
   textual read cost a `stat()` and two reads within one call could land on

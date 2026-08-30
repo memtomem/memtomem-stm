@@ -14,9 +14,20 @@ score for the same inputs forever). The embedding scorer is deliberately not
 offered here: its scores drift across providers/model versions and its
 availability varies, which would make #468 replay comparisons meaningless.
 
-The scored document per candidate is what the client actually saw: the
+The scored document per candidate is built from the advertised snapshot: the
 prefixed tool name (BM25 heading position, 3x weight) plus the advertised —
-post-truncation, post-distill — description and stable-serialized schema.
+post-truncation, post-distill — description and stable-serialized schema. Close
+to what the client saw, but not identical, in two ways worth knowing when
+reading a replay. The description here is :attr:`ProxyToolInfo.description`,
+which registration still prefixes with ``[proxied] ``
+(:data:`~memtomem_stm.proxy.tool_metadata.PROXIED_PREFIX`), so that text is in
+no document. The schema is capped at :data:`_MAX_SCHEMA_CHARS`, so a tool whose
+serialized schema exceeds the cap is scored on less text than the client was
+shown while a smaller sibling is scored on all of it. Neither divergence is
+safely dismissed as a constant: BM25 normalizes by document length against the
+corpus average, so text present in every document still shifts scores between
+documents of unequal length. Treat a replay as ranking this document, not the
+client's.
 
 ``risk_penalty`` demotes a tool without removing it: ``final_score =
 relevance_score * (1 - risk_penalty)`` and the ordering follows
