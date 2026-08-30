@@ -431,11 +431,12 @@ changes inline only. See the deprecation policy in
   outside that module remain, one of them wrong in its own way; #926 tracks
   folding them in.
 
-  **Behavior change**, in two parts. Such upstreams gain the suffix for their
-  strategy — for `hybrid` only under its default `tail_mode: "toc"`, since a
-  `truncate` tail is self-contained and carries none — which
-  under a tight `max_description_chars` costs upstream text —
-  the suffix wins the budget, by the rule #893 established. And because the
+  **Behavior change**, in two parts. For the three strategies that carry a
+  suffix at all — `selective`, `progressive`, and `hybrid` under its default
+  `tail_mode: "toc"`, a `truncate` tail being self-contained — such upstreams
+  gain it whenever it fits the effective description budget, costing upstream
+  text since the suffix wins that budget; where it cannot fit, #893's
+  whole-suffix drop still applies and nothing is advertised. And because the
   suffix predicts what a *call* will do, it is now resolved from the live
   config at each advertisement rebuild rather than the connect-time snapshot:
   an edit to `compression`, `hybrid`, or a per-tool override of either reaches
