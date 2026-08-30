@@ -175,25 +175,34 @@ def _make_manager_with_tools(
     strip_schema_descriptions: bool = False,
     server_max_desc: int = 200,
     server_strip: bool = False,
-    compression: CompressionStrategy = CompressionStrategy.AUTO,
+    compression: CompressionStrategy | None = CompressionStrategy.AUTO,
     hybrid: HybridConfig | None = None,
     advertise_context_query: bool = False,
+    default_compression: CompressionStrategy | None = None,
 ) -> ProxyManager:
-    server_cfg = UpstreamServerConfig(
-        prefix="test",
-        tool_overrides=tool_overrides or {},
-        max_description_chars=server_max_desc,
-        strip_schema_descriptions=server_strip,
-        compression=compression,
-        hybrid=hybrid,
-    )
-    proxy_cfg = ProxyConfig(
-        config_path=Path("/tmp/proxy.json"),
-        upstream_servers={"srv": server_cfg},
-        max_description_chars=max_description_chars,
-        strip_schema_descriptions=strip_schema_descriptions,
-        advertise_context_query=advertise_context_query,
-    )
+    # ``compression=None`` leaves the per-server key OUT of ``model_fields_set``
+    # — the configuration that hands resolution to the global default (#924) —
+    # as distinct from an operator explicitly typing ``compression: auto``.
+    server_kwargs: dict = {
+        "prefix": "test",
+        "tool_overrides": tool_overrides or {},
+        "max_description_chars": server_max_desc,
+        "strip_schema_descriptions": server_strip,
+        "hybrid": hybrid,
+    }
+    if compression is not None:
+        server_kwargs["compression"] = compression
+    server_cfg = UpstreamServerConfig(**server_kwargs)
+    proxy_kwargs: dict = {
+        "config_path": Path("/tmp/proxy.json"),
+        "upstream_servers": {"srv": server_cfg},
+        "max_description_chars": max_description_chars,
+        "strip_schema_descriptions": strip_schema_descriptions,
+        "advertise_context_query": advertise_context_query,
+    }
+    if default_compression is not None:
+        proxy_kwargs["default_compression"] = default_compression
+    proxy_cfg = ProxyConfig(**proxy_kwargs)
     mgr = ProxyManager(proxy_cfg, TokenTracker())
     conn = UpstreamConnection(
         name="srv",
@@ -413,6 +422,76 @@ class TestConventionSuffix:
             " | TOC response: use stm_proxy_select_chunks"
         )
 
+
+class TestGlobalDefaultCompressionSuffix:
+    """An upstream configured only by ``default_compression`` advertises the
+    same suffix it would with the per-server key set (#924).
+
+    The call path resolves compression through the global default whenever the
+    operator omitted the per-server key; advertisement read ``cfg.compression``
+    directly, so these configurations compressed responses while advertising
+    nothing about how to retrieve the rest.
+    """
+
+    @pytest.mark.parametrize(
+        "strategy,expected_suffix",
+        [
+            (CompressionStrategy.SELECTIVE, " | TOC response: use stm_proxy_select_chunks"),
+            (CompressionStrategy.PROGRESSIVE, " | Chunked: use stm_proxy_read_more for more"),
+            (CompressionStrategy.HYBRID, " | Head+TOC: use stm_proxy_select_chunks"),
+        ],
+    )
+    def test_global_default_advertises_the_same_suffix(self, strategy, expected_suffix):
+        """Global-only configuration pairs with the per-server form exactly."""
+        tools = [_fake_tool("t", description="Reads a file.")]
+        global_only = _make_manager_with_tools(
+            tools, compression=None, default_compression=strategy
+        )
+        per_server = _make_manager_with_tools(tools, compression=strategy)
+        advertised = global_only.get_proxy_tools()[0].description
+        assert advertised.endswith(expected_suffix)
+        assert advertised == per_server.get_proxy_tools()[0].description
+
+    def test_explicit_server_auto_beats_the_global_default(self):
+        """``compression: auto`` typed by the operator is a choice, not an omission.
+
+        The call path honours it over the global default, so advertisement must
+        emit no suffix — matching the response the client will actually get.
+        """
+        tools = [_fake_tool("t", description="Reads a file.")]
+        mgr = _make_manager_with_tools(
+            tools,
+            compression=CompressionStrategy.AUTO,
+            default_compression=CompressionStrategy.PROGRESSIVE,
+        )
+        assert mgr.get_proxy_tools()[0].description == "Reads a file."
+
+    def test_per_tool_override_beats_the_global_default(self):
+        tools = [_fake_tool("normal"), _fake_tool("special")]
+        mgr = _make_manager_with_tools(
+            tools,
+            compression=None,
+            default_compression=CompressionStrategy.PROGRESSIVE,
+            tool_overrides={
+                "special": ToolOverrideConfig(compression=CompressionStrategy.SELECTIVE),
+            },
+        )
+        proxy_tools = {t.original_name: t for t in mgr.get_proxy_tools()}
+        assert proxy_tools["normal"].description.endswith(
+            " | Chunked: use stm_proxy_read_more for more"
+        )
+        assert proxy_tools["special"].description.endswith(
+            " | TOC response: use stm_proxy_select_chunks"
+        )
+
+    def test_omitted_everywhere_stays_auto(self):
+        """Both keys omitted → AUTO on both paths → no suffix, as before."""
+        tools = [_fake_tool("t", description="Reads a file.")]
+        mgr = _make_manager_with_tools(tools, compression=None)
+        assert mgr.get_proxy_tools()[0].description == "Reads a file."
+
+
+class TestSuffixBudget:
     def test_suffix_within_budget(self):
         """description + suffix stays within max_description_chars."""
         long_desc = "A" * 300

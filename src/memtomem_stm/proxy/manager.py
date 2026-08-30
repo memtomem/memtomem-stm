@@ -189,6 +189,28 @@ def _describe_llm_destination(llm: LLMCompressorConfig) -> str:
     return llm.provider.value
 
 
+def _effective_compression(
+    cfg: UpstreamServerConfig, proxy_cfg: ProxyConfig
+) -> CompressionStrategy:
+    """Resolve an upstream's compression strategy against the global default.
+
+    #292: ``ProxyConfig.default_compression`` was previously unread, so an
+    operator setting it in ``stm_proxy.json`` saw no effect on any upstream —
+    every server fell back to its own default of AUTO. ``model_fields_set``
+    distinguishes "operator omitted compression" (→ honour the global default)
+    from "operator explicitly typed ``compression: auto``" (→ honour their
+    explicit choice).
+
+    One function for every reader (#924): the call path and the advertisement
+    path resolving this differently is what let a global-only configuration
+    compress responses without advertising the convention suffix those
+    responses require.
+    """
+    if "compression" in cfg.model_fields_set:
+        return cfg.compression
+    return proxy_cfg.default_compression
+
+
 def _llm_compression_leaks(
     compression: CompressionStrategy, llm: LLMCompressorConfig | None
 ) -> bool:
@@ -873,11 +895,8 @@ class ProxyManager:
         # there — its warning is gated on the same condition to stay accurate.
         comp_leak_paths: list[str] = []
         comp_dests: set[str] = set()
-        default_comp = self._config.default_compression
         for srv_name, srv_cfg in servers.items():
-            srv_comp = (
-                srv_cfg.compression if "compression" in srv_cfg.model_fields_set else default_comp
-            )
+            srv_comp = _effective_compression(srv_cfg, self._config)
             srv_llm = srv_cfg.llm
             srv_leaks = _llm_compression_leaks(srv_comp, srv_llm)
             if srv_leaks and srv_llm is not None:
@@ -2734,8 +2753,16 @@ class ProxyManager:
             for t in conn.tools:
                 override = cfg.tool_overrides.get(t.name)
 
-                # Resolve effective compression + hybrid config for convention suffix
-                effective_compression = cfg.compression
+                # Resolve effective compression + hybrid config for convention
+                # suffix. The global ``default_compression`` participates here
+                # exactly as it does on the call path (#924) — reading only
+                # ``cfg.compression`` advertised no suffix to an operator who
+                # configured compression globally, leaving the agent with a
+                # response it was never told how to retrieve the rest of. The
+                # global field comes off the one live read ``cfg_snap``, like
+                # ``global_max_desc`` / ``global_strip`` above; per-server
+                # fields stay on the connect-time snapshot.
+                effective_compression = _effective_compression(cfg, cfg_snap)
                 effective_hybrid = cfg.hybrid
                 if override is not None:
                     if override.compression is not None:
@@ -3204,17 +3231,10 @@ class ProxyManager:
         # without a reconnect (the behavior docs/configuration.md promises).
         cfg = self._server_cfg(conn, config)
 
-        # #292: ``ProxyConfig.default_compression`` was previously unread, so
-        # an operator setting it in ``stm_proxy.json`` saw no effect on any
-        # upstream — every server fell back to its own default of AUTO. Use
-        # ``model_fields_set`` to distinguish "operator omitted compression"
-        # (→ honour the global default) from "operator explicitly typed
-        # compression: auto" (→ honour their explicit choice). The pattern
-        # mirrors the auto_index / extraction overrides above and below.
-        if "compression" in cfg.model_fields_set:
-            compression = cfg.compression
-        else:
-            compression = config.default_compression
+        # #292: the global default applies when the operator omitted the
+        # per-server key. The pattern mirrors the auto_index / extraction
+        # overrides above and below.
+        compression = _effective_compression(cfg, config)
         # Token-equivalent budget takes precedence over char budget when set.
         # Resolution order for chars_per_token: tool override → server → proxy default.
         # Resolution order for max_result_tokens: tool override → server.

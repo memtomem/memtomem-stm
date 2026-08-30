@@ -86,15 +86,17 @@ Three parts compose it, in this order:
   text whose only boundary comes early is cut rather than shortened drastically.
 - **The convention suffix** is appended only by strategies that change how the
   agent must interact with the response — see
-  [Compression Strategies](../compression.md). It follows the compression
-  resolved from the per-server `compression` field and any per-tool override.
-  Two cases therefore advertise no suffix even though the response may need
-  one, both tracked in #924. A global `default_compression` alone does not
-  reach the advertisement — calls fall back to that global value but assembly
-  does not — so set `compression` on the server to get the suffix today. And
-  `auto` picks a strategy per response, so it is advertised without a suffix
-  even though it can select `hybrid`, whose default `tail_mode: "toc"` returns
-  a TOC the agent has to retrieve from.
+  [Compression Strategies](../compression.md). It follows the same compression
+  the call path resolves: the per-tool override if set, otherwise the
+  per-server `compression` field, otherwise the global `default_compression`.
+  Omitting `compression` on a server hands the decision to that global value
+  for advertisement and for calls alike; typing `compression: auto`
+  explicitly is a choice, and keeps the global default out of both.
+  One case still advertises no suffix even though the response may need one:
+  `auto` picks a strategy per response, so no static description can be
+  accurate for every call — it can select `hybrid`, whose default
+  `tail_mode: "toc"` returns a TOC the agent has to retrieve from. Under
+  `auto` the response envelope, not the description, carries that instruction.
 
 `max_description_chars` is an exact cap on that whole assembled string, prefix
 included. It is set globally and per server, and the effective budget is
