@@ -290,9 +290,10 @@ changes inline only. See the deprecation policy in
   the table also stops promising that every `tool_overrides` field reaches a
   client on the next call, which holds for how a response is compressed but not
   for the fields that shape the advertisement. Review of this
-  documentation turned up a real mismatch, filed as #924 and documented here
-  rather than papered over: a global-only `default_compression` drives calls but
-  not the advertisement, so such an upstream advertises no convention suffix.
+  documentation turned up a real mismatch, filed as #924 and documented rather
+  than papered over: a global-only `default_compression` drove calls but not the
+  advertisement, so such an upstream advertised no convention suffix. That is
+  fixed below in the same release, and the section describes the fixed behavior.
   Also corrects `tool_relevance`'s claim that the
   ranked document is "what the client actually saw": it omits the prefix and
   caps serialized schemas at 2000 characters, and since BM25 normalizes by
@@ -413,6 +414,27 @@ changes inline only. See the deprecation policy in
   external.
 
 ### Fixed
+
+- **A global-only `default_compression` now advertises its convention suffix**
+  (#924, PR #925). Calls resolve compression through the global default when a
+  server omits the `compression` key (#292), but the advertisement read the
+  per-server field alone — which is `auto` for exactly that configuration, and
+  `auto` emits no suffix. An operator who configured compression globally got
+  `selective`, `progressive` or `hybrid` responses described as if they were
+  ordinary text, so the agent saw a TOC or a chunk with nothing naming the
+  follow-up tool that retrieves the rest. The two paths disagreed because each
+  carried its own copy of the rule; one function now holds it and the call path,
+  the #610 privacy warning, and the advertisement all read it.
+
+  **Behavior change**: such upstreams gain the suffix for their strategy, which
+  under a tight `max_description_chars` costs upstream text — the suffix wins
+  the budget, by the rule #893 established. Servers that set `compression`
+  themselves, and deployments leaving the global at `auto`, are unaffected.
+
+  `auto` still advertises no suffix. It picks a strategy per response and can
+  select `hybrid`, whose default `tail_mode: "toc"` needs retrieval, so no
+  static description is accurate for every call; that instruction rides the
+  response instead.
 
 - **`max_description_chars` is now an exact cap on the client-visible
   description** (#893, PR #921). It read as a cap but did not bound the string

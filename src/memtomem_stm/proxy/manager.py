@@ -895,8 +895,14 @@ class ProxyManager:
         # there — its warning is gated on the same condition to stay accurate.
         comp_leak_paths: list[str] = []
         comp_dests: set[str] = set()
+        # ONE snapshot for the whole sweep. ``self._config`` is a property over
+        # the hot-reload loader, so reading it per server would let a reload
+        # land mid-loop and warn about some servers under the old global
+        # default and the rest under the new one — the same "never mix two
+        # reload generations" rule ``_server_cfg`` states.
+        cfg_snap = self._config
         for srv_name, srv_cfg in servers.items():
-            srv_comp = _effective_compression(srv_cfg, self._config)
+            srv_comp = _effective_compression(srv_cfg, cfg_snap)
             srv_llm = srv_cfg.llm
             srv_leaks = _llm_compression_leaks(srv_comp, srv_llm)
             if srv_leaks and srv_llm is not None:
