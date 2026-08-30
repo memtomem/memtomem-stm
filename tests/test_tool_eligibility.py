@@ -86,6 +86,9 @@ def _cand(
     schema: dict[str, Any] | None = None,
     server: str = "srv",
     task_support: str | None = None,
+    annotations: Any = None,
+    output_schema: Any = None,
+    meta: Any = None,
 ) -> ExposureCandidate:
     schema = schema if schema is not None else {"type": "object"}
     return ExposureCandidate(
@@ -95,6 +98,9 @@ def _cand(
             input_schema=schema,
             server=server,
             original_name=name,
+            annotations=annotations,
+            output_schema=output_schema,
+            meta=meta,
         ),
         raw_description=raw_desc if raw_desc is not None else desc,
         raw_schema=schema,
@@ -307,6 +313,226 @@ class TestSensitiveMetadata:
         assert _names(result) == ["test__a"]
         assert result.reject_reasons == {}
         assert result.risk_penalties == {}
+
+
+# ── signal rules: the advertised envelope (#894) ─────────────────────────
+
+
+class TestSensitiveEnvelopeMetadata:
+    """The rest of what a registered tool serves the client.
+
+    The composed name, ``output_schema`` and ``meta`` are forwarded
+    unchanged; ``annotations`` are forwarded with the server tag prepended
+    to a non-empty ``title``. All of it lands in the client's context on
+    every ``tools/list`` exactly as the description does, so a credential
+    anywhere in it must reject under ``strict``.
+    """
+
+    CRED = "ghp_" + "a" * 36
+
+    def test_credential_in_annotations_title_rejected_under_strict(self):
+        from mcp.types import ToolAnnotations
+
+        cand = _cand("a", _server_cfg(), annotations=ToolAnnotations(title=f"Deploy {self.CRED}"))
+        result = filter_tools([cand], STRICT)
+        assert result.eligible == []
+        assert result.reject_reasons == {"test__a": REASON_SENSITIVE_METADATA}
+
+    def test_credential_in_output_schema_rejected_under_strict(self):
+        schema = {
+            "type": "object",
+            "properties": {"token": {"type": "string", "default": self.CRED}},
+        }
+        result = filter_tools([_cand("a", _server_cfg(), output_schema=schema)], STRICT)
+        assert result.eligible == []
+        assert result.reject_reasons == {"test__a": REASON_SENSITIVE_METADATA}
+
+    def test_credential_in_meta_rejected_under_strict(self):
+        result = filter_tools(
+            [_cand("a", _server_cfg(), meta={"build": {"deploy_key": self.CRED}})], STRICT
+        )
+        assert result.eligible == []
+        assert result.reject_reasons == {"test__a": REASON_SENSITIVE_METADATA}
+
+    def test_credential_in_the_composed_name_rejected_under_strict(self):
+        # The upstream's raw name is embedded in the advertised name
+        # verbatim, and MCP's name charset admits the prefix-anchored token
+        # patterns — so the name is part of the scanned surface. The token
+        # is a short one on purpose: a 40-char `ghp_` name trips
+        # `name_overflow` first under this prefix, and a rule that only ever
+        # fires behind another rule proves nothing.
+        name = "sk-" + "a" * 20
+        result = filter_tools([_cand(name, _server_cfg())], STRICT)
+        assert result.eligible == []
+        assert result.reject_reasons == {f"test__{name}": REASON_SENSITIVE_METADATA}
+
+    def test_credential_in_the_server_name_rejected_under_strict(self):
+        # Registration prepends the server name to ``annotations.title``, so
+        # a credential-shaped server name reaches the client as
+        # `[<server>] <title>` even though every upstream field is clean.
+        from mcp.types import ToolAnnotations
+
+        cand = _cand(
+            "a",
+            _server_cfg(),
+            server=f"srv-{self.CRED}",
+            annotations=ToolAnnotations(title="Close browser"),
+        )
+        result = filter_tools([cand], STRICT)
+        assert result.eligible == []
+        assert result.reject_reasons == {"test__a": REASON_SENSITIVE_METADATA}
+
+    def test_unserializable_field_fails_closed(self):
+        # A field the gate cannot render is a field it cannot clear. The
+        # candidate is otherwise entirely clean, so nothing but the failure
+        # itself can produce this rejection.
+        class Hostile:
+            def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+                raise RuntimeError("boom")
+
+        result = filter_tools([_cand("a", _server_cfg(), annotations=Hostile())], STRICT)
+        assert result.eligible == []
+        assert result.reject_reasons == {"test__a": REASON_SENSITIVE_METADATA}
+
+    def test_a_benign_repr_cannot_clear_the_value_the_client_receives(self):
+        # `str(value)` was the earlier fallback, and a value hostile to
+        # serialization also chooses what its `__str__` reveals — so a benign
+        # repr cleared the very field the client then received in full.
+        class BenignRepr:
+            def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+                raise RuntimeError("boom")
+
+            def __str__(self) -> str:
+                return "ToolAnnotations(title='Close browser')"
+
+        result = filter_tools([_cand("a", _server_cfg(), annotations=BenignRepr())], STRICT)
+        assert result.eligible == []
+        assert result.reject_reasons == {"test__a": REASON_SENSITIVE_METADATA}
+
+    def test_a_nested_non_json_value_fails_the_field_closed(self):
+        # Anything embedded reaches the client through the SDK's own
+        # pydantic serialization, which this gate does not run — so its
+        # Python state is not evidence about what the client receives, and
+        # rendering it (`str(value)`, or a `default=` hook) only gave the
+        # value a way to narrate itself clean.
+        class Embedded:
+            def __str__(self) -> str:
+                return "ok"
+
+        result = filter_tools([_cand("a", _server_cfg(), meta={"x": Embedded()})], STRICT)
+        assert result.eligible == []
+        assert result.reject_reasons == {"test__a": REASON_SENSITIVE_METADATA}
+
+    def test_a_pydantic_serializer_is_never_rendered_from_state(self):
+        # A `field_serializer` can emit a credential no attribute holds, so
+        # reading `vars()` cleared a value whose wire form carries one. A
+        # pydantic object that is not a BaseModel is refused outright.
+        from pydantic import field_serializer
+        from pydantic.dataclasses import dataclass as pydantic_dataclass
+
+        @pydantic_dataclass
+        class Sneaky:
+            visible_state: str = "clean"
+
+            @field_serializer("visible_state")
+            def _emit(self, _value: str) -> str:
+                return TestSensitiveEnvelopeMetadata.CRED
+
+        result = filter_tools([_cand("a", _server_cfg(), annotations=Sneaky())], STRICT)
+        assert result.eligible == []
+        assert result.reject_reasons == {"test__a": REASON_SENSITIVE_METADATA}
+
+    def test_a_newline_inside_a_string_does_not_hide_the_match(self):
+        # `json.dumps` escapes a real newline to a literal `\n`, and the
+        # credential labels match on actual whitespace before their `:` — so
+        # scanning only the serialized form cleared a credential the client
+        # receives decoded. Every string leaf is scanned as well.
+        cand = _cand("a", _server_cfg(), meta={"note": "api_key\n: hunter2hunter2"})
+        result = filter_tools([cand], STRICT)
+        assert result.eligible == []
+        assert result.reject_reasons == {"test__a": REASON_SENSITIVE_METADATA}
+
+    def test_a_model_dump_override_cannot_hide_the_field_mcp_will_send(self):
+        # MCP serializes annotations through pydantic's own machinery, so a
+        # subclass override that returns a clean title decides only what the
+        # gate sees — never what the client gets. The scan dumps through the
+        # unbound base method for exactly that reason.
+        from mcp.types import ToolAnnotations
+
+        class Lying(ToolAnnotations):
+            def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+                return {"title": "Close browser"}
+
+        cand = _cand("a", _server_cfg(), annotations=Lying(title=f"Deploy {self.CRED}"))
+        result = filter_tools([cand], STRICT)
+        assert result.eligible == []
+        assert result.reject_reasons == {"test__a": REASON_SENSITIVE_METADATA}
+
+    def test_a_value_with_no_state_to_read_fails_closed(self):
+        # `__slots__` with nothing set leaves no `__dict__` to render, so the
+        # gate has nothing it can clear and withholds.
+        class Opaque:
+            __slots__ = ()
+
+        result = filter_tools([_cand("a", _server_cfg(), meta={"x": Opaque()})], STRICT)
+        assert result.eligible == []
+        assert result.reject_reasons == {"test__a": REASON_SENSITIVE_METADATA}
+
+    def test_a_raising_model_dump_property_does_not_abort_the_filter(self):
+        # The attribute lookup is inside the exception barrier: a raising
+        # `model_dump` *property* must reject this candidate, not propagate
+        # out and kill the whole filter pass.
+        class RaisingProperty:
+            @property
+            def model_dump(self) -> Any:
+                raise RuntimeError("boom")
+
+        result = filter_tools([_cand("a", _server_cfg(), annotations=RaisingProperty())], STRICT)
+        assert result.eligible == []
+        assert result.reject_reasons == {"test__a": REASON_SENSITIVE_METADATA}
+
+    def test_a_pattern_cannot_bridge_two_fields(self):
+        # The fields are scanned separately, not as one joined blob. The
+        # credential labels admit whitespace before their `:`, and a newline
+        # is whitespace, so a joined scan matched `api_key` + "\n" + ":" —
+        # a credential in neither field.
+        cand = _cand("a", _server_cfg(), raw_desc="api_key", desc=": documentation label")
+        result = filter_tools([cand], STRICT)
+        assert _names(result) == ["test__a"]
+        assert result.reject_reasons == {}
+
+    def test_a_credential_shaped_server_name_alone_is_not_a_match(self):
+        # The server name reaches the client only through the annotations
+        # title tag, so with no title there is nothing to tag and nothing to
+        # withhold. Scanning it unconditionally hid clean tools.
+        cand = _cand("a", _server_cfg(), server=f"srv-{self.CRED}")
+        result = filter_tools([cand], STRICT)
+        assert _names(result) == ["test__a"]
+        assert result.reject_reasons == {}
+
+    def test_benign_envelope_fields_stay_eligible(self):
+        # The serializer itself must not manufacture a match: ordinary
+        # annotations/output_schema/meta stay eligible.
+        from mcp.types import ToolAnnotations
+
+        cand = _cand(
+            "a",
+            _server_cfg(),
+            annotations=ToolAnnotations(title="Close browser", readOnlyHint=True),
+            output_schema={"type": "object", "properties": {"ok": {"type": "boolean"}}},
+            meta={"version": "1.2.3", "contact": "ops@example.com"},
+        )
+        result = filter_tools([cand], STRICT)
+        assert _names(result) == ["test__a"]
+        assert result.reject_reasons == {}
+        assert result.risk_penalties == {}
+
+    def test_review_demotes_an_envelope_match(self):
+        cand = _cand("a", _server_cfg(), meta={"deploy_key": self.CRED})
+        result = filter_tools([cand], REVIEW)
+        assert _names(result) == ["test__a"]
+        assert result.reject_reasons == {}
+        assert result.risk_penalties == {"test__a": REVIEW.review_risk_penalty}
 
 
 # ── signal rules: health ─────────────────────────────────────────────────

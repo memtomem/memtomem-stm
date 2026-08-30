@@ -49,12 +49,22 @@ then the remaining rules apply per tool in this order, first match wins:
     composed name. Ambiguous names are never auto-exposed, in any
     profile — the original #465 regression criterion, verbatim.
 ``sensitive_metadata``
-    The tool's metadata (original description, advertised description, raw
-    schema) matches a credential pattern (``privacy.CREDENTIAL_PATTERNS``
-    only — not PII, so an email in a contact-info description never trips
-    it). A credential-looking string in tool *metadata* means the upstream
-    is misconfigured at best and hostile at worst; advertising it would
-    paste the match into the client's context on every ``tools/list``.
+    The tool's metadata matches a credential pattern. Scanned: the composed
+    name, the advertised description and the raw one behind it, the raw
+    input schema behind the advertised one, the forwarded ``output_schema``
+    / ``meta``, and ``annotations`` in their tagged (client-visible) form.
+    The two raw artifacts are scanned even though the client may never see
+    them, because truncation and distillation only ever REMOVE text — a
+    credential at char 250 of a description truncated at 200 is still a
+    signal about the upstream. A field this gate cannot serialize counts as
+    a match, since a value it cannot read is one it cannot clear.
+    Credential patterns only (``privacy.CREDENTIAL_PATTERNS`` — not PII, so
+    an email in a contact-info description never trips it). A match usually
+    means the upstream is misconfigured at best and hostile at worst; in the
+    two fields the OPERATOR owns (the name prefix, and the server name
+    inside the annotations tag) it means the proxy's own config carries one.
+    Either way, advertising it would paste the match into the client's
+    context on every ``tools/list``.
     Signal rule: rejects under ``strict``, demotes under ``review``, off
     under ``explore``.
 ``unhealthy``
@@ -140,6 +150,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from pydantic import BaseModel
+
 from memtomem_stm.proxy import tool_name_budget
 from memtomem_stm.proxy.config import (
     ExposureConfig,
@@ -148,6 +160,7 @@ from memtomem_stm.proxy.config import (
 )
 from memtomem_stm.proxy.metrics import ErrorCategory
 from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS, contains_sensitive_content
+from memtomem_stm.proxy.tool_metadata import tag_annotations_title
 from memtomem_stm.proxy.toolgraph_provider import ToolgraphProtocolError
 from memtomem_stm.utils.numeric import finite_number
 
@@ -338,29 +351,170 @@ def compute_health_flags(
     return frozenset(flagged)
 
 
-def _metadata_scan_text(candidate: ExposureCandidate) -> str:
-    """Assemble the metadata text scanned for credential patterns.
+def _plain(value: Any) -> Any:
+    """One WHOLE metadata field reduced to JSON types, or an exception.
 
-    Covers the raw upstream description, the advertised description (which
-    may originate from an operator ``description_override`` rather than the
-    raw text), and the raw schema. Serialization is deterministic
-    (sorted keys) so the same candidate always scans the same text.
+    Only the outermost value of a field takes this path; anything nested
+    that is not already JSON-native is unrenderable by construction (see
+    :func:`_scan_texts`). The ladder, in order:
+
+    - JSON-native — returned as is;
+    - a pydantic model — dumped through ``BaseModel.model_dump`` *unbound*.
+      An instance or subclass override decides only what this gate sees,
+      while MCP serializes the real field, so the override is precisely the
+      narration the scan must not accept; the base method also brings in
+      computed fields, which reading attributes misses (codex R3);
+    - anything else carrying pydantic serialization machinery — REFUSED.
+      Its wire form is produced by a serializer this function does not run
+      (a ``field_serializer`` on a pydantic dataclass can emit a credential
+      that no attribute holds, codex R4), so its state is not evidence
+      about what the client receives;
+    - a duck-typed ``model_dump`` (the ``SimpleNamespace`` / ``MagicMock``
+      stand-ins on the degradation paths, which are not models) — its own
+      dump is all there is;
+    - a plain object — ``vars(obj)``, the state it holds, re-encoded by
+      these same rules and never its ``__str__`` / ``__repr__``, which the
+      object itself controls.
+
+    Anything else raises, and the caller turns that into a flag.
+    """
+    if value is None or isinstance(value, (str, int, float, bool, dict, list, tuple)):
+        return value
+    if isinstance(value, BaseModel):
+        return BaseModel.model_dump(value, mode="json", by_alias=True, exclude_none=True)
+    if hasattr(value, "__pydantic_serializer__"):
+        raise TypeError(f"unscannable pydantic value of type {type(value).__name__}")
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return model_dump(mode="json", by_alias=True, exclude_none=True)
+    data = getattr(value, "__dict__", None)
+    if isinstance(data, dict):
+        return data
+    raise TypeError(f"unrenderable metadata value of type {type(value).__name__}")
+
+
+def _string_leaves(value: Any, out: list[str]) -> None:
+    """Collect every DECODED string inside ``value`` (keys included).
+
+    The serialized form alone is not enough: ``json.dumps`` escapes a
+    newline inside a string to a literal ``\\n``, and the credential labels
+    match on real whitespace before their ``:``, so ``{"note": "api_key\\n:
+    hunter2"}`` scanned clean while the client received the decoded text
+    (codex R3). Leaves restore what the client actually reads; the
+    serialized form stays in the scan for the quoted-key patterns, which
+    only exist in JSON rendering.
+    """
+    if isinstance(value, str):
+        out.append(value)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str):
+                out.append(key)
+            _string_leaves(item, out)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _string_leaves(item, out)
+    # Nothing else can appear: :func:`_scan_texts` serializes with no
+    # ``default`` hook, so a nested non-JSON-native value has already failed
+    # the field closed before this walk runs.
+
+
+def _scan_texts(value: Any) -> list[str] | None:
+    """Every text one field contributes, or ``None`` if it is unrenderable.
+
+    Deterministic (sorted keys) so the same candidate always scans the same
+    way. Any failure returns ``None`` rather than an approximate rendering,
+    and the caller treats ``None`` as a match: a value this gate cannot read
+    is a value it cannot clear (codex R1). The whole body sits inside the
+    barrier, attribute lookup included — a raising ``model_dump`` *property*
+    would otherwise propagate out and abort the entire filter pass.
+
+    ``json.dumps`` runs with NO ``default`` hook, so the only value that may
+    be non-JSON-native is the field itself (:func:`_plain` handles that one).
+    A nested one fails the field closed instead of being rendered from its
+    attributes: for anything embedded, its wire form is produced by the
+    SDK's own pydantic serialization, which this function does not run, so
+    its Python state is not evidence about what the client receives
+    (codex R4). Genuine upstream metadata arrives as wire JSON and never
+    takes that path.
+    """
+    if value is None:
+        return []
+    try:
+        plain = _plain(value)
+        text = json.dumps(plain, sort_keys=True, separators=(",", ":"))
+        texts = [text]
+        _string_leaves(plain, texts)
+        return texts
+    except Exception:
+        return None
+
+
+def _flags_sensitive_metadata(candidate: ExposureCandidate) -> bool:
+    """Whether this candidate's metadata trips the credential scan.
+
+    Covers the whole surface one successful registration puts in front of
+    the client, not a sample of it (codex R1):
+
+    - the composed ``name`` — the upstream's raw name is embedded verbatim,
+      and MCP's name charset admits the prefix-anchored token patterns;
+    - the raw upstream description and the advertised one (which may
+      originate from an operator ``description_override``);
+    - the raw input schema — distillation only ever *removes* content;
+    - ``output_schema`` and ``meta`` (advertised as ``_meta``), forwarded
+      with no truncation or distillation at all;
+    - ``annotations`` as REGISTRATION WILL SEND THEM, i.e. through
+      :func:`tag_annotations_title`, the same function the registration
+      path calls. That tagging prepends ``info.server`` to a non-empty
+      ``title``, so the untagged value plus an unconditional server scan is
+      not equivalent: it rejects a clean, annotation-less tool whose server
+      name merely looks credential-shaped, since nothing would have carried
+      that name to the client (codex R2). Calling the shared function is
+      also the only form that cannot drift from what registration does.
+
+    ``title``, ``icons`` and ``execution`` are deliberately absent: the
+    proxy forwards none of them today (#892, #895). Add them here in the
+    same breath as any change that starts forwarding them.
+
+    Every text is scanned SEPARATELY. Scanning one joined blob let a
+    pattern bridge a field boundary: the credential labels admit whitespace
+    before their ``:``, and a newline is whitespace, so a description
+    ending in ``api_key`` matched a next field opening with ``:`` although
+    neither held a credential (codex R2). The three string fields above
+    contribute themselves; each structured field contributes two kinds of
+    text — its deterministic JSON serialization, which the quoted-key
+    patterns need, and every decoded string inside it, which the
+    whitespace-sensitive label patterns need (:func:`_string_leaves`). A
+    field that cannot be rendered at all flags the candidate rather than
+    dropping out of the scan — see :func:`_scan_texts`.
 
     Deliberately UNBOUNDED: this is a security gate, not a scoring
     document, and unlike payload telemetry there is no downstream backstop
     for advertisement — whatever passes here goes to the client's context
-    verbatim on every ``tools/list``. The scan runs once per advertisement
-    (not per call), and the advertisement path already serializes the same
-    schema unbounded, so one regex pass over the full text costs nothing
-    the upstream couldn't already inflict (codex R2).
+    verbatim on every ``tools/list``. The cost is a full pattern pass per
+    text, so a schema of many tiny strings pays per leaf rather than once
+    over one blob; that is bounded by what the upstream already made the
+    advertisement path serialize, it runs once per advertisement rather
+    than per call, and the alternative — capping the scan — is what would
+    let a credential through (codex R2, R4).
     """
+    info = candidate.info
+    texts = [candidate.raw_description, info.description, info.prefixed_name]
     try:
-        schema_text = json.dumps(
-            candidate.raw_schema or {}, sort_keys=True, separators=(",", ":"), default=str
-        )
-    except (TypeError, ValueError):  # pragma: no cover - dict from JSON can't cycle
-        schema_text = ""
-    return "\n".join((candidate.raw_description, candidate.info.description, schema_text))
+        tagged_annotations = tag_annotations_title(info.annotations, info.server)
+    except Exception:
+        return True
+    for value in (
+        candidate.raw_schema or {},
+        tagged_annotations,
+        info.output_schema,
+        info.meta,
+    ):
+        rendered = _scan_texts(value)
+        if rendered is None:
+            return True
+        texts.extend(rendered)
+    return any(contains_sensitive_content(text, CREDENTIAL_PATTERNS) for text in texts)
 
 
 @dataclass(frozen=True, slots=True)
@@ -764,7 +918,7 @@ def filter_tools(
             )
             # Precedence: upstream-compromise (credential in metadata) >
             # explicit graph policy verdict > heuristic error-rate health.
-            if contains_sensitive_content(_metadata_scan_text(candidate), CREDENTIAL_PATTERNS):
+            if _flags_sensitive_metadata(candidate):
                 flagged_reason = REASON_SENSITIVE_METADATA
             elif external_reason is not None:
                 flagged_reason = external_reason
