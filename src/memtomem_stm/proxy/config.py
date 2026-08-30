@@ -17,6 +17,8 @@ from typing import Annotated, Any, Literal, Self, Union, get_args, get_origin
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 from pydantic.fields import FieldInfo
+
+from memtomem_stm.proxy.token_estimate import tokens_to_chars
 from pydantic_core import ErrorDetails
 from pydantic_settings import (
     BaseSettings,
@@ -35,6 +37,22 @@ _PROXY_ENV_BARE = _PROXY_ENV_PREFIX[:-2]  # the block's own name, one JSON paylo
 
 
 _MISSING = object()
+
+
+#: Floor for ``max_description_chars`` at both the global and the per-server
+#: level. ``max_description_chars`` caps the client-visible description, out of
+#: which the ``[proxied] `` prefix (10) and a truncation ellipsis (3) are fixed
+#: costs; the floor leaves ~19 characters for upstream text (#893).
+#:
+#: 32 is a usability choice, not the arithmetic minimum. That minimum is 10:
+#: registration prepends the prefix unconditionally, so a cap below its length
+#: cannot be met at all, while every cap of 10 or more is met exactly. The
+#: floor is set where a surviving description can still say something, and it
+#: does NOT guarantee one — an upstream that supplies no description
+#: contributes no text at any cap, leaving only the prefix and, where it fits,
+#: the convention suffix (#896). Not imported from ``tool_metadata``, which
+#: imports this module.
+MIN_DESCRIPTION_CHARS = 32
 
 
 @dataclass(frozen=True)
@@ -1559,7 +1577,16 @@ class UpstreamServerConfig(BaseModel):
     """
     circuit_reset_seconds: float = Field(default=60.0, gt=0.0)
     """Seconds an open circuit breaker waits before allowing a probe call."""
-    max_description_chars: int = Field(default=200, gt=0)
+    max_description_chars: int = Field(default=200, ge=MIN_DESCRIPTION_CHARS)
+    """Cap on the CLIENT-VISIBLE description, ``[proxied] `` prefix included.
+
+    Composes with the global setting as ``min(server, global)``, not as an
+    override. Read from the connect-time snapshot like the other per-server
+    fields here, so an edit takes effect when this upstream next connects — a
+    restart or a reconnect — not on a config hot-reload, and not on a
+    ``tools/list_changed`` refresh, which replaces the catalogue but not the
+    config it is advertised under (#893).
+    """
     strip_schema_descriptions: bool = False
     origin: UpstreamOrigin | None = None
     """Import provenance (#475) — see :class:`UpstreamOrigin`. CLI-owned
@@ -1723,12 +1750,14 @@ class ExposureConfig(BaseModel):
     resurrected by ranking.
 
     Health signals are evaluated once at proxy startup from the persisted
-    metrics store (``proxy_metrics.db``), so the advertised set is stable
-    for the lifetime of the session — MCP clients are not guaranteed to
-    re-list tools, and a mid-session change would make telemetry lie about
-    what the client saw. A tool hidden for health is re-evaluated at the
-    next startup: once its failures age out of ``health_window_hours`` it
-    is advertised again (startup-grained half-open probing).
+    metrics store (``proxy_metrics.db``), so a tool does not slide in and out
+    of the advertisement as calls fail. A tool hidden for health is
+    re-evaluated at the next startup: once its failures age out of
+    ``health_window_hours`` it is advertised again (startup-grained half-open
+    probing). What the upstream declares is re-read when it changes: a
+    reconnect or a ``tools/list_changed`` re-runs the filter, reconciles what
+    is registered, and — when that actually changed the registry — asks the
+    clients it can reach to re-list (#917).
     """
 
     profile: ExposureProfile = ExposureProfile.STRICT
@@ -1763,9 +1792,13 @@ class ToolgraphConfig(BaseModel):
     over the MCP protocol via :class:`~memtomem_stm.proxy.toolgraph_provider.ToolgraphConsultAdapter`
     (stdio transport), mirroring the surfacing LTM-consult pattern.
 
-    Default-off: when ``enabled`` is ``True`` the consult runs once at
-    proxy startup so the advertised tool set stays session-stable, exactly
-    like the health-flag precompute. The verdict feeds
+    Default-off: when ``enabled`` is ``True`` the stdio consult runs once at
+    proxy startup, exactly like the health-flag precompute. If an upstream
+    later replaces its catalogue the advertisement is rebuilt (#917) but the
+    consult is not re-run, so a tool the graph never saw gets a
+    ``toolgraph_unconsulted`` reason instead of defaulting to allowed —
+    profile-gated like the rest of the family, so ``strict`` withholds it,
+    ``review`` demotes it and ``explore`` ignores it (#918). The verdict feeds
     ``tool_eligibility.filter_tools`` via per-candidate ``toolgraph_*`` reject
     codes (profile-gated, like the native signal rules) or a whole-call
     fail-closed withhold, and pins ``graph_generation`` into selection
@@ -2116,7 +2149,15 @@ class ProxyConfig(BaseModel):
     Default 0.65 ensures at least 65% of every response survives compression.
     Set to 0 to disable and use fixed budgets only.
     """
-    max_description_chars: int = Field(default=200, gt=0)
+    max_description_chars: int = Field(default=200, ge=MIN_DESCRIPTION_CHARS)
+    """Cap on the CLIENT-VISIBLE description, ``[proxied] `` prefix included.
+
+    The effective budget for an upstream is ``min(server, global)``, so raising
+    only this one does not widen a stricter per-server value. Read live, but
+    applied only where a tool is advertised, so a description already
+    registered keeps the length it was given until the next registration — a
+    restart, or an upstream catalogue change (#893).
+    """
     strip_schema_descriptions: bool = False
     advertise_context_query: bool = False
     """Advertise the proxy-only ``_context_query`` string in every upstream
@@ -2393,6 +2434,103 @@ class ProxyConfig(BaseModel):
             return ConfigLoadResult(
                 config=None, error=_sanitized_load_error(exc), unknown_keys=unknown_keys
             )
+
+
+def effective_compression(cfg: UpstreamServerConfig, proxy_cfg: ProxyConfig) -> CompressionStrategy:
+    """Resolve an upstream's compression strategy against the global default.
+
+    #292: ``ProxyConfig.default_compression`` was previously unread, so an
+    operator setting it in ``stm_proxy.json`` saw no effect on any upstream —
+    every server fell back to its own default of AUTO. ``model_fields_set``
+    distinguishes "operator omitted compression" (→ honour the global default)
+    from "operator explicitly typed ``compression: auto``" (→ honour their
+    explicit choice).
+
+    Lives here, beside the models it reads, so every reader shares it (#926):
+    the proxy manager, the tuner and the CLI each held their own copy, and
+    #924 was two of those copies disagreeing.
+    """
+    if "compression" in cfg.model_fields_set:
+        return cfg.compression
+    return proxy_cfg.default_compression
+
+
+def effective_compression_pair(
+    cfg: UpstreamServerConfig,
+    override: ToolOverrideConfig | None,
+    proxy_cfg: ProxyConfig,
+) -> tuple[CompressionStrategy, HybridConfig | None]:
+    """Full per-tool precedence: tool override → per-server → global default.
+
+    Both fields resolve together because the convention suffix reads them
+    together: ``hybrid`` decides whether the HYBRID strategy needs a retrieval
+    hint at all. Every reader that needs a tool's effective strategy calls this
+    (#926) — a partial copy is how the advertisement and the call path drifted
+    apart in #924, and how the tuner came to recommend pinning a strategy the
+    global default had already selected.
+
+    Callers must not pair a server config from one reload generation with a
+    global from another: resolving a connect-time omission against a newer
+    global can name a follow-up tool the call will not use. Deliberately
+    passing a retired connect-time config for a server the file no longer
+    defines is fine, as long as every reader resolves that same object against
+    the same global.
+    """
+    compression = effective_compression(cfg, proxy_cfg)
+    hybrid = cfg.hybrid
+    if override is not None:
+        if override.compression is not None:
+            compression = override.compression
+        if override.hybrid is not None:
+            hybrid = override.hybrid
+    return compression, hybrid
+
+
+def effective_max_result_chars(
+    cfg: UpstreamServerConfig,
+    override: ToolOverrideConfig | None,
+    proxy_cfg: ProxyConfig,
+) -> tuple[int, int | None]:
+    """The char budget a call runs under, and the token budget behind it.
+
+    Mirrors the strategy precedence above, for the other field a reader is
+    likely to want: a token budget takes precedence over a char budget at the
+    same level, and a server that leaves ``max_result_chars`` at its default
+    defers to the model-aware global (``effective_max_result_chars()``) rather
+    than to that literal default. The second element is the token budget when
+    one is in force, so a caller can tell "1000 chars because 400 tokens" from
+    "1000 chars" — the two differ for a caller reasoning about what an edit to
+    a char field would do, and at which level it would have to be written.
+
+    Shared for the same reason as the strategy pair (#926): the tuner reading
+    the nominal ``max_result_chars`` saw 8000 where a call ran under a global
+    16000, and recommended an "increase" that was a cut.
+    """
+    default_server_max = UpstreamServerConfig.model_fields["max_result_chars"].default
+    token_budget = cfg.max_result_tokens
+    if token_budget is not None:
+        cpt = cfg.chars_per_token if cfg.chars_per_token is not None else proxy_cfg.chars_per_token
+        max_chars = tokens_to_chars(token_budget, cpt)
+    elif cfg.max_result_chars == default_server_max:
+        max_chars = proxy_cfg.effective_max_result_chars()
+    else:
+        max_chars = cfg.max_result_chars
+
+    if override is not None:
+        if override.max_result_tokens is not None:
+            token_budget = override.max_result_tokens
+            cpt = (
+                override.chars_per_token
+                if override.chars_per_token is not None
+                else cfg.chars_per_token
+                if cfg.chars_per_token is not None
+                else proxy_cfg.chars_per_token
+            )
+            max_chars = tokens_to_chars(override.max_result_tokens, cpt)
+        elif override.max_result_chars is not None:
+            token_budget = None
+            max_chars = override.max_result_chars
+    return max_chars, token_budget
 
 
 def _resolve_config_path_for_completion(

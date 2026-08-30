@@ -7435,7 +7435,11 @@ def _collect_ollama_dependencies(config: Any) -> tuple[list[_OllamaDependency], 
     ignored. Extraction is also omitted: the bundled ``mms`` server has no
     index engine, so that stage cannot call its configured provider.
     """
-    from memtomem_stm.proxy.config import CompressionStrategy, LLMProvider
+    from memtomem_stm.proxy.config import (
+        CompressionStrategy,
+        LLMProvider,
+        effective_compression_pair,
+    )
 
     if not config.enabled or not config.upstream_servers:
         return [], []
@@ -7467,11 +7471,7 @@ def _collect_ollama_dependencies(config: Any) -> tuple[list[_OllamaDependency], 
             )
 
     for server_name, server in config.upstream_servers.items():
-        server_strategy = (
-            server.compression
-            if "compression" in server.model_fields_set
-            else config.default_compression
-        )
+        server_strategy, _ = effective_compression_pair(server, None, config)
         server_usage = f"server {server_name!r}"
         collect_llm_site(server_strategy, server.llm, server_usage)
 
@@ -7480,7 +7480,7 @@ def _collect_ollama_dependencies(config: Any) -> tuple[list[_OllamaDependency], 
             # already-collected server dependency and needs no duplicate site.
             if override.compression is None and override.llm is None:
                 continue
-            tool_strategy = override.compression or server_strategy
+            tool_strategy, _ = effective_compression_pair(server, override, config)
             tool_llm = override.llm or server.llm
             collect_llm_site(
                 tool_strategy,

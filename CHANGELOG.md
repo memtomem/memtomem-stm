@@ -259,6 +259,46 @@ changes inline only. See the deprecation policy in
 
 ### Changed
 
+- **Documented how an advertised tool description is assembled** (#896, PR
+  #923). No STM-native surface renders the assembled description —
+  `stm_proxy_stats` and `stm_proxy_health` report counts, and the `mms` commands
+  report configuration and health but never the description text. Listing tools
+  from the client shows the exact result; understanding how it was built was
+  left to the docs, and on this subject they were wrong. The proxy-config
+  reference
+  stated flatly that "per-server and per-tool values override global proxy
+  settings". `max_description_chars` composes as `min(server, global)` instead,
+  so raising only the global value does nothing whenever a per-server value is
+  the stricter one — and nothing reports that. (`strip_schema_descriptions`
+  composes too, as `server or global`; both are now named.) The same paragraph
+  described `description_override` as replacing the advertised description, when
+  the override supplies the *source text* and is truncated and suffixed like any
+  upstream text. Across all of `docs/`, the `[proxied] ` prefix every proxied
+  tool carries was named in exactly one table cell — the environment-variable
+  row #921 had just rewritten — and explained nowhere.
+  `docs/compression.md` documented the
+  selective and progressive convention suffixes while omitting the `hybrid` +
+  `tail_mode: "toc"` one entirely.
+
+  A new **Advertised tool descriptions** section in the proxy-config reference
+  now owns this explanation — the three parts that compose the string, the exact
+  cap and its `32` floor, the `min` composition, the suffix-wins-then-dropped
+  rule, what an empty source text produces (a shape #922 proposes improving),
+  and the fact that the cap is applied at registration rather than on hot
+  reload. The compression guide and the configuration hot-reload table keep only
+  what a reader needs where they stand and link to that section for the rest;
+  the table also stops promising that every `tool_overrides` field reaches a
+  client on the next call, which holds for how a response is compressed but not
+  for the fields that shape the advertisement. Review of this
+  documentation turned up a real mismatch, filed as #924 and documented rather
+  than papered over: a global-only `default_compression` drove calls but not the
+  advertisement, so such an upstream advertised no convention suffix. That is
+  fixed below in the same release, and the section describes the fixed behavior.
+  Also corrects `tool_relevance`'s claim that the
+  ranked document is "what the client actually saw": it omits the prefix and
+  caps serialized schemas at 2000 characters, and since BM25 normalizes by
+  document length, neither divergence can be waved off as a constant.
+
 - **One config snapshot per proxied request** (#889, closes #871).
   `ProxyManager._config` is a property over the hot-reload loader, so each
   textual read cost a `stat()` and two reads within one call could land on
@@ -374,6 +414,198 @@ changes inline only. See the deprecation policy in
   external.
 
 ### Fixed
+
+- **The tuner measures a tool's strategy and budget the way a call resolves
+  them** (#926). Both of its config lookups stopped one level short of the
+  runtime resolution, and both turned that into advice an operator could act on
+  to no effect or to harm:
+
+  `_current_strategy` read per-tool override → per-server `compression` and
+  stopped, so a server omitting the key looked like `auto` even under a global
+  `default_compression`. H3 gates on exactly that value, so an operator who had
+  pinned `selective` globally was told to pin `selective`, reasoned as "AUTO
+  resolves to selective in >80% of calls" — a claim about their configuration
+  that was not true, since calls were never running `auto`.
+
+  `_current_max_chars` read the nominal `max_result_chars`, missing both the
+  model-aware global a server's default defers to and any token budget. Against
+  a global `default_max_result_chars: 16000` it saw 8000, so H1 could
+  "increase" the budget to 14400 — a cut — and H2 "reduce" one to more than it
+  was. Where a *per-tool* `max_result_tokens` is set it outranks the per-tool
+  `max_result_chars` that `mms tune --apply` writes, so every heuristic that
+  recommends that field — H1, H2 and H4's `missing_example` branch — now stays
+  quiet there rather than advise an edit with no effect. A server-level token
+  budget does not suppress them: the per-tool write clears it.
+
+  Root cause is the one #924 fixed for the advertisement: each reader carried
+  its own copy of the precedence, and the tuner's copies each omitted the last
+  step. `effective_compression`, `effective_compression_pair` and
+  `effective_max_result_chars` now live in `proxy/config.py`, beside the models
+  they read, and the proxy manager, the tuner, and the `mms doctor` / `mms
+  config` Ollama-dependency check resolve through them — the CLI's copy was
+  correct but was the third one. Moving them out of the manager is what lets
+  the tuner share them without importing it.
+
+  H3 has a second, unrelated defect that this does not address: it never
+  compares against `STRATEGY_PIN_THRESHOLD` at all, because the metrics query
+  drops the dominant strategy's count. #928.
+
+- **A global-only `default_compression` now advertises its convention suffix**
+  (#924, PR #925). Calls resolve compression through the global default when a
+  server omits the `compression` key (#292), but the advertisement read the
+  per-server field alone — which is `auto` for exactly that configuration, and
+  `auto` emits no suffix. An operator who configured compression globally got
+  `selective`, `progressive` or `hybrid` responses described as if they were
+  ordinary text. Such a response usually carries an inline hint of its own, so
+  what was missing is the part that arrives *before* the call: the description
+  is what a client reads when deciding whether and how to call a tool, and it
+  described a retrieval-bearing response as a plain one. The two paths
+  disagreed because each carried its own copy of the resolution rule; one
+  function now holds it, and all three readers in the proxy manager — the call
+  path, the advertisement, and the #610 privacy warning — resolve through it.
+  Two copies outside that module remained at the time, one of them wrong in its
+  own way; #926 above folds them in and moves the function to
+  `proxy/config.py`.
+
+  **Behavior change**, in two parts. For the three strategies that carry a
+  suffix at all — `selective`, `progressive`, and `hybrid` under its default
+  `tail_mode: "toc"`, a `truncate` tail being self-contained — such upstreams
+  gain it whenever it fits the effective description budget, costing upstream
+  text since the suffix wins that budget; where it cannot fit, #893's
+  whole-suffix drop still applies and nothing is advertised. And because the
+  suffix predicts what a *call* will do, it is now resolved from the live
+  config at each advertisement rebuild rather than the connect-time snapshot:
+  an edit to `compression`, `hybrid`, or a per-tool override of either reaches
+  a client at the next rebuild instead of requiring a reconnect. That second
+  part applies to servers that set `compression` themselves too; the
+  advertisement they produce for an unedited config is unchanged, as it is for
+  deployments leaving the global at `auto`. Every other advertised-metadata
+  field keeps the lifetime `docs/configuration.md` documents.
+
+  `auto` still advertises no suffix. It picks a strategy per response and can
+  select `hybrid`, whose default `tail_mode: "toc"` needs retrieval, so no
+  static description is accurate for every call; that instruction rides the
+  response instead.
+
+- **`max_description_chars` is now an exact cap on the client-visible
+  description** (#893, PR #921). It read as a cap but did not bound the string
+  that reached the client, three ways that compound: truncation appended its ellipsis *after* slicing (+3),
+  the convention-suffix budget floored at 40 regardless of the configured
+  value, and registration prepended `[proxied] ` (+10) after all budgeting — so
+  a configured 60 could advertise 97 characters. For a client that resends tool
+  definitions with each request, that overshoot is a recurring token cost the
+  knob claimed to bound. Every fixed cost now comes out of the budget, and the
+  invariant is pinned where it is real: on the description a real
+  `ClientSession` decodes from `tools/list`, swept across five caps and four
+  compression strategies.
+
+  **Behavior change**: the budget for upstream text narrows, and long
+  descriptions can get shorter. At the default 200 the narrowing is the 10
+  characters the prefix now costs, rising to 13 for a suffix-free description
+  that also spends an ellipsis truncation previously appended on top; with a
+  convention suffix it stays 10, because the old path already reserved three
+  characters for that ellipsis. Those are budget reductions, not guaranteed
+  shortening: a description that already fits the narrowed window is untouched,
+  and a truncated one
+  is unchanged whenever both windows land on the same boundary. Where the
+  visible length does move it can move by much more, because truncation prefers
+  a sentence boundary and a narrower window can fall back to a much earlier one
+  — a description that advertised 204 characters can now advertise 79. The
+  convention suffix — the hint naming the follow-up tool — wins over upstream
+  text when it fits, and is now **dropped whole** at a cap too small to hold it
+  (below 54 for `selective`); previously it was appended whole and simply
+  overflowed the cap. The compressed response envelope still
+  carries the follow-up instructions. `max_description_chars` also gains a
+  floor of 32 at both the global and per-server level (was `> 0`); 32 is a
+  usability choice rather than the arithmetic minimum, which is 10 — the length
+  of the prefix — and a config below the floor now fails loud at load.
+
+  The cap describes what registration produces. The global setting is read
+  live but applied only where a tool is advertised, so it takes effect on the
+  next registration — a restart, or an upstream catalogue change. The
+  per-server setting is read from the connect-time snapshot, so it takes effect
+  when that upstream next connects; a `tools/list_changed` refresh replaces the
+  catalogue but not the config it is advertised under.
+
+- **A mid-session upstream catalogue change now re-decides exposure instead of
+  being ignored** (#917). The exposure filter's verdict was registered exactly
+  once, at startup, while an upstream can replace its catalogue at any time —
+  on a reconnect, or by sending `tools/list_changed`. Both swapped
+  `conn.tools` and stopped there, so a tool that only *then* earned a
+  rejection kept the advertisement it already had, and one that became
+  eligible never got registered. The gap was general to every rule in the
+  filter, and worst for `task_required` (#892), where the client is left
+  holding a tool it can see and can never successfully call. Health said as
+  much and nobody could act on it: `stm_proxy_health` counted a live
+  `tools` against an `advertised_tools` frozen at startup, and the two
+  silently diverged.
+
+  **Behavior change**: a catalogue change now re-runs the filter and
+  reconciles the registration — withdrawing tools that lost eligibility,
+  registering ones that gained it, and re-registering a survivor whose
+  advertised metadata moved so the registry cannot describe a different tool
+  than ranking and telemetry do. Clients are told to re-list (a
+  `notifications/tools/list_changed` on the subscription bus, the seam that
+  works from the background task a catalogue change arrives on), since
+  re-advertising to a client that never re-lists would be half a fix.
+  Ownership from #891/#908 is unchanged and is the constraint the reconcile
+  respects: only names this lifespan actually claimed are removed, every claim
+  goes back through the same probe, and a name an embedding host owns keeps
+  being declined rather than stolen. Teardown still removes exactly what is
+  owned — that set is simply no longer frozen at startup.
+
+  The manager still registers nothing itself; it announces, and the lifespan
+  that owns the registry reacts (`ProxyManager.set_advertisement_listener`). A
+  library caller that never sets a listener keeps the previous behavior. A
+  failed re-advertisement is contained and logged: the cost is a stale tool
+  list, where an escaping error would leave the reconnect or refresh that
+  triggered it half-applied.
+
+  Two limits worth stating. Only clients that negotiated the 2026-07-28
+  revision and opened a `subscriptions/listen` stream get the notification —
+  `MCPServer.run` exposes no `NotificationOptions`, so on the legacy protocol
+  the capability is not advertised and such a client keeps its list until it
+  re-lists; what it can no longer do is call a tool the reconcile actually
+  removed, because the registry is already correct. (A removal the SDK refuses
+  is the one exception — the tool stays installed and stays owned, so teardown
+  still removes it, rather than being silently disowned.) And with the `toolgraph` policy gateway on its
+  default `stdio` source, the consult still runs once at startup, so a tool an
+  upstream adds afterwards has no graph verdict: rather than let
+  re-advertisement expose it as though the graph had approved it, it gets a new
+  `toolgraph_unconsulted` reject reason, which rides the same profile ladder as
+  every other `toolgraph_*` code — `strict` withholds it, `review` advertises
+  it with a risk penalty, `explore` ignores it (#918 tracks re-consulting
+  instead). Bundle mode rebinds its decisions against the live
+  catalogue on every refresh, so it has no unconsulted state of its own — and
+  a live switch from `stdio` to `bundle` retires the old coverage with the
+  rest of that source's verdict.
+
+- **Tools that only run as async tasks are withheld instead of advertised
+  unusable** (#892). MCP revision 2025-11-25 added `Tool.execution`
+  (`taskSupport: "forbidden" | "optional" | "required"`), which the pinned SDK
+  models and the proxy dropped on the floor. For a `required` upstream tool
+  that was worse than a metadata gap: the re-advertised tool looked like an
+  ordinary synchronous one, while the proxy's handler and its upstream call
+  path have no task bridging at all, so every call against it failed on a
+  promise the advertisement had made.
+
+  **Behavior change**: such a tool is now withheld at eligibility time under a
+  new `task_required` reject reason, so selection telemetry records why it is
+  missing instead of the client holding a broken advertisement. (The relevance
+  ranker scores only the eligible set, so it drops the tool; `stm_proxy_health`
+  goes on counting it as discovered, just no longer as advertised.) The rule is
+  structural, applying in every exposure profile like `name_overflow`: the failure is certain rather
+  than heuristic, so there is nothing for `review` to observe, and advertising
+  it there would only accrue guaranteed failures against the tool's own health.
+  A `taskSupport: "optional"` tool keeps being advertised and stays callable,
+  deliberately *without* `execution` — the synchronous downgrade the proxy can
+  actually serve, now stated in the contract and pinned end to end (an
+  optional-task upstream carried through registration to a real client, which
+  decodes a tool with no `execution` and calls it normally) rather than
+  resting on an
+  accident of the field never having been copied. `forbidden`
+  and an absent `execution` are unchanged. Forwarding `execution` verbatim was
+  never an option: it would advertise task support nothing here can bridge.
 
 - **Health, ranking and selection telemetry no longer count a tool the server
   could not register** (#908). Exposure is decided — and snapshotted into

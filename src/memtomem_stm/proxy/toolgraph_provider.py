@@ -14,8 +14,11 @@ This module is the transport adapter only: it connects and runs the
 interprets the verdict (see ``tool_eligibility.interpret_verdict``), feeds it
 into ``filter_tools`` as per-candidate ``toolgraph_*`` rejects or a whole-call
 withhold, and pins ``graph_generation`` into selection telemetry. Unlike the
-surfacing adapter the consult runs once per session at proxy startup (so the
-advertised set stays stable), which is why this adapter has no per-request
+surfacing adapter the consult runs once per session at proxy startup, even
+when a catalogue change rebuilds the advertisement: a candidate that appeared
+after it is assigned ``toolgraph_unconsulted``, which the active profile then
+withholds, demotes or ignores (#918). That one-shot lifetime is why this
+adapter has no per-request
 lazy-start / reconnect machinery: the caller starts it once and maps any
 failure onto the configured ``on_*`` knobs.
 """

@@ -6,22 +6,42 @@ from typing import Any
 
 from memtomem_stm.proxy.config import CompressionStrategy, HybridConfig, TailMode
 
+#: Prepended to every advertised description at registration
+#: (``_fastmcp_compat.register_proxy_tool``). Defined here, where descriptions
+#: are composed, so the budgeting in ``manager.get_proxy_tools`` reserves
+#: exactly what registration will add — the cap is on what the client sees
+#: (#893).
+PROXIED_PREFIX = "[proxied] "
+
+_ELLIPSIS = "..."
+
 
 def truncate_description(desc: str, max_chars: int) -> str:
-    """Truncate description at sentence boundary within budget."""
+    """Truncate description at sentence boundary within budget.
+
+    For any non-negative ``max_chars`` the result never exceeds it: the
+    ellipsis is spent from the budget rather than added on top of it. Below
+    ``len(_ELLIPSIS) + 1`` there is no room for both, so the result is a hard
+    slice with no ellipsis. A negative budget yields the empty string, the
+    closest the contract can come to a length it cannot represent.
+    """
     if not desc or len(desc) <= max_chars:
         return desc
-    # Try to cut at last sentence boundary
+    if max_chars < len(_ELLIPSIS) + 1:
+        return desc[: max(max_chars, 0)]
+    # Try to cut at last sentence boundary. This branch appends nothing, so it
+    # may spend the whole budget.
     truncated = desc[:max_chars]
     for sep in (". ", ".\n", "! ", "? "):
         idx = truncated.rfind(sep)
         if idx > max_chars // 3:  # don't cut too early
             return truncated[: idx + 1].rstrip()
-    # Fall back to word boundary
-    idx = truncated.rfind(" ")
+    # The remaining branches append an ellipsis, so they cut short of the cap.
+    body = desc[: max_chars - len(_ELLIPSIS)]
+    idx = body.rfind(" ")
     if idx > max_chars // 3:
-        return truncated[:idx] + "..."
-    return truncated + "..."
+        return body[:idx] + _ELLIPSIS
+    return body + _ELLIPSIS
 
 
 def distill_schema(schema: dict, strip_descriptions: bool) -> dict:

@@ -27,6 +27,18 @@ then the remaining rules apply per tool in this order, first match wins:
     path logs the prefix-shortening guidance but keeps the tool in
     ``conn.tools``, so connect and reconnect get identical treatment and
     the verdict reaches telemetry on the normal startup path (codex R2).
+``task_required``
+    The upstream declared ``execution.taskSupport: "required"`` (MCP
+    revision 2025-11-25) — the tool runs only as an async task, and this
+    proxy's call path is synchronous-only, so every call against it would
+    fail. Advertising one is strictly worse than rejecting it, the same
+    posture as ``name_overflow``, and unlike the signal rules there is
+    nothing for ``review`` to observe: the failures are certain, not
+    heuristic, and would only accrue against the tool's own health. Every
+    profile. ``optional`` is the deliberate inverse — advertised WITHOUT
+    ``execution``, i.e. as a plain synchronous tool; ``ProxyToolInfo``
+    carries no ``execution`` field, so the downgrade is structural rather
+    than a strip. ``forbidden`` and an absent ``execution`` are unchanged.
 ``duplicate_name``
     More than one candidate carries the same composed name, so the ENTIRE
     group is withheld (ambiguity pre-pass, evaluated before every other
@@ -61,6 +73,12 @@ then the remaining rules apply per tool in this order, first match wins:
     once at startup and maps upstream reasons to codes). Signal rule, ranked
     above ``unhealthy`` but below ``sensitive_metadata``.
 
+    ``toolgraph_unconsulted`` is the same family but the absence of a verdict
+    rather than one: the stdio consult runs once per session, so a candidate
+    that appeared afterwards (an upstream added a tool and #917 rebuilt the
+    advertisement) was never put to the graph, and must not read the same as
+    one it approved (#918).
+
 A whole-call ``toolgraph_*`` outcome (``toolgraph_unreachable`` /
 ``toolgraph_agent_not_found`` / ``toolgraph_protocol_error``) is a SEPARATE
 mechanism: when the consult itself fails under a ``closed`` knob, the manager
@@ -84,15 +102,29 @@ Three invariants this module exists to uphold:
   withholds every multi-occurrence name outright, so no name can be both
   advertised and recorded as withheld (and no advertised metadata can
   diverge from the callable entity behind the name).
-- **The advertised set is stable for the session.** Health flags are
-  computed once at proxy startup (``compute_health_flags``) from the
-  persisted metrics store, not per call: MCP clients are not guaranteed to
-  re-list tools, and a mid-session eligibility change would make selection
-  telemetry lie about the candidate set the client actually saw. A tool
-  hidden for health gets re-evaluated at the next startup; once its
+- **STM's own signals are stable for the session; the upstream catalogue is
+  not.** Health flags are computed once at proxy startup
+  (``compute_health_flags``) from the persisted metrics store, not per call,
+  so a tool does not slide in and out of the advertisement as calls fail. A
+  tool hidden for health gets re-evaluated at the next startup; once its
   failures age out of the window it is advertised again (startup-grained
-  half-open probing — recovery is possible because hiding stops new
-  failures from accruing, and the window forgets old ones).
+  half-open probing — recovery is possible because hiding stops new failures
+  from accruing, and the window forgets old ones).
+
+  What the upstream declares is a different matter, and until #917 it was
+  treated the same way: the bundled server registered this verdict once at
+  startup, while an upstream can replace its catalogue at any time (a
+  reconnect, or ``tools/list_changed``). A tool that only THEN earned a
+  rejection kept whatever advertisement it already had — general to every
+  rule here, and worst for ``task_required``, where the client is left
+  holding a tool it can see and can never successfully call. So a catalogue
+  change now re-runs this filter and reconciles the registration
+  (``ProxyManager.set_advertisement_listener`` → the lifespan's
+  re-advertisement in ``server.py``, which asks the clients it can reach to
+  re-list whenever that changed the registry).
+  The verdict is still a pure function of its inputs; what changed is that
+  the inputs are re-read when the upstream moves them, rather than only at
+  startup.
 
 Reject reasons flow into the selection log's ``reject_reasons`` field
 (#467) via ``ProxyManager``; they are reason *codes* only — no tool
@@ -132,6 +164,7 @@ logger = logging.getLogger(__name__)
 REASON_CONFIG_HIDDEN = "config_hidden"
 REASON_PROFILE_EXCLUDED = "profile_excluded"
 REASON_NAME_OVERFLOW = "name_overflow"
+REASON_TASK_REQUIRED = "task_required"
 REASON_DUPLICATE_NAME = "duplicate_name"
 REASON_SENSITIVE_METADATA = "sensitive_metadata"
 REASON_UNHEALTHY = "unhealthy"
@@ -161,6 +194,13 @@ REASON_TOOLGRAPH_TOOL_NOT_FOUND = "toolgraph_tool_not_found"
 # recognize still results in a withhold (never a silent advertise of a tool
 # the graph wanted blocked), just under a generic code.
 REASON_TOOLGRAPH_REJECTED = "toolgraph_rejected"
+# Not a verdict but the absence of one: the stdio consult runs once per session
+# and this candidate appeared afterwards (an upstream added a tool, and #917
+# re-advertised), so the graph was never asked about it — which must not read
+# the same as "consulted and allowed" to a policy gateway. A signal rule like
+# the rest of the family: ``strict`` withholds, ``review`` demotes, ``explore``
+# ignores (#918).
+REASON_TOOLGRAPH_UNCONSULTED = "toolgraph_unconsulted"
 
 # WHOLE-CALL — the consult itself failed (or aborted) and the operator's
 # ``on_*`` knob resolved to ``closed``. These are profile-INDEPENDENT and
@@ -230,6 +270,12 @@ class ExposureCandidate:
     raw_description: str
     raw_schema: dict[str, Any] | None
     server_config: UpstreamServerConfig
+    # Normalized ``Tool.execution.task_support`` ("forbidden" / "optional" /
+    # "required"; ``None`` — an absent ``execution`` — means forbidden, per
+    # spec). A raw artifact, never advertisement data: ``ProxyToolInfo`` has
+    # no ``execution`` field, so the proxy structurally cannot forward task
+    # support it has no call path for (#892).
+    raw_task_support: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -700,6 +746,12 @@ def filter_tools(
         # ── structural rules (every profile) ─────────────────────────────
         if tool_name_budget.overflows(server_cfg.prefix, info.original_name):
             reject_reasons[info.prefixed_name] = REASON_NAME_OVERFLOW
+            continue
+        # A task-required tool cannot be served by the synchronous call path,
+        # so advertising it promises a call that always fails — withheld in
+        # every profile, ``optional`` deliberately downgraded (#892).
+        if candidate.raw_task_support == "required":
+            reject_reasons[info.prefixed_name] = REASON_TASK_REQUIRED
             continue
 
         # ── signal rules (profile-dependent) ─────────────────────────────

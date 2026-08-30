@@ -12,7 +12,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from memtomem_stm.proxy.compression_feedback_store import CompressionFeedbackStore
-from memtomem_stm.proxy.config import ProxyConfig
+from memtomem_stm.proxy.config import (
+    ProxyConfig,
+    effective_compression_pair,
+    effective_max_result_chars,
+)
 from memtomem_stm.proxy.metrics_store import MetricsStore
 
 # ── Thresholds ──────────────────────────────────────────────────────────
@@ -156,10 +160,10 @@ class CompressionTuner:
 
     def _analyze_profile(self, p: ToolProfile) -> list[TuningAction]:
         actions: list[TuningAction] = []
-        current_max = self._current_max_chars(p.server, p.tool)
+        current_max, token_governed = self._current_budget(p.server, p.tool)
 
         # H1: High violation rate → increase budget
-        if p.violation_rate > VIOLATION_RATE_THRESHOLD:
+        if p.violation_rate > VIOLATION_RATE_THRESHOLD and not token_governed:
             recommended = max(
                 int(p.p95_original_chars * 0.8),
                 (current_max or 8000) + 2000,
@@ -178,7 +182,12 @@ class CompressionTuner:
                 )
 
         # H2: Over-generous budget → reduce budget
-        if p.avg_ratio is not None and p.avg_ratio > OVER_GENEROUS_RATIO and p.violation_count == 0:
+        if (
+            p.avg_ratio is not None
+            and p.avg_ratio > OVER_GENEROUS_RATIO
+            and p.violation_count == 0
+            and not token_governed
+        ):
             recommended = max(
                 int(p.p95_original_chars * 1.1),
                 1000,
@@ -220,34 +229,62 @@ class CompressionTuner:
         # H4: Feedback-driven — dominant kind informs strategy
         if p.feedback_count >= 3 and p.feedback_dominant_kind:
             fb_action = _feedback_recommendation(p)
-            if fb_action:
+            # Its "missing_example" branch recommends a budget, so it is subject
+            # to the same rule as H1/H2: a per-tool token budget outranks the
+            # per-tool ``max_result_chars`` that ``--apply`` writes. Its
+            # ``compression`` recommendation is unaffected.
+            if fb_action and not (token_governed and fb_action.field == "max_result_chars"):
                 actions.append(fb_action)
 
         return actions
 
     # -- config lookups ---------------------------------------------------
 
-    def _current_max_chars(self, server: str, tool: str) -> int | None:
+    def _current_budget(self, server: str, tool: str) -> tuple[int | None, bool]:
+        """The char budget this tool's calls run under, and whether tokens rule.
+
+        Must match what the proxy resolves (#926). Reading the nominal
+        ``max_result_chars`` saw a server's own default where calls ran under
+        the model-aware global, so H1 could "increase" a budget to less than it
+        already was, and H2 "reduce" it to more.
+
+        The flag is true when a PER-TOOL token budget is in force. H1 and H2
+        recommend a per-tool `max_result_chars`, which that budget outranks, so
+        their advice would be an edit with no effect — they skip instead. A
+        server-level token budget does not count: the per-tool write clears it.
+        """
         if not self._config:
-            return None
+            return None, False
         srv = self._config.upstream_servers.get(server)
         if not srv:
-            return None
+            return None, False
         override = srv.tool_overrides.get(tool)
-        if override and override.max_result_chars is not None:
-            return override.max_result_chars
-        return srv.max_result_chars
+        max_chars, _ = effective_max_result_chars(srv, override, self._config)
+        # ``mms tune --apply`` writes recommendations as PER-TOOL overrides, and
+        # a per-tool ``max_result_chars`` clears an inherited server token
+        # budget — so an action is a no-op only against a per-tool token
+        # budget, which outranks the field being written. A server-level one is
+        # superseded by the write, and suppressing there would withhold advice
+        # that works.
+        return max_chars, override is not None and override.max_result_tokens is not None
 
     def _current_strategy(self, server: str, tool: str) -> str | None:
+        """The strategy this tool's calls actually run under.
+
+        Must match what the proxy resolves, global default included (#926).
+        Stopping at the per-server field read a server that omits
+        ``compression`` as ``auto``, so H3 below would tell an operator who
+        pinned a strategy globally to pin the one they already had — with a
+        reason claiming AUTO was resolving at runtime, which it was not.
+        """
         if not self._config:
             return None
         srv = self._config.upstream_servers.get(server)
         if not srv:
             return None
         override = srv.tool_overrides.get(tool)
-        if override and override.compression is not None:
-            return override.compression.value
-        return srv.compression.value
+        compression, _ = effective_compression_pair(srv, override, self._config)
+        return compression.value
 
 
 # ── helpers ─────────────────────────────────────────────────────────────

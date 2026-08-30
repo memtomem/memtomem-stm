@@ -300,6 +300,27 @@ async def test_real_fastmcp_advertises_output_schema_and_meta() -> None:
     assert tool.meta == meta
 
 
+def test_proxy_tool_info_has_no_execution_field() -> None:
+    # #892: the advertisement type carries no ``execution``, which is what
+    # makes the synchronous downgrade structural — there is no field for a
+    # future edit to fill from an upstream tool, so it cannot regress into
+    # forwarding task support the proxy has no call path for. This pins the
+    # ABSENCE only; that it survives to a real client is
+    # ``test_optional_task_upstream_reaches_the_client_without_execution``.
+    from memtomem_stm.proxy.manager import ProxyToolInfo
+
+    assert not hasattr(
+        ProxyToolInfo(
+            prefixed_name="srv__tool",
+            description="desc",
+            input_schema={"type": "object"},
+            server="srv",
+            original_name="tool",
+        ),
+        "execution",
+    )
+
+
 async def test_proxy_tool_round_trips_over_the_wire() -> None:
     """The registration tests above assert what the shim *writes*; this one
     asserts the SDK still *reads* it.

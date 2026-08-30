@@ -498,9 +498,15 @@ consistently-failing recent history in `proxy_metrics.db`
 `health_window_hours`; only upstream-attributable errors count). Under
 `review`, signal-flagged tools stay advertised but carry
 `review_risk_penalty` in tool-relevance telemetry; under `explore`, signal
-rules are off. Health is evaluated once at startup, so the advertised set
-is stable for the session — a health-hidden tool is re-evaluated at the
-next restart and returns once its failures age out of the window. Reject
+rules are off. Health is evaluated once at startup, so a tool does not slide
+in and out of the advertisement as calls fail — a health-hidden tool is
+re-evaluated at the next restart and returns once its failures age out of the
+window. What the *upstream* declares is re-read when it changes: a reconnect
+or a `tools/list_changed` re-runs the filter, reconciles what is registered,
+and, when that changed the registry, asks clients to re-list (#917) —
+reaching those on the 2026-07-28 revision with a `subscriptions/listen`
+stream; a legacy client keeps its list, but can no longer call a tool the
+reconcile withdrew. Reject
 reasons land in each selection event's `reject_reasons` when
 `selection_telemetry` is enabled; see
 [selection-telemetry.md](selection-telemetry.md) for the reason vocabulary.
@@ -554,9 +560,10 @@ and validates the schema, agent/profile scope, graph instance/generation, and
 each live MCP tool contract fingerprint before atomically adopting the
 snapshot. A changed bundle is checked whenever the proxy manager rebuilds its
 filtered catalog and before each proxied call; the call gate runs before
-response-cache lookup. FastMCP registers the external MCP tool list at startup, so a running
-session blocks a newly denied call immediately but refreshes client-visible
-tool presence after STM/the client restarts. In `strict`,
+response-cache lookup. The external MCP tool list is registered at startup and rebuilt when an
+upstream replaces its own catalogue (#917), so a running session blocks a
+newly denied call immediately, while a bundle change alone refreshes
+client-visible tool presence only after STM/the client restarts. In `strict`,
 rejected, missing, drifted, or invalid policy fails closed. In `review`, the
 same decision is observable as would-block while the call remains available.
 `explore` leaves signal-based
@@ -765,13 +772,14 @@ The config file is **hot-reloaded** — changes take effect on the next tool cal
 
 | Setting group | Hot-reload? | Notes |
 |---------------|-------------|-------|
-| Per-server compression, cleaning, `tool_overrides` | Yes | `compression`, `max_result_chars`, `retention_floor`, `cleaning.*`, `tool_overrides.*` take effect on the next tool call |
+| Per-server compression, cleaning, response-path `tool_overrides` | Yes | `compression`, `max_result_chars`, `retention_floor`, `cleaning.*`, and the per-tool budget/cache/compression fields take effect on the next tool call — for how a **response** is compressed. The `tool_overrides` fields that shape what is **advertised** instead (`description_override`, `hidden`, `expose_in_profiles`, and the `compression`/`hybrid` values that decide the convention suffix) are covered by the row below, not this one. |
 | Per-server retry/timeout/cache knobs | Yes | `max_retries`, `call_timeout_seconds`, `overall_deadline_seconds`, `reconnect_delay_seconds`, `max_reconnect_delay_seconds`, `cache`, `cache_ttl_seconds` are read per call |
 | Connection-affecting fields (`transport`, `url`, `headers`, `command`, `args`, `env`; `connect_timeout_seconds` on `sse`/`streamable_http`) | Yes (live reconnect) | Applied on the next uncached call: the replacement connection is prepared first, then swapped in. If it can't connect, the old connection keeps serving and the failed edit isn't retried until the config changes again. |
 | `relevance_scorer.*` | Yes | All five fields (`scorer`, `embedding_provider`, `embedding_model`, `embedding_base_url`, `embedding_timeout`). A change in any field rebuilds the scorer instance in place. |
 | `llm.*` compressor config | Yes | Changing any field closes the old `LLMCompressor` and constructs a new one lazily on the next tool call. |
-| Per-server `prefix` | **No** (restart) | Part of the tool names registered with the client at startup — the advertisement is session-stable. |
-| Toolgraph bundle decisions | Calls: **Yes**; advertised list: **No** | A changed strict denial gates the next call before cache/upstream access. Restart STM/the MCP client to rebuild the external `tools/list`. |
+| Per-server `prefix` | **No** (restart) | Part of the tool names registered with the client; only an upstream catalogue change re-derives the advertisement (#917), and a `prefix` edit is not one. |
+| Anything shaping **advertised tool metadata** (`max_description_chars`, `description_override`, suffix-driving `compression`/`hybrid`, `strip_schema_descriptions`, `advertise_context_query`, `hidden`, `expose_in_profiles`, `exposure.profile`) | **No** (next registration) | Applied where a tool is advertised, so an edit reaches a client only when the advertisement is rebuilt — a restart or an upstream catalogue change. Global values (`max_description_chars`, `strip_schema_descriptions`, `advertise_context_query`, `exposure.profile`) are read live but still only at that rebuild, as are the suffix-driving `compression`/`hybrid` values at every level — the suffix predicts what a **call** will do, and calls read those live, so a rebuild resolves them the same way (#924). The remaining per-server and per-tool values (`description_override`, `hidden`, `expose_in_profiles`, per-server `max_description_chars`, `strip_schema_descriptions`) come from the connect-time snapshot, so they need a reconnect on top of the rebuild. `exposure.health_window_hours`, `health_min_calls`, and `health_error_rate_threshold` are **restart-bound**: the health flags they produce are computed once at startup and reused by every later rebuild. `max_description_chars` composes as `min(server, global)` and `strip_schema_descriptions` as `server or global`, neither as an override — see [Advertised tool descriptions](reference/proxy-config.md#advertised-tool-descriptions). |
+| Toolgraph bundle decisions | Calls: **Yes**; advertised list: only on an upstream catalogue change | A changed strict denial gates the next call before cache/upstream access. The advertised list is rebuilt when an upstream replaces its catalogue (#917); otherwise restart STM/the MCP client. |
 | Per-server `circuit_*` breaker thresholds | **No** (restart) | The breaker is built at connect time on the connection object (#608). |
 | Adding / removing upstream servers | **No** (restart) | Transport connections are established once at startup. |
 
