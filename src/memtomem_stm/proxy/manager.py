@@ -69,6 +69,7 @@ from memtomem_stm.proxy.config import (
     SelectiveConfig,
     TokenEstimationMode,
     ToolgraphConfig,
+    ToolOverrideConfig,
     TransportType,
     UpstreamServerConfig,
 )
@@ -209,6 +210,33 @@ def _effective_compression(
     if "compression" in cfg.model_fields_set:
         return cfg.compression
     return proxy_cfg.default_compression
+
+
+def _effective_compression_pair(
+    cfg: UpstreamServerConfig,
+    override: ToolOverrideConfig | None,
+    proxy_cfg: ProxyConfig,
+) -> tuple[CompressionStrategy, HybridConfig | None]:
+    """Full per-tool precedence: tool override → per-server → global default.
+
+    Both fields resolve together because the convention suffix reads them
+    together: ``hybrid`` decides whether the HYBRID strategy needs a retrieval
+    hint at all. One function for both readers (#924) — the advertisement
+    duplicating this precedence beside the call path is what let the two
+    disagree, and a partial copy is how they would disagree again.
+
+    All three arguments must come from ONE config generation; pairing a
+    connect-time server config with a live global can name a follow-up tool the
+    call will not use.
+    """
+    compression = _effective_compression(cfg, proxy_cfg)
+    hybrid = cfg.hybrid
+    if override is not None:
+        if override.compression is not None:
+            compression = override.compression
+        if override.hybrid is not None:
+            hybrid = override.hybrid
+    return compression, hybrid
 
 
 def _llm_compression_leaks(
@@ -869,17 +897,23 @@ class ProxyManager:
         self._reset_toolgraph_session_state()
         self._stack = AsyncExitStack()
 
-        servers = self._config.upstream_servers
+        # ONE loader read for everything this startup path derives. ``_config``
+        # is a property over the hot-reload loader, so each access can return a
+        # newer generation than the last; taking the snapshot here is what lets
+        # the servers, the global compression default and the extraction config
+        # below describe the same file.
+        cfg_snap = self._config
+        servers = cfg_snap.upstream_servers
         if not servers:
             # Fallback re-load of a file the server startup path typically
             # already loaded (env-enabled proxy, upstreams only in the file).
             # log_warnings=False so the advisory permissive-mode /
             # unknown-key warnings don't fire twice per startup (#611);
             # a parse *failure* still logs.
-            loaded = ProxyConfig.load_from_file(self._config.config_path, log_warnings=False)
+            loaded = ProxyConfig.load_from_file(cfg_snap.config_path, log_warnings=False)
             servers = loaded.upstream_servers if loaded else {}
 
-        ext_cfg = self._config.extraction
+        ext_cfg = cfg_snap.extraction
 
         # #610: warn loudly when an LLM path will send raw upstream responses
         # UNSCANNED to an external provider (privacy_scan_enabled=false). The
@@ -895,12 +929,13 @@ class ProxyManager:
         # there — its warning is gated on the same condition to stay accurate.
         comp_leak_paths: list[str] = []
         comp_dests: set[str] = set()
-        # ONE snapshot for the whole sweep. ``self._config`` is a property over
-        # the hot-reload loader, so reading it per server would let a reload
-        # land mid-loop and warn about some servers under the old global
-        # default and the rest under the new one — the same "never mix two
-        # reload generations" rule ``_server_cfg`` states.
-        cfg_snap = self._config
+        # Resolved against the snapshot taken above, so every server in the
+        # sweep is judged under one global default — reading ``self._config``
+        # per server would let a reload land mid-loop and warn about the first
+        # servers under the old default and the rest under the new one. (When
+        # ``servers`` came from the fallback file re-load above, its entries
+        # and this default are still two reads of the same path; that pairing
+        # predates #924 and is untouched here.)
         for srv_name, srv_cfg in servers.items():
             srv_comp = _effective_compression(srv_cfg, cfg_snap)
             srv_llm = srv_cfg.llm
@@ -2755,27 +2790,32 @@ class ProxyManager:
             cfg = conn.config
             max_desc = cfg.max_description_chars
             strip = cfg.strip_schema_descriptions or global_strip
+            # The convention suffix is the one part of the description that is
+            # a PREDICTION about a call rather than a fact about this
+            # connection, so it resolves off the live snapshot while everything
+            # around it stays connect-time (#924). Calls resolve compression,
+            # hybrid and the per-tool override live, and a rebuild can happen
+            # without a reconnect — ``tools/list_changed`` refreshes
+            # ``conn.tools`` and re-advertises while ``conn.config`` keeps its
+            # connect-time value — so a suffix built from the connect-time
+            # config can name a follow-up tool the call will not use. Naming
+            # the WRONG tool is worse than naming none, which is what the
+            # connect-time read would do here. All three inputs come from this
+            # one snapshot; mixing generations is what produces the wrong name.
+            live_cfg = self._server_cfg(conn, cfg_snap)
 
             for t in conn.tools:
-                override = cfg.tool_overrides.get(t.name)
+                # Two overrides, by role: the connect-time one supplies
+                # ``description_override`` (advertised text, which follows the
+                # identity/budget fields above and the metadata lifetime
+                # documented in docs/configuration.md), the live one feeds the
+                # suffix prediction.
+                advert_override = cfg.tool_overrides.get(t.name)
+                suffix_override = live_cfg.tool_overrides.get(t.name)
 
-                # Resolve effective compression + hybrid config for convention
-                # suffix. The global ``default_compression`` participates here
-                # exactly as it does on the call path (#924) — reading only
-                # ``cfg.compression`` advertised no suffix to an operator who
-                # configured compression globally, leaving the agent with a
-                # response it was never told how to retrieve the rest of. The
-                # global field comes off the one live read ``cfg_snap``, like
-                # ``global_max_desc`` / ``global_strip`` above; per-server
-                # fields stay on the connect-time snapshot.
-                effective_compression = _effective_compression(cfg, cfg_snap)
-                effective_hybrid = cfg.hybrid
-                if override is not None:
-                    if override.compression is not None:
-                        effective_compression = override.compression
-                    if override.hybrid is not None:
-                        effective_hybrid = override.hybrid
-
+                effective_compression, effective_hybrid = _effective_compression_pair(
+                    live_cfg, suffix_override, cfg_snap
+                )
                 suffix = self._convention_suffix(effective_compression, effective_hybrid)
 
                 # Resolve description. ``max_description_chars`` caps what the
@@ -2788,8 +2828,8 @@ class ProxyManager:
                 # text, since it is what tells the client which follow-up tool
                 # to call (#893).
                 desc = t.description or ""
-                if override is not None and override.description_override is not None:
-                    desc = override.description_override
+                if advert_override is not None and advert_override.description_override is not None:
+                    desc = advert_override.description_override
                 budget = min(max_desc, global_max_desc) - len(PROXIED_PREFIX)
                 if suffix and len(suffix) <= budget:
                     desc = self._truncate_description(desc, budget - len(suffix)) + suffix
@@ -3237,10 +3277,6 @@ class ProxyManager:
         # without a reconnect (the behavior docs/configuration.md promises).
         cfg = self._server_cfg(conn, config)
 
-        # #292: the global default applies when the operator omitted the
-        # per-server key. The pattern mirrors the auto_index / extraction
-        # overrides above and below.
-        compression = _effective_compression(cfg, config)
         # Token-equivalent budget takes precedence over char budget when set.
         # Resolution order for chars_per_token: tool override → server → proxy default.
         # Resolution order for max_result_tokens: tool override → server.
@@ -3258,7 +3294,6 @@ class ProxyManager:
             max_chars = cfg.max_result_chars
         llm_cfg = cfg.llm
         sel_cfg = cfg.selective
-        hybrid_cfg = cfg.hybrid
         cleaning_cfg = cfg.cleaning or CleaningConfig()
 
         auto_index_enabled = config.auto_index.enabled
@@ -3273,9 +3308,10 @@ class ProxyManager:
         retention_floor = cfg.retention_floor
 
         override = cfg.tool_overrides.get(tool)
+        # #292/#924: compression and hybrid resolve together, through the same
+        # function the advertisement uses, so the two cannot drift apart.
+        compression, hybrid_cfg = _effective_compression_pair(cfg, override, config)
         if override is not None:
-            if override.compression is not None:
-                compression = override.compression
             # Per-tool budget override. Token override wins over char override
             # if both are set. Resolution order for chars_per_token (when token
             # budget is used): tool override → server → proxy default.
@@ -3300,8 +3336,6 @@ class ProxyManager:
                 llm_cfg = override.llm
             if override.selective is not None:
                 sel_cfg = override.selective
-            if override.hybrid is not None:
-                hybrid_cfg = override.hybrid
             if override.progressive is not None:
                 progressive_cfg = override.progressive
             if override.cleaning is not None:

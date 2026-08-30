@@ -421,10 +421,13 @@ changes inline only. See the deprecation policy in
   per-server field alone — which is `auto` for exactly that configuration, and
   `auto` emits no suffix. An operator who configured compression globally got
   `selective`, `progressive` or `hybrid` responses described as if they were
-  ordinary text, so the agent saw a TOC or a chunk with nothing naming the
-  follow-up tool that retrieves the rest. The two paths disagreed because each
-  carried its own copy of the rule; one function now holds it and the call path,
-  the #610 privacy warning, and the advertisement all read it.
+  ordinary text. The responses themselves do name the follow-up tool inline, so
+  what was missing is the part that arrives *before* the call: the description
+  is what a client reads when deciding whether and how to call a tool, and it
+  described a retrieval-bearing response as a plain one. The two paths
+  disagreed because each carried its own copy of the resolution rule; one
+  function now holds it, and the call path, the #610 privacy warning, and the
+  advertisement all read it.
 
   **Behavior change**: such upstreams gain the suffix for their strategy, which
   under a tight `max_description_chars` costs upstream text — the suffix wins

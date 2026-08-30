@@ -99,7 +99,13 @@ Three parts compose it, in this order:
   accurate for every call — it can select `hybrid`, whose default
   `tail_mode: "toc"` returns a TOC the agent has to retrieve from. Under `auto`
   that TOC names `stm_proxy_select_chunks` in the response text itself, which is
-  what carries the instruction there.
+  what carries the instruction there. Every response that needs retrieval names
+  its follow-up tool inline this way; the suffix is what says so *before* the
+  call, where it can inform the decision to make one.
+
+  Unlike the fields above, the suffix resolves off the **live** config at each
+  rebuild rather than the connect-time snapshot, since it predicts what a call
+  will do and calls read those values live.
 
 `max_description_chars` is an exact cap on that whole assembled string, prefix
 included. It is set globally and per server, and the effective budget is

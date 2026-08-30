@@ -490,6 +490,69 @@ class TestGlobalDefaultCompressionSuffix:
         mgr = _make_manager_with_tools(tools, compression=None)
         assert mgr.get_proxy_tools()[0].description == "Reads a file."
 
+    def test_a_rebuild_after_hot_reload_advertises_what_calls_resolve(self):
+        """A rebuild resolves the suffix live, not off the connect-time config.
+
+        ``tools/list_changed`` re-advertises without refreshing ``conn.config``,
+        so a suffix built from the connect-time server config could name a
+        follow-up tool the call would never use: connect with ``compression``
+        omitted, then have the operator add an explicit ``compression:
+        selective`` while the global default says ``progressive``. Resolving the
+        connect-time omission against the live global advertises
+        ``stm_proxy_read_more`` while calls resolve ``selective``.
+        """
+        tools = [_fake_tool("t", description="Reads a file.")]
+        mgr = _make_manager_with_tools(
+            tools, compression=None, default_compression=CompressionStrategy.PROGRESSIVE
+        )
+        edited_server = UpstreamServerConfig(
+            prefix="test", compression=CompressionStrategy.SELECTIVE
+        )
+        mgr._config_loader.seed(
+            mgr._config.model_copy(update={"upstream_servers": {"srv": edited_server}})
+        )
+
+        advertised = mgr.get_proxy_tools()[0].description
+        resolved = mgr._resolve_tool_config("srv", "t").compression
+
+        assert resolved == CompressionStrategy.SELECTIVE
+        assert advertised.endswith(SELECTIVE_SUFFIX)
+
+    def test_a_rebuild_honours_a_hot_reloaded_per_tool_override(self):
+        """The per-tool override feeding the suffix is read live too."""
+        tools = [_fake_tool("t", description="Reads a file.")]
+        mgr = _make_manager_with_tools(tools, compression=CompressionStrategy.PROGRESSIVE)
+        edited_server = UpstreamServerConfig(
+            prefix="test",
+            compression=CompressionStrategy.PROGRESSIVE,
+            tool_overrides={"t": ToolOverrideConfig(compression=CompressionStrategy.SELECTIVE)},
+        )
+        mgr._config_loader.seed(
+            mgr._config.model_copy(update={"upstream_servers": {"srv": edited_server}})
+        )
+
+        assert mgr._resolve_tool_config("srv", "t").compression == CompressionStrategy.SELECTIVE
+        assert mgr.get_proxy_tools()[0].description.endswith(SELECTIVE_SUFFIX)
+
+    def test_description_override_stays_connect_time(self):
+        """Only the suffix goes live — advertised TEXT keeps its lifetime.
+
+        Guards the boundary the fix draws: a hot-reloaded
+        ``description_override`` must NOT reach the client without a reconnect,
+        which is what docs/configuration.md promises for advertised metadata.
+        """
+        tools = [_fake_tool("t", description="Reads a file.")]
+        mgr = _make_manager_with_tools(tools, compression=None)
+        edited_server = UpstreamServerConfig(
+            prefix="test",
+            tool_overrides={"t": ToolOverrideConfig(description_override="Edited after connect.")},
+        )
+        mgr._config_loader.seed(
+            mgr._config.model_copy(update={"upstream_servers": {"srv": edited_server}})
+        )
+
+        assert mgr.get_proxy_tools()[0].description == "Reads a file."
+
 
 class TestSuffixBudget:
     def test_suffix_within_budget(self):
