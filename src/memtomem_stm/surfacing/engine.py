@@ -27,6 +27,7 @@ from memtomem_stm.surfacing.mcp_client import (
 from memtomem_stm.surfacing.observability import _NOOP_OBSERVABILITY, SurfacingObservability
 from memtomem_stm.surfacing.relevance import RateClaim, RelevanceGate
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
+from memtomem_stm.utils.keyed_locks import KeyedLocks
 from memtomem_stm.utils.redact import redact_exception_text, redact_url_userinfo
 
 logger = logging.getLogger(__name__)
@@ -241,14 +242,22 @@ class SurfacingEngine:
         self._draining_warning_latched = False
 
         # Per-key stampede guard — identical concurrent ``_do_surface`` calls
-        # serialize on the same lock so a cache miss triggers one LTM search
-        # rather than N and the losing coroutine cannot overwrite the
-        # winning coroutine's populated cache entry with its own (empty due
-        # to session dedup) result. Entries are popped while the lock is
-        # still held so any queued waiter sees the cached result on its
-        # own double-check. Named ``_key_locks`` to match the same pattern
-        # used by ``ProxyManager`` (extractable into a shared helper later).
-        self._key_locks: dict[str, asyncio.Lock] = {}
+        # serialize on the same lock. What that buys is mutual exclusion per
+        # key plus cache-mediated collapse: each entrant re-checks the cache
+        # under the lock, so whoever stores first collapses the ones behind it
+        # and no losing coroutine can overwrite a populated entry with its own
+        # (empty due to session dedup) result. Collapse needs a row that is
+        # still READABLE on the follower's double-check — a zero-TTL or expired
+        # row is a miss like any other. It is NOT result coalescing: a caller
+        # whose double-check still misses runs its own miss path, which may be
+        # refused admission before it ever searches LTM.
+        # ``KeyedLocks`` refcounts each entry (holders + waiters) so a caller
+        # arriving after a NON-FINAL release joins the queue on the SAME lock
+        # instead of creating a second one and racing a waiter (#878); after
+        # the final release the entry is deliberately gone and the next
+        # arrival correctly starts a new one.
+        # Shared with ``ProxyManager``, which guards its cache the same way.
+        self._key_locks = KeyedLocks()
         # Opportunistic cleanup: run cleanup_expired at most once per hour
         self._cleanup_interval = 3600.0
         self._last_cleanup: float = time.monotonic()
@@ -1522,37 +1531,34 @@ class SurfacingEngine:
         # Check surfacing cache (keyed by server+tool+query). The full miss
         # path lives in ``_do_surface_miss``; this shell handles the
         # cache-check fast path, per-key stampede lock, and post-lock
-        # double-check so identical concurrent queries share a single LTM
-        # search and the losing coroutine cannot poison the cache with an
-        # empty result (see ``_key_locks`` init docstring).
+        # double-check, so identical concurrent queries do not run
+        # overlapping LTM searches and the losing coroutine cannot poison the
+        # cache with an empty result. Collapse is cache-mediated, not
+        # coalescing (see ``_key_locks`` init docstring).
         cache_key = f"{server}/{tool}/{query}"
         cached = self._cache.get(cache_key)
         if cached is not None:
             self._observability.record_cache("hit")
             return self._render_cached(cached, response_text, query, server, tool)
 
-        lock = self._key_locks.setdefault(cache_key, asyncio.Lock())
-        async with lock:
-            try:
-                # Double-check inside the lock: a coroutine that held the
-                # lock ahead of us may have populated the cache already.
-                cached = self._cache.get(cache_key)
-                if cached is not None:
-                    self._observability.record_cache("hit")
-                    return self._render_cached(cached, response_text, query, server, tool)
-                self._observability.record_cache("miss")
-                return await self._do_surface_miss(
-                    server,
-                    tool,
-                    arguments,
-                    response_text,
-                    query,
-                    cache_key,
-                    rate_claim=rate_claim,
-                    trace_id=trace_id,
-                )
-            finally:
-                self._key_locks.pop(cache_key, None)
+        async with self._key_locks.hold(cache_key):
+            # Double-check inside the lock: a coroutine that held the
+            # lock ahead of us may have populated the cache already.
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                self._observability.record_cache("hit")
+                return self._render_cached(cached, response_text, query, server, tool)
+            self._observability.record_cache("miss")
+            return await self._do_surface_miss(
+                server,
+                tool,
+                arguments,
+                response_text,
+                query,
+                cache_key,
+                rate_claim=rate_claim,
+                trace_id=trace_id,
+            )
 
     async def _do_surface_miss(
         self,

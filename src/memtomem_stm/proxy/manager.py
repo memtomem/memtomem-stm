@@ -164,6 +164,7 @@ from memtomem_stm.proxy.metrics import (
 from memtomem_stm.observability.tracing import traced
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 from memtomem_stm.utils.json_out import escape_lone_surrogates, scrub_lone_surrogates
+from memtomem_stm.utils.keyed_locks import KeyedLocks
 from memtomem_stm.utils.mcp_transport import (
     SSE_READ_TIMEOUT_SECONDS,
     streamable_http_transport,
@@ -763,13 +764,22 @@ class ProxyManager:
         # server -> its in-flight refresh task, so stop() can tell a straggler
         # from a stale ``running`` claim (#868).
         self._tools_refresh_tasks: dict[str, asyncio.Task] = {}
-        # Per-key stampede guard — identical concurrent ``call_tool`` invocations
-        # serialize on the same lock so a cache miss triggers one upstream
-        # call rather than N. Entries are popped when the work completes so
-        # the dict stays bounded by the number of in-flight unique keys.
-        # Named ``_key_locks`` to match the same pattern used by
-        # ``SurfacingEngine`` (extractable into a shared helper later).
-        self._key_locks: dict[str, asyncio.Lock] = {}
+        # Per-key stampede guard — identical concurrent ``call_tool``
+        # invocations serialize on the same lock — the cache-eligible ones
+        # that actually MISS. A disabled cache, a non-positive TTL and an
+        # ineligible tool bypass the guard entirely, and a readable
+        # lock-free fast-path hit returns before reaching it (see the shell's
+        # docstring). What it buys for the rest is mutual exclusion per key
+        # plus cache-mediated collapse: each entrant re-checks the cache under
+        # the lock, so whoever stored a row that is still readable collapses
+        # the ones behind it. It is NOT result coalescing — a caller whose
+        # double-check still misses runs its own miss path, which may or may
+        # not reach upstream.
+        # ``KeyedLocks`` refcounts each entry (holders + waiters) so it
+        # survives exactly as long as someone references it and the dict stays
+        # bounded by the number of in-flight unique keys. Shared with
+        # ``SurfacingEngine``, which guards its LTM search the same way.
+        self._key_locks = KeyedLocks()
         # F6: one WARNING on first progressive call when ``injection_mode`` is
         # ``"prepend"`` — that mode still skips surfacing on progressive to
         # preserve the ``stm_proxy_read_more`` offset invariant.
@@ -4880,17 +4890,20 @@ class ProxyManager:
         cfg_snap: ProxyConfig,
     ) -> tuple[str | list | CallToolResult, bool]:
         """Cache stampede guard: serialize identical concurrent ``call_tool``
-        invocations on a per-key lock so a cold cache + duplicate requests
-        trigger one upstream call rather than N.
+        invocations on a per-key lock, so a cold cache + duplicate requests
+        do not fan out into overlapping upstream calls.
 
         Structure: fast-path check (lock-free for cache hits) → per-key
         ``asyncio.Lock`` with double-check (another coroutine may have
         populated while we waited) → delegate to ``_call_tool_inner`` on
-        confirmed miss. The ``_key_locks`` dict entry is popped in
-        ``finally`` while the lock is still held so any waiter already
-        queued on the same lock sees the cached result on its own
-        double-check, and a new arrival after pop likewise finds the set
-        value (stampede window closed).
+        confirmed miss. ``KeyedLocks`` keeps the entry alive while any
+        holder or waiter references it, so a caller arriving after a
+        non-final release joins the queue on the SAME lock instead of
+        creating a second one and racing a waiter (#878). Collapse is
+        cache-mediated, not coalescing: each entrant re-checks the cache
+        under the lock, so whoever stored a readable row collapses the ones
+        behind it, while a caller that still sees a miss runs its own miss
+        path — which may fail before it reaches upstream at all.
 
         Returns ``(result, cache_hit)`` so ``call_tool`` can stamp the
         selection-telemetry execution event (#467): ``True`` on either
@@ -4984,37 +4997,33 @@ class ProxyManager:
         cache_key = _cache_key(
             server, tool, upstream_args, context_query=context_query, config_fingerprint=config_fp
         )
-        lock = self._key_locks.setdefault(cache_key, asyncio.Lock())
-        async with lock:
-            try:
-                # Double-check inside the lock: a coroutine that held the
-                # lock ahead of us may have populated the cache already.
-                cached = self._cache.get(
-                    server,
-                    tool,
-                    upstream_args,
-                    context_query=context_query,
-                    config_fingerprint=config_fp,
+        async with self._key_locks.hold(cache_key):
+            # Double-check inside the lock: a coroutine that held the
+            # lock ahead of us may have populated the cache already.
+            cached = self._cache.get(
+                server,
+                tool,
+                upstream_args,
+                context_query=context_query,
+                config_fingerprint=config_fp,
+            )
+            if cached is not None:
+                return (
+                    await self._on_cache_hit(
+                        cached, server, tool, arguments, trace_id, cfg_snap=cfg_snap
+                    ),
+                    True,
                 )
-                if cached is not None:
-                    return (
-                        await self._on_cache_hit(
-                            cached, server, tool, arguments, trace_id, cfg_snap=cfg_snap
-                        ),
-                        True,
-                    )
-                # Eligible cache lookup confirmed missing (the lock-free fast-path
-                # AND this in-lock double-check). This is the SINGLE eligible-miss
-                # exit, so account the miss here. The ineligible and no-cache paths
-                # above deliberately record NOTHING — no lookup was attempted, and
-                # counting a forced-forward writer (or a ``cache: false`` tool) as a
-                # miss would skew the hit-rate diagnostics.
-                self.tracker.record_cache_miss()
-                return await self._call_tool_inner(
-                    server, tool, arguments, trace_id=trace_id, cfg_snap=cfg_snap
-                ), False
-            finally:
-                self._key_locks.pop(cache_key, None)
+            # Eligible cache lookup confirmed missing (the lock-free fast-path
+            # AND this in-lock double-check). This is the SINGLE eligible-miss
+            # exit, so account the miss here. The ineligible and no-cache paths
+            # above deliberately record NOTHING — no lookup was attempted, and
+            # counting a forced-forward writer (or a ``cache: false`` tool) as a
+            # miss would skew the hit-rate diagnostics.
+            self.tracker.record_cache_miss()
+            return await self._call_tool_inner(
+                server, tool, arguments, trace_id=trace_id, cfg_snap=cfg_snap
+            ), False
 
     def _server_cfg(self, conn: UpstreamConnection, cfg_snap: ProxyConfig) -> UpstreamServerConfig:
         """Latest per-server config from the hot-reloaded snapshot.

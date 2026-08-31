@@ -893,6 +893,113 @@ class TestCacheWithErrors:
             f"({session.call_tool.call_count} upstream calls for the same key)"
         )
 
+    async def test_late_arrival_cannot_run_beside_a_queued_waiter(self):
+        """A three-call handoff on one key (C arrives after A returns, so
+        the three are not simultaneous) where the FIRST caller stores
+        nothing — a ``cache.set`` failure, a tolerated path, see
+        ``test_cache_set_failure_does_not_break_response``. The naive
+        pop-in-finally guard drops the lock entry while B is still queued,
+        so C installs a fresh lock and runs upstream alongside B: two
+        concurrent upstream calls for one key, three calls in total.
+
+        With the refcounted registry C joins B's queue, then finds B's row
+        on its double-check — one call in flight at a time, two total."""
+        async with asyncio.timeout(5.0):
+            mgr = _make_manager()
+            session = _get_session(mgr)
+
+            in_flight = 0
+            max_in_flight = 0
+            upstream_calls = 0
+            entered = asyncio.Event()
+            release_a = asyncio.Event()
+            release_b = asyncio.Event()
+
+            async def slow_upstream(tool, args):
+                nonlocal in_flight, max_in_flight, upstream_calls
+                in_flight += 1
+                max_in_flight = max(max_in_flight, in_flight)
+                upstream_calls += 1
+                n = upstream_calls
+                entered.set()
+                await (release_a if n == 1 else release_b).wait()
+                in_flight -= 1
+                return _make_result(f"result-{n}")
+
+            session.call_tool.side_effect = slow_upstream
+
+            cache_store: dict[str, str] = {}
+
+            def _fake_key(srv, tl, a, kw):
+                return f"{srv}|{tl}|{a}|{kw.get('context_query')}|{kw.get('config_fingerprint')}"
+
+            cache = MagicMock()
+            cache.get.side_effect = lambda srv, tl, a, **kw: cache_store.get(_fake_key(srv, tl, a, kw))
+
+            writes = 0
+
+            def _set(srv, tl, a, result, ttl_seconds=None, **kw):
+                # The FIRST store fails, so the winner leaves the cache cold. The
+                # waiter behind it is NOT collapsed — it runs its own miss path —
+                # but the lock must keep that work from overlapping the winner's.
+                nonlocal writes
+                writes += 1
+                if writes == 1:
+                    raise RuntimeError("simulated SQLite lock timeout")
+                cache_store[_fake_key(srv, tl, a, kw)] = result
+
+            cache.set.side_effect = _set
+            mgr._cache = cache
+
+            async def _wait_for_refs(n: int, what: str) -> None:
+                # Wait on the observable reference count rather than assuming a
+                # fixed number of yields gets a task queued — asyncio promises no
+                # such thing. Bounded by wall clock, so it reports instead of
+                # spinning if the count never arrives.
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + 2.0
+                while mgr._key_locks.total_refs() != n:
+                    if loop.time() >= deadline:
+                        raise AssertionError(f"timed out waiting for {what}")
+                    await asyncio.sleep(0)
+
+            a = asyncio.create_task(mgr.call_tool("srv", "tool", {"x": 1}))
+            await entered.wait()
+            b = asyncio.create_task(mgr.call_tool("srv", "tool", {"x": 1}))
+            # B must be QUEUED on the key lock before A finishes — the whole
+            # scenario rests on that precondition.
+            await _wait_for_refs(2, "B to queue on the stampede lock")
+            entered.clear()
+            release_a.set()
+            await a
+
+            # A has released, which already WOKE B: B is either scheduled to
+            # resume or already inside the critical section — never still
+            # queued. Either way it still REFERENCES the entry, and that
+            # reference must have survived A's departure. The defect stated
+            # directly: the rejected shape drops the whole entry here,
+            # orphaning B onto a lock the next arrival never sees.
+            assert mgr._key_locks.total_refs() == 1, (
+                "the former waiter's reference did not survive the first caller's "
+                "release — its entry was removed from the registry"
+            )
+
+            # A is done and stored nothing. C arrives now — the window the naive
+            # guard gets wrong.
+            c = asyncio.create_task(mgr.call_tool("srv", "tool", {"x": 1}))
+            await _wait_for_refs(2, "C to register on the stampede lock")
+            release_b.set()
+            await asyncio.gather(b, c)
+
+            assert max_in_flight == 1, (
+                f"{max_in_flight} concurrent upstream calls for one cache key — a "
+                "late arrival was handed a second stampede lock"
+            )
+            assert session.call_tool.call_count == 2, (
+                "Expected A (uncached) + B only; C should have been collapsed onto "
+                f"B's stored row (got {session.call_tool.call_count} upstream calls)"
+            )
+
     async def test_cache_set_failure_does_not_break_response(self):
         """A failing ``cache.set`` (SQLite lock timeout, disk full, etc.)
         must not discard a successful upstream response. Cache writes are

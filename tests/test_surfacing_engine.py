@@ -1482,6 +1482,107 @@ class TestSurfacingCacheStampede:
             "Cache entry exists but is missing the shared memory"
         )
 
+    async def test_late_arrival_cannot_run_beside_a_queued_waiter(self):
+        """A three-call handoff on one key (C arrives after A returns, so
+        the three are not simultaneous) where the FIRST caller caches
+        nothing — its LTM search raises, so ``_do_surface_miss`` never
+        reaches ``cache.set``. The naive pop-in-finally guard drops the
+        entry while B is still queued, so C installs a fresh lock and
+        searches LTM alongside B — two concurrent searches on one key,
+        three in total, and the losing writer can still overwrite the
+        winner's populated entry.
+
+        With the refcounted registry C queues behind B and is collapsed by
+        B's cached result: two searches, one at a time."""
+        async with asyncio.timeout(5.0):
+            chunk = FakeChunk(id="mem-shared", content="shared result")
+            results = [FakeSearchResult(chunk=chunk, score=0.5)]
+            adapter = AsyncMock()
+
+            in_flight = 0
+            max_in_flight = 0
+            calls = 0
+            entered = asyncio.Event()
+            release_a = asyncio.Event()
+            release_b = asyncio.Event()
+
+            async def gated_search(**_kwargs):
+                nonlocal in_flight, max_in_flight, calls
+                in_flight += 1
+                max_in_flight = max(max_in_flight, in_flight)
+                calls += 1
+                n = calls
+                entered.set()
+                await (release_a if n == 1 else release_b).wait()
+                in_flight -= 1
+                if n == 1:
+                    # The winner fails before any cache write, so the cache stays
+                    # cold. The waiter behind it is NOT collapsed — it runs its own
+                    # search — but the lock must keep that from overlapping.
+                    raise RuntimeError("LTM search failed")
+                return (results, [], "ok")
+
+            adapter.search = AsyncMock(side_effect=gated_search)
+
+            engine = SurfacingEngine(
+                config=_make_config(cooldown_seconds=0),
+                mcp_adapter=adapter,
+            )
+
+            async def _wait_for_refs(n: int, what: str) -> None:
+                # Wait on the observable reference count rather than assuming a
+                # fixed number of yields gets a task queued — asyncio promises no
+                # such thing. Bounded by wall clock, so it reports instead of
+                # spinning if the count never arrives.
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + 2.0
+                while engine._key_locks.total_refs() != n:
+                    if loop.time() >= deadline:
+                        raise AssertionError(f"timed out waiting for {what}")
+                    await asyncio.sleep(0)
+
+            a = asyncio.create_task(engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE))
+            await entered.wait()
+            b = asyncio.create_task(engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE))
+            # B must be QUEUED on the key lock before A finishes — the whole
+            # scenario rests on that precondition.
+            await _wait_for_refs(2, "B to queue on the stampede lock")
+            entered.clear()
+            release_a.set()
+            await a
+
+            # A has released, which already WOKE B: B is either scheduled to
+            # resume or already inside the critical section — never still
+            # queued. Either way it still REFERENCES the entry, and that
+            # reference must have survived A's departure. The defect stated
+            # directly: the rejected shape drops the whole entry here,
+            # orphaning B onto a lock the next arrival never sees.
+            assert engine._key_locks.total_refs() == 1, (
+                "the former waiter's reference did not survive the first caller's "
+                "release — its entry was removed from the registry"
+            )
+
+            # A is done and cached nothing. C arrives now — the window the naive
+            # guard gets wrong.
+            c = asyncio.create_task(engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE))
+            await _wait_for_refs(2, "C to register on the stampede lock")
+            release_b.set()
+            await asyncio.gather(b, c)
+
+            assert max_in_flight == 1, (
+                f"{max_in_flight} concurrent LTM searches for one cache key — a "
+                "late arrival was handed a second stampede lock"
+            )
+            assert adapter.search.call_count == 2, (
+                "Expected the failed A + B only; C should have been collapsed onto "
+                f"B's cached result (got {adapter.search.call_count} searches)"
+            )
+            cached = engine._cache.get(f"gh/read_file/{VALID_ARGS['_context_query']}")
+            assert cached and any(r.chunk.id == "mem-shared" for r in cached), (
+                "Cache entry missing or poisoned — the second searcher's empty "
+                "result overwrote the populated one"
+            )
+
 
 class TestRelevanceGateConcurrency:
     """``RelevanceGate.should_surface`` is called at ``surface()`` entry and
