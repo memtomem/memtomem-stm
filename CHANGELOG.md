@@ -415,6 +415,56 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **The strategy pin is gated on the share it claims to have measured** (#928).
+  `STRATEGY_PIN_THRESHOLD = 0.80` is documented as the fraction one strategy
+  must dominate above before H3 recommends pinning it, but it was never
+  compared against anything — it was interpolated into the recommendation's
+  reason and nowhere else. H3 gated on the dominant label merely existing, so
+  with 7 of 12 calls resolving `hybrid` it told the operator *"AUTO resolves to
+  hybrid in >80% of calls"* and pinning it would have sent the other 42%
+  through the wrong strategy. The number justifying the edit was one the code
+  never took.
+
+  It could not gate on a share, because none was carried: the metrics query
+  picked the dominant strategy with `ORDER BY COUNT(*) DESC LIMIT 1` and
+  returned the label alone, making it a plurality winner rather than a
+  dominance measurement. `get_tool_profiles` now returns that count alongside
+  the label, plus the denominator, and `ToolProfile.dominant_strategy_share`
+  computes the fraction in the one place both the gate and the reason read.
+
+  The denominator is the calls with a recorded strategy, not `call_count`: a
+  call that recorded none — every error path, and the success paths that bypass
+  compression — can never be in the numerator, so counting it below would
+  withhold a pin the recorded calls do support. Both counts come from a single
+  statement, so they share one SQLite snapshot; read from two, a concurrent
+  writer could pair a numerator with a smaller denominator and yield a share
+  above 1.0. The volume gate counts that same population, since one recorded
+  call among nine without carries a 100% share on a single observation, and so
+  does the confidence label of any recommendation H3 contributes to. H2 and H4
+  rest on narrower populations of their own and still label off `call_count`;
+  that is untouched here and tracked as #934.
+
+  Two further things the recommendation now checks, both of which made it
+  advice an operator could not act on. A degraded call records the path it took
+  (`hybrid→progressive_fallback`), which no `compression` key accepts, so a
+  dominant label outside `CompressionStrategy` is skipped. And the reason
+  carries the counts, not a rounded percentage alone: 81 of 101 clears the
+  strict gate but renders as `80%`, which would have re-opened the same
+  gate-versus-text gap. It no longer attributes the rows to AUTO either — the
+  column records the strategy a call ran under, not whether AUTO chose it, so a
+  tool switched to `auto` an hour ago has a window full of rows AUTO never saw.
+
+  **Behavior change**: H3 no longer recommends a `compression` pin for a tool
+  whose dominant strategy holds 80% or less of its calls with a recorded
+  strategy (the threshold is a floor to exceed, matching its documented
+  wording), whose calls with a recorded strategy number fewer than
+  `MEDIUM_CONFIDENCE_CALLS`, or whose dominant label is not a settable
+  strategy. The reason states the measured counts and share instead of a fixed
+  `>80%` claim, and a recommendation H3 contributes to is labelled from that
+  same population.
+  `get_tool_profiles` dicts gain `dominant_strategy_count` and
+  `strategy_count`; the addition is additive and no existing key changes.
+
 - **The credential scan covers the whole advertised surface** (#894). The
   `sensitive_metadata` gate exists so that no secret-class string reaches the
   client's context through `tools/list`, but it read only the description (raw
@@ -489,7 +539,8 @@ changes inline only. See the deprecation policy in
 
   H3 has a second, unrelated defect that this does not address: it never
   compares against `STRATEGY_PIN_THRESHOLD` at all, because the metrics query
-  drops the dominant strategy's count. #928.
+  drops the dominant strategy's count. #928 — fixed separately, in this same
+  release; see the entry above.
 
 - **A global-only `default_compression` now advertises its convention suffix**
   (#924, PR #925). Calls resolve compression through the global default when a

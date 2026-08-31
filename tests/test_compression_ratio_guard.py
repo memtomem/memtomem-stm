@@ -633,9 +633,125 @@ class TestGetToolProfiles:
         assert p["call_count"] == 10
         assert p["violation_count"] == 2
         assert p["dominant_strategy"] == "hybrid"
+        assert p["dominant_strategy_count"] == 10
+        assert p["strategy_count"] == 10
         assert p["avg_ratio"] is not None
         assert 0 < p["avg_ratio"] < 1
         assert p["p95_original_chars"] >= 5800
+        store.close()
+
+    def test_strategy_counts_exclude_calls_that_resolved_none(self, tmp_path):
+        """The dominant count and its denominator share one population (#928).
+
+        Both count only rows carrying a strategy, so their ratio is a share;
+        `call_count` also includes the NULL-strategy rows error paths write.
+        """
+        store = MetricsStore(tmp_path / "metrics.db")
+        store.initialize()
+        seeds = [("hybrid", 6), ("truncate", 4), (None, 2)]
+        for strategy, count in seeds:
+            for _ in range(count):
+                store.record(
+                    CallMetrics(
+                        server="srv",
+                        tool="mixed",
+                        original_chars=1000,
+                        compressed_chars=500,
+                        cleaned_chars=1000,
+                        compression_strategy=strategy,
+                    )
+                )
+        for _ in range(3):
+            store.record(
+                CallMetrics(
+                    server="srv",
+                    tool="errors_only",
+                    original_chars=1000,
+                    compressed_chars=1000,
+                    cleaned_chars=1000,
+                    compression_strategy=None,
+                )
+            )
+        by_tool = {p["tool"]: p for p in store.get_tool_profiles(since_seconds=3600.0)}
+
+        mixed = by_tool["mixed"]
+        assert mixed["call_count"] == 12
+        assert mixed["strategy_count"] == 10
+        assert mixed["dominant_strategy"] == "hybrid"
+        assert mixed["dominant_strategy_count"] == 6
+
+        errors_only = by_tool["errors_only"]
+        assert errors_only["call_count"] == 3
+        assert errors_only["strategy_count"] == 0
+        assert errors_only["dominant_strategy"] is None
+        assert errors_only["dominant_strategy_count"] == 0
+        store.close()
+
+    def test_the_two_strategy_counts_come_from_one_snapshot(self, tmp_path):
+        """A concurrent writer cannot pair a numerator with a stale denominator.
+
+        The instance lock does not span processes, so a second proxy writing
+        between two statements used to leave the dominant count larger than
+        the population it was counted against — a share above 1.0.  Both now
+        come from a single statement.  The injected write stands in for that
+        other process: it lands after the main aggregation has been read.
+        """
+        import sqlite3 as _sq
+        import time as _t
+
+        db_path = tmp_path / "metrics.db"
+        store = MetricsStore(db_path)
+        store.initialize()
+        for _ in range(3):
+            store.record(
+                CallMetrics(
+                    server="srv",
+                    tool="t1",
+                    original_chars=1000,
+                    compressed_chars=500,
+                    cleaned_chars=1000,
+                    compression_strategy="hybrid",
+                )
+            )
+
+        real_conn = store._db
+        state = {"injected": False}
+
+        class _InjectingConnection:
+            """Delegates to the real connection, writing once from another one."""
+
+            def __getattr__(self, name):
+                return getattr(real_conn, name)
+
+            def execute(self, sql, *args, **kwargs):
+                cursor = real_conn.execute(sql, *args, **kwargs)
+                if not state["injected"] and "GROUP BY server, tool" in sql:
+                    state["injected"] = True
+                    other = _sq.connect(str(db_path))
+                    other.executemany(
+                        "INSERT INTO proxy_metrics "
+                        "(server, tool, original_chars, compressed_chars, cleaned_chars, "
+                        " compression_strategy, source, created_at, is_error, ratio_violation) "
+                        "VALUES ('srv', 't1', 1000, 500, 1000, 'hybrid', 'mcp', ?, 0, 0)",
+                        [(_t.time(),) for _ in range(3)],
+                    )
+                    other.commit()
+                    other.close()
+                return cursor
+
+        store._db = _InjectingConnection()  # type: ignore[assignment]
+        try:
+            p = store.get_tool_profiles(since_seconds=3600.0)[0]
+        finally:
+            store._db = real_conn
+
+        assert state["injected"], "the probe never ran; the query shape changed"
+        # call_count was read before the write and the strategy counts after,
+        # which is what proves the two reads really straddle it — without this
+        # the counts could agree simply by never having seen the new rows.
+        assert p["call_count"] == 3
+        assert p["dominant_strategy_count"] == 6
+        assert p["strategy_count"] == 6
         store.close()
 
     def test_groups_by_server_tool(self, tmp_path):

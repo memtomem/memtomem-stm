@@ -754,10 +754,18 @@ class MetricsStore:
 
         Returns a list of dicts with keys: ``server``, ``tool``,
         ``call_count``, ``violation_count``, ``avg_ratio``,
-        ``p95_original_chars``, ``dominant_strategy``, ``error_count``.
+        ``p95_original_chars``, ``dominant_strategy``,
+        ``dominant_strategy_count``, ``strategy_count``, ``error_count``.
         Only non-error rows with ``cleaned_chars > 0`` contribute to
         ``avg_ratio``.  ``p95_original_chars`` is approximated by taking
         the value at the 95th percentile rank within each group.
+
+        ``dominant_strategy_count`` and ``strategy_count`` both count only
+        rows with a non-NULL ``compression_strategy``, and are read in one
+        statement so they share a snapshot; the pair therefore yields a
+        well-defined dominance share. ``call_count`` additionally includes
+        rows that recorded no strategy — every error path, and the success
+        paths that bypass compression entirely.
 
         Scoped to ``source = 'mcp'``: the tuner adjusts *proxy* compression
         budgets for upstream MCP tools, so native built-in tool rows written by
@@ -804,17 +812,28 @@ class MetricsStore:
                     """,
                     (server, tool, cutoff, server, tool, cutoff),
                 ).fetchone()
-                # Dominant strategy
+                # Dominant strategy, its count, and the population both are
+                # over.  All three come from ONE statement so they share a
+                # single SQLite snapshot: another process writing between two
+                # statements could otherwise pair a numerator with a smaller
+                # denominator and yield a share above 1.0 (the instance lock
+                # does not span processes).
                 strat_row = self._db.execute(
                     """
-                    SELECT compression_strategy FROM proxy_metrics
+                    SELECT
+                        compression_strategy,
+                        COUNT(*),
+                        (SELECT COUNT(*) FROM proxy_metrics
+                         WHERE server = ? AND tool = ? AND created_at >= ?
+                             AND compression_strategy IS NOT NULL AND source = 'mcp')
+                    FROM proxy_metrics
                     WHERE server = ? AND tool = ? AND created_at >= ?
                         AND compression_strategy IS NOT NULL AND source = 'mcp'
                     GROUP BY compression_strategy
                     ORDER BY COUNT(*) DESC
                     LIMIT 1
                     """,
-                    (server, tool, cutoff),
+                    (server, tool, cutoff, server, tool, cutoff),
                 ).fetchone()
                 profiles.append(
                     {
@@ -825,6 +844,8 @@ class MetricsStore:
                         "avg_ratio": round(avg_ratio, 4) if avg_ratio is not None else None,
                         "p95_original_chars": p95_row[0] if p95_row else 0,
                         "dominant_strategy": strat_row[0] if strat_row else None,
+                        "dominant_strategy_count": strat_row[1] if strat_row else 0,
+                        "strategy_count": strat_row[2] if strat_row else 0,
                         "error_count": error_count or 0,
                     }
                 )
