@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import ANY, AsyncMock, MagicMock, call
 from uuid import uuid4
 
 import pytest
@@ -16,6 +16,7 @@ import pytest
 from memtomem_stm.surfacing import engine as engine_module
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine
+from memtomem_stm.surfacing.feedback_store import DIAGNOSTIC_KINDS
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -3355,7 +3356,7 @@ class TestScoreScaleDiagnostic:
             feedback_tracker=tracker,
         )
 
-    async def test_fifth_search_warns_and_persists_once(self, caplog):
+    async def test_fifth_search_warns_once_and_persists_every_saturated_search(self, caplog):
         tracker = MagicMock()
         engine = self._engine(tracker=tracker)
 
@@ -3372,9 +3373,12 @@ class TestScoreScaleDiagnostic:
         assert len(warnings) == 1
         assert "observed ceiling=0.0160" in warnings[0]
         assert "min_score=0.0300" in warnings[0]
-        tracker.record_diagnostic.assert_called_once_with(
-            "gh", "read_file", "score_ceiling_below_min"
-        )
+        # Searches 5 and 6 are both saturated, and each writes: the durable
+        # row is shared with peer processes, so persistence cannot be latched
+        # to the once-per-episode WARNING (#944).
+        assert tracker.record_diagnostic.call_args_list == [
+            call("gh", "read_file", "score_ceiling_below_min")
+        ] * 2
 
     def test_empty_recovery_and_threshold_change_reset_episode(self, caplog):
         tracker = MagicMock()
@@ -3417,7 +3421,10 @@ class TestScoreScaleDiagnostic:
         assert engine._score_scale_streaks[("gitlab", "read_file")].count == 4
         assert engine._score_scale_streaks[("gh", "search")].count == 4
 
-    def test_healthy_recovery_persists_once_until_below_min_rearms(self):
+    def test_every_healthy_observation_closes_both_kinds(self):
+        """Unlatched by design (#944): a peer process can reopen the episode
+        between two healthy observations, so this process must keep writing.
+        The store's WHERE guard makes the repeat inert."""
         tracker = MagicMock()
         engine = self._engine(tracker=tracker)
         healthy = [FakeSearchResult(chunk=FakeChunk(), score=0.03)]
@@ -3425,13 +3432,14 @@ class TestScoreScaleDiagnostic:
 
         engine._observe_score_scale("gh", "read_file", healthy, 0.03)
         engine._observe_score_scale("gh", "read_file", healthy, 0.03)
-        tracker.record_diagnostic_recovery.assert_called_once_with(
-            "gh", "read_file", "score_ceiling_below_min"
+        assert tracker.record_diagnostic_recoveries.call_count == 2
+        assert tracker.record_diagnostic_recoveries.call_args == call(
+            "gh", "read_file", DIAGNOSTIC_KINDS, recovered_at=ANY
         )
 
         engine._observe_score_scale("gh", "read_file", low, 0.03)
         engine._observe_score_scale("gh", "read_file", healthy, 0.03)
-        assert tracker.record_diagnostic_recovery.call_count == 2
+        assert tracker.record_diagnostic_recoveries.call_count == 3
 
     def test_non_finite_score_resets_without_warning(self):
         tracker = MagicMock()
@@ -3545,7 +3553,11 @@ class TestReportedScoreScale:
         assert len(warnings) == 1  # once per episode, no streak of 5 needed
         assert "score_scale='rerank'" in warnings[0]
         assert "reranker=BAAI/bge-reranker-v2-m3" in warnings[0]
-        tracker.record_diagnostic.assert_called_once_with("gh", "read_file", "score_scale_mismatch")
+        # WARNS once, PERSISTS twice: the durable row is shared, so each
+        # mismatched observation must reopen it (#944).
+        assert tracker.record_diagnostic.call_args_list == [
+            call("gh", "read_file", "score_scale_mismatch")
+        ] * 2
         # The named scale supersedes streak evidence entirely.
         assert ("gh", "read_file") not in engine._score_scale_streaks
 
@@ -3599,64 +3611,19 @@ class TestReportedScoreScale:
 
         engine._observe_score_scale("gh", "read_file", low, 0.03)
         engine._observe_score_scale("gh", "read_file", healthy, 0.03)
-        # The healthy branch also books the (no-op) ceiling-kind recovery —
-        # pre-existing behavior pinned elsewhere; here we only require the
-        # mismatch episode to close exactly once.
-        tracker.record_diagnostic_recovery.assert_any_call(
-            "gh", "read_file", "score_scale_mismatch"
+        # One batched call closes both kinds for the key.
+        tracker.record_diagnostic_recoveries.assert_called_once_with(
+            "gh", "read_file", DIAGNOSTIC_KINDS, recovered_at=ANY
         )
-        mismatch_recoveries = [
-            c
-            for c in tracker.record_diagnostic_recovery.call_args_list
-            if c.args[2] == "score_scale_mismatch"
-        ]
-        assert len(mismatch_recoveries) == 1
-        assert ("gh", "read_file") not in engine._score_scale_mismatch_recovery_pending
         # Re-arm: a fresh below-threshold observation opens a new episode.
         engine._observe_score_scale("gh", "read_file", low, 0.03)
         assert tracker.record_diagnostic.call_count == 2
 
-    def test_mismatch_recovery_retries_until_success(self):
-        tracker = MagicMock()
-        mismatch_attempts = 0
-
-        def recover(_server, _tool, kind):
-            nonlocal mismatch_attempts
-            if kind == "score_scale_mismatch":
-                mismatch_attempts += 1
-                if mismatch_attempts == 1:
-                    raise RuntimeError("sqlite unavailable")
-
-        tracker.record_diagnostic_recovery.side_effect = recover
-        engine = self._engine(tracker=tracker)
-        low = self._low("rerank")
-        healthy = self._low("rerank", score=0.5)
-        key = ("gh", "read_file")
-
-        engine._observe_score_scale(*key, low, 0.03)
-        engine._observe_score_scale(*key, healthy, 0.03)
-
-        assert key not in engine._score_scale_mismatch_active
-        assert key in engine._score_scale_mismatch_recovery_pending
-
-        calls_before_empty = tracker.record_diagnostic_recovery.call_count
-        engine._observe_score_scale(*key, [], 0.03)
-        assert tracker.record_diagnostic_recovery.call_count == calls_before_empty
-        assert key in engine._score_scale_mismatch_recovery_pending
-
-        engine._observe_score_scale(*key, healthy, 0.03)
-        assert key not in engine._score_scale_mismatch_recovery_pending
-        calls_after_success = tracker.record_diagnostic_recovery.call_count
-
-        engine._observe_score_scale(*key, healthy, 0.03)
-        assert tracker.record_diagnostic_recovery.call_count == calls_after_success
-        assert mismatch_attempts == 2
-
     def test_mismatch_rearms_without_tracker(self, caplog):
         """Finding #3: with no feedback tracker (mms hook / feedback off),
-        _persist_diagnostic_recovery returns False, but a healthy observation
-        must STILL re-arm the definitive-tier log — otherwise the mismatch
-        warns at most once per process while the streak tier re-warns."""
+        nothing is persisted at all, but a healthy observation must STILL
+        re-arm the definitive-tier log — otherwise the mismatch warns at most
+        once per process while the streak tier re-warns."""
         engine = self._engine(tracker=None)
         low = self._low("rerank")
         healthy = self._low("rerank", score=0.5)
@@ -3666,7 +3633,6 @@ class TestReportedScoreScale:
             engine._observe_score_scale("gh", "read_file", healthy, 0.03)
             # Latch cleared on the healthy observation despite no persistence.
             assert ("gh", "read_file") not in engine._score_scale_mismatch_active
-            assert ("gh", "read_file") in engine._score_scale_mismatch_recovery_pending
             engine._observe_score_scale("gh", "read_file", low, 0.03)
 
         warnings = [r.message for r in caplog.records if "score-scale mismatch" in r.message]
@@ -3720,17 +3686,21 @@ class TestReportedScoreScale:
         assert "adjust or remove the pin" in warnings[0]
         assert "scale_gated_min_score=true" not in warnings[0]
 
-    def test_mismatch_latch_survives_empty_results(self):
-        """Alternating empty/below-threshold searches must not re-fire."""
+    def test_mismatch_latch_survives_empty_results(self, caplog):
+        """Alternating empty/below-threshold searches must not re-WARN."""
         tracker = MagicMock()
         engine = self._engine(tracker=tracker)
         low = self._low("rerank")
 
-        engine._observe_score_scale("gh", "read_file", low, 0.03)
-        engine._observe_score_scale("gh", "read_file", [], 0.03)
-        engine._observe_score_scale("gh", "read_file", low, 0.03)
+        with caplog.at_level(logging.WARNING):
+            engine._observe_score_scale("gh", "read_file", low, 0.03)
+            engine._observe_score_scale("gh", "read_file", [], 0.03)
+            engine._observe_score_scale("gh", "read_file", low, 0.03)
 
-        tracker.record_diagnostic.assert_called_once()
+        # The LOG latch is what survives the empty batch; the durable counter
+        # tracks observations, so it advances on both low batches (#944).
+        assert len([r for r in caplog.records if "score-scale mismatch" in r.message]) == 1
+        assert tracker.record_diagnostic.call_count == 2
 
     async def test_record_surfacing_carries_score_scale_on_miss_and_cache_hit(self):
         tracker = MagicMock()
@@ -3856,91 +3826,6 @@ class TestScoreScaleMapsAreBounded:
         named_low = [FakeSearchResult(chunk=FakeChunk(), score=0.001, score_scale="bm25")]
         self._drive(engine, named_low)
         self._assert_capped(engine._score_scale_mismatch_active)
-
-    def test_mismatch_recovery_pending_is_capped_without_a_tracker(self):
-        """The worst leak: with ``feedback_tracker=None`` the discard at the
-        healthy branch is gated on a durable write that can never succeed, so
-        every key that ever opened an episode stayed forever.
-
-        Each key goes mismatch-then-healthy *before* the next key is seen, so
-        pending itself has to exceed the cap. Driving all 20 mismatches first
-        would prune ``_score_scale_mismatch_active`` down to 8 and this test
-        would then pass with the pending map's prune deleted.
-        """
-        engine = self._engine(min_score=0.03)
-        engine._score_scale_keys_max = 10
-        assert engine._feedback_tracker is None
-        named_low = [FakeSearchResult(chunk=FakeChunk(), score=0.001, score_scale="bm25")]
-        healthy = [FakeSearchResult(chunk=FakeChunk(), score=0.9)]
-        for i in range(20):
-            engine._observe_score_scale("gh", f"tool{i}", named_low, 0.03)
-            engine._observe_score_scale("gh", f"tool{i}", healthy, 0.03)
-        self._assert_capped(engine._score_scale_mismatch_recovery_pending)
-
-    def test_eviction_does_not_strand_an_open_episode(self):
-        """Eviction must not cost a WRONG diagnostic.
-
-        The in-memory latches are what tell a healthy observation to close the
-        durable ``score_scale_mismatch`` episode. Evicting a key removes that
-        link, so without the blind fallback the store keeps reporting an
-        episode the tool has recovered from — and ``mms doctor`` FAILs for the
-        full 7-day window.
-        """
-        tracker = MagicMock()
-        engine = self._engine(tracker=tracker, min_score=0.03)
-        engine._score_scale_keys_max = 10
-        named_low = [FakeSearchResult(chunk=FakeChunk(), score=0.001, score_scale="bm25")]
-        healthy = [FakeSearchResult(chunk=FakeChunk(), score=0.9)]
-
-        # Open a real episode for the victim, then bury it under enough
-        # distinct keys to evict every latch that holds it.
-        engine._observe_score_scale("gh", "victim", named_low, 0.03)
-        tracker.record_diagnostic.assert_called_once_with("gh", "victim", "score_scale_mismatch")
-        self._drive(engine, named_low, count=30)
-        assert ("gh", "victim") not in engine._score_scale_mismatch_active
-        assert ("gh", "victim") not in engine._score_scale_mismatch_recovery_pending
-
-        tracker.record_diagnostic_recovery.reset_mock()
-        engine._observe_score_scale("gh", "victim", healthy, 0.03)
-        assert (
-            call("gh", "victim", "score_scale_mismatch")
-            in tracker.record_diagnostic_recovery.call_args_list
-        ), "an evicted key's episode must still be closed by a healthy observation"
-
-    def test_no_extra_recovery_write_before_anything_evicts(self):
-        """The blind fallback is off until a key has actually been dropped, so
-        an ordinary deployment's write pattern is unchanged."""
-        tracker = MagicMock()
-        engine = self._engine(tracker=tracker, min_score=0.03)
-        low = [FakeSearchResult(chunk=FakeChunk(), score=0.001)]
-        healthy = [FakeSearchResult(chunk=FakeChunk(), score=0.9)]
-
-        engine._observe_score_scale("gh", "read_file", low, 0.03)
-        engine._observe_score_scale("gh", "read_file", healthy, 0.03)
-
-        assert engine._score_scale_mismatch_evicted is False
-        assert tracker.record_diagnostic_recovery.call_args_list == [
-            call("gh", "read_file", "score_ceiling_below_min")
-        ]
-
-    def test_recovery_persisted_is_capped(self):
-        engine = self._engine(tracker=MagicMock(), min_score=0.03)
-        engine._score_scale_keys_max = 10
-        low = [FakeSearchResult(chunk=FakeChunk(), score=0.001)]
-        healthy = [FakeSearchResult(chunk=FakeChunk(), score=0.9)]
-        # Below-threshold first: the healthy branch only persists recovery for
-        # a key it has not already recorded this cycle.
-        self._drive(engine, low)
-        self._drive(engine, healthy)
-        self._assert_capped(engine._score_scale_recovery_persisted)
-
-    def test_scale_gate_recovery_persisted_is_capped(self):
-        engine = self._engine(tracker=MagicMock(), min_score=0.03)
-        engine._score_scale_keys_max = 10
-        low = [FakeSearchResult(chunk=FakeChunk(), score=0.001, score_scale="rerank")]
-        self._drive(engine, low, filter_suspended=True)
-        self._assert_capped(engine._scale_gate_recovery_persisted)
-
 
 class TestScaleGatedMinScore:
     """Scale gate (``scale_gated_min_score``, the #1781-adoption follow-up):
@@ -4112,7 +3997,7 @@ class TestScaleGatedMinScore:
         )
         tuner.maybe_adjust.assert_called_once_with("read_file")
 
-    def test_suspended_batch_resets_streak_and_persists_recovery_once(self):
+    def test_suspended_batch_resets_streak_and_closes_both_kinds(self):
         tracker = MagicMock()
         engine = self._engine([], tracker=tracker, min_score=0.03)
         low = [FakeSearchResult(chunk=FakeChunk(), score=-0.17, score_scale="rerank")]
@@ -4121,160 +4006,43 @@ class TestScaleGatedMinScore:
         engine._observe_score_scale("gh", "read_file", low, 0.03)
         tracker.record_diagnostic.assert_called_once()
 
-        # Suspended observations close it once, not per batch.
+        # Every suspended batch closes both kinds — unlatched, because a peer
+        # process can reopen the episode between two of them (#944).
         engine._observe_score_scale("gh", "read_file", low, 0.03, filter_suspended=True)
         engine._observe_score_scale("gh", "read_file", low, 0.03, filter_suspended=True)
-        recoveries = [c.args[2] for c in tracker.record_diagnostic_recovery.call_args_list]
-        assert recoveries.count("score_scale_mismatch") == 1
-        assert recoveries.count("score_ceiling_below_min") == 1
+        assert tracker.record_diagnostic_recoveries.call_args_list == [
+            call("gh", "read_file", DIAGNOSTIC_KINDS, recovered_at=ANY)
+        ] * 2
         assert ("gh", "read_file") not in engine._score_scale_mismatch_active
         assert ("gh", "read_file") not in engine._score_scale_streaks
 
-    def test_suspended_recovery_retries_failed_mismatch_write(self):
-        tracker = MagicMock()
-        engine = self._engine([], tracker=tracker, min_score=0.03)
-        low = [FakeSearchResult(chunk=FakeChunk(), score=-0.17, score_scale="rerank")]
-        key = ("gh", "read_file")
-
-        engine._observe_score_scale(*key, low, 0.03)
-        mismatch_attempts = 0
-
-        def recover(_server, _tool, kind):
-            nonlocal mismatch_attempts
-            if kind == "score_scale_mismatch":
-                mismatch_attempts += 1
-                if mismatch_attempts == 1:
-                    raise RuntimeError("sqlite unavailable")
-
-        tracker.record_diagnostic_recovery.side_effect = recover
-
-        engine._observe_score_scale(*key, low, 0.03, filter_suspended=True)
-        assert key not in engine._score_scale_mismatch_active
-        assert key in engine._score_scale_mismatch_recovery_pending
-        assert key not in engine._scale_gate_recovery_persisted
-
-        engine._observe_score_scale(*key, low, 0.03, filter_suspended=True)
-        assert key not in engine._score_scale_mismatch_recovery_pending
-        assert key in engine._scale_gate_recovery_persisted
-        calls_after_success = tracker.record_diagnostic_recovery.call_count
-
-        engine._observe_score_scale(*key, low, 0.03, filter_suspended=True)
-        assert tracker.record_diagnostic_recovery.call_count == calls_after_success
-        assert mismatch_attempts == 2
-
-    def test_suspend_recovers_episode_opened_after_the_latch_armed(self):
-        """The once-per-key recovery latch must re-arm when a NEW episode
-        opens after a suspended batch already armed it — otherwise a tool
-        alternating rerank (suspend) and rrf/unstamped low-score (streak)
-        batches leaves the re-opened episode stuck FAILing in mms doctor."""
+    def test_suspend_recovers_an_episode_reopened_after_an_earlier_suspend(self):
+        """A tool alternating rerank (suspend) and rrf/unstamped low-score
+        (streak) batches must not leave the re-opened episode stuck FAILing in
+        mms doctor. Previously guarded by re-arming a once-per-key latch;
+        since #944 there is no latch to go stale, so this pins the outcome."""
         tracker = MagicMock()
         engine = self._engine([], tracker=tracker, min_score=0.03)
         rerank_low = [FakeSearchResult(chunk=FakeChunk(), score=-0.17, score_scale="rerank")]
         unstamped_low = [FakeSearchResult(chunk=FakeChunk(), score=0.001)]
 
-        # First suspended batch arms the latch (no episode open yet → the
-        # recovery UPDATEs are no-ops, but they "succeed" on a MagicMock).
         engine._observe_score_scale("gh", "read_file", rerank_low, 0.03, filter_suspended=True)
-        assert ("gh", "read_file") in engine._scale_gate_recovery_persisted
+        assert tracker.record_diagnostic_recoveries.call_count == 1
 
-        # Five unstamped below-floor batches open a fresh score_ceiling_below_min
-        # — opening it must re-arm (discard) the scale-gate recovery latch.
+        # Five unstamped below-floor batches open a fresh
+        # score_ceiling_below_min episode.
         for _ in range(5):
             engine._observe_score_scale("gh", "read_file", unstamped_low, 0.03)
-        assert ("gh", "read_file") not in engine._scale_gate_recovery_persisted
         tracker.record_diagnostic.assert_called_once_with(
             "gh", "read_file", "score_ceiling_below_min"
         )
 
-        # A later suspended batch must now close the re-opened episode.
-        tracker.record_diagnostic_recovery.reset_mock()
+        # A later suspended batch closes the re-opened episode.
+        tracker.record_diagnostic_recoveries.reset_mock()
         engine._observe_score_scale("gh", "read_file", rerank_low, 0.03, filter_suspended=True)
-        recoveries = [c.args[2] for c in tracker.record_diagnostic_recovery.call_args_list]
-        assert "score_ceiling_below_min" in recoveries
-
-    def test_suspended_recovery_retries_without_tracker(self):
-        """With no tracker the recovery write returns False, so the
-        once-per-key latch must NOT arm — a tracker attached later (or the
-        daemon path) still gets the recovery."""
-        engine = self._engine([], min_score=0.03)
-        low = [FakeSearchResult(chunk=FakeChunk(), score=-0.17, score_scale="rerank")]
-        engine._observe_score_scale("gh", "read_file", low, 0.03, filter_suspended=True)
-        assert ("gh", "read_file") not in engine._scale_gate_recovery_persisted
-
-    async def test_no_results_dedup_label_when_suspended_and_all_deduped(self):
-        """With the filter suspended an empty outcome cannot be score-caused;
-        session dedup must classify as ``no_results_dedup``."""
-        from memtomem_stm.surfacing.observability import SurfacingObservability
-
-        obs = SurfacingObservability()
-        chunk = FakeChunk(content="dup memory")
-        results = [FakeSearchResult(chunk=chunk, score=-0.5, score_scale="rerank")]
-        engine = self._engine(results, observability=obs, min_score=0.02)
-
-        out1 = await engine.surface(
-            "gh", "read_file", {"_context_query": "first dedup query"}, LONG_RESPONSE
+        tracker.record_diagnostic_recoveries.assert_called_once_with(
+            "gh", "read_file", DIAGNOSTIC_KINDS, recovered_at=ANY
         )
-        assert "dup memory" in out1
-        out2 = await engine.surface(
-            "gh", "read_file", {"_context_query": "second dedup query"}, LONG_RESPONSE
-        )
-        assert out2 == LONG_RESPONSE
-        skips = obs.snapshot()["skip_reasons"]["read_file"]
-        assert skips.get("no_results_dedup") == 1
-        assert "no_results_score" not in skips
-
-    async def test_suspension_logs_info_once(self, caplog):
-        results = [
-            FakeSearchResult(
-                chunk=FakeChunk(content="logged memory"), score=-0.5, score_scale="rerank"
-            )
-        ]
-        engine = self._engine(results, min_score=0.02)
-        with caplog.at_level(logging.INFO):
-            await engine.surface(
-                "gh", "read_file", {"_context_query": "first log query"}, LONG_RESPONSE
-            )
-            await engine.surface(
-                "gh", "read_file", {"_context_query": "second log query"}, LONG_RESPONSE
-            )
-        suspended_infos = [
-            r
-            for r in caplog.records
-            if r.levelno == logging.INFO and "min_score filter suspended" in r.message
-        ]
-        assert len(suspended_infos) == 1
-
-    async def test_snapshot_reports_gate_disabled(self):
-        results = [
-            FakeSearchResult(
-                chunk=FakeChunk(content="gate off"), score=0.5, score_scale="rerank"
-            )
-        ]
-        engine = self._engine(results, min_score=0.02, scale_gated_min_score=False)
-        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
-        snap = engine.get_min_score_snapshot()
-        assert snap["score_scale"]["gate_enabled"] is False
-        assert snap["score_scale"]["filter_suspended"] is False
-
-    async def test_cache_hit_stays_suspended_and_bucket_free(self):
-        """Cached results retain their scale stamps, so the hit render is
-        identical to the miss: injected, and bucket tags suppressed."""
-        results = [
-            FakeSearchResult(
-                chunk=FakeChunk(content="logit memory"), score=-0.5, score_scale="rerank"
-            )
-        ]
-        adapter = _make_mcp_adapter(results)
-        engine = SurfacingEngine(config=_make_config(min_score=0.02), mcp_adapter=adapter)
-
-        out1 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
-        out2 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
-        assert adapter.search.call_count == 1
-        for out in (out1, out2):
-            assert "logit memory" in out
-            for tag in ("[weak]", "[related]", "[strong]"):
-                assert tag not in out
-
 
 class TestScaleGateComposePath:
     """The scale gate and definitive diagnostic key off per-result stamps, so

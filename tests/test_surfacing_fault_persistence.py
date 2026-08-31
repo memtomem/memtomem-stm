@@ -11,6 +11,7 @@ feedback store, and ``read_surfacing_summary`` exposes them to the CLI.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -778,158 +779,122 @@ class TestEngineFaultPersistence:
         score_scale: str | None = None
         reranker: str | None = None
 
-    async def test_evicted_mismatch_latch_still_closes_the_durable_episode(self, tmp_path):
-        """#880 — the FIFO cap must not strand an open episode in the STORE.
+    async def test_peer_closing_the_episode_does_not_silence_this_process(self, tmp_path, caplog):
+        """#944 — the WARNING latch is per process, the row is shared.
 
-        Asserted against a real ``FeedbackTracker``/DB rather than a mock
-        call: what matters is that ``mms doctor`` stops FAILing, i.e. that
-        ``active_diagnostics`` is empty, not that some method was called.
+        Process A observing the tool healthy closes the row. B is still
+        mismatched, and its latch keeps it from re-WARNING; if persistence
+        were latched too, B would never reopen the row and ``mms doctor``
+        would report all-clear while the fault continued.
         """
-        adapter = AsyncMock()
         config = _make_config(tmp_path)
-        tracker = FeedbackTracker(config)
-        tracker.record_diagnostic("gh", "victim", "score_scale_mismatch")
-        assert _episode_is_open(config.feedback_db_path, "gh", "victim", "score_scale_mismatch")
-
-        engine = SurfacingEngine(config=config, mcp_adapter=adapter, feedback_tracker=tracker)
-        engine._score_scale_keys_max = 10
-        engine._score_scale_mismatch_active[("gh", "victim")] = None
-
-        # Bury the victim under enough distinct keys to evict its latch.
-        named_low = [self._ScaleResult(FakeChunk(), 0.001, "bm25")]
-        for i in range(30):
-            engine._observe_score_scale("gh", f"tool{i}", named_low, 0.03)
-        assert ("gh", "victim") not in engine._score_scale_mismatch_active
-        assert ("gh", "victim") not in engine._score_scale_mismatch_recovery_pending
-
-        healthy = [self._ScaleResult(FakeChunk(), 0.9)]
-        engine._observe_score_scale("gh", "victim", healthy, 0.03)
-
-        assert not _episode_is_open(
-            config.feedback_db_path, "gh", "victim", "score_scale_mismatch"
-        ), (
-            "an evicted key's episode stayed open — mms doctor would FAIL for "
-            "the full 7-day window on a recovered tool"
+        engine_b = SurfacingEngine(
+            config=config, mcp_adapter=AsyncMock(), feedback_tracker=FeedbackTracker(config)
         )
-
-    async def test_evicted_recovery_retries_after_a_failed_write(self, tmp_path):
-        """The fallback must inherit the pending map's retry, not be a second
-        write site that gives up when the store is transiently down."""
-        adapter = AsyncMock()
-        config = _make_config(tmp_path)
-        tracker = FeedbackTracker(config)
-        tracker.record_diagnostic("gh", "victim", "score_scale_mismatch")
-
-        engine = SurfacingEngine(config=config, mcp_adapter=adapter, feedback_tracker=tracker)
-        engine._score_scale_keys_max = 10
-        engine._score_scale_mismatch_active[("gh", "victim")] = None
+        engine_a = SurfacingEngine(
+            config=config, mcp_adapter=AsyncMock(), feedback_tracker=FeedbackTracker(config)
+        )
         named_low = [self._ScaleResult(FakeChunk(), 0.001, "bm25")]
-        for i in range(30):
-            engine._observe_score_scale("gh", f"tool{i}", named_low, 0.03)
-
         healthy = [self._ScaleResult(FakeChunk(), 0.9)]
-        real_recovery = tracker.record_diagnostic_recovery
-        calls: list[str] = []
 
-        def flaky(server, tool, kind):
-            calls.append(kind)
-            if kind == "score_scale_mismatch" and calls.count("score_scale_mismatch") == 1:
-                raise RuntimeError("sqlite unavailable")
-            real_recovery(server, tool, kind)
+        with caplog.at_level(logging.WARNING):
+            engine_b._observe_score_scale("gh", "read_file", named_low, 0.03)
+            assert _episode_is_open(
+                config.feedback_db_path, "gh", "read_file", "score_scale_mismatch"
+            )
 
-        tracker.record_diagnostic_recovery = flaky  # type: ignore[method-assign]
-        engine._observe_score_scale("gh", "victim", healthy, 0.03)
+            engine_a._observe_score_scale("gh", "read_file", healthy, 0.03)
+            assert not _episode_is_open(
+                config.feedback_db_path, "gh", "read_file", "score_scale_mismatch"
+            )
+
+            # B is still mismatched: its next observation must reopen the row.
+            engine_b._observe_score_scale("gh", "read_file", named_low, 0.03)
+
         assert _episode_is_open(
-            config.feedback_db_path, "gh", "victim", "score_scale_mismatch"
-        ), "the failed write must leave the episode open, not silently drop it"
-        assert ("gh", "victim") not in engine._score_scale_recovery_persisted, (
-            "the settled latch must stay open so the next healthy observation retries"
+            config.feedback_db_path, "gh", "read_file", "score_scale_mismatch"
+        ), "a peer's healthy observation silenced this process for the whole 7-day window"
+        assert [r for r in _fault_rows(config.feedback_db_path) if r[2] == "score_scale_mismatch"][
+            0
+        ][3] == 2, "the reopening write must also count the observation"
+        # B's WARNING stays latched — the log is per episode, per process.
+        assert len([r for r in caplog.records if "score-scale mismatch" in r.message]) == 1
+
+    async def test_healthy_observation_closes_an_episode_only_a_peer_recorded(self, tmp_path):
+        """The close side is unlatched for the same reason: this process never
+        saw the episode open, and must still close it on healthy evidence."""
+        config = _make_config(tmp_path)
+        peer = FeedbackTracker(config)
+        peer.record_diagnostic("gh", "read_file", "score_scale_mismatch")
+        peer.record_diagnostic("gh", "read_file", "score_ceiling_below_min")
+        peer.close()
+
+        engine = SurfacingEngine(
+            config=config, mcp_adapter=AsyncMock(), feedback_tracker=FeedbackTracker(config)
         )
-
-        engine._observe_score_scale("gh", "victim", healthy, 0.03)
-        assert not _episode_is_open(
-            config.feedback_db_path, "gh", "victim", "score_scale_mismatch"
+        assert ("gh", "read_file") not in engine._score_scale_mismatch_active
+        engine._observe_score_scale(
+            "gh", "read_file", [self._ScaleResult(FakeChunk(), 0.9)], 0.03
         )
-        assert ("gh", "victim") in engine._score_scale_recovery_persisted
+        assert read_surfacing_summary(config.feedback_db_path)["active_diagnostics"] == {}
 
-    async def test_retry_survives_eviction_of_the_pending_map(self, tmp_path):
-        """The retry must not depend on a map that can itself be evicted.
+    async def test_suspended_batch_closes_an_episode_only_a_peer_recorded(self, tmp_path):
+        config = _make_config(tmp_path)
+        peer = FeedbackTracker(config)
+        peer.record_diagnostic("gh", "read_file", "score_scale_mismatch")
+        peer.close()
 
-        Round-2's fix parked the key in ``_score_scale_mismatch_recovery_
-        pending``; evicting it there between the failed write and the retry
-        lost the retry for good, because the settled latch was already armed
-        by the ceiling write alone (#880, codex review round 3).
-        """
-        adapter = AsyncMock()
+        engine = SurfacingEngine(
+            config=config, mcp_adapter=AsyncMock(), feedback_tracker=FeedbackTracker(config)
+        )
+        engine._observe_score_scale(
+            "gh",
+            "read_file",
+            [self._ScaleResult(FakeChunk(), -0.17, "rerank")],
+            0.03,
+            filter_suspended=True,
+        )
+        assert read_surfacing_summary(config.feedback_db_path)["active_diagnostics"] == {}
+
+    async def test_mismatch_path_persists_every_observation(self, tmp_path, caplog):
+        """Counts track observations, not episodes — same as the fault rows."""
+        config = _make_config(tmp_path)
+        engine = SurfacingEngine(
+            config=config, mcp_adapter=AsyncMock(), feedback_tracker=FeedbackTracker(config)
+        )
+        named_low = [self._ScaleResult(FakeChunk(), 0.001, "bm25")]
+        unstamped_low = [self._ScaleResult(FakeChunk(), 0.001)]
+
+        with caplog.at_level(logging.WARNING):
+            for _ in range(3):
+                engine._observe_score_scale("gh", "read_file", named_low, 0.03)
+            for _ in range(6):
+                engine._observe_score_scale("gh", "other_tool", unstamped_low, 0.03)
+
+        rows = {(r[1], r[2]): r[3] for r in _fault_rows(config.feedback_db_path)}
+        assert rows[("read_file", "score_scale_mismatch")] == 3
+        # Six observations, saturating at five: writes on the 5th and 6th.
+        assert rows[("other_tool", "score_ceiling_below_min")] == 2
+        warnings = [r.message for r in caplog.records if "score-scale mismatch" in r.message]
+        assert len(warnings) == 2, "one WARNING per tier, still once per episode"
+
+    async def test_healthy_path_issues_one_recovery_statement_per_observation(self, tmp_path):
         config = _make_config(tmp_path)
         tracker = FeedbackTracker(config)
-        tracker.record_diagnostic("gh", "victim", "score_scale_mismatch")
-
-        engine = SurfacingEngine(config=config, mcp_adapter=adapter, feedback_tracker=tracker)
-        engine._score_scale_keys_max = 10
-        engine._score_scale_mismatch_active[("gh", "victim")] = None
-        named_low = [self._ScaleResult(FakeChunk(), 0.001, "bm25")]
-        for i in range(30):
-            engine._observe_score_scale("gh", f"tool{i}", named_low, 0.03)
+        engine = SurfacingEngine(
+            config=config, mcp_adapter=AsyncMock(), feedback_tracker=tracker
+        )
+        tracker.record_diagnostic("gh", "read_file", "score_scale_mismatch")
+        probe = _FailNthRecoveryUpdate(tracker.store._db, fail_on=0)
+        tracker.store._db = probe
 
         healthy = [self._ScaleResult(FakeChunk(), 0.9)]
-        real_recovery = tracker.record_diagnostic_recovery
-        fail_mismatch = True
-
-        def flaky(server, tool, kind):
-            if kind == "score_scale_mismatch" and fail_mismatch:
-                raise RuntimeError("sqlite unavailable")
-            real_recovery(server, tool, kind)
-
-        tracker.record_diagnostic_recovery = flaky  # type: ignore[method-assign]
-        engine._observe_score_scale("gh", "victim", healthy, 0.03)
-        assert _episode_is_open(config.feedback_db_path, "gh", "victim", "score_scale_mismatch")
-
-        # Churn every bookkeeping map well past the cap between the failure
-        # and the retry.
-        for i in range(100, 160):
-            engine._observe_score_scale("gh", f"tool{i}", named_low, 0.03)
-        assert ("gh", "victim") not in engine._score_scale_mismatch_recovery_pending
-
-        fail_mismatch = False
-        engine._observe_score_scale("gh", "victim", healthy, 0.03)
-        assert not _episode_is_open(
-            config.feedback_db_path, "gh", "victim", "score_scale_mismatch"
-        ), "eviction between the failed write and the retry lost the retry"
-
-    async def test_a_settled_key_stops_writing_when_both_writes_succeed(self, tmp_path):
-        """The settled latch closes on the AND of both writes, so a healthy
-        hot path stops writing once — and only once — both have landed."""
-        adapter = AsyncMock()
-        config = _make_config(tmp_path)
-        tracker = FeedbackTracker(config)
-        tracker.record_diagnostic("gh", "victim", "score_scale_mismatch")
-
-        engine = SurfacingEngine(config=config, mcp_adapter=adapter, feedback_tracker=tracker)
-        engine._score_scale_keys_max = 10
-        engine._score_scale_mismatch_active[("gh", "victim")] = None
-        named_low = [self._ScaleResult(FakeChunk(), 0.001, "bm25")]
-        for i in range(30):
-            engine._observe_score_scale("gh", f"tool{i}", named_low, 0.03)
-
-        healthy = [self._ScaleResult(FakeChunk(), 0.9)]
-        real_recovery = tracker.record_diagnostic_recovery
-        kinds: list[str] = []
-
-        def counting(server, tool, kind):
-            if (server, tool) == ("gh", "victim"):
-                kinds.append(kind)
-            real_recovery(server, tool, kind)
-
-        tracker.record_diagnostic_recovery = counting  # type: ignore[method-assign]
-        engine._observe_score_scale("gh", "victim", healthy, 0.03)
-        assert sorted(kinds) == ["score_ceiling_below_min", "score_scale_mismatch"]
-
         for _ in range(5):
-            engine._observe_score_scale("gh", "victim", healthy, 0.03)
-        assert sorted(kinds) == ["score_ceiling_below_min", "score_scale_mismatch"], (
-            "a settled key must not re-write its recovery on every healthy search"
-        )
+            engine._observe_score_scale("gh", "read_file", healthy, 0.03)
+
+        assert probe.attempts == 5, "one batched UPDATE covering both kinds per observation"
+        tracker.store._db = probe._db
+        assert read_surfacing_summary(config.feedback_db_path)["active_diagnostics"] == {}
 
     async def test_success_closes_the_episode_and_a_later_fault_reopens_it(self, tmp_path):
         """The whole point of #869: a healthy round trip closes the episode,
