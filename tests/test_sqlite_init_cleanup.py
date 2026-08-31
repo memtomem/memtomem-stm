@@ -22,26 +22,31 @@ from memtomem_stm.proxy.pending_store import SQLitePendingStore
 from memtomem_stm.surfacing.feedback_store import FeedbackStore
 
 
-_CASES: list[tuple[str, type[Any], str]] = [
-    ("memtomem_stm.surfacing.feedback_store", FeedbackStore, "feedback.db"),
+# The 4th element carries constructor kwargs a store requires (#876:
+# ``CompressionFeedbackStore`` has no ``retention_days`` default). ``0``
+# keeps this test's focus on connection cleanup, not purging.
+_CASES: list[tuple[str, type[Any], str, dict[str, Any]]] = [
+    ("memtomem_stm.surfacing.feedback_store", FeedbackStore, "feedback.db", {}),
     (
         "memtomem_stm.proxy.compression_feedback_store",
         CompressionFeedbackStore,
         "cfb.db",
+        {"retention_days": 0},
     ),
-    ("memtomem_stm.proxy.pending_store", SQLitePendingStore, "pending.db"),
-    ("memtomem_stm.proxy.cache", ProxyCache, "cache.db"),
-    ("memtomem_stm.proxy.metrics_store", MetricsStore, "metrics.db"),
+    ("memtomem_stm.proxy.pending_store", SQLitePendingStore, "pending.db", {}),
+    ("memtomem_stm.proxy.cache", ProxyCache, "cache.db", {}),
+    ("memtomem_stm.proxy.metrics_store", MetricsStore, "metrics.db", {}),
 ]
 
 
-@pytest.mark.parametrize("module_path, store_cls, filename", _CASES)
+@pytest.mark.parametrize("module_path, store_cls, filename, kwargs", _CASES)
 def test_initialize_releases_connection_on_tune_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     module_path: str,
     store_cls: type[Any],
     filename: str,
+    kwargs: dict[str, Any],
 ) -> None:
     mod = importlib.import_module(module_path)
 
@@ -50,7 +55,7 @@ def test_initialize_releases_connection_on_tune_failure(
 
     monkeypatch.setattr(mod, "tune_connection", boom)
 
-    store = store_cls(tmp_path / filename)
+    store = store_cls(tmp_path / filename, **kwargs)
     with pytest.raises(RuntimeError, match="simulated tune_connection failure"):
         store.initialize()
 

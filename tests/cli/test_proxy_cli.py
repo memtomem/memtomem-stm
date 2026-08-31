@@ -13856,6 +13856,53 @@ class TestTune:
         assert "--apply" in result.output
         assert config.read_bytes() == before
 
+    def test_preview_purges_feedback_per_configured_retention(self, runner, config, tmp_path):
+        """The feedback store must carry compression_feedback.retention_days.
+
+        ``tune`` opens the stores read-write and runs the server's startup
+        steps (its own docstring says so, and the sibling test above pins the
+        metrics half). ``initialize`` is where the feedback purge lives, so
+        opening the store with 0 would make it the one place that keeps rows
+        the config asked to drop (#876, codex review).
+        """
+        import sqlite3
+        import time
+
+        from memtomem_stm.proxy.compression_feedback_store import CompressionFeedbackStore
+
+        metrics_db = tmp_path / "metrics.db"
+        feedback_db = tmp_path / "cfb.db"
+        self._seed_config(
+            config,
+            metrics_db,
+            compression_feedback={"db_path": str(feedback_db), "retention_days": 30},
+        )
+        self._seed_metrics(metrics_db)
+        store = CompressionFeedbackStore(feedback_db, retention_days=0)
+        store.initialize()
+        try:
+            store.record("srv", "big_tool", "truncated", "aged out", None)
+            store.record("srv", "big_tool", "truncated", "still fresh", None)
+            store._db.execute(
+                "UPDATE compression_feedback SET created_at = ? WHERE missing = 'aged out'",
+                (time.time() - 90 * 86400.0,),
+            )
+            store._db.commit()
+        finally:
+            store.close()
+
+        result = runner.invoke(cli, ["tune", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+
+        db = sqlite3.connect(str(feedback_db))
+        try:
+            rows = [r[0] for r in db.execute("SELECT missing FROM compression_feedback")]
+        finally:
+            db.close()
+        assert rows == ["still fresh"], (
+            "tune opened the feedback store without the configured retention"
+        )
+
     def test_preview_respects_configured_max_history(self, runner, config, tmp_path):
         """The tune store must carry metrics.max_history: initialize() runs
         the per-source retention reconciliation, so the constructor default

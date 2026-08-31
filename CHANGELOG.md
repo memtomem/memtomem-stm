@@ -415,6 +415,26 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **The feedback stores no longer carry a retention default that contradicts
+  the config** (#876). `CompressionFeedbackStore` / `ProgressiveReadsStore` and
+  their trackers defaulted `retention_days` to `0` — never purge — while
+  `CompressionFeedbackConfig` / `ProgressiveReadsConfig` default to 90 days.
+  The daemon always passed the configured value, so the shipped purge was
+  correct; the risk was a *new* call site silently inheriting "keep forever",
+  and one already had: `mms tune` opened the feedback store bare, directly
+  under a comment explaining why the sibling `MetricsStore` must not do that.
+  `retention_days` is now a required keyword-only argument, so every caller
+  states its intent, and `mms tune` passes the configured value: it opens the
+  stores read-write and runs the server's startup steps by design (its
+  docstring says so, and the metrics store already carried its configured cap
+  there for the same reason), so the feedback store would otherwise be the one
+  place that keeps rows the config asked to drop. The
+  `docs/configuration.md` full example's
+  `retention_days: 90` for both blocks is now pinned against the models by
+  `test_docs_sync.py`, which previously claimed to cover every `ProxyConfig`
+  sub-block but checked only `cache` and `toolgraph`. No behavior change to the
+  proxy or the daemon: the purge runs exactly as before.
+
 - **A policy bundle's identity is published only once its decisions bind**
   (#940). Bundle adoption assigned the new snapshot, stamp, digest, instance id
   and generation before calling the bind, which is deliberately outside the
