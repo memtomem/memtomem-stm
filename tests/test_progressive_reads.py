@@ -23,7 +23,7 @@ from helpers import set_home
 
 class TestProgressiveReadsStore:
     def test_empty_stats(self, tmp_path: Path):
-        store = ProgressiveReadsStore(tmp_path / "pr.db")
+        store = ProgressiveReadsStore(tmp_path / "pr.db", retention_days=0)
         store.initialize()
         try:
             stats = store.get_stats()
@@ -40,7 +40,7 @@ class TestProgressiveReadsStore:
             store.close()
 
     def test_single_initial_row(self, tmp_path: Path):
-        store = ProgressiveReadsStore(tmp_path / "pr.db")
+        store = ProgressiveReadsStore(tmp_path / "pr.db", retention_days=0)
         store.initialize()
         try:
             store.record(
@@ -66,7 +66,7 @@ class TestProgressiveReadsStore:
 
     @pytest.mark.parametrize("field", ["key", "trace_id", "server", "tool"])
     def test_unencodable_identifier_is_refused(self, tmp_path: Path, field: str):
-        store = ProgressiveReadsStore(tmp_path / "pr.db")
+        store = ProgressiveReadsStore(tmp_path / "pr.db", retention_days=0)
         store.initialize()
         values = {"key": "key", "trace_id": "trace", "server": "server", "tool": "tool"}
         values[field] += "\ud800"
@@ -93,7 +93,7 @@ class TestProgressiveReadsStore:
         import time
 
         db_path = tmp_path / "pr.db"
-        store = ProgressiveReadsStore(db_path)
+        store = ProgressiveReadsStore(db_path, retention_days=0)
         store.initialize()
         store.record("old", "t", "s", "tool_a", 0, 10, 10, 10)
         store.record("new", "t", "s", "tool_a", 0, 10, 10, 10)
@@ -113,12 +113,17 @@ class TestProgressiveReadsStore:
         assert keys == ["new"]
         store2.close()
 
-    def test_startup_purge_disabled_by_default(self, tmp_path: Path):
-        """retention_days defaults to 0 → no purge, rows kept indefinitely."""
+    def test_startup_purge_disabled_when_zero(self, tmp_path: Path):
+        """``retention_days=0`` → no purge, rows kept indefinitely.
+
+        There is no constructor default to fall back on (#876): the store
+        requires the value, so this pins the explicit opt-out that
+        ``mms tune`` relies on, not an implicit one.
+        """
         import time
 
         db_path = tmp_path / "pr.db"
-        store = ProgressiveReadsStore(db_path)
+        store = ProgressiveReadsStore(db_path, retention_days=0)
         store.initialize()
         store.record("old", "t", "s", "tool_a", 0, 10, 10, 10)
         assert store._db is not None
@@ -129,7 +134,7 @@ class TestProgressiveReadsStore:
         store._db.commit()
         store.close()
 
-        store2 = ProgressiveReadsStore(db_path)  # retention_days=0
+        store2 = ProgressiveReadsStore(db_path, retention_days=0)
         store2.initialize()
         assert store2._db is not None
         assert store2._db.execute("SELECT COUNT(*) FROM progressive_reads").fetchone()[0] == 1
@@ -137,7 +142,7 @@ class TestProgressiveReadsStore:
 
     def test_full_follow_up_rate(self, tmp_path: Path):
         """Initial + 2 follow-ups on the same key → follow_up_rate 1.0."""
-        store = ProgressiveReadsStore(tmp_path / "pr.db")
+        store = ProgressiveReadsStore(tmp_path / "pr.db", retention_days=0)
         store.initialize()
         try:
             store.record("k1", "t1", "docfix", "tool_a", 0, 4000, 4000, 10000)
@@ -154,7 +159,7 @@ class TestProgressiveReadsStore:
 
     def test_mixed_follow_up_rate(self, tmp_path: Path):
         """Two responses: one multi-read, one single-read → rate 0.5."""
-        store = ProgressiveReadsStore(tmp_path / "pr.db")
+        store = ProgressiveReadsStore(tmp_path / "pr.db", retention_days=0)
         store.initialize()
         try:
             # k1: full coverage across 2 reads
@@ -180,7 +185,7 @@ class TestProgressiveReadsStore:
             store.close()
 
     def test_tool_filter_empties_by_tool(self, tmp_path: Path):
-        store = ProgressiveReadsStore(tmp_path / "pr.db")
+        store = ProgressiveReadsStore(tmp_path / "pr.db", retention_days=0)
         store.initialize()
         try:
             store.record("k1", None, "s", "tool_a", 0, 1000, 1000, 5000)
@@ -194,7 +199,7 @@ class TestProgressiveReadsStore:
 
     def test_coverage_capped_at_one(self, tmp_path: Path):
         """Defensive: served_to > total_chars should cap coverage at 1.0."""
-        store = ProgressiveReadsStore(tmp_path / "pr.db")
+        store = ProgressiveReadsStore(tmp_path / "pr.db", retention_days=0)
         store.initialize()
         try:
             store.record("k1", None, "s", "t", 0, 10000, 10000, 8000)
@@ -204,14 +209,14 @@ class TestProgressiveReadsStore:
             store.close()
 
     def test_record_after_close_is_noop(self, tmp_path: Path):
-        store = ProgressiveReadsStore(tmp_path / "pr.db")
+        store = ProgressiveReadsStore(tmp_path / "pr.db", retention_days=0)
         store.initialize()
         store.close()
         # No exception — telemetry must never raise into the hot path
         store.record("k1", None, "s", "t", 0, 10, 10, 10)
 
     def test_get_stats_on_closed_store_returns_empty(self, tmp_path: Path):
-        store = ProgressiveReadsStore(tmp_path / "pr.db")
+        store = ProgressiveReadsStore(tmp_path / "pr.db", retention_days=0)
         store.initialize()
         store.close()
         stats = store.get_stats()
@@ -219,13 +224,13 @@ class TestProgressiveReadsStore:
         assert stats["by_tool"] == {}
 
     def test_close_is_idempotent(self, tmp_path: Path):
-        store = ProgressiveReadsStore(tmp_path / "pr.db")
+        store = ProgressiveReadsStore(tmp_path / "pr.db", retention_days=0)
         store.initialize()
         store.close()
         store.close()  # second close must not raise
 
     def test_trace_id_nullable(self, tmp_path: Path):
-        store = ProgressiveReadsStore(tmp_path / "pr.db")
+        store = ProgressiveReadsStore(tmp_path / "pr.db", retention_days=0)
         store.initialize()
         try:
             store.record("k1", None, "s", "t", 0, 100, 100, 500)
@@ -240,9 +245,37 @@ class TestProgressiveReadsStore:
 # ---------------------------------------------------------------------------
 
 
+class TestRetentionIsAlwaysStated:
+    """#876 — the store/tracker require ``retention_days`` so no call site can
+    silently inherit "never purge" while ``ProgressiveReadsConfig`` says 90."""
+
+    def test_store_rejects_a_missing_retention(self, tmp_path: Path):
+        with pytest.raises(TypeError, match="retention_days"):
+            ProgressiveReadsStore(tmp_path / "pr.db")  # type: ignore[call-arg]
+
+    def test_store_rejects_a_positional_retention(self, tmp_path: Path):
+        with pytest.raises(TypeError):
+            ProgressiveReadsStore(tmp_path / "pr.db", 90)  # type: ignore[misc]
+
+    def test_tracker_rejects_a_missing_retention(self, tmp_path: Path):
+        with pytest.raises(TypeError, match="retention_days"):
+            ProgressiveReadsTracker(tmp_path / "pr.db")  # type: ignore[call-arg]
+
+    def test_tracker_forwards_retention_to_its_store(self, tmp_path: Path):
+        from memtomem_stm.proxy.config import ProgressiveReadsConfig
+
+        configured = ProgressiveReadsConfig().retention_days
+        assert configured == 90
+        tracker = ProgressiveReadsTracker(tmp_path / "pr.db", retention_days=configured)
+        try:
+            assert tracker.store._retention_days == 90
+        finally:
+            tracker.close()
+
+
 class TestProgressiveReadsTracker:
     def test_unencodable_identifier_is_warned_and_swallowed(self, tmp_path: Path, caplog):
-        tracker = ProgressiveReadsTracker(tmp_path / "pr.db")
+        tracker = ProgressiveReadsTracker(tmp_path / "pr.db", retention_days=0)
         try:
             with caplog.at_level("WARNING", logger="memtomem_stm.proxy.progressive_reads"):
                 tracker.record_initial(
@@ -259,7 +292,7 @@ class TestProgressiveReadsTracker:
             tracker.close()
 
     def test_record_initial_stores_offset_zero(self, tmp_path: Path):
-        tracker = ProgressiveReadsTracker(tmp_path / "pr.db")
+        tracker = ProgressiveReadsTracker(tmp_path / "pr.db", retention_days=0)
         try:
             tracker.record_initial(
                 key="k1",
@@ -277,7 +310,7 @@ class TestProgressiveReadsTracker:
             tracker.close()
 
     def test_record_follow_up_computes_served_to(self, tmp_path: Path):
-        tracker = ProgressiveReadsTracker(tmp_path / "pr.db")
+        tracker = ProgressiveReadsTracker(tmp_path / "pr.db", retention_days=0)
         try:
             tracker.record_initial(
                 key="k1",
@@ -304,7 +337,7 @@ class TestProgressiveReadsTracker:
             tracker.close()
 
     def test_record_after_close_is_swallowed(self, tmp_path: Path):
-        tracker = ProgressiveReadsTracker(tmp_path / "pr.db")
+        tracker = ProgressiveReadsTracker(tmp_path / "pr.db", retention_days=0)
         tracker.close()
         # Must not raise — telemetry failure cannot break the hot path
         tracker.record_initial(
@@ -328,7 +361,7 @@ class TestProgressiveReadsTracker:
     def test_path_expansion(self, tmp_path: Path, monkeypatch):
         """``~`` in db_path should be expanded to ``$HOME``."""
         set_home(monkeypatch, tmp_path)
-        tracker = ProgressiveReadsTracker(Path("~/pr_expand.db"))
+        tracker = ProgressiveReadsTracker(Path("~/pr_expand.db"), retention_days=0)
         try:
             assert (tmp_path / "pr_expand.db").exists()
         finally:

@@ -555,7 +555,7 @@ class TestFeedbackStoreCoexistence:
 
         # Simulate the production state: compression store created first,
         # with a row already written.
-        cstore = CompressionFeedbackStore(db_path)
+        cstore = CompressionFeedbackStore(db_path, retention_days=0)
         cstore.initialize()
         cstore.record(
             server="server-x",

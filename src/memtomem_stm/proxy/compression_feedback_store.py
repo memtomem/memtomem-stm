@@ -90,7 +90,14 @@ class CompressionFeedbackStore:
     tables are disjoint.
     """
 
-    def __init__(self, db_path: Path, retention_days: int = 0) -> None:
+    def __init__(self, db_path: Path, *, retention_days: int) -> None:
+        """*retention_days* is required so every call site states its intent.
+
+        ``0`` disables the startup purge; the configured default is 90
+        (``CompressionFeedbackConfig.retention_days``). Production callers
+        pass that config value through rather than a literal — a constructor
+        default here would silently diverge from the config (#876).
+        """
         self._db_path = db_path
         self._retention_days = retention_days
         self._db: sqlite3.Connection | None = None
