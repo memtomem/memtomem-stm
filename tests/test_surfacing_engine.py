@@ -3918,7 +3918,7 @@ class TestScoreScaleMapsAreBounded:
         engine._observe_score_scale("gh", "read_file", low, 0.03)
         engine._observe_score_scale("gh", "read_file", healthy, 0.03)
 
-        assert engine._score_scale_evicted is False
+        assert engine._score_scale_mismatch_evicted is False
         assert tracker.record_diagnostic_recovery.call_args_list == [
             call("gh", "read_file", "score_ceiling_below_min")
         ]

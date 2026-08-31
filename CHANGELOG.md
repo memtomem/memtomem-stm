@@ -434,11 +434,13 @@ changes inline only. See the deprecation policy in
   Eviction must not cost a *wrong* diagnostic: those in-memory latches are what
   tell a healthy observation to close the durable `score_scale_mismatch`
   episode, and an evicted key would otherwise keep `mms doctor` FAILing for the
-  full 7-day window on a tool that had recovered. So once anything has actually
-  been evicted, a healthy observation writes that recovery blind — a
-  WHERE-guarded UPDATE, harmless when no episode is open — under the same
-  per-key latch that already gates the ceiling recovery. Nothing evicts below
-  10k keys, so an ordinary deployment's write pattern is unchanged.
+  full 7-day window on a tool that had recovered. So once one of the two
+  mismatch maps has actually dropped a key, a healthy observation hands the key
+  to the existing recovery-pending path — which retries until the write is
+  durable — rather than issuing a second, unretried write of its own. The
+  recovery is a WHERE-guarded UPDATE, so a key with no open episode costs one
+  no-op statement. Nothing evicts below 10k keys, so an ordinary deployment's
+  write pattern is unchanged.
 
   **Behavior change**: past 10k distinct `(server, tool)` keys in one process,
   the oldest half of the score-scale state is forgotten instead of retained.
