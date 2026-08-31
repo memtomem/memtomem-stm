@@ -415,6 +415,26 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **The score-scale tripwire maps are bounded** (#880). `SurfacingEngine`
+  caps its surfaced-id, boost-dedup and cache-invalidation maps at 10k, and a
+  comment claimed the five `(server, tool)`-keyed score-scale maps needed no
+  cap because they were "naturally bounded by the configured upstream tool
+  set". Both halves were wrong. There is no configured tool set: keys come
+  from the upstream-advertised `tools/list` catalogue, which #917 rebuilds on
+  every reconnect, and on the hook/daemon path from the client-supplied
+  host-native tool name. And three of the maps shed a key only when a durable
+  recovery UPDATE succeeds — impossible for a trackerless engine, which is
+  exactly the hook/daemon configuration — so `_score_scale_mismatch_recovery_
+  pending` in particular kept every key that ever opened an episode. All five
+  now share the existing `_fifo_prune` policy through one seam in
+  `_observe_score_scale`, so every early return still prunes.
+
+  **Behavior change**: past 10k distinct `(server, tool)` keys in one process,
+  the oldest half of the score-scale state is forgotten instead of retained.
+  The cost of evicting a key is one repeated WARNING or one redundant
+  WHERE-guarded UPDATE that matches no open episode on its next observation —
+  never a wrong diagnostic.
+
 - **A policy bundle's identity is published only once its decisions bind**
   (#940). Bundle adoption assigned the new snapshot, stamp, digest, instance id
   and generation before calling the bind, which is deliberately outside the

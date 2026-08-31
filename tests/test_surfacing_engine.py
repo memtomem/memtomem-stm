@@ -3811,6 +3811,84 @@ class TestReportedScoreScale:
         assert tracker.record_surfacing.call_args.kwargs["score_scale"] is None
 
 
+class TestScoreScaleMapsAreBounded:
+    """#880 — the five score-scale tripwire maps are FIFO-capped.
+
+    Their keys are ``(server, tool)`` pairs built from the upstream-advertised
+    tool catalogue (rebuilt on every reconnect since #917) or, on the
+    hook/daemon path, from the client-supplied host-native tool name — not
+    from any configured tool set. Three of them shed a key only when a durable
+    recovery UPDATE succeeds, which a trackerless engine can never do, so
+    without a cap they grow for the life of the process.
+    """
+
+    @staticmethod
+    def _engine(*, tracker=None, **cfg_overrides):
+        return SurfacingEngine(
+            config=_make_config(**cfg_overrides),
+            mcp_adapter=_make_mcp_adapter([]),
+            feedback_tracker=tracker,
+        )
+
+    @staticmethod
+    def _drive(engine, results, *, count=20, **kwargs):
+        """Observe *count* distinct tool keys, newest last."""
+        for i in range(count):
+            engine._observe_score_scale("gh", f"tool{i}", results, 0.03, **kwargs)
+
+    def _assert_capped(self, mapping, cap=10, count=20):
+        assert len(mapping) <= cap, f"grew to {len(mapping)} past the {cap} cap"
+        assert ("gh", f"tool{count - 1}") in mapping, "newest key must survive"
+        assert ("gh", "tool0") not in mapping, "oldest key must evict"
+
+    def test_streaks_are_capped(self):
+        engine = self._engine(min_score=0.03)
+        engine._score_scale_keys_max = 10
+        low = [FakeSearchResult(chunk=FakeChunk(), score=0.001)]
+        self._drive(engine, low)
+        self._assert_capped(engine._score_scale_streaks)
+
+    def test_mismatch_active_is_capped(self):
+        engine = self._engine(min_score=0.03)
+        engine._score_scale_keys_max = 10
+        # A core-NAMED non-RRF scale with the gate off fires the definitive
+        # tier, which latches the key in ``_score_scale_mismatch_active``.
+        named_low = [FakeSearchResult(chunk=FakeChunk(), score=0.001, score_scale="bm25")]
+        self._drive(engine, named_low)
+        self._assert_capped(engine._score_scale_mismatch_active)
+
+    def test_mismatch_recovery_pending_is_capped_without_a_tracker(self):
+        """The worst leak: with ``feedback_tracker=None`` the discard at the
+        healthy branch is gated on a durable write that can never succeed, so
+        every key that ever opened an episode stayed forever."""
+        engine = self._engine(min_score=0.03)
+        engine._score_scale_keys_max = 10
+        assert engine._feedback_tracker is None
+        named_low = [FakeSearchResult(chunk=FakeChunk(), score=0.001, score_scale="bm25")]
+        healthy = [FakeSearchResult(chunk=FakeChunk(), score=0.9)]
+        self._drive(engine, named_low)
+        self._drive(engine, healthy)
+        self._assert_capped(engine._score_scale_mismatch_recovery_pending)
+
+    def test_recovery_persisted_is_capped(self):
+        engine = self._engine(tracker=MagicMock(), min_score=0.03)
+        engine._score_scale_keys_max = 10
+        low = [FakeSearchResult(chunk=FakeChunk(), score=0.001)]
+        healthy = [FakeSearchResult(chunk=FakeChunk(), score=0.9)]
+        # Below-threshold first: the healthy branch only persists recovery for
+        # a key it has not already recorded this cycle.
+        self._drive(engine, low)
+        self._drive(engine, healthy)
+        self._assert_capped(engine._score_scale_recovery_persisted)
+
+    def test_scale_gate_recovery_persisted_is_capped(self):
+        engine = self._engine(tracker=MagicMock(), min_score=0.03)
+        engine._score_scale_keys_max = 10
+        low = [FakeSearchResult(chunk=FakeChunk(), score=0.001, score_scale="rerank")]
+        self._drive(engine, low, filter_suspended=True)
+        self._assert_capped(engine._scale_gate_recovery_persisted)
+
+
 class TestScaleGatedMinScore:
     """Scale gate (``scale_gated_min_score``, the #1781-adoption follow-up):
     a core-named non-RRF scale suspends the RRF-calibrated global/auto-tuned
@@ -4669,7 +4747,7 @@ class TestFifoPruneHelper:
     def test_prune_idiom_lives_only_in_the_helper(self):
         """Source-inspection drift pin: a new guard map re-introducing the
         inline prune idiom would silently fork the eviction policy. Every
-        cap prune must route through ``_fifo_prune`` — a deliberate fifth
+        cap prune must route through ``_fifo_prune`` — a deliberate new
         call site should bump the expected count here."""
         import inspect
         import re
@@ -4681,5 +4759,7 @@ class TestFifoPruneHelper:
             "inline FIFO-prune idiom found outside _fifo_prune — route it "
             "through the helper instead"
         )
-        # 1 def + 4 call sites (boost single/batch, invalidation, surfaced).
-        assert len(re.findall(r"_fifo_prune\(", source)) == 5
+        # 1 def + 9 call sites: boost single/batch, invalidation, surfaced,
+        # and the five score-scale tripwire maps pruned together in
+        # ``_observe_score_scale``'s finally block (#880).
+        assert len(re.findall(r"_fifo_prune\(", source)) == 10
