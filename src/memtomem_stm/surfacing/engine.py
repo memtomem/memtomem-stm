@@ -768,25 +768,32 @@ class SurfacingEngine:
         if result_max >= min_score:
             self._score_scale_streaks.pop(key, None)
             if key not in self._score_scale_recovery_persisted:
-                closed_ceiling = self._persist_diagnostic_recovery(
-                    server, tool, "score_ceiling_below_min"
-                )
-                if closed_ceiling:
-                    self._score_scale_recovery_persisted[key] = None
-                # A key whose mismatch latch was FIFO-evicted (#880) may still
-                # have an OPEN ``score_scale_mismatch`` row that the
-                # latch-driven writes below can no longer reach, leaving
-                # ``mms doctor`` FAILing for the full 7-day window on a tool
-                # that recovered. Hand it to the pending map rather than
-                # writing here, so it inherits that path's retry-until-durable
-                # behavior instead of needing a second, unretried write site.
+                # The latch means "this key's recoveries are durably settled",
+                # so it is armed on the AND of the writes attempted here. That
+                # is what makes the retry unconditional: any write that fails
+                # leaves the latch open and the next healthy observation tries
+                # again, with no dependence on a second map that could itself
+                # be evicted between the failure and the retry (#880).
+                settled = self._persist_diagnostic_recovery(server, tool, "score_ceiling_below_min")
+                # A key whose mismatch latch was FIFO-evicted may still have an
+                # OPEN ``score_scale_mismatch`` row that the latch-driven
+                # writes below can no longer reach, leaving ``mms doctor``
+                # FAILing for the full 7-day window on a tool that recovered.
                 # ``record_diagnostic_recovery`` is a WHERE-guarded UPDATE, so
-                # a key with no open episode costs one no-op statement.
+                # a key with no open episode costs one no-op statement — and
+                # the close is written on this key's own healthy evidence,
+                # against this key's own row.
                 if (
                     self._score_scale_mismatch_evicted
                     and key not in self._score_scale_mismatch_active
+                    and key not in self._score_scale_mismatch_recovery_pending
                 ):
-                    self._score_scale_mismatch_recovery_pending[key] = None
+                    settled = (
+                        self._persist_diagnostic_recovery(server, tool, "score_scale_mismatch")
+                        and settled
+                    )
+                if settled:
+                    self._score_scale_recovery_persisted[key] = None
             # Re-arm the definitive-tier log UNCONDITIONALLY on a healthy
             # observation. Durable recovery is tracked separately so a DB
             # failure retries without suppressing a later genuine warning.

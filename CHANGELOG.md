@@ -435,10 +435,13 @@ changes inline only. See the deprecation policy in
   tell a healthy observation to close the durable `score_scale_mismatch`
   episode, and an evicted key would otherwise keep `mms doctor` FAILing for the
   full 7-day window on a tool that had recovered. So once one of the two
-  mismatch maps has actually dropped a key, a healthy observation hands the key
-  to the existing recovery-pending path — which retries until the write is
-  durable — rather than issuing a second, unretried write of its own. The
-  recovery is a WHERE-guarded UPDATE, so a key with no open episode costs one
+  mismatch maps has actually dropped a key, a healthy observation writes that
+  recovery too, and `_score_scale_recovery_persisted` now means "this key's
+  recoveries are durably settled" — armed on the AND of the writes attempted,
+  so any failure leaves it open and the next healthy observation retries, with
+  no dependence on bookkeeping that could itself be evicted in between. The
+  recovery is a WHERE-guarded UPDATE against that key's own row, written on
+  that key's own healthy evidence, so a key with no open episode costs one
   no-op statement. Nothing evicts below 10k keys, so an ordinary deployment's
   write pattern is unchanged.
 
