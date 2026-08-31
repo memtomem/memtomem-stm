@@ -415,6 +415,34 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **Score-scale diagnostics persist per observation and recover unlatched**
+  (#944). The `score_scale_mismatch` / `score_ceiling_below_min` path gated its
+  durable writes on four per-process in-memory latches, but the
+  `surfacing_faults` row is shared by every STM process on the machine —
+  `feedback_db_path` defaults to the user-wide `~/.memtomem/stm_feedback.db`
+  and every MCP client runs its own proxy. So one process closing an episode
+  (the scale gate does this blind on its first suspended batch) silenced
+  another that was still observing the mismatch: latched, it never wrote
+  again, and `mms doctor` reported all-clear for the rest of the 7-day window
+  while the fault continued. A single process cannot produce that, because
+  there the WARNING latch is the same state that holds the row open.
+
+  Diagnostics now follow the rule the fault path settled in #869: every
+  mismatched observation increments the row — which is also what reopens an
+  episode a peer closed — and every healthy or scale-suspended batch issues
+  one WHERE-guarded UPDATE closing both kinds. The WARNING is still logged
+  once per episode. `FeedbackStore.record_diagnostic_recovery` gained the
+  already-closed guard its fault-side twin had, so the repeat writes this
+  implies match no row, and `record_diagnostic_recoveries` closes both kinds
+  in one statement. Four latches and #880's eviction fallback are deleted with
+  it, net −326 lines.
+
+  **Behavior change**: the counts under "score-scale diagnostics" in
+  `mms stats` (and `surfacing.diagnostics` in `--json`) now count
+  below-threshold observations rather than episodes — the same meaning the
+  pipeline-fault counts above them already had. `mms doctor` only tests
+  whether an episode is open and is unaffected.
+
 - **The score-scale tripwire maps are bounded** (#880). `SurfacingEngine`
   caps its surfaced-id, boost-dedup and cache-invalidation maps at 10k, and a
   comment claimed the five `(server, tool)`-keyed score-scale maps needed no

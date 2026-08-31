@@ -708,8 +708,9 @@ hit:
 - `no_results_score` — LTM returned results, none above
   `min_score`. When five consecutive non-empty searches for the same
   upstream tool remain below the active floor, STM logs a one-shot
-  score-scale warning and persists `score_ceiling_below_min` for
-  `mms stats`. Check the LTM embedding/search backend first: a
+  score-scale warning and, from that search on, records a
+  `score_ceiling_below_min` diagnostic for `mms stats` on every such
+  search — the counter tracks observations, the warning stays one-shot. Check the LTM embedding/search backend first: a
   single-leg/BM25-only search has a lower score ceiling than the default
   hybrid scale. If the backend is healthy and the stricter policy is
   intentional, set `context_tools.<name>.min_score` explicitly. The
@@ -730,8 +731,8 @@ hit:
   non-RRF scale: a per-tool `context_tools.<name>.min_score` pin is
   present, or `scale_gated_min_score=false` — then STM warns on the
   **first** below-threshold observation (no five-call streak, the
-  threshold is calibrated against RRF) and persists
-  `score_scale_mismatch`. `stm_surfacing_stats` shows the last
+  threshold is calibrated against RRF) and records a
+  `score_scale_mismatch` diagnostic on every such observation. `stm_surfacing_stats` shows the last
   core-reported scale as a `Score scale:` line (annotated when the filter
   is suspended), the reranker model ID when one is active, and each event
   row records its scale in `stm_feedback.db`. The compact format and the
