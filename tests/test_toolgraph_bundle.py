@@ -196,6 +196,75 @@ def test_switching_from_stdio_to_bundle_drops_the_stdio_coverage(tmp_path: Path)
     assert manager._advertised_reject_reasons == {}
 
 
+def test_switching_from_stdio_to_bundle_drops_the_stdio_from_cache(tmp_path):
+    """A freshly read bundle must not report the retired consult's provenance.
+
+    ``from_cache`` answers "is this decision current?" for the *stdio* consult,
+    whose verdict a #494 cache hit can supply. Bundle adoption reads the
+    artifact live every time, so carrying that flag across the owner change
+    would tell an operator a bundle they just published is being served from a
+    cache — the one question the field exists to answer, answered wrongly
+    (#919).
+    """
+    manager, bundle_path, live_tool = _manager(tmp_path)
+    # A previous stdio consult whose verdict came from the consult cache.
+    manager._toolgraph_state_owner = "stdio"
+    manager._toolgraph_from_cache = True
+
+    _write_bundle(bundle_path, _bundle(live_tool))
+    manager._refresh_toolgraph_bundle(startup=True)
+
+    assert manager._toolgraph_state_owner == "bundle"
+    status = manager.get_toolgraph_status()
+    assert status is not None
+    assert status["source"] == "bundle"
+    assert status["from_cache"] is False, (
+        "a live bundle read reported the retired stdio consult's cache provenance"
+    )
+
+
+def test_a_failed_rebind_leaves_the_previous_verdict_in_force(tmp_path: Path, monkeypatch):
+    """A binding bug must not empty the enforcement maps into fail-open.
+
+    ``_apply_toolgraph_policy_snapshot`` builds its maps in locals and only
+    then publishes them, so an exception mid-bind leaves the PREVIOUS verdict
+    standing — stale, but still enforcing. Clearing shared state before the
+    apply would replace that with empty maps, and no later refresh would
+    repair them: the new stamp is already published, and the bound catalog
+    revision still equals the live one, so the same-stamp path finds nothing to
+    rebind. Every tool would stay silently allowed for the rest of the session.
+    """
+    manager, bundle_path, live_tool = _manager(tmp_path)
+    _write_bundle(bundle_path, _bundle(live_tool, decision="rejected"))
+    manager._refresh_toolgraph_bundle(startup=True)
+    before = dict(manager._toolgraph_external_rejects)
+    assert before, "precondition: the first bundle must reject the live tool"
+    before_penalties = dict(manager._toolgraph_risk_penalties)
+    before_facts = dict(manager._toolgraph_graph_facts)
+    assert before_penalties and before_facts, "precondition: the bind recorded enrichment"
+    # Seeded so the provenance clear is pinned to the same barrier: it must not
+    # run either until the bind that justifies it has succeeded.
+    manager._toolgraph_from_cache = True
+
+    # A new artifact (fresh stamp, so the adopt path runs) whose bind raises.
+    def _boom(*args, **kwargs):
+        raise RuntimeError("binding bug")
+
+    monkeypatch.setattr(manager_mod, "tool_contract_digest", _boom)
+    _write_bundle(bundle_path, _bundle(live_tool, decision="eligible"))
+    with pytest.raises(RuntimeError):
+        manager._refresh_toolgraph_bundle()
+
+    assert manager._toolgraph_external_rejects == before, (
+        "a bind failure emptied the enforcement maps, silently allowing every tool"
+    )
+    assert manager._toolgraph_risk_penalties == before_penalties
+    assert manager._toolgraph_graph_facts == before_facts
+    assert manager._toolgraph_from_cache is True, (
+        "provenance was retired for a bundle whose decisions never bound"
+    )
+
+
 def test_parser_accepts_additive_fields_and_pins_exact_bytes():
     doc = _bundle(_tool())
     doc["future"] = {"safe": True}

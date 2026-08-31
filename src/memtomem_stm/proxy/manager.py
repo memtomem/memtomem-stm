@@ -1238,6 +1238,18 @@ class ProxyManager:
         self._toolgraph_degraded_reason = None
         self._toolgraph_withhold_all = None
         self._apply_toolgraph_policy_snapshot(snapshot, cfg_live=cfg_live)
+        # Adoption is an owner transition, so the retired source's provenance
+        # goes with it: a bundle read from disk just now is not "from cache",
+        # whatever the stdio consult it replaced was served from (#919).
+        # AFTER the apply, not before, and deliberately not the whole
+        # ``_reset_toolgraph_verdict_state``: that helper also empties the
+        # enforcement maps, which the apply builds in locals and publishes only
+        # once it has finished. Clearing them first would turn a binding bug
+        # into empty maps — fail-open — that no later refresh repairs: the new
+        # stamp is published above, and a bind that raised never advanced
+        # ``_toolgraph_bound_catalog_revision``, which still equals the live
+        # revision, so the same-stamp path finds nothing to rebind.
+        self._clear_toolgraph_source_provenance()
         self._warn_on_bundle_provenance(path)
         logger.info(
             "Toolgraph policy bundle active: instance %s generation %d digest %s",
@@ -1616,6 +1628,16 @@ class ProxyManager:
         self._graph_generation = None
         self._toolgraph_degraded = False
         self._toolgraph_degraded_reason = None
+        self._clear_toolgraph_source_provenance()
+
+    def _clear_toolgraph_source_provenance(self) -> None:
+        """Drop what the CURRENT verdict's source says about its own freshness.
+
+        Split out so the two paths that retire a source share one enumeration:
+        the verdict reset above, and bundle adoption, which cannot use the
+        reset itself without opening a fail-open window (see the call site).
+        A field added here is picked up by both.
+        """
         self._toolgraph_from_cache = False
 
     def _reset_toolgraph_session_state(self) -> None:

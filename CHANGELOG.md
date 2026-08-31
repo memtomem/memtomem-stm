@@ -415,6 +415,20 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **A switch to a policy bundle no longer reports the retired consult's cache
+  provenance** (#919). `from_cache` records whether *this* session's stdio
+  consult verdict was served from the #494 consult cache, and it was cleared
+  only by the shared verdict reset. Successful bundle adoption was the one
+  verdict-adoption path that did not go through that reset — it overwrote the
+  owner, generation, digest and degraded flags in place — so a live
+  `stdio` → `bundle` switch after a cached consult left the flag set, and
+  `stm_proxy_health` rendered a freshly read bundle as being served "from
+  cache". Bundle adoption now drops the retired source's provenance once the
+  new decisions are bound, through the same helper the verdict reset uses so
+  the two paths share one enumeration. Reporting only: the enforcement verdict
+  was the bundle's and was already correct, but the field exists precisely to
+  answer "is this decision current?".
+
 - **H3 groups by the strategy AUTO chose, not the label the call ended on**
   (#937). The dominance share grouped by `compression_strategy`, which records
   the path a call *took*: `ProxyManager`'s degradation paths rewrite it — the
