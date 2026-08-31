@@ -423,11 +423,11 @@ changes inline only. See the deprecation policy in
   owner, generation, digest and degraded flags in place — so a live
   `stdio` → `bundle` switch after a cached consult left the flag set, and
   `stm_proxy_health` rendered a freshly read bundle as being served "from
-  cache". Bundle adoption now clears the shared verdict state the same way
-  every other owner transition does, after the load and re-stat barrier so a
-  rejected bundle still cannot disturb a verdict that is in force. Reporting
-  only: the enforcement verdict was the bundle's and was already correct, but
-  the field exists precisely to answer "is this decision current?".
+  cache". Bundle adoption now drops the retired source's provenance once the
+  new decisions are bound, through the same helper the verdict reset uses so
+  the two paths share one enumeration. Reporting only: the enforcement verdict
+  was the bundle's and was already correct, but the field exists precisely to
+  answer "is this decision current?".
 
 - **H3 groups by the strategy AUTO chose, not the label the call ended on**
   (#937). The dominance share grouped by `compression_strategy`, which records

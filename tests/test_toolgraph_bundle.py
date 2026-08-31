@@ -223,6 +223,36 @@ def test_switching_from_stdio_to_bundle_drops_the_stdio_from_cache(tmp_path):
     )
 
 
+def test_a_failed_rebind_leaves_the_previous_verdict_in_force(tmp_path: Path, monkeypatch):
+    """A binding bug must not empty the enforcement maps into fail-open.
+
+    ``_apply_toolgraph_policy_snapshot`` builds its maps in locals and publishes
+    them in one go at the end, so an exception mid-bind leaves the PREVIOUS
+    verdict standing — stale, but still enforcing. Clearing shared state before
+    the apply would replace that with empty maps, and because the new stamp and
+    the bound catalog revision are already published, no later refresh would
+    rebind: every tool would stay silently allowed for the rest of the session.
+    """
+    manager, bundle_path, live_tool = _manager(tmp_path)
+    _write_bundle(bundle_path, _bundle(live_tool, decision="rejected"))
+    manager._refresh_toolgraph_bundle(startup=True)
+    before = dict(manager._toolgraph_external_rejects)
+    assert before, "precondition: the first bundle must reject the live tool"
+
+    # A new artifact (fresh stamp, so the adopt path runs) whose bind raises.
+    def _boom(*args, **kwargs):
+        raise RuntimeError("binding bug")
+
+    monkeypatch.setattr(manager_mod, "tool_contract_digest", _boom)
+    _write_bundle(bundle_path, _bundle(live_tool, decision="eligible"))
+    with pytest.raises(RuntimeError):
+        manager._refresh_toolgraph_bundle()
+
+    assert manager._toolgraph_external_rejects == before, (
+        "a bind failure emptied the enforcement maps, silently allowing every tool"
+    )
+
+
 def test_parser_accepts_additive_fields_and_pins_exact_bytes():
     doc = _bundle(_tool())
     doc["future"] = {"safe": True}
