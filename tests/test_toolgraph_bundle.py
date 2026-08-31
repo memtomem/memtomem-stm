@@ -265,6 +265,50 @@ def test_a_failed_rebind_leaves_the_previous_verdict_in_force(tmp_path: Path, mo
     )
 
 
+def test_a_failed_bind_publishes_no_part_of_the_new_bundle(tmp_path: Path, monkeypatch):
+    """Identity and decisions move together, or not at all (#940).
+
+    Binding sits outside the reject barrier on purpose — a bug there is not an
+    invalid artifact — but it can still raise. Publishing the new bundle's
+    snapshot, digest and generation ahead of it would leave status reporting
+    the artifact that failed to bind over the decisions of the one still
+    enforcing, and settle there for good: the stamp would already match, so the
+    same-stamp path is all any later refresh would run, and it rebinds only
+    when the catalog revision moved.
+    """
+    manager, bundle_path, live_tool = _manager(tmp_path)
+    _write_bundle(bundle_path, _bundle(live_tool, decision="rejected"))
+    manager._refresh_toolgraph_bundle(startup=True)
+    before = manager.get_toolgraph_status()
+    before_rejects = dict(manager._toolgraph_external_rejects)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("binding bug")
+
+    monkeypatch.setattr(manager_mod, "tool_contract_digest", _boom)
+    # A different bundle: new generation and a new digest, so adopting any part
+    # of it is visible in the reported identity.
+    doc = _bundle(live_tool, decision="eligible")
+    doc["graph_state"]["generation"] = 99
+    _write_bundle(bundle_path, doc)
+    with pytest.raises(RuntimeError):
+        manager._refresh_toolgraph_bundle()
+
+    after = manager.get_toolgraph_status()
+    assert after["graph_generation"] == before["graph_generation"], (
+        "status reported the generation of a bundle whose decisions never bound"
+    )
+    assert after["bundle_digest"] == before["bundle_digest"]
+    assert manager._toolgraph_external_rejects == before_rejects
+
+    # And it retries rather than settling: the stamp was never published, so a
+    # later refresh re-enters adoption instead of the same-stamp rebind.
+    monkeypatch.undo()
+    manager._refresh_toolgraph_bundle()
+    assert manager.get_toolgraph_status()["graph_generation"] == 99
+    assert manager._toolgraph_external_rejects == {}
+
+
 def test_parser_accepts_additive_fields_and_pins_exact_bytes():
     doc = _bundle(_tool())
     doc["future"] = {"safe": True}

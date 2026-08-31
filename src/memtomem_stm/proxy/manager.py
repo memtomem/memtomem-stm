@@ -1228,6 +1228,19 @@ class ProxyManager:
             self._reject_toolgraph_bundle(exc, startup=startup, cfg_live=cfg_live)
             return
 
+        # Bind FIRST, publish the bundle's identity second (#940). Binding is
+        # deliberately outside the reject barrier — a bug here is not an
+        # invalid artifact — but it can still raise, and
+        # ``_apply_toolgraph_policy_snapshot`` builds its maps in locals and
+        # publishes them only once it has finished. Assigning the metadata
+        # ahead of it would leave a failure reporting the NEW bundle's
+        # snapshot, digest and generation over the OLD bundle's decisions, and
+        # settle there: the stamp would already match, so no later refresh
+        # would re-enter this path. With the order below a failed bind changes
+        # nothing at all, and the unchanged stamp makes the next refresh retry.
+        # The two halves are separated by no await, so nothing observes the
+        # manager between them.
+        self._apply_toolgraph_policy_snapshot(snapshot, cfg_live=cfg_live)
         self._toolgraph_policy_snapshot = snapshot
         self._toolgraph_bundle_stamp = after_stamp
         self._toolgraph_state_owner = "bundle"
@@ -1237,18 +1250,10 @@ class ProxyManager:
         self._toolgraph_degraded = False
         self._toolgraph_degraded_reason = None
         self._toolgraph_withhold_all = None
-        self._apply_toolgraph_policy_snapshot(snapshot, cfg_live=cfg_live)
         # Adoption is an owner transition, so the retired source's provenance
         # goes with it: a bundle read from disk just now is not "from cache",
-        # whatever the stdio consult it replaced was served from (#919).
-        # AFTER the apply, not before, and deliberately not the whole
-        # ``_reset_toolgraph_verdict_state``: that helper also empties the
-        # enforcement maps, which the apply builds in locals and publishes only
-        # once it has finished. Clearing them first would turn a binding bug
-        # into empty maps — fail-open — that no later refresh repairs: the new
-        # stamp is published above, and a bind that raised never advanced
-        # ``_toolgraph_bound_catalog_revision``, which still equals the live
-        # revision, so the same-stamp path finds nothing to rebind.
+        # whatever the stdio consult it replaced was served from (#919). Like
+        # the metadata above, it stays on the far side of the bind.
         self._clear_toolgraph_source_provenance()
         self._warn_on_bundle_provenance(path)
         logger.info(

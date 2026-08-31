@@ -415,6 +415,17 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **A policy bundle's identity is published only once its decisions bind**
+  (#940). Bundle adoption assigned the new snapshot, stamp, digest, instance id
+  and generation before calling the bind, which is deliberately outside the
+  artifact-reject barrier: a binding bug is not an invalid bundle. But a bind
+  that raised then left `stm_proxy_health` reporting the new artifact over the
+  previous bundle's decisions — and settled there, because the matching stamp
+  meant every later refresh took the same-stamp path, which rebinds only when
+  the live catalog revision has moved. Adoption now binds first and publishes
+  the identity second, so a failed bind changes nothing at all and the
+  unchanged stamp makes the next refresh retry it.
+
 - **A switch to a policy bundle no longer reports the retired consult's cache
   provenance** (#919). `from_cache` records whether *this* session's stdio
   consult verdict was served from the #494 consult cache, and it was cleared
