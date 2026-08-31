@@ -228,6 +228,118 @@ class TestRecordFault:
         assert len(_fault_rows(tmp_path / "f.db")) == 1
 
 
+class TestRecordDiagnosticRecovery:
+    """Diagnostic episodes close on the same rules as fault episodes (#944).
+
+    The engine now writes this on every healthy or scale-suspended batch
+    instead of latching "already recovered" per process, so the guard that
+    makes a repeat write inert is what keeps that affordable — and the kind
+    partition is what keeps it from touching a fault row.
+    """
+
+    def test_repeating_recovery_leaves_a_closed_row_untouched(self, tmp_path, monkeypatch):
+        clock = [1_700_000_000.0]
+        monkeypatch.setattr(
+            "memtomem_stm.surfacing.feedback_store.time.time",
+            lambda: clock[0],
+        )
+        db_path = tmp_path / "f.db"
+        store = FeedbackStore(db_path)
+        store.initialize()
+        store.record_diagnostic("gh", "read_file", "score_scale_mismatch")
+        clock[0] += 10.0
+        store.record_diagnostic_recoveries("gh", "read_file", recovered_at=clock[0])
+        stamped = store._db.execute("SELECT last_recovered_at FROM surfacing_faults").fetchone()[0]
+
+        clock[0] += 10.0
+        store.record_diagnostic_recoveries("gh", "read_file", recovered_at=clock[0])
+        assert (
+            store._db.execute("SELECT last_recovered_at FROM surfacing_faults").fetchone()[0]
+            == stamped
+        ), "a closed episode must not be re-stamped on every healthy observation"
+
+        # Positive control: a new diagnostic reopens the episode and the next
+        # recovery does advance the stamp.
+        clock[0] += 10.0
+        store.record_diagnostic("gh", "read_file", "score_scale_mismatch")
+        clock[0] += 10.0
+        store.record_diagnostic_recoveries("gh", "read_file", recovered_at=clock[0])
+        assert (
+            store._db.execute("SELECT last_recovered_at FROM surfacing_faults").fetchone()[0]
+            > stamped
+        )
+        store.close()
+
+    def test_both_kinds_close_in_one_call(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "memtomem_stm.surfacing.feedback_store.time.time",
+            lambda: 1_700_000_000.0,
+        )
+        db_path = tmp_path / "f.db"
+        store = FeedbackStore(db_path)
+        store.initialize()
+        store.record_diagnostic("gh", "read_file", "score_scale_mismatch")
+        store.record_diagnostic("gh", "read_file", "score_ceiling_below_min")
+
+        store.record_diagnostic_recoveries("gh", "read_file", recovered_at=1_700_000_000.0)
+        assert read_surfacing_summary(db_path)["active_diagnostics"] == {}
+        store.close()
+
+    def test_recovery_leaves_faults_open(self, tmp_path, monkeypatch):
+        """The mirror of ``test_recovery_leaves_diagnostics_open``: a healthy
+        score scale says nothing about a timed-out dependency."""
+        monkeypatch.setattr(
+            "memtomem_stm.surfacing.feedback_store.time.time",
+            lambda: 1_700_000_000.0,
+        )
+        db_path = tmp_path / "f.db"
+        store = FeedbackStore(db_path)
+        store.initialize()
+        store.record_fault("gh", "read_file", "error_timeout")
+        store.record_diagnostic("gh", "read_file", "score_scale_mismatch")
+
+        store.record_diagnostic_recoveries("gh", "read_file", recovered_at=1_700_000_000.0)
+        summary = read_surfacing_summary(db_path)
+        assert summary["active_diagnostics"] == {}
+        assert summary["active_faults"] == {"error_timeout": 1}
+        store.close()
+
+    def test_single_kind_wrapper_carries_the_guard(self, tmp_path, monkeypatch):
+        """``record_diagnostic_recovery`` closes only the kind it is given and
+        inherits the already-closed guard from the batched form."""
+        clock = [1_700_000_000.0]
+        monkeypatch.setattr(
+            "memtomem_stm.surfacing.feedback_store.time.time",
+            lambda: clock[0],
+        )
+        db_path = tmp_path / "f.db"
+        store = FeedbackStore(db_path)
+        store.initialize()
+        store.record_diagnostic("gh", "read_file", "score_scale_mismatch")
+        store.record_diagnostic("gh", "read_file", "score_ceiling_below_min")
+
+        clock[0] += 10.0
+        store.record_diagnostic_recovery("gh", "read_file", "score_scale_mismatch")
+        assert read_surfacing_summary(db_path)["active_diagnostics"] == {
+            "score_ceiling_below_min": 1
+        }
+        stamped = store._db.execute(
+            "SELECT last_recovered_at FROM surfacing_faults WHERE kind = ?",
+            ("score_scale_mismatch",),
+        ).fetchone()[0]
+
+        clock[0] += 10.0
+        store.record_diagnostic_recovery("gh", "read_file", "score_scale_mismatch")
+        assert (
+            store._db.execute(
+                "SELECT last_recovered_at FROM surfacing_faults WHERE kind = ?",
+                ("score_scale_mismatch",),
+            ).fetchone()[0]
+            == stamped
+        )
+        store.close()
+
+
 class TestRecordFaultRecovery:
     """A fault episode must close when a later surfacing proves LTM healthy.
 

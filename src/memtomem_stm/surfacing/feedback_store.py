@@ -597,19 +597,36 @@ class FeedbackStore:
         )
 
     def record_diagnostic_recovery(self, server: str, tool: str, kind: str) -> None:
-        """Mark all existing rows for one diagnostic episode as recovered."""
-        if self._db is None or kind not in DIAGNOSTIC_KINDS:
-            return
-        if has_lone_surrogate(server) or has_lone_surrogate(tool):
-            return
-        now = time.time()
-        with self._lock:
-            self._db.execute(
-                "UPDATE surfacing_faults SET last_recovered_at = ? "
-                "WHERE server = ? AND tool = ? AND kind = ? AND last_at <= ?",
-                (now, server, tool, kind, now),
-            )
-            self._db.commit()
+        """Mark all existing rows for one diagnostic episode as recovered.
+
+        Thin wrapper over :meth:`record_diagnostic_recoveries` so the
+        already-closed guard and the kind filter live in one place.
+        """
+        self.record_diagnostic_recoveries(server, tool, frozenset({kind}), recovered_at=time.time())
+
+    def record_diagnostic_recoveries(
+        self,
+        server: str,
+        tool: str,
+        kinds: frozenset[str] = DIAGNOSTIC_KINDS,
+        *,
+        recovered_at: float,
+    ) -> None:
+        """Close one key's diagnostic episodes in ONE statement.
+
+        The engine writes this on every healthy or scale-suspended batch
+        rather than latching "already recovered" per process, mirroring
+        :meth:`record_fault_recovery`: the rows are shared by every process
+        pointing at this DB, so a per-process latch goes stale the moment a
+        peer reopens the episode. Already-closed rows are left alone, so the
+        repeat writes that rule implies cost one statement matching no row.
+        """
+        self._close_episodes(
+            ((server, tool, kinds),),
+            DIAGNOSTIC_KINDS,
+            recovered_at=recovered_at,
+            what="diagnostic recovery",
+        )
 
     def record_fault_recovery(
         self,
@@ -665,13 +682,31 @@ class FeedbackStore:
         would show the survivors as broken with the breaker long closed.
         Per-key semantics are :meth:`record_fault_recovery`'s.
         """
+        self._close_episodes(entries, FAULT_KINDS, recovered_at=recovered_at, what="fault recovery")
+
+    def _close_episodes(
+        self,
+        entries: Iterable[tuple[str, str, frozenset[str]]],
+        allowed_kinds: frozenset[str],
+        *,
+        recovered_at: float,
+        what: str,
+    ) -> None:
+        """Close every entry's still-open episodes in one transaction.
+
+        Shared by the fault and diagnostic recovery paths so the WHERE guard
+        — including ``last_recovered_at IS NULL OR last_recovered_at <
+        last_at``, which makes a repeat write match nothing — cannot drift
+        between them. *allowed_kinds* keeps each caller inside its own
+        taxonomy: a fault recovery must never stamp a diagnostic row.
+        """
         if self._db is None:
             return
         statements: list[tuple[str, tuple[object, ...]]] = []
         for server, tool, kinds in entries:
             if has_lone_surrogate(server) or has_lone_surrogate(tool):
                 continue
-            selected = sorted(kinds & FAULT_KINDS)
+            selected = sorted(kinds & allowed_kinds)
             if not selected:
                 continue
             kind_placeholders = ", ".join("?" for _ in selected)
@@ -692,7 +727,7 @@ class FeedbackStore:
                     self._db.execute(sql, params)
                 self._db.commit()
             except Exception:
-                self._abandon_transaction("fault recovery")
+                self._abandon_transaction(what)
                 raise
 
     def _abandon_transaction(self, what: str) -> None:
