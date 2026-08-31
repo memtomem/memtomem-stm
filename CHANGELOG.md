@@ -440,10 +440,13 @@ changes inline only. See the deprecation policy in
   H3's share, its volume gate and the confidence label it contributes to all
   move to that narrowed population together — the same discipline #928 needed
   one level up, where a gate and a measurement over two different populations
-  is exactly what went wrong. The reason states what the rows attest: *"AUTO
-  selected hybrid for 9 of 10 calls it resolved (90.0%)"*. The config check
-  stays as the mirror case: the rows say AUTO ran, the config says whether it
-  still does.
+  is exactly what went wrong. The reason states what the rows attest, which is
+  which calls AUTO decided and what ran on them: *"hybrid ran on 9 of 10 calls
+  AUTO resolved (90.0%)"*. It is deliberately not phrased as what AUTO
+  *selected* — the ratio-guard ladder rewrites the label after selection, so a
+  strategy that sometimes degrades is split across labels here. That splitting
+  predates this change and is unaffected by it. The config check stays as the
+  mirror case: the rows say AUTO ran, the config says whether it still does.
 
   **Behavior change**: no `compression` pin until at least
   `MEDIUM_CONFIDENCE_CALLS` calls have been recorded whose strategy AUTO chose,

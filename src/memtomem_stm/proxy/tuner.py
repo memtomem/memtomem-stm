@@ -70,13 +70,16 @@ class ToolProfile:
 
     @property
     def auto_dominant_strategy_share(self) -> float:
-        """Fraction of AUTO's own resolutions won by ``auto_dominant_strategy``.
+        """Fraction of AUTO's own resolutions that ran ``auto_dominant_strategy``.
 
-        Numerator and denominator both count calls whose strategy AUTO chose
-        at runtime, so this measures how consistently AUTO lands on one
-        strategy — the only thing a pin can be judged against. Calls that ran
-        under a pin, and calls whose provenance was never recorded, are in
-        neither (#933).
+        Numerator and denominator both count calls the AUTO selector decided,
+        so this measures how consistently those calls land on one strategy —
+        the only thing a pin can be judged against. Calls that ran under a
+        pin, and calls whose provenance was never recorded, are in neither
+        (#933). The labels it groups are post-degradation, so a strategy that
+        sometimes falls back is split across labels and reads lower here than
+        the selector's own consistency; that predates this measurement and is
+        tracked in #937.
         """
         if self.auto_strategy_count <= 0:
             return 0.0
@@ -253,8 +256,8 @@ class CompressionTuner:
                 # this advice rests on (#934).
                 evidence = min(evidence, p.ratio_count)
 
-        # H3: Strategy pinning — AUTO settles on one settable strategy > 80% of
-        # the time. Every count here is over the calls AUTO actually resolved:
+        # H3: Strategy pinning — one settable strategy runs on > 80% of the
+        # calls AUTO resolved. Every count here is over that population:
         # the advice is "AUTO keeps reaching the same answer, so state it and
         # skip the detection", which a call that ran under a pin is no evidence
         # for (#933) — it never ran detection, and its label attests the pin.
@@ -278,9 +281,9 @@ class CompressionTuner:
                         current=current_strat,
                         recommended=p.auto_dominant_strategy,
                         reason=(
-                            f"AUTO selected {p.auto_dominant_strategy} for "
+                            f"{p.auto_dominant_strategy} ran on "
                             f"{p.auto_dominant_strategy_count} of "
-                            f"{p.auto_strategy_count} calls it resolved "
+                            f"{p.auto_strategy_count} calls AUTO resolved "
                             f"({p.auto_dominant_strategy_share:.1%}) — "
                             "pin to skip detection overhead"
                         ),

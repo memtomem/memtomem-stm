@@ -240,7 +240,7 @@ class TestAnalyze:
         strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
         assert len(strat_actions) == 1
         assert strat_actions[0].recommended == "hybrid"
-        assert "AUTO selected hybrid for 9 of 10 calls it resolved" in strat_actions[0].reason
+        assert "hybrid ran on 9 of 10 calls AUTO resolved" in strat_actions[0].reason
         assert "90.0%" in strat_actions[0].reason
 
     def test_a_share_exactly_at_the_threshold_does_not_fire(self, metrics_store: MetricsStore):
@@ -283,7 +283,7 @@ class TestAnalyze:
         recs = tuner.analyze()
         strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
         assert len(strat_actions) == 1
-        assert "AUTO selected hybrid for 9 of 11 calls it resolved" in strat_actions[0].reason
+        assert "hybrid ran on 9 of 11 calls AUTO resolved" in strat_actions[0].reason
 
     def test_the_volume_gate_counts_the_same_calls_as_the_share(
         self, metrics_store: MetricsStore
@@ -408,7 +408,7 @@ class TestAnalyze:
         strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
         assert len(strat_actions) == 1
         assert strat_actions[0].recommended == "hybrid"
-        assert "AUTO selected hybrid for 9 of 10 calls it resolved" in strat_actions[0].reason
+        assert "hybrid ran on 9 of 10 calls AUTO resolved" in strat_actions[0].reason
         assert recs[0].confidence == "medium"
 
     def test_h2_confidence_follows_the_rows_avg_ratio_reads(self, metrics_store: MetricsStore):
@@ -577,7 +577,7 @@ class TestAnalyze:
         strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
         assert len(strat_actions) == 1
         reason = strat_actions[0].reason
-        assert "AUTO selected hybrid for 81 of 101 calls it resolved" in reason
+        assert "hybrid ran on 81 of 101 calls AUTO resolved" in reason
         assert "80.2%" in reason
 
     def test_budget_advice_measures_against_the_global_default(self, metrics_store: MetricsStore):
