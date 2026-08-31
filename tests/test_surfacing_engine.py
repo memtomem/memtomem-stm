@@ -3619,6 +3619,42 @@ class TestReportedScoreScale:
         engine._observe_score_scale("gh", "read_file", low, 0.03)
         assert tracker.record_diagnostic.call_count == 2
 
+    def test_recovery_write_failure_does_not_block_the_next_write(self, caplog):
+        """A transient store failure must not poison the path (#944).
+
+        The old design retried through a pending map; unlatched, the retry is
+        simply the next healthy observation — but only if the failure neither
+        raises out nor suppresses the log re-arm.
+        """
+        tracker = MagicMock()
+        tracker.record_diagnostic_recoveries.side_effect = [RuntimeError("sqlite down"), None]
+        engine = self._engine(tracker=tracker)
+        low = self._low("rerank")
+        healthy = self._low("rerank", score=0.5)
+
+        with caplog.at_level(logging.WARNING):
+            engine._observe_score_scale("gh", "read_file", low, 0.03)
+            engine._observe_score_scale("gh", "read_file", healthy, 0.03)
+            # Log re-armed despite the failed write.
+            assert ("gh", "read_file") not in engine._score_scale_mismatch_active
+            engine._observe_score_scale("gh", "read_file", healthy, 0.03)
+
+        assert tracker.record_diagnostic_recoveries.call_count == 2
+        assert len([r for r in caplog.records if "score-scale mismatch" in r.message]) == 1
+
+    def test_diagnostic_write_failure_does_not_break_later_observations(self, caplog):
+        tracker = MagicMock()
+        tracker.record_diagnostic.side_effect = [RuntimeError("sqlite down"), None]
+        engine = self._engine(tracker=tracker)
+        low = self._low("rerank")
+
+        with caplog.at_level(logging.WARNING):
+            engine._observe_score_scale("gh", "read_file", low, 0.03)
+            engine._observe_score_scale("gh", "read_file", low, 0.03)
+
+        assert tracker.record_diagnostic.call_count == 2
+        assert len([r for r in caplog.records if "score-scale mismatch" in r.message]) == 1
+
     def test_mismatch_rearms_without_tracker(self, caplog):
         """Finding #3: with no feedback tracker (mms hook / feedback off),
         nothing is persisted at all, but a healthy observation must STILL
@@ -4043,6 +4079,81 @@ class TestScaleGatedMinScore:
         tracker.record_diagnostic_recoveries.assert_called_once_with(
             "gh", "read_file", DIAGNOSTIC_KINDS, recovered_at=ANY
         )
+
+    async def test_no_results_dedup_label_when_suspended_and_all_deduped(self):
+        """With the filter suspended an empty outcome cannot be score-caused;
+        session dedup must classify as ``no_results_dedup``."""
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        obs = SurfacingObservability()
+        chunk = FakeChunk(content="dup memory")
+        results = [FakeSearchResult(chunk=chunk, score=-0.5, score_scale="rerank")]
+        engine = self._engine(results, observability=obs, min_score=0.02)
+
+        out1 = await engine.surface(
+            "gh", "read_file", {"_context_query": "first dedup query"}, LONG_RESPONSE
+        )
+        assert "dup memory" in out1
+        out2 = await engine.surface(
+            "gh", "read_file", {"_context_query": "second dedup query"}, LONG_RESPONSE
+        )
+        assert out2 == LONG_RESPONSE
+        skips = obs.snapshot()["skip_reasons"]["read_file"]
+        assert skips.get("no_results_dedup") == 1
+        assert "no_results_score" not in skips
+
+    async def test_suspension_logs_info_once(self, caplog):
+        results = [
+            FakeSearchResult(
+                chunk=FakeChunk(content="logged memory"), score=-0.5, score_scale="rerank"
+            )
+        ]
+        engine = self._engine(results, min_score=0.02)
+        with caplog.at_level(logging.INFO):
+            await engine.surface(
+                "gh", "read_file", {"_context_query": "first log query"}, LONG_RESPONSE
+            )
+            await engine.surface(
+                "gh", "read_file", {"_context_query": "second log query"}, LONG_RESPONSE
+            )
+        suspended_infos = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.INFO and "min_score filter suspended" in r.message
+        ]
+        assert len(suspended_infos) == 1
+
+    async def test_snapshot_reports_gate_disabled(self):
+        results = [
+            FakeSearchResult(
+                chunk=FakeChunk(content="gate off"), score=0.5, score_scale="rerank"
+            )
+        ]
+        engine = self._engine(results, min_score=0.02, scale_gated_min_score=False)
+        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        snap = engine.get_min_score_snapshot()
+        assert snap["score_scale"]["gate_enabled"] is False
+        assert snap["score_scale"]["filter_suspended"] is False
+
+    async def test_cache_hit_stays_suspended_and_bucket_free(self):
+        """Cached results retain their scale stamps, so the hit render is
+        identical to the miss: injected, and bucket tags suppressed."""
+        results = [
+            FakeSearchResult(
+                chunk=FakeChunk(content="logit memory"), score=-0.5, score_scale="rerank"
+            )
+        ]
+        adapter = _make_mcp_adapter(results)
+        engine = SurfacingEngine(config=_make_config(min_score=0.02), mcp_adapter=adapter)
+
+        out1 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        out2 = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        assert adapter.search.call_count == 1
+        for out in (out1, out2):
+            assert "logit memory" in out
+            for tag in ("[weak]", "[related]", "[strong]"):
+                assert tag not in out
+
 
 class TestScaleGateComposePath:
     """The scale gate and definitive diagnostic key off per-result stamps, so

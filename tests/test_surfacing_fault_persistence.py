@@ -820,6 +820,48 @@ class TestEngineFaultPersistence:
         # B's WARNING stays latched — the log is per episode, per process.
         assert len([r for r in caplog.records if "score-scale mismatch" in r.message]) == 1
 
+    async def test_row_tracks_the_latest_observation_under_mixed_configs(self, tmp_path):
+        """Two processes configured differently make the row oscillate — and
+        that is the granularity ``surfacing_faults`` has, not a regression.
+
+        A has the scale gate on (its batches are suspended: no problem from
+        where it stands); B has the filter pinned active (a real mismatch).
+        The row is keyed ``(server, tool, kind)`` with no process column, so
+        it answers "was the newest observation healthy?", exactly as the fault
+        rows do — ``record_fault_recovery`` documents the same property.
+
+        What #944 fixes is the permanent case: B used to be latched silent
+        after A's first close, so the row stayed closed for the whole 7-day
+        window no matter how long B kept failing. Now every B observation
+        reopens it.
+        """
+        config = _make_config(tmp_path)
+        engine_a = SurfacingEngine(
+            config=config, mcp_adapter=AsyncMock(), feedback_tracker=FeedbackTracker(config)
+        )
+        engine_b = SurfacingEngine(
+            config=config, mcp_adapter=AsyncMock(), feedback_tracker=FeedbackTracker(config)
+        )
+        named_low = [self._ScaleResult(FakeChunk(), 0.001, "bm25")]
+        suspended = [self._ScaleResult(FakeChunk(), -0.17, "rerank")]
+
+        def open_now() -> bool:
+            return _episode_is_open(
+                config.feedback_db_path, "gh", "read_file", "score_scale_mismatch"
+            )
+
+        engine_b._observe_score_scale("gh", "read_file", named_low, 0.03)
+        assert open_now()
+        engine_a._observe_score_scale("gh", "read_file", suspended, 0.03, filter_suspended=True)
+        assert not open_now()
+        engine_b._observe_score_scale("gh", "read_file", named_low, 0.03)
+        assert open_now(), "B must reopen — this is the #944 fix"
+        engine_a._observe_score_scale("gh", "read_file", suspended, 0.03, filter_suspended=True)
+        assert not open_now(), "last writer wins; the row has no per-process column"
+        # And B is never permanently silenced: it reopens again, indefinitely.
+        engine_b._observe_score_scale("gh", "read_file", named_low, 0.03)
+        assert open_now()
+
     async def test_healthy_observation_closes_an_episode_only_a_peer_recorded(self, tmp_path):
         """The close side is unlatched for the same reason: this process never
         saw the episode open, and must still close it on healthy evidence."""

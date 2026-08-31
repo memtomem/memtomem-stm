@@ -431,6 +431,14 @@ class SurfacingEngine:
         *recovered_at* is the moment the healthy batch was observed; rows
         stamped after it stay active, so a mismatch a peer records during this
         call is not swallowed.
+
+        The row has no process column, so under peers configured differently
+        — one with the scale gate suspending its batches, one with the filter
+        pinned active — it tracks the NEWEST observation and oscillates. That
+        is the granularity ``surfacing_faults`` has (see
+        ``record_fault_recovery``), and it is the tolerable half of #944: what
+        is not tolerable, and what latching caused, is a process being
+        silenced permanently once a peer closed the episode.
         """
         if self._feedback_tracker is None:
             return
