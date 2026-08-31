@@ -415,6 +415,52 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **H3 groups by the strategy AUTO chose, not the label the call ended on**
+  (#937). The dominance share grouped by `compression_strategy`, which records
+  the path a call *took*: `ProxyManager`'s degradation paths rewrite it — the
+  ratio-guard ladder, the LLM-compression fallbacks, and the store-error
+  degradations alike (`hybrid→progressive_fallback`,
+  `llm_summary→timeout_fallback`, `X→passthrough_on_error`, …) — so one
+  strategy that sometimes degrades was
+  counted as two or more. Ten calls that all ran `hybrid`, four of them
+  degraded, read as `6/10 = 60%`, missed `STRATEGY_PIN_THRESHOLD` and left H3
+  silent for a tool AUTO had decided identically every time. The suppression
+  scaled with the degradation rate — a tool degrading 20% or more of its
+  calls could never be recommended a pin, however consistent it was (the gate
+  is a strict `> 0.80`, so an exactly-20% rate was suppressed too). It
+  predates #931 and #933, which changed the population the share is over but
+  not the key it groups by.
+
+  `get_tool_profiles` now reads the label up to its first `→`. An undegraded
+  call records a bare strategy, and every site that writes a degradation label
+  spells it `<base>→<suffix>` with a single `CompressionStrategy` value as the
+  base — the convention `get_progressive_degradations` already matches on — so the
+  fold recovers what AUTO selected without a schema change, and the share and
+  its volume gate keep counting the same population. Every label the ladder
+  writes therefore folds to a settable value; `SETTABLE_STRATEGIES` remains the
+  last word, since `MetricsStore.record` accepts any string a writer hands it,
+  and it now guards a base the fold did not anticipate rather than the fallback
+  labels themselves.
+
+  **Behavior change**: a tool whose AUTO calls consistently choose the same
+  settable base can now be recommended that pin even when every one of those
+  calls degrades, where it previously received nothing. The gates are the ones
+  that already applied, unchanged: `MEDIUM_CONFIDENCE_CALLS` resolutions, a
+  share strictly above `STRATEGY_PIN_THRESHOLD`, a settable non-`none` base,
+  and a tool still configured `auto`.
+
+  This re-adjudicates #932, which read the fallback label as a value no config
+  accepts and suppressed the advice — right about the label, wrong about the
+  tool. A pin skips the detection step, not the ladder: the ratio guard still
+  runs and still degrades under it, so the pinned tool's compression outcome is
+  what it is today for the same response. What the pin does change is the
+  compression cache fingerprint and the provenance a row records: it can cost
+  a one-time cache miss, which re-invokes the upstream, but it does not change
+  the selected path or the ladder. And the most consistent tool there is was
+  the one being denied the pin. The reason is phrased as a selection (*"AUTO
+  chose hybrid on 10 of 10 calls it resolved"*) because that is what the count
+  now attests.
+
 - **The strategy pin is measured on AUTO's own calls** (#933). H3 recommends
   pinning a strategy *"to skip detection overhead"* — advice that presumes the
   calls it counted were AUTO calls, resolved per response. The column it read
@@ -441,11 +487,9 @@ changes inline only. See the deprecation policy in
   move to that narrowed population together — the same discipline #928 needed
   one level up, where a gate and a measurement over two different populations
   is exactly what went wrong. The reason states what the rows attest, which is
-  which calls AUTO decided and what ran on them: *"hybrid ran on 9 of 10 calls
-  AUTO resolved (90.0%)"*. It is deliberately not phrased as what AUTO
-  *selected* — the ratio-guard ladder rewrites the label after selection, so a
-  strategy that sometimes degrades is split across labels here. That splitting
-  predates this change and is unaffected by it. The config check stays as the
+  which calls AUTO decided and what it chose on them: *"AUTO chose hybrid on 9
+  of 10 calls it resolved (90.0%)"* — the grouping key is the strategy the call
+  started on, per the #937 entry above. The config check stays as the
   mirror case: the rows say AUTO ran, the config says whether it still does.
 
   **Behavior change**: no `compression` pin until at least
@@ -523,9 +567,12 @@ changes inline only. See the deprecation policy in
   that is untouched here and tracked as #934.
 
   Two further things the recommendation now checks, both of which made it
-  advice an operator could not act on. A degraded call records the path it took
-  (`hybrid→progressive_fallback`), which no `compression` key accepts, so a
-  dominant label outside `CompressionStrategy` is skipped. And the reason
+  advice an operator could not act on. A dominant label outside
+  `CompressionStrategy` is skipped, since no `compression` key accepts one —
+  which at the time meant the degradation labels a call records when the ladder
+  rewrites it (`hybrid→progressive_fallback`); the #937 entry above then moved
+  the grouping onto the label's base, so what that check now catches is a base
+  no config accepts rather than the fallback labels themselves. And the reason
   carries the counts, not a rounded percentage alone: 81 of 101 clears the
   strict gate but renders as `80%`, which would have re-opened the same
   gate-versus-text gap. It no longer attributes the rows to AUTO either — the

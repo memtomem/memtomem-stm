@@ -11,6 +11,7 @@ Covers:
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -327,6 +328,90 @@ class TestProxyManagerRatioGuard:
         assert "_fallback" in row["compression_strategy"]
         assert row["strategy_auto_selected"] == 1
         store.close()
+
+    async def test_pinning_what_auto_chose_leaves_the_degradation_unchanged(self, tmp_path):
+        """H3's advice rests on this: a pin skips detection, not the ladder (#937).
+
+        The tuner now recommends pinning a base strategy even for a tool whose
+        calls always degrade, on the argument that the pin skips the detection
+        step and not the ladder — the ratio guard still runs underneath and
+        still degrades, so the pinned tool's compression outcome is what it is
+        today. That argument is what makes the advice safe, so it is measured
+        here rather than asserted: one response goes through AUTO, the same
+        response goes through a manager pinned to whatever AUTO resolved, and
+        the recorded compression outcome must match.
+
+        The scope of "unchanged" is the compression outcome. The provenance
+        flag is the field that necessarily differs — the pinned call did not
+        run the selector, which is the whole point — and it is asserted
+        differing so the equality above cannot quietly cover it. (Pinning also
+        changes the compression cache fingerprint, which reads
+        ``tc.compression.value``, so it can cost a one-time miss — which
+        re-invokes the upstream, and a volatile upstream may then answer
+        differently. What the pin does not change is the path taken for a given
+        response, which is what this test measures.)
+
+        No compressor is stubbed here: a stubbed ``_apply_compression``
+        returning constant bytes would compare the ladder against itself and
+        prove nothing about the strategy. The input is chosen so the guard
+        trips with room to spare rather than at a boundary. Note the budget is
+        not what decides that: the retention floor widens a small
+        ``max_result_chars`` up to the floor itself, so a plain body truncates
+        to almost exactly the floor and trips it by a character. Sectioned
+        markdown does not — the compressor AUTO picks for it lands at 0.291 of
+        ~22200 cleaned chars against a 0.65 floor, less than half. The
+        violation is asserted rather than only compared between the arms, since
+        two runs that both skipped the ladder would agree just as well.
+        """
+        text = "".join(f"\n## Section {i}\n\n{'Detail text paragraph. ' * 120}" for i in range(8))
+        (tmp_path / "auto").mkdir()
+        (tmp_path / "pinned").mkdir()
+
+        auto_mgr, auto_store = _make_manager_with_store(
+            tmp_path / "auto",
+            compression=CompressionStrategy.AUTO,
+            max_result_chars=500,
+        )
+        auto_mgr._connections["srv"].session.call_tool.return_value = _make_result(text)
+        auto_result = await auto_mgr.call_tool("srv", "tool", {})
+        auto_row = _latest_row(auto_store)
+        auto_store.close()
+
+        # What the tuner would recommend: the label's pre-arrow base.
+        resolved = auto_row["compression_strategy"].split("→")[0]
+        assert resolved in {s.value for s in CompressionStrategy}
+        assert auto_row["ratio_violation"] == 1, "the AUTO call must have tripped the guard"
+        assert "→" in auto_row["compression_strategy"], "the AUTO call must have degraded"
+
+        pinned_mgr, pinned_store = _make_manager_with_store(
+            tmp_path / "pinned",
+            compression=CompressionStrategy(resolved),
+            max_result_chars=500,
+        )
+        pinned_mgr._connections["srv"].session.call_tool.return_value = _make_result(text)
+        pinned_result = await pinned_mgr.call_tool("srv", "tool", {})
+        pinned_row = _latest_row(pinned_store)
+        pinned_store.close()
+
+        assert pinned_row["compression_strategy"] == auto_row["compression_strategy"]
+        assert pinned_row["ratio_violation"] == auto_row["ratio_violation"]
+        assert pinned_row["compressed_chars"] == auto_row["compressed_chars"]
+        assert pinned_row["cleaned_chars"] == auto_row["cleaned_chars"]
+        # The delivered text too, once the progressive store key — freshly
+        # generated per call, and per call under AUTO as well — is normalised.
+        key = re.compile(r'key="[0-9a-f]+"')
+        # One key per arm: a normalisation that matched nothing, or that
+        # swallowed part of the body, would make the comparison weaker than it
+        # reads.
+        assert len(key.findall(auto_result)) == 1
+        assert len(key.findall(pinned_result)) == 1
+        assert key.sub('key="<k>"', pinned_result) == key.sub('key="<k>"', auto_result)
+        # The only compression field that differs, and the reason the two rows
+        # are distinguishable as AUTO and pinned at all. The full records also
+        # differ in the per-call bookkeeping ``_latest_row`` does not project —
+        # ``trace_id`` and ``created_at`` — which no two calls share anyway.
+        assert auto_row["strategy_auto_selected"] == 1
+        assert pinned_row["strategy_auto_selected"] == 0
 
     async def test_progressive_strategy_call_completes_and_records_metric(self, tmp_path):
         """End-to-end PROGRESSIVE-strategy call returns a first chunk and
@@ -958,6 +1043,69 @@ class TestGetToolProfiles:
         assert legacy["auto_strategy_count"] == 0
         assert legacy["auto_dominant_strategy"] is None
         assert legacy["auto_dominant_strategy_count"] == 0
+        store.close()
+
+    def test_a_degraded_call_counts_for_the_strategy_it_started_on(self, tmp_path):
+        """The label a call ended with is not the strategy AUTO chose (#937).
+
+        The ratio-guard ladder rewrites `compression_strategy` on degradation,
+        so grouping by the raw label splits one selection across several keys:
+        ten `hybrid` resolutions, four of which degraded, read as 6/10 and the
+        tuner stays silent for a tool AUTO decided identically every time. The
+        aggregate groups by the pre-arrow base, which is what AUTO picked.
+
+        `mixed_suffixes` carries a row from each of the six write sites in
+        `ProxyManager`, not only `progressive_fallback`. One of them, the LLM
+        site, builds its suffix from a reason code and so has more spellings
+        than are seeded here — which is the point: the fold is pinned as a rule
+        over the shape, so a suffix nobody listed folds the same way.
+        """
+        store = MetricsStore(tmp_path / "metrics.db")
+        store.initialize()
+        seeds = {
+            "degrading": (("hybrid", 6), ("hybrid→progressive_fallback", 4)),
+            "mixed_suffixes": (
+                ("llm_summary", 2),
+                ("llm_summary→timeout_fallback", 2),
+                ("llm_summary→progressive_fallback", 2),
+                ("llm_summary→hybrid_fallback", 1),
+                ("llm_summary→truncate_fallback", 1),
+                ("llm_summary→passthrough_on_error", 1),
+                ("llm_summary→truncate_on_store_error", 1),
+            ),
+            # Negative control: folding must not merge two different bases.
+            "genuinely_mixed": (("hybrid", 6), ("truncate", 4)),
+        }
+        for tool, groups in seeds.items():
+            for strategy, count in groups:
+                for _ in range(count):
+                    store.record(
+                        CallMetrics(
+                            server="srv",
+                            tool=tool,
+                            original_chars=1000,
+                            compressed_chars=500,
+                            cleaned_chars=1000,
+                            compression_strategy=strategy,
+                            strategy_auto_selected=True,
+                        )
+                    )
+        by_tool = {p["tool"]: p for p in store.get_tool_profiles(since_seconds=3600.0)}
+
+        degrading = by_tool["degrading"]
+        assert degrading["auto_dominant_strategy"] == "hybrid"
+        assert degrading["auto_dominant_strategy_count"] == 10
+        assert degrading["auto_strategy_count"] == 10
+
+        suffixes = by_tool["mixed_suffixes"]
+        assert suffixes["auto_dominant_strategy"] == "llm_summary"
+        assert suffixes["auto_dominant_strategy_count"] == 10
+        assert suffixes["auto_strategy_count"] == 10
+
+        mixed = by_tool["genuinely_mixed"]
+        assert mixed["auto_dominant_strategy"] == "hybrid"
+        assert mixed["auto_dominant_strategy_count"] == 6
+        assert mixed["auto_strategy_count"] == 10
         store.close()
 
     def test_the_two_strategy_counts_come_from_one_snapshot(self, tmp_path):
