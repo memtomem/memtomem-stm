@@ -424,8 +424,12 @@ changes inline only. See the deprecation policy in
   and one already had: `mms tune` opened the feedback store bare, directly
   under a comment explaining why the sibling `MetricsStore` must not do that.
   `retention_days` is now a required keyword-only argument, so every caller
-  states its intent; `mms tune` states `0` because a read-only analysis command
-  must not delete rows. The `docs/configuration.md` full example's
+  states its intent, and `mms tune` passes the configured value: it opens the
+  stores read-write and runs the server's startup steps by design (its
+  docstring says so, and the metrics store already carried its configured cap
+  there for the same reason), so the feedback store would otherwise be the one
+  place that keeps rows the config asked to drop. The
+  `docs/configuration.md` full example's
   `retention_days: 90` for both blocks is now pinned against the models by
   `test_docs_sync.py`, which previously claimed to cover every `ProxyConfig`
   sub-block but checked only `cache` and `toolgraph`. No behavior change to the

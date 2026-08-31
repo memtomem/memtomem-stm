@@ -5104,10 +5104,11 @@ def tune(
     result without a restart.
 
     Unlike ``mms stats`` (pure read-only summaries), this opens the stores
-    read-write to run their idempotent schema migrations and the metrics
-    store's per-source retention reconciliation — the same steps the server
-    performs at startup — but only when the DB files already exist; a
-    preview never creates anything.
+    read-write to run their idempotent schema migrations, the metrics
+    store's per-source retention reconciliation and the feedback store's
+    ``retention_days`` purge — the same steps the server performs at startup
+    — but only when the DB files already exist; a preview never creates
+    anything.
     """
     config_path = resolve_cli_config_path(config_path).path
     from memtomem_stm.proxy.compression_feedback_store import CompressionFeedbackStore
@@ -5177,12 +5178,17 @@ def tune(
     # source's retention, so the constructor default would silently apply a
     # 10k cap regardless of what metrics.max_history says.
     metrics_store = MetricsStore(metrics_path, max_history=typed_cfg.metrics.max_history)
-    # ``retention_days=0``: `mms tune` is a read-only analysis command and
-    # must never purge rows. The daemon's startup purge owns retention
-    # (#876) — the constructor has no default, so this is stated, not
-    # inherited.
+    # The configured retention must ride along for the same reason as
+    # ``max_history`` above: ``initialize`` is where each store enforces it,
+    # and this command deliberately runs the server's startup steps against
+    # existing DB files (see the docstring). Passing 0 would make the feedback
+    # store the one place that silently keeps rows the config asked to drop
+    # (#876).
     feedback_store = (
-        CompressionFeedbackStore(feedback_path, retention_days=0)
+        CompressionFeedbackStore(
+            feedback_path,
+            retention_days=typed_cfg.compression_feedback.retention_days,
+        )
         if feedback_path.exists()
         else None
     )
