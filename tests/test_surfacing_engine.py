@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 from uuid import uuid4
 
 import pytest
@@ -3860,15 +3860,68 @@ class TestScoreScaleMapsAreBounded:
     def test_mismatch_recovery_pending_is_capped_without_a_tracker(self):
         """The worst leak: with ``feedback_tracker=None`` the discard at the
         healthy branch is gated on a durable write that can never succeed, so
-        every key that ever opened an episode stayed forever."""
+        every key that ever opened an episode stayed forever.
+
+        Each key goes mismatch-then-healthy *before* the next key is seen, so
+        pending itself has to exceed the cap. Driving all 20 mismatches first
+        would prune ``_score_scale_mismatch_active`` down to 8 and this test
+        would then pass with the pending map's prune deleted.
+        """
         engine = self._engine(min_score=0.03)
         engine._score_scale_keys_max = 10
         assert engine._feedback_tracker is None
         named_low = [FakeSearchResult(chunk=FakeChunk(), score=0.001, score_scale="bm25")]
         healthy = [FakeSearchResult(chunk=FakeChunk(), score=0.9)]
-        self._drive(engine, named_low)
-        self._drive(engine, healthy)
+        for i in range(20):
+            engine._observe_score_scale("gh", f"tool{i}", named_low, 0.03)
+            engine._observe_score_scale("gh", f"tool{i}", healthy, 0.03)
         self._assert_capped(engine._score_scale_mismatch_recovery_pending)
+
+    def test_eviction_does_not_strand_an_open_episode(self):
+        """Eviction must not cost a WRONG diagnostic.
+
+        The in-memory latches are what tell a healthy observation to close the
+        durable ``score_scale_mismatch`` episode. Evicting a key removes that
+        link, so without the blind fallback the store keeps reporting an
+        episode the tool has recovered from — and ``mms doctor`` FAILs for the
+        full 7-day window.
+        """
+        tracker = MagicMock()
+        engine = self._engine(tracker=tracker, min_score=0.03)
+        engine._score_scale_keys_max = 10
+        named_low = [FakeSearchResult(chunk=FakeChunk(), score=0.001, score_scale="bm25")]
+        healthy = [FakeSearchResult(chunk=FakeChunk(), score=0.9)]
+
+        # Open a real episode for the victim, then bury it under enough
+        # distinct keys to evict every latch that holds it.
+        engine._observe_score_scale("gh", "victim", named_low, 0.03)
+        tracker.record_diagnostic.assert_called_once_with("gh", "victim", "score_scale_mismatch")
+        self._drive(engine, named_low, count=30)
+        assert ("gh", "victim") not in engine._score_scale_mismatch_active
+        assert ("gh", "victim") not in engine._score_scale_mismatch_recovery_pending
+
+        tracker.record_diagnostic_recovery.reset_mock()
+        engine._observe_score_scale("gh", "victim", healthy, 0.03)
+        assert (
+            call("gh", "victim", "score_scale_mismatch")
+            in tracker.record_diagnostic_recovery.call_args_list
+        ), "an evicted key's episode must still be closed by a healthy observation"
+
+    def test_no_extra_recovery_write_before_anything_evicts(self):
+        """The blind fallback is off until a key has actually been dropped, so
+        an ordinary deployment's write pattern is unchanged."""
+        tracker = MagicMock()
+        engine = self._engine(tracker=tracker, min_score=0.03)
+        low = [FakeSearchResult(chunk=FakeChunk(), score=0.001)]
+        healthy = [FakeSearchResult(chunk=FakeChunk(), score=0.9)]
+
+        engine._observe_score_scale("gh", "read_file", low, 0.03)
+        engine._observe_score_scale("gh", "read_file", healthy, 0.03)
+
+        assert engine._score_scale_evicted is False
+        assert tracker.record_diagnostic_recovery.call_args_list == [
+            call("gh", "read_file", "score_ceiling_below_min")
+        ]
 
     def test_recovery_persisted_is_capped(self):
         engine = self._engine(tracker=MagicMock(), min_score=0.03)
@@ -4759,7 +4812,7 @@ class TestFifoPruneHelper:
             "inline FIFO-prune idiom found outside _fifo_prune — route it "
             "through the helper instead"
         )
-        # 1 def + 9 call sites: boost single/batch, invalidation, surfaced,
-        # and the five score-scale tripwire maps pruned together in
-        # ``_observe_score_scale``'s finally block (#880).
-        assert len(re.findall(r"_fifo_prune\(", source)) == 10
+        # 1 def + 5 call sites: boost single/batch, invalidation, surfaced,
+        # and one loop in ``_prune_score_scale_maps`` covering all five
+        # score-scale tripwire maps (#880).
+        assert len(re.findall(r"_fifo_prune\(", source)) == 6

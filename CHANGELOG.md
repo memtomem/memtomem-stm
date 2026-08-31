@@ -422,18 +422,29 @@ changes inline only. See the deprecation policy in
   set". Both halves were wrong. There is no configured tool set: keys come
   from the upstream-advertised `tools/list` catalogue, which #917 rebuilds on
   every reconnect, and on the hook/daemon path from the client-supplied
-  host-native tool name. And three of the maps shed a key only when a durable
-  recovery UPDATE succeeds — impossible for a trackerless engine, which is
-  exactly the hook/daemon configuration — so `_score_scale_mismatch_recovery_
-  pending` in particular kept every key that ever opened an episode. All five
-  now share the existing `_fifo_prune` policy through one seam in
-  `_observe_score_scale`, so every early return still prunes.
+  host-native tool name. And each map sheds a key only on a later observation
+  of that same key — `_score_scale_mismatch_recovery_pending` only on one whose
+  durable recovery UPDATE succeeds, impossible for a trackerless engine, which
+  is exactly the hook/daemon configuration — so a tool that is advertised,
+  observed once and never called again never left any of them. All five now
+  share the existing `_fifo_prune` policy through one seam,
+  `_prune_score_scale_maps`, run from `_observe_score_scale`'s `finally` so
+  every early return still prunes.
+
+  Eviction must not cost a *wrong* diagnostic: those in-memory latches are what
+  tell a healthy observation to close the durable `score_scale_mismatch`
+  episode, and an evicted key would otherwise keep `mms doctor` FAILing for the
+  full 7-day window on a tool that had recovered. So once anything has actually
+  been evicted, a healthy observation writes that recovery blind — a
+  WHERE-guarded UPDATE, harmless when no episode is open — under the same
+  per-key latch that already gates the ceiling recovery. Nothing evicts below
+  10k keys, so an ordinary deployment's write pattern is unchanged.
 
   **Behavior change**: past 10k distinct `(server, tool)` keys in one process,
   the oldest half of the score-scale state is forgotten instead of retained.
-  The cost of evicting a key is one repeated WARNING or one redundant
-  WHERE-guarded UPDATE that matches no open episode on its next observation —
-  never a wrong diagnostic.
+  The remaining cost of evicting a key is one repeated WARNING, one redundant
+  no-op UPDATE, or a heuristic streak counter that restarts its 5-observation
+  window.
 
 - **A policy bundle's identity is published only once its decisions bind**
   (#940). Bundle adoption assigned the new snapshot, stamp, digest, instance id
