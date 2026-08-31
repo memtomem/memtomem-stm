@@ -26,7 +26,8 @@ class ProgressiveReadsTracker:
     ``ProgressiveResponse.trace_id`` attribute in ``read_more``).
     """
 
-    def __init__(self, db_path: Path, retention_days: int = 0) -> None:
+    def __init__(self, db_path: Path, *, retention_days: int) -> None:
+        """*retention_days* is required — see ``ProgressiveReadsStore`` (#876)."""
         self._store = ProgressiveReadsStore(db_path.expanduser(), retention_days=retention_days)
         self._store.initialize()
 

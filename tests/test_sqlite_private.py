@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -86,8 +87,16 @@ STORE_FACTORIES = [
     pytest.param(ProxyCache, id="proxy_cache"),
     pytest.param(MetricsStore, id="metrics_store"),
     pytest.param(FeedbackStore, id="feedback_store"),
-    pytest.param(CompressionFeedbackStore, id="compression_feedback_store"),
-    pytest.param(ProgressiveReadsStore, id="progressive_reads_store"),
+    # ``retention_days`` has no constructor default (#876); ``0`` keeps these
+    # cases about file modes rather than purging.
+    pytest.param(
+        partial(CompressionFeedbackStore, retention_days=0),
+        id="compression_feedback_store",
+    ),
+    pytest.param(
+        partial(ProgressiveReadsStore, retention_days=0),
+        id="progressive_reads_store",
+    ),
     pytest.param(SQLitePendingStore, id="pending_store"),
     pytest.param(GraphConsultCache, id="graph_consult_cache"),
 ]

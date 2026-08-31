@@ -5177,7 +5177,15 @@ def tune(
     # source's retention, so the constructor default would silently apply a
     # 10k cap regardless of what metrics.max_history says.
     metrics_store = MetricsStore(metrics_path, max_history=typed_cfg.metrics.max_history)
-    feedback_store = CompressionFeedbackStore(feedback_path) if feedback_path.exists() else None
+    # ``retention_days=0``: `mms tune` is a read-only analysis command and
+    # must never purge rows. The daemon's startup purge owns retention
+    # (#876) — the constructor has no default, so this is stated, not
+    # inherited.
+    feedback_store = (
+        CompressionFeedbackStore(feedback_path, retention_days=0)
+        if feedback_path.exists()
+        else None
+    )
     try:
         metrics_store.initialize()
         if feedback_store is not None:

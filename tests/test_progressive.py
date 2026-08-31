@@ -745,7 +745,7 @@ class TestProgressiveReadsTelemetry:
         from memtomem_stm.proxy.metrics import TokenTracker
         from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
 
-        tracker = ProgressiveReadsTracker(tmp_path / "stm_feedback.db")
+        tracker = ProgressiveReadsTracker(tmp_path / "stm_feedback.db", retention_days=0)
         mgr = ProxyManager(
             ProxyConfig(enabled=True),
             TokenTracker(),

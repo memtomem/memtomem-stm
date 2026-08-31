@@ -52,7 +52,7 @@ class TestKindRegistry:
 
 class TestCompressionFeedbackStore:
     def test_record_and_get_stats_empty(self, tmp_path: Path):
-        store = CompressionFeedbackStore(tmp_path / "cfb.db")
+        store = CompressionFeedbackStore(tmp_path / "cfb.db", retention_days=0)
         store.initialize()
         try:
             stats = store.get_stats()
@@ -61,7 +61,7 @@ class TestCompressionFeedbackStore:
             store.close()
 
     def test_record_persists_single_row(self, tmp_path: Path):
-        store = CompressionFeedbackStore(tmp_path / "cfb.db")
+        store = CompressionFeedbackStore(tmp_path / "cfb.db", retention_days=0)
         store.initialize()
         try:
             store.record(
@@ -80,7 +80,7 @@ class TestCompressionFeedbackStore:
 
     @pytest.mark.parametrize("surrogate", ["\ud800", "\udbff", "\udc00", "\udfff"])
     def test_record_escapes_content_before_sqlite_bind(self, tmp_path: Path, surrogate: str):
-        store = CompressionFeedbackStore(tmp_path / "cfb.db")
+        store = CompressionFeedbackStore(tmp_path / "cfb.db", retention_days=0)
         store.initialize()
         try:
             store.record("server", "tool", "other", f"missing{surrogate}", None)
@@ -92,7 +92,7 @@ class TestCompressionFeedbackStore:
 
     @pytest.mark.parametrize("field", ["server", "tool", "trace_id"])
     def test_record_refuses_unencodable_identifiers(self, tmp_path: Path, field: str):
-        store = CompressionFeedbackStore(tmp_path / "cfb.db")
+        store = CompressionFeedbackStore(tmp_path / "cfb.db", retention_days=0)
         store.initialize()
         values = {"server": "server", "tool": "tool", "trace_id": "trace"}
         values[field] += "\ud800"
@@ -113,7 +113,7 @@ class TestCompressionFeedbackStore:
         """#584 — a store opened with retention_days>0 purges rows older than
         the window on initialize(); a retention_days=0 store keeps everything."""
         db_path = tmp_path / "cfb.db"
-        store = CompressionFeedbackStore(db_path)
+        store = CompressionFeedbackStore(db_path, retention_days=0)
         store.initialize()
         store.record("s", "tool_a", "truncated", "x", None)
         store.record("s", "tool_b", "truncated", "y", None)
@@ -134,8 +134,9 @@ class TestCompressionFeedbackStore:
         assert tools == ["tool_b"]
         store2.close()
 
-        # retention_days=0 (default) → the still-present row is never purged.
-        store3 = CompressionFeedbackStore(db_path)
+        # ``retention_days=0`` → the still-present row is never purged. Not a
+        # constructor default any more (#876) — every caller states it.
+        store3 = CompressionFeedbackStore(db_path, retention_days=0)
         store3.initialize()
         assert store3._db is not None
         store3._db.execute(
@@ -144,14 +145,14 @@ class TestCompressionFeedbackStore:
         )
         store3._db.commit()
         store3.close()
-        store4 = CompressionFeedbackStore(db_path)  # retention_days=0
+        store4 = CompressionFeedbackStore(db_path, retention_days=0)
         store4.initialize()
         assert store4._db is not None
         assert store4._db.execute("SELECT COUNT(*) FROM compression_feedback").fetchone()[0] == 1
         store4.close()
 
     def test_get_stats_aggregates_by_kind_and_tool(self, tmp_path: Path):
-        store = CompressionFeedbackStore(tmp_path / "cfb.db")
+        store = CompressionFeedbackStore(tmp_path / "cfb.db", retention_days=0)
         store.initialize()
         try:
             store.record("docfix", "get_document", "truncated", "m1", None)
@@ -175,7 +176,7 @@ class TestCompressionFeedbackStore:
             store.close()
 
     def test_get_stats_filtered_by_tool(self, tmp_path: Path):
-        store = CompressionFeedbackStore(tmp_path / "cfb.db")
+        store = CompressionFeedbackStore(tmp_path / "cfb.db", retention_days=0)
         store.initialize()
         try:
             store.record("docfix", "get_document", "truncated", "m1", None)
@@ -197,7 +198,7 @@ class TestCompressionFeedbackStore:
 
         surfacing = FeedbackStore(db_path)
         surfacing.initialize()
-        compression = CompressionFeedbackStore(db_path)
+        compression = CompressionFeedbackStore(db_path, retention_days=0)
         compression.initialize()
 
         try:
@@ -215,7 +216,7 @@ class TestCompressionFeedbackStore:
 
     def test_data_survives_store_reopen(self, tmp_path: Path):
         db_path = tmp_path / "cfb.db"
-        store = CompressionFeedbackStore(db_path)
+        store = CompressionFeedbackStore(db_path, retention_days=0)
         store.initialize()
         try:
             store.record("docfix", "get_document", "truncated", "m1", "t1")
@@ -223,7 +224,7 @@ class TestCompressionFeedbackStore:
         finally:
             store.close()
 
-        store2 = CompressionFeedbackStore(db_path)
+        store2 = CompressionFeedbackStore(db_path, retention_days=0)
         store2.initialize()
         try:
             stats = store2.get_stats()
@@ -234,7 +235,7 @@ class TestCompressionFeedbackStore:
             store2.close()
 
     def test_close_is_idempotent(self, tmp_path: Path):
-        store = CompressionFeedbackStore(tmp_path / "cfb.db")
+        store = CompressionFeedbackStore(tmp_path / "cfb.db", retention_days=0)
         store.initialize()
         store.close()
         store.close()  # must not raise
@@ -276,6 +277,40 @@ def _backdate_last_row(db_path: Path, delta_seconds: float) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+class TestRetentionIsAlwaysStated:
+    """#876 — ``retention_days`` has no constructor default on the feedback
+    stores/trackers, so a new call site cannot silently inherit "never purge"
+    while ``CompressionFeedbackConfig.retention_days`` says 90. The config
+    model stays the single source of truth for the daemon's value."""
+
+    def test_store_rejects_a_missing_retention(self, tmp_path: Path):
+        with pytest.raises(TypeError, match="retention_days"):
+            CompressionFeedbackStore(tmp_path / "cfb.db")  # type: ignore[call-arg]
+
+    def test_store_rejects_a_positional_retention(self, tmp_path: Path):
+        """Keyword-only: a bare ``Store(path, 90)`` cannot be misread as some
+        other int knob at the call site."""
+        with pytest.raises(TypeError):
+            CompressionFeedbackStore(tmp_path / "cfb.db", 90)  # type: ignore[misc]
+
+    def test_tracker_rejects_a_missing_retention(self, tmp_path: Path):
+        with pytest.raises(TypeError, match="retention_days"):
+            CompressionFeedbackTracker(tmp_path / "cfb.db")  # type: ignore[call-arg]
+
+    def test_tracker_forwards_retention_to_its_store(self, tmp_path: Path):
+        """The value the daemon reads off the config must reach the store that
+        runs the purge — the tracker is the only link between them."""
+        from memtomem_stm.proxy.config import CompressionFeedbackConfig
+
+        configured = CompressionFeedbackConfig().retention_days
+        assert configured == 90
+        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db", retention_days=configured)
+        try:
+            assert tracker.store._retention_days == 90
+        finally:
+            tracker.close()
 
 
 class TestMetricsStoreLookup:
@@ -354,7 +389,7 @@ def metrics_store(tmp_path: Path) -> MetricsStore:
 class TestCompressionFeedbackTracker:
     @pytest.mark.parametrize("field", ["server", "tool", "trace_id"])
     def test_unencodable_identifier_returns_sanitized_error(self, tmp_path: Path, field: str):
-        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db")
+        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db", retention_days=0)
         values = {"server": "server", "tool": "tool", "trace_id": "trace"}
         values[field] += "\udfff"
         try:
@@ -371,7 +406,7 @@ class TestCompressionFeedbackTracker:
             tracker.close()
 
     def test_invalid_kind_rejected(self, tmp_path: Path):
-        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db")
+        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db", retention_days=0)
         try:
             result = tracker.record(
                 server="docfix",
@@ -386,7 +421,7 @@ class TestCompressionFeedbackTracker:
             tracker.close()
 
     def test_missing_fields_rejected(self, tmp_path: Path):
-        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db")
+        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db", retention_days=0)
         try:
             assert "server and tool" in tracker.record(server="", tool="x", missing="m")
             assert "server and tool" in tracker.record(server="x", tool="", missing="m")
@@ -396,7 +431,7 @@ class TestCompressionFeedbackTracker:
             tracker.close()
 
     def test_explicit_trace_id_persisted(self, tmp_path: Path):
-        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db")
+        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db", retention_days=0)
         try:
             result = tracker.record(
                 server="docfix",
@@ -414,7 +449,7 @@ class TestCompressionFeedbackTracker:
     def test_trace_id_lookup_within_window(self, tmp_path: Path, metrics_store: MetricsStore):
         _record_metric(metrics_store, "docfix", "get_document", "live_trace")
 
-        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db", metrics_store=metrics_store)
+        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db", metrics_store=metrics_store, retention_days=0)
         try:
             result = tracker.record(
                 server="docfix",
@@ -434,7 +469,7 @@ class TestCompressionFeedbackTracker:
         _record_metric(metrics_store, "docfix", "get_document", "stale_trace")
         _backdate_last_row(metrics_db, delta_seconds=3600.0)
 
-        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db", metrics_store=metrics_store)
+        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db", metrics_store=metrics_store, retention_days=0)
         try:
             result = tracker.record(
                 server="docfix",
@@ -451,7 +486,7 @@ class TestCompressionFeedbackTracker:
     ):
         _record_metric(metrics_store, "docfix", "get_document", "wrong_tool")
 
-        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db", metrics_store=metrics_store)
+        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db", metrics_store=metrics_store, retention_days=0)
         try:
             result = tracker.record(
                 server="docfix",
@@ -464,7 +499,7 @@ class TestCompressionFeedbackTracker:
             tracker.close()
 
     def test_record_without_metrics_store_stores_null(self, tmp_path: Path):
-        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db")
+        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db", retention_days=0)
         try:
             result = tracker.record(
                 server="docfix",
@@ -477,14 +512,14 @@ class TestCompressionFeedbackTracker:
             tracker.close()
 
     def test_get_tool_feedback_summary_empty(self, tmp_path: Path):
-        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db")
+        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db", retention_days=0)
         try:
             assert tracker.store.get_tool_feedback_summary() == {}
         finally:
             tracker.close()
 
     def test_get_tool_feedback_summary_aggregates(self, tmp_path: Path):
-        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db")
+        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db", retention_days=0)
         try:
             tracker.record(server="s", tool="t1", missing="a", kind="truncated")
             tracker.record(server="s", tool="t1", missing="b", kind="missing_example")
@@ -501,7 +536,7 @@ class TestCompressionFeedbackTracker:
     def test_get_tool_feedback_summary_splits_same_tool_name_across_servers(self, tmp_path: Path):
         """Two upstreams exposing the same tool name must not pool feedback —
         the tuner keys per-server config recommendations off this aggregate."""
-        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db")
+        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db", retention_days=0)
         try:
             tracker.record(server="server_a", tool="search", missing="a", kind="truncated")
             tracker.record(server="server_a", tool="search", missing="b", kind="truncated")
@@ -515,7 +550,7 @@ class TestCompressionFeedbackTracker:
             tracker.close()
 
     def test_get_stats_passthrough(self, tmp_path: Path):
-        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db")
+        tracker = CompressionFeedbackTracker(tmp_path / "cfb.db", retention_days=0)
         try:
             tracker.record(server="docfix", tool="get_document", missing="x", kind="truncated")
             tracker.record(server="docfix", tool="search", missing="y", kind="wrong_topic")

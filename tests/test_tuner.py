@@ -76,7 +76,7 @@ def metrics_store(tmp_path: Path) -> MetricsStore:
 
 @pytest.fixture
 def feedback_store(tmp_path: Path) -> CompressionFeedbackStore:
-    store = CompressionFeedbackStore(tmp_path / "feedback.db")
+    store = CompressionFeedbackStore(tmp_path / "feedback.db", retention_days=0)
     store.initialize()
     yield store
     store.close()

@@ -949,10 +949,10 @@ def test_compression_md_llm_section_documents_privacy_scan() -> None:
 
 def test_configuration_full_example_documents_supported_config_blocks() -> None:
     """docs/configuration.md's representative proxy example must carry the
-    supported ``cache`` and ``toolgraph`` blocks, with keys and default values
-    matching ``CacheConfig`` / ``ToolgraphConfig`` exactly, plus the two
-    top-level knobs ``default_compression`` / ``max_upstream_chars`` at their
-    ProxyConfig defaults.
+    supported ``cache``, ``toolgraph``, ``compression_feedback`` and
+    ``progressive_reads`` blocks, with keys and default values matching their
+    models exactly, plus the two top-level knobs ``default_compression`` /
+    ``max_upstream_chars`` at their ProxyConfig defaults.
 
     Comparing each documented block to ``Model().model_dump(mode="json")``
     (rather than just a key-subset check) pins the example to the real defaults:
@@ -968,6 +968,8 @@ def test_configuration_full_example_documents_supported_config_blocks() -> None:
 
     from memtomem_stm.proxy.config import (
         CacheConfig,
+        CompressionFeedbackConfig,
+        ProgressiveReadsConfig,
         ProxyConfig,
         ToolgraphConfig,
     )
@@ -1015,19 +1017,24 @@ def test_configuration_full_example_documents_supported_config_blocks() -> None:
         # file resolves to.
         "cache": CacheConfig().model_dump(mode="json"),
         "toolgraph": ToolgraphConfig().model_dump(mode="json"),
+        # #876: the retention story lives entirely in these two models — the
+        # stores have no constructor default to fall back on — so the
+        # documented ``retention_days: 90`` must not drift from the model.
+        "compression_feedback": CompressionFeedbackConfig().model_dump(mode="json"),
+        "progressive_reads": ProgressiveReadsConfig().model_dump(mode="json"),
     }
     for name, defaults in expected_blocks.items():
         if name not in example:
             pytest.fail(
                 f"docs/configuration.md full-example omits the `{name}` block — "
-                f"add it mirroring {name.capitalize()}Config's defaults. The "
+                f"add it mirroring the `{name}` model's defaults. The "
                 "'all options' claim (and this test) require every ProxyConfig "
                 "sub-block to appear."
             )
         if _fwd_slash(example[name]) != _fwd_slash(defaults):
             pytest.fail(
-                f"docs/configuration.md `{name}` example does not match "
-                f"{name.capitalize()}Config defaults.\n"
+                f"docs/configuration.md `{name}` example does not match the "
+                f"`{name}` model defaults.\n"
                 f"  documented: {example[name]!r}\n"
                 f"  defaults:   {defaults!r}\n"
                 "Keep the example in sync with src/memtomem_stm/proxy/config.py."
