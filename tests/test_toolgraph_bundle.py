@@ -196,6 +196,33 @@ def test_switching_from_stdio_to_bundle_drops_the_stdio_coverage(tmp_path: Path)
     assert manager._advertised_reject_reasons == {}
 
 
+def test_switching_from_stdio_to_bundle_drops_the_stdio_from_cache(tmp_path):
+    """A freshly read bundle must not report the retired consult's provenance.
+
+    ``from_cache`` answers "is this decision current?" for the *stdio* consult,
+    whose verdict a #494 cache hit can supply. Bundle adoption reads the
+    artifact live every time, so carrying that flag across the owner change
+    would tell an operator a bundle they just published is being served from a
+    cache — the one question the field exists to answer, answered wrongly
+    (#919).
+    """
+    manager, bundle_path, live_tool = _manager(tmp_path)
+    # A previous stdio consult whose verdict came from the consult cache.
+    manager._toolgraph_state_owner = "stdio"
+    manager._toolgraph_from_cache = True
+
+    _write_bundle(bundle_path, _bundle(live_tool))
+    manager._refresh_toolgraph_bundle(startup=True)
+
+    assert manager._toolgraph_state_owner == "bundle"
+    status = manager.get_toolgraph_status()
+    assert status is not None
+    assert status["source"] == "bundle"
+    assert status["from_cache"] is False, (
+        "a live bundle read reported the retired stdio consult's cache provenance"
+    )
+
+
 def test_parser_accepts_additive_fields_and_pins_exact_bytes():
     doc = _bundle(_tool())
     doc["future"] = {"safe": True}

@@ -1228,6 +1228,14 @@ class ProxyManager:
             self._reject_toolgraph_bundle(exc, startup=startup, cfg_live=cfg_live)
             return
 
+        # Adoption is an owner transition like the stdio consult's, so it
+        # clears the shared verdict fields the same way (#919): the assignments
+        # below re-set them from the snapshot and the apply rebuilds the bind
+        # maps, but source provenance such as ``_toolgraph_from_cache`` belongs
+        # to the retired stdio verdict and must not survive into a bundle's
+        # status. Deliberately after the load/re-stat barrier above: a rejected
+        # bundle must never clear a verdict that is still in force.
+        self._reset_toolgraph_verdict_state()
         self._toolgraph_policy_snapshot = snapshot
         self._toolgraph_bundle_stamp = after_stamp
         self._toolgraph_state_owner = "bundle"
