@@ -5446,6 +5446,14 @@ class ProxyManager:
         # guard below when the compressor cut more than ``min_result_retention``
         # allows — it feeds into metrics for auditing R4 after the fact.
         effective_compression: CompressionStrategy = tc.compression
+        # Set True only where the selector actually runs (the compress branch
+        # below). Resolving AUTO overwrites ``effective_compression``, so this
+        # is the only place the distinction survives, and the metrics row it
+        # reaches is what lets the tuner tell AUTO's behavior from a pin's
+        # (#933). The PROGRESSIVE branch never reaches the selector, and a call
+        # whose budget gate short-circuits to NONE never ran detection either —
+        # both leave it False.
+        strategy_auto_selected = False
         ratio_violation = False
         # F6: populated only when the call runs the progressive surfacing path.
         # ``None`` elsewhere (non-progressive path, or ``injection_mode='prepend'``
@@ -5583,6 +5591,9 @@ class ProxyManager:
             # Resolve AUTO early so downstream metrics know which strategy ran.
             if effective_compression == CompressionStrategy.AUTO:
                 effective_compression = auto_select_strategy(cleaned, max_chars=effective_max_chars)
+                # Recorded next to the label, because the label alone cannot be
+                # attributed to AUTO afterwards (#933).
+                strategy_auto_selected = True
 
             with traced(
                 "proxy_call_compress",
@@ -5861,6 +5872,7 @@ class ProxyManager:
             surfaced=surfaced,
             compressed_chars_for_metrics=compressed_chars_for_metrics,
             metrics_strategy=metrics_strategy,
+            strategy_auto_selected=strategy_auto_selected,
             ratio_violation=ratio_violation,
             effective_compression=effective_compression,
             progressive_passthrough_on_error=progressive_passthrough_on_error,
@@ -6771,6 +6783,7 @@ class ProxyManager:
                 surface_ms=_surface_ms,
                 surfaced_chars=len(surfaced),
                 compression_strategy=metrics_strategy,
+                strategy_auto_selected=comp.strategy_auto_selected,
                 ratio_violation=ratio_violation,
                 scorer_fallback=getattr(_scorer, "fallback_count", 0) > _pre_scorer_fb,
                 index_ok=index_ok,

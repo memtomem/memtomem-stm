@@ -77,6 +77,13 @@ _MIGRATIONS: dict[str, str] = {
     "compression_strategy": (
         "ALTER TABLE proxy_metrics ADD COLUMN compression_strategy TEXT DEFAULT NULL"
     ),
+    # Nullable, deliberately: NOT NULL DEFAULT 0 would backfill every existing
+    # row as "not AUTO-selected", which is a claim about calls this column was
+    # not there to observe. NULL reads as unknown provenance, which the tuner
+    # excludes (#933).
+    "strategy_auto_selected": (
+        "ALTER TABLE proxy_metrics ADD COLUMN strategy_auto_selected INTEGER DEFAULT NULL"
+    ),
     "ratio_violation": (
         "ALTER TABLE proxy_metrics ADD COLUMN ratio_violation INTEGER NOT NULL DEFAULT 0"
     ),
@@ -549,11 +556,12 @@ class MetricsStore:
                 "INSERT INTO proxy_metrics "
                 "(server, tool, original_chars, compressed_chars, cleaned_chars, "
                 "is_error, error_category, error_code, error_message, trace_id, "
-                "compression_strategy, ratio_violation, scorer_fallback, "
+                "compression_strategy, strategy_auto_selected, "
+                "ratio_violation, scorer_fallback, "
                 "index_ok, index_error, chunks_indexed, "
                 "extract_ok, extract_error, "
                 "surfacing_on_progressive_ok, surface_error, source, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     metrics.server,
                     metrics.tool,
@@ -570,6 +578,7 @@ class MetricsStore:
                     ),
                     metrics.trace_id,
                     metrics.compression_strategy,
+                    _tristate(metrics.strategy_auto_selected),
                     int(metrics.ratio_violation),
                     int(metrics.scorer_fallback),
                     _tristate(metrics.index_ok),
@@ -754,8 +763,9 @@ class MetricsStore:
 
         Returns a list of dicts with keys: ``server``, ``tool``,
         ``call_count``, ``violation_count``, ``avg_ratio``, ``ratio_count``,
-        ``p95_original_chars``, ``dominant_strategy``,
-        ``dominant_strategy_count``, ``strategy_count``, ``error_count``.
+        ``p95_original_chars``, ``auto_dominant_strategy``,
+        ``auto_dominant_strategy_count``, ``auto_strategy_count``,
+        ``error_count``.
         Only non-error rows with ``cleaned_chars > 0`` contribute to
         ``avg_ratio``.  ``p95_original_chars`` is approximated by taking
         the value at the 95th percentile rank within each group.
@@ -766,12 +776,17 @@ class MetricsStore:
         ``call_count`` additionally includes error rows and rows that recorded
         no cleaned length.
 
-        ``dominant_strategy_count`` and ``strategy_count`` both count only
-        rows with a non-NULL ``compression_strategy``, and are read in one
-        statement so they share a snapshot; the pair therefore yields a
-        well-defined dominance share. ``call_count`` additionally includes
-        rows that recorded no strategy — every error path, and the success
-        paths that bypass compression entirely.
+        The three ``auto_*`` keys describe one population: the calls whose
+        strategy AUTO chose at runtime (``strategy_auto_selected = 1``). They
+        are read in one statement so they share a snapshot, and the pair of
+        counts therefore yields a well-defined dominance share. Rows that ran
+        under a strategy the config already named are excluded, and so are
+        rows with no provenance recorded — written before the column existed,
+        or by ``mms hook``, which never runs the selector. That exclusion is
+        what lets a caller generalize about AUTO's behavior from these counts;
+        counting a pinned call would attribute it to a resolution that never
+        happened (#933). ``call_count`` includes all of them, plus every error
+        path and the success paths that bypass compression entirely.
 
         Scoped to ``source = 'mcp'``: the tuner adjusts *proxy* compression
         budgets for upstream MCP tools, so native built-in tool rows written by
@@ -831,12 +846,17 @@ class MetricsStore:
                     """,
                     (server, tool, cutoff, server, tool, cutoff),
                 ).fetchone()
-                # Dominant strategy, its count, and the population both are
-                # over.  All three come from ONE statement so they share a
-                # single SQLite snapshot: another process writing between two
-                # statements could otherwise pair a numerator with a smaller
-                # denominator and yield a share above 1.0 (the instance lock
-                # does not span processes).
+                # The strategy AUTO chose most often, how often it chose it,
+                # and the population both are over.  All three come from ONE
+                # statement so they share a single SQLite snapshot: another
+                # process writing between two statements could otherwise pair
+                # a numerator with a smaller denominator and yield a share
+                # above 1.0 (the instance lock does not span processes).
+                #
+                # ``strategy_auto_selected = 1`` is what narrows this to AUTO's
+                # own behavior. It is an equality, not ``IS NOT 0``, so the
+                # NULL provenance of a pre-migration row drops out rather than
+                # counting as either answer.
                 strat_row = self._db.execute(
                     """
                     SELECT
@@ -844,10 +864,12 @@ class MetricsStore:
                         COUNT(*),
                         (SELECT COUNT(*) FROM proxy_metrics
                          WHERE server = ? AND tool = ? AND created_at >= ?
-                             AND compression_strategy IS NOT NULL AND source = 'mcp')
+                             AND compression_strategy IS NOT NULL
+                             AND strategy_auto_selected = 1 AND source = 'mcp')
                     FROM proxy_metrics
                     WHERE server = ? AND tool = ? AND created_at >= ?
-                        AND compression_strategy IS NOT NULL AND source = 'mcp'
+                        AND compression_strategy IS NOT NULL
+                        AND strategy_auto_selected = 1 AND source = 'mcp'
                     GROUP BY compression_strategy
                     ORDER BY COUNT(*) DESC
                     LIMIT 1
@@ -863,9 +885,9 @@ class MetricsStore:
                         "avg_ratio": round(avg_ratio, 4) if avg_ratio is not None else None,
                         "ratio_count": ratio_count or 0,
                         "p95_original_chars": p95_row[0] if p95_row else 0,
-                        "dominant_strategy": strat_row[0] if strat_row else None,
-                        "dominant_strategy_count": strat_row[1] if strat_row else 0,
-                        "strategy_count": strat_row[2] if strat_row else 0,
+                        "auto_dominant_strategy": strat_row[0] if strat_row else None,
+                        "auto_dominant_strategy_count": strat_row[1] if strat_row else 0,
+                        "auto_strategy_count": strat_row[2] if strat_row else 0,
                         "error_count": error_count or 0,
                     }
                 )

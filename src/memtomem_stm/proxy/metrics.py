@@ -181,6 +181,20 @@ class CallMetrics:
     # This flags calls where compression cut more than the configured floor
     # — useful for auditing R4 (min_retention bypass) after the fact.
     compression_strategy: str | None = None
+    # Provenance for the label above: did AUTO pick it at runtime, or was it the
+    # strategy the config already named? The column alone cannot say — AUTO is
+    # resolved before it is written — so a reader generalizing about AUTO's
+    # behavior from these rows was reading calls that may have run under a pin
+    # (#933). Tri-state, and the ``None`` arm is the load-bearing one:
+    #
+    #   ``None``  — no provenance recorded. Rows written before this column
+    #               existed, rows with no strategy at all, and ``mms hook``
+    #               rows, which never run the selector. NOT "was not AUTO":
+    #               provenance is simply unknown, so a reader that needs AUTO
+    #               calls must exclude these rather than count them either way.
+    #   ``True``  — ``auto_select_strategy`` chose this label for this call.
+    #   ``False`` — the strategy was in force before the call ran.
+    strategy_auto_selected: bool | None = None
     ratio_violation: bool = False
     # Scorer fallback: True when EmbeddingScorer fell back to BM25 during this call.
     scorer_fallback: bool = False

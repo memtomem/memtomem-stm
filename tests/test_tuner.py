@@ -37,12 +37,17 @@ def _seed_metrics(
     strategy: str | None = "truncate",
     violation: bool = False,
     is_error: bool = False,
+    auto_selected: bool | None = None,
 ) -> None:
     """Record ``count`` identical calls.
 
     ``strategy=None`` seeds NULL-strategy rows; ``is_error=True`` seeds rows
     the store excludes from ``avg_ratio`` (and therefore from the population
-    H2 rests on).
+    H2 rests on).  ``auto_selected`` is the #933 provenance: ``True`` for a
+    call AUTO resolved, ``False`` for one that ran under a pin, and the
+    default ``None`` for a row recording no provenance at all — what every
+    row written before that column existed looks like.  H3 counts only the
+    ``True`` rows, so a test about AUTO's behavior has to say so.
     """
     for _ in range(count):
         store.record(
@@ -53,6 +58,7 @@ def _seed_metrics(
                 compressed_chars=compressed_chars,
                 cleaned_chars=original_chars,
                 compression_strategy=strategy,
+                strategy_auto_selected=auto_selected,
                 ratio_violation=violation,
                 is_error=is_error,
             )
@@ -84,7 +90,7 @@ class TestGetProfiles:
         assert tuner.get_profiles() == []
 
     def test_shape(self, metrics_store: MetricsStore):
-        _seed_metrics(metrics_store, "srv", "t1", 10, strategy="hybrid")
+        _seed_metrics(metrics_store, "srv", "t1", 10, strategy="hybrid", auto_selected=True)
         tuner = CompressionTuner(metrics_store)
         profiles = tuner.get_profiles()
         assert len(profiles) == 1
@@ -92,10 +98,10 @@ class TestGetProfiles:
         assert p.server == "srv"
         assert p.tool == "t1"
         assert p.call_count == 10
-        assert p.dominant_strategy == "hybrid"
-        assert p.dominant_strategy_count == 10
-        assert p.strategy_count == 10
-        assert p.dominant_strategy_share == 1.0
+        assert p.auto_dominant_strategy == "hybrid"
+        assert p.auto_dominant_strategy_count == 10
+        assert p.auto_strategy_count == 10
+        assert p.auto_dominant_strategy_share == 1.0
         assert p.feedback_count == 0
         assert p.feedback_dominant_kind is None
 
@@ -189,7 +195,7 @@ class TestAnalyze:
                 "srv": UpstreamServerConfig(prefix="test", compression=CompressionStrategy.AUTO)
             }
         )
-        _seed_metrics(metrics_store, "srv", "t1", 12, strategy="hybrid")
+        _seed_metrics(metrics_store, "srv", "t1", 12, strategy="hybrid", auto_selected=True)
         tuner = CompressionTuner(metrics_store, config=cfg)
         recs = tuner.analyze()
         strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
@@ -211,8 +217,8 @@ class TestAnalyze:
                 "srv": UpstreamServerConfig(prefix="test", compression=CompressionStrategy.AUTO)
             }
         )
-        _seed_metrics(metrics_store, "srv", "t1", 7, strategy="hybrid")
-        _seed_metrics(metrics_store, "srv", "t1", 3, strategy="truncate")
+        _seed_metrics(metrics_store, "srv", "t1", 7, strategy="hybrid", auto_selected=True)
+        _seed_metrics(metrics_store, "srv", "t1", 3, strategy="truncate", auto_selected=True)
         tuner = CompressionTuner(metrics_store, config=cfg)
         recs = tuner.analyze()
         strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
@@ -227,14 +233,14 @@ class TestAnalyze:
                 "srv": UpstreamServerConfig(prefix="test", compression=CompressionStrategy.AUTO)
             }
         )
-        _seed_metrics(metrics_store, "srv", "t1", 9, strategy="hybrid")
-        _seed_metrics(metrics_store, "srv", "t1", 1, strategy="truncate")
+        _seed_metrics(metrics_store, "srv", "t1", 9, strategy="hybrid", auto_selected=True)
+        _seed_metrics(metrics_store, "srv", "t1", 1, strategy="truncate", auto_selected=True)
         tuner = CompressionTuner(metrics_store, config=cfg)
         recs = tuner.analyze()
         strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
         assert len(strat_actions) == 1
         assert strat_actions[0].recommended == "hybrid"
-        assert "9 of 10 calls with a recorded strategy" in strat_actions[0].reason
+        assert "AUTO selected hybrid for 9 of 10 calls it resolved" in strat_actions[0].reason
         assert "90.0%" in strat_actions[0].reason
 
     def test_a_share_exactly_at_the_threshold_does_not_fire(self, metrics_store: MetricsStore):
@@ -244,10 +250,10 @@ class TestAnalyze:
                 "srv": UpstreamServerConfig(prefix="test", compression=CompressionStrategy.AUTO)
             }
         )
-        _seed_metrics(metrics_store, "srv", "t1", 8, strategy="hybrid")
-        _seed_metrics(metrics_store, "srv", "t1", 2, strategy="truncate")
+        _seed_metrics(metrics_store, "srv", "t1", 8, strategy="hybrid", auto_selected=True)
+        _seed_metrics(metrics_store, "srv", "t1", 2, strategy="truncate", auto_selected=True)
         tuner = CompressionTuner(metrics_store, config=cfg)
-        assert tuner.get_profiles()[0].dominant_strategy_share == STRATEGY_PIN_THRESHOLD
+        assert tuner.get_profiles()[0].auto_dominant_strategy_share == STRATEGY_PIN_THRESHOLD
         recs = tuner.analyze()
         strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
         assert strat_actions == []
@@ -267,17 +273,17 @@ class TestAnalyze:
                 "srv": UpstreamServerConfig(prefix="test", compression=CompressionStrategy.AUTO)
             }
         )
-        _seed_metrics(metrics_store, "srv", "t1", 9, strategy="hybrid")
-        _seed_metrics(metrics_store, "srv", "t1", 2, strategy="truncate")
+        _seed_metrics(metrics_store, "srv", "t1", 9, strategy="hybrid", auto_selected=True)
+        _seed_metrics(metrics_store, "srv", "t1", 2, strategy="truncate", auto_selected=True)
         _seed_metrics(metrics_store, "srv", "t1", 2, strategy=None)
         tuner = CompressionTuner(metrics_store, config=cfg)
         p = tuner.get_profiles()[0]
         assert p.call_count == 13
-        assert p.strategy_count == 11
+        assert p.auto_strategy_count == 11
         recs = tuner.analyze()
         strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
         assert len(strat_actions) == 1
-        assert "9 of 11 calls with a recorded strategy" in strat_actions[0].reason
+        assert "AUTO selected hybrid for 9 of 11 calls it resolved" in strat_actions[0].reason
 
     def test_the_volume_gate_counts_the_same_calls_as_the_share(
         self, metrics_store: MetricsStore
@@ -293,13 +299,13 @@ class TestAnalyze:
                 "srv": UpstreamServerConfig(prefix="test", compression=CompressionStrategy.AUTO)
             }
         )
-        _seed_metrics(metrics_store, "srv", "t1", 1, strategy="hybrid")
+        _seed_metrics(metrics_store, "srv", "t1", 1, strategy="hybrid", auto_selected=True)
         _seed_metrics(metrics_store, "srv", "t1", 9, strategy=None)
         tuner = CompressionTuner(metrics_store, config=cfg)
         p = tuner.get_profiles()[0]
         assert p.call_count == 10
-        assert p.strategy_count == 1
-        assert p.dominant_strategy_share == 1.0
+        assert p.auto_strategy_count == 1
+        assert p.auto_dominant_strategy_share == 1.0
         recs = tuner.analyze()
         strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
         assert strat_actions == []
@@ -317,15 +323,92 @@ class TestAnalyze:
                 "srv": UpstreamServerConfig(prefix="test", compression=CompressionStrategy.AUTO)
             }
         )
-        _seed_metrics(metrics_store, "srv", "t1", 10, strategy="hybrid")
+        _seed_metrics(metrics_store, "srv", "t1", 10, strategy="hybrid", auto_selected=True)
         _seed_metrics(metrics_store, "srv", "t1", 15, strategy=None)
         tuner = CompressionTuner(metrics_store, config=cfg)
         p = tuner.get_profiles()[0]
         assert p.call_count == 25
-        assert p.strategy_count == 10
+        assert p.auto_strategy_count == 10
         recs = tuner.analyze()
         assert len(recs) == 1
         assert [a.field for a in recs[0].actions] == ["compression"]
+        assert recs[0].confidence == "medium"
+
+    def test_calls_that_ran_under_a_pin_are_not_auto_behavior(self, metrics_store: MetricsStore):
+        """H3 generalizes about AUTO, so only AUTO's own calls count (#933).
+
+        The issue's input: nine calls made while the tool was pinned to
+        `hybrid`, then the operator switches it to `auto` and the one AUTO
+        call so far resolves `truncate`. Counting the nine reads 90% `hybrid`
+        and pins the one strategy AUTO has never chosen; the correct result is
+        to withhold advice, because AUTO has been observed once.
+        """
+        cfg = ProxyConfig(
+            upstream_servers={
+                "srv": UpstreamServerConfig(prefix="test", compression=CompressionStrategy.AUTO)
+            }
+        )
+        _seed_metrics(metrics_store, "srv", "t1", 9, strategy="hybrid", auto_selected=False)
+        _seed_metrics(metrics_store, "srv", "t1", 1, strategy="truncate", auto_selected=True)
+        tuner = CompressionTuner(metrics_store, config=cfg)
+        p = tuner.get_profiles()[0]
+        assert p.call_count == 10
+        assert p.auto_strategy_count == 1
+        assert p.auto_dominant_strategy == "truncate"
+        recs = tuner.analyze()
+        strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
+        assert strat_actions == []
+
+    def test_rows_with_no_recorded_provenance_are_not_auto_behavior(
+        self, metrics_store: MetricsStore
+    ):
+        """A row written before the column existed is unknown, not "not AUTO".
+
+        Twelve such rows would clear every gate if NULL were read as either
+        answer; they have to drop out of the population entirely (#933).
+        """
+        cfg = ProxyConfig(
+            upstream_servers={
+                "srv": UpstreamServerConfig(prefix="test", compression=CompressionStrategy.AUTO)
+            }
+        )
+        _seed_metrics(metrics_store, "srv", "t1", 12, strategy="hybrid")
+        tuner = CompressionTuner(metrics_store, config=cfg)
+        p = tuner.get_profiles()[0]
+        assert p.call_count == 12
+        assert p.auto_strategy_count == 0
+        assert p.auto_dominant_strategy is None
+        recs = tuner.analyze()
+        strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
+        assert strat_actions == []
+
+    def test_the_pin_still_fires_on_auto_resolutions_alone(self, metrics_store: MetricsStore):
+        """The positive control for the two tests above (#933).
+
+        Same shape as the withheld case — a dominant `hybrid` beside one
+        `truncate` — except every row is one AUTO resolved. Without this, the
+        exclusion could be silencing H3 entirely and both negatives would
+        still pass.
+        """
+        cfg = ProxyConfig(
+            upstream_servers={
+                "srv": UpstreamServerConfig(prefix="test", compression=CompressionStrategy.AUTO)
+            }
+        )
+        _seed_metrics(metrics_store, "srv", "t1", 9, strategy="hybrid", auto_selected=True)
+        _seed_metrics(metrics_store, "srv", "t1", 1, strategy="truncate", auto_selected=True)
+        _seed_metrics(metrics_store, "srv", "t1", 20, strategy="hybrid", auto_selected=False)
+        tuner = CompressionTuner(metrics_store, config=cfg)
+        p = tuner.get_profiles()[0]
+        # The pinned rows raise `call_count` without touching the share or the
+        # volume gate, so the label stays medium on ten observations.
+        assert p.call_count == 30
+        assert p.auto_strategy_count == 10
+        recs = tuner.analyze()
+        strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
+        assert len(strat_actions) == 1
+        assert strat_actions[0].recommended == "hybrid"
+        assert "AUTO selected hybrid for 9 of 10 calls it resolved" in strat_actions[0].reason
         assert recs[0].confidence == "medium"
 
     def test_h2_confidence_follows_the_rows_avg_ratio_reads(self, metrics_store: MetricsStore):
@@ -459,9 +542,16 @@ class TestAnalyze:
                 "srv": UpstreamServerConfig(prefix="test", compression=CompressionStrategy.AUTO)
             }
         )
-        _seed_metrics(metrics_store, "srv", "t1", 12, strategy="hybrid→progressive_fallback")
+        _seed_metrics(
+            metrics_store,
+            "srv",
+            "t1",
+            12,
+            strategy="hybrid→progressive_fallback",
+            auto_selected=True,
+        )
         tuner = CompressionTuner(metrics_store, config=cfg)
-        assert tuner.get_profiles()[0].dominant_strategy_share == 1.0
+        assert tuner.get_profiles()[0].auto_dominant_strategy_share == 1.0
         recs = tuner.analyze()
         strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
         assert strat_actions == []
@@ -480,14 +570,14 @@ class TestAnalyze:
                 "srv": UpstreamServerConfig(prefix="test", compression=CompressionStrategy.AUTO)
             }
         )
-        _seed_metrics(metrics_store, "srv", "t1", 81, strategy="hybrid")
-        _seed_metrics(metrics_store, "srv", "t1", 20, strategy="truncate")
+        _seed_metrics(metrics_store, "srv", "t1", 81, strategy="hybrid", auto_selected=True)
+        _seed_metrics(metrics_store, "srv", "t1", 20, strategy="truncate", auto_selected=True)
         tuner = CompressionTuner(metrics_store, config=cfg)
         recs = tuner.analyze()
         strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
         assert len(strat_actions) == 1
         reason = strat_actions[0].reason
-        assert "81 of 101 calls with a recorded strategy" in reason
+        assert "AUTO selected hybrid for 81 of 101 calls it resolved" in reason
         assert "80.2%" in reason
 
     def test_budget_advice_measures_against_the_global_default(self, metrics_store: MetricsStore):
@@ -624,7 +714,7 @@ class TestAnalyze:
             upstream_servers={"srv": UpstreamServerConfig(prefix="test")},
             default_compression=CompressionStrategy.HYBRID,
         )
-        _seed_metrics(metrics_store, "srv", "t1", 12, strategy="hybrid")
+        _seed_metrics(metrics_store, "srv", "t1", 12, strategy="hybrid", auto_selected=True)
         tuner = CompressionTuner(metrics_store, config=cfg)
         recs = tuner.analyze()
         strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
@@ -643,7 +733,7 @@ class TestAnalyze:
             },
             default_compression=CompressionStrategy.HYBRID,
         )
-        _seed_metrics(metrics_store, "srv", "t1", 12, strategy="hybrid")
+        _seed_metrics(metrics_store, "srv", "t1", 12, strategy="hybrid", auto_selected=True)
         tuner = CompressionTuner(metrics_store, config=cfg)
         recs = tuner.analyze()
         strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
@@ -662,7 +752,7 @@ class TestAnalyze:
             },
             default_compression=CompressionStrategy.AUTO,
         )
-        _seed_metrics(metrics_store, "srv", "t1", 12, strategy="hybrid")
+        _seed_metrics(metrics_store, "srv", "t1", 12, strategy="hybrid", auto_selected=True)
         tuner = CompressionTuner(metrics_store, config=cfg)
         recs = tuner.analyze()
         strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]

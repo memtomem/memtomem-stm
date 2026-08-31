@@ -80,6 +80,12 @@ class CompressionResult:
     surfaced: str
     compressed_chars_for_metrics: int
     metrics_strategy: str
+    # Whether ``auto_select_strategy`` picked the strategy this call ran under,
+    # as opposed to the config naming it. ``effective_compression`` below cannot
+    # say — AUTO is resolved into it — and the metrics row needs the difference
+    # to keep AUTO's observed behavior apart from a pin's (#933). No default
+    # (the module contract above): both branches set it explicitly.
+    strategy_auto_selected: bool
     ratio_violation: bool
     effective_compression: CompressionStrategy
     progressive_passthrough_on_error: bool
