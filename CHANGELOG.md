@@ -415,6 +415,42 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **The score-scale tripwire maps are bounded** (#880). `SurfacingEngine`
+  caps its surfaced-id, boost-dedup and cache-invalidation maps at 10k, and a
+  comment claimed the five `(server, tool)`-keyed score-scale maps needed no
+  cap because they were "naturally bounded by the configured upstream tool
+  set". Both halves were wrong. There is no configured tool set: keys come
+  from the upstream-advertised `tools/list` catalogue, which #917 rebuilds on
+  every reconnect, and on the hook/daemon path from the client-supplied
+  host-native tool name. And each map sheds a key only on a later observation
+  of that same key — `_score_scale_mismatch_recovery_pending` only on one whose
+  durable recovery UPDATE succeeds, impossible for a trackerless engine, which
+  is exactly the hook/daemon configuration — so a tool that is advertised,
+  observed once and never called again never left any of them. All five now
+  share the existing `_fifo_prune` policy through one seam,
+  `_prune_score_scale_maps`, run from `_observe_score_scale`'s `finally` so
+  every early return still prunes.
+
+  Eviction must not cost a *wrong* diagnostic: those in-memory latches are what
+  tell a healthy observation to close the durable `score_scale_mismatch`
+  episode, and an evicted key would otherwise keep `mms doctor` FAILing for the
+  full 7-day window on a tool that had recovered. So once one of the two
+  mismatch maps has actually dropped a key, a healthy observation writes that
+  recovery too, and `_score_scale_recovery_persisted` now means "this key's
+  recoveries are durably settled" — armed on the AND of the writes attempted,
+  so any failure leaves it open and the next healthy observation retries, with
+  no dependence on bookkeeping that could itself be evicted in between. The
+  recovery is a WHERE-guarded UPDATE against that key's own row, written on
+  that key's own healthy evidence, so a key with no open episode costs one
+  no-op statement. Nothing evicts below 10k keys, so an ordinary deployment's
+  write pattern is unchanged.
+
+  **Behavior change**: past 10k distinct `(server, tool)` keys in one process,
+  the oldest half of the score-scale state is forgotten instead of retained.
+  The remaining cost of evicting a key is one repeated WARNING, one redundant
+  no-op UPDATE, or a heuristic streak counter that restarts its 5-observation
+  window.
+
 - **The feedback stores no longer carry a retention default that contradicts
   the config** (#876). `CompressionFeedbackStore` / `ProgressiveReadsStore` and
   their trackers defaulted `retention_days` to `0` — never purge — while

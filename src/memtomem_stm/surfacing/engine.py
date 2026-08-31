@@ -32,13 +32,15 @@ from memtomem_stm.utils.redact import redact_exception_text, redact_url_userinfo
 logger = logging.getLogger(__name__)
 
 
-def _fifo_prune(d: dict[Any, None], cap: int) -> None:
+def _fifo_prune(d: dict[Any, Any], cap: int) -> None:
     """Evict oldest (first-inserted) entries once *cap* is exceeded.
 
     Prunes down to roughly half the cap so steady-state inserts don't
     re-trip the prune on every call. Shared by the engine's bounded
     insertion-ordered guard maps (boost dedup, cache invalidation,
-    surfaced-id dedup) so the eviction policy can't drift per site.
+    surfaced-id dedup, and the five score-scale tripwire maps) so the
+    eviction policy can't drift per site. Values are ignored — callers
+    pass ``None``-valued ordered sets or real payloads alike.
     """
     if len(d) <= cap:
         return
@@ -261,15 +263,42 @@ class SurfacingEngine:
         # contract break (e.g. core renamed a top-level key) is silent to an
         # operator who is not reading counters — same rationale as #349.
         self._warned_compose_failed: bool = False
-        # Per-upstream-tool score-scale tripwire (#672). Only real LTM
-        # searches update this state; cache hits have no raw scores and are
-        # deliberately neutral. Entries disappear on recovery/reset, so the
-        # map is naturally bounded by the configured upstream tool set.
+        # Per-upstream-tool score-scale tripwire (#672), keyed by
+        # ``(server, tool)``. Only real LTM searches update this state; cache
+        # hits have no raw scores and are deliberately neutral.
+        #
+        # All five maps below are FIFO-capped at ``_score_scale_keys_max``
+        # (#880). An earlier comment here claimed they were "naturally bounded
+        # by the configured upstream tool set"; both halves were wrong. There
+        # is no configured tool set — keys come from the upstream-advertised
+        # ``tools/list`` catalogue, which #917 rebuilds on every reconnect, and
+        # on the hook/daemon path from the client-supplied host-native tool
+        # name. And every one of them sheds a key only on a LATER observation
+        # of that same key — ``_score_scale_mismatch_recovery_pending`` only on
+        # one whose durable recovery UPDATE succeeds, which a trackerless
+        # engine (exactly the hook/daemon configuration) can never do. A tool
+        # that is advertised, observed once and never called again therefore
+        # never leaves any of them.
+        #
+        # Eviction costs at most a repeated WARNING or a redundant
+        # WHERE-guarded UPDATE, plus a reset streak counter (the heuristic
+        # tier restarts its 5-observation window). It must not cost a WRONG
+        # diagnostic, so the healthy branch falls back to a blind mismatch
+        # recovery once ``_score_scale_evicted`` is set — see there.
+        self._score_scale_keys_max = 10000
+        # True once ``_prune_score_scale_maps`` has dropped a key from one of
+        # the two MISMATCH maps specifically. Only those two carry the link
+        # between a healthy observation and the durable recovery write, so
+        # only their eviction justifies the healthy branch's blind fallback —
+        # a flag tripped by unrelated streak/ceiling eviction would widen that
+        # write to keys this engine never un-latched. Until it flips, the
+        # write pattern is byte-identical to the pre-#880 engine.
+        self._score_scale_mismatch_evicted = False
         self._score_scale_streaks: dict[tuple[str, str], _ScoreScaleStreak] = {}
         # A healthy observation closes at most one persisted episode per key.
         # Re-arm only after a subsequent below-threshold observation so the
         # healthy hot path does not UPDATE+commit on every search.
-        self._score_scale_recovery_persisted: set[tuple[str, str]] = set()
+        self._score_scale_recovery_persisted: dict[tuple[str, str], None] = {}
         # Keys with an open ``score_scale_mismatch`` episode (#1781): the core
         # NAMED a non-RRF scale while the ceiling sat below min_score, so the
         # diagnostic fired without streak evidence. Fires once per episode;
@@ -277,12 +306,12 @@ class SurfacingEngine:
         # can warn even when persistence is unavailable. Deliberately NOT
         # cleared on empty results — alternating empty/below-threshold searches
         # must not re-fire the WARNING.
-        self._score_scale_mismatch_active: set[tuple[str, str]] = set()
+        self._score_scale_mismatch_active: dict[tuple[str, str], None] = {}
         # Keys whose definitive-tier episode became healthy but whose durable
         # recovery UPDATE has not succeeded yet (#729). Kept separate from the
         # warning latch above so logging re-arms immediately while transient DB
         # failures retry on later healthy observations.
-        self._score_scale_mismatch_recovery_pending: set[tuple[str, str]] = set()
+        self._score_scale_mismatch_recovery_pending: dict[tuple[str, str], None] = {}
         # Last core-reported score scale / reranker model ID (#1781), fed to
         # ``get_min_score_snapshot`` for stm_surfacing_stats. ``None`` until a
         # capable core names one this process; kept at the last REPORTED value
@@ -296,7 +325,7 @@ class SurfacingEngine:
         # episode describes a problem that no longer exists. Closed once per
         # key per process, guarded on persistence success so a trackerless
         # engine retries (a cheap no-op) instead of never writing.
-        self._scale_gate_recovery_persisted: set[tuple[str, str]] = set()
+        self._scale_gate_recovery_persisted: dict[tuple[str, str], None] = {}
         # Warn-once INFO latch for the first suspended batch this process.
         self._scale_gate_logged: bool = False
         # Keys THIS engine turned away while its breaker was open (#869). The
@@ -404,7 +433,7 @@ class SurfacingEngine:
         # every below-threshold observation. Fires before the tracker guard so
         # the in-memory latch stays correct regardless of persistence backend
         # (a trackerless engine never arms the latch, so this is a no-op there).
-        self._scale_gate_recovery_persisted.discard((server, tool))
+        self._scale_gate_recovery_persisted.pop((server, tool), None)
         if self._feedback_tracker is None:
             return
         try:
@@ -613,6 +642,63 @@ class SurfacingEngine:
         *,
         filter_suspended: bool = False,
     ) -> None:
+        """Observe one batch, then bound the tripwire maps (#880).
+
+        The prune lives here rather than at each insert so every early
+        ``return`` inside the body is still followed by it, and so the five
+        maps share one eviction policy with the other guard maps. See the
+        ``__init__`` comment for why they are not bounded by anything else.
+        """
+        try:
+            self._observe_score_scale_inner(
+                server,
+                tool,
+                results,
+                min_score,
+                scale,
+                reranker,
+                filter_suspended=filter_suspended,
+            )
+        finally:
+            self._prune_score_scale_maps()
+
+    def _prune_score_scale_maps(self) -> None:
+        """Bound the five tripwire maps, recording whether anything evicted.
+
+        Tracks eviction from the two MISMATCH maps only: they are the ones
+        holding the link between a healthy observation and the durable
+        recovery write, so their eviction is what the healthy branch's
+        fallback compensates for. Nothing evicts until a process has seen more
+        than ``_score_scale_keys_max`` distinct keys, so that fallback costs
+        nothing in an ordinary deployment.
+        """
+        cap = self._score_scale_keys_max
+        mismatch_maps: tuple[dict[Any, Any], ...] = (
+            self._score_scale_mismatch_active,
+            self._score_scale_mismatch_recovery_pending,
+        )
+        other_maps: tuple[dict[Any, Any], ...] = (
+            self._score_scale_streaks,
+            self._score_scale_recovery_persisted,
+            self._scale_gate_recovery_persisted,
+        )
+        before = sum(len(m) for m in mismatch_maps)
+        for m in other_maps + mismatch_maps:
+            _fifo_prune(m, cap)
+        if sum(len(m) for m in mismatch_maps) < before:
+            self._score_scale_mismatch_evicted = True
+
+    def _observe_score_scale_inner(
+        self,
+        server: str,
+        tool: str,
+        results: list[Any],
+        min_score: float,
+        scale: str | None | object = _UNSET,
+        reranker: str | None = None,
+        *,
+        filter_suspended: bool = False,
+    ) -> None:
         """Warn once per episode when healthy search scores stay below floor.
 
         ``scale``/``reranker`` may be passed as the caller's already-derived
@@ -654,8 +740,8 @@ class SurfacingEngine:
         if filter_suspended:
             self._score_scale_streaks.pop(key, None)
             if key in self._score_scale_mismatch_active:
-                self._score_scale_mismatch_recovery_pending.add(key)
-            self._score_scale_mismatch_active.discard(key)
+                self._score_scale_mismatch_recovery_pending[key] = None
+            self._score_scale_mismatch_active.pop(key, None)
             if key not in self._scale_gate_recovery_persisted:
                 closed_mismatch = self._persist_diagnostic_recovery(
                     server, tool, "score_scale_mismatch"
@@ -669,9 +755,9 @@ class SurfacingEngine:
                 # first suspended batch instead of FAILing for the full
                 # 7-day window on a setup the gate just fixed.
                 if closed_mismatch:
-                    self._score_scale_mismatch_recovery_pending.discard(key)
+                    self._score_scale_mismatch_recovery_pending.pop(key, None)
                 if closed_mismatch and closed_ceiling:
-                    self._scale_gate_recovery_persisted.add(key)
+                    self._scale_gate_recovery_persisted[key] = None
             return
 
         scores = [float(r.score) for r in results]
@@ -681,25 +767,47 @@ class SurfacingEngine:
         result_max = max(scores)
         if result_max >= min_score:
             self._score_scale_streaks.pop(key, None)
-            if (
-                key not in self._score_scale_recovery_persisted
-                and self._persist_diagnostic_recovery(server, tool, "score_ceiling_below_min")
-            ):
-                self._score_scale_recovery_persisted.add(key)
+            if key not in self._score_scale_recovery_persisted:
+                # The latch means "this key's recoveries are durably settled",
+                # so it is armed on the AND of the writes attempted here. That
+                # is what makes the retry unconditional: any write that fails
+                # leaves the latch open and the next healthy observation tries
+                # again, with no dependence on a second map that could itself
+                # be evicted between the failure and the retry (#880).
+                settled = self._persist_diagnostic_recovery(server, tool, "score_ceiling_below_min")
+                # A key whose mismatch latch was FIFO-evicted may still have an
+                # OPEN ``score_scale_mismatch`` row that the latch-driven
+                # writes below can no longer reach, leaving ``mms doctor``
+                # FAILing for the full 7-day window on a tool that recovered.
+                # ``record_diagnostic_recovery`` is a WHERE-guarded UPDATE, so
+                # a key with no open episode costs one no-op statement — and
+                # the close is written on this key's own healthy evidence,
+                # against this key's own row.
+                if (
+                    self._score_scale_mismatch_evicted
+                    and key not in self._score_scale_mismatch_active
+                    and key not in self._score_scale_mismatch_recovery_pending
+                ):
+                    settled = (
+                        self._persist_diagnostic_recovery(server, tool, "score_scale_mismatch")
+                        and settled
+                    )
+                if settled:
+                    self._score_scale_recovery_persisted[key] = None
             # Re-arm the definitive-tier log UNCONDITIONALLY on a healthy
             # observation. Durable recovery is tracked separately so a DB
             # failure retries without suppressing a later genuine warning.
             if key in self._score_scale_mismatch_active:
-                self._score_scale_mismatch_recovery_pending.add(key)
-                self._score_scale_mismatch_active.discard(key)
+                self._score_scale_mismatch_recovery_pending[key] = None
+                self._score_scale_mismatch_active.pop(key, None)
             if (
                 key in self._score_scale_mismatch_recovery_pending
                 and self._persist_diagnostic_recovery(server, tool, "score_scale_mismatch")
             ):
-                self._score_scale_mismatch_recovery_pending.discard(key)
+                self._score_scale_mismatch_recovery_pending.pop(key, None)
             return
 
-        self._score_scale_recovery_persisted.discard(key)
+        self._score_scale_recovery_persisted.pop(key, None)
 
         if scale is not None and scale in KNOWN_SCORE_SCALES and scale != "rrf":
             # Definitive tier: no streak needed — the core itself says the
@@ -753,7 +861,7 @@ class SurfacingEngine:
                     remedy,
                 )
                 self._persist_diagnostic(server, tool, "score_scale_mismatch")
-                self._score_scale_mismatch_active.add(key)
+                self._score_scale_mismatch_active[key] = None
             # The named scale supersedes streak evidence: keep the heuristic
             # counter out of a window the definitive diagnostic already covers.
             self._score_scale_streaks.pop(key, None)
