@@ -437,6 +437,15 @@ changes inline only. See the deprecation policy in
   in one statement. Four latches and #880's eviction fallback are deleted with
   it, net −326 lines.
 
+  Under peers configured *differently* — one suspending via the scale gate,
+  one pinning `min_score` — the row now tracks the newest observation and
+  oscillates, so the gated peer can read a `mms doctor` FAIL its own suspended
+  filter does not justify. That trade is deliberate: `surfacing_faults` is
+  keyed `(server, tool, kind)` with no process column (the fault rows have
+  always behaved this way), and it ends the unbounded failure where a
+  mismatching process was silenced for the whole retention window. Making both
+  verdicts right at once needs per-process ownership in the schema.
+
   **Behavior change**: the counts under "score-scale diagnostics" in
   `mms stats` (and `surfacing.diagnostics` in `--json`) now count
   below-threshold observations rather than episodes — the same meaning the

@@ -436,9 +436,12 @@ class SurfacingEngine:
         — one with the scale gate suspending its batches, one with the filter
         pinned active — it tracks the NEWEST observation and oscillates. That
         is the granularity ``surfacing_faults`` has (see
-        ``record_fault_recovery``), and it is the tolerable half of #944: what
-        is not tolerable, and what latching caused, is a process being
-        silenced permanently once a peer closed the episode.
+        ``record_fault_recovery``), and the trade is deliberate, not free:
+        the gated peer can now read a FAIL its own suspended filter does not
+        justify, where before it read a PASS. What that buys is the end of the
+        unbounded failure — a mismatching process silenced for the whole
+        retention window once a peer closed the episode (#944). Making both
+        verdicts right at once needs per-process ownership in the schema.
         """
         if self._feedback_tracker is None:
             return
