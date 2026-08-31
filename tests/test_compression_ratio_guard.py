@@ -63,6 +63,7 @@ class TestMetricsStoreCompressionMigration:
         store.initialize()
         cols = {row[1] for row in store._db.execute("PRAGMA table_info(proxy_metrics)")}
         assert "compression_strategy" in cols
+        assert "strategy_auto_selected" in cols
         assert "ratio_violation" in cols
         store.close()
 
@@ -84,6 +85,7 @@ class TestMetricsStoreCompressionMigration:
         store.initialize()
         cols = {row[1] for row in store._db.execute("PRAGMA table_info(proxy_metrics)")}
         assert "compression_strategy" in cols
+        assert "strategy_auto_selected" in cols
         assert "ratio_violation" in cols
         store.close()
 
@@ -99,6 +101,7 @@ class TestMetricsStoreCompressionMigration:
         store2.initialize()
         cols = {row[1] for row in store2._db.execute("PRAGMA table_info(proxy_metrics)")}
         assert "compression_strategy" in cols
+        assert "strategy_auto_selected" in cols
         assert "ratio_violation" in cols
         store2.close()
 
@@ -113,13 +116,15 @@ class TestMetricsStoreCompressionMigration:
                 compressed_chars=500,
                 cleaned_chars=10000,
                 compression_strategy="truncate",
+                strategy_auto_selected=True,
                 ratio_violation=True,
             )
         )
         row = store._db.execute(
-            "SELECT compression_strategy, ratio_violation FROM proxy_metrics"
+            "SELECT compression_strategy, ratio_violation, strategy_auto_selected "
+            "FROM proxy_metrics"
         ).fetchone()
-        assert row == ("truncate", 1)
+        assert row == ("truncate", 1, 1)
         store.close()
 
     def test_record_success_defaults(self, tmp_path):
@@ -136,9 +141,12 @@ class TestMetricsStoreCompressionMigration:
             )
         )
         row = store._db.execute(
-            "SELECT compression_strategy, ratio_violation FROM proxy_metrics"
+            "SELECT compression_strategy, ratio_violation, strategy_auto_selected "
+            "FROM proxy_metrics"
         ).fetchone()
-        assert row == (None, 0)
+        # The provenance flag is tri-state: an unrecorded strategy has no
+        # provenance either, and NULL must not read as "not AUTO" (#933).
+        assert row == (None, 0, None)
         store.close()
 
 
@@ -161,11 +169,18 @@ def _make_manager_with_store(
     max_result_chars: int = 50000,
     progressive: ProgressiveConfig | None = None,
     selective: SelectiveConfig | None = None,
+    max_result_tokens: int | None = None,
+    token_estimation_mode: str | None = None,
 ) -> tuple[ProxyManager, MetricsStore]:
     """Build a ProxyManager wired to a real MetricsStore so tests can read
     persisted rows directly — closer to production than summary dicts."""
     store = MetricsStore(tmp_path / "metrics.db")
     store.initialize()
+    extra: dict = {}
+    if max_result_tokens is not None:
+        extra["max_result_tokens"] = max_result_tokens
+    if token_estimation_mode is not None:
+        extra["token_estimation_mode"] = token_estimation_mode
     server_cfg = UpstreamServerConfig(
         prefix="test",
         compression=compression,
@@ -174,6 +189,7 @@ def _make_manager_with_store(
         reconnect_delay_seconds=0.0,
         progressive=progressive,
         selective=selective,
+        **extra,
     )
     proxy_cfg = ProxyConfig(
         config_path=tmp_path / "proxy.json",
@@ -195,7 +211,7 @@ def _make_manager_with_store(
 def _latest_row(store: MetricsStore) -> dict:
     row = store._db.execute(
         "SELECT server, tool, cleaned_chars, compressed_chars, "
-        "compression_strategy, ratio_violation "
+        "compression_strategy, ratio_violation, strategy_auto_selected "
         "FROM proxy_metrics ORDER BY id DESC LIMIT 1"
     ).fetchone()
     return {
@@ -205,6 +221,7 @@ def _latest_row(store: MetricsStore) -> dict:
         "compressed_chars": row[3],
         "compression_strategy": row[4],
         "ratio_violation": row[5],
+        "strategy_auto_selected": row[6],
     }
 
 
@@ -218,6 +235,97 @@ class TestProxyManagerRatioGuard:
         row = _latest_row(store)
         assert row["compression_strategy"] == "truncate"
         assert row["ratio_violation"] == 0
+        store.close()
+
+    async def test_a_pinned_strategy_is_not_recorded_as_auto_selected(self, tmp_path):
+        """The label alone cannot say who chose it (#933).
+
+        `truncate` is written identically whether AUTO landed on it or the
+        config named it, so the provenance flag is the only thing that keeps
+        a pinned call out of AUTO's observed behavior.
+        """
+        mgr, store = _make_manager_with_store(tmp_path)
+        mgr._connections["srv"].session.call_tool.return_value = _make_result("ok")
+        await mgr.call_tool("srv", "tool", {})
+        row = _latest_row(store)
+        assert row["compression_strategy"] == "truncate"
+        assert row["strategy_auto_selected"] == 0
+        store.close()
+
+    async def test_auto_resolution_is_recorded_as_auto_selected(self, tmp_path):
+        """A call the selector resolved records that it did (#933)."""
+        mgr, store = _make_manager_with_store(
+            tmp_path,
+            compression=CompressionStrategy.AUTO,
+            max_result_chars=100,
+        )
+        mgr._connections["srv"].session.call_tool.return_value = _make_result("x" * 5000)
+        await mgr.call_tool("srv", "tool", {})
+        row = _latest_row(store)
+        # Which strategy AUTO picked is `auto_select_strategy`'s business; what
+        # this pins is that the row says AUTO picked it, and that the recorded
+        # label is a concrete strategy rather than "auto".
+        assert row["compression_strategy"] != "auto"
+        assert row["strategy_auto_selected"] == 1
+        store.close()
+
+    async def test_a_budget_short_circuit_under_auto_is_not_a_resolution(self, tmp_path):
+        """The token gate can settle the strategy before the selector runs.
+
+        With a unicode token budget the response fits, the branch sets NONE
+        and the AUTO check below never fires. The config said `auto`, so a
+        flag meaning "AUTO was configured" would read True here; it means
+        "the selector ran", which it did not (#933).
+        """
+        mgr, store = _make_manager_with_store(
+            tmp_path,
+            compression=CompressionStrategy.AUTO,
+            max_result_chars=10,
+            max_result_tokens=100000,
+            token_estimation_mode="unicode",
+        )
+        mgr._connections["srv"].session.call_tool.return_value = _make_result("short body")
+        await mgr.call_tool("srv", "tool", {})
+        row = _latest_row(store)
+        assert row["compression_strategy"] == "none"
+        assert row["strategy_auto_selected"] == 0
+        store.close()
+
+        # Positive control: the same call without the gate reaches the
+        # selector, which also answers "none" — so the label proves nothing
+        # and only the flag separates the two paths.
+        mgr2, store2 = _make_manager_with_store(
+            tmp_path / "control",
+            compression=CompressionStrategy.AUTO,
+            max_result_chars=10,
+        )
+        mgr2._connections["srv"].session.call_tool.return_value = _make_result("short body")
+        await mgr2.call_tool("srv", "tool", {})
+        control = _latest_row(store2)
+        assert control["compression_strategy"] == "none"
+        assert control["strategy_auto_selected"] == 1
+        store2.close()
+
+    async def test_a_degraded_auto_call_still_records_the_resolution(self, tmp_path):
+        """The ladder rewrites the label; it does not undo the resolution.
+
+        AUTO resolved this call, then the ratio guard degraded it and the
+        label became `X→…_fallback`. The provenance flag tracks the selector,
+        not the final label, so the call stays in AUTO's population (#933).
+        """
+        mgr, store = _make_manager_with_store(
+            tmp_path,
+            compression=CompressionStrategy.AUTO,
+            max_result_chars=500,
+        )
+        text = "No heading content. " * 150
+        mgr._connections["srv"].session.call_tool.return_value = _make_result(text)
+        mgr._apply_compression = AsyncMock(return_value=("x" * 50, None))
+        await mgr.call_tool("srv", "tool", {})
+        row = _latest_row(store)
+        assert row["ratio_violation"] == 1
+        assert "_fallback" in row["compression_strategy"]
+        assert row["strategy_auto_selected"] == 1
         store.close()
 
     async def test_progressive_strategy_call_completes_and_records_metric(self, tmp_path):
@@ -243,6 +351,9 @@ class TestProxyManagerRatioGuard:
         row = _latest_row(store)
         assert row["compression_strategy"] == "progressive"
         assert row["ratio_violation"] == 0
+        # The PROGRESSIVE branch returns before the AUTO check, so no
+        # resolution happened and the row must not claim one (#933).
+        assert row["strategy_auto_selected"] == 0
         store.close()
 
     async def test_primary_progressive_store_failure_falls_back_to_passthrough(self, tmp_path):
@@ -622,6 +733,7 @@ class TestGetToolProfiles:
                     compressed_chars=3000,
                     cleaned_chars=5000 + i * 100,
                     compression_strategy="hybrid",
+                    strategy_auto_selected=True,
                     ratio_violation=(i < 2),
                 )
             )
@@ -632,9 +744,9 @@ class TestGetToolProfiles:
         assert p["tool"] == "t1"
         assert p["call_count"] == 10
         assert p["violation_count"] == 2
-        assert p["dominant_strategy"] == "hybrid"
-        assert p["dominant_strategy_count"] == 10
-        assert p["strategy_count"] == 10
+        assert p["auto_dominant_strategy"] == "hybrid"
+        assert p["auto_dominant_strategy_count"] == 10
+        assert p["auto_strategy_count"] == 10
         assert p["avg_ratio"] is not None
         assert 0 < p["avg_ratio"] < 1
         assert p["ratio_count"] == 10
@@ -709,11 +821,12 @@ class TestGetToolProfiles:
         assert errors_only["avg_ratio"] is None
         store.close()
 
-    def test_strategy_counts_exclude_calls_that_resolved_none(self, tmp_path):
+    def test_strategy_counts_exclude_calls_with_no_recorded_strategy(self, tmp_path):
         """The dominant count and its denominator share one population (#928).
 
-        Both count only rows carrying a strategy, so their ratio is a share;
-        `call_count` also includes the NULL-strategy rows error paths write.
+        Both count only AUTO-resolved rows carrying a strategy, so their ratio
+        is a share; `call_count` also includes the NULL-strategy rows error
+        paths write.
         """
         store = MetricsStore(tmp_path / "metrics.db")
         store.initialize()
@@ -728,6 +841,7 @@ class TestGetToolProfiles:
                         compressed_chars=500,
                         cleaned_chars=1000,
                         compression_strategy=strategy,
+                        strategy_auto_selected=strategy is not None,
                     )
                 )
         for _ in range(3):
@@ -745,15 +859,105 @@ class TestGetToolProfiles:
 
         mixed = by_tool["mixed"]
         assert mixed["call_count"] == 12
-        assert mixed["strategy_count"] == 10
-        assert mixed["dominant_strategy"] == "hybrid"
-        assert mixed["dominant_strategy_count"] == 6
+        assert mixed["auto_strategy_count"] == 10
+        assert mixed["auto_dominant_strategy"] == "hybrid"
+        assert mixed["auto_dominant_strategy_count"] == 6
 
         errors_only = by_tool["errors_only"]
         assert errors_only["call_count"] == 3
-        assert errors_only["strategy_count"] == 0
-        assert errors_only["dominant_strategy"] is None
-        assert errors_only["dominant_strategy_count"] == 0
+        assert errors_only["auto_strategy_count"] == 0
+        assert errors_only["auto_dominant_strategy"] is None
+        assert errors_only["auto_dominant_strategy_count"] == 0
+        store.close()
+
+    def test_an_auto_call_that_resolved_none_stays_in_the_denominator(self, tmp_path):
+        """Resolving to `none` is a resolution, unlike recording no strategy.
+
+        AUTO answering "this already fits" records the label `"none"` with
+        provenance, so the call belongs in the population AUTO's consistency
+        is measured over — a NULL strategy, which records no resolution at
+        all, does not. The tuner declines to recommend `none` as a pin
+        separately; that is a different gate from this count.
+        """
+        store = MetricsStore(tmp_path / "metrics.db")
+        store.initialize()
+        for strategy, count in (("hybrid", 7), ("none", 3)):
+            for _ in range(count):
+                store.record(
+                    CallMetrics(
+                        server="srv",
+                        tool="t1",
+                        original_chars=1000,
+                        compressed_chars=500,
+                        cleaned_chars=1000,
+                        compression_strategy=strategy,
+                        strategy_auto_selected=True,
+                    )
+                )
+        p = store.get_tool_profiles(since_seconds=3600.0)[0]
+        assert p["auto_strategy_count"] == 10
+        assert p["auto_dominant_strategy"] == "hybrid"
+        assert p["auto_dominant_strategy_count"] == 7
+        store.close()
+
+    def test_auto_counts_exclude_pinned_and_unprovenanced_calls(self, tmp_path):
+        """Only calls AUTO resolved can speak for what AUTO does (#933).
+
+        The issue's input: nine calls made while the tool was pinned to
+        `hybrid`, then one AUTO call resolving `truncate`. Counting the nine
+        reports `hybrid` at 90% and pins a strategy AUTO has never chosen.
+        A row written before the provenance column existed is unknown, not
+        "not AUTO", and is excluded the same way.
+        """
+        store = MetricsStore(tmp_path / "metrics.db")
+        store.initialize()
+        for _ in range(9):
+            store.record(
+                CallMetrics(
+                    server="srv",
+                    tool="switched",
+                    original_chars=1000,
+                    compressed_chars=500,
+                    cleaned_chars=1000,
+                    compression_strategy="hybrid",
+                    strategy_auto_selected=False,
+                )
+            )
+        store.record(
+            CallMetrics(
+                server="srv",
+                tool="switched",
+                original_chars=1000,
+                compressed_chars=500,
+                cleaned_chars=1000,
+                compression_strategy="truncate",
+                strategy_auto_selected=True,
+            )
+        )
+        for _ in range(5):
+            store.record(
+                CallMetrics(
+                    server="srv",
+                    tool="legacy",
+                    original_chars=1000,
+                    compressed_chars=500,
+                    cleaned_chars=1000,
+                    compression_strategy="hybrid",
+                )
+            )
+        by_tool = {p["tool"]: p for p in store.get_tool_profiles(since_seconds=3600.0)}
+
+        switched = by_tool["switched"]
+        assert switched["call_count"] == 10
+        assert switched["auto_strategy_count"] == 1
+        assert switched["auto_dominant_strategy"] == "truncate"
+        assert switched["auto_dominant_strategy_count"] == 1
+
+        legacy = by_tool["legacy"]
+        assert legacy["call_count"] == 5
+        assert legacy["auto_strategy_count"] == 0
+        assert legacy["auto_dominant_strategy"] is None
+        assert legacy["auto_dominant_strategy_count"] == 0
         store.close()
 
     def test_the_two_strategy_counts_come_from_one_snapshot(self, tmp_path):
@@ -780,6 +984,7 @@ class TestGetToolProfiles:
                     compressed_chars=500,
                     cleaned_chars=1000,
                     compression_strategy="hybrid",
+                    strategy_auto_selected=True,
                 )
             )
 
@@ -800,8 +1005,9 @@ class TestGetToolProfiles:
                     other.executemany(
                         "INSERT INTO proxy_metrics "
                         "(server, tool, original_chars, compressed_chars, cleaned_chars, "
-                        " compression_strategy, source, created_at, is_error, ratio_violation) "
-                        "VALUES ('srv', 't1', 1000, 500, 1000, 'hybrid', 'mcp', ?, 0, 0)",
+                        " compression_strategy, strategy_auto_selected, source, "
+                        " created_at, is_error, ratio_violation) "
+                        "VALUES ('srv', 't1', 1000, 500, 1000, 'hybrid', 1, 'mcp', ?, 0, 0)",
                         [(_t.time(),) for _ in range(3)],
                     )
                     other.commit()
@@ -819,8 +1025,8 @@ class TestGetToolProfiles:
         # which is what proves the two reads really straddle it — without this
         # the counts could agree simply by never having seen the new rows.
         assert p["call_count"] == 3
-        assert p["dominant_strategy_count"] == 6
-        assert p["strategy_count"] == 6
+        assert p["auto_dominant_strategy_count"] == 6
+        assert p["auto_strategy_count"] == 6
         store.close()
 
     def test_groups_by_server_tool(self, tmp_path):

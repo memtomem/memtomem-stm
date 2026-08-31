@@ -59,28 +59,31 @@ class ToolProfile:
     violation_rate: float
     avg_ratio: float | None
     p95_original_chars: int
-    dominant_strategy: str | None
+    auto_dominant_strategy: str | None
     error_count: int
-    dominant_strategy_count: int = 0
-    strategy_count: int = 0
+    auto_dominant_strategy_count: int = 0
+    auto_strategy_count: int = 0
     ratio_count: int = 0
     """Calls ``avg_ratio`` is averaged over — non-error, non-empty-cleaned."""
     feedback_count: int = 0
     feedback_dominant_kind: str | None = None
 
     @property
-    def dominant_strategy_share(self) -> float:
-        """Fraction of calls with a recorded strategy won by ``dominant_strategy``.
+    def auto_dominant_strategy_share(self) -> float:
+        """Fraction of AUTO's own resolutions that ran ``auto_dominant_strategy``.
 
-        The denominator excludes calls that recorded none, so this is a
-        dominance measurement over the calls the pin can be judged on rather
-        than over ``call_count``. A recorded strategy is not quite the same
-        as a resolved one — a stage that throws after the upstream returns
-        records the row without it — but it is what the column can attest.
+        Numerator and denominator both count calls the AUTO selector decided,
+        so this measures how consistently those calls land on one strategy —
+        the only thing a pin can be judged against. Calls that ran under a
+        pin, and calls whose provenance was never recorded, are in neither
+        (#933). The labels it groups are post-degradation, so a strategy that
+        sometimes falls back is split across labels and reads lower here than
+        the selector's own consistency; that predates this measurement and is
+        tracked in #937.
         """
-        if self.strategy_count <= 0:
+        if self.auto_strategy_count <= 0:
             return 0.0
-        return self.dominant_strategy_count / self.strategy_count
+        return self.auto_dominant_strategy_count / self.auto_strategy_count
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,10 +150,10 @@ class CompressionTuner:
                     violation_rate=(violation_count / call_count if call_count > 0 else 0.0),
                     avg_ratio=r["avg_ratio"],
                     p95_original_chars=r["p95_original_chars"],
-                    dominant_strategy=r["dominant_strategy"],
+                    auto_dominant_strategy=r["auto_dominant_strategy"],
                     error_count=r["error_count"],
-                    dominant_strategy_count=r["dominant_strategy_count"],
-                    strategy_count=r["strategy_count"],
+                    auto_dominant_strategy_count=r["auto_dominant_strategy_count"],
+                    auto_strategy_count=r["auto_strategy_count"],
                     ratio_count=r["ratio_count"],
                     feedback_count=fb_total,
                     feedback_dominant_kind=fb_dominant,
@@ -195,9 +198,9 @@ class CompressionTuner:
         The confidence label covers the whole recommendation, so it is the
         smallest population any emitted action rests on — the weakest link,
         since one label speaks for every action under it. H1 reads all calls;
-        H2 the rows ``avg_ratio`` is averaged over, H3 the calls with a
-        recorded strategy, H4 the feedback reports, each of which can be far
-        fewer than ``call_count``. A heuristic that narrows the label also
+        H2 the rows ``avg_ratio`` is averaged over, H3 the calls AUTO resolved,
+        H4 the feedback reports, each of which can be far fewer than
+        ``call_count``. A heuristic that narrows the label also
         states its population in its reason, so the report says what the
         number is over rather than leaving the label to carry it alone.
         """
@@ -253,34 +256,40 @@ class CompressionTuner:
                 # this advice rests on (#934).
                 evidence = min(evidence, p.ratio_count)
 
-        # H3: Strategy pinning — one settable strategy dominates > 80%.
-        # The volume gate counts calls with a recorded strategy, the same
-        # population the share is over: gating on call_count would let one
-        # recorded call among nine without report a 100% share.
+        # H3: Strategy pinning — one settable strategy runs on > 80% of the
+        # calls AUTO resolved. Every count here is over that population:
+        # the advice is "AUTO keeps reaching the same answer, so state it and
+        # skip the detection", which a call that ran under a pin is no evidence
+        # for (#933) — it never ran detection, and its label attests the pin.
+        # The volume gate counts that same population, as the share does: one
+        # AUTO call among nine pinned ones otherwise reports a 100% share.
         if (
-            p.dominant_strategy
-            and p.dominant_strategy != "none"
-            and p.dominant_strategy in SETTABLE_STRATEGIES
-            and p.strategy_count >= MEDIUM_CONFIDENCE_CALLS
-            and p.dominant_strategy_share > STRATEGY_PIN_THRESHOLD
+            p.auto_dominant_strategy
+            and p.auto_dominant_strategy != "none"
+            and p.auto_dominant_strategy in SETTABLE_STRATEGIES
+            and p.auto_strategy_count >= MEDIUM_CONFIDENCE_CALLS
+            and p.auto_dominant_strategy_share > STRATEGY_PIN_THRESHOLD
         ):
             current_strat = self._current_strategy(p.server, p.tool)
-            if current_strat in ("auto", None) and p.dominant_strategy != "auto":
+            # The rows say AUTO ran; the config says whether it still does. A
+            # tool pinned since those calls were made needs no pin, and the
+            # window can outlive the change either way (#933).
+            if current_strat in ("auto", None) and p.auto_dominant_strategy != "auto":
                 actions.append(
                     TuningAction(
                         field="compression",
                         current=current_strat,
-                        recommended=p.dominant_strategy,
+                        recommended=p.auto_dominant_strategy,
                         reason=(
-                            f"{p.dominant_strategy_count} of {p.strategy_count} "
-                            f"calls with a recorded strategy ran "
-                            f"{p.dominant_strategy} "
-                            f"({p.dominant_strategy_share:.1%}) — "
+                            f"{p.auto_dominant_strategy} ran on "
+                            f"{p.auto_dominant_strategy_count} of "
+                            f"{p.auto_strategy_count} calls AUTO resolved "
+                            f"({p.auto_dominant_strategy_share:.1%}) — "
                             "pin to skip detection overhead"
                         ),
                     )
                 )
-                evidence = min(evidence, p.strategy_count)
+                evidence = min(evidence, p.auto_strategy_count)
 
         # H4: Feedback-driven — dominant kind informs strategy
         if p.feedback_count >= 3 and p.feedback_dominant_kind:

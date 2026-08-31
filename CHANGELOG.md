@@ -415,6 +415,52 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **The strategy pin is measured on AUTO's own calls** (#933). H3 recommends
+  pinning a strategy *"to skip detection overhead"* — advice that presumes the
+  calls it counted were AUTO calls, resolved per response. The column it read
+  cannot support that: `compression_strategy` records the strategy a call ran
+  under, with AUTO already resolved, and keeps no trace of who chose it. The
+  heuristic's only check was the strategy the tool runs under *now*, so a tool
+  whose `compression` changed inside the window had its old configuration's
+  calls attributed to the new one. Nine calls made while a tool was pinned to
+  `hybrid`, then switched to `auto` with its one AUTO call resolving
+  `truncate`, read as *"9 of 10 … ran hybrid (90.0%)"* and recommended pinning
+  the one strategy AUTO had never selected.
+
+  Provenance is now recorded rather than inferred. `CallMetrics` carries
+  `strategy_auto_selected`, set where `auto_select_strategy` actually runs —
+  the one place the distinction survives, since resolving AUTO overwrites the
+  strategy — and `proxy_metrics` gains a nullable column for it. Nullable
+  deliberately: `NOT NULL DEFAULT 0` would backfill every existing row as "not
+  AUTO-selected", a claim about calls the column was not there to observe.
+  NULL is unknown provenance, and the tuner excludes it with an equality test
+  rather than counting it as either answer. Pre-migration rows, and `mms hook`
+  rows, which never run the selector, read that way.
+
+  H3's share, its volume gate and the confidence label it contributes to all
+  move to that narrowed population together — the same discipline #928 needed
+  one level up, where a gate and a measurement over two different populations
+  is exactly what went wrong. The reason states what the rows attest, which is
+  which calls AUTO decided and what ran on them: *"hybrid ran on 9 of 10 calls
+  AUTO resolved (90.0%)"*. It is deliberately not phrased as what AUTO
+  *selected* — the ratio-guard ladder rewrites the label after selection, so a
+  strategy that sometimes degrades is split across labels here. That splitting
+  predates this change and is unaffected by it. The config check stays as the
+  mirror case: the rows say AUTO ran, the config says whether it still does.
+
+  **Behavior change**: no `compression` pin until at least
+  `MEDIUM_CONFIDENCE_CALLS` calls have been recorded whose strategy AUTO chose,
+  so an existing deployment gets no strategy advice for a tool until that many
+  such calls accumulate after upgrading — every row already on disk has no
+  provenance and is excluded. The three `get_tool_profiles` strategy keys are
+  renamed to the population they now describe: `dominant_strategy`,
+  `dominant_strategy_count` and `strategy_count` become
+  `auto_dominant_strategy`, `auto_dominant_strategy_count` and
+  `auto_strategy_count`, with `ToolProfile.dominant_strategy_share` becoming
+  `auto_dominant_strategy_share`. `proxy_metrics` gains
+  `strategy_auto_selected`; the migration is additive and older databases pick
+  it up on the next open.
+
 - **A recommendation's confidence follows the rows its heuristics measured**
   (#934). The label is one word over every action in a `TuningRecommendation`,
   and it was read from `call_count` — the calls in the window — while two of
