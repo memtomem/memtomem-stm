@@ -788,6 +788,17 @@ class MetricsStore:
         happened (#933). ``call_count`` includes all of them, plus every error
         path and the success paths that bypass compression entirely.
 
+        Within that population the grouping key is the strategy the call
+        *started on*: ``compression_strategy`` records what a call ran under,
+        and the ratio-guard ladder rewrites it on degradation, so the stored
+        label is read up to the first ``→`` (#937), so a tool whose calls
+        sometimes degrade is not split across labels and counted as several
+        strategies. Every label the proxy itself writes folds to a settable
+        ``CompressionStrategy`` value; this method does not enforce that, since
+        ``record`` stores whatever string a writer hands it, so a consumer that
+        turns ``auto_dominant_strategy`` into config still checks it (the
+        tuner's ``SETTABLE_STRATEGIES``).
+
         Scoped to ``source = 'mcp'``: the tuner adjusts *proxy* compression
         budgets for upstream MCP tools, so native built-in tool rows written by
         ``mms hook`` (``source='hook'``) must not be aggregated here — otherwise
@@ -857,10 +868,25 @@ class MetricsStore:
                 # own behavior. It is an equality, not ``IS NOT 0``, so the
                 # NULL provenance of a pre-migration row drops out rather than
                 # counting as either answer.
+                #
+                # The key is the label's pre-arrow base, not the label: the
+                # ratio-guard ladder rewrites ``compression_strategy`` on
+                # degradation, so grouping by the stored value splits one
+                # selection across ``hybrid`` and ``hybrid→progressive_fallback``
+                # and reads a perfectly consistent tool as inconsistent (#937).
+                # An undegraded call records a bare strategy; every site that
+                # writes a degradation label spells it ``<base>→<suffix>`` with
+                # a single ``CompressionStrategy`` value as the base — the same
+                # convention ``get_progressive_degradations`` matches on — so
+                # cutting at the first arrow yields what AUTO chose, and leaves
+                # an undegraded label untouched.
                 strat_row = self._db.execute(
                     """
                     SELECT
-                        compression_strategy,
+                        CASE WHEN instr(compression_strategy, '→') > 0
+                             THEN substr(compression_strategy, 1,
+                                         instr(compression_strategy, '→') - 1)
+                             ELSE compression_strategy END AS selected_strategy,
                         COUNT(*),
                         (SELECT COUNT(*) FROM proxy_metrics
                          WHERE server = ? AND tool = ? AND created_at >= ?
@@ -870,7 +896,7 @@ class MetricsStore:
                     WHERE server = ? AND tool = ? AND created_at >= ?
                         AND compression_strategy IS NOT NULL
                         AND strategy_auto_selected = 1 AND source = 'mcp'
-                    GROUP BY compression_strategy
+                    GROUP BY selected_strategy
                     ORDER BY COUNT(*) DESC
                     LIMIT 1
                     """,

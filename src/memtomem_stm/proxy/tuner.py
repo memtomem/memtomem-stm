@@ -43,7 +43,11 @@ SETTABLE_STRATEGIES = frozenset(s.value for s in CompressionStrategy)
 The metrics column records the strategy a call *ran under*, which is not
 always one of these: a degraded call records the path it took
 (``hybrid→progressive_fallback``). Recommending one of those would be advice
-no config can accept.
+no config can accept. ``get_tool_profiles`` now folds a degradation label back
+onto the strategy AUTO selected (#937), so this guard no longer carries that
+exclusion on its own. It stays the last word: the store records whatever string
+a writer hands it, so a base the fold did not anticipate reaches here as a
+recommendation candidate and must not become one.
 """
 
 
@@ -70,16 +74,17 @@ class ToolProfile:
 
     @property
     def auto_dominant_strategy_share(self) -> float:
-        """Fraction of AUTO's own resolutions that ran ``auto_dominant_strategy``.
+        """Fraction of AUTO's own resolutions that chose ``auto_dominant_strategy``.
 
         Numerator and denominator both count calls the AUTO selector decided,
         so this measures how consistently those calls land on one strategy —
         the only thing a pin can be judged against. Calls that ran under a
         pin, and calls whose provenance was never recorded, are in neither
-        (#933). The labels it groups are post-degradation, so a strategy that
-        sometimes falls back is split across labels and reads lower here than
-        the selector's own consistency; that predates this measurement and is
-        tracked in #937.
+        (#933). It measures selection, not outcome: a call that degraded still
+        counts for the strategy AUTO chose, because the store groups by the
+        label's pre-arrow base (#937). Reading the post-degradation label
+        instead split one strategy across its fallback labels and scored a
+        perfectly consistent tool by its degradation rate.
         """
         if self.auto_strategy_count <= 0:
             return 0.0
@@ -263,6 +268,12 @@ class CompressionTuner:
         # for (#933) — it never ran detection, and its label attests the pin.
         # The volume gate counts that same population, as the share does: one
         # AUTO call among nine pinned ones otherwise reports a 100% share.
+        # A call that degraded counts for the strategy AUTO chose, not the
+        # path it ended on (#937): the pin skips the detection step, not the
+        # ladder, so the ratio guard still runs and still degrades under it and
+        # the pinned tool's compression outcome is what it is today. (It is not
+        # invisible: the pin changes the compression cache fingerprint and the
+        # provenance a row records.)
         if (
             p.auto_dominant_strategy
             and p.auto_dominant_strategy != "none"
@@ -281,9 +292,9 @@ class CompressionTuner:
                         current=current_strat,
                         recommended=p.auto_dominant_strategy,
                         reason=(
-                            f"{p.auto_dominant_strategy} ran on "
+                            f"AUTO chose {p.auto_dominant_strategy} on "
                             f"{p.auto_dominant_strategy_count} of "
-                            f"{p.auto_strategy_count} calls AUTO resolved "
+                            f"{p.auto_strategy_count} calls it resolved "
                             f"({p.auto_dominant_strategy_share:.1%}) — "
                             "pin to skip detection overhead"
                         ),

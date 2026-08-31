@@ -16,6 +16,7 @@ from memtomem_stm.proxy.config import (
 from memtomem_stm.proxy.metrics import CallMetrics
 from memtomem_stm.proxy.metrics_store import MetricsStore
 from memtomem_stm.proxy.tuner import (
+    SETTABLE_STRATEGIES,
     STRATEGY_PIN_THRESHOLD,
     CompressionTuner,
     TuningAction,
@@ -240,7 +241,7 @@ class TestAnalyze:
         strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
         assert len(strat_actions) == 1
         assert strat_actions[0].recommended == "hybrid"
-        assert "hybrid ran on 9 of 10 calls AUTO resolved" in strat_actions[0].reason
+        assert "AUTO chose hybrid on 9 of 10 calls it resolved" in strat_actions[0].reason
         assert "90.0%" in strat_actions[0].reason
 
     def test_a_share_exactly_at_the_threshold_does_not_fire(self, metrics_store: MetricsStore):
@@ -283,7 +284,7 @@ class TestAnalyze:
         recs = tuner.analyze()
         strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
         assert len(strat_actions) == 1
-        assert "hybrid ran on 9 of 11 calls AUTO resolved" in strat_actions[0].reason
+        assert "AUTO chose hybrid on 9 of 11 calls it resolved" in strat_actions[0].reason
 
     def test_the_volume_gate_counts_the_same_calls_as_the_share(
         self, metrics_store: MetricsStore
@@ -408,7 +409,7 @@ class TestAnalyze:
         strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
         assert len(strat_actions) == 1
         assert strat_actions[0].recommended == "hybrid"
-        assert "hybrid ran on 9 of 10 calls AUTO resolved" in strat_actions[0].reason
+        assert "AUTO chose hybrid on 9 of 10 calls it resolved" in strat_actions[0].reason
         assert recs[0].confidence == "medium"
 
     def test_h2_confidence_follows_the_rows_avg_ratio_reads(self, metrics_store: MetricsStore):
@@ -529,13 +530,26 @@ class TestAnalyze:
         assert {a.field for a in recs[0].actions} == {"max_result_chars", "compression"}
         assert recs[0].confidence == "low"
 
-    def test_a_fallback_label_is_never_recommended_as_a_pin(self, metrics_store: MetricsStore):
-        """A degraded call records the path it took, which no config accepts.
+    def test_an_always_degrading_tool_is_told_to_pin_what_auto_chose(
+        self, metrics_store: MetricsStore
+    ):
+        """Degrading every call does not make AUTO's choice less consistent (#937).
 
-        `compression_strategy` holds the strategy a call *ran under*, and a
-        fallback records `hybrid→progressive_fallback`.  Recommending that as
-        a `compression` value is advice the operator cannot apply — `mms tune
-        --apply` fails schema validation on it.
+        This re-adjudicates what #932 decided. That issue read
+        `hybrid→progressive_fallback` as a value no `compression` key accepts
+        and suppressed the recommendation, which is right about the label and
+        wrong about the tool: AUTO selected `hybrid` on all twelve calls, and
+        pinning `hybrid` skips the detection step and not the ladder — the
+        ratio guard still runs and still degrades, so the pinned tool's
+        compression outcome is what it is today (measured in
+        `test_pinning_what_auto_chose_leaves_the_degradation_unchanged`, which
+        also pins the fields that do differ). Suppressing here withheld a pin
+        from the most consistent tool there is.
+
+        What survives from #932 is the narrower invariant asserted below: no
+        recommendation is ever a label a config cannot accept. The store now
+        folds the suffix, so `SETTABLE_STRATEGIES` guards a future label shape
+        rather than being the thing that excludes fallbacks.
         """
         cfg = ProxyConfig(
             upstream_servers={
@@ -552,6 +566,111 @@ class TestAnalyze:
         )
         tuner = CompressionTuner(metrics_store, config=cfg)
         assert tuner.get_profiles()[0].auto_dominant_strategy_share == 1.0
+        recs = tuner.analyze()
+        strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
+        assert len(strat_actions) == 1
+        assert strat_actions[0].recommended == "hybrid"
+        assert all(a.recommended in SETTABLE_STRATEGIES for a in strat_actions)
+
+    def test_an_unsettable_base_is_still_never_recommended(self, metrics_store: MetricsStore):
+        """The guard #932 installed is still live, and still the last word.
+
+        Folding the suffix makes every label the ladder writes settable, so
+        the test above can no longer tell whether `SETTABLE_STRATEGIES` is
+        doing anything — a fold that produced nonsense would satisfy it just
+        as well. A row whose base is not a strategy at all is what separates
+        the two: `MetricsStore.record` stores whatever string its caller hands
+        it, so a future label shape — or any other writer — can put one there,
+        and the recommendation must stay silent rather than emit advice
+        `mms tune --apply` would reject.
+        """
+        cfg = ProxyConfig(
+            upstream_servers={
+                "srv": UpstreamServerConfig(prefix="test", compression=CompressionStrategy.AUTO)
+            }
+        )
+        _seed_metrics(
+            metrics_store,
+            "srv",
+            "t1",
+            12,
+            strategy="not_a_strategy→progressive_fallback",
+            auto_selected=True,
+        )
+        tuner = CompressionTuner(metrics_store, config=cfg)
+        p = tuner.get_profiles()[0]
+        assert p.auto_dominant_strategy == "not_a_strategy"
+        assert p.auto_dominant_strategy_share == 1.0
+        recs = tuner.analyze()
+        strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
+        assert strat_actions == []
+
+    def test_a_sometimes_degrading_tool_reaches_the_pin_threshold(
+        self, metrics_store: MetricsStore
+    ):
+        """#937's own input: consistency measured on the label reads as 60%.
+
+        Six clean `hybrid` calls and four that degraded are ten AUTO
+        resolutions of `hybrid`. Grouped by the label they split 6/4, the
+        share misses `STRATEGY_PIN_THRESHOLD`, and the suppression scales with
+        the degradation rate — the gate is a strict `> 0.80`, so a tool
+        degrading 20% or more of its calls could never be recommended a pin,
+        however consistent it was.
+        """
+        cfg = ProxyConfig(
+            upstream_servers={
+                "srv": UpstreamServerConfig(prefix="test", compression=CompressionStrategy.AUTO)
+            }
+        )
+        _seed_metrics(metrics_store, "srv", "t1", 6, strategy="hybrid", auto_selected=True)
+        _seed_metrics(
+            metrics_store,
+            "srv",
+            "t1",
+            4,
+            strategy="hybrid→progressive_fallback",
+            auto_selected=True,
+        )
+        tuner = CompressionTuner(metrics_store, config=cfg)
+        p = tuner.get_profiles()[0]
+        assert p.auto_dominant_strategy == "hybrid"
+        assert p.auto_dominant_strategy_share == 1.0
+        # The volume gate counts the same population the share is over, so the
+        # degraded calls have to be in both — ten resolutions, not six.
+        assert p.auto_strategy_count == 10
+        recs = tuner.analyze()
+        strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
+        assert len(strat_actions) == 1
+        assert strat_actions[0].recommended == "hybrid"
+        assert "AUTO chose hybrid on 10 of 10 calls it resolved" in strat_actions[0].reason
+
+    def test_folding_a_suffix_does_not_merge_two_strategies(self, metrics_store: MetricsStore):
+        """Only the suffix folds; two different bases stay two strategies.
+
+        A fold that also merged `truncate` into `hybrid` would manufacture the
+        consistency it claims to measure, so the positive test above needs
+        this control: the same ten calls, four of them a genuinely different
+        selection, must still read 6/10 and stay silent.
+        """
+        cfg = ProxyConfig(
+            upstream_servers={
+                "srv": UpstreamServerConfig(prefix="test", compression=CompressionStrategy.AUTO)
+            }
+        )
+        _seed_metrics(metrics_store, "srv", "t1", 6, strategy="hybrid", auto_selected=True)
+        _seed_metrics(
+            metrics_store,
+            "srv",
+            "t1",
+            4,
+            strategy="truncate→progressive_fallback",
+            auto_selected=True,
+        )
+        tuner = CompressionTuner(metrics_store, config=cfg)
+        p = tuner.get_profiles()[0]
+        assert p.auto_dominant_strategy == "hybrid"
+        assert p.auto_dominant_strategy_count == 6
+        assert p.auto_strategy_count == 10
         recs = tuner.analyze()
         strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
         assert strat_actions == []
@@ -577,7 +696,7 @@ class TestAnalyze:
         strat_actions = [a for rec in recs for a in rec.actions if a.field == "compression"]
         assert len(strat_actions) == 1
         reason = strat_actions[0].reason
-        assert "hybrid ran on 81 of 101 calls AUTO resolved" in reason
+        assert "AUTO chose hybrid on 81 of 101 calls it resolved" in reason
         assert "80.2%" in reason
 
     def test_budget_advice_measures_against_the_global_default(self, metrics_store: MetricsStore):
