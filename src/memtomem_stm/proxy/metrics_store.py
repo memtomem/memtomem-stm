@@ -753,12 +753,18 @@ class MetricsStore:
         """Aggregate per ``(server, tool)`` stats for auto-tuner analysis.
 
         Returns a list of dicts with keys: ``server``, ``tool``,
-        ``call_count``, ``violation_count``, ``avg_ratio``,
+        ``call_count``, ``violation_count``, ``avg_ratio``, ``ratio_count``,
         ``p95_original_chars``, ``dominant_strategy``,
         ``dominant_strategy_count``, ``strategy_count``, ``error_count``.
         Only non-error rows with ``cleaned_chars > 0`` contribute to
         ``avg_ratio``.  ``p95_original_chars`` is approximated by taking
         the value at the 95th percentile rank within each group.
+
+        ``ratio_count`` is the size of that contributing population, counted
+        by the same predicate in the same statement as the average itself, so
+        a reader can tell how many responses ``avg_ratio`` is over.
+        ``call_count`` additionally includes error rows and rows that recorded
+        no cleaned length.
 
         ``dominant_strategy_count`` and ``strategy_count`` both count only
         rows with a non-NULL ``compression_strategy``, and are read in one
@@ -789,6 +795,11 @@ class MetricsStore:
                              THEN CAST(compressed_chars AS REAL) / cleaned_chars
                         END
                     )                                                 AS avg_ratio,
+                    SUM(
+                        CASE WHEN cleaned_chars > 0 AND is_error = 0
+                             THEN 1 ELSE 0
+                        END
+                    )                                                 AS ratio_count,
                     SUM(is_error)                                     AS error_count
                 FROM proxy_metrics
                 WHERE created_at >= ? AND source = 'mcp'
@@ -798,7 +809,15 @@ class MetricsStore:
             ).fetchall()
 
             profiles: list[dict] = []
-            for server, tool, call_count, violation_count, avg_ratio, error_count in rows:
+            for (
+                server,
+                tool,
+                call_count,
+                violation_count,
+                avg_ratio,
+                ratio_count,
+                error_count,
+            ) in rows:
                 # p95 approximation: pick the value at rank ceil(0.95 * N)
                 p95_row = self._db.execute(
                     """
@@ -842,6 +861,7 @@ class MetricsStore:
                         "call_count": call_count,
                         "violation_count": violation_count or 0,
                         "avg_ratio": round(avg_ratio, 4) if avg_ratio is not None else None,
+                        "ratio_count": ratio_count or 0,
                         "p95_original_chars": p95_row[0] if p95_row else 0,
                         "dominant_strategy": strat_row[0] if strat_row else None,
                         "dominant_strategy_count": strat_row[1] if strat_row else 0,

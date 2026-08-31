@@ -415,6 +415,38 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **A recommendation's confidence follows the rows its heuristics measured**
+  (#934). The label is one word over every action in a `TuningRecommendation`,
+  and it was read from `call_count` — the calls in the window — while two of
+  the four heuristics rest on far narrower populations, so it could state
+  `high` on a number taken from a single observation.
+
+  H2 fires on `avg_ratio`, which the store averages only over rows with
+  `cleaned_chars > 0 AND is_error = 0`. One such row among 24 errors reported
+  *"high | avg ratio 0.99 — responses nearly always fit"*: an average over one
+  response, labelled from 25 rows that contributed nothing to it. H4 fires on
+  three feedback reports and reports the feedback kind, but three reports
+  against 25 calls read as `high` as well. #931 narrowed the label for H3 and
+  left these two, naming them; this closes the class.
+
+  The rule is now stated once and holds for all four: the label is the
+  smallest population any emitted action rests on — the weakest link, since
+  one label speaks for every action under it — and a heuristic that narrows it
+  also states its population in its reason, so the report says what the number
+  is over instead of leaving the label to carry it alone. H2's reason gains
+  `over N of M calls`; H3's and H4's already carried their counts. The
+  thresholds are shared rather than split per kind: the label answers the same
+  question in each case — how much the stated number carries — and a label
+  that over-trusts a signal is the costlier of the two mistakes for advice
+  `mms tune --apply` writes into a config.
+
+  **Behavior change**: an H2-only recommendation is labelled from the calls
+  `avg_ratio` averages, and an H4-only one from `feedback_count`, so the same
+  data can now read `low` where it read `high`; a recommendation combining
+  heuristics takes the lowest. H2's reason states the two counts.
+  `get_tool_profiles` dicts gain `ratio_count`; the addition is additive and
+  no existing key changes.
+
 - **The strategy pin is gated on the share it claims to have measured** (#928).
   `STRATEGY_PIN_THRESHOLD = 0.80` is documented as the fraction one strategy
   must dominate above before H3 recommends pinning it, but it was never

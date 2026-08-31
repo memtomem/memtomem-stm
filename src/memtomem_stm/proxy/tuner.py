@@ -63,6 +63,8 @@ class ToolProfile:
     error_count: int
     dominant_strategy_count: int = 0
     strategy_count: int = 0
+    ratio_count: int = 0
+    """Calls ``avg_ratio`` is averaged over — non-error, non-empty-cleaned."""
     feedback_count: int = 0
     feedback_dominant_kind: str | None = None
 
@@ -149,6 +151,7 @@ class CompressionTuner:
                     error_count=r["error_count"],
                     dominant_strategy_count=r["dominant_strategy_count"],
                     strategy_count=r["strategy_count"],
+                    ratio_count=r["ratio_count"],
                     feedback_count=fb_total,
                     feedback_dominant_kind=fb_dominant,
                 )
@@ -187,14 +190,16 @@ class CompressionTuner:
     # -- heuristics -------------------------------------------------------
 
     def _analyze_profile(self, p: ToolProfile) -> tuple[list[TuningAction], int]:
-        """Actions for this tool, and the call count to label them with.
+        """Actions for this tool, and the observation count to label them with.
 
-        The confidence label covers the whole recommendation, so an action
-        derived from a narrower population than ``call_count`` has to pull it
-        down. Only H3 does so here: it reads calls with a recorded strategy,
-        which can be far fewer. H2 and H4 rest on narrower populations of
-        their own (rows eligible for ``avg_ratio``, and feedback reports) and
-        do not yet narrow this — see #934.
+        The confidence label covers the whole recommendation, so it is the
+        smallest population any emitted action rests on — the weakest link,
+        since one label speaks for every action under it. H1 reads all calls;
+        H2 the rows ``avg_ratio`` is averaged over, H3 the calls with a
+        recorded strategy, H4 the feedback reports, each of which can be far
+        fewer than ``call_count``. A heuristic that narrows the label also
+        states its population in its reason, so the report says what the
+        number is over rather than leaving the label to carry it alone.
         """
         actions: list[TuningAction] = []
         evidence = p.call_count
@@ -237,11 +242,16 @@ class CompressionTuner:
                         current=str(current_max),
                         recommended=str(recommended),
                         reason=(
-                            f"avg ratio {p.avg_ratio:.2f} — responses nearly "
+                            f"avg ratio {p.avg_ratio:.2f} over {p.ratio_count} "
+                            f"of {p.call_count} calls — responses nearly "
                             "always fit, budget can be reduced to save context"
                         ),
                     )
                 )
+                # The average is over the non-error calls that recorded a
+                # cleaned length; the rest contributed nothing to the number
+                # this advice rests on (#934).
+                evidence = min(evidence, p.ratio_count)
 
         # H3: Strategy pinning — one settable strategy dominates > 80%.
         # The volume gate counts calls with a recorded strategy, the same
@@ -281,6 +291,10 @@ class CompressionTuner:
             # ``compression`` recommendation is unaffected.
             if fb_action and not (token_governed and fb_action.field == "max_result_chars"):
                 actions.append(fb_action)
+                # Its reason reports the feedback count, and that is what it
+                # rests on: three reports against twenty-five calls are three
+                # observations, not twenty-five (#934).
+                evidence = min(evidence, p.feedback_count)
 
         return actions, evidence
 
@@ -336,10 +350,17 @@ class CompressionTuner:
 # ── helpers ─────────────────────────────────────────────────────────────
 
 
-def _confidence(call_count: int) -> str:
-    if call_count >= HIGH_CONFIDENCE_CALLS:
+def _confidence(observations: int) -> str:
+    """Label a recommendation by how many observations it rests on.
+
+    Not always calls: an H4 recommendation rests on feedback reports, and an
+    H2 one on the calls that contributed to ``avg_ratio``. The thresholds are
+    shared because the label answers the same question in each case — how much
+    the number stated in the reason carries.
+    """
+    if observations >= HIGH_CONFIDENCE_CALLS:
         return "high"
-    if call_count >= MEDIUM_CONFIDENCE_CALLS:
+    if observations >= MEDIUM_CONFIDENCE_CALLS:
         return "medium"
     return "low"
 

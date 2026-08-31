@@ -36,8 +36,14 @@ def _seed_metrics(
     compressed_chars: int = 3000,
     strategy: str | None = "truncate",
     violation: bool = False,
+    is_error: bool = False,
 ) -> None:
-    """Record ``count`` identical calls; ``strategy=None`` seeds NULL-strategy rows."""
+    """Record ``count`` identical calls.
+
+    ``strategy=None`` seeds NULL-strategy rows; ``is_error=True`` seeds rows
+    the store excludes from ``avg_ratio`` (and therefore from the population
+    H2 rests on).
+    """
     for _ in range(count):
         store.record(
             CallMetrics(
@@ -48,6 +54,7 @@ def _seed_metrics(
                 cleaned_chars=original_chars,
                 compression_strategy=strategy,
                 ratio_violation=violation,
+                is_error=is_error,
             )
         )
 
@@ -320,6 +327,124 @@ class TestAnalyze:
         assert len(recs) == 1
         assert [a.field for a in recs[0].actions] == ["compression"]
         assert recs[0].confidence == "medium"
+
+    def test_h2_confidence_follows_the_rows_avg_ratio_reads(self, metrics_store: MetricsStore):
+        """`avg_ratio` is an average over rows H2's label used to ignore (#934).
+
+        The store averages only rows with `cleaned_chars > 0 AND is_error = 0`.
+        One such row among 24 errors reported `high` on an average over a
+        single response.
+        """
+        cfg = ProxyConfig(
+            upstream_servers={"srv": UpstreamServerConfig(prefix="test", max_result_chars=50000)}
+        )
+        _seed_metrics(
+            metrics_store,
+            "srv",
+            "t1",
+            1,
+            original_chars=2000,
+            compressed_chars=1990,
+            strategy=None,
+        )
+        _seed_metrics(
+            metrics_store,
+            "srv",
+            "t1",
+            24,
+            original_chars=2000,
+            compressed_chars=2000,
+            strategy=None,
+            is_error=True,
+        )
+        tuner = CompressionTuner(metrics_store, config=cfg)
+        p = tuner.get_profiles()[0]
+        assert p.call_count == 25
+        assert p.ratio_count == 1
+        recs = tuner.analyze()
+        assert len(recs) == 1
+        assert [a.field for a in recs[0].actions] == ["max_result_chars"]
+        assert "over 1 of 25 calls" in recs[0].actions[0].reason
+        assert recs[0].confidence == "low"
+
+    def test_h2_confidence_rises_with_the_eligible_rows(self, metrics_store: MetricsStore):
+        """Ten eligible rows among 25 calls are medium, not high."""
+        cfg = ProxyConfig(
+            upstream_servers={"srv": UpstreamServerConfig(prefix="test", max_result_chars=50000)}
+        )
+        _seed_metrics(
+            metrics_store,
+            "srv",
+            "t1",
+            10,
+            original_chars=2000,
+            compressed_chars=1990,
+            strategy=None,
+        )
+        _seed_metrics(
+            metrics_store,
+            "srv",
+            "t1",
+            15,
+            original_chars=2000,
+            compressed_chars=2000,
+            strategy=None,
+            is_error=True,
+        )
+        tuner = CompressionTuner(metrics_store, config=cfg)
+        p = tuner.get_profiles()[0]
+        assert p.call_count == 25
+        assert p.ratio_count == 10
+        recs = tuner.analyze()
+        assert len(recs) == 1
+        assert [a.field for a in recs[0].actions] == ["max_result_chars"]
+        assert recs[0].confidence == "medium"
+
+    def test_h4_confidence_follows_the_feedback_reports(
+        self,
+        metrics_store: MetricsStore,
+        feedback_store: CompressionFeedbackStore,
+    ):
+        """A feedback recommendation rests on reports, not on calls (#934).
+
+        Three reports against 25 calls read as `high`.  The thresholds are
+        reused deliberately: the label states how many observations the number
+        in the reason rests on, whatever kind of observation it is.
+        """
+        for tool, reports in (("low", 3), ("med", 10), ("hi", 20)):
+            # NULL strategies keep H3 silent; the default 0.6 ratio keeps H2
+            # silent, so each recommendation carries the H4 action alone.
+            _seed_metrics(metrics_store, "srv", tool, 25, strategy=None)
+            for _ in range(reports):
+                feedback_store.record("srv", tool, "truncated", "missing stuff", None)
+        tuner = CompressionTuner(metrics_store, feedback_store)
+        recs = tuner.analyze()
+        by_tool = {r.tool: r for r in recs}
+        assert set(by_tool) == {"low", "med", "hi"}
+        for rec in by_tool.values():
+            assert [a.field for a in rec.actions] == ["compression"]
+        assert by_tool["low"].confidence == "low"
+        assert by_tool["med"].confidence == "medium"
+        assert by_tool["hi"].confidence == "high"
+
+    def test_confidence_is_the_smallest_population_among_the_actions(
+        self,
+        metrics_store: MetricsStore,
+        feedback_store: CompressionFeedbackStore,
+    ):
+        """One label covers every action, so the weakest evidence sets it.
+
+        H1 rests on all 25 calls, H4 on 3 feedback reports; a `high` here
+        would overstate the feedback action it also covers.
+        """
+        _seed_metrics(metrics_store, "srv", "t1", 25, violation=True, strategy=None)
+        for _ in range(3):
+            feedback_store.record("srv", "t1", "truncated", "missing stuff", None)
+        tuner = CompressionTuner(metrics_store, feedback_store)
+        recs = tuner.analyze()
+        assert len(recs) == 1
+        assert {a.field for a in recs[0].actions} == {"max_result_chars", "compression"}
+        assert recs[0].confidence == "low"
 
     def test_a_fallback_label_is_never_recommended_as_a_pin(self, metrics_store: MetricsStore):
         """A degraded call records the path it took, which no config accepts.
