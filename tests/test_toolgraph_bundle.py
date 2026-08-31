@@ -226,18 +226,25 @@ def test_switching_from_stdio_to_bundle_drops_the_stdio_from_cache(tmp_path):
 def test_a_failed_rebind_leaves_the_previous_verdict_in_force(tmp_path: Path, monkeypatch):
     """A binding bug must not empty the enforcement maps into fail-open.
 
-    ``_apply_toolgraph_policy_snapshot`` builds its maps in locals and publishes
-    them in one go at the end, so an exception mid-bind leaves the PREVIOUS
-    verdict standing — stale, but still enforcing. Clearing shared state before
-    the apply would replace that with empty maps, and because the new stamp and
-    the bound catalog revision are already published, no later refresh would
-    rebind: every tool would stay silently allowed for the rest of the session.
+    ``_apply_toolgraph_policy_snapshot`` builds its maps in locals and only
+    then publishes them, so an exception mid-bind leaves the PREVIOUS verdict
+    standing — stale, but still enforcing. Clearing shared state before the
+    apply would replace that with empty maps, and no later refresh would
+    repair them: the new stamp is already published, and the bound catalog
+    revision still equals the live one, so the same-stamp path finds nothing to
+    rebind. Every tool would stay silently allowed for the rest of the session.
     """
     manager, bundle_path, live_tool = _manager(tmp_path)
     _write_bundle(bundle_path, _bundle(live_tool, decision="rejected"))
     manager._refresh_toolgraph_bundle(startup=True)
     before = dict(manager._toolgraph_external_rejects)
     assert before, "precondition: the first bundle must reject the live tool"
+    before_penalties = dict(manager._toolgraph_risk_penalties)
+    before_facts = dict(manager._toolgraph_graph_facts)
+    assert before_penalties and before_facts, "precondition: the bind recorded enrichment"
+    # Seeded so the provenance clear is pinned to the same barrier: it must not
+    # run either until the bind that justifies it has succeeded.
+    manager._toolgraph_from_cache = True
 
     # A new artifact (fresh stamp, so the adopt path runs) whose bind raises.
     def _boom(*args, **kwargs):
@@ -250,6 +257,11 @@ def test_a_failed_rebind_leaves_the_previous_verdict_in_force(tmp_path: Path, mo
 
     assert manager._toolgraph_external_rejects == before, (
         "a bind failure emptied the enforcement maps, silently allowing every tool"
+    )
+    assert manager._toolgraph_risk_penalties == before_penalties
+    assert manager._toolgraph_graph_facts == before_facts
+    assert manager._toolgraph_from_cache is True, (
+        "provenance was retired for a bundle whose decisions never bound"
     )
 
 

@@ -1243,10 +1243,12 @@ class ProxyManager:
         # whatever the stdio consult it replaced was served from (#919).
         # AFTER the apply, not before, and deliberately not the whole
         # ``_reset_toolgraph_verdict_state``: that helper also empties the
-        # enforcement maps, which the apply publishes in one assignment at its
-        # end. Clearing them first would turn a binding bug into empty maps —
-        # fail-open — that no later refresh repairs, because the new stamp and
-        # bound revision are already published by then.
+        # enforcement maps, which the apply builds in locals and publishes only
+        # once it has finished. Clearing them first would turn a binding bug
+        # into empty maps — fail-open — that no later refresh repairs: the new
+        # stamp is published above, and a bind that raised never advanced
+        # ``_toolgraph_bound_catalog_revision``, which still equals the live
+        # revision, so the same-stamp path finds nothing to rebind.
         self._clear_toolgraph_source_provenance()
         self._warn_on_bundle_provenance(path)
         logger.info(
