@@ -637,7 +637,76 @@ class TestGetToolProfiles:
         assert p["strategy_count"] == 10
         assert p["avg_ratio"] is not None
         assert 0 < p["avg_ratio"] < 1
+        assert p["ratio_count"] == 10
         assert p["p95_original_chars"] >= 5800
+        store.close()
+
+    def test_ratio_count_counts_only_the_rows_avg_ratio_reads(self, tmp_path):
+        """`avg_ratio`'s population is narrower than `call_count` (#934).
+
+        The average is taken over rows with `cleaned_chars > 0 AND
+        is_error = 0`; error rows and rows that recorded no cleaned length
+        contribute nothing to it, so the tuner cannot label an average over
+        one response from a count of twenty-five.
+        """
+        store = MetricsStore(tmp_path / "metrics.db")
+        store.initialize()
+        store.record(
+            CallMetrics(
+                server="srv",
+                tool="mixed",
+                original_chars=2000,
+                compressed_chars=1990,
+                cleaned_chars=2000,
+                compression_strategy="truncate",
+            )
+        )
+        for _ in range(3):
+            store.record(
+                CallMetrics(
+                    server="srv",
+                    tool="mixed",
+                    original_chars=2000,
+                    compressed_chars=2000,
+                    cleaned_chars=2000,
+                    compression_strategy=None,
+                    is_error=True,
+                )
+            )
+        for _ in range(2):
+            store.record(
+                CallMetrics(
+                    server="srv",
+                    tool="mixed",
+                    original_chars=2000,
+                    compressed_chars=2000,
+                    cleaned_chars=0,
+                    compression_strategy="truncate",
+                )
+            )
+        for _ in range(3):
+            store.record(
+                CallMetrics(
+                    server="srv",
+                    tool="errors_only",
+                    original_chars=1000,
+                    compressed_chars=1000,
+                    cleaned_chars=1000,
+                    compression_strategy=None,
+                    is_error=True,
+                )
+            )
+        by_tool = {p["tool"]: p for p in store.get_tool_profiles(since_seconds=3600.0)}
+
+        mixed = by_tool["mixed"]
+        assert mixed["call_count"] == 6
+        assert mixed["ratio_count"] == 1
+        assert mixed["avg_ratio"] == 0.995
+
+        errors_only = by_tool["errors_only"]
+        assert errors_only["call_count"] == 3
+        assert errors_only["ratio_count"] == 0
+        assert errors_only["avg_ratio"] is None
         store.close()
 
     def test_strategy_counts_exclude_calls_that_resolved_none(self, tmp_path):
