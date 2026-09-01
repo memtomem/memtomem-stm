@@ -416,7 +416,7 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - **Response-cache warm starts no longer rescan every cached body for privacy**
-  (issue #872). `ProxyCache` now stamps the fingerprint of its storage privacy
+  (#950, issue #872). `ProxyCache` now stamps the fingerprint of its storage privacy
   patterns in a component-owned SQLite metadata table. A missing or changed
   fingerprint still performs the full `result` + envelope sweep and removes
   matches before publishing the new stamp; an unchanged fingerprint skips the
