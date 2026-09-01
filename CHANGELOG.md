@@ -423,8 +423,16 @@ changes inline only. See the deprecation policy in
   only keys queued by SQLite triggers when a legacy or out-of-band writer
   inserts or changes a body; current checked writes dequeue their own key only
   while the published stamp matches their local policy, so an older process
-  cannot certify writes during a rolling policy upgrade. Write-time rejection
-  and read-time scan-and-evict remain in place as immediate guards. **Behavior change**: none
+  cannot certify writes during a rolling policy upgrade. The full sweep runs
+  without holding the write reservation — holding it across work proportional
+  to cache volume would lock a second process out of its own cache for that
+  process's whole lifetime — and a repair token published for the duration
+  matches no build's fingerprint, so every write racing the sweep stays queued
+  to be re-decided under the reservation that publishes the stamp. That same
+  reservation is where the queue triggers are compared against the text this
+  build ships and replaced when they differ, so a stamp is never published
+  over a queue maintained by another build's rules. Write-time rejection and
+  read-time scan-and-evict remain in place as immediate guards. **Behavior change**: none
   external; the first open after this upgrade or a later policy change still
   performs the same repair, while subsequent starts avoid cache-size-dependent
   regex work.
