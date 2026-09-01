@@ -1590,16 +1590,60 @@ class TestConnectionGenerationLeases:
         conn.active_calls[0] = 1
         conn.reconnect_generation = 1
 
-        # Releasing the last lease marks the generation and schedules the close…
+        # Releasing the last lease registers the close task…
         mgr._release_connection_session(conn, 0)
-        assert conn.retiring_generations == {0}
+        assert set(conn.retiring_tasks) == {0}
         # …and stop() runs before the loop ever steps that task (no await in
         # between), so its drain loop cancels it before the coroutine body runs.
         await mgr.stop()
 
         old_stack.aclose.assert_awaited_once()
         assert conn.retired_resources == {}
-        assert conn.retiring_generations == set()
+
+    async def test_stop_closes_retired_generation_despite_an_unrelated_straggler(self):
+        """#952: the decision is per generation. An unrelated background task
+        that outlives the bounded drain must not keep a cancelled retire task's
+        entry standing — that entry is what makes stop() skip the generation,
+        and ``_connections`` is cleared right after."""
+        cfg = UpstreamServerConfig(prefix="docs")
+        mgr = _make_manager(servers={"docs": cfg})
+        old_stack = AsyncMock()
+        conn = UpstreamConnection(name="docs", config=cfg, session=AsyncMock(), tools=[])
+        mgr._connections["docs"] = conn
+        conn.retired_resources[0] = _RetiredConnectionResources(
+            owner=None, stack=old_stack, config=cfg
+        )
+        conn.active_calls[0] = 1
+        conn.reconnect_generation = 1
+
+        # A background task that swallows cancellation until released, so the
+        # drain loop cannot empty ``_background_tasks`` within its budget.
+        release = asyncio.Event()
+
+        async def _straggler() -> None:
+            while True:
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    if release.is_set():
+                        raise
+
+        straggler = asyncio.create_task(_straggler())
+        mgr._background_tasks.add(straggler)
+        await asyncio.sleep(0)  # let it reach the sleep, so it can swallow
+        try:
+            mgr._release_connection_session(conn, 0)
+            with patch("memtomem_stm.proxy.manager.BACKGROUND_DRAIN_BUDGET_SECONDS", 0.05):
+                await mgr.stop()
+            assert not straggler.done()  # it really did outlive the drain
+        finally:
+            release.set()
+            straggler.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await straggler
+
+        old_stack.aclose.assert_awaited_once()
+        assert conn.retired_resources == {}
 
     async def test_retired_generation_error_keeps_old_credentials_client_safe(self):
         old_url_token = "old-url-token"
