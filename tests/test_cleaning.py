@@ -60,6 +60,22 @@ class TestPlaceholderRestoration:
         before fences — restoring fences first would leave the raw token."""
         assert _clean("Map<`K`, V> and <b>x</b>") == "Map<`K`, V> and x"
 
+    def test_upstream_token_inside_a_saved_generic_is_not_expanded(self):
+        """A token spelling that arrives in the response and is then captured
+        inside a saved generic comes back out during restoration. It is
+        upstream text, so it is left alone — the former per-index
+        `str.replace` loop instead expanded it on a later iteration, which let
+        the response relocate a copy of `List<A>` into the outer generic
+        (`Map<List<A>> List<A>`)."""
+        text = "Map<\x00GEN1\x00> List<A>"
+        assert _clean(text) == "Map<\x00GEN1\x00> List<A>"
+
+    def test_upstream_token_inside_a_saved_fence_is_not_expanded(self):
+        """The same rule on the fence pass, which runs last and so has no
+        later iteration to be caught by either."""
+        text = "```\n\x00FENCE1\x00\n```\n`x`"
+        assert _clean(text) == "```\n\x00FENCE1\x00\n```\n`x`"
+
     def test_literal_placeholder_tokens_pass_through(self):
         """Upstream text that merely looks like a placeholder is not a token we
         minted: an out-of-range index, a leading zero, and a fence index with no

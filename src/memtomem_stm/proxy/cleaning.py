@@ -16,10 +16,11 @@ _LINK_LINE_RE = re.compile(r"^\s*[-*]\s*\[.*?\]\(https?://\S+\)")
 _BARE_URL_LINE_RE = re.compile(r"^\s*[-*]?\s*https?://\S+\s*$")
 _GENERIC_RE = re.compile(r"[A-Z]\w{0,60}<[^>]+>")
 # Placeholders `_strip_html_jsx` swaps in for saved fences / generics. The
-# digit bound keeps `int()` cheap on adversarial upstream text; a longer run
-# is not a placeholder we minted and falls through as literal text.
-_FENCE_PLACEHOLDER_RE = re.compile(r"\x00FENCE(\d{1,9})\x00")
-_GEN_PLACEHOLDER_RE = re.compile(r"\x00GEN(\d{1,9})\x00")
+# digit bound keeps `int()` cheap on adversarial upstream text and is wider
+# than any index a real response can reach — one placeholder costs at least
+# eight characters, so even a 19-digit index is unrepresentable in memory.
+_FENCE_PLACEHOLDER_RE = re.compile(r"\x00FENCE(\d{1,19})\x00")
+_GEN_PLACEHOLDER_RE = re.compile(r"\x00GEN(\d{1,19})\x00")
 
 # Prompt injection heuristic patterns — common LLM manipulation attempts
 _INJECTION_PATTERNS = [
@@ -39,11 +40,18 @@ def _restore_placeholders(pattern: re.Pattern[str], items: list[str], text: str)
     """Swap every ``pattern`` placeholder in ``text`` back for ``items[index]``.
 
     One linear pass over ``text`` regardless of how many placeholders were
-    minted. It restores exactly the tokens the former per-index
-    ``str.replace`` loop restored — the spelling ``f"{i}"`` for ``i`` below
-    ``len(items)``. Anything else that happens to look like a placeholder
-    (an index out of range, a leading zero, an oversized digit run) was
-    upstream text, not a token we minted, and passes through verbatim.
+    minted, restoring the spelling ``f"{i}"`` for ``i`` below ``len(items)``.
+    Anything else that looks like a placeholder — an index out of range, a
+    leading zero, an oversized digit run — was upstream text, not a token we
+    minted, and passes through verbatim.
+
+    The substitution is **not** re-applied to what it inserts, which is a
+    deliberate difference from the former per-index ``str.replace`` loop.
+    There, a token spelling that arrived in the upstream response and was
+    then captured inside a saved fence or generic came back out during the
+    loop and the later iteration for that index expanded it, letting the
+    response relocate a copy of another region of itself into a spot it
+    never occupied. Restored content is upstream text and is left alone.
     """
 
     def _lookup(m: re.Match[str]) -> str:

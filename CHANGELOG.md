@@ -423,8 +423,19 @@ changes inline only. See the deprecation policy in
   longer grows with the product of the two. A 312 KB fence-heavy response with
   5,000 fences and 5,000 generics went from 1076-1102 ms to 6.5-7.2 ms in
   `_strip_html_jsx` (5 runs each, measured against the released code); a 30 KB
-  one from 11.1-11.9 ms to 0.61-0.72 ms. Output is byte-identical, including
-  for upstream text that merely looks like a placeholder.
+  one from 11.1-11.9 ms to 0.61-0.72 ms.
+
+  **Behavior change**: for one class of upstream input the cleaned text
+  differs. The placeholders are NUL-delimited (`\x00GEN0\x00`), and an
+  upstream response is free to contain that spelling itself. If such a token
+  was captured *inside* a saved fence or generic, the old loop put the
+  enclosing text back and then a later iteration expanded the token that had
+  come out with it — so a response containing `Map<\x00GEN1\x00> List<A>`
+  was cleaned to `Map<List<A>> List<A>`, relocating a copy of one region into
+  a spot it never occupied. A single pass does not re-scan what it inserts:
+  restored content is upstream text and is now left alone. Every other input
+  cleans byte-identically, tokens that merely look like placeholders (out of
+  range, leading zero) included — those were already passed through.
 
 - **Score-scale diagnostics persist per observation and recover unlatched**
   (#944). The `score_scale_mismatch` / `score_ceiling_below_min` path gated its
