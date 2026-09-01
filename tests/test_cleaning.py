@@ -40,50 +40,127 @@ class TestHTMLStripping:
         assert "List<String>" in result
 
 
-class TestPlaceholderRestoration:
-    """`_strip_html_jsx` shields fences and generics behind NUL-delimited
-    placeholders, then restores them. These pin what "restore" means."""
+class TestProtectedRegions:
+    r"""Code fences and generic types are carried through the tag stripping
+    verbatim. They are recognized as spans of the original text — nothing is
+    substituted into the text and searched for again — so no input can spell a
+    marker that the cleaner then acts on (#948)."""
 
-    def test_many_fences_and_generics_restored_in_order(self):
-        """Index 1 and index 10+ coexist, so a prefix-matching restore (split
-        on the token stem, or a shortest-match sub) mixes up GEN1 and GEN10."""
-        parts = []
-        for i in range(12):
-            parts.append(f"<b>t{i}</b> List<Item{i}> `code{i}`")
-        text = "\n".join(parts)
+    def test_adjacent_fences_separated_by_token_text_survive(self):
+        r"""The earlier design swapped each fence for `\x00FENCE{i}\x00`, and two
+        of those standing next to each other spelled a *generic* marker across
+        their boundary, which restoration then consumed: this input cleaned to
+        `\x00FENCE0List<A>FENCE1\x00 List<A>`, losing both fences and emitting
+        raw control characters. No NUL from the upstream was required."""
+        text = "`keep-me`GEN0`and-me` List<A>"
+        assert _clean(text) == text
+
+    def test_upstream_token_text_is_never_expanded(self):
+        """A marker spelling the upstream sent itself used to be restored at
+        every occurrence, so one saved item was emitted once per copy and a
+        small response could expand quadratically. Nothing here is a marker."""
+        text = "\x00GEN0\x00" * 3 + "List<A>"
+        assert _clean(text) == text
+        assert len(_clean(text)) <= len(text)
+
+    def test_generic_enclosing_inline_code_is_preserved(self):
+        """Generics are located on a copy where fences are already blanked, and
+        the two span lists are then merged, so a generic that encloses a fence
+        covers it rather than being cut short by it."""
+        assert _clean("Map<`K`, V> and <b>x</b>") == "Map<`K`, V> and x"
+
+    def test_script_outside_a_fence_takes_the_fence_with_it(self):
+        """A `<script>` opened in ordinary text starts before the fence it
+        contains, so the whole block goes — content, tags and fence alike."""
+        assert _clean("before <script>var x = `a`;</script> after") == "before  after"
+
+    def test_script_inside_a_fence_is_preserved(self):
+        """The mirror case: the fence starts first, so the block inside it is
+        documentation, not markup to drop."""
+        text = "```\n<script>evil</script>\n```"
+        assert _clean(text) == text
+
+    def test_generic_spanning_a_fence_that_contains_a_bracket(self):
+        """Generics are located on a copy where fences are already blanked, so
+        a `>` *inside* a fence cannot end the generic early. Searching the raw
+        text instead would cut the generic short at that bracket and leave the
+        rest of it — here the `<i>` — exposed to the tag stripper."""
+        assert _clean("Map<`a>b`, <i>V> tail") == "Map<`a>b`, <i>V> tail"
+
+    def test_tag_whose_attribute_holds_a_fence_is_still_stripped(self):
+        """A protected region must be opaque to the tag pattern, not a wall it
+        cannot cross: `<div title="`x`">` is markup, and the fence inside its
+        attribute must not split the tag and leave the markup in the output."""
+        assert _clean('<div title="`x`">body</div>') == "body"
+        assert _clean('<div title="List<A>">body</div>') == "body"
+
+    def test_script_crossing_into_a_fence_does_not_close_inside_it(self):
+        """The `</script>` here sits inside the fence, so the block never
+        closes and only the opening tag is stripped. Selecting regions by
+        earliest start instead would let the script arm consume through the
+        fence and drop the tail with it."""
+        text = "<script>abc ```code </script> tail ```"
+        assert _clean(text) == "abc ```code </script> tail ```"
+
+    def test_close_tag_formed_by_an_earlier_removal_is_removed(self):
+        """The removal patterns run one after another over the surviving text,
+        so each sees what the previous one left joined. Blanking a cut in place
+        would keep the two sides apart and leave this `</a>` behind."""
+        assert _clean("</<b>a>") == ""
+
+    def test_regions_that_become_adjacent_after_a_removal(self):
+        r"""Two fences separated by a tag end up side by side once the tag
+        goes. The shortcut that splices regions back by position only holds
+        while their blanked runs still line up one-for-one, so this has to
+        fall through to the segment bookkeeping and still come out right."""
+        assert _clean("`a`<b>`c`") == "`a``c`"
+
+    def test_region_removed_with_its_enclosing_script(self):
+        r"""A protected region can be removed outright, which is the other way
+        the runs stop lining up."""
+        assert _clean("`a`<script>x</script>`b`") == "`a``b`"
+
+    def test_upstream_nul_cannot_stand_in_for_a_removed_region(self):
+        r"""The splice shortcut matches blanked runs to regions by position, so
+        it is only sound while every run in the stripped text came from a
+        region. Here the response brings its own NUL run: one fence is removed
+        with the script around it, and the upstream run takes its place in the
+        count with the same length. Without the check that the text carries no
+        NUL of its own, the removed fence's content reappears at the upstream
+        run (`a`X`b`) — content the response never had at that spot."""
+        text = "`a`X\x00\x00\x00<script>`b`</script>"
+        assert _clean(text) == "`a`X\x00\x00\x00"
+
+    def test_marker_text_inside_a_protected_region_is_left_alone(self):
+        r"""Held over from the placeholder-era suite as a black-box contract:
+        text that looks like the old markers is content, wherever it sits."""
+        fenced = "```\n\x00FENCE1\x00\n```\n`x`"
+        assert _clean(fenced) == fenced
+        assert _clean("Map<\x00GEN1\x00> List<A>") == "Map<\x00GEN1\x00> List<A>"
+
+    def test_out_of_range_and_leading_zero_marker_text_survives(self):
+        r"""Also held over: an index that never existed and a non-canonical one
+        were the inputs the old restore loop had to leave alone."""
+        text = "List<A> \x00GEN99\x00 \x00GEN01\x00 List<B> \x00FENCE7\x00 <b>x</b>"
+        assert _clean(text) == "List<A> \x00GEN99\x00 \x00GEN01\x00 List<B> \x00FENCE7\x00 x"
+
+    def test_many_regions_keep_their_own_content(self):
+        r"""Held over: with a dozen fences and a dozen generics, region 1 and
+        region 10+ must not be confused for one another."""
+        text = "\n".join(f"<b>t{i}</b> List<Item{i}> `code{i}`" for i in range(12))
         expected = "\n".join(f"t{i} List<Item{i}> `code{i}`" for i in range(12))
         assert _clean(text) == expected
 
-    def test_generic_enclosing_inline_code_is_restored(self):
-        """Fences are saved first, so a generic can be saved with a fence
-        placeholder already inside it. Generics must therefore be restored
-        before fences — restoring fences first would leave the raw token."""
-        assert _clean("Map<`K`, V> and <b>x</b>") == "Map<`K`, V> and x"
+    def test_case_insensitive_script_is_dropped(self):
+        """The script/style rule matches case-insensitively, as it always has;
+        the generic rule must not, or `list<A>` would be protected too."""
+        assert _clean("<SCRIPT>evil</SCRIPT> keep") == "keep"
+        assert _clean("<Style>a{}</STYLE> keep") == "keep"
 
-    def test_upstream_token_inside_a_saved_generic_is_not_expanded(self):
-        """A token spelling that arrives in the response and is then captured
-        inside a saved generic comes back out during restoration. It is
-        upstream text, so it is left alone — the former per-index
-        `str.replace` loop instead expanded it on a later iteration, which let
-        the response relocate a copy of `List<A>` into the outer generic
-        (`Map<List<A>> List<A>`)."""
-        text = "Map<\x00GEN1\x00> List<A>"
-        assert _clean(text) == "Map<\x00GEN1\x00> List<A>"
-
-    def test_upstream_token_inside_a_saved_fence_is_not_expanded(self):
-        """The same rule on the fence pass, which runs last and so has no
-        later iteration to be caught by either."""
-        text = "```\n\x00FENCE1\x00\n```\n`x`"
-        assert _clean(text) == "```\n\x00FENCE1\x00\n```\n`x`"
-
-    def test_literal_placeholder_tokens_pass_through(self):
-        """Upstream text that merely looks like a placeholder is not a token we
-        minted: an out-of-range index, a leading zero, and a fence index with no
-        fence behind it all survive verbatim, exactly as the former per-index
-        `str.replace` loop left them."""
-        text = "List<A> \x00GEN99\x00 \x00GEN01\x00 List<B> \x00FENCE7\x00 <b>x</b>"
-        expected = "List<A> \x00GEN99\x00 \x00GEN01\x00 List<B> \x00FENCE7\x00 x"
-        assert _clean(text) == expected
+    def test_lowercase_generic_is_still_not_protected(self):
+        """The scoped flag must not leak: `list<A>` is not a generic type, so
+        it is ordinary text and `<A>` is stripped as a tag."""
+        assert _clean("list<A> here") == "list here"
 
 
 class TestDeduplication:
