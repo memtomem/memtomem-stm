@@ -15,6 +15,11 @@ _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 _LINK_LINE_RE = re.compile(r"^\s*[-*]\s*\[.*?\]\(https?://\S+\)")
 _BARE_URL_LINE_RE = re.compile(r"^\s*[-*]?\s*https?://\S+\s*$")
 _GENERIC_RE = re.compile(r"[A-Z]\w{0,60}<[^>]+>")
+# Placeholders `_strip_html_jsx` swaps in for saved fences / generics. The
+# digit bound keeps `int()` cheap on adversarial upstream text; a longer run
+# is not a placeholder we minted and falls through as literal text.
+_FENCE_PLACEHOLDER_RE = re.compile(r"\x00FENCE(\d{1,9})\x00")
+_GEN_PLACEHOLDER_RE = re.compile(r"\x00GEN(\d{1,9})\x00")
 
 # Prompt injection heuristic patterns — common LLM manipulation attempts
 _INJECTION_PATTERNS = [
@@ -28,6 +33,27 @@ _INJECTION_PATTERNS = [
 ]
 
 _logger = _logging.getLogger(__name__)
+
+
+def _restore_placeholders(pattern: re.Pattern[str], items: list[str], text: str) -> str:
+    """Swap every ``pattern`` placeholder in ``text`` back for ``items[index]``.
+
+    One linear pass over ``text`` regardless of how many placeholders were
+    minted. It restores exactly the tokens the former per-index
+    ``str.replace`` loop restored — the spelling ``f"{i}"`` for ``i`` below
+    ``len(items)``. Anything else that happens to look like a placeholder
+    (an index out of range, a leading zero, an oversized digit run) was
+    upstream text, not a token we minted, and passes through verbatim.
+    """
+
+    def _lookup(m: re.Match[str]) -> str:
+        digits = m.group(1)
+        idx = int(digits)
+        if str(idx) != digits or idx >= len(items):
+            return m.group(0)
+        return items[idx]
+
+    return pattern.sub(_lookup, text)
 
 
 class ContentCleaner(Protocol):
@@ -106,10 +132,11 @@ class DefaultContentCleaner:
         text = _HTML_TAG_RE.sub("", text)
         text = _CLOSE_TAG_RE.sub("", text)
 
-        for i, g in enumerate(generics):
-            text = text.replace(f"\x00GEN{i}\x00", g)
-        for i, f in enumerate(fences):
-            text = text.replace(f"\x00FENCE{i}\x00", f)
+        # Order is fixed: a generic can enclose a fence placeholder (``Map<`K`,
+        # V>`` is saved whole, after the inline code inside it became a token),
+        # so generics must be restored first for the fence pass to see it.
+        text = _restore_placeholders(_GEN_PLACEHOLDER_RE, generics, text)
+        text = _restore_placeholders(_FENCE_PLACEHOLDER_RE, fences, text)
 
         return text
 

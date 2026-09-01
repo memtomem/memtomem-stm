@@ -415,6 +415,17 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **Code-fence restoration in the cleaner is linear in response size** (#877).
+  `_strip_html_jsx` shields code fences and generic types (`List<T>`) behind
+  placeholders while HTML tags are stripped, then put each one back with a
+  full-text `str.replace` — one scan of the whole response *per placeholder*.
+  Restoration is now a single regex pass per placeholder kind, so the cost no
+  longer grows with the product of the two. A 312 KB fence-heavy response with
+  5,000 fences and 5,000 generics went from 1076-1102 ms to 6.5-7.2 ms in
+  `_strip_html_jsx` (5 runs each, measured against the released code); a 30 KB
+  one from 11.1-11.9 ms to 0.61-0.72 ms. Output is byte-identical, including
+  for upstream text that merely looks like a placeholder.
+
 - **Score-scale diagnostics persist per observation and recover unlatched**
   (#944). The `score_scale_mismatch` / `score_ceiling_below_min` path gated its
   durable writes on four per-process in-memory latches, but the
