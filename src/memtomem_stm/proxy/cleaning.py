@@ -7,20 +7,31 @@ import re
 import unicodedata
 from typing import Protocol
 
-_CODE_FENCE_RE = re.compile(r"(```[\s\S]*?```|`[^`\n]+`)")
-_SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>[\s\S]*?</\1>", re.I)
 _HTML_TAG_RE = re.compile(r"<[a-zA-Z][\w.-]*(?:\s[^>]*)?\s*/?>")
 _CLOSE_TAG_RE = re.compile(r"</[a-zA-Z][\w.-]*\s*>")
 _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 _LINK_LINE_RE = re.compile(r"^\s*[-*]\s*\[.*?\]\(https?://\S+\)")
 _BARE_URL_LINE_RE = re.compile(r"^\s*[-*]?\s*https?://\S+\s*$")
-_GENERIC_RE = re.compile(r"[A-Z]\w{0,60}<[^>]+>")
-# Placeholders `_strip_html_jsx` swaps in for saved fences / generics. The
-# digit bound keeps `int()` cheap on adversarial upstream text and is wider
-# than any index a real response can reach — one placeholder costs at least
-# eight characters, so even a 19-digit index is unrepresentable in memory.
-_FENCE_PLACEHOLDER_RE = re.compile(r"\x00FENCE(\d{1,19})\x00")
-_GEN_PLACEHOLDER_RE = re.compile(r"\x00GEN(\d{1,19})\x00")
+
+# The regions `_strip_html_jsx` recognizes. Each body is written once and
+# only reaches the engine through `_PROTECTED_RE`, so there is no second copy
+# of a rule to drift out of step with this one.
+_FENCE_SRC = r"```[\s\S]*?```|`[^`\n]+`"
+_GENERIC_SRC = r"[A-Z]\w{0,60}<[^>]+>"
+# Scoped case-insensitivity, because a module-level `re.I` would reach
+# `_GENERIC_SRC`'s `[A-Z]` and make it match lowercase. The backreference must
+# be named: a numbered one cannot refer out of the still-open alternation.
+_SCRIPT_STYLE_SRC = r"(?i:<(?P<tag>script|style)\b[^>]*>[\s\S]*?</(?P=tag)>)"
+
+# One alternation, so a single left-to-right pass decides the regions by
+# position: the earlier START wins. That is what makes a `<script>` opened
+# outside a fence swallow a fence inside it, while a `<script>` written
+# *inside* a fence is left alone. Alternative order carries no meaning here —
+# the three begin with a backtick, `<` and `[A-Z]` respectively, so no two can
+# start at the same offset for the order to break a tie between.
+_PROTECTED_RE = re.compile(
+    f"(?P<fence>{_FENCE_SRC})|(?P<drop>{_SCRIPT_STYLE_SRC})|(?P<generic>{_GENERIC_SRC})"
+)
 
 # Prompt injection heuristic patterns — common LLM manipulation attempts
 _INJECTION_PATTERNS = [
@@ -36,32 +47,10 @@ _INJECTION_PATTERNS = [
 _logger = _logging.getLogger(__name__)
 
 
-def _restore_placeholders(pattern: re.Pattern[str], items: list[str], text: str) -> str:
-    """Swap every ``pattern`` placeholder in ``text`` back for ``items[index]``.
-
-    One linear pass over ``text`` regardless of how many placeholders were
-    minted, restoring the spelling ``f"{i}"`` for ``i`` below ``len(items)``.
-    Anything else that looks like a placeholder — an index out of range, a
-    leading zero, an oversized digit run — was upstream text, not a token we
-    minted, and passes through verbatim.
-
-    The substitution is **not** re-applied to what it inserts, which is a
-    deliberate difference from the former per-index ``str.replace`` loop.
-    There, a token spelling that arrived in the upstream response and was
-    then captured inside a saved fence or generic came back out during the
-    loop and the later iteration for that index expanded it, letting the
-    response relocate a copy of another region of itself into a spot it
-    never occupied. Restored content is upstream text and is left alone.
-    """
-
-    def _lookup(m: re.Match[str]) -> str:
-        digits = m.group(1)
-        idx = int(digits)
-        if str(idx) != digits or idx >= len(items):
-            return m.group(0)
-        return items[idx]
-
-    return pattern.sub(_lookup, text)
+def _strip_tags(segment: str) -> str:
+    """Remove HTML tags from a segment that lies outside every protected region."""
+    segment = _HTML_TAG_RE.sub("", segment)
+    return _CLOSE_TAG_RE.sub("", segment)
 
 
 class ContentCleaner(Protocol):
@@ -120,33 +109,29 @@ class DefaultContentCleaner:
                     return
 
     def _strip_html_jsx(self, text: str) -> str:
-        fences: list[str] = []
+        r"""Strip HTML/JSX tags, leaving code fences and generic types intact.
 
-        def _save_fence(m: re.Match) -> str:
-            fences.append(m.group(0))
-            return f"\x00FENCE{len(fences) - 1}\x00"
-
-        text = _CODE_FENCE_RE.sub(_save_fence, text)
-
-        generics: list[str] = []
-
-        def _save_generic(m: re.Match) -> str:
-            generics.append(m.group(0))
-            return f"\x00GEN{len(generics) - 1}\x00"
-
-        text = _GENERIC_RE.sub(_save_generic, text)
-        # Remove <script>/<style> blocks entirely (content + tags)
-        text = _SCRIPT_STYLE_RE.sub("", text)
-        text = _HTML_TAG_RE.sub("", text)
-        text = _CLOSE_TAG_RE.sub("", text)
-
-        # Order is fixed: a generic can enclose a fence placeholder (``Map<`K`,
-        # V>`` is saved whole, after the inline code inside it became a token),
-        # so generics must be restored first for the fence pass to see it.
-        text = _restore_placeholders(_GEN_PLACEHOLDER_RE, generics, text)
-        text = _restore_placeholders(_FENCE_PLACEHOLDER_RE, fences, text)
-
-        return text
+        The protected regions are never substituted for a marker. An earlier
+        design swapped each fence and generic for a NUL-delimited token, and
+        that spelling is not reserved: the substitution wrote the very
+        sequences it later searched for. Two tokens standing next to each
+        other spelled a third across their boundary — ``\`a\`GEN0\`b\``` lost
+        both fences — and a token the upstream sent itself was restored at
+        every occurrence, so a small response could expand quadratically
+        (#948). Walking spans instead means nothing is ever written into the
+        text and looked for again, so neither is expressible.
+        """
+        out: list[str] = []
+        pos = 0
+        for m in _PROTECTED_RE.finditer(text):
+            out.append(_strip_tags(text[pos : m.start()]))
+            # `drop` is the <script>/<style> block, content and tags alike;
+            # a fence or generic is carried over exactly as it arrived.
+            if m.group("drop") is None:
+                out.append(m.group(0))
+            pos = m.end()
+        out.append(_strip_tags(text[pos:]))
+        return "".join(out)
 
     def _deduplicate_paragraphs(self, text: str) -> str:
         paragraphs = re.split(r"\n{2,}", text)

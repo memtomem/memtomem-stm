@@ -415,6 +415,37 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **The cleaner protects code fences by span, not by placeholder** (#948).
+  `_strip_html_jsx` used to swap each fence and generic type for a
+  NUL-delimited marker (`\x00FENCE0\x00`) while HTML was stripped, then put
+  them back. That spelling was never reserved, and the substitution wrote the
+  very sequences it later searched for, which cost two ways:
+
+  - **Content was lost on ordinary input.** Two inline-code spans separated by
+    the literal text `GEN0` made the boundary between their own markers spell
+    a *generic* marker, which restoration then consumed. `` `keep-me`GEN0`and-me`
+    List<A> `` cleaned to `\x00FENCE0List<A>FENCE1\x00 List<A>` — both fences
+    gone and raw control characters delivered to the client. No hostile
+    upstream and no NUL in the response were required.
+  - **A response could expand quadratically.** A marker the upstream sent
+    itself (` ` is legal JSON) was restored at every occurrence, so one
+    saved item was emitted once per copy: 56,006 characters in became
+    64,056,006 out. This ran *after* the `max_upstream_chars` guard, which is
+    applied before cleaning and so bounds only the input.
+
+  Both are gone: the fences, generics and `<script>`/`<style>` blocks are now
+  recognized as spans of the original text in one left-to-right pass, and the
+  tag-stripping regexes run only on the gaps between them. Nothing is written
+  into the text and looked for again, so neither defect is expressible rather
+  than merely unlikely. The same input now returns 56,006 characters.
+
+  **Behavior change**: on the two classes above. Ordinary responses clean
+  byte-identically — a 600-document corpus of markdown, HTML and code found no
+  divergence, and every input in the cleaner's test suite is unchanged. The
+  placeholder machinery #877 made linear is removed rather than optimized
+  again; the pass costs 6.32-6.52 ms against 6.17-6.37 ms on a 110 KB
+  fence-heavy body (7 runs).
+
 - **Code-fence restoration in the cleaner is linear in response size** (#877).
   `_strip_html_jsx` shields code fences and generic types (`List<T>`) behind
   placeholders while HTML tags are stripped, then put each one back with a
