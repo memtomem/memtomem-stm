@@ -55,6 +55,7 @@ from memtomem_stm.mms.import_hosts import (
     _desktop_config_path,
     _is_self_reference,
     _read_json_safely,
+    project_local_gate_message,
 )
 from memtomem_stm.mms.secrets import REDACTED_DISPLAY
 from memtomem_stm.mms.state import utc_now_iso
@@ -2325,6 +2326,12 @@ def stats(
     help="Probe the server (MCP initialize + list-tools) before saving; abort on failure.",
 )
 @click.option(
+    "--save-unverified",
+    is_flag=True,
+    help="With --from-clients --validate, save the entire import even if one or more "
+    "connection probes fail. Without this acknowledgement, validation is all-or-nothing.",
+)
+@click.option(
     "--timeout",
     "validate_timeout",
     type=click.IntRange(min=1),
@@ -2372,6 +2379,11 @@ def stats(
     "via STM. Default: interactive prompt on TTY, skip on non-TTY. Only "
     "valid with --from-clients/--import.",
 )
+@click.option(
+    "--allow-project-configs",
+    is_flag=True,
+    help="Acknowledge importing MCP entries from project-local .mcp.json.",
+)
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
 @with_config_write_lock(json_envelope=True)
 def add(
@@ -2387,11 +2399,13 @@ def add(
     compression: str,
     max_result_chars: int,
     validate: bool,
+    save_unverified: bool,
     validate_timeout: int,
     from_clients: bool,
     select_all: bool,
     select_names: tuple[str, ...],
     prune: bool,
+    allow_project_configs: bool,
     as_json: bool = False,
 ) -> None:
     """Add an upstream MCP server to the proxy configuration."""
@@ -2405,6 +2419,10 @@ def add(
         raise click.UsageError("--all cannot be combined with --select.")
     if (select_all or selected) and not from_clients:
         raise click.UsageError("--all / --select require --from-clients/--import.")
+    if save_unverified and not from_clients:
+        raise click.UsageError("--save-unverified requires --from-clients/--import.")
+    if save_unverified and not validate:
+        raise click.UsageError("--save-unverified requires --validate.")
 
     if from_clients:
         noninteractive = select_all or bool(selected)
@@ -2447,9 +2465,14 @@ def add(
             prune=prune,
             select_all=select_all,
             select_names=selected,
+            allow_project_configs=allow_project_configs,
+            save_unverified=save_unverified,
             as_json=as_json,
         )
         return
+
+    if allow_project_configs:
+        raise click.UsageError("--allow-project-configs requires --from-clients/--import.")
 
     if prune:
         # --prune only has semantics when we know which servers were just
@@ -2860,10 +2883,11 @@ class _SourceSpec:
     label: str
     kind: str
     claude_scope: str | None
+    is_repo_local: bool = False
 
 
 _SOURCE_SPECS: tuple[_SourceSpec, ...] = (
-    _SourceSpec(".mcp.json (project)", "mcp-json", "project"),
+    _SourceSpec(".mcp.json (project)", "mcp-json", "project", is_repo_local=True),
     _SourceSpec("Claude Code (user)", "claude-user", "user"),
     _SourceSpec("Claude Code (project)", "claude-project", "local"),
     _SourceSpec("Claude Desktop", "claude-desktop", None),
@@ -2975,6 +2999,7 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
                 "entry": entry,
                 "raw": copy.deepcopy(raw),
                 "source_ref": source_ref,
+                "is_repo_local": spec.is_repo_local,
             }
     return list(seen.values())
 
@@ -3784,6 +3809,8 @@ def _add_from_clients(
     prune: bool = False,
     select_all: bool = False,
     select_names: tuple[str, ...] = (),
+    allow_project_configs: bool = False,
+    save_unverified: bool = False,
     as_json: bool = False,
 ) -> None:
     """Bulk-import path for ``mms add --from-clients``.
@@ -3916,6 +3943,22 @@ def _add_from_clients(
             click.echo(f"{_ok('No servers selected.')} Config unchanged.")
             return
 
+    selected_candidates = [new_candidates[i] for i in picks]
+    repo_local = [cand for cand in selected_candidates if cand.get("is_repo_local") is True]
+    if repo_local and not allow_project_configs:
+        names = [str(cand["name"]) for cand in repo_local]
+        msg = project_local_gate_message([_disp(name) for name in names])
+        click.echo(f"{_err('Error:')} {msg}", err=True)
+        if as_json:
+            _json_fail(
+                "add",
+                "project_config_ack_required",
+                msg,
+                exit_code=2,
+                names=names,
+            )
+        raise SystemExit(2)
+
     # Seed the "taken prefixes" set with what's already in the config so
     # suggestions don't collide with prior registrations.
     used_prefixes: set[str] = {p for srv_cfg in servers.values() if (p := srv_cfg.get("prefix"))}
@@ -3948,18 +3991,50 @@ def _add_from_clients(
         info(f"Validating {len(imported)} server(s) (timeout={validate_timeout}s)...")
         probes = asyncio.run(_probe_servers(imported, validate_timeout))
         rows_by_name = {row["name"]: row for row in imported_rows}
+        failed_probes: list[tuple[str, StagedProbeResult]] = []
         for n, probe in probes.items():
             rows_by_name[n]["reachable"] = probe.connected
             rows_by_name[n]["tools_reachable"] = probe.tools if probe.connected else None
             if probe.connected:
                 info(f"  {_ok('Reachable:')} {_disp(n)} — {probe.tools} tool(s).")
             else:
+                failed_probes.append((n, probe))
                 # One message string for both surfaces so the stderr wording
                 # and the --json ``warnings`` entry cannot fork.
                 warn_msg = f"{n} — probe failed: {probe.error or ''}"
                 warnings_json.append(warn_msg)
                 click.echo(f"  {_warn('Warning:')} {_disp(warn_msg)}", err=True)
-                click.echo("  Saving anyway. Run `mms health` later to retry.", err=True)
+        if failed_probes and not save_unverified:
+            names = [name for name, _probe in failed_probes]
+            msg = f"validation failed for {len(names)} server(s); no imported servers were saved"
+            click.echo(f"{_err('Error:')} {_disp(msg)}.", err=True)
+            click.echo(
+                "  Fix connectivity and retry, or explicitly pass --save-unverified.",
+                err=True,
+            )
+            if as_json:
+                _json_fail(
+                    "add",
+                    "validation_failed",
+                    msg,
+                    mode="from_clients",
+                    names=names,
+                    failures=[
+                        {
+                            "name": name,
+                            "error": probe.error or "",
+                            "stage": probe.stage.value,
+                        }
+                        for name, probe in failed_probes
+                    ],
+                )
+            raise SystemExit(1)
+        if failed_probes:
+            click.echo(
+                "  Saving all selected servers because --save-unverified was acknowledged. "
+                "Run `mms health` later to retry.",
+                err=True,
+            )
 
     servers.update(imported)
     _save(config_path, data)
@@ -3982,7 +4057,7 @@ def _add_from_clients(
     # the interactive prompt (TTY), and the hint-only fallback (non-TTY /
     # non-interactive selection / user declined).
     pruned, failed = _handle_source_prune(
-        [new_candidates[i] for i in picks],
+        selected_candidates,
         prune=prune,
         config_path=config_path,
         data=data,

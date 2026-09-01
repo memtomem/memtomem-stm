@@ -218,6 +218,9 @@ Options:
   --validate                      Probe the server (MCP initialize +
                                   list-tools) before saving; abort on
                                   failure.
+  --save-unverified               With --from-clients --validate, save the
+                                  entire import even if one or more probes
+                                  fail. Validation is otherwise all-or-nothing.
   --timeout INTEGER RANGE         Connection timeout (seconds) when
                                   --validate is set.  [default: 10; x>=1]
   --from-clients, --import        Import additional servers interactively
@@ -245,6 +248,8 @@ Options:
                                   confirm prompt (default No); non-TTY
                                   callers must pass the flag explicitly.
                                   Requires --from-clients / --import.
+  --allow-project-configs         Acknowledge importing MCP entries from a
+                                  project-local .mcp.json.
   --json                          Output as JSON for scripting.
 ```
 
@@ -266,6 +271,17 @@ of the `init` discovery step — servers already registered in this config are
 filtered out by name and by `(transport, command, args)` / `(transport, url)`
 signature before the selection UI. `--validate` and `--timeout` work on the
 selected subset.
+
+A selected entry from the current checkout's project-local `.mcp.json` is
+refused before probing, saving, or pruning unless
+`--allow-project-configs` is passed. Selecting a repository file is not by
+itself consent to adopt a command supplied by that checkout.
+
+Bulk validation is atomic by default: if any selected server fails its probe,
+none of the imported servers are written and the command exits 1
+(`validation_failed`). Pass `--save-unverified` together with `--validate`
+only when you intentionally want the complete selected batch saved despite
+those failures; the flag never saves a partial subset.
 
 For scripts and CI, `--all` (import everything newly discovered) or `--select
 NAME[,NAME...]` (import only the named servers, repeatable and comma-separated)
@@ -911,6 +927,10 @@ Commands:
 
 `mms daemon run` accepts `--foreground` and `--detached`; normal users should
 prefer `start`, while service wrappers can choose the explicit run mode.
+`start` exits 1 if the detached process does not become ready. `stop` reports
+success only after the shutdown acknowledgement is followed by confirmed
+endpoint closure and handshake removal; an accepted request whose teardown is
+still running exits 1 instead of claiming the daemon has stopped.
 
 Daemons are keyed by config, so `start`/`stop`/`restart` for one config never
 touch a daemon serving another config. The one escape hatch is `stop --all`:

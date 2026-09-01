@@ -746,8 +746,7 @@ class TestStop:
             lambda mgr, entry: mgr._retiring_retry_requested.discard(entry)
         )
         assert other.close.await_count == 0, (
-            "a stale catch-up candidate was retried for a request that had "
-            "already been spent"
+            "a stale catch-up candidate was retried for a request that had already been spent"
         )
 
     async def test_a_carried_retry_is_skipped_once_another_pass_claims_it(self):
@@ -1535,6 +1534,188 @@ class TestConnectServerOverflowSkip:
         assert "will not be advertised" not in caplog.text
 
 
+class TestConnectionGenerationLeases:
+    async def test_reconnect_retires_old_session_after_last_call_releases(self):
+        cfg = UpstreamServerConfig(prefix="docs")
+        mgr = _make_manager(servers={"docs": cfg})
+        old_session = AsyncMock()
+        old_stack = AsyncMock()
+        conn = UpstreamConnection(
+            name="docs",
+            config=cfg,
+            session=old_session,
+            tools=[],
+            stack=old_stack,
+        )
+        mgr._connections["docs"] = conn
+        leased_session, generation = mgr._acquire_connection_session(conn)
+        new_session = AsyncMock()
+
+        with patch.object(
+            mgr,
+            "_establish_connection",
+            new_callable=AsyncMock,
+            return_value=(new_session, None, []),
+        ):
+            await mgr._reconnect_server("docs", cfg)
+
+        assert leased_session is old_session
+        assert conn.session is new_session
+        old_stack.aclose.assert_not_awaited()
+        assert generation in conn.retired_resources
+
+        mgr._release_connection_session(conn, generation)
+        await asyncio.gather(*mgr._background_tasks)
+
+        old_stack.aclose.assert_awaited_once()
+        assert generation not in conn.retired_resources
+
+    async def test_retired_generation_error_keeps_old_credentials_client_safe(self):
+        old_url_token = "old-url-token"
+        old_header_token = "old-header-token"
+        old_env_token = "old-env-token"
+        old_cfg = UpstreamServerConfig(
+            prefix="docs",
+            transport=TransportType.SSE,
+            url=f"https://alice:{old_url_token}@old.example.test/mcp",
+            headers={"Authorization": f"Bearer {old_header_token}"},
+            env={"UPSTREAM_TOKEN": old_env_token},
+            max_retries=0,
+        )
+        mgr = _make_manager(servers={"docs": old_cfg})
+        old_session = AsyncMock()
+        entered = asyncio.Event()
+        fail = asyncio.Event()
+
+        async def old_call(*_args, **_kwargs):
+            entered.set()
+            await fail.wait()
+            raise ConnectionError(
+                f"failed at {old_cfg.url}; auth=Bearer {old_header_token}; env={old_env_token}"
+            )
+
+        old_session.call_tool.side_effect = old_call
+        old_stack = AsyncMock()
+        conn = UpstreamConnection(
+            name="docs", config=old_cfg, session=old_session, tools=[], stack=old_stack
+        )
+        mgr._connections["docs"] = conn
+
+        call = asyncio.create_task(mgr.call_tool("docs", "read", {}))
+        await entered.wait()
+
+        new_cfg = old_cfg.model_copy(
+            update={
+                "url": "https://bob:new-url-token@new.example.test/mcp",
+                "headers": {"Authorization": "Bearer new-header-token"},
+                "env": {"UPSTREAM_TOKEN": "new-env-token"},
+            }
+        )
+        current = mgr._config.model_copy(update={"upstream_servers": {"docs": new_cfg}})
+        mgr._config_loader.seed(current)
+        with patch.object(
+            mgr,
+            "_establish_connection",
+            new_callable=AsyncMock,
+            return_value=(AsyncMock(), None, []),
+        ):
+            await mgr._reconnect_server("docs", new_cfg)
+        assert 0 in conn.retired_resources
+
+        fail.set()
+        with pytest.raises(ConnectionError) as raised:
+            await call
+
+        rendered = mgr.safe_upstream_error("docs", raised.value)
+        for secret in (old_url_token, old_header_token, old_env_token):
+            assert secret not in rendered
+        assert "***@old.example.test" in rendered
+        await asyncio.gather(*list(mgr._background_tasks), return_exceptions=True)
+
+    async def test_next_dispatch_waits_for_failed_generation_recovery(self):
+        cfg = UpstreamServerConfig(prefix="docs", max_retries=0)
+        mgr = _make_manager(servers={"docs": cfg})
+        old_session = AsyncMock()
+        old_session.call_tool.side_effect = ConnectionError("broken session")
+        new_session = AsyncMock()
+        new_session.call_tool.return_value = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="fresh")], is_error=False
+        )
+        conn = UpstreamConnection(name="docs", config=cfg, session=old_session, tools=[])
+        mgr._connections["docs"] = conn
+        publish = asyncio.Event()
+
+        async def reconnect(_name, _cfg=None):
+            await publish.wait()
+            conn.session = new_session
+            conn.reconnect_generation += 1
+
+        with patch.object(mgr, "_reconnect_server", side_effect=reconnect):
+            with pytest.raises(ConnectionError, match="broken session"):
+                await mgr.call_tool("docs", "read", {})
+
+            second = asyncio.create_task(mgr.call_tool("docs", "read", {}))
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert not second.done()
+            assert old_session.call_tool.await_count == 1
+            assert new_session.call_tool.await_count == 0
+
+            publish.set()
+            assert await second == "fresh"
+
+        assert new_session.call_tool.await_count == 1
+        await asyncio.gather(*list(mgr._background_tasks), return_exceptions=True)
+
+    async def test_concurrent_terminal_failures_share_one_recovery_task(self):
+        cfg = UpstreamServerConfig(prefix="docs", max_retries=0, circuit_max_failures=0)
+        mgr = _make_manager(servers={"docs": cfg})
+        session = AsyncMock()
+        caller_count = 12
+        entered = 0
+        all_entered = asyncio.Event()
+        fail_calls = asyncio.Event()
+
+        async def failed_call(*_args, **_kwargs):
+            nonlocal entered
+            entered += 1
+            if entered == caller_count:
+                all_entered.set()
+            await fail_calls.wait()
+            raise ConnectionError("shared outage")
+
+        session.call_tool.side_effect = failed_call
+        conn = UpstreamConnection(name="docs", config=cfg, session=session, tools=[])
+        mgr._connections["docs"] = conn
+        recovery_entered = asyncio.Event()
+        release_recovery = asyncio.Event()
+
+        async def failed_reconnect(*_args, **_kwargs):
+            recovery_entered.set()
+            await release_recovery.wait()
+            raise ConnectionError("still unavailable")
+
+        with patch.object(mgr, "_reconnect_server", side_effect=failed_reconnect) as reconnect:
+            calls = [
+                asyncio.create_task(mgr.call_tool("docs", "read", {"caller": index}))
+                for index in range(caller_count)
+            ]
+            await all_entered.wait()
+            fail_calls.set()
+            results = await asyncio.gather(*calls, return_exceptions=True)
+            await recovery_entered.wait()
+
+            assert all(isinstance(result, ConnectionError) for result in results)
+            assert session.call_tool.await_count == caller_count
+            assert reconnect.await_count == 1
+            recovery = conn.recovery_task
+            assert recovery is not None
+
+            release_recovery.set()
+            assert await recovery is False
+            reconnect.assert_awaited_once_with("docs", cfg)
+
+
 class TestCleanupLogCredentialRedaction:
     """#605 (follow-up to #580/#593): the connection-lifecycle cleanup and
     reconnect DEBUG logs close or reopen transports opened with the
@@ -1681,35 +1862,45 @@ class TestCleanupLogCredentialRedaction:
         return session
 
     async def test_fetch_post_deadline_reconnect_redacts(self, caplog):
-        """_fetch_upstream best-effort reconnect after the overall deadline is
-        blown; a reconnect failure must not leak the credentialed URL."""
+        """A failed RPC generation is recovered after its overall deadline;
+        a reconnect failure must not leak the credentialed URL."""
         import pytest as _pt
 
-        cfg = self._cfg(overall_deadline_seconds=1.0, call_timeout_seconds=1.0)
+        cfg = self._cfg(
+            overall_deadline_seconds=0.05,
+            call_timeout_seconds=0.05,
+            reconnect_delay_seconds=0.1,
+        )
         mgr = _make_manager(servers={"bad": cfg})
-        self._seed_fetch_conn(mgr, cfg)
+        session = self._seed_fetch_conn(mgr, cfg)
+        session.call_tool.side_effect = ConnectionError("transport reset")
+        mgr._connections["bad"].tools = [
+            SimpleNamespace(
+                name="t",
+                annotations=SimpleNamespace(read_only_hint=True, destructive_hint=False),
+            )
+        ]
 
         with caplog.at_level("DEBUG"):
-            with (
-                # _call_started_at, then the in-loop deadline check reads a
-                # monotonic far in the future → remaining_deadline <= 0.
-                patch(
-                    "memtomem_stm.proxy.manager._time.monotonic",
-                    side_effect=[100.0, 200.0, 200.0, 200.0],
-                ),
-                patch.object(
-                    mgr,
-                    "_reconnect_server",
-                    new_callable=AsyncMock,
-                    side_effect=ConnectionError(f"reconnect boom for {self.URL}"),
-                ),
+            with patch.object(
+                mgr,
+                "_reconnect_server",
+                new_callable=AsyncMock,
+                side_effect=ConnectionError(f"reconnect boom for {self.URL}"),
             ):
                 with _pt.raises(asyncio.TimeoutError):
                     await mgr._fetch_upstream(
-                        "bad", "t", {"_trace_id": None}, trace_id=None, cfg_snap=mgr._config
+                        "bad",
+                        "t",
+                        {"_trace_id": None},
+                        trace_id=None,
+                        cfg_snap=mgr._config,
                     )
+                await asyncio.gather(*mgr._background_tasks)
 
-        self._assert_redacted(caplog, "Post-deadline reconnect failed for 'bad'")
+        self._assert_redacted(
+            caplog, "Background reconnect after overall deadline failed for 'bad'"
+        )
 
     async def test_fetch_post_protocol_error_reconnect_redacts(self, caplog):
         """_fetch_upstream reconnects after a no-retry protocol error; a
@@ -1738,8 +1929,9 @@ class TestCleanupLogCredentialRedaction:
                     await mgr._fetch_upstream(
                         "bad", "t", {"_trace_id": None}, trace_id=None, cfg_snap=mgr._config
                     )
+                await asyncio.gather(*mgr._background_tasks)
 
-        self._assert_redacted(caplog, "Post-protocol-error reconnect failed for 'bad'")
+        self._assert_redacted(caplog, "Background reconnect after protocol error failed for 'bad'")
 
     async def test_fetch_post_failure_reconnect_redacts(self, caplog):
         """_fetch_upstream reconnects after exhausting retries on a transport
@@ -1764,8 +1956,11 @@ class TestCleanupLogCredentialRedaction:
                     await mgr._fetch_upstream(
                         "bad", "t", {"_trace_id": None}, trace_id=None, cfg_snap=mgr._config
                     )
+                await asyncio.gather(*mgr._background_tasks)
 
-        self._assert_redacted(caplog, "Post-failure reconnect failed for 'bad'")
+        self._assert_redacted(
+            caplog, "Background reconnect after terminal call failure failed for 'bad'"
+        )
 
     async def test_fetch_mid_loop_reconnect_failure_redacts(self, caplog):
         """#622: the mid-loop reconnect on the retry-continue path (a retryable
@@ -1774,7 +1969,14 @@ class TestCleanupLogCredentialRedaction:
         #605 post-error reconnect sites, which this sweep originally missed."""
         import pytest as _pt
 
-        cfg = self._cfg(max_retries=1, reconnect_delay_seconds=0.0, max_reconnect_delay_seconds=0.0)
+        cfg = self._cfg(
+            max_retries=1,
+            reconnect_delay_seconds=0.0,
+            max_reconnect_delay_seconds=0.0,
+            # An explicit cache allowlist is affirmative evidence that this
+            # tool is safe to replay after an ambiguous transport failure.
+            cache=True,
+        )
         mgr = _make_manager(servers={"bad": cfg})
         session = self._seed_fetch_conn(mgr, cfg)
         # URL-free upstream error so the ONLY token-bearing string is the
@@ -1794,6 +1996,41 @@ class TestCleanupLogCredentialRedaction:
                     )
 
         self._assert_redacted(caplog, "Reconnect to 'bad' failed")
+
+    async def test_retry_warning_redacts_header_and_env_values(self, caplog):
+        import pytest as _pt
+
+        header_token = "header-secret-token"
+        env_token = "env-secret-token"
+        cfg = UpstreamServerConfig(
+            prefix="bad",
+            transport=TransportType.SSE,
+            url=self.URL,
+            headers={"Authorization": f"Bearer {header_token}"},
+            env={"UPSTREAM_TOKEN": env_token},
+            cache=True,
+            max_retries=1,
+            reconnect_delay_seconds=0.0,
+            max_reconnect_delay_seconds=0.0,
+        )
+        mgr = _make_manager(servers={"bad": cfg})
+        session = self._seed_fetch_conn(mgr, cfg)
+        session.call_tool = AsyncMock(
+            side_effect=ConnectionError(
+                f"failed for {self.URL}; auth=Bearer {header_token}; env={env_token}"
+            )
+        )
+
+        with caplog.at_level("WARNING"):
+            with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+                with _pt.raises(ConnectionError):
+                    await mgr._fetch_upstream("bad", "t", {}, trace_id=None, cfg_snap=mgr._config)
+                await asyncio.gather(*mgr._background_tasks)
+
+        assert "Tool call bad/t failed" in caplog.text
+        for secret in ("s3cr3t-token", header_token, env_token):
+            assert secret not in caplog.text
+        assert "***@ltm.example.com" in caplog.text
 
 
 # ── _open_transport ──────────────────────────────────────────────────────
@@ -1918,6 +2155,44 @@ class TestBackgroundTaskBounds:
         finally:
             gate.set()
             await asyncio.gather(*mgr._background_tasks, return_exceptions=True)
+
+    async def test_reconnect_bypasses_saturated_enrichment_cap(self, tmp_path):
+        from memtomem_stm.proxy.manager import MAX_BACKGROUND_TASKS
+
+        cfg = UpstreamServerConfig(prefix="s")
+        mgr = _make_manager(servers={"s": cfg}, tmp_path=tmp_path)
+        mgr._connections["s"] = UpstreamConnection(
+            name="s", config=cfg, session=AsyncMock(), tools=[]
+        )
+        gate = asyncio.Event()
+        recovery_entered = asyncio.Event()
+        recovery_gate = asyncio.Event()
+        try:
+            self._fill_to_cap(mgr, gate)
+            assert len(mgr._background_tasks) == MAX_BACKGROUND_TASKS
+
+            async def reconnect_server(name, reconnect_cfg):
+                recovery_entered.set()
+                await recovery_gate.wait()
+                raise ConnectionError("still down")
+
+            with patch.object(mgr, "_reconnect_server", side_effect=reconnect_server) as reconnect:
+                recovery = mgr._schedule_reconnect_for_next_call("s", cfg, "terminal failure")
+                assert recovery is not None
+                assert len(mgr._background_tasks) == MAX_BACKGROUND_TASKS + 1
+                duplicates = [
+                    mgr._schedule_reconnect_for_next_call("s", cfg, "terminal failure")
+                    for _ in range(100)
+                ]
+                assert all(task is recovery for task in duplicates)
+                assert len(mgr._background_tasks) == MAX_BACKGROUND_TASKS + 1
+                await recovery_entered.wait()
+                recovery_gate.set()
+                assert await recovery is False
+                reconnect.assert_awaited_once_with("s", cfg)
+        finally:
+            gate.set()
+            await asyncio.gather(*list(mgr._background_tasks), return_exceptions=True)
 
     async def test_shed_warning_re_arms_after_pressure_clears(self, tmp_path, caplog):
         # A one-shot latch would report the first burst and stay silent for

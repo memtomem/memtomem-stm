@@ -123,6 +123,15 @@ def _get_session(mgr: ProxyManager) -> AsyncMock:
     return mgr._connections["srv"].session
 
 
+def _advancing_reconnect(mgr: ProxyManager):
+    """Mock a successful reconnect publication for recovery-gate tests."""
+
+    async def reconnect(name: str, _cfg=None) -> None:
+        mgr._connections[name].reconnect_generation += 1
+
+    return reconnect
+
+
 # ── Transport failure: retry + reconnect ─────────────────────────────────
 
 
@@ -150,7 +159,7 @@ class TestTransportFailureRetry:
         mock_reconnect.assert_awaited_once_with("srv", ANY)
 
     async def test_retries_exhaust_then_raises(self):
-        mgr = _make_manager(max_retries=2)
+        mgr = _make_manager(max_retries=2, tools=_read_only_tools())
         session = _get_session(mgr)
         session.call_tool.side_effect = ConnectionError("down")
 
@@ -162,7 +171,7 @@ class TestTransportFailureRetry:
         assert session.call_tool.call_count == 3
 
     async def test_reconnect_called_on_each_retry(self):
-        mgr = _make_manager(max_retries=2)
+        mgr = _make_manager(max_retries=2, tools=_read_only_tools())
         session = _get_session(mgr)
         session.call_tool.side_effect = [
             OSError("fail1"),
@@ -178,7 +187,7 @@ class TestTransportFailureRetry:
         assert mock_reconnect.await_count == 2
 
     async def test_tracker_records_reconnects(self):
-        mgr = _make_manager(max_retries=3)
+        mgr = _make_manager(max_retries=3, tools=_read_only_tools())
         session = _get_session(mgr)
         session.call_tool.side_effect = [
             ConnectionError("fail1"),
@@ -193,7 +202,12 @@ class TestTransportFailureRetry:
         assert summary["reconnects"] == 2
 
     async def test_exponential_backoff_delay(self):
-        mgr = _make_manager(max_retries=3, reconnect_delay=1.0, max_reconnect_delay=10.0)
+        mgr = _make_manager(
+            max_retries=3,
+            reconnect_delay=1.0,
+            max_reconnect_delay=10.0,
+            tools=_read_only_tools(),
+        )
         session = _get_session(mgr)
         session.call_tool.side_effect = [
             OSError("1"),
@@ -217,7 +231,12 @@ class TestTransportFailureRetry:
         assert sleep_delays == [1.0, 2.0, 4.0]
 
     async def test_backoff_capped_at_max(self):
-        mgr = _make_manager(max_retries=3, reconnect_delay=5.0, max_reconnect_delay=8.0)
+        mgr = _make_manager(
+            max_retries=3,
+            reconnect_delay=5.0,
+            max_reconnect_delay=8.0,
+            tools=_read_only_tools(),
+        )
         session = _get_session(mgr)
         session.call_tool.side_effect = [
             OSError("1"),
@@ -242,7 +261,7 @@ class TestTransportFailureRetry:
 
     async def test_post_exhaustion_reconnect_attempted(self):
         """After all retries fail, a final reconnect is attempted before raising."""
-        mgr = _make_manager(max_retries=1)
+        mgr = _make_manager(max_retries=1, tools=_read_only_tools())
         session = _get_session(mgr)
         session.call_tool.side_effect = OSError("persistent")
 
@@ -254,6 +273,7 @@ class TestTransportFailureRetry:
         with patch.object(mgr, "_reconnect_server", side_effect=track_reconnect):
             with pytest.raises(OSError):
                 await mgr.call_tool("srv", "tool", {})
+            await asyncio.gather(*mgr._background_tasks)
 
         # 1 reconnect during retry + 1 post-exhaustion reconnect
         assert len(reconnect_calls) == 2
@@ -281,6 +301,7 @@ class TestProtocolError:
         with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock) as mock_reconnect:
             with pytest.raises(Exception, match="protocol error"):
                 await mgr.call_tool("srv", "tool", {})
+            await asyncio.gather(*mgr._background_tasks)
 
         # Only 1 attempt — no retries
         assert session.call_tool.call_count == 1
@@ -301,6 +322,7 @@ class TestProtocolError:
         ):
             with pytest.raises(Exception, match="bad params"):
                 await mgr.call_tool("srv", "tool", {})
+            await asyncio.gather(*mgr._background_tasks)
 
 
 # ── Non-retryable errors: immediate propagation ─────────────────────────
@@ -339,7 +361,7 @@ class TestReconnectFailure:
     """When _reconnect_server itself fails during retry loop."""
 
     async def test_reconnect_failure_during_retry_raises(self):
-        mgr = _make_manager(max_retries=2)
+        mgr = _make_manager(max_retries=2, tools=_read_only_tools())
         session = _get_session(mgr)
         session.call_tool.side_effect = ConnectionError("transport down")
 
@@ -357,7 +379,7 @@ class TestReconnectFailure:
 
     async def test_reconnect_succeeds_then_fails(self):
         """First reconnect works, second fails."""
-        mgr = _make_manager(max_retries=3)
+        mgr = _make_manager(max_retries=3, tools=_read_only_tools())
         session = _get_session(mgr)
         session.call_tool.side_effect = ConnectionError("fail")
 
@@ -492,6 +514,7 @@ class TestZeroRetries:
         with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock) as mock_reconnect:
             with pytest.raises(ConnectionError):
                 await mgr.call_tool("srv", "tool", {})
+            await asyncio.gather(*mgr._background_tasks)
 
         assert session.call_tool.call_count == 1
         # Post-failure reconnect still attempted
@@ -934,7 +957,9 @@ class TestCacheWithErrors:
                 return f"{srv}|{tl}|{a}|{kw.get('context_query')}|{kw.get('config_fingerprint')}"
 
             cache = MagicMock()
-            cache.get.side_effect = lambda srv, tl, a, **kw: cache_store.get(_fake_key(srv, tl, a, kw))
+            cache.get.side_effect = lambda srv, tl, a, **kw: cache_store.get(
+                _fake_key(srv, tl, a, kw)
+            )
 
             writes = 0
 
@@ -1078,6 +1103,7 @@ class TestCallTimeout:
         with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock) as mock_reconnect:
             with pytest.raises(asyncio.TimeoutError):
                 await mgr.call_tool("srv", "tool", {})
+            await asyncio.gather(*mgr._background_tasks)
 
         # Terminal retry path still reconnects before re-raising so the next
         # call (if any) starts on a fresh session.
@@ -1154,6 +1180,29 @@ class TestCallTimeout:
             "overall_deadline did not cap the retry loop: "
             f"saw {session.call_tool.call_count} attempts"
         )
+
+    async def test_overall_deadline_includes_backoff_sleep(self):
+        mgr = _make_manager(
+            max_retries=3,
+            reconnect_delay=0.2,
+            max_reconnect_delay=0.2,
+            call_timeout=0.05,
+            overall_deadline=0.05,
+            tools=_read_only_tools(),
+        )
+        session = _get_session(mgr)
+        session.call_tool.side_effect = ConnectionError("ambiguous reset")
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            with pytest.raises(asyncio.TimeoutError, match="overall_deadline"):
+                await mgr.call_tool("srv", "tool", {})
+            await asyncio.gather(*mgr._background_tasks)
+
+        assert loop.time() - started < 0.15
+        assert session.call_tool.call_count == 1
+        assert mgr._connections["srv"].unavailable_generation == 0
 
     async def test_per_attempt_shrinks_to_remaining_deadline(self):
         """Once prior attempts have consumed most of the deadline, the next
@@ -1236,6 +1285,7 @@ class TestTimeoutReplayGuard:
         with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock) as mock_reconnect:
             with pytest.raises(asyncio.TimeoutError):
                 await mgr.call_tool("srv", "tool", {})
+            await asyncio.gather(*mgr._background_tasks)
 
         assert session.call_tool.call_count == 1, "writer tool must not be re-invoked on timeout"
         mock_reconnect.assert_awaited_once_with("srv", ANY)
@@ -1259,6 +1309,7 @@ class TestTimeoutReplayGuard:
         with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock) as mock_reconnect:
             with pytest.raises(asyncio.TimeoutError):
                 await mgr.call_tool("srv", "tool", {})
+            await asyncio.gather(*mgr._background_tasks)
 
         assert session.call_tool.call_count == 1
         mock_reconnect.assert_awaited_once_with("srv", ANY)
@@ -1290,9 +1341,9 @@ class TestTimeoutReplayGuard:
         assert result == "ok"
         assert attempts == 2
 
-    async def test_writer_connection_refused_is_retried(self):
-        """A non-timeout connection failure (refused) provably never executed,
-        so it stays retryable even for a writer tool."""
+    async def test_writer_connection_refused_is_not_retried(self):
+        """Even a refused-looking failure occurs after dispatch entered the
+        session boundary, so a writer is never replayed on that inference."""
         mgr = _make_manager(
             max_retries=3,
             tools=[_tool("tool", _ann(read_only=False))],
@@ -1301,15 +1352,15 @@ class TestTimeoutReplayGuard:
         session.call_tool.side_effect = [ConnectionRefusedError("refused"), _make_result("ok")]
 
         with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock) as mock_reconnect:
-            result = await mgr.call_tool("srv", "tool", {})
+            with pytest.raises(ConnectionRefusedError, match="refused"):
+                await mgr.call_tool("srv", "tool", {})
+            await asyncio.gather(*mgr._background_tasks)
 
-        assert result == "ok"
-        assert session.call_tool.call_count == 2
+        assert session.call_tool.call_count == 1
         mock_reconnect.assert_awaited_once_with("srv", ANY)
 
-    async def test_ignore_policy_keeps_replay(self):
-        """``tool_annotation_policy=ignore`` opts out of annotation trust, so a
-        writer timeout retries as it did pre-#578."""
+    async def test_ignore_policy_does_not_authorize_replay(self):
+        """Ignoring annotations is not affirmative evidence of idempotency."""
         mgr = _make_manager(
             max_retries=1,
             call_timeout=0.05,
@@ -1331,10 +1382,10 @@ class TestTimeoutReplayGuard:
         session.call_tool.side_effect = hang_once_then_ok
 
         with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
-            result = await mgr.call_tool("srv", "tool", {})
+            with pytest.raises(asyncio.TimeoutError):
+                await mgr.call_tool("srv", "tool", {})
 
-        assert result == "ok"
-        assert attempts == 2
+        assert attempts == 1
 
     async def test_per_tool_cache_true_override_keeps_replay(self):
         """An explicit per-tool ``cache: true`` is the operator's 'effectively
@@ -1596,7 +1647,7 @@ class TestUpstreamCircuitBreaker:
         session = _get_session(mgr)
         session.call_tool.side_effect = ConnectionError("down")
 
-        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+        with patch.object(mgr, "_reconnect_server", side_effect=_advancing_reconnect(mgr)):
             for _ in range(2):
                 with pytest.raises(ConnectionError):
                     await mgr.call_tool("srv", "tool", {})
@@ -1619,7 +1670,7 @@ class TestUpstreamCircuitBreaker:
         session = _get_session(mgr)
         session.call_tool.side_effect = ConnectionError("down")
 
-        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+        with patch.object(mgr, "_reconnect_server", side_effect=_advancing_reconnect(mgr)):
             for _ in range(2):
                 with pytest.raises(ConnectionError):
                     await mgr.call_tool("srv", "tool", {})
@@ -1640,7 +1691,7 @@ class TestUpstreamCircuitBreaker:
         session = _get_session(mgr)
         session.call_tool.side_effect = ConnectionError("down")
 
-        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+        with patch.object(mgr, "_reconnect_server", side_effect=_advancing_reconnect(mgr)):
             with pytest.raises(ConnectionError):
                 await mgr.call_tool("srv", "tool", {})
 
@@ -1654,7 +1705,7 @@ class TestUpstreamCircuitBreaker:
         session = _get_session(mgr)
         session.call_tool.side_effect = [ConnectionError("down"), _make_result("ok")]
 
-        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+        with patch.object(mgr, "_reconnect_server", side_effect=_advancing_reconnect(mgr)):
             with pytest.raises(ConnectionError):
                 await mgr.call_tool("srv", "tool", {})
             breaker = mgr._connections["srv"].breaker
@@ -1677,7 +1728,7 @@ class TestUpstreamCircuitBreaker:
             _make_result("tool blew up", is_error=True),
         ]
 
-        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+        with patch.object(mgr, "_reconnect_server", side_effect=_advancing_reconnect(mgr)):
             with pytest.raises(ConnectionError):
                 await mgr.call_tool("srv", "tool", {})
             result = await mgr.call_tool("srv", "tool", {})
@@ -1719,7 +1770,7 @@ class TestUpstreamCircuitBreaker:
         protocol_exc = Exception("bad params")
         protocol_exc.error = SimpleNamespace(code=-32602)
 
-        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+        with patch.object(mgr, "_reconnect_server", side_effect=_advancing_reconnect(mgr)):
             # Two transport failures build the streak...
             session.call_tool.side_effect = ConnectionError("down")
             for _ in range(2):
@@ -1768,7 +1819,7 @@ class TestUpstreamCircuitBreaker:
         session.call_tool.side_effect = [ConnectionError("down"), _make_result("ok")]
         breaker = mgr._connections["srv"].breaker
 
-        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+        with patch.object(mgr, "_reconnect_server", side_effect=_advancing_reconnect(mgr)):
             with pytest.raises(ConnectionError):
                 await mgr.call_tool("srv", "tool", {})
             assert breaker.state == "open"
@@ -1787,7 +1838,7 @@ class TestUpstreamCircuitBreaker:
         session.call_tool.side_effect = ConnectionError("still down")
         breaker = mgr._connections["srv"].breaker
 
-        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+        with patch.object(mgr, "_reconnect_server", side_effect=_advancing_reconnect(mgr)):
             with pytest.raises(ConnectionError):
                 await mgr.call_tool("srv", "tool", {})
             first_opened_at = breaker.opened_at
@@ -1828,7 +1879,7 @@ class TestUpstreamCircuitBreaker:
         session.call_tool.side_effect = ConnectionError("down")
 
         assert mgr._connections["srv"].breaker is None
-        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+        with patch.object(mgr, "_reconnect_server", side_effect=_advancing_reconnect(mgr)):
             for _ in range(5):
                 with pytest.raises(ConnectionError):
                     await mgr.call_tool("srv", "tool", {})
@@ -1872,3 +1923,60 @@ class TestUpstreamCircuitBreaker:
         result = await mgr.call_tool("srv", "tool", {})
         assert result == "cached result"
         session.call_tool.assert_not_called()
+
+
+async def test_timeout_does_not_gate_other_tools_behind_recovery():
+    """A per-attempt timeout is not evidence the session is broken.
+
+    A slow-but-healthy tool exceeding ``call_timeout_seconds`` must not mark the
+    whole generation unavailable — that would send every OTHER tool on the
+    server through ``await_required_recovery`` and hard-fail it with "was not
+    dispatched" whenever the respawn is slow. A transport failure still does.
+    """
+    mgr = _make_manager(max_retries=0, call_timeout=0.02, overall_deadline=1.0)
+    session = _get_session(mgr)
+
+    async def always_hang(*_a, **_kw):
+        await asyncio.sleep(10)
+
+    session.call_tool.side_effect = always_hang
+
+    with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+        with pytest.raises(asyncio.TimeoutError):
+            await mgr.call_tool("srv", "tool", {})
+        await asyncio.gather(*mgr._background_tasks)
+
+    assert mgr._connections["srv"].unavailable_generation is None
+
+    session.call_tool.side_effect = ConnectionError("reset")
+    with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+        with pytest.raises(ConnectionError):
+            await mgr.call_tool("srv", "tool", {})
+        await asyncio.gather(*mgr._background_tasks)
+
+    assert mgr._connections["srv"].unavailable_generation is not None
+
+
+def test_safe_upstream_error_scrubs_every_generation_in_one_pass():
+    """Per-config ``sanitize_secrets`` passes corrupt each other.
+
+    A short secret from a retired generation would rewrite the ``<REDACTED>``
+    placeholder a previous config's pass just inserted, mangling the message
+    (``<R<REDACTED>ACTED>``) — the exact hazard the sanitizer documents.
+    """
+    from memtomem_stm.proxy.manager import _RetiredConnectionResources
+
+    mgr = _make_manager()
+    conn = mgr._connections["srv"]
+    conn.config = conn.config.model_copy(update={"env": {"TOKEN": "LONGSECRETVALUE"}})
+    conn.retired_resources[0] = _RetiredConnectionResources(
+        owner=None,
+        stack=None,
+        config=conn.config.model_copy(update={"env": {"OLD": "RED"}}),
+    )
+
+    text = mgr.safe_upstream_error("srv", RuntimeError("auth LONGSECRETVALUE failed"))
+
+    # A second pass for the retired ``RED`` value would rewrite the placeholder
+    # into ``<<REDACTED>ACTED>``.
+    assert text == "RuntimeError: auth <REDACTED> failed"

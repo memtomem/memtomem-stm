@@ -166,10 +166,13 @@ from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 from memtomem_stm.utils.json_out import escape_lone_surrogates, scrub_lone_surrogates
 from memtomem_stm.utils.keyed_locks import KeyedLocks
 from memtomem_stm.utils.mcp_transport import (
+    BoundedReadStream,
     SSE_READ_TIMEOUT_SECONDS,
+    is_inbound_message_too_large_error,
     streamable_http_transport,
 )
-from memtomem_stm.utils.redact import redact_exception_text
+from memtomem_stm.utils.json_size import json_utf8_size_async
+from memtomem_stm.utils.redact import redact_exception_text, sanitize_secrets
 
 # JSON-RPC error codes that indicate bad input, not connection problems.
 # Retrying these wastes time and can damage the connection.
@@ -338,6 +341,7 @@ def compression_fingerprint(
     tc: ToolConfig,
     min_result_retention: float,
     max_upstream_chars: int,
+    max_upstream_bytes: int,
     relevance_scorer: RelevanceScorerConfig,
 ) -> str:
     """SHA-256 fingerprint of the settings that shape the cached response body.
@@ -356,6 +360,8 @@ def compression_fingerprint(
       ``original_text`` BEFORE cleaning/compression (``_shape_response``); an
       oversized response is cut to this budget, and that cut text is what gets
       compressed and cached, so lowering the limit must rotate the key.
+    - ``max_upstream_bytes`` — the whole MCP envelope rejection limit. A row
+      cached under a wider limit must not bypass a newly tightened limit.
     - ``relevance_scorer`` — the query-aware compressors (TRUNCATE,
       SCHEMA_PRUNING, SKELETON) allocate budget with this scorer, so switching
       bm25↔embedding or changing the embedding model changes the cached bytes
@@ -389,6 +395,7 @@ def compression_fingerprint(
         ),
         "min_result_retention": min_result_retention,
         "max_upstream_chars": max_upstream_chars,
+        "max_upstream_bytes": max_upstream_bytes,
         "relevance_scorer": relevance_scorer.model_dump(mode="json"),
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -424,6 +431,13 @@ class _UpstreamConnectionOwner:
 
 
 @dataclass
+class _RetiredConnectionResources:
+    owner: _UpstreamConnectionOwner | None
+    stack: AsyncExitStack | None
+    config: UpstreamServerConfig
+
+
+@dataclass
 class UpstreamConnection:
     name: str
     config: UpstreamServerConfig
@@ -443,6 +457,20 @@ class UpstreamConnection:
     # collapsing a reconnect storm into one transport spawn.
     reconnect_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     reconnect_generation: int = 0
+    # A tool call leases the generation it dispatched on. Reconnect publishes
+    # a replacement immediately but cannot close a retired transport until
+    # every call that captured its session has returned.
+    active_calls: dict[int, int] = field(default_factory=dict)
+    retired_resources: dict[int, _RetiredConnectionResources] = field(default_factory=dict)
+    retiring_generations: set[int] = field(default_factory=set)
+    # A timeout/transport failure makes only the generation that carried that
+    # RPC unavailable. One shared recovery task per server reconnects it;
+    # subsequent calls await that task instead of dispatching onto the known-
+    # broken session. A successful reconnect advances ``reconnect_generation``,
+    # which makes this marker stale and safe to clear.
+    unavailable_generation: int | None = None
+    recovery_generation: int | None = None
+    recovery_task: asyncio.Task[bool] | None = None
     # Per-upstream circuit breaker (#608). Lives on the connection because
     # ``_reconnect_server`` mutates the connection in place (never replaces
     # it), so breaker state survives reconnects. ``None`` when the upstream's
@@ -535,6 +563,17 @@ def _mark_recorded(exc: BaseException) -> None:
     try:
         exc._stm_metrics_recorded = True  # type: ignore[attr-defined]
     except (AttributeError, TypeError):
+        pass
+
+
+def _mark_safe_upstream_error(exc: BaseException, message: str) -> None:
+    """Pin credential-safe client text to the exact failing config generation."""
+    try:
+        exc._stm_safe_upstream_error = message  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        # Most Python exceptions carry ``__dict__``. The fallback for unusual
+        # slotted exceptions is ``safe_upstream_error`` scanning the active,
+        # live, and still-retired configurations.
         pass
 
 
@@ -802,7 +841,7 @@ class ProxyManager:
                         logger.debug(
                             "Failed to close connection stack for '%s' in double-start guard: %s",
                             conn.name,
-                            self._redacted_error(cleanup_exc, conn.config.url),
+                            self._safe_error_for_config(cleanup_exc, conn.config),
                         )
             try:
                 await self._stack.aclose()
@@ -971,7 +1010,7 @@ class ProxyManager:
                 # path would leak the token — via ``stm_proxy_health`` to the MCP
                 # client/model, or via the log. Do NOT use ``logger.exception``:
                 # its traceback tail repeats the raw, unredacted exception string.
-                redacted = self._redacted_error(exc, cfg.url)
+                redacted = self._safe_error_for_config(exc, cfg)
                 logger.error("Failed to connect to upstream server '%s': %s", name, redacted)
                 # Record the failure so ``get_upstream_health`` can report the
                 # configured-but-dead server — otherwise it is absent from
@@ -1942,15 +1981,52 @@ class ProxyManager:
                 )
 
     @staticmethod
-    def _redacted_error(exc: BaseException, url: str) -> str:
-        """Exception text with *url* userinfo scrubbed, capped for storage/logs
-        (#580). One choke point for every credential-safe rendering of a
-        connect/cleanup exception: httpx transport errors embed the credentialed
-        request URL, so any log or health field built from them must go through
-        here. Redacts the FULL message BEFORE the cap so a long credential can't
-        be truncated past ``redact_exception_text``'s reach.
+    def _safe_error_for_config(exc: BaseException, cfg: UpstreamServerConfig) -> str:
+        """Render an upstream exception without configured credentials.
+
+        Network exceptions can echo URL userinfo while SDK validation and
+        subprocess errors can echo HTTP header or environment values. Scrub
+        the complete string before applying the persistence/log cap so a long
+        token cannot survive as a truncated prefix.
         """
-        return redact_exception_text(f"{type(exc).__name__}: {exc}", url)[:MAX_ERROR_MESSAGE_CHARS]
+        text = redact_exception_text(f"{type(exc).__name__}: {exc}", cfg.url)
+        text = sanitize_secrets(
+            text,
+            [*(cfg.headers or {}).values(), *(cfg.env or {}).values()],
+        )
+        return text[:MAX_ERROR_MESSAGE_CHARS]
+
+    def safe_upstream_error(self, server: str, exc: BaseException) -> str:
+        """Credential-safe error text for the client-facing MCP boundary."""
+        configs: list[UpstreamServerConfig] = []
+        conn = self._connections.get(server)
+        if conn is not None:
+            configs.append(conn.config)
+            # A call can fail after a hot reconnect published new credentials
+            # but while it still leases the retired generation. Retain every
+            # old generation's scrub inputs until its owner is drained.
+            configs.extend(resources.config for resources in conn.retired_resources.values())
+        try:
+            live = self._config.upstream_servers.get(server)
+        except Exception:
+            live = None
+        if live is not None and all(live is not cfg for cfg in configs):
+            configs.append(live)
+
+        pinned = getattr(exc, "_stm_safe_upstream_error", None)
+        text = pinned if isinstance(pinned, str) else f"{type(exc).__name__}: {exc}"
+        # ``sanitize_secrets`` must see every secret in ONE pass: it documents
+        # that a second pass can rewrite a placeholder the first just inserted
+        # (a short secret like ``RED`` corrupting ``<REDACTED>``). Redaction of
+        # each generation's url is idempotent and stays in the loop; the secret
+        # values are collected and scrubbed once.
+        secret_values: list[str] = []
+        for cfg in configs:
+            text = redact_exception_text(text, cfg.url)
+            secret_values.extend((cfg.headers or {}).values())
+            secret_values.extend((cfg.env or {}).values())
+        text = sanitize_secrets(text, secret_values)
+        return text[:MAX_ERROR_MESSAGE_CHARS]
 
     async def _run_connection_owner(
         self,
@@ -1973,7 +2049,9 @@ class ProxyManager:
                 streams = await stack.enter_async_context(self._open_transport(cfg))
                 session = await stack.enter_async_context(
                     ClientSession(
-                        streams[0], streams[1], message_handler=self._make_message_handler(name)
+                        BoundedReadStream(streams[0], self._live_max_upstream_bytes),
+                        streams[1],
+                        message_handler=self._make_message_handler(name),
                     )
                 )
                 await session.initialize()
@@ -2031,7 +2109,7 @@ class ProxyManager:
                 logger.debug(
                     "Error during connection cleanup for '%s': %s",
                     name,
-                    self._redacted_error(owner.cleanup_error, cfg.url),
+                    self._safe_error_for_config(owner.cleanup_error, cfg),
                 )
             raise
         except BaseException:
@@ -2043,7 +2121,7 @@ class ProxyManager:
                 logger.debug(
                     "Error during connection cleanup for '%s': %s",
                     name,
-                    self._redacted_error(owner.cleanup_error, cfg.url),
+                    self._safe_error_for_config(owner.cleanup_error, cfg),
                 )
             raise
         return session, owner, tools
@@ -2126,6 +2204,148 @@ class ProxyManager:
         self._failed_servers.pop(name, None)
         logger.info("Connected to '%s' (%s tools discovered)", name, len(tools))
 
+    @staticmethod
+    def _acquire_connection_session(conn: UpstreamConnection) -> tuple[ClientSession, int]:
+        """Lease the currently published session generation for one RPC."""
+        generation = conn.reconnect_generation
+        conn.active_calls[generation] = conn.active_calls.get(generation, 0) + 1
+        return conn.session, generation
+
+    def _release_connection_session(self, conn: UpstreamConnection, generation: int) -> None:
+        """Release an RPC lease and asynchronously drain retired resources."""
+        remaining = conn.active_calls.get(generation, 0) - 1
+        if remaining > 0:
+            conn.active_calls[generation] = remaining
+            return
+        conn.active_calls.pop(generation, None)
+        if (
+            generation not in conn.retired_resources
+            or generation in conn.retiring_generations
+            or self._background_closed
+        ):
+            return
+        conn.retiring_generations.add(generation)
+        task = asyncio.create_task(self._close_retired_generation(conn, generation))
+        self._background_tasks.add(task)
+        task.add_done_callback(
+            functools.partial(
+                self._on_background_task_done,
+                "connection_retire",
+                conn.name,
+                "*",
+            )
+        )
+
+    async def _close_retired_generation(self, conn: UpstreamConnection, generation: int) -> None:
+        resources = conn.retired_resources.get(generation)
+        if resources is None:
+            conn.retiring_generations.discard(generation)
+            return
+        try:
+            await self._close_connection_resources(resources.owner, resources.stack)
+        except Exception as exc:
+            logger.debug(
+                "Failed to close retired generation %d for '%s': %s",
+                generation,
+                conn.name,
+                self._safe_error_for_config(exc, resources.config),
+            )
+        else:
+            conn.retired_resources.pop(generation, None)
+        finally:
+            conn.retiring_generations.discard(generation)
+
+    async def _reconnect_for_next_call(
+        self,
+        server: str,
+        cfg: UpstreamServerConfig,
+        reason: str,
+        failed_generation: int,
+    ) -> bool:
+        """Reconnect one failed generation, coalesced outside the caller deadline."""
+        conn = self._connections.get(server)
+        if conn is None or conn.reconnect_generation != failed_generation:
+            return True
+        try:
+            await self._reconnect_server(server, cfg)
+        except Exception as exc:
+            logger.debug(
+                "Background reconnect after %s failed for '%s': %s",
+                reason,
+                server,
+                self._safe_error_for_config(exc, cfg),
+            )
+            return False
+        return conn.reconnect_generation != failed_generation
+
+    @staticmethod
+    def _mark_generation_unavailable(conn: UpstreamConnection, generation: int) -> None:
+        """Block new dispatches only if the failed generation is still current."""
+        if conn.reconnect_generation == generation:
+            conn.unavailable_generation = generation
+
+    @staticmethod
+    def _on_recovery_task_done(
+        conn: UpstreamConnection,
+        generation: int,
+        task: asyncio.Task[bool],
+    ) -> None:
+        if conn.recovery_task is not task:
+            return
+        conn.recovery_task = None
+        conn.recovery_generation = None
+        if task.cancelled():
+            return
+        try:
+            recovered = task.result()
+        except Exception:
+            # Expected reconnect failures are contained and return False. Keep
+            # the unavailable marker on an unexpected escape too.
+            return
+        if (
+            recovered
+            and conn.unavailable_generation == generation
+            and conn.reconnect_generation != generation
+        ):
+            conn.unavailable_generation = None
+
+    def _schedule_reconnect_for_next_call(
+        self,
+        server: str,
+        cfg: UpstreamServerConfig,
+        reason: str,
+        *,
+        failed_generation: int | None = None,
+    ) -> asyncio.Task[bool] | None:
+        # Recovery is required connection maintenance, not shed-able response
+        # enrichment. It shares stop() tracking with background work but
+        # bypasses the enrichment cap. Coalescing here is equally important:
+        # failed reconnects do not advance the generation, so reconnect_lock
+        # alone would serialize an unbounded queue of duplicate respawns.
+        conn = self._connections.get(server)
+        if conn is None:
+            return None
+        generation = conn.reconnect_generation if failed_generation is None else failed_generation
+        if conn.reconnect_generation != generation:
+            if conn.unavailable_generation == generation:
+                conn.unavailable_generation = None
+            return None
+        existing = conn.recovery_task
+        if existing is not None and not existing.done():
+            return existing
+        task = self._spawn_required_background(
+            self._reconnect_for_next_call(server, cfg, reason, generation),
+            stage="upstream_reconnect",
+            server=server,
+            tool="*",
+        )
+        if task is None:
+            return None
+        conn.recovery_generation = generation
+        conn.recovery_task = task
+        task.add_done_callback(functools.partial(self._on_recovery_task_done, conn, generation))
+        return task
+
     async def _reconnect_server(self, name: str, cfg: UpstreamServerConfig | None = None) -> None:
         conn = self._connections[name]
 
@@ -2169,10 +2389,11 @@ class ProxyManager:
 
             old_owner = conn.owner
             old_stack = conn.stack
+            old_generation = conn.reconnect_generation
             # The old stack wraps a transport opened with the OLD credentialed
             # url — capture it before the swap so the cleanup log redacts the
             # right token.
-            old_url = conn.config.url
+            old_cfg = conn.config
             conn.session = session
             conn.owner = owner
             conn.stack = None
@@ -2204,16 +2425,23 @@ class ProxyManager:
             conn.reconnect_generation += 1
 
             if old_owner is not None or old_stack is not None:
-                try:
-                    await self._close_connection_resources(old_owner, old_stack)
-                except Exception as cleanup_exc:
-                    # Redact + no exc_info (#605): a close failure's traceback
-                    # tail could leak the token at DEBUG.
-                    logger.debug(
-                        "Failed to close previous stack for '%s': %s",
-                        name,
-                        self._redacted_error(cleanup_exc, old_url),
+                if conn.active_calls.get(old_generation, 0) > 0:
+                    conn.retired_resources[old_generation] = _RetiredConnectionResources(
+                        owner=old_owner,
+                        stack=old_stack,
+                        config=old_cfg,
                     )
+                else:
+                    try:
+                        await self._close_connection_resources(old_owner, old_stack)
+                    except Exception as cleanup_exc:
+                        # Redact + no exc_info (#605): a close failure's traceback
+                        # tail could leak the token at DEBUG.
+                        logger.debug(
+                            "Failed to close previous stack for '%s': %s",
+                            name,
+                            self._safe_error_for_config(cleanup_exc, old_cfg),
+                        )
             logger.info("Reconnected to '%s' (%s tools discovered)", name, len(conn.tools))
             # The reconnect replaced the catalogue this upstream advertises, so
             # the exposure verdict standing downstream was decided against tools
@@ -2420,6 +2648,37 @@ class ProxyManager:
         )
         return task
 
+    def _spawn_required_background(
+        self,
+        coro: Coroutine[Any, Any, Any],
+        *,
+        stage: str,
+        server: str,
+        tool: str,
+    ) -> asyncio.Task | None:
+        """Spawn non-shed-able maintenance while retaining bounded shutdown.
+
+        Connection recovery must remain schedulable when the enrichment pool
+        is saturated. Required tasks are still refused once stop() closes the
+        producer path and are tracked in the same set so shutdown cancels and
+        drains them with every other manager-owned task.
+        """
+        if self._background_closed:
+            coro.close()
+            logger.debug(
+                "Required background %s for %s/%s skipped: manager is stopping",
+                stage,
+                server,
+                tool,
+            )
+            return None
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(
+            functools.partial(self._on_background_task_done, stage, server, tool)
+        )
+        return task
+
     def _on_background_task_done(
         self,
         stage: str,
@@ -2577,6 +2836,20 @@ class ProxyManager:
                 logger.debug("Failed to close tool-graph consult cache", exc_info=True)
             self._toolgraph_cache = None
         for conn in self._connections.values():
+            for generation, resources in list(conn.retired_resources.items()):
+                if generation in conn.retiring_generations:
+                    continue
+                try:
+                    await self._close_connection_resources(resources.owner, resources.stack)
+                except Exception as cleanup_exc:
+                    logger.debug(
+                        "Failed to close retired generation %d for '%s' during stop: %s",
+                        generation,
+                        conn.name,
+                        self._safe_error_for_config(cleanup_exc, resources.config),
+                    )
+                else:
+                    conn.retired_resources.pop(generation, None)
             if conn.owner is not None or conn.stack is not None:
                 try:
                     await self._close_connection_resources(conn.owner, conn.stack)
@@ -2588,7 +2861,7 @@ class ProxyManager:
                     logger.debug(
                         "Failed to close connection stack for '%s': %s",
                         conn.name,
-                        self._redacted_error(cleanup_exc, conn.config.url),
+                        self._safe_error_for_config(cleanup_exc, conn.config),
                     )
         if self._stack:
             await self._stack.aclose()
@@ -2634,6 +2907,18 @@ class ProxyManager:
     @property
     def _config(self) -> ProxyConfig:
         return self._config_loader.get()
+
+    def _live_max_upstream_bytes(self) -> int:
+        """Current successfully loaded inbound limit for live stream wrappers.
+
+        Every public call pins ``self._config`` before reaching the upstream,
+        which advances ``current`` when a valid file reload lands. Reading the
+        already-loaded generation here avoids synchronous stat/parse work in
+        the dispatcher while allowing an existing stdio/SSE/HTTP connection to
+        honor both upward and downward changes immediately.
+        """
+        current = self._config_loader.current
+        return (current if current is not None else self._config).max_upstream_bytes
 
     @property
     def _relevance_scorer(self) -> "RelevanceScorer":
@@ -3357,6 +3642,7 @@ class ProxyManager:
             tc,
             cfg_snap.min_result_retention,
             cfg_snap.max_upstream_chars,
+            cfg_snap.max_upstream_bytes,
             cfg_snap.relevance_scorer,
         )
 
@@ -4715,7 +5001,10 @@ class ProxyManager:
                                 # get populated, so without this the row is
                                 # all-NULL across diagnostic text — same gap
                                 # the rest of #253 closes for upstream errors.
-                                error_message=format_error_message_from_exc(exc),
+                                error_message=self._safe_error_for_config(
+                                    exc,
+                                    self._server_cfg(self._connections[server], cfg_snap),
+                                ),
                             )
                         )
                     except Exception:
@@ -4724,6 +5013,15 @@ class ProxyManager:
                             pipeline_category.value,
                             exc_info=True,
                         )
+                # Pin the client-facing text against THIS call's config
+                # snapshot before a concurrent hot reload can retire and close
+                # the generation whose exception may contain its old URL,
+                # header, or environment credentials.
+                try:
+                    pinned_cfg = self._server_cfg(self._connections[server], cfg_snap)
+                    _mark_safe_upstream_error(exc, self._safe_error_for_config(exc, pinned_cfg))
+                except Exception:
+                    logger.debug("Failed to pin credential-safe upstream error")
                 self._log_execution(
                     selection_id,
                     server,
@@ -5069,7 +5367,7 @@ class ProxyManager:
                 "existing connection (won't retry until the config changes "
                 "again): %s",
                 conn.name,
-                self._redacted_error(exc, fresh_cfg.url),
+                self._safe_error_for_config(exc, fresh_cfg),
             )
         else:
             # A successful initialize + tools/list is a completed round-trip:
@@ -5105,14 +5403,158 @@ class ProxyManager:
         # (edits apply on the next call), pinned once per call — a reload
         # mid-request can't move the deadline under a running retry loop.
         cfg = self._server_cfg(conn, cfg_snap)
+        call_started_at = _time.monotonic()
+        last_failed_generation: int | None = None
+
+        def remaining_deadline() -> float:
+            return cfg.overall_deadline_seconds - (_time.monotonic() - call_started_at)
+
+        def deadline_failure(attempts: int) -> asyncio.TimeoutError:
+            exc = asyncio.TimeoutError(
+                f"{server}/{tool} exceeded overall_deadline_seconds "
+                f"({cfg.overall_deadline_seconds}s) after {attempts} attempt(s)"
+            )
+            self.tracker.record_error(
+                CallMetrics(
+                    server=server,
+                    tool=tool,
+                    original_chars=0,
+                    compressed_chars=0,
+                    is_error=True,
+                    error_category=ErrorCategory.TIMEOUT,
+                    error_message=format_error_message_from_exc(exc),
+                    trace_id=trace_id,
+                )
+            )
+            _mark_recorded(exc)
+            failed_generation = last_failed_generation
+            if failed_generation is None:
+                failed_generation = conn.unavailable_generation
+            if failed_generation is not None:
+                # A deadline spent trying a hot-edited replacement says
+                # nothing about the still-published generation. Only charge
+                # dependency health when an RPC/recovery has identified the
+                # generation that actually failed; otherwise a single hanging
+                # edit could open the old connection's breaker and defeat the
+                # damping fallback below.
+                if conn.breaker is not None:
+                    conn.breaker.record_failure()
+                self._mark_generation_unavailable(conn, failed_generation)
+                self._schedule_reconnect_for_next_call(
+                    server,
+                    cfg,
+                    "overall deadline",
+                    failed_generation=failed_generation,
+                )
+            return exc
+
+        async def await_before_deadline(
+            awaitable: Awaitable[Any],
+            attempts: int,
+            *,
+            on_deadline: Callable[[], None] | None = None,
+        ) -> Any:
+            remaining = remaining_deadline()
+            if remaining <= 0:
+                if inspect.iscoroutine(awaitable):
+                    awaitable.close()
+                if on_deadline is not None:
+                    on_deadline()
+                raise deadline_failure(attempts)
+            timeout = asyncio.timeout(remaining)
+            try:
+                async with timeout:
+                    return await awaitable
+            except asyncio.TimeoutError:
+                if timeout.expired():
+                    if on_deadline is not None:
+                        on_deadline()
+                    raise deadline_failure(attempts) from None
+                raise
+
         # Connection-affecting edits (url/headers/transport/command/args/env)
         # are applied here via live reconnect — BEFORE the breaker check, so a
         # config fix isn't fast-failed by the old config's failure streak. The
         # cache fast-path in ``_call_tool_guarded`` intentionally bypasses
         # this: a cache hit never touches the connection.
-        await self._maybe_reconnect_for_config_change(conn, cfg)
+        changed_connection_fp = _connection_fingerprint(cfg)
+        config_reconnect_pending = (
+            changed_connection_fp != _connection_fingerprint(conn.config)
+            and changed_connection_fp != conn.last_failed_connection_fp
+        )
+
+        def damp_timed_out_config_reconnect() -> None:
+            if not config_reconnect_pending:
+                return
+            conn.last_failed_connection_fp = changed_connection_fp
+            logger.warning(
+                "Live reconnect for changed config of '%s' reached the call deadline; "
+                "keeping the existing connection (won't retry until the config changes again)",
+                conn.name,
+            )
+
+        await await_before_deadline(
+            self._maybe_reconnect_for_config_change(conn, cfg),
+            0,
+            on_deadline=damp_timed_out_config_reconnect,
+        )
         delay = cfg.reconnect_delay_seconds
         breaker = conn.breaker
+
+        async def await_required_recovery() -> None:
+            """Keep a new RPC off a generation already known to be broken."""
+            failed_generation = conn.unavailable_generation
+            if failed_generation is None:
+                return
+            if conn.reconnect_generation != failed_generation:
+                conn.unavailable_generation = None
+                return
+            task = conn.recovery_task
+            if task is not None and conn.recovery_generation != failed_generation:
+                # A recovery for an older generation may still be finishing
+                # after a newer session was published and then failed. Keep
+                # the one-task-per-server invariant: drain that task first,
+                # then schedule the current generation below if it is still
+                # unavailable.
+                await await_before_deadline(asyncio.shield(task), 0)
+                if conn.reconnect_generation != failed_generation:
+                    conn.unavailable_generation = None
+                    return
+                task = None
+            if task is None or task.done():
+                task = self._schedule_reconnect_for_next_call(
+                    server,
+                    cfg,
+                    "required before next dispatch",
+                    failed_generation=failed_generation,
+                )
+            recovered = (
+                await await_before_deadline(asyncio.shield(task), 0) if task is not None else False
+            )
+            if recovered and conn.reconnect_generation != failed_generation:
+                conn.unavailable_generation = None
+                return
+
+            exc = ConnectionError(
+                f"Upstream '{server}' connection recovery failed; tool call was not dispatched"
+            )
+            self.tracker.record_error(
+                CallMetrics(
+                    server=server,
+                    tool=tool,
+                    original_chars=0,
+                    compressed_chars=0,
+                    is_error=True,
+                    error_category=ErrorCategory.TRANSPORT,
+                    error_message=str(exc)[:MAX_ERROR_MESSAGE_CHARS],
+                    trace_id=trace_id,
+                )
+            )
+            _mark_recorded(exc)
+            _mark_safe_upstream_error(exc, f"ConnectionError: {exc}")
+            if breaker is not None:
+                breaker.record_failure()
+            raise exc
 
         # Per-upstream circuit breaker fast-fail (#608). Checked here — after
         # the cache fast-path in ``_call_tool_guarded`` — so cached responses
@@ -5146,6 +5588,12 @@ class ProxyManager:
             _mark_recorded(tool_err)
             raise tool_err
 
+        # A terminal failure marks its exact session generation unavailable
+        # before it schedules recovery. Every subsequent caller that would
+        # actually dispatch shares and awaits that per-server task here; a
+        # breaker fast-fail above performs no dispatch and need not wait.
+        await await_required_recovery()
+
         # Overall-deadline policy: each attempt uses
         # ``min(call_timeout_seconds, remaining_deadline)`` as its effective
         # timeout. ``asyncio.wait_for`` cancels the inner ``call_tool`` on
@@ -5154,50 +5602,20 @@ class ProxyManager:
         # and its transport. That drops any orphaned ``request_id`` so a late
         # upstream response from the cancelled attempt cannot be delivered to
         # a subsequent caller.
-        _call_started_at = _time.monotonic()
-
         for attempt in range(cfg.max_retries + 1):
-            remaining_deadline = cfg.overall_deadline_seconds - (
-                _time.monotonic() - _call_started_at
-            )
-            if remaining_deadline <= 0:
-                deadline_exc = asyncio.TimeoutError(
-                    f"{server}/{tool} exceeded overall_deadline_seconds "
-                    f"({cfg.overall_deadline_seconds}s) after {attempt} attempt(s)"
-                )
-                self.tracker.record_error(
-                    CallMetrics(
-                        server=server,
-                        tool=tool,
-                        original_chars=0,
-                        compressed_chars=0,
-                        is_error=True,
-                        error_category=ErrorCategory.TIMEOUT,
-                        error_message=format_error_message_from_exc(deadline_exc),
-                        trace_id=trace_id,
-                    )
-                )
-                _mark_recorded(deadline_exc)
-                if breaker is not None:
-                    breaker.record_failure()
-                try:
-                    await self._reconnect_server(server, cfg)
-                except Exception as reconnect_exc:
-                    # Redact + no exc_info (#605): the reconnect reopens a transport
-                    # with the credentialed ``cfg.url``, so a failure's traceback
-                    # tail could leak the token at DEBUG.
-                    logger.debug(
-                        "Post-deadline reconnect failed for '%s': %s",
-                        server,
-                        self._redacted_error(reconnect_exc, cfg.url),
-                    )
-                raise deadline_exc
-            per_attempt_timeout = min(cfg.call_timeout_seconds, remaining_deadline)
+            remaining = remaining_deadline()
+            if remaining <= 0:
+                raise deadline_failure(attempt)
+            per_attempt_timeout = min(cfg.call_timeout_seconds, remaining)
             try:
-                result = await asyncio.wait_for(
-                    conn.session.call_tool(tool, upstream_args),
-                    timeout=per_attempt_timeout,
-                )
+                session, generation = self._acquire_connection_session(conn)
+                try:
+                    result = await asyncio.wait_for(
+                        session.call_tool(tool, upstream_args),
+                        timeout=per_attempt_timeout,
+                    )
+                finally:
+                    self._release_connection_session(conn, generation)
                 # Any completed round-trip proves the upstream is alive — an
                 # ``isError`` result (classified UPSTREAM_ERROR downstream) is
                 # a tool-level failure, not a dependency-health signal, so it
@@ -5207,6 +5625,27 @@ class ProxyManager:
                 return result
             except Exception as exc:
                 err_code = getattr(getattr(exc, "error", None), "code", None)
+                if is_inbound_message_too_large_error(exc):
+                    # BoundedReadStream preserved the response id through the
+                    # SDK dispatcher, so this is a completed but unusable
+                    # upstream response. Never replay it, even for an
+                    # idempotent tool: another attempt would download and parse
+                    # the same over-budget envelope again.
+                    self.tracker.record_error(
+                        CallMetrics(
+                            server=server,
+                            tool=tool,
+                            original_chars=0,
+                            compressed_chars=0,
+                            is_error=True,
+                            error_category=ErrorCategory.OVERSIZE,
+                            error_code=err_code,
+                            error_message=self._safe_error_for_config(exc, cfg),
+                            trace_id=trace_id,
+                        )
+                    )
+                    _mark_recorded(exc)
+                    raise
                 # Only retry transport/connection errors and MCP errors.
                 # Programming errors (TypeError, AttributeError, etc.)
                 # propagate immediately to avoid masking bugs.
@@ -5222,7 +5661,7 @@ class ProxyManager:
                             compressed_chars=0,
                             is_error=True,
                             error_category=ErrorCategory.PROGRAMMING,
-                            error_message=format_error_message_from_exc(exc),
+                            error_message=self._safe_error_for_config(exc, cfg),
                             trace_id=trace_id,
                         )
                     )
@@ -5252,43 +5691,27 @@ class ProxyManager:
                             is_error=True,
                             error_category=ErrorCategory.PROTOCOL,
                             error_code=err_code,
-                            error_message=format_error_message_from_exc(exc),
+                            error_message=self._safe_error_for_config(exc, cfg),
                             trace_id=trace_id,
                         )
                     )
                     _mark_recorded(exc)
-                    try:
-                        await self._reconnect_server(server, cfg)
-                    except Exception as reconnect_exc:
-                        # Expected fallback: the primary error is already being
-                        # re-raised and carries the actionable trace. The
-                        # reconnect attempt here is best-effort for the NEXT
-                        # call — a failure is noise for current operators.
-                        # Redact + no exc_info (#605): the reconnect reopens a
-                        # transport with the credentialed ``cfg.url``.
-                        logger.debug(
-                            "Post-protocol-error reconnect failed for '%s': %s",
-                            server,
-                            self._redacted_error(reconnect_exc, cfg.url),
-                        )
+                    self._schedule_reconnect_for_next_call(server, cfg, "protocol error")
                     raise
 
-                # Timeout-replay guard (#578): a per-attempt timeout cancels OUR
-                # wait — the request may already have executed upstream, so
-                # re-invoking a non-read-only tool would manufacture duplicate
-                # writes. Connection-level failures (refused / reset / EOF) stay
-                # retryable for every tool: they overwhelmingly mean the request
-                # never completed, and gating them would disable most useful
-                # retries. MCP-error retries (err_code path) also re-execute but
-                # are out of scope here — tracked as a follow-up on #578.
-                replay_unsafe = isinstance(
-                    exc, asyncio.TimeoutError
-                ) and not self._tool_idempotent_for_retry(server, tool, cfg_snap=cfg_snap)
+                # Once ``session.call_tool`` has been entered, every failure is
+                # ambiguous: the upstream may have committed the side effect
+                # before the transport reset, EOF, timeout, or retryable MCP
+                # error reached us. Replay only calls with an affirmative
+                # idempotency signal; availability must not manufacture a
+                # duplicate write.
+                last_failed_generation = generation
+                replay_unsafe = not self._tool_idempotent_for_retry(server, tool, cfg_snap=cfg_snap)
                 if attempt >= cfg.max_retries or replay_unsafe:
                     if replay_unsafe and attempt < cfg.max_retries:
                         logger.warning(
-                            "Timeout on non-read-only tool %s/%s — not retrying "
-                            "(replay guard); reconnecting for the next call",
+                            "Ambiguous failure on replay-unsafe tool %s/%s — not retrying; "
+                            "reconnecting for the next call",
                             server,
                             tool,
                         )
@@ -5305,7 +5728,7 @@ class ProxyManager:
                             compressed_chars=0,
                             is_error=True,
                             error_category=cat,
-                            error_message=format_error_message_from_exc(exc),
+                            error_message=self._safe_error_for_config(exc, cfg),
                             trace_id=trace_id,
                         )
                     )
@@ -5315,20 +5738,24 @@ class ProxyManager:
                     # nothing on the breaker.
                     if breaker is not None:
                         breaker.record_failure()
-                    # Reconnect before raising so the NEXT call starts fresh
-                    try:
-                        await self._reconnect_server(server, cfg)
-                    except Exception as reconnect_exc:
-                        # Same reasoning as the protocol-error path above:
-                        # the primary failure is being re-raised, the
-                        # reconnect attempt is just pre-emptive cleanup.
-                        # Redact + no exc_info (#605): the reconnect reopens a
-                        # transport with the credentialed ``cfg.url``.
-                        logger.debug(
-                            "Post-failure reconnect failed for '%s': %s",
-                            server,
-                            self._redacted_error(reconnect_exc, cfg.url),
-                        )
+                    if cat is not ErrorCategory.TIMEOUT:
+                        # A per-attempt timeout is not evidence that the
+                        # session is broken: a slow-but-healthy tool exceeding
+                        # ``call_timeout_seconds`` looks identical here. Gating
+                        # every OTHER tool on that server behind a full
+                        # reconnect (and hard-failing them with "was not
+                        # dispatched" when the respawn is slow) trades one slow
+                        # tool for a dead upstream. The reconnect below still
+                        # replaces the session so the cancelled attempt's
+                        # orphaned request id cannot outlive it; it just stays
+                        # best-effort, as it was before the fail-closed change.
+                        self._mark_generation_unavailable(conn, generation)
+                    self._schedule_reconnect_for_next_call(
+                        server,
+                        cfg,
+                        "terminal call failure",
+                        failed_generation=generation,
+                    )
                     raise
                 logger.warning(
                     "Tool call %s/%s failed (attempt %d/%d): %s",
@@ -5336,15 +5763,17 @@ class ProxyManager:
                     tool,
                     attempt + 1,
                     cfg.max_retries,
-                    exc,
+                    self._safe_error_for_config(exc, cfg),
                 )
-                await asyncio.sleep(delay)
+                await await_before_deadline(asyncio.sleep(delay), attempt + 1)
                 delay = min(max(delay * 2, 0.1), cfg.max_reconnect_delay_seconds)
                 self.tracker.record_reconnect()
                 try:
-                    await self._reconnect_server(server, cfg)
+                    await await_before_deadline(self._reconnect_server(server, cfg), attempt + 1)
                     conn = self._connections[server]
                 except Exception as reconnect_exc:
+                    if getattr(reconnect_exc, "_stm_metrics_recorded", False):
+                        raise
                     # Redact (#622, #605/#606 family): the reconnect reopens a
                     # transport with the credentialed ``cfg.url``, so an httpx
                     # error here embeds the token — the three sibling
@@ -5352,13 +5781,20 @@ class ProxyManager:
                     logger.error(
                         "Reconnect to '%s' failed: %s",
                         server,
-                        self._redacted_error(reconnect_exc, cfg.url),
+                        self._safe_error_for_config(reconnect_exc, cfg),
                     )
                     # Third terminal exit (#608): a mid-loop reconnect failure
                     # means the upstream is unreachable — count it, or a dead
                     # stdio upstream whose respawns fail escapes the breaker.
                     if breaker is not None:
                         breaker.record_failure()
+                    self._mark_generation_unavailable(conn, generation)
+                    self._schedule_reconnect_for_next_call(
+                        server,
+                        cfg,
+                        "failed retry reconnect",
+                        failed_generation=generation,
+                    )
                     raise
 
         # The loop always returns on success or raises on every failure path;
@@ -6253,7 +6689,7 @@ class ProxyManager:
         return not (read_only is False or destructive is True)
 
     def _tool_idempotent_for_retry(self, server: str, tool: str, *, cfg_snap: ProxyConfig) -> bool:
-        """Whether a timed-out call to ``(server, tool)`` may be re-invoked (#578).
+        """Whether an ambiguously failed call may be re-invoked safely.
 
         A per-attempt timeout cancels OUR wait, not the upstream execution — the
         request may already have committed its side effect, so re-invoking a
@@ -6272,17 +6708,16 @@ class ProxyManager:
           a stored response (no re-execution), while a conservative *retry*
           verdict would RE-EXECUTE an unknown tool's side effect — the failure
           directions are not symmetric, so unknown means don't replay.
-        - ``policy == "ignore"`` returns True: the operator declared the
-          annotations untrustworthy, and deriving a new safety gate from data
-          they opted out of would silently change behavior on known-bad input.
-          They keep the pre-#578 replay-on-timeout semantics.
+        - ``policy == "ignore"`` is unsafe by default. Ignoring annotations is
+          not an affirmative idempotency statement; operators can opt a tool
+          in with ``cache: true`` when they know replay is safe.
 
-        An unknown server (direct dispatch / tests with no registered
-        connection) is treated as idempotent, mirroring ``_tool_cache_eligible``.
+        Unknown servers are unsafe: absence of evidence never authorizes a
+        side-effecting retry.
         """
         conn = self._connections.get(server)
         if conn is None:
-            return True
+            return False
         # Overrides ride the hot-reloaded ``cfg_snap`` (same as
         # ``_tool_cache_eligible``): an operator's replay-safety assertion
         # applies on the next call, not the next reconnect.
@@ -6299,7 +6734,7 @@ class ProxyManager:
 
         policy = cfg_snap.cache.tool_annotation_policy
         if policy == "ignore":
-            return True
+            return False
         ann = self._tool_annotations(conn, tool)
         read_only = getattr(ann, "read_only_hint", None)
         destructive = getattr(ann, "destructive_hint", None)
@@ -6589,6 +7024,35 @@ class ProxyManager:
             result = await self._fetch_upstream(
                 server, tool, upstream_args, trace_id=trace_id, cfg_snap=cfg_snap
             )
+
+        result_bytes = await json_utf8_size_async(result, limit=cfg_snap.max_upstream_bytes)
+        if result_bytes > cfg_snap.max_upstream_bytes:
+            msg = (
+                f"Upstream '{server}/{tool}' response exceeded "
+                f"max_upstream_bytes={cfg_snap.max_upstream_bytes}"
+            )
+            logger.warning(msg)
+            self.tracker.record_error(
+                CallMetrics(
+                    server=server,
+                    tool=tool,
+                    original_chars=0,
+                    compressed_chars=0,
+                    is_error=True,
+                    error_category=ErrorCategory.OVERSIZE,
+                    error_message=msg[:MAX_ERROR_MESSAGE_CHARS],
+                    trace_id=trace_id,
+                )
+            )
+            self._invalidate_disabled_cache(
+                server, tool, cache_args, cfg_snap=cfg_snap, context_query=context_query
+            )
+            from mcp.server.mcpserver.exceptions import ToolError
+
+            exc = ToolError(msg)
+            _mark_recorded(exc)
+            _mark_cache_invalidated(exc)
+            raise exc
 
         # ── Stage 2: INGEST SCRUB (lone surrogates) ──
         # Escape here, once, rather than at each place the text is later

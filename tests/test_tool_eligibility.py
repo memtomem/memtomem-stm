@@ -689,6 +689,12 @@ class TestComputeHealthFlags:
             _record(store, "good")
         assert compute_health_flags(store, STRICT) == frozenset({("srv", "bad")})
 
+    def test_consistently_oversize_tool_is_flagged(self, tmp_path):
+        store = self._store(tmp_path)
+        for _ in range(5):
+            _record(store, "oversize", error=ErrorCategory.OVERSIZE)
+        assert compute_health_flags(store, STRICT) == frozenset({("srv", "oversize")})
+
     def test_below_min_calls_is_presumed_healthy(self, tmp_path):
         store = self._store(tmp_path)
         for _ in range(4):  # default health_min_calls = 5
@@ -747,6 +753,14 @@ class TestGetToolErrorStats:
         _record(store, "t")
         stats = store.get_tool_error_stats(3600.0, UPSTREAM_ERROR_CATEGORIES)
         assert stats == {("srv", "t"): (3, 1)}
+
+    def test_oversize_is_upstream_attributable(self, tmp_path):
+        store = MetricsStore(tmp_path / "metrics.db")
+        store.initialize()
+        _record(store, "t", error=ErrorCategory.OVERSIZE)
+        assert store.get_tool_error_stats(3600.0, UPSTREAM_ERROR_CATEGORIES) == {
+            ("srv", "t"): (1, 1)
+        }
 
     def test_window_excludes_old_rows(self, tmp_path):
         store = MetricsStore(tmp_path / "metrics.db")

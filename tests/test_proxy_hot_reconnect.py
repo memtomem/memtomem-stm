@@ -299,6 +299,48 @@ class TestConfigChangeDetection:
         old_stack.aclose.assert_not_awaited()
         assert conn.last_failed_connection_fp == _connection_fingerprint(cfg_b)
 
+    async def test_config_reconnect_deadline_damps_edit_and_old_session_serves(self, tmp_path):
+        """The call-wide deadline cancels a hanging config reconnect from
+        outside its ordinary ``except Exception`` guard. Record that exact
+        fingerprint before propagating the timeout, so the following call
+        uses the still-healthy old session instead of retrying the edit.
+        """
+        cfg_a = _sse_cfg("https://old.example/sse")
+        cfg_b = UpstreamServerConfig(
+            prefix="srv",
+            transport=TransportType.SSE,
+            url="https://hanging.example/sse",
+            connect_timeout_seconds=1.0,
+            call_timeout_seconds=0.02,
+            overall_deadline_seconds=0.02,
+        )
+        mgr = _make_manager(tmp_path, {"srv": cfg_a})
+        conn = _seed_connection(mgr, "srv", cfg_a)
+        conn.breaker = CircuitBreaker(max_failures=1, reset_timeout=3600.0, name="upstream-srv")
+        conn.session.call_tool = AsyncMock(return_value=_ok_result("old-session"))
+        _reseed(mgr, tmp_path, {"srv": cfg_b})
+
+        async def hanging_reconnect(*_args, **_kwargs):
+            await asyncio.sleep(10)
+
+        with (
+            patch.object(mgr, "_reconnect_server", side_effect=hanging_reconnect) as reconnect,
+            patch.object(
+                mgr, "_schedule_reconnect_for_next_call", return_value=None
+            ) as schedule_reconnect,
+        ):
+            with pytest.raises(asyncio.TimeoutError, match="overall_deadline"):
+                await _fetch(mgr)
+
+            assert conn.last_failed_connection_fp == _connection_fingerprint(cfg_b)
+            assert not conn.breaker.is_open
+            schedule_reconnect.assert_not_called()
+            result = await _fetch(mgr)
+
+        assert result.content[0].text == "old-session"
+        assert reconnect.await_count == 1
+        conn.session.call_tool.assert_awaited_once()
+
     async def test_damping_clears_on_next_edit(self, tmp_path):
         """A further edit (different fingerprint) re-arms detection after a
         damped failure."""

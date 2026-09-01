@@ -15,6 +15,9 @@ uv sync
 # Run tests (same filter CI uses)
 uv run pytest -m "not bench_qa_meta and not bench_qa_llm_judge and not bench_qa_sweep and not bench_qa_drift and not bench_qa_perf"
 
+# Match the Ubuntu 3.12 branch-coverage gate (minimum 90%)
+uv run pytest -m "not bench_qa_meta and not bench_qa_llm_judge and not bench_qa_sweep and not bench_qa_drift and not bench_qa_perf" --cov=memtomem_stm --cov-branch --cov-fail-under=90
+
 # Lint and format
 uv run ruff check src
 uv run ruff format src

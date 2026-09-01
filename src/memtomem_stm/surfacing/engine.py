@@ -27,6 +27,7 @@ from memtomem_stm.surfacing.mcp_client import (
 from memtomem_stm.surfacing.observability import _NOOP_OBSERVABILITY, SurfacingObservability
 from memtomem_stm.surfacing.relevance import RateClaim, RelevanceGate
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
+from memtomem_stm.utils.digest import framed_digest
 from memtomem_stm.utils.keyed_locks import KeyedLocks
 from memtomem_stm.utils.redact import redact_exception_text, redact_url_userinfo
 
@@ -1114,7 +1115,6 @@ class SurfacingEngine:
                 ),
                 effective_timeout,
             )
-            self._circuit_breaker.record_success()
             return result
         except asyncio.TimeoutError:
             self._observability.record_outcome(tool, "error_timeout")
@@ -1535,11 +1535,17 @@ class SurfacingEngine:
         # overlapping LTM searches and the losing coroutine cannot poison the
         # cache with an empty result. Collapse is cache-mediated, not
         # coalescing (see ``_key_locks`` init docstring).
-        cache_key = f"{server}/{tool}/{query}"
+        cache_key = framed_digest((server, tool, query))
         cached = self._cache.get(cache_key)
         if cached is not None:
             self._observability.record_cache("hit")
-            return self._render_cached(cached, response_text, query, server, tool)
+            try:
+                return self._render_cached(cached, response_text, query, server, tool)
+            finally:
+                # This caller claimed a rate slot before it knew the cache
+                # could answer. A hit starts no LTM work, so it is not an
+                # attempt under RelevanceGate's documented accounting.
+                self._gate.release_claim(rate_claim)
 
         async with self._key_locks.hold(cache_key):
             # Double-check inside the lock: a coroutine that held the
@@ -1547,7 +1553,10 @@ class SurfacingEngine:
             cached = self._cache.get(cache_key)
             if cached is not None:
                 self._observability.record_cache("hit")
-                return self._render_cached(cached, response_text, query, server, tool)
+                try:
+                    return self._render_cached(cached, response_text, query, server, tool)
+                finally:
+                    self._gate.release_claim(rate_claim)
             self._observability.record_cache("miss")
             return await self._do_surface_miss(
                 server,
@@ -1784,6 +1793,7 @@ class SurfacingEngine:
         # touching LTM and so prove nothing about its current health. The
         # timestamp is taken here, not at write time, so a fault recorded
         # after this instant stays active.
+        self._circuit_breaker.record_success()
         self._persist_fault_recovery(server, tool, time.time())
 
         retrieved_results = [r for r in results if not getattr(r, "pinned", False)]

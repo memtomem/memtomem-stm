@@ -101,6 +101,7 @@ export MEMTOMEM_STM_PROXY__ENABLED=true
 export MEMTOMEM_STM_PROXY__DEFAULT_COMPRESSION=auto
 export MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS=16000
 export MEMTOMEM_STM_PROXY__MAX_UPSTREAM_CHARS=10000000   # OOM guard before compression
+export MEMTOMEM_STM_PROXY__MAX_UPSTREAM_BYTES=41943040   # whole MCP result envelope (40 MiB)
 export MEMTOMEM_STM_PROXY__MIN_RESULT_RETENTION=0.65
 export MEMTOMEM_STM_PROXY__CONSUMER_MODEL=claude-sonnet-4
 export MEMTOMEM_STM_PROXY__CONTEXT_BUDGET_RATIO=0.05
@@ -287,6 +288,7 @@ Representative configuration (see the linked reference for omitted fields):
   "default_max_result_chars": 16000,
   "default_compression": "auto",
   "max_upstream_chars": 10000000,
+  "max_upstream_bytes": 41943040,
   "min_result_retention": 0.65,
   "consumer_model": "",
   "context_budget_ratio": 0.05,
@@ -433,6 +435,13 @@ Representative configuration (see the linked reference for omitted fields):
   }
 }
 ```
+
+`max_upstream_bytes` is the fail-closed inbound boundary for the complete MCP
+result envelope, including text, images, `structuredContent`, result `_meta`,
+and error payloads. The default is 40 MiB. It is distinct from
+`max_upstream_chars`: the character limit shapes text before compression,
+whereas the byte limit rejects the whole oversized result before it can enter
+the cache, compression, indexing, or surfacing pipeline.
 
 The `auto_index` and `extraction` keys are reserved and unsupported by the
 bundled mms server. They remain accepted for compatibility and are meaningful

@@ -6327,6 +6327,82 @@ class TestAddFromClientsNonInteractive:
             },
         ]
 
+    def _repo_local_candidate(self):
+        return {
+            "name": "repo-server",
+            "source": ".mcp.json (project)",
+            "entry": {"transport": "stdio", "command": "untrusted-command"},
+            "raw": {"command": "untrusted-command"},
+            "source_ref": {"kind": "mcp-json", "path": "/repo/.mcp.json"},
+            "is_repo_local": True,
+        }
+
+    @pytest.mark.parametrize(
+        "selection",
+        [["--all"], ["--select", "repo-server"]],
+    )
+    def test_project_local_import_requires_explicit_ack_before_side_effects(
+        self, runner, config, monkeypatch, selection
+    ):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, [self._repo_local_candidate()])
+        before = config.read_bytes()
+
+        async def probe_must_not_run(*_args, **_kwargs):
+            raise AssertionError("project-local server was probed before consent")
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", probe_must_not_run)
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", *selection, "--validate", *_cfg_args(config)],
+        )
+
+        assert result.exit_code == 2, result.output
+        assert "--allow-project-configs" in result.output
+        assert config.read_bytes() == before
+
+    def test_project_local_json_gate_is_atomic_for_mixed_batch(
+        self, runner, config, monkeypatch
+    ):
+        self._seed_config(config, {})
+        self._stub_candidates(
+            monkeypatch,
+            [self._two_candidates()[0], self._repo_local_candidate()],
+        )
+        before = config.read_bytes()
+
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--all", "--json", *_cfg_args(config)],
+        )
+
+        assert result.exit_code == 2, result.output
+        payload = json.loads(result.stdout)
+        assert payload["error"] == "project_config_ack_required"
+        assert payload["names"] == ["repo-server"]
+        assert config.read_bytes() == before
+
+    def test_project_local_import_with_ack_succeeds(self, runner, config, monkeypatch):
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, [self._repo_local_candidate()])
+
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "--from-clients",
+                "--all",
+                "--allow-project-configs",
+                *_cfg_args(config),
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        servers = json.loads(config.read_text(encoding="utf-8"))["upstream_servers"]
+        assert set(servers) == {"repo-server"}
+
     def test_all_imports_every_candidate_without_prompting(self, runner, config, monkeypatch):
         """No stdin at all → both candidates land with suggested prefixes."""
         self._seed_config(config, {})
@@ -6681,7 +6757,15 @@ class TestAddFromClientsNonInteractive:
 
         result = runner.invoke(
             cli,
-            ["add", "--from-clients", "--all", "--json", "--validate", *_cfg_args(config)],
+            [
+                "add",
+                "--from-clients",
+                "--all",
+                "--json",
+                "--validate",
+                "--save-unverified",
+                *_cfg_args(config),
+            ],
         )
         assert result.exit_code == 0, result.output
 
@@ -6692,12 +6776,43 @@ class TestAddFromClientsNonInteractive:
         assert rows["filesystem"]["tools_reachable"] == 7
         assert rows["github"]["reachable"] is False
         assert rows["github"]["tools_reachable"] is None
-        # A failed probe warns but still saves — same as the interactive path.
+        # Explicit acknowledgement preserves the force-save path.
         assert any("connection refused" in w for w in payload["warnings"])
         assert set(json.loads(config.read_text(encoding="utf-8"))["upstream_servers"]) == {
             "filesystem",
             "github",
         }
+
+    def test_bulk_validate_failure_is_atomic_by_default(self, runner, config, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._seed_config(config, {"existing": {"prefix": "old", "command": "old"}})
+        self._stub_candidates(monkeypatch, self._two_candidates())
+
+        async def fake_probe_servers(servers, timeout):
+            return {
+                "filesystem": _probe_ok(tools=7),
+                "github": StagedProbeResult(
+                    stage=ProbeStage.CONFIGURED,
+                    error="connection refused",
+                ),
+            }
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        before = config.read_bytes()
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--all", "--json", "--validate", *_cfg_args(config)],
+        )
+
+        assert result.exit_code == 1, result.output
+        payload = json.loads(result.stdout)
+        assert payload["ok"] is False
+        assert payload["error"] == "validation_failed"
+        assert payload["names"] == ["github"]
+        assert payload["failures"][0]["stage"] == "configured"
+        assert config.read_bytes() == before
 
     def test_prune_never_prompts_on_a_tty_in_scripted_mode(self, runner, config, monkeypatch):
         """Without --prune the scripted path falls straight through to the
