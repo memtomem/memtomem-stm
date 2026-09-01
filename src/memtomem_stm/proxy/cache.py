@@ -53,13 +53,66 @@ CREATE TABLE IF NOT EXISTS proxy_cache_meta (
 );
 """
 
+# A small trigger-maintained queue separates "which rows need checking" from
+# the (potentially large) response bodies.  The triggers live in SQLite, so
+# they also observe writes from an older process that knows only the
+# ``proxy_cache`` table.  A current writer removes only the key whose body it
+# has just checked; legacy inserts and body updates remain queued for the next
+# startup sweep.
+_CREATE_PRIVACY_UNVERIFIED_TABLE = """
+CREATE TABLE IF NOT EXISTS proxy_cache_privacy_unverified (
+    cache_key TEXT PRIMARY KEY
+);
+"""
+
+_CREATE_PRIVACY_UNVERIFIED_TRIGGERS = (
+    """
+    CREATE TRIGGER IF NOT EXISTS proxy_cache_privacy_track_insert
+    AFTER INSERT ON proxy_cache
+    BEGIN
+        INSERT INTO proxy_cache_privacy_unverified (cache_key)
+        VALUES (NEW.cache_key)
+        ON CONFLICT(cache_key) DO NOTHING;
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS proxy_cache_privacy_track_body_update
+    AFTER UPDATE OF cache_key, result, envelope_json ON proxy_cache
+    BEGIN
+        DELETE FROM proxy_cache_privacy_unverified
+        WHERE cache_key = OLD.cache_key;
+        INSERT INTO proxy_cache_privacy_unverified (cache_key)
+        VALUES (NEW.cache_key)
+        ON CONFLICT(cache_key) DO NOTHING;
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS proxy_cache_privacy_track_delete
+    AFTER DELETE ON proxy_cache
+    BEGIN
+        DELETE FROM proxy_cache_privacy_unverified
+        WHERE cache_key = OLD.cache_key;
+    END;
+    """,
+)
+
+_SELECT_UNVERIFIED_PRIVACY_ROWS = """
+SELECT p.cache_key, p.result, p.envelope_json
+FROM proxy_cache AS p
+WHERE p.cache_key IN (
+    SELECT cache_key FROM proxy_cache_privacy_unverified
+);
+"""
+
 _PRIVACY_POLICY_FINGERPRINT_KEY = "privacy_policy_fingerprint"
 
 # Version of the fingerprint encoding and any scanner semantics not expressed
 # by ``DEFAULT_PATTERNS`` itself. Pattern additions/removals change the digest
 # automatically; bump this only when the same pattern tuple would be evaluated
-# under a meaningfully different storage policy.
-_PRIVACY_POLICY_EPOCH = 1
+# under a meaningfully different storage policy. Epoch 2 establishes the
+# trigger-backed unverified-key baseline, invalidating stamps created before
+# legacy writes could be tracked.
+_PRIVACY_POLICY_EPOCH = 2
 
 
 def _privacy_policy_fingerprint() -> str:
@@ -240,6 +293,9 @@ class ProxyCache:
             db.execute(_CREATE_TABLE)
             db.execute(_CREATE_INDEX)
             db.execute(_CREATE_META_TABLE)
+            db.execute(_CREATE_PRIVACY_UNVERIFIED_TABLE)
+            for trigger_sql in _CREATE_PRIVACY_UNVERIFIED_TRIGGERS:
+                db.execute(trigger_sql)
             db.commit()
             # Startup purge of expired rows, running against the local
             # ``db`` before it is handed off to ``self._db``. Failures fall
@@ -264,42 +320,58 @@ class ProxyCache:
             )
             db.commit()
             # Purge rows cached before the privacy gate in ``set()`` (#453),
-            # or before the current pattern policy. The regex sweep is gated
-            # by a database stamp because feeding every cached response body
-            # through every pattern on every startup makes initialization
-            # proportional to cache volume (#872). A missing/stale stamp runs
-            # the full repair once; an equal stamp skips even the body SELECT.
+            # before the current pattern policy, or later by a writer that did
+            # not pass through the current gate. The regex sweep is gated by a
+            # database stamp because feeding every cached response body through
+            # every pattern on every startup makes initialization proportional
+            # to cache volume (#872). A missing/stale stamp runs the full repair
+            # once; an equal stamp scans only keys placed in the small
+            # trigger-maintained queue by legacy/out-of-band writes.
             #
-            # Stamp LAST, in the same transaction as any deletions. A scan,
-            # delete, or stamp failure therefore leaves the previous/missing
-            # value in place and the next opener retries. Rows written later by
-            # an older process or an external SQL writer remain covered by the
-            # read-side guard in ``get()``.
+            # Take the write reservation before selecting bodies so no writer
+            # can land between the scan and publication of the stamp. Stamp and
+            # dequeue LAST, in the same transaction as any deletions. A scan,
+            # delete, dequeue, or stamp failure therefore rolls back the whole
+            # repair and the next opener retries. The read-side guard in
+            # ``get()`` remains an immediate backstop for post-startup writes.
             policy_fingerprint = _privacy_policy_fingerprint()
+            db.execute("BEGIN IMMEDIATE")
             stamp_row = db.execute(
                 "SELECT value FROM proxy_cache_meta WHERE key = ?",
                 (_PRIVACY_POLICY_FINGERPRINT_KEY,),
             ).fetchone()
-            if stamp_row is None or stamp_row[0] != policy_fingerprint:
-                stale_keys = [
-                    key
-                    for key, result, envelope in db.execute(
-                        "SELECT cache_key, result, envelope_json FROM proxy_cache"
-                    )
-                    if privacy.contains_sensitive_content(result)
-                    or (envelope is not None and privacy.contains_sensitive_content(envelope))
-                ]
-                if stale_keys:
-                    db.executemany(
-                        "DELETE FROM proxy_cache WHERE cache_key = ?",
-                        [(key,) for key in stale_keys],
-                    )
+            policy_changed = stamp_row is None or stamp_row[0] != policy_fingerprint
+            if policy_changed:
+                rows_to_check = db.execute(
+                    "SELECT cache_key, result, envelope_json FROM proxy_cache"
+                )
+            else:
+                # The IN subquery makes SQLite drive the lookup from the small
+                # queue and probe proxy_cache by its primary-key index. A plain
+                # JOIN can be reordered into a full proxy_cache table scan.
+                rows_to_check = db.execute(_SELECT_UNVERIFIED_PRIVACY_ROWS)
+            stale_keys = [
+                key
+                for key, result, envelope in rows_to_check
+                if privacy.contains_sensitive_content(result)
+                or (envelope is not None and privacy.contains_sensitive_content(envelope))
+            ]
+            if stale_keys:
+                db.executemany(
+                    "DELETE FROM proxy_cache WHERE cache_key = ?",
+                    [(key,) for key in stale_keys],
+                )
+            # Every surviving row selected above has now passed the current
+            # policy. Under BEGIN IMMEDIATE no legacy writer can add a new
+            # queue entry until after this transaction commits.
+            db.execute("DELETE FROM proxy_cache_privacy_unverified")
+            if policy_changed:
                 db.execute(
                     "INSERT INTO proxy_cache_meta (key, value) VALUES (?, ?) "
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                     (_PRIVACY_POLICY_FINGERPRINT_KEY, policy_fingerprint),
                 )
-                db.commit()
+            db.commit()
         except Exception:
             db.close()
             raise
@@ -580,6 +652,15 @@ class ProxyCache:
                     ttl_seconds,
                     envelope_json,
                 ),
+            )
+            # The INSERT/UPDATE trigger conservatively queued this key before
+            # the write became visible. ``set()`` checked the exact body and
+            # envelope above, so dequeue this key in the same transaction.
+            # An older writer never performs this step and therefore forces a
+            # targeted scan on the next startup.
+            self._db.execute(
+                "DELETE FROM proxy_cache_privacy_unverified WHERE cache_key = ?",
+                (key,),
             )
             self._db.commit()
             self._trim()

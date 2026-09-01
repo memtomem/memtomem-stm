@@ -419,9 +419,11 @@ changes inline only. See the deprecation policy in
   (#950, issue #872). `ProxyCache` now stamps the fingerprint of its storage privacy
   patterns in a component-owned SQLite metadata table. A missing or changed
   fingerprint still performs the full `result` + envelope sweep and removes
-  matches before publishing the new stamp; an unchanged fingerprint skips the
-  body query entirely. Write-time rejection and read-time scan-and-evict remain
-  in place for rows created after that sweep. **Behavior change**: none
+  matches before publishing the new stamp. An unchanged fingerprint checks
+  only keys queued by SQLite triggers when a legacy or out-of-band writer
+  inserts or changes a body; current checked writes dequeue their own key in
+  the same transaction. Write-time rejection and read-time scan-and-evict
+  remain in place as immediate guards. **Behavior change**: none
   external; the first open after this upgrade or a later policy change still
   performs the same repair, while subsequent starts avoid cache-size-dependent
   regex work.
