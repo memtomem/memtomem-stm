@@ -725,6 +725,54 @@ class TestPrivacyGate:
         finally:
             cache.close()
 
+    def test_older_writer_leaves_row_queued_under_newer_policy_stamp(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "rolling_policy_upgrade.db"
+        future_policy_fingerprint = "future-policy-fingerprint"
+        future_secret = "future-policy-sensitive-marker"
+        older_writer = ProxyCache(db_path, max_entries=100)
+        older_writer.initialize()
+        try:
+            older_writer._db.execute(
+                "UPDATE proxy_cache_meta SET value = ? WHERE key = ?",
+                (future_policy_fingerprint, cache_module._PRIVACY_POLICY_FINGERPRINT_KEY),
+            )
+            older_writer._db.commit()
+
+            # The old policy accepts this body, but its trigger-created queue
+            # entry must survive because a newer process owns the published
+            # stamp and may classify the body differently.
+            older_writer.set("s", "t", {}, future_secret, ttl_seconds=None)
+            assert (
+                older_writer._db.execute(
+                    "SELECT COUNT(*) FROM proxy_cache_privacy_unverified"
+                ).fetchone()[0]
+                == 1
+            )
+        finally:
+            older_writer.close()
+
+        monkeypatch.setattr(
+            cache_module, "_privacy_policy_fingerprint", lambda: future_policy_fingerprint
+        )
+        monkeypatch.setattr(
+            cache_module.privacy,
+            "contains_sensitive_content",
+            lambda text: future_secret in text,
+        )
+
+        newer_process = ProxyCache(db_path, max_entries=100)
+        newer_process.initialize()
+        try:
+            assert newer_process._db.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0] == 0
+            assert (
+                newer_process._db.execute(
+                    "SELECT COUNT(*) FROM proxy_cache_privacy_unverified"
+                ).fetchone()[0]
+                == 0
+            )
+        finally:
+            newer_process.close()
+
     def test_stale_policy_scan_reserves_writer_before_publishing_stamp(self, tmp_path, monkeypatch):
         db_path = tmp_path / "privacy_scan_writer_race.db"
         seed = ProxyCache(db_path, max_entries=100)

@@ -421,9 +421,10 @@ changes inline only. See the deprecation policy in
   fingerprint still performs the full `result` + envelope sweep and removes
   matches before publishing the new stamp. An unchanged fingerprint checks
   only keys queued by SQLite triggers when a legacy or out-of-band writer
-  inserts or changes a body; current checked writes dequeue their own key in
-  the same transaction. Write-time rejection and read-time scan-and-evict
-  remain in place as immediate guards. **Behavior change**: none
+  inserts or changes a body; current checked writes dequeue their own key only
+  while the published stamp matches their local policy, so an older process
+  cannot certify writes during a rolling policy upgrade. Write-time rejection
+  and read-time scan-and-evict remain in place as immediate guards. **Behavior change**: none
   external; the first open after this upgrade or a later policy change still
   performs the same repair, while subsequent starts avoid cache-size-dependent
   regex work.

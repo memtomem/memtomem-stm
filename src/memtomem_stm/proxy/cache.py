@@ -56,9 +56,9 @@ CREATE TABLE IF NOT EXISTS proxy_cache_meta (
 # A small trigger-maintained queue separates "which rows need checking" from
 # the (potentially large) response bodies.  The triggers live in SQLite, so
 # they also observe writes from an older process that knows only the
-# ``proxy_cache`` table.  A current writer removes only the key whose body it
-# has just checked; legacy inserts and body updates remain queued for the next
-# startup sweep.
+# ``proxy_cache`` table. A current writer removes only the key whose body it
+# has just checked under the database's published policy; legacy or older-policy
+# inserts and body updates remain queued for the next startup sweep.
 _CREATE_PRIVACY_UNVERIFIED_TABLE = """
 CREATE TABLE IF NOT EXISTS proxy_cache_privacy_unverified (
     cache_key TEXT PRIMARY KEY
@@ -655,12 +655,20 @@ class ProxyCache:
             )
             # The INSERT/UPDATE trigger conservatively queued this key before
             # the write became visible. ``set()`` checked the exact body and
-            # envelope above, so dequeue this key in the same transaction.
-            # An older writer never performs this step and therefore forces a
-            # targeted scan on the next startup.
+            # envelope above, so dequeue this key in the same transaction only
+            # when the database's published stamp matches this process's
+            # policy. During a rolling policy upgrade, an older process must
+            # leave its writes queued for the newer process to verify.
             self._db.execute(
-                "DELETE FROM proxy_cache_privacy_unverified WHERE cache_key = ?",
-                (key,),
+                "DELETE FROM proxy_cache_privacy_unverified WHERE cache_key = ? "
+                "AND EXISTS ("
+                "SELECT 1 FROM proxy_cache_meta WHERE key = ? AND value = ?"
+                ")",
+                (
+                    key,
+                    _PRIVACY_POLICY_FINGERPRINT_KEY,
+                    _privacy_policy_fingerprint(),
+                ),
             )
             self._db.commit()
             self._trim()
