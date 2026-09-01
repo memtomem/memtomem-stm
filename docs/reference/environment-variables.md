@@ -57,6 +57,7 @@ Status meanings:
 | `MEMTOMEM_STM_PROXY__DEFAULT_COMPRESSION` | compression strategy | `auto` | Default strategy when an upstream does not override it. | Bundled |
 | `MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS` | positive integer | `16000` | Configured response-size ceiling. | Bundled |
 | `MEMTOMEM_STM_PROXY__MAX_UPSTREAM_CHARS` | positive integer | `10000000` | Pre-compression OOM guard for upstream content. | Bundled |
+| `MEMTOMEM_STM_PROXY__MAX_UPSTREAM_BYTES` | positive integer | `41943040` | Whole-result inbound boundary (40 MiB), including text, binary content, structured content, metadata, and errors. | Bundled |
 | `MEMTOMEM_STM_PROXY__MIN_RESULT_RETENTION` | float `0..1` | `0.65` | Minimum retained fraction before a fixed budget is allowed. | Bundled |
 | `MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__SCORER` | `bm25 / embedding` | `bm25` | Query-aware compression scorer. | Bundled |
 | `MEMTOMEM_STM_PROXY__RELEVANCE_SCORER__EMBEDDING_PROVIDER` | provider name | `ollama` | Embedding backend when the scorer is `embedding`. | Bundled |

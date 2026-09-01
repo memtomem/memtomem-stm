@@ -19,18 +19,142 @@ Timeout mapping from the old two-parameter shape:
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import logging
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
-from typing import Any
+from types import TracebackType
+from typing import Any, Generic, TypeVar, cast
 
+import anyio
 import httpx2
 
+from mcp import types as mcp_types
 from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
+from mcp.shared.message import SessionMessage
+
+from memtomem_stm.utils.json_size import json_utf8_size_async
 
 # The SDK's SSE-friendly read default. Named here because the proxy pins the
 # read leg while overriding the connect leg: a long-lived stream must not
 # inherit the connect budget.
 SSE_READ_TIMEOUT_SECONDS = 300.0
+
+logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+
+# Private server-error code and data marker used only between the bounded
+# stream wrapper and ProxyManager.  A response that is too large has already
+# been decoded by the SDK transport, but must not disappear into the
+# dispatcher's generic CONNECTION_CLOSED fan-out: preserving its request id
+# lets the pending call receive this recognizable, non-retryable outcome.
+INBOUND_MESSAGE_TOO_LARGE_CODE = -32098
+_INBOUND_MESSAGE_TOO_LARGE_MARKER = "memtomem_stm.inbound_message_too_large"
+
+
+class BoundedReadStream(Generic[_T]):
+    """Read-stream wrapper enforcing a per-message UTF-8 JSON byte limit.
+
+    MCP transports parse framing before publishing ``SessionMessage`` values.
+    This wrapper sits at the next shared boundary, before ``ClientSession``
+    dispatch and result-model validation, and works for stdio, SSE, and
+    streamable HTTP without forking SDK transport implementations.
+    """
+
+    def __init__(self, stream: Any, max_bytes: int | Callable[[], int]) -> None:
+        self._stream = stream
+        self._max_bytes = max_bytes
+
+    def _current_max_bytes(self) -> int:
+        value = self._max_bytes() if callable(self._max_bytes) else self._max_bytes
+        if value <= 0:  # defensive: ProxyConfig validates this before runtime
+            raise ValueError("max_upstream_bytes must be positive")
+        return value
+
+    @property
+    def last_context(self) -> Any:
+        return getattr(self._stream, "last_context", None)
+
+    async def receive(self) -> _T:
+        while True:
+            item = await self._stream.receive()
+            if isinstance(item, Exception):
+                return cast(_T, item)
+            message = getattr(item, "message", item)
+            max_bytes = self._current_max_bytes()
+            if await json_utf8_size_async(message, limit=max_bytes) <= max_bytes:
+                return item
+            if isinstance(message, (mcp_types.JSONRPCResponse, mcp_types.JSONRPCError)):
+                # Raising here crashes JSONRPCDispatcher.run(), whose finally
+                # block wakes every waiter with the indistinguishable
+                # "Connection closed" error. Replace only correlated responses
+                # with a compact error carrying the same id, so the dispatcher
+                # resolves exactly that pending request and ProxyManager can
+                # classify it as OVERSIZE without retrying.
+                return cast(
+                    _T,
+                    SessionMessage(
+                        mcp_types.JSONRPCError(
+                            jsonrpc="2.0",
+                            id=message.id,
+                            error=mcp_types.ErrorData(
+                                code=INBOUND_MESSAGE_TOO_LARGE_CODE,
+                                message=(
+                                    f"Inbound MCP response exceeded max_upstream_bytes={max_bytes}"
+                                ),
+                                data={_INBOUND_MESSAGE_TOO_LARGE_MARKER: True},
+                            ),
+                        ),
+                        metadata=getattr(item, "metadata", None),
+                    ),
+                )
+            # An uncorrelated message (notification, or a server->client
+            # request) has no pending waiter to fail. Raising here would escape
+            # ``JSONRPCDispatcher.run``'s ``async for`` — it catches only
+            # ``ClosedResourceError`` — tearing down the task group and waking
+            # EVERY in-flight call with the indistinguishable "Connection
+            # closed" error, which is exactly what the correlated branch above
+            # exists to avoid. Drop the over-budget message and keep reading.
+            logger.warning(
+                "Dropping inbound MCP %s exceeding max_upstream_bytes=%d",
+                type(message).__name__,
+                max_bytes,
+            )
+
+    def __aiter__(self) -> BoundedReadStream[_T]:
+        return self
+
+    async def __anext__(self) -> _T:
+        try:
+            return await self.receive()
+        except anyio.EndOfStream:
+            raise StopAsyncIteration from None
+
+    async def aclose(self) -> None:
+        await self._stream.aclose()
+
+    async def __aenter__(self) -> BoundedReadStream[_T]:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> bool | None:
+        await self.aclose()
+        return None
+
+
+def is_inbound_message_too_large_error(exc: BaseException) -> bool:
+    """Return whether *exc* is the correlated local oversize outcome."""
+    error = getattr(exc, "error", None)
+    data = getattr(error, "data", None)
+    return (
+        getattr(error, "code", None) == INBOUND_MESSAGE_TOO_LARGE_CODE
+        and isinstance(data, Mapping)
+        and data.get(_INBOUND_MESSAGE_TOO_LARGE_MARKER) is True
+    )
 
 
 @asynccontextmanager

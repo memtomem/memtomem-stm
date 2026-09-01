@@ -784,6 +784,19 @@ class TestOuterCancellationLazyReconnect:
         assert adapter._needs_reconnect is True
 
     @pytest.mark.asyncio
+    async def test_increment_access_transport_failure_is_not_replayed(self):
+        adapter = McpClientSearchAdapter(SurfacingConfig())
+        mock_session = AsyncMock()
+        mock_session.call_tool = AsyncMock(side_effect=ConnectionError("reset after dispatch"))
+        adapter._session = mock_session
+        adapter._shared_reconnect = AsyncMock()  # type: ignore[method-assign]
+
+        await adapter.increment_access(["chunk-1"])
+
+        mock_session.call_tool.assert_awaited_once()
+        adapter._shared_reconnect.assert_awaited_once_with(adapter._generation)
+
+    @pytest.mark.asyncio
     async def test_scratch_list_cancellation_marks_for_reconnect(self):
         adapter = McpClientSearchAdapter(SurfacingConfig())
 

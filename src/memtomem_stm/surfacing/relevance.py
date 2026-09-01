@@ -11,7 +11,6 @@ from memtomem_stm.surfacing.observability import _NOOP_OBSERVABILITY, SurfacingO
 
 # Module-level constants
 _MAX_RECENT_QUERIES = 50
-_MAX_SURFACING_TIMESTAMPS = 200
 _RATE_LIMIT_WINDOW_SECONDS = 60.0
 _SIMILARITY_THRESHOLD = 0.95
 
@@ -49,7 +48,12 @@ class RelevanceGate:
         # stay unconditional.
         self._observability = observability if observability is not None else _NOOP_OBSERVABILITY
         self._recent_queries: deque[tuple[float, str]] = deque(maxlen=_MAX_RECENT_QUERIES)
-        self._surfacing_timestamps: deque[RateClaim] = deque(maxlen=_MAX_SURFACING_TIMESTAMPS)
+        # Do not put a fixed ``maxlen`` on rate claims. The configured limit
+        # is allowed to exceed 200, and silently evicting live claims would
+        # turn (for example) a 250/minute limit into no limit after the 200th
+        # request. Window pruning in ``should_surface`` bounds this deque by
+        # the operator-selected rate instead.
+        self._surfacing_timestamps: deque[RateClaim] = deque()
 
     def should_surface(
         self,
@@ -148,9 +152,9 @@ class RelevanceGate:
         would, under a concurrent claim in between, hand back the *other*
         caller's slot and leave this caller's older timestamp counting — whose
         earlier expiry frees capacity sooner than the surviving real attempt
-        should allow. A claim that already left the deque (pruned by window
-        expiry, or evicted by ``maxlen``) is simply gone; releasing it is a
-        no-op rather than someone else's slot.
+        should allow. A claim that already left the deque after window pruning
+        is simply gone; releasing it is a no-op rather than someone else's
+        slot.
         """
         try:
             self._surfacing_timestamps.remove(claim)

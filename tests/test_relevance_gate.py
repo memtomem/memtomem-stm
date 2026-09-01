@@ -77,6 +77,14 @@ class TestRelevanceGateRateLimit:
         # 4th should be rejected
         assert not gate.should_surface("s", "tool_x", "another different query")
 
+    def test_configured_limit_above_200_is_enforced(self):
+        gate = _gate(max_surfacings_per_minute=250, cooldown_seconds=0.0)
+
+        for i in range(250):
+            assert gate.should_surface("s", f"tool_{i}", f"distinct query {i}")
+
+        assert not gate.should_surface("s", "tool_over_limit", "one query too many")
+
 
 class TestRelevanceGateReleaseClaim:
     def test_release_returns_the_callers_own_claim(self):
@@ -94,7 +102,7 @@ class TestRelevanceGateReleaseClaim:
 
     def test_release_tolerates_an_already_pruned_claim(self, monkeypatch):
         # A claim can leave the deque before its caller refunds — pruned by
-        # window expiry or evicted by the deque's maxlen. The refund must
+        # window expiry. The refund must
         # neither raise nor take someone else's slot with it. The clock is
         # frozen because two claims really can share one time.monotonic()
         # reading (Windows ticks at ~15.6ms, where CI caught exactly this):

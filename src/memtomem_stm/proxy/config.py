@@ -2138,6 +2138,14 @@ class ProxyConfig(BaseModel):
     Default 10 M chars (~10 MB UTF-8). Per-server / per-tool overrides are a
     follow-up if needed.
     """
+    max_upstream_bytes: int = Field(default=41_943_040, gt=0)
+    """Per-message and complete-result UTF-8 JSON byte cap (40 MiB).
+
+    Unlike ``max_upstream_chars``, this includes non-text content,
+    ``structuredContent``, ``_meta`` and error envelopes. Oversized messages
+    are rejected instead of truncated because arbitrary structured or binary
+    payloads cannot be truncated without corrupting their schema.
+    """
     min_result_retention: float = Field(default=0.65, ge=0.0, le=1.0)
     relevance_scorer: RelevanceScorerConfig = Field(default_factory=RelevanceScorerConfig)
     """Minimum fraction of response to preserve after compression (0-1).

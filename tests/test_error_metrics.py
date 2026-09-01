@@ -10,6 +10,9 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from mcp import types as mcp_types
+from mcp.shared.exceptions import MCPError
+
 from memtomem_stm.proxy.config import CompressionStrategy, ProxyConfig, UpstreamServerConfig
 from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
 from memtomem_stm.proxy.metrics import (
@@ -20,6 +23,10 @@ from memtomem_stm.proxy.metrics import (
 )
 from memtomem_stm.proxy.metrics_store import MetricsStore
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
+from memtomem_stm.utils.mcp_transport import (
+    INBOUND_MESSAGE_TOO_LARGE_CODE,
+    BoundedReadStream,
+)
 
 
 # ── ErrorCategory enum ───────────────────────────────────────────────────
@@ -449,6 +456,43 @@ class TestManagerErrorRecording:
         s = mgr.tracker.get_summary()
         assert s["errors_by_category"]["timeout"] == 1
 
+    async def test_dispatcher_oversize_error_is_recorded_once_without_retry(self):
+        mgr = _make_manager(max_retries=3)
+        # Affirmative replay permission demonstrates that this result is
+        # rejected before the ordinary retryable-MCP-error branch.
+        cfg = mgr._connections["srv"].config.model_copy(update={"cache": True})
+        mgr._connections["srv"].config = cfg
+        mgr._config_loader.seed(mgr._config.model_copy(update={"upstream_servers": {"srv": cfg}}))
+
+        response = SimpleNamespace(
+            message=mcp_types.JSONRPCResponse(
+                jsonrpc="2.0",
+                id=1,
+                result={"content": [{"type": "text", "text": "x" * 1_000}]},
+            ),
+            metadata=None,
+        )
+
+        class _OneResponse:
+            async def receive(self):
+                return response
+
+        bounded = BoundedReadStream(_OneResponse(), 100)
+        replacement = await bounded.receive()
+        rpc_error = replacement.message
+        assert isinstance(rpc_error, mcp_types.JSONRPCError)
+        exc = MCPError.from_jsonrpc_error(rpc_error)
+        mgr._connections["srv"].session.call_tool.side_effect = exc
+
+        with pytest.raises(MCPError) as raised:
+            await mgr.call_tool("srv", "tool", {})
+
+        assert raised.value.error.code == INBOUND_MESSAGE_TOO_LARGE_CODE
+        assert mgr._connections["srv"].session.call_tool.await_count == 1
+        summary = mgr.tracker.get_summary()
+        assert summary["errors_by_category"]["oversize"] == 1
+        assert summary["total_errors"] == 1
+
     async def test_upstream_error_records_metric(self):
         mgr = _make_manager()
         mgr._connections["srv"].session.call_tool.return_value = _make_result(
@@ -544,6 +588,46 @@ class TestErrorMessagePersistence:
         cat, _code, msg = _read_error_row(mgr)
         assert cat == "transport"
         assert msg == "ConnectionError: down"
+
+    async def test_transport_message_redacts_url_header_and_env_secrets(self, tmp_path):
+        url_token = "url-secret-token"
+        header_token = "header-secret-token"
+        env_token = "env-secret-token"
+        server_cfg = UpstreamServerConfig(
+            prefix="test",
+            transport="sse",
+            url=f"https://alice:{url_token}@example.test/mcp",
+            headers={"Authorization": f"Bearer {header_token}"},
+            env={"UPSTREAM_TOKEN": env_token},
+            compression=CompressionStrategy.NONE,
+            max_retries=0,
+        )
+        proxy_cfg = ProxyConfig(
+            config_path=Path("/tmp/proxy.json"),
+            upstream_servers={"srv": server_cfg},
+        )
+        store = MetricsStore(tmp_path / "metrics.db")
+        store.initialize()
+        mgr = ProxyManager(proxy_cfg, TokenTracker(metrics_store=store))
+        message = (
+            f"request failed for {server_cfg.url}; auth=Bearer {header_token}; env={env_token}"
+        )
+        session = AsyncMock()
+        session.call_tool.side_effect = ConnectionError(message)
+        mgr._connections["srv"] = UpstreamConnection(
+            name="srv", config=server_cfg, session=session, tools=[]
+        )
+
+        with patch.object(mgr, "_reconnect_server", new_callable=AsyncMock):
+            with pytest.raises(ConnectionError):
+                await mgr.call_tool("srv", "tool", {})
+
+        msg = store._db.execute("SELECT error_message FROM proxy_metrics").fetchone()[0]
+        for secret in (url_token, header_token, env_token):
+            assert secret not in msg
+        assert "***@example.test" in msg
+        assert "<REDACTED>" in msg
+        store.close()
 
     async def test_timeout_persists_message(self, tmp_path):
         mgr = _make_manager_with_store(tmp_path, max_retries=0)
