@@ -454,11 +454,15 @@ changes inline only. See the deprecation policy in
   documents and 800 adversarial character-fuzz documents: no divergence.
 
   The placeholder machinery #877 made linear is removed rather than optimized
-  again, and cleaning costs what it did. A 150 KB tag-heavy body runs at
-  4.42-4.56 ms against 4.41-4.66 ms before; a 110 KB fence-heavy body at
-  6.71-8.01 ms against 6.17-6.31 ms; a 10 MB body of alternating script blocks
+  again, and cleaning costs about what it did. A 150 KB tag-heavy body runs at
+  4.34-4.42 ms against 4.39-4.50 ms before; a 110 KB fence-heavy body at
+  6.46-6.69 ms against 6.02-6.10 ms; a 10 MB body of alternating script blocks
   and tags — the shape that sits at the `max_upstream_chars` ceiling — at
-  0.135-0.140 s against 0.132-0.135 s, peaking at 37.5 MiB against 36.8 MiB.
+  0.129-0.131 s against 0.128-0.133 s, peaking at 37.5 MiB against 36.8 MiB.
+  Peak memory is the one place it is measurably higher: holding the protected
+  regions as offsets costs where the old code held them as saved strings, so a
+  2 MB fence-dense body peaks at 77.6 MiB against 65.2 MiB, with its time
+  unchanged (0.295-0.297 s against 0.305-0.314 s).
 
 - **Code-fence restoration in the cleaner is linear in response size** (#877).
   `_strip_html_jsx` shields code fences and generic types (`List<T>`) behind

@@ -24,7 +24,6 @@ _BARE_URL_LINE_RE = re.compile(r"^\s*[-*]?\s*https?://\S+\s*$")
 _MASK_CHAR = "\x00"
 _MASK_RUN_RE = re.compile(r"\x00+")
 
-_Span = tuple[int, int]
 
 # Prompt injection heuristic patterns — common LLM manipulation attempts
 _INJECTION_PATTERNS = [
@@ -40,7 +39,48 @@ _INJECTION_PATTERNS = [
 _logger = _logging.getLogger(__name__)
 
 
-def _mask_spans(text: str, spans: list[_Span]) -> str:
+def _find_spans(pattern: re.Pattern[str], text: str) -> list[int]:
+    """Every match of ``pattern`` as a flat ``[start, end, start, end, ...]``.
+
+    Flat rather than a list of pairs: a fence-dense response can hold hundreds
+    of thousands of matches, and a tuple per match costs several times what two
+    entries in one list do.
+    """
+    out: list[int] = []
+    for match in pattern.finditer(text):
+        out.append(match.start())
+        out.append(match.end())
+    return out
+
+
+def _merge_spans(first: list[int], second: list[int]) -> list[int]:
+    """Merge two ascending flat span lists, coalescing overlap and adjacency.
+
+    Both inputs come from ``finditer`` and are already ordered, so this is one
+    linear pass — sorting a concatenation would allocate a third list and cost
+    a comparison sort for order the matches already have. A generic can enclose
+    a fence, which is what makes the coalescing necessary.
+    """
+    out: list[int] = []
+    i = j = 0
+    len_first, len_second = len(first), len(second)
+    while i < len_first or j < len_second:
+        if j >= len_second or (i < len_first and first[i] <= second[j]):
+            span_start, span_end = first[i], first[i + 1]
+            i += 2
+        else:
+            span_start, span_end = second[j], second[j + 1]
+            j += 2
+        if out and span_start <= out[-1]:
+            if span_end > out[-1]:
+                out[-1] = span_end
+        else:
+            out.append(span_start)
+            out.append(span_end)
+    return out
+
+
+def _mask_spans(text: str, spans: list[int]) -> str:
     """Blank out ``spans`` while keeping every other offset where it was.
 
     Same length in, same length out — that is what lets a match found on the
@@ -50,24 +90,13 @@ def _mask_spans(text: str, spans: list[_Span]) -> str:
         return text
     parts: list[str] = []
     pos = 0
-    for start, end in spans:
+    for i in range(0, len(spans), 2):
+        start, end = spans[i], spans[i + 1]
         parts.append(text[pos:start])
         parts.append(_MASK_CHAR * (end - start))
         pos = end
     parts.append(text[pos:])
     return "".join(parts)
-
-
-def _merge_spans(spans: list[_Span]) -> list[_Span]:
-    """Coalesce sorted, possibly overlapping spans (a generic can contain a fence)."""
-    merged: list[_Span] = []
-    for start, end in sorted(spans):
-        if merged and start <= merged[-1][1]:
-            last_start, last_end = merged[-1]
-            merged[-1] = (last_start, max(last_end, end))
-        else:
-            merged.append((start, end))
-    return merged
 
 
 def _drop_from_segments(segments: list[int], matches: Iterator[re.Match[str]]) -> list[int] | None:
@@ -192,13 +221,11 @@ class DefaultContentCleaner:
         for — while the result is sliced from the original text by offset.
         Nothing an upstream can send is ever read back as a marker.
         """
-        fences = [m.span() for m in _CODE_FENCE_RE.finditer(text)]
+        fences = _find_spans(_CODE_FENCE_RE, text)
         # Generics are found on a copy where fences are already opaque, so a
         # fence inside one (``Map<`K`, V>``) cannot end the `[^>]+` early.
         with_fences_hidden = _mask_spans(text, fences)
-        protected = _merge_spans(
-            fences + [m.span() for m in _GENERIC_RE.finditer(with_fences_hidden)]
-        )
+        protected = _merge_spans(fences, _find_spans(_GENERIC_RE, with_fences_hidden))
         if not protected:
             # Nothing to keep out of the patterns' way, so there is nothing for
             # the offset bookkeeping below to preserve: remove in place.
@@ -212,25 +239,38 @@ class DefaultContentCleaner:
         # region is all _MASK_CHAR, so a match can neither begin nor end inside
         # one: a protected region is removed whole or not at all. When the run
         # count and lengths still line up afterwards — and the text brought no
-        # _MASK_CHAR of its own to be mistaken for one — nothing was removed
-        # and nothing merged, so the k-th run is the k-th region and the
-        # originals splice straight back in order.
+        # _MASK_CHAR of its own to be mistaken for one — no protected region
+        # was removed and no two were brought together, so the k-th run is the
+        # k-th region and the originals splice straight back in order. Tags and
+        # script blocks around them may well have been removed; that is the
+        # point, and it does not disturb the alignment.
         stripped = _SCRIPT_STYLE_RE.sub("", masked)
         stripped = _HTML_TAG_RE.sub("", stripped)
         stripped = _CLOSE_TAG_RE.sub("", stripped)
         if _MASK_CHAR not in text:
-            runs = _MASK_RUN_RE.findall(stripped)
-            if len(runs) == len(protected) and all(
-                len(run) == end - start for run, (start, end) in zip(runs, protected)
-            ):
-                parts: list[str] = []
-                pos = 0
-                for run_match, (start, end) in zip(_MASK_RUN_RE.finditer(stripped), protected):
-                    parts.append(stripped[pos : run_match.start()])
-                    parts.append(text[start:end])
-                    pos = run_match.end()
+            # Checked and spliced in the same walk: a separate pass to validate
+            # would materialize one string per run, and a fence-dense response
+            # has hundreds of thousands of them. A run that does not line up
+            # abandons the attempt and the segment walk below takes over.
+            parts: list[str] = []
+            pos = 0
+            index = 0
+            aligned = True
+            for run_match in _MASK_RUN_RE.finditer(stripped):
+                run_start = run_match.start()
+                if index >= len(protected) or (
+                    run_match.end() - run_start != protected[index + 1] - protected[index]
+                ):
+                    aligned = False
+                    break
+                parts.append(stripped[pos:run_start])
+                parts.append(text[protected[index] : protected[index + 1]])
+                pos = run_match.end()
+                index += 2
+            if aligned and index == len(protected):
                 parts.append(stripped[pos:])
                 return "".join(parts)
+            del parts
 
         total = len(text)
         segments = [0, total]

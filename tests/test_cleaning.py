@@ -64,10 +64,9 @@ class TestProtectedRegions:
         assert len(_clean(text)) <= len(text)
 
     def test_generic_enclosing_inline_code_is_preserved(self):
-        """The generic starts before the fence inside it, so the leftmost-start
-        rule takes the whole span. (Alternation order is not what decides this:
-        reordering the three alternatives leaves every test in this class
-        green, because none of them can start at the same offset.)"""
+        """Generics are located on a copy where fences are already blanked, and
+        the two span lists are then merged, so a generic that encloses a fence
+        covers it rather than being cut short by it."""
         assert _clean("Map<`K`, V> and <b>x</b>") == "Map<`K`, V> and x"
 
     def test_script_outside_a_fence_takes_the_fence_with_it(self):
@@ -153,8 +152,8 @@ class TestProtectedRegions:
         assert _clean(text) == expected
 
     def test_case_insensitive_script_is_dropped(self):
-        """`re.I` cannot be set on the whole alternation without making the
-        generic's `[A-Z]` match lowercase, so the script arm scopes its own."""
+        """The script/style rule matches case-insensitively, as it always has;
+        the generic rule must not, or `list<A>` would be protected too."""
         assert _clean("<SCRIPT>evil</SCRIPT> keep") == "keep"
         assert _clean("<Style>a{}</STYLE> keep") == "keep"
 
