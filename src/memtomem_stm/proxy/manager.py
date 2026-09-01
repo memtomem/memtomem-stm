@@ -567,13 +567,38 @@ def _mark_recorded(exc: BaseException) -> None:
 
 
 def _mark_safe_upstream_error(exc: BaseException, message: str) -> None:
-    """Pin credential-safe client text to the exact failing config generation."""
+    """Pin final client-facing text that carries no configured credentials.
+
+    Only for messages STM composes itself (no upstream string interpolated).
+    ``safe_upstream_error`` returns these verbatim: running the sanitizer over
+    already-safe text is what lets a short secret from another generation
+    rewrite a placeholder. To pin an upstream exception whose config may be
+    retired before the boundary renders it, use ``_pin_safe_upstream_scrub``.
+    """
     try:
         exc._stm_safe_upstream_error = message  # type: ignore[attr-defined]
     except (AttributeError, TypeError):
         # Most Python exceptions carry ``__dict__``. The fallback for unusual
         # slotted exceptions is ``safe_upstream_error`` scanning the active,
         # live, and still-retired configurations.
+        pass
+
+
+def _pin_safe_upstream_scrub(exc: BaseException, cfg: UpstreamServerConfig) -> None:
+    """Pin one config's scrub INPUTS (url + secret values) to ``exc``.
+
+    A concurrent hot reload can retire and close the generation whose
+    credentials the exception text may echo, leaving nothing for
+    ``safe_upstream_error`` to scrub against. Capturing the inputs — rather
+    than pre-scrubbing the text — keeps every secret in the SINGLE sanitizer
+    pass at the boundary, which is what makes the placeholder safe.
+    """
+    try:
+        exc._stm_safe_upstream_scrub = (  # type: ignore[attr-defined]
+            cfg.url,
+            [*(cfg.headers or {}).values(), *(cfg.env or {}).values()],
+        )
+    except (AttributeError, TypeError):
         pass
 
 
@@ -2014,13 +2039,26 @@ class ProxyManager:
             configs.append(live)
 
         pinned = getattr(exc, "_stm_safe_upstream_error", None)
-        text = pinned if isinstance(pinned, str) else f"{type(exc).__name__}: {exc}"
+        if isinstance(pinned, str):
+            # STM composed this text and it interpolates no upstream string, so
+            # it is already credential-free. Sanitizing it again is exactly the
+            # double pass that corrupts the placeholder.
+            return pinned[:MAX_ERROR_MESSAGE_CHARS]
+
+        text = f"{type(exc).__name__}: {exc}"
         # ``sanitize_secrets`` must see every secret in ONE pass: it documents
         # that a second pass can rewrite a placeholder the first just inserted
         # (a short secret like ``RED`` corrupting ``<REDACTED>``). Redaction of
         # each generation's url is idempotent and stays in the loop; the secret
         # values are collected and scrubbed once.
         secret_values: list[str] = []
+        pinned_scrub = getattr(exc, "_stm_safe_upstream_scrub", None)
+        if isinstance(pinned_scrub, tuple) and len(pinned_scrub) == 2:
+            # A generation retired and closed since the failure contributes no
+            # config above; its pinned inputs join the same single pass.
+            pinned_url, pinned_secrets = pinned_scrub
+            text = redact_exception_text(text, pinned_url)
+            secret_values.extend(pinned_secrets)
         for cfg in configs:
             text = redact_exception_text(text, cfg.url)
             secret_values.extend((cfg.headers or {}).values())
@@ -5019,7 +5057,7 @@ class ProxyManager:
                 # header, or environment credentials.
                 try:
                     pinned_cfg = self._server_cfg(self._connections[server], cfg_snap)
-                    _mark_safe_upstream_error(exc, self._safe_error_for_config(exc, pinned_cfg))
+                    _pin_safe_upstream_scrub(exc, pinned_cfg)
                 except Exception:
                     logger.debug("Failed to pin credential-safe upstream error")
                 self._log_execution(
@@ -5645,6 +5683,13 @@ class ProxyManager:
                         )
                     )
                     _mark_recorded(exc)
+                    # A response arrived and was correlated — the round trip
+                    # completed, it was only unusable. Same signal as the
+                    # success path above: leaving the breaker's prior failures
+                    # standing as "consecutive" would let an unrelated later
+                    # failure trip it.
+                    if breaker is not None:
+                        breaker.record_success()
                     raise
                 # Only retry transport/connection errors and MCP errors.
                 # Programming errors (TypeError, AttributeError, etc.)

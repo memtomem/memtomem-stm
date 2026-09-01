@@ -1980,3 +1980,80 @@ def test_safe_upstream_error_scrubs_every_generation_in_one_pass():
     # A second pass for the retired ``RED`` value would rewrite the placeholder
     # into ``<<REDACTED>ACTED>``.
     assert text == "RuntimeError: auth <REDACTED> failed"
+
+
+def test_safe_upstream_error_returns_pinned_text_verbatim():
+    """Pinned text is STM-composed and already credential-free.
+
+    Re-running the sanitizer over it is the second pass that lets another
+    generation's short secret rewrite the placeholder it already contains.
+    """
+    from memtomem_stm.proxy.manager import _mark_safe_upstream_error
+
+    mgr = _make_manager()
+    conn = mgr._connections["srv"]
+    conn.config = conn.config.model_copy(update={"env": {"OLD": "RED"}})
+
+    exc = ConnectionError("ignored")
+    _mark_safe_upstream_error(exc, "ConnectionError: recovery failed; <REDACTED> stays intact")
+
+    assert (
+        mgr.safe_upstream_error("srv", exc)
+        == "ConnectionError: recovery failed; <REDACTED> stays intact"
+    )
+
+
+def test_safe_upstream_error_scrubs_pinned_inputs_of_a_closed_generation():
+    """A generation retired and closed since the failure leaves no config to
+    scrub against, so its url/secrets are pinned to the exception and join the
+    same single sanitizer pass."""
+    from memtomem_stm.proxy.manager import _pin_safe_upstream_scrub
+
+    mgr = _make_manager()
+    conn = mgr._connections["srv"]
+    conn.config = conn.config.model_copy(update={"env": {"NEW": "RED"}})
+    gone = conn.config.model_copy(update={"env": {"GONE": "RETIREDSECRET"}})
+
+    exc = RuntimeError("spawn failed: RETIREDSECRET")
+    _pin_safe_upstream_scrub(exc, gone)
+
+    assert mgr.safe_upstream_error("srv", exc) == "RuntimeError: spawn failed: <REDACTED>"
+
+
+async def test_oversize_response_closes_the_circuit_breaker():
+    """An oversize response is a COMPLETED round trip — unusable, but proof the
+    upstream is alive. Leaving prior failures standing as "consecutive" would
+    let an unrelated later failure trip the breaker."""
+    from mcp import types as mcp_types
+    from mcp.shared.exceptions import MCPError
+
+    from memtomem_stm.utils.mcp_transport import (
+        INBOUND_MESSAGE_TOO_LARGE_CODE,
+        is_inbound_message_too_large_error,
+    )
+
+    mgr = _make_manager(max_retries=0, circuit_max_failures=3, tools=_read_only_tools())
+    breaker = mgr._connections["srv"].breaker
+    breaker.record_failure()
+    breaker.record_failure()
+    assert breaker.failure_count == 2
+
+    exc = MCPError.from_jsonrpc_error(
+        mcp_types.JSONRPCError(
+            jsonrpc="2.0",
+            id=1,
+            error=mcp_types.ErrorData(
+                code=INBOUND_MESSAGE_TOO_LARGE_CODE,
+                message="Inbound MCP response exceeded max_upstream_bytes=100",
+                data={"memtomem_stm.inbound_message_too_large": True},
+            ),
+        )
+    )
+    assert is_inbound_message_too_large_error(exc)
+    _get_session(mgr).call_tool.side_effect = exc
+
+    with pytest.raises(MCPError):
+        await mgr.call_tool("srv", "tool", {})
+
+    assert breaker.failure_count == 0
+    assert not breaker.is_open
