@@ -415,6 +415,17 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **Response-cache warm starts no longer rescan every cached body for privacy**
+  (issue #872). `ProxyCache` now stamps the fingerprint of its storage privacy
+  patterns in a component-owned SQLite metadata table. A missing or changed
+  fingerprint still performs the full `result` + envelope sweep and removes
+  matches before publishing the new stamp; an unchanged fingerprint skips the
+  body query entirely. Write-time rejection and read-time scan-and-evict remain
+  in place for rows created after that sweep. **Behavior change**: none
+  external; the first open after this upgrade or a later policy change still
+  performs the same repair, while subsequent starts avoid cache-size-dependent
+  regex work.
+
 - **The cleaner keeps its markers out of the text entirely** (#948).
   `_strip_html_jsx` used to swap each code fence and generic type for a
   NUL-delimited marker (`\x00FENCE0\x00`) while HTML was stripped, then put

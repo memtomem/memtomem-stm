@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from memtomem_stm.proxy.privacy import contains_sensitive_content
+from memtomem_stm.proxy import privacy
 from memtomem_stm.utils.digest import framed_digest
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.utils.json_out import (
@@ -41,6 +41,30 @@ _CREATE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_proxy_cache_server_tool
 ON proxy_cache (server, tool);
 """
+
+# Policy bookkeeping is deliberately table-scoped rather than stored in
+# ``PRAGMA user_version``. That pragma already belongs to the response-cache
+# key/row schema below and, as a database-global slot, can also be stamped by a
+# different component when configurable store paths share one SQLite file.
+_CREATE_META_TABLE = """
+CREATE TABLE IF NOT EXISTS proxy_cache_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"""
+
+_PRIVACY_POLICY_FINGERPRINT_KEY = "privacy_policy_fingerprint"
+
+# Version of the fingerprint encoding and any scanner semantics not expressed
+# by ``DEFAULT_PATTERNS`` itself. Pattern additions/removals change the digest
+# automatically; bump this only when the same pattern tuple would be evaluated
+# under a meaningfully different storage policy.
+_PRIVACY_POLICY_EPOCH = 1
+
+
+def _privacy_policy_fingerprint() -> str:
+    """Stable digest of the exact default pattern policy used by this store."""
+    return framed_digest((str(_PRIVACY_POLICY_EPOCH), *privacy.DEFAULT_PATTERNS))
 
 
 @dataclass
@@ -215,6 +239,7 @@ class ProxyCache:
                 db.execute(f"PRAGMA user_version = {_KEY_SCHEMA_VERSION}")
             db.execute(_CREATE_TABLE)
             db.execute(_CREATE_INDEX)
+            db.execute(_CREATE_META_TABLE)
             db.commit()
             # Startup purge of expired rows, running against the local
             # ``db`` before it is handed off to ``self._db``. Failures fall
@@ -238,28 +263,41 @@ class ProxyCache:
                 (_PROGRESSIVE_MARKER, _SELECTION_KEY_MARKER, _TOC_SHAPE_MARKER),
             )
             db.commit()
-            # Purge of legacy rows cached before the privacy gate in ``set()``
-            # (#453) — they may embed secret-looking content that SECURITY.md
-            # promises is never persisted. Privacy patterns are Python regexes,
-            # so unlike the marker purge above this scans rows in Python; the
-            # scan and the gate share ``contains_sensitive_content`` so they
-            # can never diverge. Runs on every startup (matching the marker
-            # purge) — after the first pass it finds nothing, because ``set()``
-            # refuses new matching rows. Rows written LATER by an older
-            # still-running pre-gate process are outside this purge's reach;
-            # the read-side guard in ``get()`` refuses and evicts those.
-            stale_keys = [
-                key
-                for key, result, envelope in db.execute(
-                    "SELECT cache_key, result, envelope_json FROM proxy_cache"
-                )
-                if contains_sensitive_content(result)
-                or (envelope is not None and contains_sensitive_content(envelope))
-            ]
-            if stale_keys:
-                db.executemany(
-                    "DELETE FROM proxy_cache WHERE cache_key = ?",
-                    [(key,) for key in stale_keys],
+            # Purge rows cached before the privacy gate in ``set()`` (#453),
+            # or before the current pattern policy. The regex sweep is gated
+            # by a database stamp because feeding every cached response body
+            # through every pattern on every startup makes initialization
+            # proportional to cache volume (#872). A missing/stale stamp runs
+            # the full repair once; an equal stamp skips even the body SELECT.
+            #
+            # Stamp LAST, in the same transaction as any deletions. A scan,
+            # delete, or stamp failure therefore leaves the previous/missing
+            # value in place and the next opener retries. Rows written later by
+            # an older process or an external SQL writer remain covered by the
+            # read-side guard in ``get()``.
+            policy_fingerprint = _privacy_policy_fingerprint()
+            stamp_row = db.execute(
+                "SELECT value FROM proxy_cache_meta WHERE key = ?",
+                (_PRIVACY_POLICY_FINGERPRINT_KEY,),
+            ).fetchone()
+            if stamp_row is None or stamp_row[0] != policy_fingerprint:
+                stale_keys = [
+                    key
+                    for key, result, envelope in db.execute(
+                        "SELECT cache_key, result, envelope_json FROM proxy_cache"
+                    )
+                    if privacy.contains_sensitive_content(result)
+                    or (envelope is not None and privacy.contains_sensitive_content(envelope))
+                ]
+                if stale_keys:
+                    db.executemany(
+                        "DELETE FROM proxy_cache WHERE cache_key = ?",
+                        [(key,) for key in stale_keys],
+                    )
+                db.execute(
+                    "INSERT INTO proxy_cache_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (_PRIVACY_POLICY_FINGERPRINT_KEY, policy_fingerprint),
                 )
                 db.commit()
         except Exception:
@@ -310,8 +348,8 @@ class ProxyCache:
             return None
         entry = CacheEntry(result=row[0], created_at=row[1], ttl_seconds=row[2])
         envelope_json = row[4]
-        if contains_sensitive_content(entry.result) or (
-            envelope_json is not None and contains_sensitive_content(envelope_json)
+        if privacy.contains_sensitive_content(entry.result) or (
+            envelope_json is not None and privacy.contains_sensitive_content(envelope_json)
         ):
             # Read-side mirror of the ``set()`` gate: a row can land here
             # without passing ``set()`` — written by an older still-running
@@ -478,8 +516,8 @@ class ProxyCache:
                     "Skipping cache store for %s/%s: envelope is not JSON-safe", server, tool
                 )
                 return
-        if contains_sensitive_content(result) or (
-            envelope_json is not None and contains_sensitive_content(envelope_json)
+        if privacy.contains_sensitive_content(result) or (
+            envelope_json is not None and privacy.contains_sensitive_content(envelope_json)
         ):
             # SECURITY.md: responses that look like secrets are never
             # persisted to the response cache. Enforced at the store

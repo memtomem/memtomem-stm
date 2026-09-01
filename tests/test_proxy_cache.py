@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import time
+from pathlib import Path
 
 import pytest
 
+from memtomem_stm.proxy import cache as cache_module
 from memtomem_stm.proxy.cache import (
     ProxyCache,
     _make_key,
+    _privacy_policy_fingerprint,
     response_carries_transient_key,
 )
 from memtomem_stm.proxy.compression import HybridCompressor, SelectiveCompressor
@@ -23,6 +27,22 @@ _TOC_TEXT = "# Doc\n\n" + "\n\n".join(
     f"## Section {i} heading text\n" + ("alpha beta gamma delta epsilon zeta " * 12)
     for i in range(12)
 )
+
+
+def _read_privacy_policy_stamp(db_path: Path) -> str | None:
+    db = sqlite3.connect(str(db_path))
+    try:
+        row = db.execute(
+            "SELECT value FROM proxy_cache_meta WHERE key = ?",
+            (cache_module._PRIVACY_POLICY_FINGERPRINT_KEY,),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
+        return None
+    finally:
+        db.close()
+    return str(row[0]) if row is not None else None
 
 
 class TestProxyCacheBasic:
@@ -367,6 +387,198 @@ class TestPrivacyGate:
         proxy_cache.set("s", "t", {}, "contact: dev@example.com", ttl_seconds=60.0)
         assert proxy_cache.get("s", "t", {}) is None
 
+    def test_initialize_stamps_current_privacy_policy(self, tmp_path):
+        db_path = tmp_path / "privacy_stamp.db"
+        cache = ProxyCache(db_path, max_entries=100)
+        cache.initialize()
+        cache.close()
+
+        assert _read_privacy_policy_stamp(db_path) == _privacy_policy_fingerprint()
+
+    def test_matching_stamp_skips_nonempty_body_query_and_scan(self, tmp_path, monkeypatch):
+        """The #872 hot path must be real, not an empty-cache false pass."""
+        db_path = tmp_path / "warm_privacy_stamp.db"
+        seed = ProxyCache(db_path, max_entries=100)
+        seed.initialize()
+        try:
+            seed.set("s", "clean", {}, "ordinary cached response", ttl_seconds=None)
+            assert seed.stats()["total_entries"] == 1  # positive control
+        finally:
+            seed.close()
+
+        statements: list[str] = []
+        scan_calls: list[str] = []
+        real_connect = sqlite3.connect
+
+        def _traced_connect(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            db = real_connect(*args, **kwargs)
+            db.set_trace_callback(statements.append)
+            return db
+
+        def _scan_spy(text: str) -> bool:
+            scan_calls.append(text)
+            return False
+
+        monkeypatch.setattr(cache_module.sqlite3, "connect", _traced_connect)
+        monkeypatch.setattr(cache_module.privacy, "contains_sensitive_content", _scan_spy)
+
+        reopened = ProxyCache(db_path, max_entries=100)
+        reopened.initialize()
+        reopened.close()
+
+        normalized = [" ".join(statement.split()) for statement in statements]
+        assert not any(
+            statement.startswith("SELECT cache_key, result, envelope_json FROM proxy_cache")
+            for statement in normalized
+        )
+        assert scan_calls == []
+
+    @pytest.mark.parametrize("stamp_state", ["missing", "stale"])
+    def test_missing_or_stale_stamp_rescans_result_and_envelope(self, tmp_path, stamp_state):
+        db_path = tmp_path / f"privacy_{stamp_state}.db"
+        seed = ProxyCache(db_path, max_entries=100)
+        seed.initialize()
+        try:
+            seed.set("s", "clean", {}, "ordinary cached response", ttl_seconds=None)
+        finally:
+            seed.close()
+
+        raw = sqlite3.connect(str(db_path))
+        try:
+            raw.executemany(
+                "INSERT INTO proxy_cache "
+                "(cache_key, server, tool, result, created_at, ttl_seconds, "
+                "envelope_json, envelope_safe) VALUES (?, 's', ?, ?, ?, NULL, ?, 1)",
+                [
+                    (
+                        _make_key("s", "result-secret", {}),
+                        "result-secret",
+                        "login password=hunter2",
+                        time.time(),
+                        None,
+                    ),
+                    (
+                        _make_key("s", "envelope-secret", {}),
+                        "envelope-secret",
+                        "ordinary body",
+                        time.time(),
+                        '{"schema_version":1,"_meta":{"password":"hunter2"}}',
+                    ),
+                ],
+            )
+            if stamp_state == "missing":
+                raw.execute(
+                    "DELETE FROM proxy_cache_meta WHERE key = ?",
+                    (cache_module._PRIVACY_POLICY_FINGERPRINT_KEY,),
+                )
+            else:
+                raw.execute(
+                    "UPDATE proxy_cache_meta SET value = 'stale' WHERE key = ?",
+                    (cache_module._PRIVACY_POLICY_FINGERPRINT_KEY,),
+                )
+            raw.commit()
+        finally:
+            raw.close()
+
+        reopened = ProxyCache(db_path, max_entries=100)
+        reopened.initialize()
+        try:
+            remaining = {
+                row[0] for row in reopened._db.execute("SELECT tool FROM proxy_cache").fetchall()
+            }
+            assert remaining == {"clean"}
+        finally:
+            reopened.close()
+
+        assert _read_privacy_policy_stamp(db_path) == _privacy_policy_fingerprint()
+
+    def test_added_pattern_changes_fingerprint_and_forces_rescan(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "changed_privacy_policy.db"
+        marker = "policy-only-marker-872"
+        seed = ProxyCache(db_path, max_entries=100)
+        seed.initialize()
+        try:
+            seed.set("s", "new-secret", {}, f"contains {marker}", ttl_seconds=None)
+            assert seed.stats()["total_entries"] == 1
+        finally:
+            seed.close()
+
+        old_fingerprint = _privacy_policy_fingerprint()
+        monkeypatch.setattr(
+            cache_module.privacy,
+            "DEFAULT_PATTERNS",
+            [*cache_module.privacy.DEFAULT_PATTERNS, re.escape(marker)],
+        )
+        assert _privacy_policy_fingerprint() != old_fingerprint
+
+        reopened = ProxyCache(db_path, max_entries=100)
+        reopened.initialize()
+        try:
+            assert reopened._db.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0] == 0
+        finally:
+            reopened.close()
+        assert _read_privacy_policy_stamp(db_path) == _privacy_policy_fingerprint()
+
+    def test_stamp_failure_rolls_back_deletions_and_retries(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "privacy_stamp_failure.db"
+        seed = ProxyCache(db_path, max_entries=100)
+        seed.initialize()
+        seed.close()
+
+        raw = sqlite3.connect(str(db_path))
+        try:
+            raw.execute(
+                "INSERT INTO proxy_cache "
+                "(cache_key, server, tool, result, created_at, ttl_seconds) "
+                "VALUES (?, 's', 'secret', 'password=hunter2', ?, NULL)",
+                (_make_key("s", "secret", {}), time.time()),
+            )
+            raw.execute(
+                "UPDATE proxy_cache_meta SET value = 'stale' WHERE key = ?",
+                (cache_module._PRIVACY_POLICY_FINGERPRINT_KEY,),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+        real_connect = sqlite3.connect
+
+        class _StampFailsConnection:
+            def __init__(self, real: sqlite3.Connection) -> None:
+                self._real = real
+
+            def execute(self, sql: str, *args):  # noqa: ANN002, ANN202
+                if sql.lstrip().startswith("INSERT INTO proxy_cache_meta"):
+                    raise sqlite3.OperationalError("disk I/O error")
+                return self._real.execute(sql, *args)
+
+            def __getattr__(self, name: str):  # noqa: ANN202
+                return getattr(self._real, name)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                cache_module.sqlite3,
+                "connect",
+                lambda *args, **kwargs: _StampFailsConnection(real_connect(*args, **kwargs)),
+            )
+            with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+                ProxyCache(db_path, max_entries=100).initialize()
+
+        assert _read_privacy_policy_stamp(db_path) == "stale"
+        check = sqlite3.connect(str(db_path))
+        try:
+            assert check.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0] == 1
+        finally:
+            check.close()
+
+        recovered = ProxyCache(db_path, max_entries=100)
+        recovered.initialize()
+        try:
+            assert recovered._db.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0] == 0
+        finally:
+            recovered.close()
+        assert _read_privacy_policy_stamp(db_path) == _privacy_policy_fingerprint()
+
     def test_initialize_purges_legacy_secret_rows(self, tmp_path):
         db_path = tmp_path / "legacy_secrets.db"
         seed = ProxyCache(db_path, max_entries=100)
@@ -392,6 +604,13 @@ class TestPrivacyGate:
                     None,
                 ),
             )
+            # Model a pre-stamp database. Without this, a raw row inserted by
+            # an out-of-band writer after a current sweep is intentionally left
+            # for the read-side guard below.
+            raw.execute(
+                "DELETE FROM proxy_cache_meta WHERE key = ?",
+                (cache_module._PRIVACY_POLICY_FINGERPRINT_KEY,),
+            )
             raw.commit()
         finally:
             raw.close()
@@ -400,6 +619,10 @@ class TestPrivacyGate:
         reopened = ProxyCache(db_path, max_entries=100)
         reopened.initialize()
         try:
+            remaining = {
+                row[0] for row in reopened._db.execute("SELECT tool FROM proxy_cache").fetchall()
+            }
+            assert remaining == {"plain"}  # proved before ``get`` can evict
             assert reopened.get("s", "sec", {}) is None
             assert reopened.get("s", "plain", {}) == "ordinary cached response"
         finally:
