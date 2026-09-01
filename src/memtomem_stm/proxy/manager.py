@@ -2873,6 +2873,23 @@ class ProxyManager:
             except Exception:
                 logger.debug("Failed to close tool-graph consult cache", exc_info=True)
             self._toolgraph_cache = None
+        # Reset the #952 retire bookkeeping, mirroring the #557 reset above. A
+        # retire task cancelled before its first step never runs its coroutine
+        # body, so neither discard in ``_close_retired_generation`` fires and
+        # the generation stays in ``retiring_generations`` with no task behind
+        # it — the drain loop below would then skip that entry forever, leaving
+        # the retired transport open (stdio child + fds). A task that DID run
+        # discards its own marker in ``finally``, so the markers surviving here
+        # are exactly the cancelled-before-first-step ones, and their resources
+        # are still in ``retired_resources`` (popped only on a successful
+        # close).
+        #
+        # Markers are cleared only once every background task finished
+        # unwinding: a straggler may still be mid-close, and its marker is what
+        # keeps the loop below from closing the same resources beside it.
+        if not self._background_tasks:
+            for conn in self._connections.values():
+                conn.retiring_generations.clear()
         for conn in self._connections.values():
             for generation, resources in list(conn.retired_resources.items()):
                 if generation in conn.retiring_generations:

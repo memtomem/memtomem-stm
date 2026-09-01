@@ -16,7 +16,11 @@ from memtomem_stm.proxy.config import (
     TransportType,
     UpstreamServerConfig,
 )
-from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
+from memtomem_stm.proxy.manager import (
+    ProxyManager,
+    UpstreamConnection,
+    _RetiredConnectionResources,
+)
 from memtomem_stm.proxy.metrics import TokenTracker
 
 
@@ -1569,6 +1573,33 @@ class TestConnectionGenerationLeases:
 
         old_stack.aclose.assert_awaited_once()
         assert generation not in conn.retired_resources
+
+    async def test_stop_closes_retired_generation_whose_retire_task_never_started(self):
+        """#952: a retire task cancelled before its first step never discards its
+        ``retiring_generations`` marker, and stop() used to skip exactly those
+        generations — leaving the retired transport open."""
+        cfg = UpstreamServerConfig(prefix="docs")
+        mgr = _make_manager(servers={"docs": cfg})
+        old_stack = AsyncMock()
+        conn = UpstreamConnection(name="docs", config=cfg, session=AsyncMock(), tools=[])
+        mgr._connections["docs"] = conn
+        # A reconnect retired generation 0 while one call still held a lease.
+        conn.retired_resources[0] = _RetiredConnectionResources(
+            owner=None, stack=old_stack, config=cfg
+        )
+        conn.active_calls[0] = 1
+        conn.reconnect_generation = 1
+
+        # Releasing the last lease marks the generation and schedules the close…
+        mgr._release_connection_session(conn, 0)
+        assert conn.retiring_generations == {0}
+        # …and stop() runs before the loop ever steps that task (no await in
+        # between), so its drain loop cancels it before the coroutine body runs.
+        await mgr.stop()
+
+        old_stack.aclose.assert_awaited_once()
+        assert conn.retired_resources == {}
+        assert conn.retiring_generations == set()
 
     async def test_retired_generation_error_keeps_old_credentials_client_safe(self):
         old_url_token = "old-url-token"
