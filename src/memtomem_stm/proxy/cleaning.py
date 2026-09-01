@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import bisect
 import logging as _logging
 import re
 import unicodedata
+from collections.abc import Iterator
 from typing import Protocol
 
 _CODE_FENCE_RE = re.compile(r"```[\s\S]*?```|`[^`\n]+`")
@@ -22,6 +22,7 @@ _BARE_URL_LINE_RE = re.compile(r"^\s*[-*]?\s*https?://\S+\s*$")
 # from the ORIGINAL text by offset — so an upstream copy of it cannot make the
 # cleaner drop or duplicate anything.
 _MASK_CHAR = "\x00"
+_MASK_RUN_RE = re.compile(r"\x00+")
 
 _Span = tuple[int, int]
 
@@ -69,42 +70,52 @@ def _merge_spans(spans: list[_Span]) -> list[_Span]:
     return merged
 
 
-def _drop_from_segments(segments: list[_Span], cuts: list[_Span], total: int) -> list[_Span]:
-    """Remove ``cuts`` — offsets into the segments joined end to end — from ``segments``.
+def _drop_from_segments(segments: list[int], matches: Iterator[re.Match[str]]) -> list[int] | None:
+    """Remove the spans ``matches`` reports — offsets into the segments joined
+    end to end — from ``segments``, or return ``None`` when there were none.
+
+    ``segments`` is a flat ``[start, end, start, end, ...]`` in original
+    coordinates. It and the matches are both sorted and non-overlapping, so one
+    merge walks them together without a search per match, and the matches are
+    consumed straight off the iterator: a response at the ``max_upstream_chars``
+    ceiling produces hundreds of thousands of them, and materializing a list of
+    pairs first costs more than the rest of the pass.
 
     The removal patterns run one after another over the surviving text, so each
     sees what the previous one left *joined*, exactly as sequential ``sub``
-    calls on a shrinking string did. Masking the cut in place instead would
+    calls on a shrinking string did. Masking a match in place instead would
     leave the two sides apart, and a close tag formed only by the join would
     survive.
     """
-    kept_view: list[_Span] = []
-    pos = 0
-    for start, end in cuts:
-        if start > pos:
-            kept_view.append((pos, start))
-        pos = max(pos, end)
-    if pos < total:
-        kept_view.append((pos, total))
-
-    view_starts: list[int] = []
-    offset = 0
-    for start, end in segments:
-        view_starts.append(offset)
-        offset += end - start
-
-    out: list[_Span] = []
-    for view_start, view_end in kept_view:
-        index = bisect.bisect_right(view_starts, view_start) - 1
-        while view_start < view_end:
-            seg_start, seg_end = segments[index]
-            seg_view_start = view_starts[index]
-            take_end = min(view_end, seg_view_start + seg_end - seg_start)
-            out.append(
-                (seg_start + view_start - seg_view_start, seg_start + take_end - seg_view_start)
-            )
-            view_start = take_end
-            index += 1
+    match = next(matches, None)
+    if match is None:
+        return None
+    cut_start, cut_end = match.span()
+    out: list[int] = []
+    view_pos = 0
+    for i in range(0, len(segments), 2):
+        seg_start = segments[i]
+        seg_end = segments[i + 1]
+        seg_view_end = view_pos + seg_end - seg_start
+        keep_from = seg_start
+        while match is not None and cut_start < seg_view_end:
+            if cut_end > view_pos:
+                start_here = seg_start + cut_start - view_pos if cut_start > view_pos else seg_start
+                end_here = seg_start + cut_end - view_pos if cut_end < seg_view_end else seg_end
+                if start_here > keep_from:
+                    out.append(keep_from)
+                    out.append(start_here)
+                if end_here > keep_from:
+                    keep_from = end_here
+                if cut_end > seg_view_end:
+                    break
+            match = next(matches, None)
+            if match is not None:
+                cut_start, cut_end = match.span()
+        if keep_from < seg_end:
+            out.append(keep_from)
+            out.append(seg_end)
+        view_pos = seg_view_end
     return out
 
 
@@ -196,20 +207,47 @@ class DefaultContentCleaner:
             return _CLOSE_TAG_RE.sub("", stripped)
 
         masked = _mask_spans(text, protected)
+
+        # Every removal pattern opens on "<" and closes on ">", and a masked
+        # region is all _MASK_CHAR, so a match can neither begin nor end inside
+        # one: a protected region is removed whole or not at all. When the run
+        # count and lengths still line up afterwards — and the text brought no
+        # _MASK_CHAR of its own to be mistaken for one — nothing was removed
+        # and nothing merged, so the k-th run is the k-th region and the
+        # originals splice straight back in order.
+        stripped = _SCRIPT_STYLE_RE.sub("", masked)
+        stripped = _HTML_TAG_RE.sub("", stripped)
+        stripped = _CLOSE_TAG_RE.sub("", stripped)
+        if _MASK_CHAR not in text:
+            runs = _MASK_RUN_RE.findall(stripped)
+            if len(runs) == len(protected) and all(
+                len(run) == end - start for run, (start, end) in zip(runs, protected)
+            ):
+                parts: list[str] = []
+                pos = 0
+                for run_match, (start, end) in zip(_MASK_RUN_RE.finditer(stripped), protected):
+                    parts.append(stripped[pos : run_match.start()])
+                    parts.append(text[start:end])
+                    pos = run_match.end()
+                parts.append(stripped[pos:])
+                return "".join(parts)
+
         total = len(text)
-        segments: list[_Span] = [(0, total)]
+        segments = [0, total]
         view = masked
         patterns = (_SCRIPT_STYLE_RE, _HTML_TAG_RE, _CLOSE_TAG_RE)
         for index, pattern in enumerate(patterns):
-            cuts = [m.span() for m in pattern.finditer(view)]
-            if not cuts:
+            dropped = _drop_from_segments(segments, pattern.finditer(view))
+            if dropped is None:
                 continue
-            segments = _drop_from_segments(segments, cuts, len(view))
+            segments = dropped
             if index + 1 < len(patterns):
-                view = "".join(masked[start:end] for start, end in segments)
-        if len(segments) == 1 and segments[0] == (0, total):
+                view = "".join(
+                    masked[segments[i] : segments[i + 1]] for i in range(0, len(segments), 2)
+                )
+        if segments == [0, total]:
             return text
-        return "".join(text[start:end] for start, end in segments)
+        return "".join(text[segments[i] : segments[i + 1]] for i in range(0, len(segments), 2))
 
     def _deduplicate_paragraphs(self, text: str) -> str:
         paragraphs = re.split(r"\n{2,}", text)

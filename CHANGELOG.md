@@ -435,14 +435,15 @@ changes inline only. See the deprecation policy in
     *after* the `max_upstream_chars` guard, which is applied before cleaning
     and so bounds only the input.
 
-  The fences, generics and `<script>`/`<style>` blocks are now located as
-  spans and blanked out on a separate, equal-length copy of the text. The
-  removal patterns scan that copy — so a protected region is opaque to them,
-  which is all the markers were ever for — while every character of the result
-  is sliced from the original text by offset. Nothing an upstream sends is
-  ever read back as a marker, so neither defect is expressible rather than
-  merely unlikely. The same input now returns 56,006 characters and the
-  data-loss input is returned unchanged.
+  The fences and generic types are now located as spans and blanked out on a
+  separate copy of the text of equal length. The removal patterns — the
+  `<script>`/`<style>` rule and the two tag rules — scan that copy, so a
+  protected region is one opaque run to them, which is all the markers were
+  ever for, and what they match is removed from the result. Every character
+  that survives is sliced from the original text by offset, so nothing an
+  upstream sends is ever read back as a marker and neither defect is
+  expressible rather than merely unlikely. The same input now returns 56,006
+  characters and the data-loss input is returned unchanged.
 
   **Behavior change**: on those two classes of input, and only those. Every
   other response cleans byte-identically, including the corners where the old
@@ -453,10 +454,11 @@ changes inline only. See the deprecation policy in
   documents and 800 adversarial character-fuzz documents: no divergence.
 
   The placeholder machinery #877 made linear is removed rather than optimized
-  again. Cleaning a 110 KB fence-heavy body costs 6.37-6.76 ms against
-  5.55-5.95 ms before (7 runs); a 150 KB tag-heavy body with no protected
-  regions is unchanged (4.10-4.13 ms against 4.14-4.22 ms), since it takes a
-  fast path that skips the offset bookkeeping entirely.
+  again, and cleaning costs what it did. A 150 KB tag-heavy body runs at
+  4.42-4.56 ms against 4.41-4.66 ms before; a 110 KB fence-heavy body at
+  6.71-8.01 ms against 6.17-6.31 ms; a 10 MB body of alternating script blocks
+  and tags — the shape that sits at the `max_upstream_chars` ceiling — at
+  0.135-0.140 s against 0.132-0.135 s, peaking at 37.5 MiB against 36.8 MiB.
 
 - **Code-fence restoration in the cleaner is linear in response size** (#877).
   `_strip_html_jsx` shields code fences and generic types (`List<T>`) behind

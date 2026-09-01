@@ -109,6 +109,49 @@ class TestProtectedRegions:
         would keep the two sides apart and leave this `</a>` behind."""
         assert _clean("</<b>a>") == ""
 
+    def test_regions_that_become_adjacent_after_a_removal(self):
+        r"""Two fences separated by a tag end up side by side once the tag
+        goes. The shortcut that splices regions back by position only holds
+        while their blanked runs still line up one-for-one, so this has to
+        fall through to the segment bookkeeping and still come out right."""
+        assert _clean("`a`<b>`c`") == "`a``c`"
+
+    def test_region_removed_with_its_enclosing_script(self):
+        r"""A protected region can be removed outright, which is the other way
+        the runs stop lining up."""
+        assert _clean("`a`<script>x</script>`b`") == "`a``b`"
+
+    def test_upstream_nul_cannot_stand_in_for_a_removed_region(self):
+        r"""The splice shortcut matches blanked runs to regions by position, so
+        it is only sound while every run in the stripped text came from a
+        region. Here the response brings its own NUL run: one fence is removed
+        with the script around it, and the upstream run takes its place in the
+        count with the same length. Without the check that the text carries no
+        NUL of its own, the removed fence's content reappears at the upstream
+        run (`a`X`b`) — content the response never had at that spot."""
+        text = "`a`X\x00\x00\x00<script>`b`</script>"
+        assert _clean(text) == "`a`X\x00\x00\x00"
+
+    def test_marker_text_inside_a_protected_region_is_left_alone(self):
+        r"""Held over from the placeholder-era suite as a black-box contract:
+        text that looks like the old markers is content, wherever it sits."""
+        fenced = "```\n\x00FENCE1\x00\n```\n`x`"
+        assert _clean(fenced) == fenced
+        assert _clean("Map<\x00GEN1\x00> List<A>") == "Map<\x00GEN1\x00> List<A>"
+
+    def test_out_of_range_and_leading_zero_marker_text_survives(self):
+        r"""Also held over: an index that never existed and a non-canonical one
+        were the inputs the old restore loop had to leave alone."""
+        text = "List<A> \x00GEN99\x00 \x00GEN01\x00 List<B> \x00FENCE7\x00 <b>x</b>"
+        assert _clean(text) == "List<A> \x00GEN99\x00 \x00GEN01\x00 List<B> \x00FENCE7\x00 x"
+
+    def test_many_regions_keep_their_own_content(self):
+        r"""Held over: with a dozen fences and a dozen generics, region 1 and
+        region 10+ must not be confused for one another."""
+        text = "\n".join(f"<b>t{i}</b> List<Item{i}> `code{i}`" for i in range(12))
+        expected = "\n".join(f"t{i} List<Item{i}> `code{i}`" for i in range(12))
+        assert _clean(text) == expected
+
     def test_case_insensitive_script_is_dropped(self):
         """`re.I` cannot be set on the whole alternation without making the
         generic's `[A-Z]` match lowercase, so the script arm scopes its own."""
