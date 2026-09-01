@@ -415,36 +415,48 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
-- **The cleaner protects code fences by span, not by placeholder** (#948).
-  `_strip_html_jsx` used to swap each fence and generic type for a
+- **The cleaner keeps its markers out of the text entirely** (#948).
+  `_strip_html_jsx` used to swap each code fence and generic type for a
   NUL-delimited marker (`\x00FENCE0\x00`) while HTML was stripped, then put
-  them back. That spelling was never reserved, and the substitution wrote the
-  very sequences it later searched for, which cost two ways:
+  them back. That spelling was never reserved — a response carries NUL bytes
+  through legal JSON `\u0000` escapes — and the substitution wrote the very
+  sequences it later searched for. It cost two ways:
 
   - **Content was lost on ordinary input.** Two inline-code spans separated by
     the literal text `GEN0` made the boundary between their own markers spell
     a *generic* marker, which restoration then consumed. `` `keep-me`GEN0`and-me`
     List<A> `` cleaned to `\x00FENCE0List<A>FENCE1\x00 List<A>` — both fences
     gone and raw control characters delivered to the client. No hostile
-    upstream and no NUL in the response were required.
+    upstream and no NUL in the response were required; the NULs were the
+    cleaner's own markers standing next to each other.
   - **A response could expand quadratically.** A marker the upstream sent
-    itself (` ` is legal JSON) was restored at every occurrence, so one
-    saved item was emitted once per copy: 56,006 characters in became
-    64,056,006 out. This ran *after* the `max_upstream_chars` guard, which is
-    applied before cleaning and so bounds only the input.
+    itself was restored at every occurrence, so one saved item was emitted
+    once per copy: 56,006 characters in became 64,056,006 out. This ran
+    *after* the `max_upstream_chars` guard, which is applied before cleaning
+    and so bounds only the input.
 
-  Both are gone: the fences, generics and `<script>`/`<style>` blocks are now
-  recognized as spans of the original text in one left-to-right pass, and the
-  tag-stripping regexes run only on the gaps between them. Nothing is written
-  into the text and looked for again, so neither defect is expressible rather
-  than merely unlikely. The same input now returns 56,006 characters.
+  The fences, generics and `<script>`/`<style>` blocks are now located as
+  spans and blanked out on a separate, equal-length copy of the text. The
+  removal patterns scan that copy — so a protected region is opaque to them,
+  which is all the markers were ever for — while every character of the result
+  is sliced from the original text by offset. Nothing an upstream sends is
+  ever read back as a marker, so neither defect is expressible rather than
+  merely unlikely. The same input now returns 56,006 characters and the
+  data-loss input is returned unchanged.
 
-  **Behavior change**: on the two classes above. Ordinary responses clean
-  byte-identically — a 600-document corpus of markdown, HTML and code found no
-  divergence, and every input in the cleaner's test suite is unchanged. The
-  placeholder machinery #877 made linear is removed rather than optimized
-  again; the pass costs 6.32-6.52 ms against 6.17-6.37 ms on a 110 KB
-  fence-heavy body (7 runs).
+  **Behavior change**: on those two classes of input, and only those. Every
+  other response cleans byte-identically, including the corners where the old
+  and new mechanisms could plausibly have parted — a tag whose attribute holds
+  a fence, a `<script>` that crosses into one, unclosed fences and tags, and a
+  close tag formed only by an earlier removal joining the text. Checked
+  against the previous implementation on 2,000 generated markdown/HTML/code
+  documents and 800 adversarial character-fuzz documents: no divergence.
+
+  The placeholder machinery #877 made linear is removed rather than optimized
+  again. Cleaning a 110 KB fence-heavy body costs 6.37-6.76 ms against
+  5.55-5.95 ms before (7 runs); a 150 KB tag-heavy body with no protected
+  regions is unchanged (4.10-4.13 ms against 4.14-4.22 ms), since it takes a
+  fast path that skips the offset bookkeeping entirely.
 
 - **Code-fence restoration in the cleaner is linear in response size** (#877).
   `_strip_html_jsx` shields code fences and generic types (`List<T>`) behind

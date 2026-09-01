@@ -2,36 +2,28 @@
 
 from __future__ import annotations
 
+import bisect
 import logging as _logging
 import re
 import unicodedata
 from typing import Protocol
 
+_CODE_FENCE_RE = re.compile(r"```[\s\S]*?```|`[^`\n]+`")
+_GENERIC_RE = re.compile(r"[A-Z]\w{0,60}<[^>]+>")
+_SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>[\s\S]*?</\1>", re.I)
 _HTML_TAG_RE = re.compile(r"<[a-zA-Z][\w.-]*(?:\s[^>]*)?\s*/?>")
 _CLOSE_TAG_RE = re.compile(r"</[a-zA-Z][\w.-]*\s*>")
 _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 _LINK_LINE_RE = re.compile(r"^\s*[-*]\s*\[.*?\]\(https?://\S+\)")
 _BARE_URL_LINE_RE = re.compile(r"^\s*[-*]?\s*https?://\S+\s*$")
 
-# The regions `_strip_html_jsx` recognizes. Each body is written once and
-# only reaches the engine through `_PROTECTED_RE`, so there is no second copy
-# of a rule to drift out of step with this one.
-_FENCE_SRC = r"```[\s\S]*?```|`[^`\n]+`"
-_GENERIC_SRC = r"[A-Z]\w{0,60}<[^>]+>"
-# Scoped case-insensitivity, because a module-level `re.I` would reach
-# `_GENERIC_SRC`'s `[A-Z]` and make it match lowercase. The backreference must
-# be named: a numbered one cannot refer out of the still-open alternation.
-_SCRIPT_STYLE_SRC = r"(?i:<(?P<tag>script|style)\b[^>]*>[\s\S]*?</(?P=tag)>)"
+# Filler for a protected region while the removal patterns scan. It only ever
+# reaches a scan, never the result — every character of the output is sliced
+# from the ORIGINAL text by offset — so an upstream copy of it cannot make the
+# cleaner drop or duplicate anything.
+_MASK_CHAR = "\x00"
 
-# One alternation, so a single left-to-right pass decides the regions by
-# position: the earlier START wins. That is what makes a `<script>` opened
-# outside a fence swallow a fence inside it, while a `<script>` written
-# *inside* a fence is left alone. Alternative order carries no meaning here —
-# the three begin with a backtick, `<` and `[A-Z]` respectively, so no two can
-# start at the same offset for the order to break a tie between.
-_PROTECTED_RE = re.compile(
-    f"(?P<fence>{_FENCE_SRC})|(?P<drop>{_SCRIPT_STYLE_SRC})|(?P<generic>{_GENERIC_SRC})"
-)
+_Span = tuple[int, int]
 
 # Prompt injection heuristic patterns — common LLM manipulation attempts
 _INJECTION_PATTERNS = [
@@ -47,10 +39,73 @@ _INJECTION_PATTERNS = [
 _logger = _logging.getLogger(__name__)
 
 
-def _strip_tags(segment: str) -> str:
-    """Remove HTML tags from a segment that lies outside every protected region."""
-    segment = _HTML_TAG_RE.sub("", segment)
-    return _CLOSE_TAG_RE.sub("", segment)
+def _mask_spans(text: str, spans: list[_Span]) -> str:
+    """Blank out ``spans`` while keeping every other offset where it was.
+
+    Same length in, same length out — that is what lets a match found on the
+    masked copy be read back as a span of the original.
+    """
+    if not spans:
+        return text
+    parts: list[str] = []
+    pos = 0
+    for start, end in spans:
+        parts.append(text[pos:start])
+        parts.append(_MASK_CHAR * (end - start))
+        pos = end
+    parts.append(text[pos:])
+    return "".join(parts)
+
+
+def _merge_spans(spans: list[_Span]) -> list[_Span]:
+    """Coalesce sorted, possibly overlapping spans (a generic can contain a fence)."""
+    merged: list[_Span] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            last_start, last_end = merged[-1]
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _drop_from_segments(segments: list[_Span], cuts: list[_Span], total: int) -> list[_Span]:
+    """Remove ``cuts`` — offsets into the segments joined end to end — from ``segments``.
+
+    The removal patterns run one after another over the surviving text, so each
+    sees what the previous one left *joined*, exactly as sequential ``sub``
+    calls on a shrinking string did. Masking the cut in place instead would
+    leave the two sides apart, and a close tag formed only by the join would
+    survive.
+    """
+    kept_view: list[_Span] = []
+    pos = 0
+    for start, end in cuts:
+        if start > pos:
+            kept_view.append((pos, start))
+        pos = max(pos, end)
+    if pos < total:
+        kept_view.append((pos, total))
+
+    view_starts: list[int] = []
+    offset = 0
+    for start, end in segments:
+        view_starts.append(offset)
+        offset += end - start
+
+    out: list[_Span] = []
+    for view_start, view_end in kept_view:
+        index = bisect.bisect_right(view_starts, view_start) - 1
+        while view_start < view_end:
+            seg_start, seg_end = segments[index]
+            seg_view_start = view_starts[index]
+            take_end = min(view_end, seg_view_start + seg_end - seg_start)
+            out.append(
+                (seg_start + view_start - seg_view_start, seg_start + take_end - seg_view_start)
+            )
+            view_start = take_end
+            index += 1
+    return out
 
 
 class ContentCleaner(Protocol):
@@ -111,27 +166,50 @@ class DefaultContentCleaner:
     def _strip_html_jsx(self, text: str) -> str:
         r"""Strip HTML/JSX tags, leaving code fences and generic types intact.
 
-        The protected regions are never substituted for a marker. An earlier
-        design swapped each fence and generic for a NUL-delimited token, and
-        that spelling is not reserved: the substitution wrote the very
-        sequences it later searched for. Two tokens standing next to each
-        other spelled a third across their boundary — ``\`a\`GEN0\`b\``` lost
-        both fences — and a token the upstream sent itself was restored at
+        The protected regions are never substituted into the text. An earlier
+        design swapped each fence and generic for a NUL-delimited marker, and
+        that spelling was not reserved: the substitution wrote the very
+        sequences it later searched for. Two markers standing next to each
+        other spelled a third across their boundary, so ``\`a\`GEN0\`b\``` lost
+        both fences, and a marker the upstream sent itself was restored at
         every occurrence, so a small response could expand quadratically
-        (#948). Walking spans instead means nothing is ever written into the
-        text and looked for again, so neither is expressible.
+        (#948).
+
+        Instead the regions are located as spans and blanked out on a
+        SEPARATE, equal-length copy. The removal patterns scan that copy — so
+        a protected region is opaque to them, which is what the markers were
+        for — while the result is sliced from the original text by offset.
+        Nothing an upstream can send is ever read back as a marker.
         """
-        out: list[str] = []
-        pos = 0
-        for m in _PROTECTED_RE.finditer(text):
-            out.append(_strip_tags(text[pos : m.start()]))
-            # `drop` is the <script>/<style> block, content and tags alike;
-            # a fence or generic is carried over exactly as it arrived.
-            if m.group("drop") is None:
-                out.append(m.group(0))
-            pos = m.end()
-        out.append(_strip_tags(text[pos:]))
-        return "".join(out)
+        fences = [m.span() for m in _CODE_FENCE_RE.finditer(text)]
+        # Generics are found on a copy where fences are already opaque, so a
+        # fence inside one (``Map<`K`, V>``) cannot end the `[^>]+` early.
+        with_fences_hidden = _mask_spans(text, fences)
+        protected = _merge_spans(
+            fences + [m.span() for m in _GENERIC_RE.finditer(with_fences_hidden)]
+        )
+        if not protected:
+            # Nothing to keep out of the patterns' way, so there is nothing for
+            # the offset bookkeeping below to preserve: remove in place.
+            stripped = _SCRIPT_STYLE_RE.sub("", text)
+            stripped = _HTML_TAG_RE.sub("", stripped)
+            return _CLOSE_TAG_RE.sub("", stripped)
+
+        masked = _mask_spans(text, protected)
+        total = len(text)
+        segments: list[_Span] = [(0, total)]
+        view = masked
+        patterns = (_SCRIPT_STYLE_RE, _HTML_TAG_RE, _CLOSE_TAG_RE)
+        for index, pattern in enumerate(patterns):
+            cuts = [m.span() for m in pattern.finditer(view)]
+            if not cuts:
+                continue
+            segments = _drop_from_segments(segments, cuts, len(view))
+            if index + 1 < len(patterns):
+                view = "".join(masked[start:end] for start, end in segments)
+        if len(segments) == 1 and segments[0] == (0, total):
+            return text
+        return "".join(text[start:end] for start, end in segments)
 
     def _deduplicate_paragraphs(self, text: str) -> str:
         paragraphs = re.split(r"\n{2,}", text)

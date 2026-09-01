@@ -81,6 +81,34 @@ class TestProtectedRegions:
         text = "```\n<script>evil</script>\n```"
         assert _clean(text) == text
 
+    def test_generic_spanning_a_fence_that_contains_a_bracket(self):
+        """Generics are located on a copy where fences are already blanked, so
+        a `>` *inside* a fence cannot end the generic early. Searching the raw
+        text instead would cut the generic short at that bracket and leave the
+        rest of it — here the `<i>` — exposed to the tag stripper."""
+        assert _clean("Map<`a>b`, <i>V> tail") == "Map<`a>b`, <i>V> tail"
+
+    def test_tag_whose_attribute_holds_a_fence_is_still_stripped(self):
+        """A protected region must be opaque to the tag pattern, not a wall it
+        cannot cross: `<div title="`x`">` is markup, and the fence inside its
+        attribute must not split the tag and leave the markup in the output."""
+        assert _clean('<div title="`x`">body</div>') == "body"
+        assert _clean('<div title="List<A>">body</div>') == "body"
+
+    def test_script_crossing_into_a_fence_does_not_close_inside_it(self):
+        """The `</script>` here sits inside the fence, so the block never
+        closes and only the opening tag is stripped. Selecting regions by
+        earliest start instead would let the script arm consume through the
+        fence and drop the tail with it."""
+        text = "<script>abc ```code </script> tail ```"
+        assert _clean(text) == "abc ```code </script> tail ```"
+
+    def test_close_tag_formed_by_an_earlier_removal_is_removed(self):
+        """The removal patterns run one after another over the surviving text,
+        so each sees what the previous one left joined. Blanking a cut in place
+        would keep the two sides apart and leave this `</a>` behind."""
+        assert _clean("</<b>a>") == ""
+
     def test_case_insensitive_script_is_dropped(self):
         """`re.I` cannot be set on the whole alternation without making the
         generic's `[A-Z]` match lowercase, so the script arm scopes its own."""
