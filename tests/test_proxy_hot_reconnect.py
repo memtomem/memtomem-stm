@@ -508,6 +508,73 @@ class TestConfigChangeDetection:
         assert result.content[0].text == "on-c"
         assert conn.config is cfg_c
 
+    async def test_recovery_reconnect_race_does_not_swallow_hot_reloaded_config(self, tmp_path):
+        """#959: a config-change reconnect that loses the lock to a RECOVERY
+        reconnect — which reinstalls the same connection identity — must still
+        establish the new config. Coalescing on the generation alone dropped
+        the edit silently, and the wrapper's clean return damps nothing, so
+        nothing retried it."""
+        cfg_old = _sse_cfg("https://old.example/sse")
+        cfg_new = _sse_cfg("https://new.example/sse")
+        mgr = _make_manager(tmp_path, {"srv": cfg_old})
+        conn = _seed_connection(mgr, "srv", cfg_old)
+        _reseed(mgr, tmp_path, {"srv": cfg_new})  # the file now wants NEW
+
+        opens: list[str] = []
+
+        def _open(cfg):
+            opens.append(cfg.url)
+            return _mock_transport()
+
+        with (
+            patch.object(mgr, "_open_transport", side_effect=_open),
+            patch("memtomem_stm.proxy.manager.ClientSession", return_value=_mock_session()),
+        ):
+            async with conn.reconnect_lock:
+                task = asyncio.create_task(mgr._maybe_reconnect_for_config_change(conn, cfg_new))
+                await asyncio.sleep(0)  # let it capture generation 0 and block
+                # A background recovery reconnect wins the lock and completes,
+                # reinstalling the OLD identity.
+                conn.reconnect_generation += 1
+            await task
+
+        assert opens == [cfg_new.url]  # the edit was applied, not skipped
+        assert conn.config is cfg_new
+        assert conn.reconnect_generation == 2
+        assert conn.last_failed_connection_fp is None
+
+    async def test_stale_recovery_reconnect_does_not_revert_newer_config(self, tmp_path):
+        """The reverse race: a recovery reconnect pinned to the pre-reload
+        config must NOT "restore" that identity over a newer edit the winner
+        already installed. It skips, and the file's config stands."""
+        cfg_old = _sse_cfg("https://old.example/sse")
+        cfg_new = _sse_cfg("https://new.example/sse")
+        mgr = _make_manager(tmp_path, {"srv": cfg_old})
+        conn = _seed_connection(mgr, "srv", cfg_old)
+
+        opens: list[str] = []
+
+        def _open(cfg):
+            opens.append(cfg.url)
+            return _mock_transport()
+
+        with patch.object(mgr, "_open_transport", side_effect=_open):
+            async with conn.reconnect_lock:
+                # Recovery reconnect pinned to the config as it was BEFORE the
+                # reload; it blocks on the lock.
+                task = asyncio.create_task(mgr._reconnect_server("srv", cfg_old))
+                await asyncio.sleep(0)
+                # A config-change reconnect wins and installs NEW; the file
+                # agrees.
+                conn.reconnect_generation += 1
+                conn.config = cfg_new
+                _reseed(mgr, tmp_path, {"srv": cfg_new})
+            await task
+
+        assert opens == []  # the stale pin never reopened the old transport
+        assert conn.config is cfg_new
+        assert conn.reconnect_generation == 1
+
     async def test_successful_failure_triggered_reconnect_clears_damper(self, tmp_path):
         """Any successful reconnect (config-change OR failure-triggered)
         proves the current config connects and clears the damper."""
