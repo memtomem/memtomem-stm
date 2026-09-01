@@ -41,23 +41,60 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
-          version: "latest"
+          version: "0.12.5"
+          python-version: "3.12"
+      - name: Verify tag target and source versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "$GITHUB_REF_NAME")"
+          uv run --frozen python -m memtomem_stm.release_check --tag "$GITHUB_REF_NAME"
+      - name: Install locked development environment
+        run: uv sync --frozen
+      - name: Lint and typecheck exact tag
+        run: |
+          uv run ruff check src
+          uv run ruff format --check src
+          uv run mypy src
+      - name: Test exact tag
+        run: >-
+          uv run pytest
+          -m "not bench_qa_meta and not bench_qa_llm_judge and not bench_qa_sweep and not bench_qa_drift and not bench_qa_perf"
+          --tb=short -q
+      - name: Run tutorial notebook
+        run: >-
+          uv run pytest --nbmake notebooks/01_quickstart_proxy_setup.ipynb
+          --nbmake-timeout=180 --tb=short -q
       - name: Audit locked runtime dependencies
         run: scripts/audit-dependencies.sh runtime
       - name: Audit locked optional extras
         run: scripts/audit-dependencies.sh extras
       - name: Build distribution
         run: uv build
+      - name: Verify wheel and sdist metadata
+        run: >-
+          uv run --frozen python -m memtomem_stm.release_check
+          --tag "$GITHUB_REF_NAME" --dist dist
+      - name: Clean-install wheel and smoke all entry points
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv venv /tmp/memtomem-stm-release-smoke
+          uv pip install --python /tmp/memtomem-stm-release-smoke/bin/python dist/*.whl
+          /tmp/memtomem-stm-release-smoke/bin/python -c \
+            'import importlib.metadata as m; import memtomem_stm as p; assert m.version("memtomem-stm") == p.__version__'
+          for entrypoint in mms memtomem-stm memtomem-stm-proxy; do
+            "/tmp/memtomem-stm-release-smoke/bin/$entrypoint" --version
+            "/tmp/memtomem-stm-release-smoke/bin/$entrypoint" --help >/dev/null
+          done
       - name: Publish to PyPI
         if: ${{ !startsWith(github.ref_name, 'test-') }}
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: dist
-          skip-existing: true
       - name: Publish to TestPyPI
         if: ${{ startsWith(github.ref_name, 'test-') }}
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           repository-url: https://test.pypi.org/legacy/
           packages-dir: dist
-          skip-existing: true

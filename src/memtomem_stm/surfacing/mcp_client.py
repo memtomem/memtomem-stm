@@ -1666,29 +1666,19 @@ class McpClientSearchAdapter:
             await self._rpc(session, generation, "mem_do", call_args)
         except self._TRANSPORT_ERRORS as exc:
             logger.warning(
-                "MCP transport error in increment_access, reconnecting: %s", self._scrub_exc(exc)
+                "MCP transport error in increment_access; not replaying the additive "
+                "mutation, reconnecting for the next call: %s",
+                self._scrub_exc(exc),
             )
             self._mark_dirty(session, generation)
-            retry_session = session
-            retry_generation = generation
             try:
                 await self._shared_reconnect(generation)
-                assert self._session is not None
-                retry_session = self._session
-                retry_generation = self._generation
-                await self._rpc(retry_session, retry_generation, "mem_do", call_args)
             except asyncio.CancelledError:
                 raise
-            except self._TRANSPORT_ERRORS as retry_exc:
-                self._mark_dirty(retry_session, retry_generation)
+            except Exception as reconnect_exc:
                 logger.debug(
-                    "MCP mem_do(increment_access) failed after reconnect: %s",
-                    self._scrub_exc(retry_exc),
-                )
-            except Exception as retry_exc:
-                logger.debug(
-                    "MCP mem_do(increment_access) failed after reconnect: %s",
-                    self._scrub_exc(retry_exc),
+                    "MCP reconnect after increment_access failure failed: %s",
+                    self._scrub_exc(reconnect_exc),
                 )
         except asyncio.CancelledError:
             # #290: see search() — mid-RPC cancellation marks the session

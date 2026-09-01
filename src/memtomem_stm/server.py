@@ -545,9 +545,13 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                 # lowlevel handler verbatim — preserving structuredContent,
                 # result-level _meta, isError, and content order end to end.
                 async def proxy_tool(**kwargs: object) -> CallToolResult:
-                    return to_call_tool_result(
-                        await pm.call_tool(server_name, tool_name, dict(kwargs))
-                    )
+                    try:
+                        result = await pm.call_tool(server_name, tool_name, dict(kwargs))
+                    except Exception as exc:
+                        from mcp.server.mcpserver.exceptions import ToolError
+
+                        raise ToolError(pm.safe_upstream_error(server_name, exc)) from None
+                    return to_call_tool_result(result)
 
                 return proxy_tool
 

@@ -418,7 +418,7 @@ def test_start_caps_spawn_attempts_for_crash_looping_child(
     )
 
     result = CliRunner().invoke(cli, ["daemon", "start"])
-    assert result.exit_code == 0
+    assert result.exit_code == 1
     assert "did not become ready" in result.output
     from memtomem_stm.cli.daemon_cmd import _START_MAX_SPAWNS
 
@@ -718,6 +718,46 @@ class TestDaemonStopCli:
         result = CliRunner().invoke(_cli(), ["daemon", "stop"])
         assert result.exit_code == 0, result.output
         assert "daemon stopped" in result.output
+
+    def test_graceful_ack_waits_for_confirmed_teardown(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from types import SimpleNamespace
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _write_handshake(
+            {
+                "pid": 12345,
+                "host": "127.0.0.1",
+                "port": 4567,
+                "token": "t",
+            }
+        )
+
+        async def fake_shutdown(config):
+            return True
+
+        monkeypatch.setattr("memtomem_stm.daemon.client.shutdown", fake_shutdown)
+        monkeypatch.setattr(
+            "memtomem_stm.daemon.client.probe_listening",
+            lambda host, port, **kwargs: True,
+        )
+        clock = {"t": 0.0}
+        monkeypatch.setattr(
+            "memtomem_stm.cli.daemon_cmd.time",
+            SimpleNamespace(
+                time=lambda: clock["t"],
+                sleep=lambda seconds: clock.__setitem__("t", clock["t"] + seconds),
+            ),
+        )
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+
+        assert result.exit_code == 1, result.output
+        assert "accepted shutdown but is still cleaning up" in result.output
+        assert "daemon stopped" not in result.output
 
     def test_no_daemon_no_handshake(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         from click.testing import CliRunner
@@ -1019,6 +1059,33 @@ class TestDaemonForeignOrphans:
         assert result.exit_code == 0, result.output
         assert killed == [(98765, _signal.SIGTERM)]
         assert "sent SIGTERM to daemon pid=98765 (fp=foreignfp000000)" in result.output
+
+    def test_stop_all_continues_foreign_cleanup_after_current_stop_timeout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A current daemon may acknowledge shutdown but miss its teardown
+        wait. Preserve that nonzero result only after ``--all`` has performed
+        the independently requested foreign-daemon cleanup.
+        """
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        foreign_cleanup: list[STMConfig] = []
+
+        def current_timeout(_config: STMConfig) -> None:
+            raise SystemExit(1)
+
+        monkeypatch.setattr(
+            "memtomem_stm.cli.daemon_cmd._stop_current_config_daemon", current_timeout
+        )
+        monkeypatch.setattr(
+            "memtomem_stm.cli.daemon_cmd._stop_foreign_daemons", foreign_cleanup.append
+        )
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+
+        assert result.exit_code == 1
+        assert len(foreign_cleanup) == 1
 
     @pytest.mark.skipif(os.name == "nt", reason="POSIX SIGTERM fallback")
     def test_pinned_fingerprint_change_is_reachable(
@@ -1468,9 +1535,7 @@ class TestBrokenConfigObservability:
     def _broken_proxy_env(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         for name in [n for n in os.environ if n.startswith("MEMTOMEM_STM_PROXY")]:
             monkeypatch.delenv(name, raising=False)
-        monkeypatch.setenv(
-            "MEMTOMEM_STM_PROXY__CONFIG_PATH", str(tmp_path / "absent.json")
-        )
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(tmp_path / "absent.json"))
         monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND", "x")
 
     def test_daemon_server_run_logs_before_raising(self, caplog):

@@ -951,8 +951,9 @@ def test_configuration_full_example_documents_supported_config_blocks() -> None:
     """docs/configuration.md's representative proxy example must carry the
     supported ``cache``, ``toolgraph``, ``compression_feedback`` and
     ``progressive_reads`` blocks, with keys and default values matching their
-    models exactly, plus the two top-level knobs ``default_compression`` /
-    ``max_upstream_chars`` at their ProxyConfig defaults.
+    models exactly, plus the high-risk top-level knobs
+    ``default_compression`` / ``max_upstream_chars`` /
+    ``max_upstream_bytes`` at their ProxyConfig defaults.
 
     Comparing each documented block to ``Model().model_dump(mode="json")``
     (rather than just a key-subset check) pins the example to the real defaults:
@@ -994,7 +995,7 @@ def test_configuration_full_example_documents_supported_config_blocks() -> None:
     example = json.loads(block_match.group(1))
 
     proxy_defaults = ProxyConfig().model_dump(mode="json")
-    for top_level in ("default_compression", "max_upstream_chars"):
+    for top_level in ("default_compression", "max_upstream_chars", "max_upstream_bytes"):
         if top_level not in example:
             pytest.fail(
                 f"docs/configuration.md full-example omits top-level "

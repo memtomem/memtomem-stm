@@ -33,6 +33,22 @@ from memtomem_stm.proxy.metrics_store import MetricsStore
 from memtomem_stm.proxy.pending_store import SQLitePendingStore
 
 
+_CREATED_MANAGERS: list[ProxyManager] = []
+
+
+@pytest.fixture(autouse=True)
+async def _close_created_managers():
+    """Close lazy SQLite stores opened by managers built in each test."""
+    first = len(_CREATED_MANAGERS)
+    try:
+        yield
+    finally:
+        created = _CREATED_MANAGERS[first:]
+        for manager in reversed(created):
+            await manager.stop()
+        del _CREATED_MANAGERS[first:]
+
+
 # ── CallMetrics compression fields ───────────────────────────────────────
 
 
@@ -199,6 +215,7 @@ def _make_manager_with_store(
     )
     tracker = TokenTracker(metrics_store=store)
     mgr = ProxyManager(proxy_cfg, tracker)
+    _CREATED_MANAGERS.append(mgr)
     session = AsyncMock()
     mgr._connections["srv"] = UpstreamConnection(
         name="srv",

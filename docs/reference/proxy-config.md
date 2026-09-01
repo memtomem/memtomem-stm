@@ -12,6 +12,7 @@ daemon, Langfuse, or OTLP settings; those are covered by the
 {
   "enabled": true,
   "advertise_context_query": true,
+  "max_upstream_bytes": 41943040,
   "token_estimation_mode": "unicode",
   "cache": {
     "tool_annotation_policy": "strict"
@@ -41,6 +42,12 @@ daemon, Langfuse, or OTLP settings; those are covered by the
 
 The example is intentionally representative, not exhaustive. Unknown keys are
 preserved for forward compatibility but reported by `mms config validate`.
+
+`max_upstream_bytes` caps the complete inbound MCP result envelope at 40 MiB
+by default. Text, images, `structuredContent`, result `_meta`, and error
+payloads all count. An oversized result is rejected before caching,
+compression, indexing, or surfacing. This is separate from
+`max_upstream_chars`, which is a text-only shaping guard.
 
 ## Upstream servers
 

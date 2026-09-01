@@ -13,6 +13,19 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- **Release publication now verifies the exact tag, source versions, built
+  metadata, and clean-installed entry points before OIDC upload.** Both
+  `vVERSION` and `test-vVERSION` releases fail closed when the checked-out
+  commit is not the tag target, the tag/`pyproject.toml`/runtime versions
+  differ, the wheel and sdist metadata disagree, or any of the three shipped
+  commands cannot start from the clean wheel. Existing files are no longer
+  silently accepted by the publisher.
+
+- **Required CI now names its supported interpreter lanes and enforces branch
+  coverage.** Tests run on Python 3.12 for Ubuntu/Windows and Python 3.13 for
+  Ubuntu; the Ubuntu 3.12 lane fails below 90% branch coverage. CI and release
+  jobs use the repository-tested uv 0.12.5 instead of floating on `latest`.
+
 - **Opt-in backstop for a client that goes away without closing stdin** (#914,
   the last of #906's four directions). #910-#913 hardened every path where
   *something* tells the server to stop — EOF, a signal, a deadline. A client
@@ -259,6 +272,22 @@ changes inline only. See the deprecation policy in
 
 ### Changed
 
+- **Behavior change**: **retries after an ambiguous tool-call failure now
+  require affirmative idempotence evidence.** Previously only a per-attempt
+  timeout was replay-gated; a connection reset or EOF was retried for every
+  tool. Once `session.call_tool` has been entered, any failure — reset, EOF,
+  timeout, retryable MCP error — may have committed the upstream side effect,
+  so STM replays a call only when the tool carries `readOnlyHint: true`
+  (without a contradicting `destructiveHint: true`) or an explicit per-tool /
+  per-server `cache: true` override. Two defaults flipped with it:
+  `cache.tool_annotation_policy: ignore` and unknown servers are now treated as
+  replay-*unsafe* rather than replay-safe. **Operators running
+  `tool_annotation_policy: ignore` therefore lose retries entirely with no
+  config change on their side** — `max_retries` and `reconnect_delay_seconds`
+  become inert for those tools. Opt individual tools back in with
+  `cache: true` where replay is known to be safe. A replay-unsafe failure still
+  reconnects for the next call; it just does not re-invoke the tool.
+
 - **Documented how an advertised tool description is assembled** (#896, PR
   #923). No STM-native surface renders the assembled description —
   `stm_proxy_stats` and `stm_proxy_health` report counts, and the `mms` commands
@@ -436,6 +465,32 @@ changes inline only. See the deprecation policy in
   external; the first open after this upgrade or a later policy change still
   performs the same repair, while subsequent starts avoid cache-size-dependent
   regex work.
+
+- **The proxy boundary now fails closed across trust, retries, response size,
+  and surfacing state.** Project-local `.mcp.json` entries selected by
+  `mms add --from-clients` require `--allow-project-configs` before any probe,
+  write, or prune. Upstream URL/header/env credentials are redacted from
+  client errors, logs, and metrics. Once a tool RPC may have reached an
+  upstream, STM replays it only with affirmative idempotence evidence;
+  additive access increments are never replayed after an ambiguous transport
+  failure. Overall call deadlines now include reconnect and backoff, while
+  generation leases keep in-flight sessions alive across hot reconnects.
+  Complete MCP result envelopes are capped at 40 MiB by
+  `max_upstream_bytes` before caching/compression/indexing/surfacing, including
+  images, structured content, metadata, and error payloads.
+
+- **Surfacing cache hits no longer manufacture dependency health or consume
+  LTM rate slots.** Circuit-breaker recovery is recorded only after a healthy
+  live LTM round trip, cached calls refund their eager rate claim, cache keys
+  use injective component framing, and configured per-minute limits above 200
+  are enforced instead of silently evicting live claims.
+
+- **Operational CLI success now means the requested state was reached.** A
+  bulk `mms add --from-clients --validate` is all-or-nothing unless
+  `--save-unverified` explicitly acknowledges saving the complete failed
+  batch. `mms daemon start` exits non-zero when readiness never arrives, and
+  `mms daemon stop` waits for endpoint closure and handshake removal after the
+  shutdown acknowledgement before reporting success.
 
 - **The cleaner keeps its markers out of the text entirely** (#948).
   `_strip_html_jsx` used to swap each code fence and generic type for a

@@ -271,8 +271,10 @@ def start_cmd() -> None:
         _warn(
             "daemon did not become ready in time — "
             "check the daemon log under data_dir (stm-daemon.log)"
-        )
+        ),
+        err=True,
     )
+    raise SystemExit(1)
 
 
 @daemon_group.command(name="stop")
@@ -294,9 +296,15 @@ def stop_cmd(stop_all: bool) -> None:
     ``PROTOCOL_VERSION`` change, which is otherwise invisible to ``stop``/``status``.
     """
     config = _load_config()
-    _stop_current_config_daemon(config)
+    current_stop_error: SystemExit | None = None
+    try:
+        _stop_current_config_daemon(config)
+    except SystemExit as exc:
+        current_stop_error = exc
     if stop_all:
         _stop_foreign_daemons(config)
+    if current_stop_error is not None:
+        raise current_stop_error
 
 
 def _stop_current_config_daemon(config: STMConfig) -> None:
@@ -309,14 +317,34 @@ def _stop_current_config_daemon(config: STMConfig) -> None:
         read_handshake,
     )
 
+    hs_path = handshake_path(config.data_dir, config_fingerprint(config))
+    raw = read_handshake(hs_path)
     if asyncio.run(client.shutdown(config)):
-        click.echo(_ok("daemon stopped"))
-        return
+        # The wire response means only "shutdown accepted". Teardown still
+        # has to stop the engine/LTM child and remove the handshake, so do not
+        # tell scripts the daemon is stopped until both its endpoint and
+        # ownership record are gone.
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            handshake_gone = read_handshake(hs_path) is None
+            endpoint_gone = raw is None or not client.probe_listening(
+                raw.get("host"), raw.get("port"), timeout=0.1
+            )
+            if handshake_gone and endpoint_gone:
+                click.echo(_ok("daemon stopped"))
+                return
+            time.sleep(0.05)
+        click.echo(
+            _warn(
+                "daemon accepted shutdown but is still cleaning up — "
+                "run `mms daemon status` before starting a replacement"
+            ),
+            err=True,
+        )
+        raise SystemExit(1)
     # Graceful path declined → no daemon for *this config*. Only ever act on our
     # own config's handshake; a different-config daemon owns a different file and
     # is handled by ``--all`` (``_stop_foreign_daemons``), not here.
-    hs_path = handshake_path(config.data_dir, config_fingerprint(config))
-    raw = read_handshake(hs_path)
     if raw is None:
         click.echo("no running daemon")
         return

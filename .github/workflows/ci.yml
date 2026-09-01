@@ -30,7 +30,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
-          version: "latest"
+          version: "0.12.5"
+          python-version: "3.12"
       - run: uv sync --frozen
       - run: uv run ruff check src
       - run: uv run ruff format --check src
@@ -45,7 +46,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
-          version: "latest"
+          version: "0.12.5"
+          python-version: "3.12"
       - run: uv sync --frozen
       - name: mypy
         run: uv run mypy src
@@ -54,15 +56,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            python: "3.12"
+            coverage_args: "--cov=memtomem_stm --cov-branch --cov-fail-under=90"
+          - os: ubuntu-latest
+            python: "3.13"
+            coverage_args: ""
+          - os: windows-latest
+            python: "3.12"
+            coverage_args: ""
+    name: Test (${{ matrix.os }}, Python ${{ matrix.python }})
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
-          version: "latest"
+          version: "0.12.5"
+          python-version: ${{ matrix.python }}
       - run: uv sync --frozen
-      - run: uv run pytest -m "not bench_qa_meta and not bench_qa_llm_judge and not bench_qa_sweep and not bench_qa_drift and not bench_qa_perf" --tb=short -q
+      - run: uv run pytest -m "not bench_qa_meta and not bench_qa_llm_judge and not bench_qa_sweep and not bench_qa_drift and not bench_qa_perf" ${{ matrix.coverage_args }} --tb=short -q
 
   notebooks:
     runs-on: ubuntu-latest
@@ -70,7 +83,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
-          version: "latest"
+          version: "0.12.5"
+          python-version: "3.12"
       - run: uv sync --frozen
       - name: Run tutorial notebook
         run: |
@@ -84,7 +98,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
-          version: "latest"
+          version: "0.12.5"
       - name: Audit locked runtime dependencies
         run: scripts/audit-dependencies.sh runtime
 
@@ -94,7 +108,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
-          version: "latest"
+          version: "0.12.5"
       - name: Audit locked optional extras
         run: scripts/audit-dependencies.sh extras
 
@@ -104,7 +118,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
-          version: "latest"
+          version: "0.12.5"
       - name: Audit locked development closure (advisory)
         run: scripts/audit-dependencies.sh dev
         continue-on-error: true
@@ -124,7 +138,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
-          version: "latest"
+          version: "0.12.5"
       - run: uv sync --frozen
       - name: Run bench_qa suite
         env:
@@ -203,7 +217,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
-          version: "latest"
+          version: "0.12.5"
       - run: uv sync --frozen
       - name: Run bench_qa drift gate
         env:
@@ -242,7 +256,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
-          version: "latest"
+          version: "0.12.5"
       - run: uv sync --frozen
       - name: Run bench_qa perf gate
         env:

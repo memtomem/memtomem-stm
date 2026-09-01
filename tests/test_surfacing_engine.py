@@ -17,6 +17,7 @@ from memtomem_stm.surfacing import engine as engine_module
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine
 from memtomem_stm.surfacing.feedback_store import DIAGNOSTIC_KINDS
+from memtomem_stm.utils.digest import framed_digest
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -1411,6 +1412,60 @@ class TestSurfacingCache:
         assert "cached memory" in out2
         assert adapter.search.call_count == 1  # not called again
 
+    async def test_cache_key_component_boundaries_do_not_collide(self):
+        async def search(**kwargs):
+            query = kwargs["query"]
+            result = FakeSearchResult(
+                chunk=FakeChunk(content=f"memory for {query}"),
+                score=0.5,
+            )
+            return [result], [], "ok"
+
+        adapter = AsyncMock()
+        adapter.search = AsyncMock(side_effect=search)
+        engine = SurfacingEngine(
+            config=_make_config(cooldown_seconds=0),
+            mcp_adapter=adapter,
+        )
+
+        # These tuples both rendered as
+        # ``a/b/c/long distinct query`` under the old slash join.
+        first = await engine.surface(
+            "a", "b", {}, LONG_RESPONSE, context_query="c/long distinct query"
+        )
+        second = await engine.surface(
+            "a", "b/c", {}, LONG_RESPONSE, context_query="long distinct query"
+        )
+
+        assert "memory for c/long distinct query" in first
+        assert "memory for long distinct query" in second
+        assert adapter.search.await_count == 2
+
+    async def test_cache_hit_neither_spends_rate_slot_nor_resets_breaker(self):
+        results = [FakeSearchResult(chunk=FakeChunk(content="cached memory"), score=0.5)]
+        adapter = _make_mcp_adapter(results)
+        engine = SurfacingEngine(
+            config=_make_config(
+                cooldown_seconds=0,
+                max_surfacings_per_minute=1,
+                circuit_max_failures=3,
+            ),
+            mcp_adapter=adapter,
+        )
+
+        await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        # Isolate cache-hit accounting from the one real LTM attempt above.
+        engine._gate._surfacing_timestamps.clear()
+        engine._circuit_breaker.record_failure()
+
+        for _ in range(2):
+            output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            assert "cached memory" in output
+
+        assert adapter.search.await_count == 1
+        assert list(engine._gate._surfacing_timestamps) == []
+        assert engine._circuit_breaker.failure_count == 1
+
 
 class TestSurfacingCacheStampede:
     """Two concurrent ``surface()`` calls for the same ``{server}/{tool}/{query}``
@@ -1472,7 +1527,7 @@ class TestSurfacingCacheStampede:
         # Symptom 3: cache entry reflects the populated result, not the
         # poisoned empty list. A subsequent call for the same query must
         # still hit the memory, not bypass surfacing on an empty-hit.
-        cache_key = f"gh/read_file/{VALID_ARGS['_context_query']}"
+        cache_key = framed_digest(("gh", "read_file", VALID_ARGS["_context_query"]))
         cached = engine._cache.get(cache_key)
         assert cached, (
             "Cache poisoned with empty list — stampede's losing writer "
@@ -1577,7 +1632,9 @@ class TestSurfacingCacheStampede:
                 "Expected the failed A + B only; C should have been collapsed onto "
                 f"B's cached result (got {adapter.search.call_count} searches)"
             )
-            cached = engine._cache.get(f"gh/read_file/{VALID_ARGS['_context_query']}")
+            cached = engine._cache.get(
+                framed_digest(("gh", "read_file", VALID_ARGS["_context_query"]))
+            )
             assert cached and any(r.chunk.id == "mem-shared" for r in cached), (
                 "Cache entry missing or poisoned — the second searcher's empty "
                 "result overwrote the populated one"

@@ -65,6 +65,7 @@ def _build_mgr(
     tmp_path: Path,
     *,
     with_cache: bool = False,
+    max_upstream_bytes: int = 41_943_040,
 ) -> tuple[ProxyManager, MetricsStore, ProxyCache | None]:
     store = MetricsStore(tmp_path / "metrics.db")
     store.initialize()
@@ -79,6 +80,7 @@ def _build_mgr(
         config_path=tmp_path / "proxy.json",
         upstream_servers={"srv": server_cfg},
         cache=CacheConfig(db_path=tmp_path / "cache.db"),
+        max_upstream_bytes=max_upstream_bytes,
     )
     mgr = ProxyManager(proxy_cfg, TokenTracker(metrics_store=store))
     mgr._connections["srv"] = UpstreamConnection(
@@ -199,6 +201,34 @@ class TestEnvelopePreservation:
         assert isinstance(res, list)
         assert isinstance(res[0], TextContent)
         assert res[1] is img
+
+
+class TestMaxUpstreamBytes:
+    @pytest.mark.parametrize(
+        "result",
+        [
+            _result(blocks=[ImageContent(type="image", data="x" * 500, mimeType="image/png")]),
+            _result(structured={"blob": "x" * 500}),
+            _result(meta={"blob": "x" * 500}),
+            _result("x", is_error=True, structured={"blob": "x" * 500}),
+        ],
+        ids=["image", "structured", "meta", "is-error-envelope"],
+    )
+    async def test_non_text_and_envelope_fields_cannot_bypass_byte_cap(self, make_mgr, result):
+        from mcp.server.mcpserver.exceptions import ToolError
+
+        mgr, store, cache = make_mgr(with_cache=True, max_upstream_bytes=200)
+        _set_upstream(mgr, result)
+
+        with pytest.raises(ToolError, match="max_upstream_bytes=200"):
+            await mgr.call_tool("srv", "tool", {})
+
+        row = store._db.execute(
+            "SELECT error_category, error_message FROM proxy_metrics ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert row[0] == "oversize"
+        assert "max_upstream_bytes=200" in row[1]
+        assert cache.stats()["total_entries"] == 0
 
 
 # ── isError ordering ─────────────────────────────────────────────────────

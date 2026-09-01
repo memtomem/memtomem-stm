@@ -276,6 +276,13 @@ class TestCompressionEffectiveness:
 class TestAutoTunerConvergence:
     """Verify the auto-tuner adjusts thresholds based on user feedback."""
 
+    def setup_method(self):
+        self._trackers: list[FeedbackTracker] = []
+
+    def teardown_method(self):
+        for tracker in self._trackers:
+            tracker.close()
+
     def _make_tuner(self, tmp_path, min_score=0.02, min_samples=5, increment=0.005):
         config = SurfacingConfig(
             auto_tune_enabled=True,
@@ -284,6 +291,7 @@ class TestAutoTunerConvergence:
             min_score=min_score,
         )
         tracker = FeedbackTracker(config, tmp_path / "fb.db")
+        self._trackers.append(tracker)
         tuner = AutoTuner(config, tracker.store)
         return config, tracker, tuner
 
@@ -464,18 +472,21 @@ class TestAutoTunerColdStart:
             min_score=0.02,
         )
         tracker = FeedbackTracker(config, tmp_path / "fb.db")
-        tuner = AutoTuner(config, tracker.store)
+        try:
+            tuner = AutoTuner(config, tracker.store)
 
-        # Build global history on tool_a (5 negative feedbacks)
-        for i in range(5):
-            sid = f"global{i}"
-            tracker.record_surfacing(sid, "s", "tool_a", f"q{i}", ["id"], [0.03])
-            tracker.store.record_feedback(sid, "not_relevant")
+            # Build global history on tool_a (5 negative feedbacks)
+            for i in range(5):
+                sid = f"global{i}"
+                tracker.record_surfacing(sid, "s", "tool_a", f"q{i}", ["id"], [0.03])
+                tracker.store.record_feedback(sid, "not_relevant")
 
-        # tool_b has 0 samples → should use global ratio (100% negative)
-        new = tuner.maybe_adjust("tool_b")
-        if new is not None:
-            assert new > config.min_score  # raised due to global negative ratio
+            # tool_b has 0 samples → should use global ratio (100% negative)
+            new = tuner.maybe_adjust("tool_b")
+            if new is not None:
+                assert new > config.min_score  # raised due to global negative ratio
+        finally:
+            tracker.close()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
