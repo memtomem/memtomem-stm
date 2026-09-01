@@ -40,6 +40,52 @@ class TestHTMLStripping:
         assert "List<String>" in result
 
 
+class TestPlaceholderRestoration:
+    """`_strip_html_jsx` shields fences and generics behind NUL-delimited
+    placeholders, then restores them. These pin what "restore" means."""
+
+    def test_many_fences_and_generics_restored_in_order(self):
+        """Index 1 and index 10+ coexist, so a prefix-matching restore (split
+        on the token stem, or a shortest-match sub) mixes up GEN1 and GEN10."""
+        parts = []
+        for i in range(12):
+            parts.append(f"<b>t{i}</b> List<Item{i}> `code{i}`")
+        text = "\n".join(parts)
+        expected = "\n".join(f"t{i} List<Item{i}> `code{i}`" for i in range(12))
+        assert _clean(text) == expected
+
+    def test_generic_enclosing_inline_code_is_restored(self):
+        """Fences are saved first, so a generic can be saved with a fence
+        placeholder already inside it. Generics must therefore be restored
+        before fences — restoring fences first would leave the raw token."""
+        assert _clean("Map<`K`, V> and <b>x</b>") == "Map<`K`, V> and x"
+
+    def test_upstream_token_inside_a_saved_generic_is_not_expanded(self):
+        """A token spelling that arrives in the response and is then captured
+        inside a saved generic comes back out during restoration. It is
+        upstream text, so it is left alone — the former per-index
+        `str.replace` loop instead expanded it on a later iteration, which let
+        the response relocate a copy of `List<A>` into the outer generic
+        (`Map<List<A>> List<A>`)."""
+        text = "Map<\x00GEN1\x00> List<A>"
+        assert _clean(text) == "Map<\x00GEN1\x00> List<A>"
+
+    def test_upstream_token_inside_a_saved_fence_is_not_expanded(self):
+        """The same rule on the fence pass, which runs last and so has no
+        later iteration to be caught by either."""
+        text = "```\n\x00FENCE1\x00\n```\n`x`"
+        assert _clean(text) == "```\n\x00FENCE1\x00\n```\n`x`"
+
+    def test_literal_placeholder_tokens_pass_through(self):
+        """Upstream text that merely looks like a placeholder is not a token we
+        minted: an out-of-range index, a leading zero, and a fence index with no
+        fence behind it all survive verbatim, exactly as the former per-index
+        `str.replace` loop left them."""
+        text = "List<A> \x00GEN99\x00 \x00GEN01\x00 List<B> \x00FENCE7\x00 <b>x</b>"
+        expected = "List<A> \x00GEN99\x00 \x00GEN01\x00 List<B> \x00FENCE7\x00 x"
+        assert _clean(text) == expected
+
+
 class TestDeduplication:
     def test_duplicate_paragraphs_removed(self):
         text = "First paragraph.\n\nSecond paragraph.\n\nFirst paragraph."
