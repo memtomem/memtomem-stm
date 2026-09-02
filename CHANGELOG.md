@@ -13,6 +13,22 @@ changes inline only. See the deprecation policy in
 
 ### Changed
 
+- **A successful tool result is no longer byte-measured a second time** when the
+  wire check already measured its envelope (issue #957). `BoundedReadStream`
+  reports what it measured back to the call that is waiting for that response,
+  correlated by JSON-RPC request id, so the skip is granted per response rather
+  than inferred from the connection: a session the proxy did not wrap, a reply
+  that never arrived, and each retry attempt in turn are all still measured.
+  **Behavior change**: `max_upstream_bytes` is enforced on the inbound envelope,
+  which is what `docs/configuration.md` has always described. A result that
+  serializes larger than the envelope that carried it — validation fills in
+  defaults the wire may omit, including a content block's `type` discriminator —
+  is no longer rejected on that parsed size. The config field's docstring said
+  "per-message and complete-result"; it now matches the docs and the code, and
+  both now state what the cap actually measures: the decoded message's compact
+  JSON size at the transport boundary, not raw bytes off the socket, so
+  whitespace an upstream padded its JSON with has never counted against it.
+
 - **Inbound MCP size accounting no longer hops to a thread for every message**
   (issue #956). `BoundedReadStream` measures each inbound envelope against
   `max_upstream_bytes`, and it does so from the dispatcher's only read loop —

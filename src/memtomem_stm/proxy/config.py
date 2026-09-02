@@ -2139,12 +2139,20 @@ class ProxyConfig(BaseModel):
     follow-up if needed.
     """
     max_upstream_bytes: int = Field(default=41_943_040, gt=0)
-    """Per-message and complete-result UTF-8 JSON byte cap (40 MiB).
+    """UTF-8 JSON byte cap on each inbound MCP message envelope (40 MiB).
 
     Unlike ``max_upstream_chars``, this includes non-text content,
     ``structuredContent``, ``_meta`` and error envelopes. Oversized messages
     are rejected instead of truncated because arbitrary structured or binary
     payloads cannot be truncated without corrupting their schema.
+
+    The cap is enforced on each decoded message's compact JSON size, measured
+    where the transport hands the message to the client session. Insignificant
+    whitespace an upstream may have sent is therefore not counted, and neither
+    are defaults that validation fills in further along: a validated result
+    model can serialize larger than the envelope that carried it — a content
+    block's omitted ``type`` discriminator is added per block — so a result
+    measured after parsing is a different number and is not what this bounds.
     """
     min_result_retention: float = Field(default=0.65, ge=0.0, le=1.0)
     relevance_scorer: RelevanceScorerConfig = Field(default_factory=RelevanceScorerConfig)
