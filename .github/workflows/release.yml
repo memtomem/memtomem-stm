@@ -98,3 +98,15 @@ jobs:
         with:
           repository-url: https://test.pypi.org/legacy/
           packages-dir: dist
+          # Dry-run lane only (#953). A dry run gets attempted more than once
+          # for one version — a re-run after a lost response, a re-pushed
+          # `test-v*` tag — and TestPyPI already holds those filenames, so
+          # without this the job can never go green again. It SKIPS them:
+          # publishing a changed build needs a new version, since
+          # `release_check` ties the tag to pyproject. The PyPI step above
+          # keeps failing on a re-upload on purpose: for a real release an
+          # existing file means the version was already published, and the
+          # publisher refusing it is the only thing that says so — the
+          # verification steps above check the local tag, sources and built
+          # metadata, never the index.
+          skip-existing: true
