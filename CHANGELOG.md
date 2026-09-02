@@ -818,6 +818,15 @@ changes inline only. See the deprecation policy in
   threshold, which is the pre-#353 branch that `partially_helpful` ratings made
   misfire.
 
+- docs: the reviewed-resume guide's install pins widen to admit the releases a
+  reader would actually install — `memtomem[all]>=0.4,<0.6` and
+  `memtomem-stm>=0.2,<0.4` — keeping the schema-4 floor the guide states, and
+  README and `docs/surfacing.md` name every core the released-core smoke covers
+  instead of stopping at 0.3.13 (#972). The weekly compatibility advisory gains
+  a core 0.5.0 row, verified before it was added: the smoke passes against a
+  0.5.0-only environment, so that release still advertises `context_compose`
+  schema 4, and it declares `mcp[cli]>=2,<3` itself, so the row needs no pin.
+
 - ci: the CLA workflow no longer locks a pull request that was closed without
   being merged (#969). `contributor-assistant/github-action` defaults
   `lock-pullrequest-aftermerge` to `true` and acts on the `closed` event without
