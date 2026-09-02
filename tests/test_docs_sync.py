@@ -2394,3 +2394,101 @@ def test_functions_reaching_reports_posix_separated_keys(tmp_path) -> None:
     )
     reaching = _functions_reaching(src, "log_feedback")
     assert reaching == {("cli/selection_cmd.py", "_write_label")}
+
+
+def test_release_publish_steps_scope_skip_existing_to_the_dry_run_lane() -> None:
+    """Only the TestPyPI upload may skip files the index already has (#953).
+
+    A dry run is expected to be attempted more than once for one version — a
+    re-run after a lost response, a re-pushed ``test-v*`` tag — and TestPyPI
+    already holds those filenames, so without the flag the job can never go
+    green again. (It skips them; publishing a CHANGED build needs a new
+    version, since ``release_check`` ties the tag to `pyproject.toml`.)
+    Production must keep refusing them: there an existing file means the
+    version was already published. The flag's spelling is part of the contract
+    — the runner only WARNS on an input an action does not declare, so a typo
+    would upload successfully and surface as a failure on someone's rerun
+    months later, which is exactly the failure this pins.
+
+    Assertions are on canonical block formatting: reformatting these steps
+    means updating this test in the same change.
+    """
+    workflow = _read(".github/workflows/release.yml")
+
+    def _active(block: str) -> list[str]:
+        """The block's real YAML lines, indentation kept, comments dropped.
+
+        Every assertion below runs against these. A commented-out line still
+        contains its own text, so a substring check over the raw block would
+        read ``# repository-url: …`` as the input being set — and that one
+        edit sends the skipping upload to production. Keeping the indentation
+        is what binds an input to its ``with:`` block rather than to any line
+        that happens to spell it. A list, not a set: the count below is the
+        whole point, and a second step spelling the flag identically is
+        exactly the edit that must not collapse into one.
+        """
+        return [
+            line.rstrip()
+            for line in block.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+
+    live = _active(workflow)
+    # Two publisher invocations, no more: the pair below is the whole routing
+    # contract, and a third — pinned, gated on the test- prefix, with no
+    # ``repository-url`` — would upload a test tag straight to production
+    # while every assertion about the named pair still held.
+    assert len([line for line in live if "uses: pypa/gh-action-pypi-publish" in line]) == 2, (
+        "release.yml must invoke the publisher exactly twice, once per lane"
+    )
+    # One step, anywhere in the file, may carry the flag. Locating it by step
+    # NAME alone would miss it landing in an unnamed ``- uses:`` step or in a
+    # second production upload added later.
+    assert len([line for line in live if "skip-existing:" in line]) == 1, (
+        "exactly one publish step may skip files the index already has"
+    )
+    # ``skip_existing`` is the action's deprecated alias: accepted today, but a
+    # silent no-op the moment it is dropped.
+    assert not [line for line in live if "skip_existing" in line], (
+        "use the canonical skip-existing spelling"
+    )
+
+    steps = workflow.split("      - name: ")
+    pypi = [s for s in steps if s.startswith("Publish to PyPI\n")]
+    testpypi = [s for s in steps if s.startswith("Publish to TestPyPI\n")]
+    assert len(pypi) == 1 and len(testpypi) == 1, "release.yml lost a named publish step"
+    production, dry_run = _active(pypi[0]), _active(testpypi[0])
+
+    # The names are labels; three other things decide where a tag's files
+    # actually land, and each can be edited on its own — so pin all three.
+    #
+    # The ``if:`` routes the tag...
+    assert "        if: ${{ startsWith(github.ref_name, 'test-') }}" in dry_run, (
+        "the TestPyPI step must be the one gated ON the test- prefix"
+    )
+    assert "        if: ${{ !startsWith(github.ref_name, 'test-') }}" in production, (
+        "the PyPI step must be the one gated on the ABSENCE of the test- prefix"
+    )
+    # ...``repository-url`` picks the index, and the action defaults to
+    # PRODUCTION without it: dropping that one line silently turns the
+    # skip-existing step into a production upload that accepts existing files.
+    assert "          repository-url: https://test.pypi.org/legacy/" in dry_run, (
+        "the skipping lane must name TestPyPI — the publisher defaults to PyPI"
+    )
+    assert not [line for line in production if "repository-url" in line], (
+        "the production step must publish to the default index, not a redirect"
+    )
+    # ...and both must be the pinned publisher itself. Without this a refactor
+    # to a composite or reusable action would carry the inputs somewhere this
+    # test cannot see, and pass by looking unchanged.
+    action = "        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33"
+    for step, label in ((production, "PyPI"), (dry_run, "TestPyPI")):
+        assert any(line.startswith(action) for line in step), (
+            f"the {label} step must call the pinned publisher action directly"
+        )
+    assert not [line for line in production if "skip-existing" in line], (
+        "the production upload must fail on an already-published file, not skip it"
+    )
+    assert "          skip-existing: true" in dry_run, (
+        "the TestPyPI dry-run lane must skip existing files so a test-v* tag can be re-pushed"
+    )
