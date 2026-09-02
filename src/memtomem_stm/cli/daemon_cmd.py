@@ -327,19 +327,20 @@ def _handshake_removed(path: Path) -> bool:
     except FileNotFoundError:
         # ``lstat`` does not follow the entry itself, but it still resolves
         # everything above it — a broken ancestor raises the same error while
-        # saying nothing about whether teardown removed the handshake. Walk up
-        # to the first ancestor that exists: reaching one means the path really
-        # was walkable and the entry really is gone, while meeting a dangling
-        # link first means we cannot tell, so keep waiting.
+        # saying nothing about whether teardown removed the handshake. Only an
+        # ancestor that EXISTS proves the path was walkable and the entry
+        # really is gone; anything else leaves the question unanswered, so the
+        # wait stays open. ``is_junction`` covers the Windows spelling of a
+        # link, which ``is_symlink`` reports as False.
         for ancestor in path.parents:
             if ancestor.exists():
-                break
-            if ancestor.is_symlink():
+                return True
+            if ancestor.is_symlink() or ancestor.is_junction():
                 # An entry that is there but does not resolve. ``exists`` has
                 # to be asked first: a WORKING link resolves, and treating it
                 # as unwalkable would hang the wait on every such layout.
                 return False
-        return True
+        return False
     except OSError:
         return False
     return False

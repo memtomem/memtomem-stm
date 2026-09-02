@@ -504,7 +504,7 @@ changes inline only. See the deprecation policy in
   bulk `mms add --from-clients --validate` is all-or-nothing unless
   `--save-unverified` explicitly acknowledges saving the complete failed
   batch. `mms daemon start` exits non-zero when readiness never arrives, and
-  `mms daemon stop` waits for endpoint closure and handshake removal after the
+  `mms daemon stop` waits for the daemon's handshake to be removed after the
   shutdown acknowledgement before reporting success.
 
 - **The cleaner keeps its markers out of the text entirely** (#948).

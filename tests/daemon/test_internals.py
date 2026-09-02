@@ -772,6 +772,21 @@ class TestHandshakeRemovedPredicate:
 
         assert _handshake_removed(tmp_path / "never" / "made" / "hs.json") is True
 
+    def test_no_existing_ancestor_at_all_is_not_a_removed_entry(self, tmp_path: Path):
+        """Only an ancestor that EXISTS proves the path was walkable. A root
+        that is itself unreachable — a disconnected drive or UNC share on
+        Windows — answers nothing, so the wait must stay open rather than
+        report a stop."""
+        from memtomem_stm.cli.daemon_cmd import _handshake_removed
+
+        unreachable = SimpleNamespace(exists=lambda: False, is_symlink=lambda: False)
+        unreachable.is_junction = lambda: False  # type: ignore[attr-defined]
+        path = SimpleNamespace(
+            lstat=lambda: (_ for _ in ()).throw(FileNotFoundError()),
+            parents=[unreachable, unreachable],
+        )
+        assert _handshake_removed(path) is False  # type: ignore[arg-type]
+
 
 class TestDaemonStopCli:
     def test_graceful_ack(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
