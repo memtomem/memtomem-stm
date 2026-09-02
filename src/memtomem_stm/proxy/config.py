@@ -1367,10 +1367,11 @@ class ToolOverrideConfig(BaseModel):
     ``max_result_tokens`` or the one inherited from the server — the ratio
     describes what this tool returns, not where its budget is written (#929).
     Inert when the tool sets ``max_result_chars`` and no token budget of its
-    own: a char budget is absolute and nothing converts into it. ``gt=0``
-    admits ``+inf`` on its own (#722), which the conversion cannot represent —
-    the three ratio fields reject non-finite values together because #929 made
-    this one reachable from a budget written at either of the other two."""
+    own: a char budget is absolute and nothing converts into it. Must be
+    finite: ``gt=0`` admits ``+inf`` on its own (#722), which the conversion
+    cannot represent. All three ratio fields are guarded together — this one
+    could already be reached by a tool that also set ``max_result_tokens``,
+    and #929 added the route from a budget inherited from the server."""
     token_estimation_mode: TokenEstimationMode | None = None
     """Per-tool gate mode. ``unicode`` measures the actual response; ``None``
     inherits the upstream or proxy setting."""

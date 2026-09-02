@@ -8,6 +8,7 @@ paths in ``ProxyManager._resolve_tool_config``.
 
 from __future__ import annotations
 
+import sys
 from unittest.mock import AsyncMock
 
 import pytest
@@ -85,6 +86,16 @@ class TestTokensToChars:
     def test_korean_calibrated_ratio(self):
         # 1500 tokens * 1.85 chars/tok = 2775 chars
         assert tokens_to_chars(1500, 1.85) == 2775
+
+    def test_a_finite_product_that_overflows_saturates(self):
+        """Two legal finite values can still multiply to ``inf`` (#929).
+
+        Rejecting non-finite inputs does not make the multiplication safe, and
+        this runs in the budget resolution of every proxied call — an
+        ``OverflowError`` here fails the tool call and names neither field.
+        """
+        assert tokens_to_chars(2, 1e308) == sys.maxsize
+        assert tokens_to_chars(10**400, 3.5) == sys.maxsize
 
 
 # ── ProxyConfig.chars_per_token + effective_max_result_chars ─────────────
@@ -421,9 +432,10 @@ class TestCharsPerTokenIsFinite:
 
     ``int(tokens * inf)`` raises ``OverflowError`` inside the resolution every
     call runs through, so the value has to be refused where it is written. The
-    per-tool field only became reachable this way once a tool ratio started
-    converting an inherited budget (#929); the other two levels were always
-    reachable, which is why the guard is pinned at all three.
+    A tool that also set ``max_result_tokens`` could already reach it, and #929
+    added the route from a budget inherited from the server; the other two
+    levels were always reachable, which is why the guard is pinned at all
+    three.
 
     ``+inf`` is the case the guard adds: ``gt=0`` already refuses ``nan`` and
     ``-inf`` (both compare false against 0), so those parameters document the

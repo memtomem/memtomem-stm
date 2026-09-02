@@ -31,6 +31,9 @@ threshold decisions, not for billing.
 
 from __future__ import annotations
 
+import math
+import sys
+
 # Tokens-per-character by Unicode block, calibrated 2026-04-29 against
 # cl100k_base on a 13-pair EN/KO doc corpus. See module docstring for
 # methodology.
@@ -80,8 +83,25 @@ def tokens_to_chars(tokens: int, chars_per_token: float) -> int:
     For Korean (Hangul-dominant) content, 1.8-2.0 is realistic.
     For Chinese (CJK-ideograph-dominant), 1.0-1.5.
 
-    Returns ``0`` for non-positive inputs.
+    Returns ``0`` for non-positive inputs, and ``sys.maxsize`` when the product
+    overflows to infinity. Both ends are saturating rather than raising: this
+    runs inside the budget resolution of every proxied call, and two finite
+    values a config can legally hold (a ratio near the float ceiling, or an
+    enormous token budget) multiply to ``inf``, which ``int()`` refuses. A
+    config that absurd asks for an unbounded budget, so answering with the
+    largest representable one says that, where an ``OverflowError`` would fail
+    the tool call instead and name neither field. Non-finite *inputs* are
+    refused where they are written (``chars_per_token`` at all three levels).
     """
     if tokens <= 0 or chars_per_token <= 0:
         return 0
-    return int(tokens * chars_per_token)
+    try:
+        product = tokens * chars_per_token
+    except OverflowError:
+        # A token budget past the float range raises in the multiplication
+        # itself rather than producing ``inf`` — ``max_result_tokens`` is an
+        # unbounded int and JSON can carry one.
+        return sys.maxsize
+    if not math.isfinite(product):
+        return sys.maxsize
+    return int(product)

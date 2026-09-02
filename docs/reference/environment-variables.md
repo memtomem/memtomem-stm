@@ -70,7 +70,7 @@ Status meanings:
 | `MEMTOMEM_STM_PROXY__LOCK_TIMEOUT_SECONDS` | positive float | `30.0` | Internal proxy state-lock deadline. | Bundled |
 | `MEMTOMEM_STM_PROXY__CONSUMER_MODEL` | string | empty | Consumer model used for conservative budget calculation. | Bundled |
 | `MEMTOMEM_STM_PROXY__CONTEXT_BUDGET_RATIO` | float `0..1` | `0.05` | Fraction of a known model context allotted to one response. | Bundled |
-| `MEMTOMEM_STM_PROXY__CHARS_PER_TOKEN` | positive float | `3.5` | Token-to-character conversion ratio. | Bundled |
+| `MEMTOMEM_STM_PROXY__CHARS_PER_TOKEN` | finite positive float | `3.5` | Token-to-character conversion ratio. Also settable per upstream server and per tool, both finite too. | Bundled |
 | `MEMTOMEM_STM_PROXY__TOKEN_ESTIMATION_MODE` | `static / unicode` | `static` | Response token-estimation mode. | Bundled |
 | `MEMTOMEM_STM_PROXY__CACHE__ENABLED` | boolean | `true` | Enable response caching. | Bundled |
 | `MEMTOMEM_STM_PROXY__CACHE__DB_PATH` | path | `~/.memtomem/proxy_cache.db` | Response-cache SQLite file. | Bundled |

@@ -54,17 +54,24 @@ changes inline only. See the deprecation policy in
   sets `chars_per_token` on a tool and `max_result_tokens` on the server sees
   that tool's resolved char budget re-scaled to the documented value (for
   example a server at 400 tokens x 2.5 with a tool ratio of 4.0 moves from 1000
-  to 1600 chars). That resolved budget is what a `static`-mode gate compares
-  against and what `mms tune` reports; `unicode` mode derives a
-  response-specific budget and `progressive` has no size gate, so neither reads
-  the ratio at call time and neither changes here. A per-tool
+  to 1600 chars). That resolved budget is the starting point a `static`-mode
+  gate uses (the retention floor can still raise it) and the number `mms tune`
+  reports. `unicode` mode measures the response and derives its own budget and
+  `progressive` has no size gate, so their compression decisions are unchanged
+  — but the resolved budget is part of the response-cache key at every mode, so
+  an affected tool's cached entries are rotated once regardless. A per-tool
   `max_result_chars` with no per-tool token budget beside it still outranks the
   ratio and is unaffected.
-- **`chars_per_token` rejects a non-finite value at all three levels.**
-  `gt=0` admits `+inf` on its own (#722) and the token-to-char conversion
-  cannot represent it, so the call raised `OverflowError`. Reachable at the
-  server and proxy levels before this release; the fix above made the per-tool
-  field reachable the same way, which is why all three are guarded together.
+- **`chars_per_token` rejects a non-finite value at all three levels, and an
+  overflowing budget saturates instead of failing the call.** `gt=0` admits
+  `+inf` on its own (#722) and `int(tokens * inf)` raises `OverflowError`
+  inside the resolution every proxied call runs through. A tool setting both
+  the ratio and its own token budget could already reach it before this
+  release, as could either of the other two levels; the fix above added the
+  inherited-budget route, so all three fields are guarded together. Rejecting
+  non-finite input does not make the multiplication safe, so two finite values
+  that overflow (a ratio near the float ceiling, or a token budget past the
+  float range) now yield the largest representable budget rather than raising.
 
 ## [0.3.0] — 2026-09-02
 
