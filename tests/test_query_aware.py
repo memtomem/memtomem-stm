@@ -388,7 +388,7 @@ class TestEmbeddingOpenAIResponseParsing:
 
 
 class TestEmbeddingCache:
-    """Repeat texts cost a dict lookup instead of a round trip (#873).
+    """Repeat texts are looked up instead of re-sent (#873).
 
     Section bodies are derived deterministically from an upstream response and
     truncated, so the same text recurs call after call while only the query
