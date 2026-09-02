@@ -392,8 +392,9 @@ class TestEmbeddingCache:
 
     Section bodies are derived deterministically from an upstream response and
     truncated, so the same text recurs call after call while only the query
-    rotates; the tool ranker re-scores one catalogue every pass. Every miss is
-    an HTTP request that can take up to ``embedding_timeout``.
+    rotates. A pass sends one batch, so a hit saves that text's share of it and
+    a pass that hits on everything saves the request — which can take up to
+    ``embedding_timeout``.
     """
 
     def _make_scorer(self, cache_size: int = 256):
@@ -541,8 +542,10 @@ class TestEmbeddingCache:
         """``uses_blocking_io`` puts several worker threads on one instance.
 
         Every thread works on texts of its own under a capacity that cannot
-        hold them all, so writes and evictions from different threads
-        interleave. What this pins is that concurrent use returns correct
+        hold them all, so each is writing and evicting on a map the others are
+        using — though nothing here forces those steps to overlap, only to run
+        against one shared instance. What this pins is that concurrent use
+        returns correct
         scores, raises nothing, and leaves the map bounded — it does **not**
         prove the lock: removing it leaves this green, and a heavier probe (16
         threads x 80 passes at capacity 2) produced no failure either, because

@@ -1978,9 +1978,10 @@ class RelevanceScorerConfig(BaseModel):
     Budget roughly 25 KB per entry for a 768-dimension model (a Python list of
     boxed floats). Held per scorer instance, so it is dropped when a
     ``relevance_scorer`` edit rebuilds the scorer — with the exception the
-    SELECTIVE path documents: a compressor caches the scorer it was built with
-    and is itself keyed on ``selective``, so a scorer-only edit reaches it at
-    the next selective rebuild. Only used when scorer="embedding"."""
+    SELECTIVE path documents and HYBRID shares: both run the compressor that
+    caches the scorer it was built with, and that compressor is keyed on
+    ``selective``, so a scorer-only edit reaches them at the next selective
+    rebuild. Only used when scorer="embedding"."""
 
     @model_validator(mode="after")
     def _apply_provider_default_url(self) -> "RelevanceScorerConfig":

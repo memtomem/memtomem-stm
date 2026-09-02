@@ -195,10 +195,11 @@ class EmbeddingScorer:
         self._fallback_lock = threading.Lock()
         # Section bodies are derived deterministically from upstream responses
         # (JSON keys, markdown headings) and truncated, so the same text comes
-        # back call after call while only the query rotates — and the tool
-        # ranker re-scores one catalogue every pass. Each entry costs one HTTP
-        # round trip on a cold or slow embedding backend, up to the full
-        # timeout. Keyed per instance rather than per module: a config change
+        # back call after call while only the query rotates. A pass sends one
+        # batch, so what a hit saves is that text's share of it — and a pass
+        # that hits on everything saves the whole request, up to the full
+        # timeout on a cold or slow backend. Keyed per instance rather than per
+        # module: a config change
         # rebuilds the scorer (`ProxyManager._relevance_scorer_for`), which
         # discards the cache with it, so nothing has to invalidate on a model
         # or provider edit. Guarded by its own lock for the same reason
