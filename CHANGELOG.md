@@ -11,6 +11,127 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-09-02
+
+### Upgrade notes
+
+- **The proxy boundary now fails closed** (#958). A tool RPC that may have
+  reached an upstream is replayed only with affirmative idempotence evidence,
+  and an additive access increment is never replayed after an ambiguous
+  transport failure — a workload that relied on silent retries will see fewer
+  of them. Project-local `.mcp.json` entries selected by
+  `mms add --from-clients` now require `--allow-project-configs` before any
+  probe, write or prune. Complete MCP result envelopes are capped at 40 MiB by
+  `max_upstream_bytes`, and upstream URL, header and env credentials are
+  redacted from client errors, logs and metrics.
+
+- **Shutdown now really ends the process, and its children** (#910, #911,
+  #913, #961, #884, #883). `SIGTERM`/`SIGINT` run the full teardown and exit
+  `0` instead of dying or hanging, and a second signal exits `128 + signum` —
+  where the handlers install, which is POSIX on a main-thread event loop.
+  Ceilings inside the teardown are best-effort; the exit guarantee is a
+  watchdog that exits 1 after a CRITICAL line on overrun, while
+  `MEMTOMEM_STM_TEARDOWN_WATCHDOG_SECONDS` is non-zero (default 60) and its
+  thread starts. Surviving direct children are SIGTERM'd then SIGKILL'd with
+  their pids logged. `stop()` returns within its drain budget and cancels the
+  survivors, refusing new background work while it runs. A background index or
+  extract stage is shed past 64 in flight, and a shed auto-index records
+  `index_ok=False` and `shed` instead of returning the
+  `[Indexing…] · scheduled` footer. Separately, the LLM helpers' `close()`
+  drain is bounded at the captured deadline plus two seconds. For a client that
+  leaves without closing stdin there is a new **opt-in** backstop, off by
+  default: see `MEMTOMEM_STM_PARENT_LIVENESS_POLL_SECONDS` under Added (#915).
+
+- **More configuration now takes effect without a restart** (#962, #903, #899,
+  #889). An edit to an upstream's `url`, `command`, `args` or `env` that races
+  a recovery reconnect is applied instead of being dropped; `extraction` edits
+  reach the extractor itself from the next lookup that observes them; Toolgraph
+  verdicts are retired when the config behind them goes away, so a tool no
+  longer stays withheld under a rule already relaxed. Each proxied request now
+  reads one config snapshot throughout. Adding or removing a server stays
+  restart-only.
+
+- **The advertised tool surface changed shape** (#921, #925, #920, #916, #930).
+  `max_description_chars` is an exact cap on the client-visible description
+  rather than an approximation of it, so descriptions may be shorter than
+  before. A global-only `default_compression` now advertises its convention
+  suffix, matching what calls already resolved. An upstream that replaces its
+  catalogue mid-session has exposure re-decided instead of ignored, and a tool
+  that only runs as an async task is withheld rather than advertised unusable.
+  The credential scan covers the whole advertised surface. An unexpected error
+  from a policy bundle reload is mapped onto the same rejection semantics the
+  documented failures use, so it degrades or fails closed by profile instead of
+  aborting the server or the request (#882), and `stm_proxy_health` no longer
+  reports a live bundle read as served from cache (#939).
+
+- **`mms hook` is cheaper and can no longer report a failure to the host**
+  (#881, #862, #886, #888, #864). Any escaping exception now exits 0 with the
+  pass-through fallback. `metrics.max_history` becomes a **per-source** cap, so
+  the table's worst case grows to the cap times the number of sources — about
+  20k rows instead of 10k at the defaults — and it is approximate on the write
+  path, staying within the cap plus at most 64 rows while a source is being
+  written. Caps of 199 or less stay exactly enforced.
+
+- **Operator output reads differently** (#860, #885, #945, #943, #964).
+  `stm_surfacing_stats` opens with a `Verdict` line, so tooling that indexes
+  that output by line number must adjust. `mms stats` warns about degraded-LTM
+  faults only while an episode is open, adding a line saying surfacing has
+  since completed a successful LTM round trip; a database written before the
+  recovery column existed keeps the unconditional warning. `mms daemon stop`
+  no longer exits 1 on a daemon that stopped correctly.
+
+- **`mms tune` deletes aged compression-feedback rows** (#942). It now opens
+  the compression-feedback store with the configured `retention_days`, where it
+  previously opened it bare and kept every row forever. Rows past the retention
+  the config already declares are purged, unless that value is `0`, which
+  disables the purge — the same behavior the daemon has had at startup all
+  along, with the same value and the same SQL. If you have been
+  reading history older than `compression_feedback.retention_days` out of that
+  file, raise the setting before running the command. The command only reaches
+  the store when a proxy-metrics database exists and the feedback file itself
+  exists; it opens no other feedback store, and `progressive_reads` is
+  untouched. The proxy and the daemon are unaffected.
+
+- **Auto-tune recommendations are computed from the rows they claim to
+  measure** (#931, #935, #936, #938). A strategy pin is gated on, and measured
+  from, AUTO's own calls; H3 groups by the strategy AUTO chose; a
+  recommendation's confidence follows the rows its heuristic actually read; and
+  no `compression` pin is recommended for a tool whose strategy is already
+  fixed by `default_compression`, with budget advice measured against the
+  effective budget (#927). Existing recommendations may therefore change or
+  disappear. Selection telemetry now records the tool-graph's per-candidate
+  facts, and a non-finite reported score is recorded as `null` rather than
+  travelling into the log and the cache as a token strict JSON readers reject
+  (#852).
+
+- **Compressed output and extraction behave differently at the edges** (#949,
+  #947, #863, #902). The cleaner keeps its markers out of the text entirely and
+  restores fences in one pass per kind. A hung LLM extraction fails over to
+  heuristic extraction after `llm_timeout_seconds`, and repeated expirations
+  now open the extraction circuit breaker. Pending eviction ranks by operation
+  order rather than by the clock, so a key just handed to a client is no longer
+  the one discarded, its TTL starts after the scoring call rather than before
+  it, and a scorer that raises leaves no orphan key (#900). Cache-eligible
+  same-key misses that could previously overlap are now serialized, so fewer
+  concurrent upstream calls and LTM searches run under that pattern (#946).
+
+- **Environment overrides and `--config` resolve consistently** (#836, #838,
+  #845, #846, #849, #850, #844, #897). A JSON-valued override is decoded the
+  way the server decodes it, a bare `MEMTOMEM_STM_PROXY` payload is visible to
+  the overlay, overriding one field of a file-declared upstream no longer
+  breaks every `STMConfig()`, an untyped `--config` honors
+  `MEMTOMEM_STM_PROXY__CONFIG_PATH`, and an explicit `--config` steers the
+  checks that build an `STMConfig`. A bare `STMConfig()` that fails now says so
+  instead of degrading silently, and override warnings name variables by
+  measurement rather than inference.
+
+- **Smaller CLI corrections** (#832, #833, #855, #857, #826).
+  `"compression": "progressive"` applies its defaults when the sibling block is
+  omitted, `mms doctor` flags upstream servers configured behind a disabled
+  proxy, `mms selection replay` counts a malformed `rank`, `candidate_tools` or
+  number instead of crashing or silently trusting it, and
+  `mms add --from-clients` sizes prefix truncation from the suffix it applies.
+
 ### Added
 
 - **Release publication now verifies the exact tag, source versions, built
@@ -23,15 +144,15 @@ changes inline only. See the deprecation policy in
   version fails the job instead. The `test-vVERSION` dry-run lane keeps
   skipping them, so a re-run or a re-pushed test tag can still go green
   instead of dying on "file already exists" — publishing a changed build
-  still needs a new version (#953, fixed by #965).
+  still needs a new version (#965, issue #953).
 
 - **Required CI now names its supported interpreter lanes and enforces branch
-  coverage.** Tests run on Python 3.12 for Ubuntu/Windows and Python 3.13 for
+  coverage** (#958). Tests run on Python 3.12 for Ubuntu/Windows and Python 3.13 for
   Ubuntu; the Ubuntu 3.12 lane fails below 90% branch coverage. CI and release
   jobs use the repository-tested uv 0.12.5 instead of floating on `latest`.
 
-- **Opt-in backstop for a client that goes away without closing stdin** (#914,
-  the last of #906's four directions). #910-#913 hardened every path where
+- **Opt-in backstop for a client that goes away without closing stdin** (#915,
+  issue #914, the last of #906's four directions). #910-#913 hardened every path where
   *something* tells the server to stop — EOF, a signal, a deadline. A client
   that exits having leaked the stdin pipe's write end into a surviving
   descendant tells it nothing: no EOF, no signal, and none of that teardown is
@@ -64,7 +185,8 @@ changes inline only. See the deprecation policy in
   fires — or leave the feature off. POSIX-only; the detached daemon runs its own
   lifespan and is unaffected.
 
-- **`stm_surfacing_stats` opens with a health verdict** (#363, part of #351).
+- **`stm_surfacing_stats` opens with a health verdict** (#860, issue #363, part
+  of #351).
   The output starts with raw counts and grows past 50 lines once skip reasons,
   outcomes and cache buckets fill in, so the operator's first question — "is
   surfacing healthy?" — was the one thing the tool did not answer. It now
@@ -85,6 +207,10 @@ changes inline only. See the deprecation policy in
   `surfacing_feedback` has no recorded distribution to anchor a target band
   against (#364 stays open). Scope is one process since start, as the label
   says — `mms stats` remains the persisted 7-UTC-day fault view.
+
+  **Behavior change**: `stm_surfacing_stats` output gains a `Verdict` line
+  immediately under the header, so tooling that indexes this output by line
+  number must adjust. The counters below it are unchanged.
 
 - **`mms selection feedback` labels a recorded tool selection** (#853, part of
   #469). The selection log's `feedback` event has been schema-pinned since #467
@@ -277,7 +403,7 @@ changes inline only. See the deprecation policy in
 ### Changed
 
 - **Behavior change**: **retries after an ambiguous tool-call failure now
-  require affirmative idempotence evidence.** Previously only a per-attempt
+  require affirmative idempotence evidence** (#958). Previously only a per-attempt
   timeout was replay-gated; a connection reset or EOF was retried for every
   tool. Once `session.call_tool` has been entered, any failure — reset, EOF,
   timeout, retryable MCP error — may have committed the upstream side effect,
@@ -292,8 +418,8 @@ changes inline only. See the deprecation policy in
   `cache: true` where replay is known to be safe. A replay-unsafe failure still
   reconnects for the next call; it just does not re-invoke the tool.
 
-- **Documented how an advertised tool description is assembled** (#896, PR
-  #923). No STM-native surface renders the assembled description —
+- **Documented how an advertised tool description is assembled** (#923, issue
+  #896). No STM-native surface renders the assembled description —
   `stm_proxy_stats` and `stm_proxy_health` report counts, and the `mms` commands
   report configuration and health but never the description text. Listing tools
   from the client shows the exact result; understanding how it was built was
@@ -448,6 +574,279 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **A signal, a wedged teardown, or a leaked child can no longer leave the
+  server or its upstreams running** (#910, #911 and #913, issue #906). Three of
+  that issue's four directions, in the order they run. `SIGTERM`/`SIGINT` now
+  run the full teardown and exit `0` instead of killing the process with its
+  stdio children orphaned, or hanging. The handlers stay installed across
+  teardown — handing the signals back would put SIGTERM's default disposition
+  in charge of the very window this shutdown exists to survive — and a second
+  signal instead takes the immediate-exit path and exits `128 + signum`, while
+  the signal that started the teardown does not re-enter it. Some of the
+  cancellable waits inside the teardown carry ceilings and some steps carry
+  none; read `server.py`'s lifespan for which is which, since that division
+  moves with the code. What matters for a reader is that no ceiling is the
+  exit guarantee: cancelling a wait does not stop work that swallows
+  `CancelledError`, and it cannot touch a synchronous call at all. The
+  guarantee is a watchdog, armed only between teardown starting and finishing,
+  which exits the process 1 after a CRITICAL line when the teardown overruns
+  `MEMTOMEM_STM_TEARDOWN_WATCHDOG_SECONDS` (default 60). It is a backstop and
+  says so: `0` disables it, and a thread it cannot start leaves the shutdown
+  running without it rather than failing the shutdown. What survives teardown
+  is then swept: direct children still alive are SIGTERM'd, then SIGKILL'd, and
+  their pids logged at WARNING under `memtomem_stm.utils.child_reaper`.
+
+  **Behavior change**: where the handlers install — POSIX, on a main-thread
+  event loop — a signalled shutdown exits `0` after a real teardown rather than
+  dying or hanging, and a ceilinged step that overruns while still taking
+  cancellation is abandoned with a WARNING naming it. An overrunning teardown
+  exits 1 rather than living on, while the watchdog is enabled and armed. A
+  leaked child is killed rather than orphaned, and a clean shutdown that could
+  take a startup baseline and finds nothing logs nothing; without a baseline
+  the sweep is skipped with a WARNING saying so. The sweep is a no-op on
+  Windows and wherever `pgrep` is unavailable, so it can never itself be why
+  the process fails to exit. Signal installation never fails startup — a
+  non-main thread cannot install one, and Windows has no
+  `add_signal_handler`, so on those the old behavior stands. The fourth
+  direction, a client that leaves without closing stdin, is the opt-in backstop
+  under Added (#915).
+
+- **A retire task cancelled before its first step no longer strands the
+  connection it was closing** (#961, issue #952). `_release_connection_session`
+  adds the generation to `conn.retiring_generations` before creating the close
+  task, and `_close_retired_generation` discards that marker only from inside
+  its own body. A task `stop()` cancels before it ever runs therefore leaves the
+  marker permanently, and `stop()`'s drain loop skips any generation still
+  marked — so neither path closed the retired owner. The generation set is
+  replaced by a `retiring_tasks` map from generation to the task closing it, so
+  the entry is owned by the code that created it and a task that never starts
+  leaves nothing behind for the drain to skip.
+
+  **Behavior change**: an orphaned stdio child process, or an open HTTP
+  transport, no longer survives shutdown through this window — the same leak
+  class the parent-liveness backstop exists to prevent. Nothing changes when the
+  retire task runs normally.
+
+- **A hot config edit is no longer dropped by a reconnect that was already in
+  flight** (#962, issue #959). `_reconnect_server` coalesced concurrent
+  reconnects by comparing `conn.reconnect_generation` alone, which answers
+  "another reconnect finished" and not "the connection now matches the config I
+  was asked to install". A background recovery reconnect running on the old
+  settings could finish first, advance the generation, and make a
+  config-change reconnect conclude its work was already done. Coalescing now
+  compares the connection identity — the requested transport fingerprint against
+  the installed one — so a reconnect returns early only when the settings it
+  carries are the settings in place. The fingerprint is the frozen view of the
+  fields the active transport consumes: `transport` always, then `command`,
+  `args` and `env` for stdio, or `url`, `headers` and
+  `connect_timeout_seconds` for a network transport.
+
+  **Behavior change**: an edit to any field of that fingerprint that raced a
+  recovery reconnect now takes effect instead of being silently dropped until
+  the next restart. Two concurrent detections of the same edit still collapse
+  into one reconnect, a prefix-only edit still skips, adding or removing a
+  server stays restart-only, and the generation is still bumped only on success.
+
+- **The per-key stampede guards no longer let a late arrival run alongside a
+  queued waiter** (#946, issue #878). Both guards — in `ProxyManager` and in
+  `SurfacingEngine` — popped the per-key lock entry in `finally` while still
+  holding it. A caller queued on that lock is then orphaned onto an entry no
+  longer in the registry, so the next arrival installs a fresh lock under the
+  same key and runs concurrently with it. The window is harmless whenever the
+  first caller's result populated the cache and that row is still readable; it
+  bites when it stored nothing — a swallowed `cache.set` failure, or an empty
+  LTM result that is deliberately not cached. The locks are now refcounted and
+  removed only when the last holder leaves.
+
+  **Behavior change**: no MCP or response-shape change. Cache-eligible
+  same-key misses that previously could overlap are now serialized, so the
+  observable difference under the triggering pattern is fewer concurrent
+  upstream calls and LTM searches, and no empty-list overwrite of a populated
+  surfacing cache entry. A disabled cache, a non-positive TTL, and anything else
+  that never reaches the guard are unaffected. The Python surface grows one
+  internal module, `memtomem_stm.utils.keyed_locks`.
+
+- **Surfacing fault episodes close when surfacing recovers** (#885, issue #869).
+  `last_recovered_at` had exactly one writer, hard-guarded to the diagnostic
+  kinds. Every real fault kind — `circuit_open`, `error_timeout`, the `ltm_*`
+  family — had no recovery writer and no call site at all: the engine's success
+  path only reset the in-memory breaker, so a fault row stayed open for its
+  whole retention window. In the dogfood database both fault streams had been
+  quiet for days while `mms stats` still warned about ongoing degraded LTM. A
+  successful surfacing round trip now closes the open episodes for that key in
+  one update, and `record_fault` clears the recovery stamp so a re-break reopens
+  the episode.
+
+  **Behavior change**: `mms stats` warns about degraded-LTM faults only while an
+  episode is open. The fault counts and the `last fault:` line still render,
+  followed by a line saying surfacing has since completed a successful LTM round
+  trip. A database written before the recovery column existed cannot tell the
+  two apart and keeps the unconditional warning. `read_surfacing_summary` gains
+  `active_faults` and `faults_recovery_supported`; the raw `faults` dict is
+  unchanged.
+
+- **An unexpected error from a policy bundle reload no longer takes down the
+  server or the request** (#882, issue #866). The startup bundle refresh caught
+  `OSError` and `PolicyBundleError` only, so any other exception escaping the
+  reload — a malformed bundle, or an internal loader, `stat()` or config error
+  — aborted the whole MCP server instead of degrading the toolgraph feature.
+  The same reload runs on every proxied `tools/call` and on each advertisement
+  build, so the crash reached live requests too. Unexpected classes are now
+  mapped onto the same rejection semantics the documented failures use.
+
+  **Behavior change**: at startup the server starts with toolgraph degraded
+  under the review profile, or fails with the policy-shaped
+  `ToolgraphStartupError` under strict, instead of propagating the raw
+  exception; at runtime the proxied-call gate fails closed with the policy
+  `ToolError` under strict, or keeps serving under review. `OSError` and
+  `PolicyBundleError` keep their rejection mapping and warning format, and now
+  also clear the stamp, so a transient failure on those classes recovers where
+  it could previously stick. `CancelledError`, `KeyboardInterrupt` and
+  `SystemExit` still propagate. No change for a healthy reload.
+
+- **Background index and extract stages are capped, and `stop()` cancels what
+  outlives its drain** (#884, issue #868). Fire-and-forget stages accumulated
+  with no cap — the task count was bounded only by the request rate — and
+  `stop()`'s drain gave up after eight passes, logged "leaking them" and cleared
+  the set, leaving those tasks running against resources being torn down. One
+  choke point, `_spawn_background()`, now owns the cap, the tracking set and the
+  done-callback together.
+
+  **Behavior change**: a background stage is shed while 64 tasks are already in
+  flight, where previously every one was spawned. A shed auto-index no longer
+  returns the `[Indexing…] · scheduled` footer and records `index_ok=False` and
+  `shed` instead of a pending-looking `None`. `stop()` returns within its drain
+  budget even when a task delays or suppresses cancellation, cancels the
+  survivors instead of abandoning them, and keeps any straggler tracked. While
+  that drain runs, new background work is refused and a `tools/list_changed`
+  notification is refused rather than scheduled.
+
+- **`close()` on the LLM helpers is bounded, and the fact extractor drains at
+  all** (#883, issue #867). `LLMCompressor.close()` awaited its idle gate with
+  no ceiling, and `ProxyManager.stop()` awaited that unguarded — in practice
+  the in-flight compress is bounded by its own timeout, but nothing in `close()`
+  enforced it. `FactExtractor.close()` had no drain whatsoever, so `aclose()`
+  could land under a live request and tear the httpx transport down mid-call.
+  Both now share the bounded `InFlightGate` and `drain_or_warn()` helpers.
+
+  **Behavior change**: the drain in `close()` is bounded at the captured
+  deadline plus two seconds, logging a warning and closing the client anyway at
+  the ceiling; the subsequent `aclose()` is unbounded as before, so total
+  `close()` duration is not capped. `FactExtractor.extract()` gains one new
+  degrade-to-heuristic path, for a close in progress or a closed extractor whose
+  client reference was resurrected. No change on any path where the drain
+  completes normally.
+
+- **A hung LLM extraction is bounded by `llm_timeout_seconds`** (#863).
+  `FactExtractor._extract_llm` awaited the provider call with no `wait_for`,
+  unlike its explicitly mirrored sibling `LLMCompressor.compress`. The httpx
+  client timeout covers socket phases only, so a provider that accepts the
+  connection and then stalls mid-body could hold the caller for up to a minute
+  — and with `extraction.background: false` that await sits inline on the
+  tool-response path.
+
+  **Behavior change**: a hung extraction fails over to heuristic extraction
+  after `llm_timeout_seconds` instead of holding the pipeline for as long as the
+  transport allows. Repeated expirations now count toward the existing
+  extraction circuit breaker; previously a hung call never returned, so it could
+  not be booked as a failure at all.
+
+- **A retirement claim is marked rather than removed while the close runs**
+  (#905, issue #904). `ProxyManager._close_retiring_extractors` claimed an entry
+  by removing it from the registry before awaiting its `close()`, handing it
+  back only if that close failed or was cancelled. For the length of a close the
+  instance was in no set at all, invisible to every other pass including
+  `stop()`'s — so a `stop()` that ran during one saw nothing to drain and
+  finished, leaving no retry point.
+
+  **Behavior change**: none on the ordinary paths. `stop()` still does not wait
+  for another task's close; it just no longer walks past the instance and loses
+  it.
+
+- **`mms hook` no longer exits non-zero when an unguarded step fails** (#881,
+  issue #865). The hook contract is "always exit 0, degrade to passthrough", but
+  several per-invocation steps ran outside any barrier — the runtime env
+  overrides, the payload read, host resolution, adapter lookup, serialization,
+  and the final stdout write, which caught `UnicodeEncodeError` only. The inner
+  guard also caught `Exception` alone, so a `SystemExit` escaping the
+  orchestrator became the process exit code. One top-level `BaseException`
+  barrier now wraps the whole body.
+
+  **Behavior change**: a previously escaping exception exits 0 with the
+  pass-through fallback instead of a non-zero exit the host reads as a hook
+  failure on every built-in tool call. No change on any success or
+  already-guarded path — the serialized output is byte-identical.
+
+- **`metrics.max_history` is enforced per source, so hook churn cannot evict
+  proxied-call rows** (#864). The
+  retention cap was table-wide FIFO, and its two writers have wildly different
+  rates: the `mms hook` path writes one row per built-in host tool call and
+  outpaces proxied MCP traffic by orders of magnitude. In live data on one
+  machine, hook rows held 9,969 of the 10,000-row cap, leaving 31 surviving
+  `mcp` rows — and the tuner and error aggregations in this store are
+  `mcp`-scoped, so their sample had been starved to uselessness. `_trim` now
+  enforces the cap within the source of the row just written, backed by a
+  `(source, created_at)` index.
+
+  **Behavior change**: `metrics.max_history` becomes a per-source cap instead of
+  a table-wide one, so the table's worst case grows to the cap times the number
+  of distinct sources — about 20k rows instead of 10k at the defaults, with two
+  sources today. No config shape changes and existing databases migrate
+  transparently.
+
+- **The `mms hook` metrics write no longer pays a schema cycle and a full
+  partition scan per invocation** (#886 and #888, issue #870). The hook opens a
+  short-lived metrics store on every built-in host tool call. `initialize()`
+  re-ran work that is invariant after the first run — the base DDL, a
+  `PRAGMA table_info` probe with sixteen conditional migration checks, and three
+  commits — and `_trim` then ran a `COUNT(*)` covering-index scan over the
+  writer's partition, which in steady state sits at the cap. Measured on a
+  checkpointed database at the default cap, that scan was 0.387 ms of a 0.43 ms
+  `record()`, and it grew linearly with `max_history`. The DDL and migration are
+  now gated on a schema stamp, and the trim runs on an interval boundary rather
+  than on every write.
+
+  **Behavior change**: `max_history` becomes an approximate cap on the write
+  path. While a source is being written its partition stays within the cap plus
+  the interval — at most 64 rows, about 0.6% at the default — and returns to the
+  cap at the next crossing. Caps of 199 or less are unaffected and stay exactly
+  enforced, and the reconcile pass in `initialize` is still exact. A source that
+  stops being written keeps whatever excess it had until it is written again.
+
+- **Importing the CLI group no longer pulls in the MCP SDK** (#862). `mms hook`
+  runs on every built-in Read, Grep, Glob and Bash call in a host that wires it,
+  and each invocation imported `cli/proxy.py` — where seven eagerly registered
+  command families dominated the cost. Importing the group took about 341 ms, of
+  which roughly 230 ms was the selection family reaching `proxy.manager` and
+  through it the whole MCP SDK. The families now resolve from a name-to-module
+  registry on first access, removing about 271 ms of that import; a hook
+  invocation additionally imports only the hook command itself.
+
+  **Behavior change**: none external. `--help` and shell completion still list
+  and resolve every command, through `list_commands` and `get_command`.
+
+- docs: the auto-tuner's no-op region is described as the two independent gates
+  it has been since #353 part 2, not as a single `[0.2, 0.6]` band on one axis
+  (#861). The old phrasing also implied that a low negative ratio lowers the
+  threshold, which is the pre-#353 branch that `partially_helpful` ratings made
+  misfire.
+
+- docs: the reviewed-resume guide's install pins widen to admit the releases a
+  reader would actually install — `memtomem[all]>=0.4,<0.6` and
+  `memtomem-stm>=0.2,<0.4` — keeping the schema-4 floor the guide states, and
+  README and `docs/surfacing.md` name every core the released-core smoke covers
+  instead of stopping at 0.3.13 (#972). The weekly compatibility advisory gains
+  a core 0.5.0 row, verified before it was added: the smoke passes against a
+  0.5.0-only environment, so that release still advertises `context_compose`
+  schema 4, and it declares `mcp[cli]>=2,<3` itself, so the row needs no pin.
+
+- ci: the CLA workflow no longer locks a pull request that was closed without
+  being merged (#969). `contributor-assistant/github-action` defaults
+  `lock-pullrequest-aftermerge` to `true` and acts on the `closed` event without
+  asking whether the pull request was actually merged, so closing and reopening
+  one to retrigger CI locked its conversation — after which every later comment
+  job on it failed with `HTTP 403`.
+
 - **`mms daemon stop` no longer reports failure on a daemon that stopped
   correctly** (#964, issues #954 and #966). The wait for teardown also probed the
   host/port read from the handshake *before* shutdown, and that probe carries
@@ -521,7 +920,7 @@ changes inline only. See the deprecation policy in
   regex work.
 
 - **The proxy boundary now fails closed across trust, retries, response size,
-  and surfacing state.** Project-local `.mcp.json` entries selected by
+  and surfacing state** (#958). Project-local `.mcp.json` entries selected by
   `mms add --from-clients` require `--allow-project-configs` before any probe,
   write, or prune. Upstream URL/header/env credentials are redacted from
   client errors, logs, and metrics. Once a tool RPC may have reached an
@@ -534,19 +933,20 @@ changes inline only. See the deprecation policy in
   images, structured content, metadata, and error payloads.
 
 - **Surfacing cache hits no longer manufacture dependency health or consume
-  LTM rate slots.** Circuit-breaker recovery is recorded only after a healthy
+  LTM rate slots** (#958). Circuit-breaker recovery is recorded only after a healthy
   live LTM round trip, cached calls refund their eager rate claim, cache keys
   use injective component framing, and configured per-minute limits above 200
   are enforced instead of silently evicting live claims.
 
-- **Operational CLI success now means the requested state was reached.** A
-  bulk `mms add --from-clients --validate` is all-or-nothing unless
+- **Operational CLI success now means the requested state was reached** (#958).
+  A bulk `mms add --from-clients --validate` is all-or-nothing unless
   `--save-unverified` explicitly acknowledges saving the complete failed
   batch. `mms daemon start` exits non-zero when readiness never arrives, and
   `mms daemon stop` waits for the daemon's handshake to be removed after the
   shutdown acknowledgement before reporting success.
 
-- **The cleaner keeps its markers out of the text entirely** (#948).
+- **The cleaner keeps its markers out of the text entirely** (#949, issue
+  #948).
   `_strip_html_jsx` used to swap each code fence and generic type for a
   NUL-delimited marker (`\x00FENCE0\x00`) while HTML was stripped, then put
   them back. That spelling was never reserved — a response carries NUL bytes
@@ -595,7 +995,8 @@ changes inline only. See the deprecation policy in
   2 MB fence-dense body peaks at 77.6 MiB against 65.2 MiB, with its time
   unchanged (0.295-0.297 s against 0.305-0.314 s).
 
-- **Code-fence restoration in the cleaner is linear in response size** (#877).
+- **Code-fence restoration in the cleaner is linear in response size** (#947,
+  issue #877).
   `_strip_html_jsx` shields code fences and generic types (`List<T>`) behind
   placeholders while HTML tags are stripped, then put each one back with a
   full-text `str.replace` — one scan of the whole response *per placeholder*.
@@ -618,7 +1019,7 @@ changes inline only. See the deprecation policy in
   range, leading zero) included — those were already passed through.
 
 - **Score-scale diagnostics persist per observation and recover unlatched**
-  (#944). The `score_scale_mismatch` / `score_ceiling_below_min` path gated its
+  (#945, issue #944). The `score_scale_mismatch` / `score_ceiling_below_min` path gated its
   durable writes on four per-process in-memory latches, but the
   `surfacing_faults` row is shared by every STM process on the machine —
   `feedback_db_path` defaults to the user-wide `~/.memtomem/stm_feedback.db`
@@ -654,7 +1055,8 @@ changes inline only. See the deprecation policy in
   pipeline-fault counts above them already had. `mms doctor` only tests
   whether an episode is open and is unaffected.
 
-- **The score-scale tripwire maps are bounded** (#880). `SurfacingEngine`
+- **The score-scale tripwire maps are bounded** (#943, issue #880).
+  `SurfacingEngine`
   caps its surfaced-id, boost-dedup and cache-invalidation maps at 10k, and a
   comment claimed the five `(server, tool)`-keyed score-scale maps needed no
   cap because they were "naturally bounded by the configured upstream tool
@@ -691,7 +1093,7 @@ changes inline only. See the deprecation policy in
   window.
 
 - **The feedback stores no longer carry a retention default that contradicts
-  the config** (#876). `CompressionFeedbackStore` / `ProgressiveReadsStore` and
+  the config** (#942, issue #876). `CompressionFeedbackStore` / `ProgressiveReadsStore` and
   their trackers defaulted `retention_days` to `0` — never purge — while
   `CompressionFeedbackConfig` / `ProgressiveReadsConfig` default to 90 days.
   The daemon always passed the configured value, so the shipped purge was
@@ -707,11 +1109,21 @@ changes inline only. See the deprecation policy in
   `docs/configuration.md` full example's
   `retention_days: 90` for both blocks is now pinned against the models by
   `test_docs_sync.py`, which previously claimed to cover every `ProxyConfig`
-  sub-block but checked only `cache` and `toolgraph`. No behavior change to the
-  proxy or the daemon: the purge runs exactly as before.
+  sub-block but checked only `cache` and `toolgraph`.
+
+  **Behavior change**: `mms tune` now purges compression-feedback rows older
+  than the configured `compression_feedback.retention_days` when it opens that
+  store, where it previously opened it bare — always at `0`, which disables the
+  purge — and kept them forever. It is the same purge the daemon has always run
+  at startup, with the same value and the same SQL, and a configured `0` still
+  disables it. It is the only feedback store the command opens, and it opens it only
+  when a proxy-metrics database exists and the feedback file itself exists, so
+  a run that finds neither deletes nothing. The proxy and the daemon are
+  unaffected. A caller that omits `retention_days` now raises `TypeError`,
+  which cannot happen at any shipped call site.
 
 - **A policy bundle's identity is published only once its decisions bind**
-  (#940). Bundle adoption assigned the new snapshot, stamp, digest, instance id
+  (#941, issue #940). Bundle adoption assigned the new snapshot, stamp, digest, instance id
   and generation before calling the bind, which is deliberately outside the
   artifact-reject barrier: a binding bug is not an invalid bundle. But a bind
   that raised then left `stm_proxy_health` reporting the new artifact over the
@@ -722,7 +1134,7 @@ changes inline only. See the deprecation policy in
   unchanged stamp makes the next refresh retry it.
 
 - **A switch to a policy bundle no longer reports the retired consult's cache
-  provenance** (#919). `from_cache` records whether *this* session's stdio
+  provenance** (#939, issue #919). `from_cache` records whether *this* session's stdio
   consult verdict was served from the #494 consult cache, and it was cleared
   only by the shared verdict reset. Successful bundle adoption was the one
   verdict-adoption path that did not go through that reset — it overwrote the
@@ -731,12 +1143,16 @@ changes inline only. See the deprecation policy in
   `stm_proxy_health` rendered a freshly read bundle as being served "from
   cache". Bundle adoption now drops the retired source's provenance once the
   new decisions are bound, through the same helper the verdict reset uses so
-  the two paths share one enumeration. Reporting only: the enforcement verdict
-  was the bundle's and was already correct, but the field exists precisely to
+  the two paths share one enumeration.
+
+  **Behavior change**: reporting only, and only in `stm_proxy_health`. A bundle
+  read live no longer inherits the retired stdio consult's ", from cache" note,
+  so the field reports the current source's provenance. The enforcement verdict
+  was the bundle's and was already correct; the field exists precisely to
   answer "is this decision current?".
 
 - **H3 groups by the strategy AUTO chose, not the label the call ended on**
-  (#937). The dominance share grouped by `compression_strategy`, which records
+  (#938, issue #937). The dominance share grouped by `compression_strategy`, which records
   the path a call *took*: `ProxyManager`'s degradation paths rewrite it — the
   ratio-guard ladder, the LLM-compression fallbacks, and the store-error
   degradations alike (`hybrid→progressive_fallback`,
@@ -781,7 +1197,8 @@ changes inline only. See the deprecation policy in
   chose hybrid on 10 of 10 calls it resolved"*) because that is what the count
   now attests.
 
-- **The strategy pin is measured on AUTO's own calls** (#933). H3 recommends
+- **The strategy pin is measured on AUTO's own calls** (#936, issue #933). H3
+  recommends
   pinning a strategy *"to skip detection overhead"* — advice that presumes the
   calls it counted were AUTO calls, resolved per response. The column it read
   cannot support that: `compression_strategy` records the strategy a call ran
@@ -826,7 +1243,7 @@ changes inline only. See the deprecation policy in
   it up on the next open.
 
 - **A recommendation's confidence follows the rows its heuristics measured**
-  (#934). The label is one word over every action in a `TuningRecommendation`,
+  (#935, issue #934). The label is one word over every action in a `TuningRecommendation`,
   and it was read from `call_count` — the calls in the window — while two of
   the four heuristics rest on far narrower populations, so it could state
   `high` on a number taken from a single observation.
@@ -857,7 +1274,8 @@ changes inline only. See the deprecation policy in
   `get_tool_profiles` dicts gain `ratio_count`; the addition is additive and
   no existing key changes.
 
-- **The strategy pin is gated on the share it claims to have measured** (#928).
+- **The strategy pin is gated on the share it claims to have measured** (#931,
+  issues #928 and #932).
   `STRATEGY_PIN_THRESHOLD = 0.80` is documented as the fraction one strategy
   must dominate above before H3 recommends pinning it, but it was never
   compared against anything — it was interpolated into the recommendation's
@@ -910,7 +1328,8 @@ changes inline only. See the deprecation policy in
   `get_tool_profiles` dicts gain `dominant_strategy_count` and
   `strategy_count`; the addition is additive and no existing key changes.
 
-- **The credential scan covers the whole advertised surface** (#894). The
+- **The credential scan covers the whole advertised surface** (#930, issue
+  #894). The
   `sensitive_metadata` gate exists so that no secret-class string reaches the
   client's context through `tools/list`, but it read only the description (raw
   and advertised) and the input schema. Everything else a successful
@@ -952,7 +1371,7 @@ changes inline only. See the deprecation policy in
   signal.
 
 - **The tuner measures a tool's strategy and budget the way a call resolves
-  them** (#926). Both of its config lookups stopped one level short of the
+  them** (#927, issue #926). Both of its config lookups stopped one level short of the
   runtime resolution, and both turned that into advice an operator could act on
   to no effect or to harm:
 
@@ -987,8 +1406,13 @@ changes inline only. See the deprecation policy in
   drops the dominant strategy's count. #928 — fixed separately, in this same
   release; see the entry above.
 
+  **Behavior change**: only the tuner's output. No `compression` pin action is
+  recommended for a tool whose strategy is already fixed by
+  `default_compression`, and budget advice is measured against the effective
+  budget, so an existing recommendation may change or disappear.
+
 - **A global-only `default_compression` now advertises its convention suffix**
-  (#924, PR #925). Calls resolve compression through the global default when a
+  (#925, issue #924). Calls resolve compression through the global default when a
   server omits the `compression` key (#292), but the advertisement read the
   per-server field alone — which is `auto` for exactly that configuration, and
   `auto` emits no suffix. An operator who configured compression globally got
@@ -1004,7 +1428,7 @@ changes inline only. See the deprecation policy in
   own way; #926 above folds them in and moves the function to
   `proxy/config.py`.
 
-  **Behavior change**, in two parts. For the three strategies that carry a
+  **Behavior change**: in two parts. For the three strategies that carry a
   suffix at all — `selective`, `progressive`, and `hybrid` under its default
   `tail_mode: "toc"`, a `truncate` tail being self-contained — such upstreams
   gain it whenever it fits the effective description budget, costing upstream
@@ -1025,7 +1449,7 @@ changes inline only. See the deprecation policy in
   response instead.
 
 - **`max_description_chars` is now an exact cap on the client-visible
-  description** (#893, PR #921). It read as a cap but did not bound the string
+  description** (#921, issue #893). It read as a cap but did not bound the string
   that reached the client, three ways that compound: truncation appended its ellipsis *after* slicing (+3),
   the convention-suffix budget floored at 40 regardless of the configured
   value, and registration prepended `[proxied] ` (+10) after all budgeting — so
@@ -1065,7 +1489,7 @@ changes inline only. See the deprecation policy in
   catalogue but not the config it is advertised under.
 
 - **A mid-session upstream catalogue change now re-decides exposure instead of
-  being ignored** (#917). The exposure filter's verdict was registered exactly
+  being ignored** (#920, issue #917). The exposure filter's verdict was registered exactly
   once, at startup, while an upstream can replace its catalogue at any time —
   on a reconnect, or by sending `tools/list_changed`. Both swapped
   `conn.tools` and stopped there, so a tool that only *then* earned a
@@ -1118,7 +1542,7 @@ changes inline only. See the deprecation policy in
   rest of that source's verdict.
 
 - **Tools that only run as async tasks are withheld instead of advertised
-  unusable** (#892). MCP revision 2025-11-25 added `Tool.execution`
+  unusable** (#916, issue #892). MCP revision 2025-11-25 added `Tool.execution`
   (`taskSupport: "forbidden" | "optional" | "required"`), which the pinned SDK
   models and the proxy dropped on the floor. For a `required` upstream tool
   that was worse than a metadata gap: the re-advertised tool looked like an
@@ -1145,7 +1569,7 @@ changes inline only. See the deprecation policy in
   never an option: it would advertise task support nothing here can bridge.
 
 - **Health, ranking and selection telemetry no longer count a tool the server
-  could not register** (#908). Exposure is decided — and snapshotted into
+  could not register** (#909, issue #908). Exposure is decided — and snapshotted into
   `_advertised_*` — inside `get_proxy_tools()`, which necessarily runs before
   the caller has tried to register anything. Registration can still decline a
   name: `add_tool` raising for any reason, or the prefixed name already
@@ -1169,7 +1593,7 @@ changes inline only. See the deprecation policy in
   advertises once at startup, so this only concerns library use.
 
 - **Server shutdown unregisters the tools it registered, not the ones it would
-  advertise now** (#891). The lifespan registered one `get_proxy_tools()` pass
+  advertise now** (#907, issue #891). The lifespan registered one `get_proxy_tools()` pass
   and, at teardown, called `get_proxy_tools()` a second time and removed *that*
   result. That call is a live re-derivation, so any catalog movement during the
   session made the two disagree: a tool an upstream withdrew via
@@ -1201,7 +1625,7 @@ changes inline only. See the deprecation policy in
   at debug level instead of discarded.
 
 - **An edit to `extraction` now reaches the extractor, not just the stage
-  around it** (#890). `ProxyManager` built its `FactExtractor` once and kept
+  around it** (#903, issue #890). `ProxyManager` built its `FactExtractor` once and kept
   that instance for the life of the process. After a hot reload of
   `stm_proxy.json`, the stage gate and the config the extracted facts were
   stored under both moved to the new generation, while the extractor itself
@@ -1319,7 +1743,7 @@ changes inline only. See the deprecation policy in
   Instances sharing one store file must be upgraded together, as above.
 
 - **A selection key minted off-thread lands in the generation the reader
-  consults** (#898). A SELECTIVE/HYBRID compress can run on a worker thread for
+  consults** (#900, issue #898). A SELECTIVE/HYBRID compress can run on a worker thread for
   as long as its embedding scorer takes, and `begin_use` (#628) only keeps that
   compressor ALIVE — not reachable. `stm_proxy_select_chunks` reads the
   manager's current slot, so a selective-config change landing mid-compress let
@@ -1377,6 +1801,12 @@ changes inline only. See the deprecation policy in
   and building the TOC string. Closing it completely needs retired stores to
   stay readable until their keys expire, which is the lease lifecycle #890
   carries for the fact extractor.
+
+  **Behavior change**: a table of contents reports the `ttl_seconds_remaining`
+  of the generation that will actually enforce it, a selection's TTL starts
+  after the scoring call rather than before it — so under a slow embedding
+  endpoint the key lives its full TTL from the moment it exists — and a scorer
+  that raises leaves no orphan key where it previously stored one first.
 
 - **An unseeded loader with an unreadable config file answers, and honors
   `MEMTOMEM_STM_PROXY__*`** (#897). `ProxyConfigLoader.get()` returned `None`
@@ -1454,7 +1884,7 @@ changes inline only. See the deprecation policy in
   beside a new `parity_checked` denominator, because `0` mismatches otherwise
   reads as a clean bill of health even when nothing was checkable.
 
-  **Behavior change**, as measured against the previous release. *A traceback
+  **Behavior change**: as measured against the previous release. *A traceback
   becomes a report*: an oversized integer in any of the six fields. *A silent
   or unserializable result becomes an `invalid` report*, so the command exits
   1 where it exited 0. That covers every value in those fields that is not a
@@ -1516,7 +1946,7 @@ changes inline only. See the deprecation policy in
   from hand-edited logs, an older producer, or a future ranker that widens the
   field.
 
-  **Behavior change.** Two facts about the old code govern the rest. A rank
+  **Behavior change**: two facts about the old code govern the rest. A rank
   was only ever coerced or recorded on the entry naming `selected_tool`, so a
   malformed rank elsewhere never reached the coercion. And whether such a rank
   was counted at all came down to an equality check against the entry's
