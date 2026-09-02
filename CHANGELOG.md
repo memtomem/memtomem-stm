@@ -11,6 +11,23 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Changed
+
+- **Inbound MCP size accounting no longer hops to a thread for every message**
+  (issue #956). `BoundedReadStream` measures each inbound envelope against
+  `max_upstream_bytes`, and it does so from the dispatcher's only read loop —
+  where an unconditional `asyncio.to_thread` cost more than the measurement and
+  queued every arriving message behind unrelated work in the shared default
+  executor, including the proxy's own `compress()`. Accounting now runs on the
+  loop thread under a 64 KiB budget, which covers progress notifications,
+  `list_changed` and small tool results; only a payload that outgrows that
+  budget is re-measured, on the sizer's own single-worker executor rather than
+  the shared pool. Routing between the two walks a pydantic message field by
+  field instead of dumping it, so a large response never materializes its dump
+  on the event loop, and a model whose serialized form the walk cannot predict
+  (a custom serializer, a computed field, extras) is routed off-loop rather
+  than trusted. **Behavior change**: none external.
+
 ## [0.3.0] — 2026-09-02
 
 ### Upgrade notes
