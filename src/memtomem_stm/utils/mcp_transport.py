@@ -103,6 +103,10 @@ class BoundedReadStream(Generic[_T]):
                 return cast(_T, item)
             message = getattr(item, "message", item)
             max_bytes = self._current_max_bytes()
+            # Cheap for the small messages that dominate this loop: the sizer
+            # measures on this thread under its own sync budget and reaches its
+            # own worker only for a plausibly large payload, so an inbound
+            # notification never waits on the shared default executor (#956).
             if await json_utf8_size_async(message, limit=max_bytes) <= max_bytes:
                 return item
             if isinstance(message, (mcp_types.JSONRPCResponse, mcp_types.JSONRPCError)):
