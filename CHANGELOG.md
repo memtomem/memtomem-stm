@@ -454,7 +454,9 @@ changes inline only. See the deprecation policy in
   entry that is really gone counts — one that is unreadable, unreachable, or
   behind a broken directory link keeps the wait open rather than announcing a
   stop that may not have happened. **Behavior change**: an unreadable
-  handshake is no longer reported as no daemon anywhere. `mms daemon status`
+  handshake is no longer reported as no daemon for the *current* config —
+  the foreign-fingerprint listing behind `--all` still skips records it
+  cannot parse, having no pid or endpoint to act on. `mms daemon status`
   reports one as `stale` with `handshake_unreadable: true` (plain output:
   "handshake present but unreadable — daemon state unknown") instead of
   `stopped`, and `mms daemon stop` exits 1 pointing at `status` instead of

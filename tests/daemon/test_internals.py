@@ -670,9 +670,15 @@ def test_single_owner_lock_excludes_second(tmp_path: Path):
 # Zero direct CliRunner coverage existed for stop_cmd / status_cmd /
 # restart_cmd — the commands carrying the unguarded int()/float() handshake
 # casts and the SIGTERM-fallback + handshake-cleanup branches. These pin the
-# contract that ops commands degrade (exit 0) instead of raising on a
-# corrupted / hand-edited handshake, which read_handshake's docstring calls
-# an anticipated input (it validates dict-ness only, not field types).
+# contract that ops commands degrade instead of raising on a corrupted /
+# hand-edited handshake, which read_handshake's docstring calls an anticipated
+# input (it validates dict-ness only, not field types).
+#
+# Degrading means exit 0 for a handshake that still PARSES: garbage field
+# values are read tolerantly and the command completes. One that does not
+# parse is a different answer — it leaves the daemon's state unknown, and a
+# command that cannot confirm the state it was asked for exits 1 rather than
+# claiming it (#954).
 
 
 def _cli():
@@ -771,6 +777,22 @@ class TestHandshakeRemovedPredicate:
         from memtomem_stm.cli.daemon_cmd import _handshake_removed
 
         assert _handshake_removed(tmp_path / "never" / "made" / "hs.json") is True
+
+    def test_an_ancestor_that_raises_is_not_a_removed_entry(self, tmp_path: Path):
+        """The walk runs inside the FileNotFoundError handler, where the
+        function's own ``except OSError`` cannot see what it raises — so it
+        guards itself rather than leaving the command as a traceback."""
+        from memtomem_stm.cli.daemon_cmd import _handshake_removed
+
+        def _boom() -> bool:
+            raise PermissionError()
+
+        blocked = SimpleNamespace(exists=_boom, is_symlink=_boom, is_junction=_boom)
+        path = SimpleNamespace(
+            lstat=lambda: (_ for _ in ()).throw(FileNotFoundError()),
+            parents=[blocked],
+        )
+        assert _handshake_removed(path) is False  # type: ignore[arg-type]
 
     def test_no_existing_ancestor_at_all_is_not_a_removed_entry(self, tmp_path: Path):
         """Only an ancestor that EXISTS proves the path was walkable. A root

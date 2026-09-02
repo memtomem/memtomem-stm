@@ -332,14 +332,23 @@ def _handshake_removed(path: Path) -> bool:
         # really is gone; anything else leaves the question unanswered, so the
         # wait stays open. ``is_junction`` covers the Windows spelling of a
         # link, which ``is_symlink`` reports as False.
-        for ancestor in path.parents:
-            if ancestor.exists():
-                return True
-            if ancestor.is_symlink() or ancestor.is_junction():
-                # An entry that is there but does not resolve. ``exists`` has
-                # to be asked first: a WORKING link resolves, and treating it
-                # as unwalkable would hang the wait on every such layout.
-                return False
+        #
+        # The walk carries its own guard: an error raised in here is raised
+        # INSIDE this handler, where the ``except OSError`` below cannot see
+        # it, and it would leave the command as a traceback rather than as the
+        # conservative answer everything else in this function gives.
+        try:
+            for ancestor in path.parents:
+                if ancestor.exists():
+                    return True
+                if ancestor.is_symlink() or ancestor.is_junction():
+                    # An entry that is there but does not resolve. ``exists``
+                    # has to be asked first: a WORKING link resolves, and
+                    # treating it as unwalkable would hang the wait on every
+                    # such layout.
+                    return False
+        except OSError:
+            return False
         return False
     except OSError:
         return False
