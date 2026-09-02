@@ -469,6 +469,19 @@ changes inline only. See the deprecation policy in
   daemon is gone; treating it as proof is what starts a replacement beside a
   live one.
 
+- **A connection close cancelled mid-unwind is now finished instead of lost**
+  (issue #963). `AsyncExitStack.aclose()` pops each callback off the stack
+  before awaiting it, so cancelling a retire task while a callback was in
+  flight left that callback gone from the stack and unfinished; the retry in
+  `ProxyManager.stop()` then unwound an empty stack, returned cleanly, and
+  dropped the resources as closed while `_connections.clear()` took the last
+  reference to the transport. The legacy/injected stack path now tracks its
+  unwind through a single shielded task, the way owner-managed connections
+  already did: a cancelled caller no longer interrupts the close, and every
+  retry joins that one unwind rather than re-entering it. Owner-managed
+  connections — every connection the proxy establishes itself — were never
+  affected.
+
 - **An oversized server-to-client request is now answered instead of dropped**
   (issue #960). `max_upstream_bytes` rejects each inbound MCP message, and an
   over-budget reverse RPC — sampling, roots, or elicitation — used to be
