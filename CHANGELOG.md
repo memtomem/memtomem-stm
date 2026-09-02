@@ -449,7 +449,7 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - **`mms daemon stop` no longer reports failure on a daemon that stopped
-  correctly** (#964, issue #954). The wait for teardown also probed the
+  correctly** (#964, issues #954 and #966). The wait for teardown also probed the
   host/port read from the handshake *before* shutdown, and that probe carries
   no identity — when the OS handed the daemon's ephemeral port to an unrelated
   listener inside the 5s window, a clean stop timed out and exited 1. The
@@ -470,7 +470,7 @@ changes inline only. See the deprecation policy in
   live one.
 
 - **A connection close cancelled mid-unwind is now finished instead of lost**
-  (issue #963). `AsyncExitStack.aclose()` pops each callback off the stack
+  (#967, issue #963). `AsyncExitStack.aclose()` pops each callback off the stack
   before awaiting it, so cancelling a retire task while a callback was in
   flight left that callback gone from the stack and unfinished; the retry in
   `ProxyManager.stop()` then unwound an empty stack, returned cleanly, and
@@ -483,7 +483,7 @@ changes inline only. See the deprecation policy in
   affected.
 
 - **An oversized server-to-client request is now answered instead of dropped**
-  (issue #960). `max_upstream_bytes` rejects each inbound MCP message, and an
+  (#968, issue #960). `max_upstream_bytes` rejects each inbound MCP message, and an
   over-budget reverse RPC — sampling, roots, or elicitation — used to be
   dropped with a warning. Its id identifies a request whose upstream sender is
   blocked on a reply, so the upstream handler stayed blocked until its own
