@@ -1801,11 +1801,11 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     # has been edited out from under it, so substrings alone would keep
     # passing over a recipe that no longer installs anything.
     for command in (
-        "uv tool install 'memtomem[all]>=0.4,<0.5'",
-        "uv tool install 'memtomem-stm>=0.2,<0.3'",
-        "uv tool install --reinstall 'memtomem[all]>=0.4,<0.5'",
+        "uv tool install 'memtomem[all]>=0.4,<0.6'",
+        "uv tool install 'memtomem-stm>=0.2,<0.4'",
+        "uv tool install --reinstall 'memtomem[all]>=0.4,<0.6'",
         "export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS="
-        '\'["--from","memtomem>=0.4,<0.5","memtomem-server"]\'',
+        '\'["--from","memtomem>=0.4,<0.6","memtomem-server"]\'',
     ):
         assert command in guide, f"reviewed-memory-resume guide lost {command!r}"
 

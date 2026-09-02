@@ -55,6 +55,14 @@ jobs:
           - core: "0.4.0"
             expected: schema4
             mcp_pin: ""
+          # 0.5.0 changes no capability STM negotiates: its breaking changes are
+          # CLI (`mm init -y`), a removed `mem_context_migrate` alias, and
+          # chunk-id project boundaries on read-by-id surfaces STM does not use.
+          # Its advertisement still reads context_compose schema_version 4, and
+          # it caps mcp itself (`mcp[cli]>=2.0.0,<3`), so no pin.
+          - core: "0.5.0"
+            expected: schema4
+            mcp_pin: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
