@@ -2092,7 +2092,11 @@ class ProxyManager:
                 streams = await stack.enter_async_context(self._open_transport(cfg))
                 session = await stack.enter_async_context(
                     ClientSession(
-                        BoundedReadStream(streams[0], self._live_max_upstream_bytes),
+                        BoundedReadStream(
+                            streams[0],
+                            self._live_max_upstream_bytes,
+                            write_stream=streams[1],
+                        ),
                         streams[1],
                         message_handler=self._make_message_handler(name),
                     )

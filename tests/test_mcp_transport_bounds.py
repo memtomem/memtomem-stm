@@ -50,6 +50,22 @@ class _QueueStream:
         pass
 
 
+class _CollectingWriteStream:
+    """Minimal ``WriteStream``-shaped double: records what was sent."""
+
+    def __init__(self, raises: BaseException | None = None):
+        self.sent = []
+        self.raises = raises
+
+    async def send(self, item):
+        if self.raises is not None:
+            raise self.raises
+        self.sent.append(item)
+
+    async def aclose(self):
+        pass
+
+
 def test_json_utf8_size_exact_boundary_without_materializing_envelope():
     value = {"payload": "한글\nvalue"}
     exact = len('{"payload":"한글\\nvalue"}'.encode())
@@ -169,3 +185,103 @@ async def test_oversize_response_survives_real_dispatcher_with_request_id():
         assert raised.value.error.code == INBOUND_MESSAGE_TOO_LARGE_CODE
         assert is_inbound_message_too_large_error(raised.value)
         assert "max_upstream_bytes=200" in str(raised.value)
+
+
+def _oversize_request(request_id: int = 9):
+    return SessionMessage(
+        mcp_types.JSONRPCRequest(
+            jsonrpc="2.0",
+            id=request_id,
+            method="sampling/createMessage",
+            params={
+                "messages": [{"role": "user", "content": {"type": "text", "text": "x" * 1_000}}]
+            },
+        )
+    )
+
+
+async def test_bounded_read_stream_answers_oversize_server_request_with_same_id_error(caplog):
+    """#960: a server->client request is correlated the other way round — its
+    sender blocks on our answer, so dropping it strands the upstream handler."""
+    keeper = SimpleNamespace(message=SimpleNamespace(payload="ok"))
+    write_stream = _CollectingWriteStream()
+    stream = BoundedReadStream(
+        _QueueStream(_oversize_request(9), keeper), 200, write_stream=write_stream
+    )
+
+    with caplog.at_level("WARNING"):
+        assert await stream.receive() is keeper
+
+    assert len(write_stream.sent) == 1
+    reply = write_stream.sent[0].message
+    assert isinstance(reply, mcp_types.JSONRPCError)
+    assert reply.id == 9
+    # A spec code, not the private response-correlation marker: this frame
+    # travels to the upstream server.
+    assert reply.error.code == mcp_types.INVALID_REQUEST
+    assert reply.error.code != INBOUND_MESSAGE_TOO_LARGE_CODE
+    assert reply.error.data is None
+    assert "max_upstream_bytes=200" in reply.error.message
+    assert "Dropping" not in caplog.text
+    assert "Rejecting" in caplog.text
+
+
+async def test_bounded_read_stream_drops_oversize_notification_even_with_write_stream(caplog):
+    """Positive control for the drop branch: nothing waits on a notification,
+    so it is still dropped and nothing is written back."""
+    oversize = SessionMessage(
+        mcp_types.JSONRPCNotification(
+            jsonrpc="2.0",
+            method="notifications/message",
+            params={"data": "x" * 1_000},
+        )
+    )
+    keeper = SimpleNamespace(message=SimpleNamespace(payload="ok"))
+    write_stream = _CollectingWriteStream()
+    stream = BoundedReadStream(_QueueStream(oversize, keeper), 200, write_stream=write_stream)
+
+    with caplog.at_level("WARNING"):
+        assert await stream.receive() is keeper
+
+    assert write_stream.sent == []
+    assert "Dropping inbound MCP JSONRPCNotification" in caplog.text
+
+
+async def test_bounded_read_stream_without_write_stream_still_drops_oversize_request(caplog):
+    """No write side, no answer to give: the legacy constructor keeps dropping."""
+    keeper = SimpleNamespace(message=SimpleNamespace(payload="ok"))
+    stream = BoundedReadStream(_QueueStream(_oversize_request(3), keeper), 200)
+
+    with caplog.at_level("WARNING"):
+        assert await stream.receive() is keeper
+
+    assert "Dropping inbound MCP JSONRPCRequest" in caplog.text
+
+
+async def test_oversize_server_request_reply_survives_closed_write_stream():
+    """A teardown race on the write side must not escape the read loop."""
+    keeper = SimpleNamespace(message=SimpleNamespace(payload="ok"))
+    write_stream = _CollectingWriteStream(raises=anyio.ClosedResourceError())
+    stream = BoundedReadStream(
+        _QueueStream(_oversize_request(4), keeper), 200, write_stream=write_stream
+    )
+
+    assert await stream.receive() is keeper
+
+
+async def test_oversize_server_request_is_answered_through_real_dispatcher():
+    inbound_send, inbound_receive = anyio.create_memory_object_stream(1)
+    outbound_send, outbound_receive = anyio.create_memory_object_stream(1)
+    bounded = BoundedReadStream(inbound_receive, 200, write_stream=outbound_send)
+
+    async with inbound_send, outbound_receive, ClientSession(bounded, outbound_send):
+        await inbound_send.send(_oversize_request(11))
+        # Bounded so a regression fails red instead of hanging the suite: with
+        # the request dropped, nothing is ever written back.
+        outbound = await asyncio.wait_for(outbound_receive.receive(), 5)
+
+    reply = outbound.message
+    assert isinstance(reply, mcp_types.JSONRPCError)
+    assert reply.id == 11
+    assert reply.error.code == mcp_types.INVALID_REQUEST
+    assert "max_upstream_bytes=200" in reply.error.message

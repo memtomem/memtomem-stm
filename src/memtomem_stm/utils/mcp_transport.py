@@ -59,11 +59,23 @@ class BoundedReadStream(Generic[_T]):
     This wrapper sits at the next shared boundary, before ``ClientSession``
     dispatch and result-model validation, and works for stdio, SSE, and
     streamable HTTP without forking SDK transport implementations.
+
+    Given the paired write stream it also *answers* an oversize server->client
+    request instead of dropping it (#960); the read side alone cannot, and the
+    sender of such a request is blocked until it gets a reply. The write stream
+    is borrowed, never closed here: ``JSONRPCDispatcher.run`` owns its
+    lifetime.
     """
 
-    def __init__(self, stream: Any, max_bytes: int | Callable[[], int]) -> None:
+    def __init__(
+        self,
+        stream: Any,
+        max_bytes: int | Callable[[], int],
+        write_stream: Any | None = None,
+    ) -> None:
         self._stream = stream
         self._max_bytes = max_bytes
+        self._write_stream = write_stream
 
     def _current_max_bytes(self) -> int:
         value = self._max_bytes() if callable(self._max_bytes) else self._max_bytes
@@ -108,18 +120,62 @@ class BoundedReadStream(Generic[_T]):
                         metadata=getattr(item, "metadata", None),
                     ),
                 )
-            # An uncorrelated message (notification, or a server->client
-            # request) has no pending waiter to fail. Raising here would escape
+            if isinstance(message, mcp_types.JSONRPCRequest) and self._write_stream is not None:
+                # A server->client request IS correlated, just the other way
+                # round: its id identifies a reverse RPC (sampling, roots,
+                # elicitation) whose upstream sender is blocked on our answer.
+                # Dropping it left that handler waiting until its own timeout,
+                # or until our call timeout tore the session down (#960).
+                await self._reject_oversize_request(self._write_stream, message.id, max_bytes)
+                continue
+            # A notification has no waiter to fail, and neither does a request
+            # we have no write side for. Raising here would escape
             # ``JSONRPCDispatcher.run``'s ``async for`` — it catches only
             # ``ClosedResourceError`` — tearing down the task group and waking
             # EVERY in-flight call with the indistinguishable "Connection
-            # closed" error, which is exactly what the correlated branch above
-            # exists to avoid. Drop the over-budget message and keep reading.
+            # closed" error, which is exactly what the branches above exist to
+            # avoid. Drop the over-budget message and keep reading.
             logger.warning(
                 "Dropping inbound MCP %s exceeding max_upstream_bytes=%d",
                 type(message).__name__,
                 max_bytes,
             )
+
+    async def _reject_oversize_request(
+        self, write_stream: Any, request_id: Any, max_bytes: int
+    ) -> None:
+        """Answer an oversize server->client request with a same-id error.
+
+        The reply travels to the upstream server, so it carries a spec error
+        code rather than ``INBOUND_MESSAGE_TOO_LARGE_CODE`` — that private code
+        and its marker exist only for local correlation of an oversize
+        *response* to the pending call it belongs to, and must not become an
+        outbound convention.
+        """
+        logger.warning(
+            "Rejecting inbound MCP JSONRPCRequest %r exceeding max_upstream_bytes=%d",
+            request_id,
+            max_bytes,
+        )
+        try:
+            await write_stream.send(
+                SessionMessage(
+                    mcp_types.JSONRPCError(
+                        jsonrpc="2.0",
+                        id=request_id,
+                        error=mcp_types.ErrorData(
+                            code=mcp_types.INVALID_REQUEST,
+                            message=(
+                                f"Inbound MCP request exceeded max_upstream_bytes={max_bytes}"
+                            ),
+                        ),
+                    )
+                )
+            )
+        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+            # Mirrors ``JSONRPCDispatcher._write_error``: a teardown race must
+            # not escape the read loop.
+            logger.debug("dropped oversize rejection for %r: write stream closed", request_id)
 
     def __aiter__(self) -> BoundedReadStream[_T]:
         return self

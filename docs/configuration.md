@@ -443,6 +443,14 @@ and error payloads. The default is 40 MiB. It is distinct from
 whereas the byte limit rejects the whole oversized result before it can enter
 the cache, compression, indexing, or surfacing pipeline.
 
+The limit applies to every inbound message, and what happens next depends on
+who is waiting for it. An oversized result fails only the one call it belongs
+to. An oversized server-to-client request — a reverse RPC such as sampling,
+roots, or elicitation — is answered with an `Invalid Request` error carrying
+the same id, so the upstream handler that sent it is not left waiting. An
+oversized notification is dropped with a warning, because nothing is waiting
+on it.
+
 The `auto_index` and `extraction` keys are reserved and unsupported by the
 bundled mms server. They remain accepted for compatibility and are meaningful
 only to custom embedders that construct `ProxyManager` with an `index_engine`.
