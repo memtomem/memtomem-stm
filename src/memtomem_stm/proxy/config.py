@@ -2538,10 +2538,12 @@ def effective_max_result_chars(
     nothing converts into it. Set both on one tool and tokens win, as they do
     at every other level, so the ratio stays live.
 
-    What this returns is the *nominal* budget. ``token_estimation_mode`` set to
-    ``unicode`` measures the response instead and derives its own char budget,
-    and ``progressive`` has no result-size gate at all — neither reads the
-    ratio at call time.
+    What this returns is the *nominal* budget, resolved on every call whatever
+    the mode. ``token_estimation_mode`` set to ``unicode`` measures the
+    response and derives its own char budget from that, and ``progressive`` has
+    no result-size gate at all, so neither lets this value decide how a
+    response is compressed — but both still carry it into the response-cache
+    fingerprint.
     """
     default_server_max = UpstreamServerConfig.model_fields["max_result_chars"].default
     token_budget = cfg.max_result_tokens
