@@ -27,10 +27,11 @@ changes inline only. See the deprecation policy in
 
 - **Shutdown now really ends the process, and its children** (#910, #911,
   #913, #961, #884, #883). `SIGTERM`/`SIGINT` run the full teardown and exit
-  `0` instead of dying or hanging; a second signal exits `128 + signum`. Each
-  teardown step is bounded, an overrunning teardown exits 1 after a CRITICAL
-  line, and surviving direct children are SIGTERM'd then SIGKILL'd with their
-  pids logged. `stop()` returns within its drain budget and cancels the
+  `0` instead of dying or hanging; a second signal exits `128 + signum`.
+  Selected cancellable waits in the teardown carry best-effort ceilings, and
+  while `MEMTOMEM_STM_TEARDOWN_WATCHDOG_SECONDS` is non-zero — it defaults to
+  60 — an overrunning teardown exits 1 after a CRITICAL line. Surviving direct
+  children are SIGTERM'd then SIGKILL'd with their pids logged. `stop()` returns within its drain budget and cancels the
   survivors, refusing new background work while it runs. A background index or
   extract stage is shed past 64 in flight, and a shed auto-index records
   `index_ok=False` and `shed` instead of returning the
@@ -77,14 +78,16 @@ changes inline only. See the deprecation policy in
   recovery column existed keeps the unconditional warning. `mms daemon stop`
   no longer exits 1 on a daemon that stopped correctly.
 
-- **`mms tune` deletes aged feedback rows the first time you run it** (#942).
-  It now opens the feedback stores with the configured `retention_days`, where
-  it previously opened them bare and kept every row forever. Rows past the
-  retention the config already declares are purged — the same purge the daemon
-  has run at startup all along, with the same values and the same SQL. If you
-  have been reading history older than `compression_feedback.retention_days` or
-  `progressive_reads.retention_days` out of those files, raise the setting
-  before running the command. The proxy and the daemon are unaffected.
+- **`mms tune` deletes aged compression-feedback rows** (#942). It now opens
+  the compression-feedback store with the configured `retention_days`, where it
+  previously opened it bare and kept every row forever. Rows past the retention
+  the config already declares are purged — the same purge the daemon has run at
+  startup all along, with the same value and the same SQL. If you have been
+  reading history older than `compression_feedback.retention_days` out of that
+  file, raise the setting before running the command. The command only reaches
+  the store when a proxy-metrics database exists and the feedback file itself
+  exists; it opens no other feedback store, and `progressive_reads` is
+  untouched. The proxy and the daemon are unaffected.
 
 - **Auto-tune recommendations are computed from the rows they claim to
   measure** (#931, #935, #936, #938). A strategy pin is gated on, and measured
@@ -576,21 +579,25 @@ changes inline only. See the deprecation policy in
   teardown — handing the signals back would put SIGTERM's default disposition
   in charge of the very window this shutdown exists to survive — and a second
   signal instead takes the immediate-exit path and exits `128 + signum`, while
-  the signal that started the teardown does not re-enter it. Each teardown step
-  carries a ceiling, real for work that takes cancellation and best-effort
-  otherwise: a step that swallows `CancelledError` or wedges in a synchronous
-  call parks past its timeout. The hard guarantee is a watchdog armed only
-  between teardown starting and finishing, which exits the process 1 after a
-  CRITICAL line if the whole thing overruns its budget. What survives teardown
+  the signal that started the teardown does not re-enter it. Ceilings cover
+  selected cancellable waits — the manager and engine stops, the watcher and
+  warm-up joins — and they are best-effort even there, since a step that
+  swallows `CancelledError` or wedges in a synchronous call parks past its
+  timeout. Other steps carry no ceiling at all: the synchronous `close()` of
+  each store and cache, and the MCP adapter's own stop. The whole-process
+  guarantee is therefore a watchdog, armed only between teardown starting and
+  finishing, which exits the process 1 after a CRITICAL line if the teardown
+  overruns `MEMTOMEM_STM_TEARDOWN_WATCHDOG_SECONDS` (default 60; `0` disables
+  the backstop and with it the guarantee). What survives teardown
   is then swept: direct children still alive are SIGTERM'd,
   then SIGKILL'd, and their pids logged at WARNING under
   `memtomem_stm.utils.child_reaper`.
 
   **Behavior change**: signalled shutdown exits `0` after a real teardown rather
-  than dying or hanging, a step that overruns its ceiling while still taking
+  than dying or hanging, a ceilinged step that overruns while still taking
   cancellation is abandoned with a WARNING naming it, an overrunning teardown
-  exits 1 rather than living on, and a leaked child is killed rather than
-  orphaned. A clean shutdown finds nothing and logs nothing. The sweep is a
+  exits 1 rather than living on unless the watchdog is disabled, and a leaked
+  child is killed rather than orphaned. A clean shutdown finds nothing and logs nothing. The sweep is a
   no-op on Windows and
   wherever `pgrep` is unavailable, so it can never itself be why the process
   fails to exit. Signal installation never fails startup — a non-main thread
@@ -1098,14 +1105,15 @@ changes inline only. See the deprecation policy in
   `test_docs_sync.py`, which previously claimed to cover every `ProxyConfig`
   sub-block but checked only `cache` and `toolgraph`.
 
-  **Behavior change**: `mms tune` now purges feedback rows older than the
-  configured `retention_days` when it opens the store, where it previously
-  opened the store bare and kept them forever. Rows past the retention the
-  config already declares are deleted the first time the command runs, the
-  same purge the daemon has always run at startup, with the same config values
-  and the same SQL. The proxy and the daemon are unaffected. A caller that
-  omits `retention_days` now raises `TypeError`, which cannot happen at any
-  shipped call site.
+  **Behavior change**: `mms tune` now purges compression-feedback rows older
+  than the configured `compression_feedback.retention_days` when it opens that
+  store, where it previously opened it bare and kept them forever — the same
+  purge the daemon has always run at startup, with the same value and the same
+  SQL. It is the only feedback store the command opens, and it opens it only
+  when a proxy-metrics database exists and the feedback file itself exists, so
+  a run that finds neither deletes nothing. The proxy and the daemon are
+  unaffected. A caller that omits `retention_days` now raises `TypeError`,
+  which cannot happen at any shipped call site.
 
 - **A policy bundle's identity is published only once its decisions bind**
   (#941, issue #940). Bundle adoption assigned the new snapshot, stamp, digest, instance id
