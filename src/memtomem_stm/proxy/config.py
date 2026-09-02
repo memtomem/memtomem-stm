@@ -1360,14 +1360,17 @@ class ToolOverrideConfig(BaseModel):
     ``max_result_chars`` and is converted to a char budget via the resolved
     ``chars_per_token`` ratio. Useful for non-Latin-script content where a
     fixed char budget under-triggers compression. See ``token_estimate.py``."""
-    chars_per_token: float | None = Field(default=None, gt=0.0)
+    chars_per_token: float | None = Field(default=None, gt=0.0, allow_inf_nan=False)
     """Per-tool override for the chars-per-token ratio used to convert a token
     budget to a char budget. Falls back to the upstream server's ratio, then
     ``ProxyConfig.chars_per_token``. The budget it converts may be this tool's
     ``max_result_tokens`` or the one inherited from the server — the ratio
     describes what this tool returns, not where its budget is written (#929).
-    Inert when the tool sets its own ``max_result_chars``: a char budget is
-    absolute and nothing converts into it."""
+    Inert when the tool sets ``max_result_chars`` and no token budget of its
+    own: a char budget is absolute and nothing converts into it. ``gt=0``
+    admits ``+inf`` on its own (#722), which the conversion cannot represent —
+    the three ratio fields reject non-finite values together because #929 made
+    this one reachable from a budget written at either of the other two."""
     token_estimation_mode: TokenEstimationMode | None = None
     """Per-tool gate mode. ``unicode`` measures the actual response; ``None``
     inherits the upstream or proxy setting."""
@@ -1480,7 +1483,7 @@ class UpstreamServerConfig(BaseModel):
     over ``max_result_chars`` and is converted to a char budget via the
     resolved ``chars_per_token`` ratio. See ``token_estimate.py`` for the
     estimator used at gate time."""
-    chars_per_token: float | None = Field(default=None, gt=0.0)
+    chars_per_token: float | None = Field(default=None, gt=0.0, allow_inf_nan=False)
     """Per-server override for the chars-per-token ratio. Falls back to
     ``ProxyConfig.chars_per_token`` (default 3.5, English-biased). Set to
     ~2.0 for Korean-dominant content, ~1.3 for Chinese-dominant."""
@@ -2193,7 +2196,7 @@ class ProxyConfig(BaseModel):
     lock_timeout_seconds: float = Field(default=30.0, gt=0.0)
     consumer_model: str = ""
     context_budget_ratio: float = Field(default=0.05, ge=0.0, le=1.0)
-    chars_per_token: float = Field(default=3.5, gt=0.0)
+    chars_per_token: float = Field(default=3.5, gt=0.0, allow_inf_nan=False)
     """Default chars-per-token ratio used to convert token budgets into char
     budgets. The default ``3.5`` is English-biased (ASCII text averages
     ~4.0 chars/token for cl100k_base). Set to ~2.0 for Korean-dominant
@@ -2533,8 +2536,15 @@ def effective_max_result_chars(
     states its ratio and inherits the server's token budget gets both. Reading
     the tool ratio only beside a tool token budget silently dropped it, against
     what the field docstrings and the configuration guide both promise. A
-    per-tool ``max_result_chars`` still ends the question before any ratio
-    applies: a char budget is absolute, and nothing converts into it.
+    per-tool ``max_result_chars`` with no per-tool token budget beside it still
+    ends the question before any ratio applies: a char budget is absolute, and
+    nothing converts into it. Set both on one tool and tokens win, as they do
+    at every other level, so the ratio stays live.
+
+    What this returns is the *nominal* budget. ``token_estimation_mode`` set to
+    ``unicode`` measures the response instead and derives its own char budget,
+    and ``progressive`` has no result-size gate at all — neither reads the
+    ratio at call time.
     """
     default_server_max = UpstreamServerConfig.model_fields["max_result_chars"].default
     token_budget = cfg.max_result_tokens

@@ -49,14 +49,22 @@ changes inline only. See the deprecation policy in
 - **A per-tool `chars_per_token` now applies to a token budget inherited from
   its upstream server** (#929). The ratio was read only beside a per-tool
   `max_result_tokens`, so a tool that stated only its ratio ran at the server's
-  — against the cascade its own field docstring, `docs/configuration.md` and the
-  0.1.x changelog entry all describe. **Behavior change**: a deployment that
+  — against the cascade `docs/configuration.md` and the 0.1.x entry that
+  introduced the field both describe. **Behavior change**: a deployment that
   sets `chars_per_token` on a tool and `max_result_tokens` on the server sees
-  that tool's effective char budget re-scaled to the documented value (for
+  that tool's resolved char budget re-scaled to the documented value (for
   example a server at 400 tokens x 2.5 with a tool ratio of 4.0 moves from 1000
-  to 1600 chars). `mms tune` reports the same corrected budget, so its budget
-  advice is no longer measured against a number the call never ran under. A
-  per-tool `max_result_chars` still outranks both and is unaffected.
+  to 1600 chars). That resolved budget is what a `static`-mode gate compares
+  against and what `mms tune` reports; `unicode` mode derives a
+  response-specific budget and `progressive` has no size gate, so neither reads
+  the ratio at call time and neither changes here. A per-tool
+  `max_result_chars` with no per-tool token budget beside it still outranks the
+  ratio and is unaffected.
+- **`chars_per_token` rejects a non-finite value at all three levels.**
+  `gt=0` admits `+inf` on its own (#722) and the token-to-char conversion
+  cannot represent it, so the call raised `OverflowError`. Reachable at the
+  server and proxy levels before this release; the fix above made the per-tool
+  field reachable the same way, which is why all three are guarded together.
 
 ## [0.3.0] — 2026-09-02
 

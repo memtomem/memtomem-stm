@@ -11,6 +11,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 
 import pytest
+from pydantic import ValidationError
 
 from memtomem_stm.proxy.config import (
     CompressionStrategy,
@@ -413,6 +414,46 @@ class TestCharsPerTokenResolutionOrder:
         tc = mgr._resolve_tool_config("srv", "both")
         assert tc.max_chars == 321
         assert tc.token_budget is None
+
+
+class TestCharsPerTokenIsFinite:
+    """``gt=0`` admits ``+inf`` on its own (#722); the conversion cannot.
+
+    ``int(tokens * inf)`` raises ``OverflowError`` inside the resolution every
+    call runs through, so the value has to be refused where it is written. The
+    per-tool field only became reachable this way once a tool ratio started
+    converting an inherited budget (#929); the other two levels were always
+    reachable, which is why the guard is pinned at all three.
+
+    ``+inf`` is the case the guard adds: ``gt=0`` already refuses ``nan`` and
+    ``-inf`` (both compare false against 0), so those parameters document the
+    boundary rather than test the new constraint.
+    """
+
+    @pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+    def test_tool_level_rejects_non_finite(self, value: float):
+        with pytest.raises(ValidationError):
+            ToolOverrideConfig(chars_per_token=value)
+
+    @pytest.mark.parametrize("value", [float("inf"), float("nan")])
+    def test_server_level_rejects_non_finite(self, value: float):
+        with pytest.raises(ValidationError):
+            UpstreamServerConfig(prefix="x", chars_per_token=value)
+
+    @pytest.mark.parametrize("value", [float("inf"), float("nan")])
+    def test_proxy_level_rejects_non_finite(self, value: float):
+        with pytest.raises(ValidationError):
+            ProxyConfig(chars_per_token=value)
+
+    def test_a_string_infinity_is_refused_too(self):
+        """The reachable spelling: JSON writes ``Infinity`` and env vars strings.
+
+        ``json.dumps`` emits a bare ``Infinity`` for a non-finite float and
+        ``json.loads`` reads it back, so a config file can carry one without
+        anything unusual having been typed.
+        """
+        with pytest.raises(ValidationError):
+            ToolOverrideConfig(chars_per_token="inf")
 
 
 class TestTokenEstimationMode:
