@@ -482,6 +482,22 @@ changes inline only. See the deprecation policy in
   connections — every connection the proxy establishes itself — were never
   affected.
 
+- **An oversized server-to-client request is now answered instead of dropped**
+  (issue #960). `max_upstream_bytes` rejects each inbound MCP message, and an
+  over-budget reverse RPC — sampling, roots, or elicitation — used to be
+  dropped with a warning. Its id identifies a request whose upstream sender is
+  blocked on a reply, so the upstream handler stayed blocked until its own
+  timeout, or until the proxy's call timeout and reconnect tore the session
+  down. The bounded stream now holds the paired write side and answers such a
+  request with an `Invalid Request` error carrying the same id. The reply is
+  sent from its own task, never from the read loop: client transports create
+  both directions with a buffer size of 0, so awaiting the send there would
+  park the dispatcher's only reader — and for stdio that deadlocks, since an
+  upstream blocked writing to a pipe nobody drains never reads its own stdin.
+  Rejections still waiting on a stalled writer are capped. Oversized
+  notifications are still dropped, since nothing waits on them, and an
+  oversized result still fails only the single call it belongs to.
+
 - **Response-cache warm starts no longer rescan every cached body for privacy**
   (#950, issue #872). `ProxyCache` now stamps the fingerprint of its storage privacy
   patterns in a component-owned SQLite metadata table. A missing or changed
