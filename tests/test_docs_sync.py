@@ -1834,9 +1834,23 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     # alone would pass on a commented-out row, and the well-formedness count
     # below passes whether or not this row exists at all — deleting it outright
     # is exactly the regression that check cannot see.
+    #
+    # Match inside the matrix block rather than the whole file: row-shaped text
+    # is legal in a `run: |` script, so a file-wide search proves the shape
+    # exists somewhere, not that the workflow runs it. The block ends at the
+    # first line indented no deeper than `include:` itself — pyyaml is not a
+    # test dependency, and this needs no parser.
+    include = re.search(r"^(\s*)include:\s*$", workflow, re.MULTILINE)
+    assert include is not None, "core-compat advisory lost its matrix include block"
+    body: list[str] = []
+    for line in workflow[include.end() :].splitlines():
+        if line.strip() and len(line) - len(line.lstrip()) <= len(include.group(1)):
+            break
+        body.append(line)
+    matrix = "\n".join(body)
     newest = re.search(
         r"^\s*- core:\s*[\"']?0\.5\.0[\"']?\n\s+expected:\s*(\w+)\n\s+mcp_pin:\s*[\"']([^\"']*)[\"']\s*$",
-        workflow,
+        matrix,
         re.MULTILINE,
     )
     assert newest is not None, (
@@ -1873,9 +1887,11 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     # Both patterns accept any YAML scalar spelling: counting only `- core: "`
     # would let `- core: '0.3.14'` or an unquoted value slip past both sides.
     scalar = r"[\"']?[^\"'\s]+[\"']?"
-    declared_rows = len(re.findall(r"^\s*- core:\s*\S", workflow, re.MULTILINE))
+    # Counted over the matrix block for the same reason the row above is
+    # matched there: row-shaped text elsewhere in the file is not a row.
+    declared_rows = len(re.findall(r"^\s*- core:\s*\S", matrix, re.MULTILINE))
     well_formed = re.findall(
-        rf"- core:\s*{scalar}\n\s+expected:\s*(\w+)(?:\n\s+mcp_pin:\s*{scalar})?\n", workflow
+        rf"- core:\s*{scalar}\n\s+expected:\s*(\w+)(?:\n\s+mcp_pin:\s*{scalar})?\n", matrix
     )
     assert declared_rows >= 5, "core-compat matrix lost rows"
     assert len(well_formed) == declared_rows, (
