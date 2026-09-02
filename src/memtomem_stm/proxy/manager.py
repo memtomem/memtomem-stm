@@ -462,7 +462,12 @@ class UpstreamConnection:
     # every call that captured its session has returned.
     active_calls: dict[int, int] = field(default_factory=dict)
     retired_resources: dict[int, _RetiredConnectionResources] = field(default_factory=dict)
-    retiring_generations: set[int] = field(default_factory=set)
+    # Keyed by generation, valued by the close task that owns it: the entry is
+    # what defers a second close of the same resources, so it is meaningful
+    # only while that task is alive. A task cancelled before its first step
+    # never runs its ``finally``, so teardown must judge the entry by its task
+    # rather than by its presence (#952).
+    retiring_tasks: dict[int, asyncio.Task[None]] = field(default_factory=dict)
     # A timeout/transport failure makes only the generation that carried that
     # RPC unavailable. One shared recovery task per server reconnects it;
     # subsequent calls await that task instead of dispatching onto the known-
@@ -2258,12 +2263,19 @@ class ProxyManager:
         conn.active_calls.pop(generation, None)
         if (
             generation not in conn.retired_resources
-            or generation in conn.retiring_generations
+            or generation in conn.retiring_tasks
             or self._background_closed
         ):
             return
-        conn.retiring_generations.add(generation)
         task = asyncio.create_task(self._close_retired_generation(conn, generation))
+        # Registering after the spawn is what keeps the entry and its task in
+        # step under the default factory (the coroutine cannot run before this
+        # line). An eager task factory can run it to completion first, though,
+        # and its ``finally`` would then pop nothing — so a task that already
+        # finished is never registered, rather than left behind as an entry no
+        # ``finally`` will ever clear.
+        if not task.done():
+            conn.retiring_tasks[generation] = task
         self._background_tasks.add(task)
         task.add_done_callback(
             functools.partial(
@@ -2277,7 +2289,7 @@ class ProxyManager:
     async def _close_retired_generation(self, conn: UpstreamConnection, generation: int) -> None:
         resources = conn.retired_resources.get(generation)
         if resources is None:
-            conn.retiring_generations.discard(generation)
+            conn.retiring_tasks.pop(generation, None)
             return
         try:
             await self._close_connection_resources(resources.owner, resources.stack)
@@ -2291,7 +2303,7 @@ class ProxyManager:
         else:
             conn.retired_resources.pop(generation, None)
         finally:
-            conn.retiring_generations.discard(generation)
+            conn.retiring_tasks.pop(generation, None)
 
     async def _reconnect_for_next_call(
         self,
@@ -2902,7 +2914,17 @@ class ProxyManager:
             self._toolgraph_cache = None
         for conn in self._connections.values():
             for generation, resources in list(conn.retired_resources.items()):
-                if generation in conn.retiring_generations:
+                # Yield the close only to a retire task that is STILL RUNNING
+                # (#952). The entry's presence is not enough: a retire task
+                # cancelled before its first step never runs its coroutine
+                # body, so its ``finally`` never pops the entry, and skipping
+                # on presence alone left that transport open for good —
+                # ``_connections`` is cleared just below, taking the last
+                # reference to the stdio child and its fds with it. A task that
+                # finished has either popped its own entry or, having closed
+                # nothing, left the resources here for this loop.
+                retiring = conn.retiring_tasks.get(generation)
+                if retiring is not None and not retiring.done():
                     continue
                 try:
                     await self._close_connection_resources(resources.owner, resources.stack)
