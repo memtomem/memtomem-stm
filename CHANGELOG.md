@@ -444,6 +444,21 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **`mms daemon stop` no longer reports failure on a daemon that stopped
+  correctly** (#964, issue #954). The wait for teardown also probed the
+  host/port read from the handshake *before* shutdown, and that probe carries
+  no identity — when the OS handed the daemon's ephemeral port to an unrelated
+  listener inside the 5s window, a clean stop timed out and exited 1. The
+  handshake alone now ends the wait, which is also the stricter signal: the
+  daemon closes its listener first and removes the handshake last. Only an
+  entry that is really gone counts — one that is unreadable, unreachable, or
+  behind a broken directory link keeps the wait open rather than announcing a
+  stop that may not have happened. **Behavior change**: `mms daemon status`
+  reports a handshake it cannot parse as `stale` with `handshake_unreadable:
+  true` (plain output: "handshake present but unreadable — daemon state
+  unknown") instead of `stopped`; a record that cannot be read is not proof
+  the daemon is gone, and `stop` now sends users here for exactly that case.
+
 - **Response-cache warm starts no longer rescan every cached body for privacy**
   (#950, issue #872). `ProxyCache` now stamps the fingerprint of its storage privacy
   patterns in a component-owned SQLite metadata table. A missing or changed

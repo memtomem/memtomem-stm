@@ -705,6 +705,74 @@ def _no_daemon(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
 
 
+class TestHandshakeRemovedPredicate:
+    """``_handshake_removed`` decides when ``mms daemon stop`` may report a stop.
+
+    Exercised directly as well as through the CLI: the symlink cases below need
+    a real filesystem *and* the privilege to create links, which an unelevated
+    Windows lane does not have — and Windows gates merge here, so the
+    distinction this predicate exists for must be pinned somewhere that runs
+    everywhere.
+    """
+
+    def test_reports_removed_only_for_a_missing_entry(self, tmp_path: Path):
+        from memtomem_stm.cli.daemon_cmd import _handshake_removed
+
+        present = tmp_path / "hs.json"
+        present.write_text("{}", encoding="utf-8")
+        assert _handshake_removed(present) is False
+        assert _handshake_removed(tmp_path / "absent.json") is True
+
+    def test_does_not_follow_the_entry(self, tmp_path: Path):
+        """``stat`` would answer for the target and call this removed."""
+        from memtomem_stm.cli.daemon_cmd import _handshake_removed
+
+        path = SimpleNamespace(
+            lstat=lambda: SimpleNamespace(st_mode=0),
+            stat=lambda: (_ for _ in ()).throw(FileNotFoundError()),
+        )
+        assert _handshake_removed(path) is False  # type: ignore[arg-type]
+
+    def test_keeps_waiting_when_the_entry_cannot_be_reached(self, tmp_path: Path):
+        """A read error is not an absence — teardown removes the file last, so
+        an unanswerable path must hold the wait open rather than end it."""
+        from memtomem_stm.cli.daemon_cmd import _handshake_removed
+
+        path = SimpleNamespace(lstat=lambda: (_ for _ in ()).throw(PermissionError()))
+        assert _handshake_removed(path) is False  # type: ignore[arg-type]
+
+    def test_a_dangling_ancestor_is_not_a_removed_entry(self, tmp_path: Path):
+        """A broken directory link raises the same FileNotFoundError while
+        saying nothing about the handshake."""
+        from memtomem_stm.cli.daemon_cmd import _handshake_removed
+
+        link = tmp_path / "data"
+        try:
+            link.symlink_to(tmp_path / "gone", target_is_directory=True)
+        except (OSError, NotImplementedError):  # unprivileged Windows
+            pytest.skip("symlink creation not permitted here")
+        assert _handshake_removed(link / "hs.json") is False
+
+    def test_a_working_ancestor_link_still_reports_a_removed_entry(self, tmp_path: Path):
+        """The dangling-ancestor guard must not hang the wait on a data_dir
+        that is simply a symlink to a real directory."""
+        from memtomem_stm.cli.daemon_cmd import _handshake_removed
+
+        real = tmp_path / "real"
+        real.mkdir()
+        link = tmp_path / "data"
+        try:
+            link.symlink_to(real, target_is_directory=True)
+        except (OSError, NotImplementedError):  # unprivileged Windows
+            pytest.skip("symlink creation not permitted here")
+        assert _handshake_removed(link / "hs.json") is True
+
+    def test_a_missing_directory_reports_a_removed_entry(self, tmp_path: Path):
+        from memtomem_stm.cli.daemon_cmd import _handshake_removed
+
+        assert _handshake_removed(tmp_path / "never" / "made" / "hs.json") is True
+
+
 class TestDaemonStopCli:
     def test_graceful_ack(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         from click.testing import CliRunner
@@ -1009,6 +1077,33 @@ class TestDaemonStatusCli:
         assert info["uptime_seconds"] >= 0.0
         assert "hook_will_use_daemon" in info
         assert "standalone_will_use_daemon" in info
+
+    def test_unreadable_handshake_is_stale_not_stopped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#954: a record we cannot parse is still a record. Reporting it as
+        `stopped` is what sends someone off to start a replacement beside a
+        daemon that may be mid-teardown — and `stop`'s timeout now points here
+        for exactly this case."""
+        import json
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        hs_path = _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 4567, "token": "t"})
+        hs_path.write_text("{ truncated", encoding="utf-8")
+        _no_daemon(monkeypatch)
+
+        result = CliRunner().invoke(_cli(), ["daemon", "status", "--json"])
+        assert result.exit_code == 0, result.output
+        info = json.loads(result.output)
+        assert info["state"] == "stale"
+        assert info["handshake_unreadable"] is True
+
+        plain = CliRunner().invoke(_cli(), ["daemon", "status"])
+        assert plain.exit_code == 0, plain.output
+        assert "unreadable" in plain.output
+        assert "stopped" not in plain.output
 
     def test_running_corrupted_created_at_degrades(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

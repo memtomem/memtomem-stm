@@ -325,6 +325,20 @@ def _handshake_removed(path: Path) -> bool:
     try:
         path.lstat()
     except FileNotFoundError:
+        # ``lstat`` does not follow the entry itself, but it still resolves
+        # everything above it — a broken ancestor raises the same error while
+        # saying nothing about whether teardown removed the handshake. Walk up
+        # to the first ancestor that exists: reaching one means the path really
+        # was walkable and the entry really is gone, while meeting a dangling
+        # link first means we cannot tell, so keep waiting.
+        for ancestor in path.parents:
+            if ancestor.exists():
+                break
+            if ancestor.is_symlink():
+                # An entry that is there but does not resolve. ``exists`` has
+                # to be asked first: a WORKING link resolves, and treating it
+                # as unwalkable would hang the wait on every such layout.
+                return False
         return True
     except OSError:
         return False
@@ -488,12 +502,26 @@ def status_cmd(as_json: bool) -> None:
             "standalone_will_use_daemon": standalone_use_daemon,
         }
     else:
-        raw = read_handshake(handshake_path(config.data_dir, config_fingerprint(config)))
+        hs_path = handshake_path(config.data_dir, config_fingerprint(config))
+        raw = read_handshake(hs_path)
         if raw is not None:
             info = {
                 "state": "stale",
                 "pid": raw.get("pid"),
                 "pid_alive": is_pid_alive(_as_int(raw.get("pid", -1))),
+                "hook_will_use_daemon": use_daemon,
+                "standalone_will_use_daemon": standalone_use_daemon,
+            }
+        elif not _handshake_removed(hs_path):
+            # A record we cannot parse is still a record: the daemon that owns
+            # it may be mid-teardown or merely unresponsive to a ping, and
+            # teardown removes this file last. Calling that "stopped" is what
+            # sends someone off to start a replacement beside a live daemon —
+            # and it is the answer `stop` now sends them here to get (#954).
+            # No pid to report: reading it is the thing that failed.
+            info = {
+                "state": "stale",
+                "handshake_unreadable": True,
                 "hook_will_use_daemon": use_daemon,
                 "standalone_will_use_daemon": standalone_use_daemon,
             }
@@ -530,6 +558,9 @@ def status_cmd(as_json: bool) -> None:
                 f"capacity={queue.get('capacity', 0)} "
                 f"busy_rejections={queue.get('busy_rejections', 0)}"
             )
+    elif state == "stale" and info.get("handshake_unreadable"):
+        # No pid line: reading the record is what failed.
+        click.echo(_warn("handshake present but unreadable — daemon state unknown"))
     elif state == "stale":
         click.echo(
             _warn(
