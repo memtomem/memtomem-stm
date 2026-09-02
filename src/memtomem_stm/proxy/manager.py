@@ -2419,10 +2419,37 @@ class ProxyManager:
         generation_at_entry = conn.reconnect_generation
         async with conn.reconnect_lock:
             if conn.reconnect_generation != generation_at_entry:
+                # "Another reconnect completed" is not yet "the connection now
+                # matches the config I was asked to install" (#959). A recovery
+                # reconnect reinstalls the OLD fingerprint, so a racing
+                # hot-reload edit that loses the lock would be swallowed: the
+                # config-change wrapper reads a clean return as success and
+                # damps nothing, leaving the edit unapplied until some later
+                # detection pass. Proceed when the winner installed a different
+                # identity than the one requested.
+                #
+                # Gated on the current snapshot as well, for the reverse race:
+                # a recovery reconnect pins its cfg BEFORE a reload, and
+                # without this it would "restore" the pre-edit identity over
+                # the newly installed one. A request the file no longer wants
+                # skips instead, and the next call's detection applies the
+                # newest config. The re-read decides only whether to skip —
+                # the config attempted below stays the caller's ``cfg``, so
+                # the damping and redaction divergence the comment above guards
+                # against cannot happen.
+                installed_fp = _connection_fingerprint(conn.config)
+                requested_fp = _connection_fingerprint(cfg)
+                desired = self._config.upstream_servers.get(name) or conn.config
+                if requested_fp == installed_fp or requested_fp != _connection_fingerprint(desired):
+                    logger.debug(
+                        "Skipping reconnect for '%s' — another reconnect already completed", name
+                    )
+                    return
                 logger.debug(
-                    "Skipping reconnect for '%s' — another reconnect already completed", name
+                    "Proceeding with reconnect for '%s' — the completed reconnect installed "
+                    "a different connection identity than the one requested",
+                    name,
                 )
-                return
 
             # Prepare-first: build the replacement connection while the old one
             # stays untouched. If _establish_connection raises, ``conn`` still

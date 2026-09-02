@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
+import threading
 import time
+from pathlib import Path
 
 import pytest
 
+from memtomem_stm.proxy import cache as cache_module
 from memtomem_stm.proxy.cache import (
     ProxyCache,
     _make_key,
+    _privacy_policy_fingerprint,
     response_carries_transient_key,
 )
 from memtomem_stm.proxy.compression import HybridCompressor, SelectiveCompressor
@@ -23,6 +28,22 @@ _TOC_TEXT = "# Doc\n\n" + "\n\n".join(
     f"## Section {i} heading text\n" + ("alpha beta gamma delta epsilon zeta " * 12)
     for i in range(12)
 )
+
+
+def _read_privacy_policy_stamp(db_path: Path) -> str | None:
+    db = sqlite3.connect(str(db_path))
+    try:
+        row = db.execute(
+            "SELECT value FROM proxy_cache_meta WHERE key = ?",
+            (cache_module._PRIVACY_POLICY_FINGERPRINT_KEY,),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
+        return None
+    finally:
+        db.close()
+    return str(row[0]) if row is not None else None
 
 
 class TestProxyCacheBasic:
@@ -367,24 +388,754 @@ class TestPrivacyGate:
         proxy_cache.set("s", "t", {}, "contact: dev@example.com", ttl_seconds=60.0)
         assert proxy_cache.get("s", "t", {}) is None
 
-    def test_initialize_purges_legacy_secret_rows(self, tmp_path):
-        db_path = tmp_path / "legacy_secrets.db"
+    def test_initialize_stamps_current_privacy_policy(self, tmp_path):
+        db_path = tmp_path / "privacy_stamp.db"
+        cache = ProxyCache(db_path, max_entries=100)
+        cache.initialize()
+        cache.close()
+
+        assert _read_privacy_policy_stamp(db_path) == _privacy_policy_fingerprint()
+
+    def test_matching_stamp_skips_nonempty_body_query_and_scan(self, tmp_path, monkeypatch):
+        """The #872 hot path must be real, not an empty-cache false pass."""
+        db_path = tmp_path / "warm_privacy_stamp.db"
         seed = ProxyCache(db_path, max_entries=100)
         seed.initialize()
         try:
-            seed.set("s", "plain", {}, "ordinary cached response", ttl_seconds=None)
+            seed.set("s", "clean", {}, "ordinary cached response", ttl_seconds=None)
+            assert seed.stats()["total_entries"] == 1  # positive control
+            plan = seed._db.execute(
+                f"EXPLAIN QUERY PLAN {cache_module._SELECT_UNVERIFIED_PRIVACY_ROWS}"
+            ).fetchall()
+            assert not any("SCAN P" in str(row[3]).upper() for row in plan)
         finally:
             seed.close()
-        # Seed the secret row via raw SQL: it models a row written by a
-        # pre-gate release — ``set()`` itself now refuses such content.
+
+        statements: list[str] = []
+        scan_calls: list[str] = []
+        real_connect = sqlite3.connect
+
+        def _traced_connect(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            db = real_connect(*args, **kwargs)
+            db.set_trace_callback(statements.append)
+            return db
+
+        def _scan_spy(text: str) -> bool:
+            scan_calls.append(text)
+            return False
+
+        monkeypatch.setattr(cache_module.sqlite3, "connect", _traced_connect)
+        monkeypatch.setattr(cache_module.privacy, "contains_sensitive_content", _scan_spy)
+
+        reopened = ProxyCache(db_path, max_entries=100)
+        reopened.initialize()
+        reopened.close()
+
+        normalized = [" ".join(statement.split()) for statement in statements]
+        assert not any(
+            statement.startswith("SELECT cache_key, result, envelope_json FROM proxy_cache")
+            for statement in normalized
+        )
+        assert any(
+            "SELECT cache_key FROM proxy_cache_privacy_unverified" in statement
+            for statement in normalized
+        )
+        assert scan_calls == []
+
+    @pytest.mark.parametrize("stamp_state", ["missing", "stale"])
+    def test_missing_or_stale_stamp_rescans_result_and_envelope(self, tmp_path, stamp_state):
+        db_path = tmp_path / f"privacy_{stamp_state}.db"
+        seed = ProxyCache(db_path, max_entries=100)
+        seed.initialize()
+        try:
+            seed.set("s", "clean", {}, "ordinary cached response", ttl_seconds=None)
+        finally:
+            seed.close()
+
+        raw = sqlite3.connect(str(db_path))
+        try:
+            raw.executemany(
+                "INSERT INTO proxy_cache "
+                "(cache_key, server, tool, result, created_at, ttl_seconds, "
+                "envelope_json, envelope_safe) VALUES (?, 's', ?, ?, ?, NULL, ?, 1)",
+                [
+                    (
+                        _make_key("s", "result-secret", {}),
+                        "result-secret",
+                        "login password=hunter2",
+                        time.time(),
+                        None,
+                    ),
+                    (
+                        _make_key("s", "envelope-secret", {}),
+                        "envelope-secret",
+                        "ordinary body",
+                        time.time(),
+                        '{"schema_version":1,"_meta":{"password":"hunter2"}}',
+                    ),
+                ],
+            )
+            if stamp_state == "missing":
+                raw.execute(
+                    "DELETE FROM proxy_cache_meta WHERE key = ?",
+                    (cache_module._PRIVACY_POLICY_FINGERPRINT_KEY,),
+                )
+            else:
+                raw.execute(
+                    "UPDATE proxy_cache_meta SET value = 'stale' WHERE key = ?",
+                    (cache_module._PRIVACY_POLICY_FINGERPRINT_KEY,),
+                )
+            raw.commit()
+        finally:
+            raw.close()
+
+        reopened = ProxyCache(db_path, max_entries=100)
+        reopened.initialize()
+        try:
+            remaining = {
+                row[0] for row in reopened._db.execute("SELECT tool FROM proxy_cache").fetchall()
+            }
+            assert remaining == {"clean"}
+        finally:
+            reopened.close()
+
+        assert _read_privacy_policy_stamp(db_path) == _privacy_policy_fingerprint()
+
+    def test_added_pattern_changes_fingerprint_and_forces_rescan(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "changed_privacy_policy.db"
+        marker = "policy-only-marker-872"
+        seed = ProxyCache(db_path, max_entries=100)
+        seed.initialize()
+        try:
+            seed.set("s", "new-secret", {}, f"contains {marker}", ttl_seconds=None)
+            assert seed.stats()["total_entries"] == 1
+        finally:
+            seed.close()
+
+        old_fingerprint = _privacy_policy_fingerprint()
+        monkeypatch.setattr(
+            cache_module.privacy,
+            "DEFAULT_PATTERNS",
+            [*cache_module.privacy.DEFAULT_PATTERNS, re.escape(marker)],
+        )
+        assert _privacy_policy_fingerprint() != old_fingerprint
+
+        reopened = ProxyCache(db_path, max_entries=100)
+        reopened.initialize()
+        try:
+            assert reopened._db.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0] == 0
+        finally:
+            reopened.close()
+        assert _read_privacy_policy_stamp(db_path) == _privacy_policy_fingerprint()
+
+    def test_stamp_failure_rolls_back_deletions_and_retries(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "privacy_stamp_failure.db"
+        seed = ProxyCache(db_path, max_entries=100)
+        seed.initialize()
+        seed.close()
+
         raw = sqlite3.connect(str(db_path))
         try:
             raw.execute(
                 "INSERT INTO proxy_cache "
                 "(cache_key, server, tool, result, created_at, ttl_seconds) "
+                "VALUES (?, 's', 'secret', 'password=hunter2', ?, NULL)",
+                (_make_key("s", "secret", {}), time.time()),
+            )
+            raw.execute(
+                "UPDATE proxy_cache_meta SET value = 'stale' WHERE key = ?",
+                (cache_module._PRIVACY_POLICY_FINGERPRINT_KEY,),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+        real_connect = sqlite3.connect
+
+        class _StampFailsConnection:
+            def __init__(self, real: sqlite3.Connection) -> None:
+                self._real = real
+
+            def execute(self, sql: str, *args):  # noqa: ANN002, ANN202
+                # ONLY the final publication of the real fingerprint, which
+                # lands after the deletions and the dequeue. Failing every
+                # metadata write would stop at the repair token published
+                # before the sweep and never reach the state under test.
+                if (
+                    sql.lstrip().startswith("INSERT INTO proxy_cache_meta")
+                    and args[0][1] == _privacy_policy_fingerprint()
+                ):
+                    raise sqlite3.OperationalError("disk I/O error")
+                return self._real.execute(sql, *args)
+
+            def __getattr__(self, name: str):  # noqa: ANN202
+                return getattr(self._real, name)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                cache_module.sqlite3,
+                "connect",
+                lambda *args, **kwargs: _StampFailsConnection(real_connect(*args, **kwargs)),
+            )
+            with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+                ProxyCache(db_path, max_entries=100).initialize()
+
+        # The deletion and the dequeue rolled back with the failed stamp, and
+        # the slot still holds this attempt's repair token — a value no
+        # writer's fingerprint matches, so the next opener repeats the repair.
+        stamp = _read_privacy_policy_stamp(db_path)
+        assert stamp is not None
+        assert stamp.startswith(cache_module._PRIVACY_REPAIR_TOKEN_PREFIX)
+        check = sqlite3.connect(str(db_path))
+        try:
+            assert check.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0] == 1
+            assert (
+                check.execute("SELECT COUNT(*) FROM proxy_cache_privacy_unverified").fetchone()[0]
+                == 1
+            )
+        finally:
+            check.close()
+
+        recovered = ProxyCache(db_path, max_entries=100)
+        recovered.initialize()
+        try:
+            assert recovered._db.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0] == 0
+        finally:
+            recovered.close()
+        assert _read_privacy_policy_stamp(db_path) == _privacy_policy_fingerprint()
+
+    def test_superseded_repair_retries_until_this_policy_is_published(self, tmp_path, monkeypatch):
+        """Losing the race may not be accepted as an outcome.
+
+        A superseding initializer can be running a different policy, so its
+        stamp says nothing about rows only THIS build calls sensitive. Ending
+        the repair there would leave such a row persisted with nothing
+        scheduled to remove it — the read guard would refuse to serve it, but
+        SECURITY.md says it is never stored in the first place.
+        """
+        db_path = tmp_path / "superseded_repair.db"
+        seed = ProxyCache(db_path, max_entries=100)
+        seed.initialize()
+        seed.close()
+
+        raw = sqlite3.connect(str(db_path))
+        try:
+            raw.execute(
+                "INSERT INTO proxy_cache "
+                "(cache_key, server, tool, result, created_at, ttl_seconds) "
+                "VALUES ('legacy-secret', 's', 'secret', 'password=hunter2', ?, NULL)",
+                (time.time(),),
+            )
+            raw.execute(
+                "UPDATE proxy_cache_meta SET value = 'stale' WHERE key = ?",
+                (cache_module._PRIVACY_POLICY_FINGERPRINT_KEY,),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+        real_scan = cache_module.privacy.contains_sensitive_content
+        sweeps: list[str] = []
+
+        def _steal_the_token_once(text: str) -> bool:
+            if text == "password=hunter2":
+                sweeps.append(text)
+                if len(sweeps) == 1:
+                    # A peer finishes its own repair mid-sweep and publishes a
+                    # fingerprint that is not ours.
+                    peer = sqlite3.connect(str(db_path), timeout=5.0)
+                    try:
+                        peer.execute(
+                            "UPDATE proxy_cache_meta SET value = 'other-policy' WHERE key = ?",
+                            (cache_module._PRIVACY_POLICY_FINGERPRINT_KEY,),
+                        )
+                        peer.commit()
+                    finally:
+                        peer.close()
+            return real_scan(text)
+
+        monkeypatch.setattr(
+            cache_module.privacy, "contains_sensitive_content", _steal_the_token_once
+        )
+
+        cache = ProxyCache(db_path, max_entries=100)
+        cache.initialize()
+        try:
+            assert cache._db.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0] == 0
+        finally:
+            cache.close()
+        assert len(sweeps) >= 2  # the first attempt was superseded and retried
+        assert _read_privacy_policy_stamp(db_path) == _privacy_policy_fingerprint()
+
+    def test_last_repair_attempt_completes_under_the_reservation(self, tmp_path, monkeypatch):
+        """The retry loop has to terminate even against a relentless peer.
+
+        The final attempt sweeps inside the reservation it already holds: it
+        blocks writers, which is what the unlocked shape exists to avoid, but
+        nothing can supersede it.
+        """
+        # ``raising=False``: the constant does not exist in the pre-fix code, and
+        # this test has to reach the race there rather than erroring on setup.
+        monkeypatch.setattr(cache_module, "_PRIVACY_REPAIR_ATTEMPTS", 2, raising=False)
+        db_path = tmp_path / "last_attempt_repair.db"
+        seed = ProxyCache(db_path, max_entries=100)
+        seed.initialize()
+        seed.close()
+
+        raw = sqlite3.connect(str(db_path))
+        try:
+            raw.execute(
+                "INSERT INTO proxy_cache "
+                "(cache_key, server, tool, result, created_at, ttl_seconds) "
+                "VALUES ('legacy-secret', 's', 'secret', 'password=hunter2', ?, NULL)",
+                (time.time(),),
+            )
+            raw.execute(
+                "UPDATE proxy_cache_meta SET value = 'stale' WHERE key = ?",
+                (cache_module._PRIVACY_POLICY_FINGERPRINT_KEY,),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+        real_scan = cache_module.privacy.contains_sensitive_content
+        steal_attempts: list[bool] = []
+
+        def _steal_the_token_whenever_possible(text: str) -> bool:
+            if text == "password=hunter2":
+                # A peer that publishes over every token it can reach. On the
+                # last attempt the reservation is already held, so its write
+                # cannot land and it gives up rather than waiting it out.
+                peer = sqlite3.connect(str(db_path), timeout=0.05)
+                try:
+                    peer.execute(
+                        "UPDATE proxy_cache_meta SET value = 'other-policy' WHERE key = ?",
+                        (cache_module._PRIVACY_POLICY_FINGERPRINT_KEY,),
+                    )
+                    peer.commit()
+                    steal_attempts.append(True)
+                except sqlite3.OperationalError:
+                    steal_attempts.append(False)
+                finally:
+                    peer.close()
+            return real_scan(text)
+
+        monkeypatch.setattr(
+            cache_module.privacy, "contains_sensitive_content", _steal_the_token_whenever_possible
+        )
+
+        cache = ProxyCache(db_path, max_entries=100)
+        cache.initialize()
+        try:
+            assert cache._db.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0] == 0
+            assert (
+                cache._db.execute("SELECT COUNT(*) FROM proxy_cache_privacy_unverified").fetchone()[
+                    0
+                ]
+                == 0
+            )
+        finally:
+            cache.close()
+        assert _read_privacy_policy_stamp(db_path) == _privacy_policy_fingerprint()
+        # Positive control: the peer really did supersede the unlocked attempt
+        # (first scan) and really was locked out of every scan the final
+        # attempt made while holding the reservation.
+        assert steal_attempts[0] is True
+        assert steal_attempts[1:] and not any(steal_attempts[1:])
+
+    def test_peer_policy_dequeue_is_purged_at_this_build_next_startup(self, tmp_path, monkeypatch):
+        """Bound the damage a differently-policed peer can do.
+
+        Two builds sharing a store share one stamp slot, so the last
+        initializer to publish is the one whose ``set()`` may dequeue. A row
+        the older build calls clean and this build calls sensitive can
+        therefore end up stored and unqueued. What must not happen is this
+        build later CERTIFYING it: the stamp it finds is the peer's, so its
+        next startup runs the full sweep and purges the row — the same bound
+        as the unconditional startup sweep this design replaced, with the
+        read-side guard in ``get()`` covering the interval.
+        """
+        db_path = tmp_path / "peer_policy_dequeue.db"
+        this_build = ProxyCache(db_path, max_entries=100)
+        this_build.initialize()
+        this_build.close()
+        assert _read_privacy_policy_stamp(db_path) == _privacy_policy_fingerprint()
+
+        real_scan = cache_module.privacy.contains_sensitive_content
+        with monkeypatch.context() as older_build:
+            older_build.setattr(cache_module, "_privacy_policy_fingerprint", lambda: "older-policy")
+            older_build.setattr(
+                cache_module.privacy,
+                "contains_sensitive_content",
+                lambda text: False if "password=hunter2" in text else real_scan(text),
+            )
+            peer = ProxyCache(db_path, max_entries=100)
+            peer.initialize()
+            try:
+                peer.set("s", "t", {}, "password=hunter2", ttl_seconds=None)
+            finally:
+                peer.close()
+
+        check = sqlite3.connect(str(db_path))
+        try:
+            # Positive control for the premise: the peer's stamp matched its
+            # own policy, so it really did dequeue its own write.
+            assert check.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0] == 1
+            assert (
+                check.execute("SELECT COUNT(*) FROM proxy_cache_privacy_unverified").fetchone()[0]
+                == 0
+            )
+        finally:
+            check.close()
+        assert _read_privacy_policy_stamp(db_path) == "older-policy"
+
+        restarted = ProxyCache(db_path, max_entries=100)
+        restarted.initialize()
+        try:
+            assert restarted._db.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0] == 0
+        finally:
+            restarted.close()
+        assert _read_privacy_policy_stamp(db_path) == _privacy_policy_fingerprint()
+
+    def test_triggers_swapped_during_the_sweep_force_a_reservation_held_repair(
+        self, tmp_path, monkeypatch
+    ):
+        """Trigger identity has to be checked where the stamp is published.
+
+        A build with different trigger text can install it AFTER any earlier
+        validation. If the repair then published this build's fingerprint, a
+        later same-build opener would take the queue-only fast path over a row
+        the foreign trigger never queued and nothing ever scanned — a false
+        certification, not merely a delayed purge.
+        """
+        db_path = tmp_path / "trigger_swap_during_sweep.db"
+        seed = ProxyCache(db_path, max_entries=100)
+        seed.initialize()
+        try:
+            seed.set("s", "clean", {}, "ordinary cached response", ttl_seconds=None)
+            seed.set("s", "target", {}, "harmless body", ttl_seconds=None)
+        finally:
+            seed.close()
+        target_key = _make_key("s", "target", {})
+
+        raw = sqlite3.connect(str(db_path))
+        try:
+            raw.execute(
+                "UPDATE proxy_cache_meta SET value = 'stale' WHERE key = ?",
+                (cache_module._PRIVACY_POLICY_FINGERPRINT_KEY,),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+        real_scan = cache_module.privacy.contains_sensitive_content
+        swapped: list[str] = []
+
+        def _swap_triggers_mid_sweep(text: str) -> bool:
+            if text == "ordinary cached response" and not swapped:
+                swapped.append(text)
+                peer = sqlite3.connect(str(db_path), timeout=5.0)
+                try:
+                    # Another build installs its own narrower trigger, then a
+                    # writer makes an update that trigger does not queue.
+                    peer.execute("DROP TRIGGER proxy_cache_privacy_track_body_update")
+                    peer.execute(
+                        "CREATE TRIGGER proxy_cache_privacy_track_body_update "
+                        "AFTER UPDATE OF cache_key ON proxy_cache BEGIN SELECT 1; END"
+                    )
+                    peer.execute(
+                        "UPDATE proxy_cache SET result = 'password=hunter2' WHERE cache_key = ?",
+                        (target_key,),
+                    )
+                    peer.commit()
+                    assert (
+                        peer.execute(
+                            "SELECT COUNT(*) FROM proxy_cache_privacy_unverified"
+                        ).fetchone()[0]
+                        == 0
+                    )  # positive control: the write really went untracked
+                finally:
+                    peer.close()
+            return real_scan(text)
+
+        monkeypatch.setattr(
+            cache_module.privacy, "contains_sensitive_content", _swap_triggers_mid_sweep
+        )
+
+        cache = ProxyCache(db_path, max_entries=100)
+        cache.initialize()
+        try:
+            assert (
+                cache._db.execute(
+                    "SELECT COUNT(*) FROM proxy_cache WHERE cache_key = ?", (target_key,)
+                ).fetchone()[0]
+                == 0
+            )
+        finally:
+            cache.close()
+        assert swapped  # the race really ran
+        assert _read_privacy_policy_stamp(db_path) == _privacy_policy_fingerprint()
+
+        check = sqlite3.connect(str(db_path))
+        try:
+            assert cache_module._installed_triggers_are_current(check)
+        finally:
+            check.close()
+
+    def test_stale_delete_trigger_does_not_abort_initialization(self, tmp_path):
+        """No DML on proxy_cache before the triggers are this build's.
+
+        The startup purges run against whatever triggers the database is
+        carrying. A stale one that raises would abort initialization — and the
+        repair that would have removed it never runs, so every open fails the
+        same way.
+        """
+        db_path = tmp_path / "stale_delete_trigger.db"
+        seed = ProxyCache(db_path, max_entries=100)
+        seed.initialize()
+        try:
+            seed.set("s", "expired", {}, "ordinary cached response", ttl_seconds=60.0)
+        finally:
+            seed.close()
+
+        raw = sqlite3.connect(str(db_path))
+        try:
+            raw.execute("DROP TRIGGER proxy_cache_privacy_track_delete")
+            raw.execute(
+                "CREATE TRIGGER proxy_cache_privacy_track_delete AFTER DELETE ON proxy_cache "
+                "BEGIN SELECT RAISE(ABORT, 'stale trigger'); END"
+            )
+            # Make the seeded row due for the startup expiry purge.
+            raw.execute("UPDATE proxy_cache SET created_at = ?", (time.time() - 600.0,))
+            raw.commit()
+        finally:
+            raw.close()
+
+        reopened = ProxyCache(db_path, max_entries=100)
+        reopened.initialize()
+        try:
+            assert reopened._db.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0] == 0
+            assert cache_module._installed_triggers_are_current(reopened._db)
+        finally:
+            reopened.close()
+
+    def test_obsolete_extra_trigger_is_removed(self, tmp_path):
+        """Currentness counts every owned trigger, so removal must too.
+
+        A build that shipped a fourth trigger leaves one behind that no static
+        drop list names. It would keep running, and the currentness check would
+        stay false forever — forcing the reservation-held full sweep on every
+        open, the exact cost the stamp exists to avoid.
+        """
+        db_path = tmp_path / "obsolete_extra_trigger.db"
+        cache = ProxyCache(db_path, max_entries=100)
+        cache.initialize()
+        cache.close()
+
+        raw = sqlite3.connect(str(db_path))
+        try:
+            raw.execute(
+                "CREATE TRIGGER proxy_cache_privacy_track_legacy_extra "
+                "AFTER INSERT ON proxy_cache BEGIN SELECT 1; END"
+            )
+            raw.commit()
+            assert not cache_module._installed_triggers_are_current(raw)  # positive control
+        finally:
+            raw.close()
+
+        reopened = ProxyCache(db_path, max_entries=100)
+        reopened.initialize()
+        try:
+            assert cache_module._installed_triggers_are_current(reopened._db)
+            assert (
+                reopened._db.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' "
+                    "AND name = 'proxy_cache_privacy_track_legacy_extra'"
+                ).fetchone()[0]
+                == 0
+            )
+        finally:
+            reopened.close()
+        assert _read_privacy_policy_stamp(db_path) == _privacy_policy_fingerprint()
+
+    def test_near_match_trigger_of_another_component_survives(self, tmp_path):
+        """Ownership is a literal prefix, not a LIKE pattern.
+
+        Every underscore in the prefix is a single-character wildcard to LIKE,
+        so a pattern match would also select — and this store would DROP — a
+        trigger another component named with hyphens in the same database.
+        """
+        db_path = tmp_path / "near_match_trigger.db"
+        cache = ProxyCache(db_path, max_entries=100)
+        cache.initialize()
+        cache.close()
+
+        raw = sqlite3.connect(str(db_path))
+        try:
+            raw.execute("CREATE TABLE IF NOT EXISTS other_component (id INTEGER PRIMARY KEY)")
+            raw.execute(
+                'CREATE TRIGGER "proxy-cache-privacy-track-external" '
+                "AFTER INSERT ON other_component BEGIN SELECT 1; END"
+            )
+            # An owned trigger to remove in the same open, so the drop path
+            # really runs rather than short-circuiting on "already current".
+            raw.execute(
+                "CREATE TRIGGER proxy_cache_privacy_track_legacy_extra "
+                "AFTER INSERT ON proxy_cache BEGIN SELECT 1; END"
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+        reopened = ProxyCache(db_path, max_entries=100)
+        reopened.initialize()
+        try:
+            surviving = {
+                name
+                for (name,) in reopened._db.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+                )
+            }
+            assert "proxy-cache-privacy-track-external" in surviving
+            assert "proxy_cache_privacy_track_legacy_extra" not in surviving
+            assert cache_module._installed_triggers_are_current(reopened._db)
+        finally:
+            reopened.close()
+
+    def test_expired_rows_are_deleted_before_any_body_is_scanned(self, tmp_path, monkeypatch):
+        """The stamp exists to avoid scanning bodies; don't scan doomed ones.
+
+        Expired and transient-key rows are deleted by pure SQL. Sweeping first
+        would run every privacy pattern over the very bodies that SQL is about
+        to delete, and would hold the write reservation longer doing it.
+        """
+        db_path = tmp_path / "purge_before_scan.db"
+        seed = ProxyCache(db_path, max_entries=100)
+        seed.initialize()
+        try:
+            seed.set("s", "expired", {}, "doomed expired body", ttl_seconds=60.0)
+            seed.set("s", "live", {}, "ordinary cached response", ttl_seconds=None)
+        finally:
+            seed.close()
+
+        raw = sqlite3.connect(str(db_path))
+        try:
+            raw.execute(
+                "UPDATE proxy_cache SET created_at = ? WHERE tool = 'expired'",
+                (time.time() - 600.0,),
+            )
+            raw.execute(
+                "UPDATE proxy_cache_meta SET value = 'stale' WHERE key = ?",
+                (cache_module._PRIVACY_POLICY_FINGERPRINT_KEY,),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+        scanned: list[str] = []
+        real_scan = cache_module.privacy.contains_sensitive_content
+
+        def _recording_scan(text: str) -> bool:
+            scanned.append(text)
+            return real_scan(text)
+
+        monkeypatch.setattr(cache_module.privacy, "contains_sensitive_content", _recording_scan)
+
+        reopened = ProxyCache(db_path, max_entries=100)
+        reopened.initialize()
+        try:
+            assert reopened._db.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0] == 1
+        finally:
+            reopened.close()
+        assert "doomed expired body" not in scanned
+        assert "ordinary cached response" in scanned  # positive control
+
+    def test_odd_cased_owned_triggers_are_recognized_and_replaced(self, tmp_path):
+        """SQLite identifiers are case-insensitive; ownership must be too.
+
+        A trigger stored as PROXY_CACHE_PRIVACY_TRACK_DELETE is one of this
+        store's and fires as one. Missing it means calling the store current
+        while running it — and a CREATE of the canonical name then collides
+        with the case variant instead of replacing it.
+        """
+        db_path = tmp_path / "odd_cased_triggers.db"
+        cache = ProxyCache(db_path, max_entries=100)
+        cache.initialize()
+        try:
+            cache.set("s", "t", {}, "ordinary cached response", ttl_seconds=60.0)
+        finally:
+            cache.close()
+
+        raw = sqlite3.connect(str(db_path))
+        try:
+            raw.execute("DROP TRIGGER proxy_cache_privacy_track_delete")
+            raw.execute("DROP TRIGGER proxy_cache_privacy_track_insert")
+            raw.execute(
+                "CREATE TRIGGER PROXY_CACHE_PRIVACY_TRACK_DELETE AFTER DELETE ON proxy_cache "
+                "BEGIN SELECT RAISE(ABORT, 'stale upper-cased trigger'); END"
+            )
+            raw.execute(
+                "CREATE TRIGGER Proxy_Cache_Privacy_Track_Insert AFTER INSERT ON proxy_cache "
+                "BEGIN SELECT 1; END"
+            )
+            raw.execute("UPDATE proxy_cache SET created_at = ?", (time.time() - 600.0,))
+            raw.commit()
+            # Positive control: a case-sensitive ownership test calls this
+            # database current, which is exactly the bug.
+            assert not cache_module._installed_triggers_are_current(raw)
+        finally:
+            raw.close()
+
+        reopened = ProxyCache(db_path, max_entries=100)
+        reopened.initialize()
+        try:
+            assert cache_module._installed_triggers_are_current(reopened._db)
+            assert reopened._db.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0] == 0
+            names = {
+                name
+                for (name,) in reopened._db.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+                )
+            }
+            assert names == {
+                "proxy_cache_privacy_track_insert",
+                "proxy_cache_privacy_track_body_update",
+                "proxy_cache_privacy_track_delete",
+            }
+        finally:
+            reopened.close()
+
+    def test_matching_stamp_purges_secret_inserted_by_legacy_writer(self, tmp_path):
+        db_path = tmp_path / "legacy_secrets.db"
+        bootstrap = sqlite3.connect(str(db_path))
+        try:
+            bootstrap.execute(cache_module._CREATE_TABLE)
+            bootstrap.execute(f"PRAGMA user_version = {cache_module._KEY_SCHEMA_VERSION}")
+            bootstrap.commit()
+        finally:
+            bootstrap.close()
+
+        # Open and prime the legacy connection before the new initializer
+        # installs its triggers, matching a still-running pre-gate process.
+        legacy_writer = sqlite3.connect(str(db_path))
+        try:
+            assert legacy_writer.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0] == 0
+
+            seed = ProxyCache(db_path, max_entries=100)
+            seed.initialize()
+            try:
+                seed.set("s", "plain", {}, "ordinary cached response", ttl_seconds=None)
+            finally:
+                seed.close()
+
+            # This writer knows neither the policy stamp nor the unverified-key
+            # queue, but the database trigger still observes its insert.
+            legacy_writer.execute(
+                "INSERT INTO proxy_cache "
+                "(cache_key, server, tool, result, created_at, ttl_seconds) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (
-                    _make_key("s", "sec", {}),
+                    "legacy-opaque-key",
                     "s",
                     "sec",
                     "login password=hunter2",
@@ -392,18 +1143,540 @@ class TestPrivacyGate:
                     None,
                 ),
             )
-            raw.commit()
+            legacy_writer.commit()
         finally:
-            raw.close()
+            legacy_writer.close()
 
         # Re-open the SAME db: the startup purge runs in initialize().
         reopened = ProxyCache(db_path, max_entries=100)
         reopened.initialize()
         try:
+            remaining = {
+                row[0] for row in reopened._db.execute("SELECT tool FROM proxy_cache").fetchall()
+            }
+            assert remaining == {"plain"}  # proved before ``get`` can evict
             assert reopened.get("s", "sec", {}) is None
             assert reopened.get("s", "plain", {}) == "ordinary cached response"
+            assert (
+                reopened._db.execute(
+                    "SELECT COUNT(*) FROM proxy_cache_privacy_unverified"
+                ).fetchone()[0]
+                == 0
+            )
         finally:
             reopened.close()
+
+    def test_matching_stamp_purges_verified_row_overwritten_by_legacy_writer(self, tmp_path):
+        db_path = tmp_path / "legacy_update.db"
+        seed = ProxyCache(db_path, max_entries=100)
+        seed.initialize()
+        try:
+            seed.set("s", "t", {}, "ordinary cached response", ttl_seconds=None)
+        finally:
+            seed.close()
+
+        raw = sqlite3.connect(str(db_path))
+        try:
+            raw.execute("UPDATE proxy_cache SET result = 'login password=hunter2' WHERE tool = 't'")
+            raw.commit()
+        finally:
+            raw.close()
+
+        reopened = ProxyCache(db_path, max_entries=100)
+        reopened.initialize()
+        try:
+            assert reopened._db.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0] == 0
+        finally:
+            reopened.close()
+
+    def test_matching_stamp_checks_clean_legacy_row_only_once(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "clean_legacy_insert.db"
+        seed = ProxyCache(db_path, max_entries=100)
+        seed.initialize()
+        seed.close()
+
+        raw = sqlite3.connect(str(db_path))
+        try:
+            raw.execute(
+                "INSERT INTO proxy_cache "
+                "(cache_key, server, tool, result, created_at, ttl_seconds) "
+                "VALUES ('legacy-key', 's', 't', 'ordinary legacy response', ?, NULL)",
+                (time.time(),),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+        scan_calls: list[str] = []
+        real_scan = cache_module.privacy.contains_sensitive_content
+
+        def _scan_spy(text: str) -> bool:
+            scan_calls.append(text)
+            return real_scan(text)
+
+        monkeypatch.setattr(cache_module.privacy, "contains_sensitive_content", _scan_spy)
+
+        first = ProxyCache(db_path, max_entries=100)
+        first.initialize()
+        first.close()
+        assert scan_calls == ["ordinary legacy response"]
+
+        scan_calls.clear()
+        second = ProxyCache(db_path, max_entries=100)
+        second.initialize()
+        second.close()
+        assert scan_calls == []
+
+    def test_current_writer_dequeues_its_verified_row(self, tmp_path):
+        db_path = tmp_path / "current_writer.db"
+        cache = ProxyCache(db_path, max_entries=100)
+        cache.initialize()
+        try:
+            cache.set("s", "t", {}, "ordinary cached response", ttl_seconds=None)
+            assert (
+                cache._db.execute("SELECT COUNT(*) FROM proxy_cache_privacy_unverified").fetchone()[
+                    0
+                ]
+                == 0
+            )
+        finally:
+            cache.close()
+
+    def test_older_writer_leaves_row_queued_under_newer_policy_stamp(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "rolling_policy_upgrade.db"
+        future_policy_fingerprint = "future-policy-fingerprint"
+        future_secret = "future-policy-sensitive-marker"
+        older_writer = ProxyCache(db_path, max_entries=100)
+        older_writer.initialize()
+        try:
+            older_writer._db.execute(
+                "UPDATE proxy_cache_meta SET value = ? WHERE key = ?",
+                (future_policy_fingerprint, cache_module._PRIVACY_POLICY_FINGERPRINT_KEY),
+            )
+            older_writer._db.commit()
+
+            # The old policy accepts this body, but its trigger-created queue
+            # entry must survive because a newer process owns the published
+            # stamp and may classify the body differently.
+            older_writer.set("s", "t", {}, future_secret, ttl_seconds=None)
+            assert (
+                older_writer._db.execute(
+                    "SELECT COUNT(*) FROM proxy_cache_privacy_unverified"
+                ).fetchone()[0]
+                == 1
+            )
+        finally:
+            older_writer.close()
+
+        monkeypatch.setattr(
+            cache_module, "_privacy_policy_fingerprint", lambda: future_policy_fingerprint
+        )
+        monkeypatch.setattr(
+            cache_module.privacy,
+            "contains_sensitive_content",
+            lambda text: future_secret in text,
+        )
+
+        newer_process = ProxyCache(db_path, max_entries=100)
+        newer_process.initialize()
+        try:
+            assert newer_process._db.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0] == 0
+            assert (
+                newer_process._db.execute(
+                    "SELECT COUNT(*) FROM proxy_cache_privacy_unverified"
+                ).fetchone()[0]
+                == 0
+            )
+        finally:
+            newer_process.close()
+
+    def test_stale_policy_sweep_does_not_block_a_concurrent_writer(self, tmp_path, monkeypatch):
+        """The full sweep must not hold the write reservation (#872).
+
+        Scanning every body is the one piece of work proportional to cache
+        volume. Holding ``BEGIN IMMEDIATE`` across it makes a peer opener fail
+        on ``busy_timeout`` — and ``server.py`` answers that by running with
+        ``proxy_cache = None`` for the rest of the process's life. The trigger
+        queue, not the lock, is what keeps a racing write from being vouched
+        for by the stamp this repair publishes.
+        """
+        db_path = tmp_path / "privacy_scan_writer_race.db"
+        seed = ProxyCache(db_path, max_entries=100)
+        seed.initialize()
+        try:
+            seed.set("s", "clean", {}, "ordinary cached response", ttl_seconds=None)
+        finally:
+            seed.close()
+
+        raw = sqlite3.connect(str(db_path))
+        try:
+            raw.execute(
+                "UPDATE proxy_cache_meta SET value = 'stale' WHERE key = ?",
+                (cache_module._PRIVACY_POLICY_FINGERPRINT_KEY,),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+        scan_started = threading.Event()
+        release_scan = threading.Event()
+        writer_committed = threading.Event()
+        errors: list[BaseException] = []
+        real_scan = cache_module.privacy.contains_sensitive_content
+
+        def _blocking_scan(text: str) -> bool:
+            if text == "ordinary cached response":
+                scan_started.set()
+                assert release_scan.wait(timeout=5.0)
+            return real_scan(text)
+
+        def _initialize() -> None:
+            cache = ProxyCache(db_path, max_entries=100)
+            try:
+                cache.initialize()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+            finally:
+                cache.close()
+
+        def _legacy_write() -> None:
+            writer = sqlite3.connect(str(db_path), timeout=5.0)
+            try:
+                writer.execute(
+                    "INSERT INTO proxy_cache "
+                    "(cache_key, server, tool, result, created_at, ttl_seconds) "
+                    "VALUES ('racing-legacy-key', 's', 'secret', "
+                    "'password=hunter2', ?, NULL)",
+                    (time.time(),),
+                )
+                writer.commit()
+                writer_committed.set()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+            finally:
+                writer.close()
+
+        monkeypatch.setattr(cache_module.privacy, "contains_sensitive_content", _blocking_scan)
+        initializer = threading.Thread(target=_initialize)
+        initializer.start()
+        assert scan_started.wait(timeout=5.0)
+
+        legacy_writer = threading.Thread(target=_legacy_write)
+        legacy_writer.start()
+        # The whole point: this commit lands WHILE the sweep is parked.
+        assert writer_committed.wait(timeout=5.0)
+
+        release_scan.set()
+        initializer.join(timeout=5.0)
+        legacy_writer.join(timeout=5.0)
+        assert not initializer.is_alive()
+        assert not legacy_writer.is_alive()
+        assert errors == []
+        assert _read_privacy_policy_stamp(db_path) == _privacy_policy_fingerprint()
+
+        check = sqlite3.connect(str(db_path))
+        try:
+            # The racing secret arrived after the sweep read the table, so the
+            # sweep never judged it — the queue did, under the reservation, in
+            # the same transaction that published the stamp.
+            assert check.execute("SELECT tool FROM proxy_cache").fetchall() == [("clean",)]
+            assert (
+                check.execute("SELECT COUNT(*) FROM proxy_cache_privacy_unverified").fetchone()[0]
+                == 0
+            )
+        finally:
+            check.close()
+
+    def test_body_rewritten_during_sweep_is_rejudged_from_the_queue(self, tmp_path, monkeypatch):
+        """A verdict from the unlocked sweep must not outlive the body it read.
+
+        With the sweep outside the reservation, a row it judged sensitive can
+        be rewritten before the reservation is taken. The queue entry that
+        rewrite leaves behind decides the row instead; deleting on the sweep's
+        stale verdict would evict a row whose stored body is clean.
+        """
+        db_path = tmp_path / "privacy_scan_rewrite.db"
+        seed = ProxyCache(db_path, max_entries=100)
+        seed.initialize()
+        seed.close()
+
+        raw = sqlite3.connect(str(db_path))
+        try:
+            raw.execute(
+                "INSERT INTO proxy_cache "
+                "(cache_key, server, tool, result, created_at, ttl_seconds) "
+                "VALUES ('rewritten-key', 's', 'secret', 'password=hunter2', ?, NULL)",
+                (time.time(),),
+            )
+            raw.execute(
+                "UPDATE proxy_cache_meta SET value = 'stale' WHERE key = ?",
+                (cache_module._PRIVACY_POLICY_FINGERPRINT_KEY,),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+        scan_started = threading.Event()
+        release_scan = threading.Event()
+        errors: list[BaseException] = []
+        real_scan = cache_module.privacy.contains_sensitive_content
+
+        def _blocking_scan(text: str) -> bool:
+            if text == "password=hunter2":
+                scan_started.set()
+                assert release_scan.wait(timeout=5.0)
+            return real_scan(text)
+
+        def _initialize() -> None:
+            cache = ProxyCache(db_path, max_entries=100)
+            try:
+                cache.initialize()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+            finally:
+                cache.close()
+
+        monkeypatch.setattr(cache_module.privacy, "contains_sensitive_content", _blocking_scan)
+        initializer = threading.Thread(target=_initialize)
+        initializer.start()
+        assert scan_started.wait(timeout=5.0)
+
+        rewriter = sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            rewriter.execute(
+                "UPDATE proxy_cache SET result = 'harmless replacement' "
+                "WHERE cache_key = 'rewritten-key'"
+            )
+            rewriter.commit()
+        finally:
+            rewriter.close()
+
+        release_scan.set()
+        initializer.join(timeout=5.0)
+        assert not initializer.is_alive()
+        assert errors == []
+
+        check = sqlite3.connect(str(db_path))
+        try:
+            assert check.execute(
+                "SELECT result FROM proxy_cache WHERE cache_key = 'rewritten-key'"
+            ).fetchone() == ("harmless replacement",)
+            assert (
+                check.execute("SELECT COUNT(*) FROM proxy_cache_privacy_unverified").fetchone()[0]
+                == 0
+            )
+        finally:
+            check.close()
+        assert _read_privacy_policy_stamp(db_path) == _privacy_policy_fingerprint()
+
+    def test_reopen_replaces_stale_trigger_bodies(self, tmp_path):
+        """Trigger semantics must be upgradable on an existing database.
+
+        ``CREATE TRIGGER IF NOT EXISTS`` is a no-op wherever the trigger
+        already exists, so a change to what the queue tracks would never reach
+        an installed database — and the policy stamp would then assert a
+        policy the stored triggers do not implement. Bumping the epoch cannot
+        fix that: it forces one rescan, not new trigger text.
+        """
+        db_path = tmp_path / "trigger_upgrade.db"
+        cache = ProxyCache(db_path, max_entries=100)
+        cache.initialize()
+        cache.close()
+
+        raw = sqlite3.connect(str(db_path))
+        try:
+            # Stand in for a previous release's trigger: same name, narrower
+            # body (tracks nothing).
+            raw.execute("DROP TRIGGER proxy_cache_privacy_track_body_update")
+            raw.execute(
+                "CREATE TRIGGER proxy_cache_privacy_track_body_update "
+                "AFTER UPDATE OF result ON proxy_cache BEGIN SELECT 1; END"
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+        reopened = ProxyCache(db_path, max_entries=100)
+        reopened.initialize()
+        try:
+            reopened.set("s", "t", {}, "ordinary cached response", ttl_seconds=None)
+            key = _make_key("s", "t", {})
+            assert (
+                reopened._db.execute(
+                    "SELECT COUNT(*) FROM proxy_cache_privacy_unverified"
+                ).fetchone()[0]
+                == 0
+            )
+            raw = sqlite3.connect(str(db_path), timeout=5.0)
+            try:
+                raw.execute(
+                    "UPDATE proxy_cache SET result = 'rewritten out of band' WHERE cache_key = ?",
+                    (key,),
+                )
+                raw.commit()
+            finally:
+                raw.close()
+            # Only the recreated trigger queues this out-of-band body update.
+            assert reopened._db.execute(
+                "SELECT cache_key FROM proxy_cache_privacy_unverified"
+            ).fetchall() == [(key,)]
+        finally:
+            reopened.close()
+
+    def test_older_policy_writer_racing_the_sweep_is_not_vouched_for(self, tmp_path, monkeypatch):
+        """A repair token must stand while the sweep runs unlocked.
+
+        During a rolling upgrade a live older-policy process keeps calling
+        ``set()``. If the OLD stamp were still published while the sweep runs,
+        that writer's dequeue would match it and remove its own key from the
+        queue — so a body the old policy considers clean and the new policy
+        flags would be neither swept (it arrived after the snapshot) nor
+        queued, and this initializer would publish the new stamp over it.
+        """
+        db_path = tmp_path / "older_policy_writer_race.db"
+        seed = ProxyCache(db_path, max_entries=100)
+        seed.initialize()
+        try:
+            seed.set("s", "clean", {}, "ordinary cached response", ttl_seconds=None)
+        finally:
+            seed.close()
+
+        old_fingerprint = "old-policy-fingerprint"
+        raw = sqlite3.connect(str(db_path))
+        try:
+            raw.execute(
+                "UPDATE proxy_cache_meta SET value = ? WHERE key = ?",
+                (old_fingerprint, cache_module._PRIVACY_POLICY_FINGERPRINT_KEY),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+        writer_thread_name = "older-policy-writer"
+        real_fingerprint = _privacy_policy_fingerprint()
+        real_scan = cache_module.privacy.contains_sensitive_content
+        scan_started = threading.Event()
+        release_scan = threading.Event()
+        writer_done = threading.Event()
+        errors: list[BaseException] = []
+
+        def _thread_local_fingerprint() -> str:
+            # The writer is a separate PROCESS in production; here it is the
+            # one thread whose build predates the new pattern.
+            if threading.current_thread().name == writer_thread_name:
+                return old_fingerprint
+            return real_fingerprint
+
+        def _thread_local_scan(text: str) -> bool:
+            if threading.current_thread().name == writer_thread_name:
+                return False  # the older policy has no pattern for this body
+            if text == "ordinary cached response":
+                scan_started.set()
+                assert release_scan.wait(timeout=5.0)
+            return real_scan(text)
+
+        monkeypatch.setattr(cache_module, "_privacy_policy_fingerprint", _thread_local_fingerprint)
+        monkeypatch.setattr(cache_module.privacy, "contains_sensitive_content", _thread_local_scan)
+
+        def _initialize() -> None:
+            cache = ProxyCache(db_path, max_entries=100)
+            try:
+                cache.initialize()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+            finally:
+                cache.close()
+
+        def _older_policy_write() -> None:
+            # A process that initialized before this one: only its ``set()``
+            # path is under test, so it opens the store directly.
+            writer = ProxyCache(db_path, max_entries=100)
+            writer._db = sqlite3.connect(str(db_path), check_same_thread=False, timeout=5.0)
+            try:
+                writer.set("s", "racy", {}, "password=hunter2", ttl_seconds=None)
+                writer_done.set()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+            finally:
+                writer.close()
+
+        initializer = threading.Thread(target=_initialize)
+        initializer.start()
+        assert scan_started.wait(timeout=5.0)
+
+        writer = threading.Thread(target=_older_policy_write, name=writer_thread_name)
+        writer.start()
+        assert writer_done.wait(timeout=5.0)
+
+        release_scan.set()
+        initializer.join(timeout=5.0)
+        writer.join(timeout=5.0)
+        assert not initializer.is_alive()
+        assert not writer.is_alive()
+        assert errors == []
+
+        check = sqlite3.connect(str(db_path))
+        try:
+            assert check.execute("SELECT tool FROM proxy_cache").fetchall() == [("clean",)]
+            assert (
+                check.execute("SELECT COUNT(*) FROM proxy_cache_privacy_unverified").fetchone()[0]
+                == 0
+            )
+        finally:
+            check.close()
+        assert _read_privacy_policy_stamp(db_path) == real_fingerprint
+
+    def test_replaced_triggers_invalidate_the_policy_stamp(self, tmp_path):
+        """Restoring the triggers is not enough — the stamp must be dropped.
+
+        A write the previous trigger failed to queue is invisible to the fast
+        path, so a reopen that merely recreates the trigger would find a
+        matching stamp, skip the sweep, and leave that row vouched for.
+        """
+        db_path = tmp_path / "stale_trigger_missed_write.db"
+        cache = ProxyCache(db_path, max_entries=100)
+        cache.initialize()
+        try:
+            cache.set("s", "t", {}, "ordinary cached response", ttl_seconds=None)
+        finally:
+            cache.close()
+        key = _make_key("s", "t", {})
+
+        raw = sqlite3.connect(str(db_path))
+        try:
+            # A previous release's trigger, narrow enough to miss this update.
+            raw.execute("DROP TRIGGER proxy_cache_privacy_track_body_update")
+            raw.execute(
+                "CREATE TRIGGER proxy_cache_privacy_track_body_update "
+                "AFTER UPDATE OF result ON proxy_cache BEGIN SELECT 1; END"
+            )
+            raw.execute(
+                "UPDATE proxy_cache SET result = 'password=hunter2' WHERE cache_key = ?",
+                (key,),
+            )
+            raw.commit()
+            # Positive control: the write really did go untracked.
+            assert (
+                raw.execute("SELECT COUNT(*) FROM proxy_cache_privacy_unverified").fetchone()[0]
+                == 0
+            )
+            assert (
+                raw.execute(
+                    "SELECT value FROM proxy_cache_meta WHERE key = ?",
+                    (cache_module._PRIVACY_POLICY_FINGERPRINT_KEY,),
+                ).fetchone()[0]
+                == _privacy_policy_fingerprint()
+            )
+        finally:
+            raw.close()
+
+        reopened = ProxyCache(db_path, max_entries=100)
+        reopened.initialize()
+        try:
+            assert reopened._db.execute("SELECT COUNT(*) FROM proxy_cache").fetchone()[0] == 0
+        finally:
+            reopened.close()
+        assert _read_privacy_policy_stamp(db_path) == _privacy_policy_fingerprint()
 
     def test_get_refuses_and_evicts_sensitive_row_written_after_startup(self, tmp_path):
         # An older still-running pre-gate process (or an external SQL writer)
