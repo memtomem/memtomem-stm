@@ -320,17 +320,22 @@ def _stop_current_config_daemon(config: STMConfig) -> None:
     hs_path = handshake_path(config.data_dir, config_fingerprint(config))
     raw = read_handshake(hs_path)
     if asyncio.run(client.shutdown(config)):
-        # The wire response means only "shutdown accepted". Teardown still
-        # has to stop the engine/LTM child and remove the handshake, so do not
-        # tell scripts the daemon is stopped until both its endpoint and
-        # ownership record are gone.
+        # The wire response means only "shutdown accepted". Teardown still has
+        # to stop the engine/LTM child before it removes the handshake, so do
+        # not tell scripts the daemon is stopped until that record is gone.
+        #
+        # The handshake alone is the terminal condition (#954). It is also the
+        # strictest one: the daemon closes its listener when the serve block
+        # exits, then tears down engine, tracker and LTM child, and removes the
+        # handshake LAST — so an absent handshake already implies an absent
+        # endpoint. Probing the recorded port on top of that asked about a
+        # host/port that identified this daemon only at the moment we read it;
+        # an ephemeral port the OS reassigned to an unrelated listener inside
+        # this window kept the probe true forever and reported a clean stop as
+        # a failure.
         deadline = time.time() + 5.0
         while time.time() < deadline:
-            handshake_gone = read_handshake(hs_path) is None
-            endpoint_gone = raw is None or not client.probe_listening(
-                raw.get("host"), raw.get("port"), timeout=0.1
-            )
-            if handshake_gone and endpoint_gone:
+            if read_handshake(hs_path) is None:
                 click.echo(_ok("daemon stopped"))
                 return
             time.sleep(0.05)

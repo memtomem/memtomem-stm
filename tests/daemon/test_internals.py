@@ -759,6 +759,36 @@ class TestDaemonStopCli:
         assert "accepted shutdown but is still cleaning up" in result.output
         assert "daemon stopped" not in result.output
 
+    def test_graceful_ack_reports_stop_when_recorded_port_is_reassigned(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#954: the recorded host/port identified the daemon only when we read
+        it. Once teardown removed the handshake the daemon is stopped, even if
+        the OS handed that ephemeral port to an unrelated listener meanwhile —
+        probing it used to spin out the full wait and exit 1 on a clean stop."""
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        hs_path = _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 4567, "token": "t"})
+
+        async def fake_shutdown(config):
+            # Teardown completes: the handshake, removed last, is gone.
+            hs_path.unlink()
+            return True
+
+        monkeypatch.setattr("memtomem_stm.daemon.client.shutdown", fake_shutdown)
+        # Something else now answers on the port the handshake recorded.
+        monkeypatch.setattr(
+            "memtomem_stm.daemon.client.probe_listening",
+            lambda host, port, **kwargs: True,
+        )
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+
+        assert result.exit_code == 0, result.output
+        assert "daemon stopped" in result.output
+        assert "still cleaning up" not in result.output
+
     def test_no_daemon_no_handshake(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         from click.testing import CliRunner
 
