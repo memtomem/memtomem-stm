@@ -103,6 +103,8 @@ jobs:
           # files from the first attempt — without this every later attempt at
           # the same version dies on "file already exists". The PyPI step above
           # keeps failing on a re-upload on purpose: for a real release an
-          # existing file means the version was already published, which the
-          # verification steps exist to catch rather than paper over.
+          # existing file means the version was already published, and the
+          # publisher refusing it is the only thing that says so — the
+          # verification steps above check the local tag, sources and built
+          # metadata, never the index.
           skip-existing: true

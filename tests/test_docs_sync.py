@@ -2394,3 +2394,31 @@ def test_functions_reaching_reports_posix_separated_keys(tmp_path) -> None:
     )
     reaching = _functions_reaching(src, "log_feedback")
     assert reaching == {("cli/selection_cmd.py", "_write_label")}
+
+
+def test_release_publish_steps_scope_skip_existing_to_the_dry_run_lane() -> None:
+    """Only the TestPyPI upload may skip files the index already has (#953).
+
+    Re-pushing a ``test-v*`` tag to iterate is what that prefix is for, and the
+    second attempt hits files TestPyPI already took. Production must keep
+    refusing them: there an existing file means the version was already
+    published. The flag's spelling is part of the contract — the runner only
+    WARNS on an input an action does not declare, so a typo would upload
+    successfully and surface as a failure on someone's rerun months later,
+    which is exactly the failure this pins.
+    """
+    workflow = _read(".github/workflows/release.yml")
+    steps = workflow.split("      - name: ")
+    pypi = [s for s in steps if s.startswith("Publish to PyPI\n")]
+    testpypi = [s for s in steps if s.startswith("Publish to TestPyPI\n")]
+    assert len(pypi) == 1 and len(testpypi) == 1, "release.yml lost a named publish step"
+
+    assert "skip-existing" not in pypi[0], (
+        "the production upload must fail on an already-published file, not skip it"
+    )
+    assert "skip-existing: true" in testpypi[0], (
+        "the TestPyPI dry-run lane must skip existing files so a test-v* tag can be re-pushed"
+    )
+    # ``skip_existing`` is the action's deprecated alias: accepted today, but a
+    # silent no-op the moment it is dropped.
+    assert "skip_existing" not in workflow, "use the canonical skip-existing spelling"
