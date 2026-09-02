@@ -700,7 +700,7 @@ By default, every result-size budget in STM is expressed in **characters** (`max
 
 Three opt-in fields make budgets token-aware without breaking existing char-based configs:
 
-- **`chars_per_token`** — chars-per-token ratio used to convert a token budget to a char budget. Configurable at `ProxyConfig` (default `3.5`), per upstream server, or per tool. Lower it for non-Latin content (`~2.0` for Korean, `~1.3` for Chinese). Cascading resolution: tool override → server → proxy default.
+- **`chars_per_token`** — chars-per-token ratio used to convert a token budget to a char budget. Configurable at `ProxyConfig` (default `3.5`), per upstream server, or per tool. Lower it for non-Latin content (`~2.0` for Korean, `~1.3` for Chinese). Cascading resolution: tool override → server → proxy default, resolved independently of where the token budget comes from — a tool that states only its ratio still converts the budget it inherits from the server. A per-tool `max_result_chars` ends the question first: a char budget is absolute, so no ratio applies under it.
 - **`max_result_tokens`** — token-equivalent budget on `UpstreamServerConfig` and `ToolOverrideConfig`. When set, takes precedence over `max_result_chars` and is converted to a char budget at gate time via the resolved `chars_per_token`.
 - **`token_estimation_mode`** — `static` (default) keeps the conversion above. `unicode` estimates the actual response at runtime, passes through responses that fit the token budget, and derives a response-specific character budget when they do not. Resolution is tool → server → proxy. Tools on the zero-loss `progressive` strategy are unaffected: chunked delivery has no result-size gate, so their budgets and metrics keep the static behavior.
 

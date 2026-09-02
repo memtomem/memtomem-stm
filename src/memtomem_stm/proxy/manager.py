@@ -3693,9 +3693,10 @@ class ProxyManager:
         cfg = self._server_cfg(conn, config)
 
         # Token-equivalent budget takes precedence over char budget when set.
-        # Resolution order for chars_per_token: tool override → server → proxy default.
+        # Resolution order for chars_per_token: tool override → server → proxy default,
+        # resolved independently of where the token budget comes from (#929).
         # Resolution order for max_result_tokens: tool override → server.
-        # Falls back to existing char-budget paths when neither override is set.
+        # Falls back to existing char-budget paths when no token budget is in force.
         token_estimation_mode = cfg.token_estimation_mode or config.token_estimation_mode
         llm_cfg = cfg.llm
         sel_cfg = cfg.selective

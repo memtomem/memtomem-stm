@@ -44,6 +44,20 @@ changes inline only. See the deprecation policy in
   (a custom serializer, a computed field, extras) is routed off-loop rather
   than trusted. **Behavior change**: none external.
 
+### Fixed
+
+- **A per-tool `chars_per_token` now applies to a token budget inherited from
+  its upstream server** (#929). The ratio was read only beside a per-tool
+  `max_result_tokens`, so a tool that stated only its ratio ran at the server's
+  — against the cascade its own field docstring, `docs/configuration.md` and the
+  0.1.x changelog entry all describe. **Behavior change**: a deployment that
+  sets `chars_per_token` on a tool and `max_result_tokens` on the server sees
+  that tool's effective char budget re-scaled to the documented value (for
+  example a server at 400 tokens x 2.5 with a tool ratio of 4.0 moves from 1000
+  to 1600 chars). `mms tune` reports the same corrected budget, so its budget
+  advice is no longer measured against a number the call never ran under. A
+  per-tool `max_result_chars` still outranks both and is unaffected.
+
 ## [0.3.0] — 2026-09-02
 
 ### Upgrade notes

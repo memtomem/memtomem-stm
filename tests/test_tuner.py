@@ -759,6 +759,35 @@ class TestAnalyze:
         assert budget[0].current == "1000"
         assert budget[0].recommended == str(max(int(18000 * 0.8), 1000 + 2000))
 
+    def test_budget_advice_reads_a_tool_ratio_under_a_server_token_budget(
+        self, metrics_store: MetricsStore
+    ):
+        """The tuner is the second reader of the ratio cascade (#929).
+
+        Both readers go through ``effective_max_result_chars``, but a rule with
+        two readers goes wrong one copy at a time, and here the failure is a
+        false claim rather than silence: H1 would print a `current` the call
+        never ran under and measure its "increase" against it.
+        """
+        cfg = ProxyConfig(
+            upstream_servers={
+                "srv": UpstreamServerConfig(
+                    prefix="test",
+                    max_result_tokens=400,
+                    chars_per_token=2.5,
+                    tool_overrides={"t1": ToolOverrideConfig(chars_per_token=4.0)},
+                )
+            }
+        )
+        _seed_metrics(metrics_store, "srv", "t1", 10, original_chars=18000, violation=True)
+        tuner = CompressionTuner(metrics_store, config=cfg)
+        recs = tuner.analyze()
+        budget = [a for rec in recs for a in rec.actions if a.field == "max_result_chars"]
+        # 400 x 4.0 (tool ratio) = 1600, not 400 x 2.5 = 1000.
+        assert len(budget) == 1
+        assert budget[0].current == "1600"
+        assert budget[0].recommended == str(max(int(18000 * 0.8), 1600 + 2000))
+
     def test_h2_skips_only_against_a_per_tool_token_budget(self, tmp_path: Path):
         """The same rule on the reduction side, which H1's cases cannot reach.
 
