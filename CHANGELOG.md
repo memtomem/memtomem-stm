@@ -55,7 +55,11 @@ changes inline only. See the deprecation policy in
   suffix, matching what calls already resolved. An upstream that replaces its
   catalogue mid-session has exposure re-decided instead of ignored, and a tool
   that only runs as an async task is withheld rather than advertised unusable.
-  The credential scan covers the whole advertised surface.
+  The credential scan covers the whole advertised surface. An unexpected error
+  from a policy bundle reload is mapped onto the same rejection semantics the
+  documented failures use, so it degrades or fails closed by profile instead of
+  aborting the server or the request (#882), and `stm_proxy_health` no longer
+  reports a live bundle read as served from cache (#939).
 
 - **`mms hook` is cheaper and can no longer report a failure to the host**
   (#881, #862, #886, #888, #864). Any escaping exception now exits 0 with the
@@ -73,11 +77,26 @@ changes inline only. See the deprecation policy in
   recovery column existed keeps the unconditional warning. `mms daemon stop`
   no longer exits 1 on a daemon that stopped correctly.
 
+- **`mms tune` deletes aged feedback rows the first time you run it** (#942).
+  It now opens the feedback stores with the configured `retention_days`, where
+  it previously opened them bare and kept every row forever. Rows past the
+  retention the config already declares are purged — the same purge the daemon
+  has run at startup all along, with the same values and the same SQL. If you
+  have been reading history older than `compression_feedback.retention_days` or
+  `progressive_reads.retention_days` out of those files, raise the setting
+  before running the command. The proxy and the daemon are unaffected.
+
 - **Auto-tune recommendations are computed from the rows they claim to
   measure** (#931, #935, #936, #938). A strategy pin is gated on, and measured
   from, AUTO's own calls; H3 groups by the strategy AUTO chose; a
-  recommendation's confidence follows the rows its heuristic actually read.
-  Existing recommendations may therefore change or disappear.
+  recommendation's confidence follows the rows its heuristic actually read; and
+  no `compression` pin is recommended for a tool whose strategy is already
+  fixed by `default_compression`, with budget advice measured against the
+  effective budget (#927). Existing recommendations may therefore change or
+  disappear. Selection telemetry now records the tool-graph's per-candidate
+  facts, and a non-finite reported score is recorded as `null` rather than
+  travelling into the log and the cache as a token strict JSON readers reject
+  (#852).
 
 - **Compressed output and extraction behave differently at the edges** (#949,
   #947, #863, #902). The cleaner keeps its markers out of the text entirely and
@@ -85,7 +104,10 @@ changes inline only. See the deprecation policy in
   heuristic extraction after `llm_timeout_seconds`, and repeated expirations
   now open the extraction circuit breaker. Pending eviction ranks by operation
   order rather than by the clock, so a key just handed to a client is no longer
-  the one discarded.
+  the one discarded, its TTL starts after the scoring call rather than before
+  it, and a scorer that raises leaves no orphan key (#900). Cache-eligible
+  same-key misses that could previously overlap are now serialized, so fewer
+  concurrent upstream calls and LTM searches run under that pattern (#946).
 
 - **Environment overrides and `--config` resolve consistently** (#836, #838,
   #845, #846, #849, #850, #844, #897). A JSON-valued override is decoded the
@@ -116,7 +138,7 @@ changes inline only. See the deprecation policy in
   version fails the job instead. The `test-vVERSION` dry-run lane keeps
   skipping them, so a re-run or a re-pushed test tag can still go green
   instead of dying on "file already exists" — publishing a changed build
-  still needs a new version (#953, fixed by #965).
+  still needs a new version (#965, issue #953).
 
 - **Required CI now names its supported interpreter lanes and enforces branch
   coverage.** Tests run on Python 3.12 for Ubuntu/Windows and Python 3.13 for
@@ -390,8 +412,8 @@ changes inline only. See the deprecation policy in
   `cache: true` where replay is known to be safe. A replay-unsafe failure still
   reconnects for the next call; it just does not re-invoke the tool.
 
-- **Documented how an advertised tool description is assembled** (#896, PR
-  #923). No STM-native surface renders the assembled description —
+- **Documented how an advertised tool description is assembled** (#923, issue
+  #896). No STM-native surface renders the assembled description —
   `stm_proxy_stats` and `stm_proxy_health` report counts, and the `mms` commands
   report configuration and health but never the description text. Listing tools
   from the client shows the exact result; understanding how it was built was
@@ -550,19 +572,26 @@ changes inline only. See the deprecation policy in
   server or its upstreams running** (#910, #911 and #913, issue #906). Three of
   that issue's four directions, in the order they run. `SIGTERM`/`SIGINT` now
   run the full teardown and exit `0` instead of killing the process with its
-  stdio children orphaned, or hanging; a second signal exits `128 + signum`, and
-  handlers are given back as teardown begins so one arriving mid-shutdown takes
-  the default disposition instead of re-entering. Each teardown step is bounded,
-  and a watchdog armed only between teardown starting and finishing exits the
-  process 1 after a CRITICAL line if the whole thing overruns its budget. What
-  survives teardown is then swept: direct children still alive are SIGTERM'd,
+  stdio children orphaned, or hanging. The handlers stay installed across
+  teardown — handing the signals back would put SIGTERM's default disposition
+  in charge of the very window this shutdown exists to survive — and a second
+  signal instead takes the immediate-exit path and exits `128 + signum`, while
+  the signal that started the teardown does not re-enter it. Each teardown step
+  carries a ceiling, real for work that takes cancellation and best-effort
+  otherwise: a step that swallows `CancelledError` or wedges in a synchronous
+  call parks past its timeout. The hard guarantee is a watchdog armed only
+  between teardown starting and finishing, which exits the process 1 after a
+  CRITICAL line if the whole thing overruns its budget. What survives teardown
+  is then swept: direct children still alive are SIGTERM'd,
   then SIGKILL'd, and their pids logged at WARNING under
   `memtomem_stm.utils.child_reaper`.
 
   **Behavior change**: signalled shutdown exits `0` after a real teardown rather
-  than dying or hanging, a wedged step is abandoned at its ceiling with a
-  WARNING naming it, and a leaked child is killed rather than orphaned. A clean
-  shutdown finds nothing and logs nothing. The sweep is a no-op on Windows and
+  than dying or hanging, a step that overruns its ceiling while still taking
+  cancellation is abandoned with a WARNING naming it, an overrunning teardown
+  exits 1 rather than living on, and a leaked child is killed rather than
+  orphaned. A clean shutdown finds nothing and logs nothing. The sweep is a
+  no-op on Windows and
   wherever `pgrep` is unavailable, so it can never itself be why the process
   fails to exit. Signal installation never fails startup — a non-main thread
   cannot install one, and Windows has no `add_signal_handler`. The fourth
@@ -575,8 +604,10 @@ changes inline only. See the deprecation policy in
   task, and `_close_retired_generation` discards that marker only from inside
   its own body. A task `stop()` cancels before it ever runs therefore leaves the
   marker permanently, and `stop()`'s drain loop skips any generation still
-  marked — so neither path closed the retired owner. The marker is now cleared
-  by the code that created it when the task does not start.
+  marked — so neither path closed the retired owner. The generation set is
+  replaced by a `retiring_tasks` map from generation to the task closing it, so
+  the entry is owned by the code that created it and a task that never starts
+  leaves nothing behind for the drain to skip.
 
   **Behavior change**: an orphaned stdio child process, or an open HTTP
   transport, no longer survives shutdown through this window — the same leak
@@ -592,10 +623,13 @@ changes inline only. See the deprecation policy in
   config-change reconnect conclude its work was already done. Coalescing now
   compares the connection identity — the requested transport fingerprint against
   the installed one — so a reconnect returns early only when the settings it
-  carries are the settings in place.
+  carries are the settings in place. The fingerprint is the frozen view of the
+  fields the active transport consumes: `transport` always, then `command`,
+  `args` and `env` for stdio, or `url`, `headers` and
+  `connect_timeout_seconds` for a network transport.
 
-  **Behavior change**: an edit to `url` / `command` / `args` / `env` that raced
-  a recovery reconnect now takes effect instead of being silently dropped until
+  **Behavior change**: an edit to any field of that fingerprint that raced a
+  recovery reconnect now takes effect instead of being silently dropped until
   the next restart. Two concurrent detections of the same edit still collapse
   into one reconnect, a prefix-only edit still skips, adding or removing a
   server stays restart-only, and the generation is still bumped only on success.
@@ -1053,8 +1087,16 @@ changes inline only. See the deprecation policy in
   `docs/configuration.md` full example's
   `retention_days: 90` for both blocks is now pinned against the models by
   `test_docs_sync.py`, which previously claimed to cover every `ProxyConfig`
-  sub-block but checked only `cache` and `toolgraph`. No behavior change to the
-  proxy or the daemon: the purge runs exactly as before.
+  sub-block but checked only `cache` and `toolgraph`.
+
+  **Behavior change**: `mms tune` now purges feedback rows older than the
+  configured `retention_days` when it opens the store, where it previously
+  opened the store bare and kept them forever. Rows past the retention the
+  config already declares are deleted the first time the command runs, the
+  same purge the daemon has always run at startup, with the same config values
+  and the same SQL. The proxy and the daemon are unaffected. A caller that
+  omits `retention_days` now raises `TypeError`, which cannot happen at any
+  shipped call site.
 
 - **A policy bundle's identity is published only once its decisions bind**
   (#941, issue #940). Bundle adoption assigned the new snapshot, stamp, digest, instance id
@@ -1077,8 +1119,12 @@ changes inline only. See the deprecation policy in
   `stm_proxy_health` rendered a freshly read bundle as being served "from
   cache". Bundle adoption now drops the retired source's provenance once the
   new decisions are bound, through the same helper the verdict reset uses so
-  the two paths share one enumeration. Reporting only: the enforcement verdict
-  was the bundle's and was already correct, but the field exists precisely to
+  the two paths share one enumeration.
+
+  **Behavior change**: reporting only, and only in `stm_proxy_health`. A bundle
+  read live no longer inherits the retired stdio consult's ", from cache" note,
+  so the field reports the current source's provenance. The enforcement verdict
+  was the bundle's and was already correct; the field exists precisely to
   answer "is this decision current?".
 
 - **H3 groups by the strategy AUTO chose, not the label the call ended on**
@@ -1336,8 +1382,13 @@ changes inline only. See the deprecation policy in
   drops the dominant strategy's count. #928 — fixed separately, in this same
   release; see the entry above.
 
+  **Behavior change**: only the tuner's output. No `compression` pin action is
+  recommended for a tool whose strategy is already fixed by
+  `default_compression`, and budget advice is measured against the effective
+  budget, so an existing recommendation may change or disappear.
+
 - **A global-only `default_compression` now advertises its convention suffix**
-  (#924, PR #925). Calls resolve compression through the global default when a
+  (#925, issue #924). Calls resolve compression through the global default when a
   server omits the `compression` key (#292), but the advertisement read the
   per-server field alone — which is `auto` for exactly that configuration, and
   `auto` emits no suffix. An operator who configured compression globally got
@@ -1353,7 +1404,7 @@ changes inline only. See the deprecation policy in
   own way; #926 above folds them in and moves the function to
   `proxy/config.py`.
 
-  **Behavior change**, in two parts. For the three strategies that carry a
+  **Behavior change**: in two parts. For the three strategies that carry a
   suffix at all — `selective`, `progressive`, and `hybrid` under its default
   `tail_mode: "toc"`, a `truncate` tail being self-contained — such upstreams
   gain it whenever it fits the effective description budget, costing upstream
@@ -1374,7 +1425,7 @@ changes inline only. See the deprecation policy in
   response instead.
 
 - **`max_description_chars` is now an exact cap on the client-visible
-  description** (#893, PR #921). It read as a cap but did not bound the string
+  description** (#921, issue #893). It read as a cap but did not bound the string
   that reached the client, three ways that compound: truncation appended its ellipsis *after* slicing (+3),
   the convention-suffix budget floored at 40 regardless of the configured
   value, and registration prepended `[proxied] ` (+10) after all budgeting — so
@@ -1668,7 +1719,7 @@ changes inline only. See the deprecation policy in
   Instances sharing one store file must be upgraded together, as above.
 
 - **A selection key minted off-thread lands in the generation the reader
-  consults** (#898). A SELECTIVE/HYBRID compress can run on a worker thread for
+  consults** (#900, issue #898). A SELECTIVE/HYBRID compress can run on a worker thread for
   as long as its embedding scorer takes, and `begin_use` (#628) only keeps that
   compressor ALIVE — not reachable. `stm_proxy_select_chunks` reads the
   manager's current slot, so a selective-config change landing mid-compress let
@@ -1726,6 +1777,12 @@ changes inline only. See the deprecation policy in
   and building the TOC string. Closing it completely needs retired stores to
   stay readable until their keys expire, which is the lease lifecycle #890
   carries for the fact extractor.
+
+  **Behavior change**: a table of contents reports the `ttl_seconds_remaining`
+  of the generation that will actually enforce it, a selection's TTL starts
+  after the scoring call rather than before it — so under a slow embedding
+  endpoint the key lives its full TTL from the moment it exists — and a scorer
+  that raises leaves no orphan key where it previously stored one first.
 
 - **An unseeded loader with an unreadable config file answers, and honors
   `MEMTOMEM_STM_PROXY__*`** (#897). `ProxyConfigLoader.get()` returned `None`
@@ -1803,7 +1860,7 @@ changes inline only. See the deprecation policy in
   beside a new `parity_checked` denominator, because `0` mismatches otherwise
   reads as a clean bill of health even when nothing was checkable.
 
-  **Behavior change**, as measured against the previous release. *A traceback
+  **Behavior change**: as measured against the previous release. *A traceback
   becomes a report*: an oversized integer in any of the six fields. *A silent
   or unserializable result becomes an `invalid` report*, so the command exits
   1 where it exited 0. That covers every value in those fields that is not a
@@ -1865,7 +1922,7 @@ changes inline only. See the deprecation policy in
   from hand-edited logs, an older producer, or a future ranker that widens the
   field.
 
-  **Behavior change.** Two facts about the old code govern the rest. A rank
+  **Behavior change**: two facts about the old code govern the rest. A rank
   was only ever coerced or recorded on the entry naming `selected_tool`, so a
   malformed rank elsewhere never reached the coercion. And whether such a rank
   was counted at all came down to an equality check against the entry's
