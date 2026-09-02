@@ -21,8 +21,9 @@ changes inline only. See the deprecation policy in
   commands cannot start from the clean wheel (#958). A production `vVERSION`
   upload no longer silently accepts existing files — an already-published
   version fails the job instead. The `test-vVERSION` dry-run lane keeps
-  skipping them, so re-pushing a test tag to iterate still works (#953,
-  fixed by #965).
+  skipping them, so a re-run or a re-pushed test tag can still go green
+  instead of dying on "file already exists" — publishing a changed build
+  still needs a new version (#953, fixed by #965).
 
 - **Required CI now names its supported interpreter lanes and enforces branch
   coverage.** Tests run on Python 3.12 for Ubuntu/Windows and Python 3.13 for

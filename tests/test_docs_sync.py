@@ -2399,13 +2399,19 @@ def test_functions_reaching_reports_posix_separated_keys(tmp_path) -> None:
 def test_release_publish_steps_scope_skip_existing_to_the_dry_run_lane() -> None:
     """Only the TestPyPI upload may skip files the index already has (#953).
 
-    Re-pushing a ``test-v*`` tag to iterate is what that prefix is for, and the
-    second attempt hits files TestPyPI already took. Production must keep
-    refusing them: there an existing file means the version was already
-    published. The flag's spelling is part of the contract — the runner only
-    WARNS on an input an action does not declare, so a typo would upload
-    successfully and surface as a failure on someone's rerun months later,
-    which is exactly the failure this pins.
+    A dry run is expected to be attempted more than once for one version — a
+    re-run after a lost response, a re-pushed ``test-v*`` tag — and TestPyPI
+    already holds those filenames, so without the flag the job can never go
+    green again. (It skips them; publishing a CHANGED build needs a new
+    version, since ``release_check`` ties the tag to `pyproject.toml`.)
+    Production must keep refusing them: there an existing file means the
+    version was already published. The flag's spelling is part of the contract
+    — the runner only WARNS on an input an action does not declare, so a typo
+    would upload successfully and surface as a failure on someone's rerun
+    months later, which is exactly the failure this pins.
+
+    Assertions are on canonical block formatting: reformatting these steps
+    means updating this test in the same change.
     """
     workflow = _read(".github/workflows/release.yml")
 
@@ -2428,6 +2434,13 @@ def test_release_publish_steps_scope_skip_existing_to_the_dry_run_lane() -> None
         ]
 
     live = _active(workflow)
+    # Two publisher invocations, no more: the pair below is the whole routing
+    # contract, and a third — pinned, gated on the test- prefix, with no
+    # ``repository-url`` — would upload a test tag straight to production
+    # while every assertion about the named pair still held.
+    assert len([line for line in live if "uses: pypa/gh-action-pypi-publish" in line]) == 2, (
+        "release.yml must invoke the publisher exactly twice, once per lane"
+    )
     # One step, anywhere in the file, may carry the flag. Locating it by step
     # NAME alone would miss it landing in an unnamed ``- uses:`` step or in a
     # second production upload added later.
