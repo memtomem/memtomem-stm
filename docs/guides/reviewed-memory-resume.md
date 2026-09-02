@@ -20,8 +20,8 @@ Run this from a Git project root. Project-local memory is gitignored and does
 not leave the current checkout.
 
 ```bash
-uv tool install 'memtomem[all]>=0.4,<0.5'
-uv tool install 'memtomem-stm>=0.2,<0.3'
+uv tool install 'memtomem[all]>=0.4,<0.6'
+uv tool install 'memtomem-stm>=0.2,<0.4'
 
 mm status
 mm mem init
@@ -34,15 +34,16 @@ mm pinned list --json
 mm pinned compose "blue-green rollback checklist"
 ```
 
-Both pins sit on the `mcp` 2.x SDK: core 0.4.0 and memtomem-stm 0.2.0 declare
-`mcp[cli]>=2,<3` themselves, so neither needs a `--with` constraint the way the
-0.3.x/0.1.x stack did. They are still two separate `uv tool install`
+Both pins sit on the `mcp` 2.x SDK: every core and memtomem-stm release the
+ranges above admit — core 0.4.0 and 0.5.0, memtomem-stm 0.2.x and 0.3.x —
+declares `mcp[cli]>=2,<3` itself, so neither needs a `--with` constraint the
+way the 0.3.x/0.1.x stack did. They are still two separate `uv tool install`
 environments — the SDK major matters per environment, not across the MCP
 connection between them. Upgrading an existing tool from the older stack takes
 a reinstall:
 
 ```bash
-uv tool install --reinstall 'memtomem[all]>=0.4,<0.5'
+uv tool install --reinstall 'memtomem[all]>=0.4,<0.6'
 ```
 
 Do not run `mm init` as part of this scenario: it rewrites the user-level Core
@@ -90,7 +91,7 @@ your normal thresholds afterwards.
 
 ```bash
 export MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND=uvx
-export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS='["--from","memtomem>=0.4,<0.5","memtomem-server"]'
+export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS='["--from","memtomem>=0.4,<0.6","memtomem-server"]'
 export MEMTOMEM_STM_SURFACING__DEFAULT_NAMESPACE=resume-demo
 export MEMTOMEM_STM_SURFACING__CONTEXT_WINDOW_SIZE=1
 export MEMTOMEM_STM_SURFACING__MIN_SCORE=0

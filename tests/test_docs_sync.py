@@ -1314,6 +1314,9 @@ def test_surfacing_docs_pin_current_core_and_library_boundaries() -> None:
     for body in (readme, surfacing):
         assert "Core 0.3.12" in body
         assert "Core 0.3.13" in body
+        # The smoke's coverage claim has to move with the matrix, or both docs
+        # keep telling a reader the newest verified Core is an older one.
+        assert "Core 0.5.0" in body
         assert "schema 4" in body
         assert "planned first release" not in body
     assert "planned for Core 0.3.12" not in surfacing
@@ -1801,11 +1804,11 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     # has been edited out from under it, so substrings alone would keep
     # passing over a recipe that no longer installs anything.
     for command in (
-        "uv tool install 'memtomem[all]>=0.4,<0.5'",
-        "uv tool install 'memtomem-stm>=0.2,<0.3'",
-        "uv tool install --reinstall 'memtomem[all]>=0.4,<0.5'",
+        "uv tool install 'memtomem[all]>=0.4,<0.6'",
+        "uv tool install 'memtomem-stm>=0.2,<0.4'",
+        "uv tool install --reinstall 'memtomem[all]>=0.4,<0.6'",
         "export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS="
-        '\'["--from","memtomem>=0.4,<0.5","memtomem-server"]\'',
+        '\'["--from","memtomem>=0.4,<0.6","memtomem-server"]\'',
     ):
         assert command in guide, f"reviewed-memory-resume guide lost {command!r}"
 
@@ -1826,6 +1829,38 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     workflow = _read(".github/workflows/core-compat-advisory.yml")
     for version in ('core: "0.3.12"', 'core: "0.3.13"'):
         assert version in workflow
+    # The newest released Core must be a row, with the expectation and the
+    # (empty) pin it was verified under. A membership check on the version
+    # alone would pass on a commented-out row, and the well-formedness count
+    # below passes whether or not this row exists at all — deleting it outright
+    # is exactly the regression that check cannot see.
+    #
+    # Match inside the matrix block rather than the whole file: row-shaped text
+    # is legal in a `run: |` script, so a file-wide search proves the shape
+    # exists somewhere, not that the workflow runs it. The block ends at the
+    # first line indented no deeper than `include:` itself — pyyaml is not a
+    # test dependency, and this needs no parser.
+    include = re.search(r"^(\s*)include:\s*$", workflow, re.MULTILINE)
+    assert include is not None, "core-compat advisory lost its matrix include block"
+    body: list[str] = []
+    for line in workflow[include.end() :].splitlines():
+        if line.strip() and len(line) - len(line.lstrip()) <= len(include.group(1)):
+            break
+        body.append(line)
+    matrix = "\n".join(body)
+    newest = re.search(
+        r"^\s*- core:\s*[\"']?0\.5\.0[\"']?\n\s+expected:\s*(\w+)\n\s+mcp_pin:\s*[\"']([^\"']*)[\"']\s*$",
+        matrix,
+        re.MULTILINE,
+    )
+    assert newest is not None, (
+        "core-compat matrix lost its Core 0.5.0 row; a released Core that no "
+        "row covers is a Core nothing verifies"
+    )
+    assert newest.group(1) == "schema4", "Core 0.5.0 advertises context_compose schema 4"
+    assert newest.group(2) == "", (
+        "Core 0.5.0 declares mcp[cli]>=2.0.0,<3 itself; a pin it never asked for would hold it back"
+    )
     # The pin is per matrix row, so a newly added Core does not inherit it, and
     # it announces its own expiry rather than outliving the Core gap. Pin every
     # link of that wiring: declaring the field is worthless if the install step
@@ -1852,9 +1887,11 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     # Both patterns accept any YAML scalar spelling: counting only `- core: "`
     # would let `- core: '0.3.14'` or an unquoted value slip past both sides.
     scalar = r"[\"']?[^\"'\s]+[\"']?"
-    declared_rows = len(re.findall(r"^\s*- core:\s*\S", workflow, re.MULTILINE))
+    # Counted over the matrix block for the same reason the row above is
+    # matched there: row-shaped text elsewhere in the file is not a row.
+    declared_rows = len(re.findall(r"^\s*- core:\s*\S", matrix, re.MULTILINE))
     well_formed = re.findall(
-        rf"- core:\s*{scalar}\n\s+expected:\s*(\w+)(?:\n\s+mcp_pin:\s*{scalar})?\n", workflow
+        rf"- core:\s*{scalar}\n\s+expected:\s*(\w+)(?:\n\s+mcp_pin:\s*{scalar})?\n", matrix
     )
     assert declared_rows >= 5, "core-compat matrix lost rows"
     assert len(well_formed) == declared_rows, (
