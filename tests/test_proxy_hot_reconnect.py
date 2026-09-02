@@ -18,6 +18,7 @@ shadow the reseed mid-run).
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -915,3 +916,60 @@ asyncio.run(main())
         assert "Attempted to exit" not in stderr
         assert "Exception ignored in" not in stderr
         assert "traceback" not in stderr.lower()
+
+
+# ── #957: a published connection reports its measured envelope sizes ─────
+
+
+class TestPublishedConnectionIsCorrelated:
+    """The result-level size check defers to the wire measurement only when a
+    measurement actually arrives, so both halves of the correlation have to be
+    in place on every connection the proxy establishes."""
+
+    @staticmethod
+    def _capture_streams(mgr, cfg):
+        from unittest.mock import patch as _patch
+
+        seen: dict[str, object] = {}
+
+        def _capture_session(read_stream, write_stream, **kwargs):
+            seen["read"] = read_stream
+            seen["write"] = write_stream
+            return _mock_session()
+
+        return seen, (
+            _patch.object(mgr, "_open_transport", side_effect=lambda c: _mock_transport()),
+            _patch("memtomem_stm.proxy.manager.ClientSession", side_effect=_capture_session),
+        )
+
+    async def test_connect_pairs_a_bounded_reader_with_a_correlating_writer(self, tmp_path):
+        from memtomem_stm.utils.mcp_transport import BoundedReadStream, CorrelatingWriteStream
+
+        cfg = _sse_cfg("https://example.invalid/sse")
+        mgr = _make_manager(tmp_path, {"srv": cfg})
+        mgr._stack = AsyncExitStack()  # _connect_server's start() precondition
+        seen, patches = self._capture_streams(mgr, cfg)
+
+        with patches[0], patches[1]:
+            await mgr._connect_server("srv", cfg)
+
+        assert isinstance(seen["read"], BoundedReadStream)
+        assert isinstance(seen["write"], CorrelatingWriteStream)
+        # One correlator, or the id the writer records is not the one the
+        # reader looks up, and no measurement ever reaches a caller.
+        assert seen["read"]._correlator is seen["write"]._correlator
+
+    async def test_reconnect_pairs_them_too(self, tmp_path):
+        from memtomem_stm.utils.mcp_transport import BoundedReadStream, CorrelatingWriteStream
+
+        cfg = _sse_cfg("https://example.invalid/sse")
+        mgr = _make_manager(tmp_path, {"srv": cfg})
+        _seed_connection(mgr, "srv", cfg)
+        seen, patches = self._capture_streams(mgr, cfg)
+
+        with patches[0], patches[1]:
+            await mgr._reconnect_server("srv")
+
+        assert isinstance(seen["read"], BoundedReadStream)
+        assert isinstance(seen["write"], CorrelatingWriteStream)
+        assert seen["read"]._correlator is seen["write"]._correlator

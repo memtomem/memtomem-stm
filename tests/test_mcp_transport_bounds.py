@@ -18,9 +18,14 @@ from memtomem_stm.utils import json_size as json_size_module
 from memtomem_stm.utils.json_size import _SYNC_MEASURE_BYTES, json_utf8_size
 from memtomem_stm.utils.mcp_transport import (
     INBOUND_MESSAGE_TOO_LARGE_CODE,
+    _MAX_PENDING_CORRELATIONS,
     _MAX_PENDING_REJECTIONS,
     BoundedReadStream,
+    CorrelatingWriteStream,
+    ResponseCorrelator,
+    ResponseSize,
     is_inbound_message_too_large_error,
+    measured_response,
 )
 
 
@@ -654,3 +659,318 @@ class TestRoutingEstimateStaysConservative:
         approx = json_size_module._approx_json_size(message, limit=_SYNC_MEASURE_BYTES)
         assert approx <= _SYNC_MEASURE_BYTES
         assert abs(approx - exact) < 64, (approx, exact)
+
+
+# ── #957: reporting the wire measurement back to the waiting call ────────
+
+
+def _sized_response(request_id, text: str):
+    return SessionMessage(
+        mcp_types.JSONRPCResponse(
+            jsonrpc="2.0",
+            id=request_id,
+            result={"content": [{"type": "text", "text": text}], "isError": False},
+        )
+    )
+
+
+def _request(request_id, method: str = "tools/call"):
+    return SessionMessage(
+        mcp_types.JSONRPCRequest(jsonrpc="2.0", id=request_id, method=method, params={})
+    )
+
+
+class TestResponseSizeCorrelation:
+    """A caller must be able to tell that ``max_upstream_bytes`` was already
+    enforced on THIS response, rather than infer it from the connection — the
+    parsed result is not a byte-for-byte stand-in for the envelope, so the
+    weaker per-connection claim would open the cap (#957)."""
+
+    async def test_the_write_side_registers_a_request_sent_inside_a_slot(self):
+        correlator = ResponseCorrelator()
+        write = CorrelatingWriteStream(_CollectingWriteStream(), correlator)
+
+        with measured_response() as slot:
+            await write.send(_request(7))
+            assert correlator.take(7) is slot
+
+    async def test_a_request_sent_outside_a_slot_registers_nothing(self):
+        correlator = ResponseCorrelator()
+        write = CorrelatingWriteStream(_CollectingWriteStream(), correlator)
+
+        await write.send(_request(7))
+
+        assert correlator.pending == {}
+
+    async def test_a_notification_never_registers(self):
+        """Nothing replies to a notification, so a slot registered for one
+        would never be retired."""
+        correlator = ResponseCorrelator()
+        inner = _CollectingWriteStream()
+        write = CorrelatingWriteStream(inner, correlator)
+
+        with measured_response():
+            await write.send(
+                SessionMessage(
+                    mcp_types.JSONRPCNotification(
+                        jsonrpc="2.0", method="notifications/initialized"
+                    )
+                )
+            )
+
+        assert correlator.pending == {}
+        assert len(inner.sent) == 1
+
+    async def test_the_read_side_fills_the_slot_with_the_measured_envelope(self):
+        correlator = ResponseCorrelator()
+        response = _sized_response(7, "x" * 100)
+        exact = json_utf8_size(response.message, limit=10**9)
+        stream = BoundedReadStream(_OneItemStream(response), 41_943_040, correlator=correlator)
+
+        slot = ResponseSize()
+        correlator.register(7, slot)
+        assert await stream.receive() is response
+
+        assert slot.envelope_bytes == exact
+        assert slot.limit_applied == 41_943_040
+        assert correlator.pending == {}
+
+    async def test_an_uncorrelated_response_leaves_other_slots_alone(self):
+        correlator = ResponseCorrelator()
+        stream = BoundedReadStream(
+            _OneItemStream(_sized_response(9, "x")), 41_943_040, correlator=correlator
+        )
+
+        mine = ResponseSize()
+        correlator.register(7, mine)
+        await stream.receive()
+
+        assert mine.envelope_bytes is None
+        assert correlator.take(7) is mine
+
+    async def test_an_oversize_response_reports_no_size_and_retires_its_slot(self):
+        """The caller is about to fail on the oversize error. A slot saying
+        "within the cap" would be a lie, and a slot left behind would leak."""
+        correlator = ResponseCorrelator()
+        stream = BoundedReadStream(_OneItemStream(_oversize_response(7)), 20, correlator=correlator)
+
+        slot = ResponseSize()
+        correlator.register(7, slot)
+        received = await stream.receive()
+
+        assert received.message.error.code == INBOUND_MESSAGE_TOO_LARGE_CODE
+        assert slot.envelope_bytes is None
+        assert correlator.pending == {}
+
+    async def test_a_string_id_echoed_for_an_int_id_still_correlates(self):
+        """The SDK treats "7" and 7 as one id for correlation; so must this."""
+        correlator = ResponseCorrelator()
+        stream = BoundedReadStream(
+            _OneItemStream(_sized_response("7", "x")), 41_943_040, correlator=correlator
+        )
+
+        slot = ResponseSize()
+        correlator.register(7, slot)
+        await stream.receive()
+
+        assert slot.envelope_bytes is not None
+
+    async def test_a_slot_takes_only_the_first_request_it_is_armed_for(self):
+        """A slot describes one request. The SDK follows ``call_tool`` with its
+        own ``list_tools`` inside the same context, and a slot that kept taking
+        registrations would report that second, smaller envelope as the
+        result's — a size check skipped on the strength of the wrong number."""
+        correlator = ResponseCorrelator()
+        write = CorrelatingWriteStream(_CollectingWriteStream(), correlator)
+
+        with measured_response() as slot:
+            await write.send(_request(1, "tools/call"))
+            await write.send(_request(2, "tools/list"))
+            assert correlator.take(1) is slot
+            assert correlator.take(2) is None
+
+    async def test_rearming_takes_the_next_request(self):
+        """One arming per retry attempt: a later attempt measures its own reply
+        rather than inheriting the previous attempt's."""
+        correlator = ResponseCorrelator()
+        write = CorrelatingWriteStream(_CollectingWriteStream(), correlator)
+
+        with measured_response() as slot:
+            await write.send(_request(1))
+            slot.envelope_bytes = 123
+            slot.rearm()
+            # Rearming also retires the previous attempt's id: nothing is
+            # coming for it, and it would otherwise sit in ``pending``.
+            assert correlator.pending == {}
+            await write.send(_request(2))
+            assert slot.envelope_bytes is None
+            assert correlator.take(2) is slot
+
+    async def test_registrations_are_capped(self, caplog):
+        correlator = ResponseCorrelator()
+        write = CorrelatingWriteStream(_CollectingWriteStream(), correlator)
+
+        # Slots kept alive, as in-flight calls would be: a slot that exits its
+        # context retires its own id, which is what this cap is a backstop for.
+        slots = [measured_response() for _ in range(_MAX_PENDING_CORRELATIONS + 3)]
+        with caplog.at_level("WARNING"):
+            for i, ctx in enumerate(slots):
+                ctx.__enter__()
+                await write.send(_request(i))
+
+        assert len(correlator.pending) == _MAX_PENDING_CORRELATIONS
+        assert "already pending" in caplog.text
+        for ctx in reversed(slots):
+            ctx.__exit__(None, None, None)
+        assert correlator.pending == {}
+
+    async def test_a_refused_registration_still_spends_the_arming(self):
+        """The cap refuses the id, but the request was still sent. If the slot
+        stayed armed, the SDK's follow-up ``list_tools`` — sent once another
+        reply frees capacity — would claim it, and that smaller envelope would
+        stand in for the tool result's size."""
+        correlator = ResponseCorrelator()
+        write = CorrelatingWriteStream(_CollectingWriteStream(), correlator)
+        filler = {i: ResponseSize() for i in range(_MAX_PENDING_CORRELATIONS)}
+        correlator.pending.update(filler)
+
+        with measured_response() as slot:
+            # Ids outside the filler's range, so a hit here is this slot's.
+            await write.send(_request(90_001, "tools/call"))  # refused: table full
+            correlator.pending.pop(0)  # another call's reply lands, freeing room
+            await write.send(_request(90_002, "tools/list"))
+
+            assert correlator.take(90_002) is None, "the follow-up claimed the result's slot"
+        assert slot.envelope_bytes is None
+
+    async def test_a_refusal_does_not_starve_the_next_attempt(self):
+        """Spending the arming on a refused id must not cost the retry its
+        measurement: ``_fetch_upstream`` rearms per attempt, and by then the
+        table may well have room again."""
+        correlator = ResponseCorrelator()
+        write = CorrelatingWriteStream(_CollectingWriteStream(), correlator)
+        correlator.pending.update({i: ResponseSize() for i in range(_MAX_PENDING_CORRELATIONS)})
+
+        with measured_response() as slot:
+            await write.send(_request(90_001))  # refused
+            correlator.pending.pop(0)  # a reply lands, freeing room
+            slot.rearm()  # what the next retry attempt does
+            await write.send(_request(90_002))
+
+            assert correlator.take(90_002) is slot
+
+    async def test_a_capped_request_is_still_sent(self):
+        """Correlation is an optimization; refusing to send would not be."""
+        correlator = ResponseCorrelator()
+        inner = _CollectingWriteStream()
+        write = CorrelatingWriteStream(inner, correlator)
+        correlator.pending.update({i: ResponseSize() for i in range(_MAX_PENDING_CORRELATIONS)})
+
+        with measured_response() as slot:
+            await write.send(_request(99_999))
+            assert correlator.take(99_999) is None
+        # Nothing measured it, so the caller's own size check has to run.
+        assert slot.envelope_bytes is None
+
+        assert len(inner.sent) == 1
+
+    async def test_a_call_that_never_gets_its_reply_leaves_nothing_behind(self):
+        """A timed-out or cancelled call's id is waiting for a response that
+        will never come. The session outlives the call, so nothing else would
+        ever retire it."""
+        correlator = ResponseCorrelator()
+        write = CorrelatingWriteStream(_CollectingWriteStream(), correlator)
+
+        with measured_response():
+            await write.send(_request(7))
+            assert correlator.pending != {}
+
+        assert correlator.pending == {}
+
+    async def test_releasing_never_retires_another_call_s_registration(self):
+        """An id can come round again — a reconnected upstream restarts its
+        sequence at 1. A stale slot releasing on the way out must drop only its
+        OWN entry, not whatever call now holds that id."""
+        correlator = ResponseCorrelator()
+        write = CorrelatingWriteStream(_CollectingWriteStream(), correlator)
+        later = ResponseSize()
+
+        with measured_response():
+            await write.send(_request(7))
+            # The reply never came; meanwhile a new call takes the same id.
+            correlator.register(7, later)
+
+        assert correlator.take(7) is later, "the stale slot retired the live one"
+
+    async def test_two_concurrent_calls_each_get_their_own_size(self):
+        """The correlation must be per call, not per connection: this is the
+        property the whole design turns on. Driven through a real
+        ``ClientSession`` so the context and id handling are the SDK's."""
+        inbound_send, inbound_receive = anyio.create_memory_object_stream(4)
+        outbound_send, outbound_receive = anyio.create_memory_object_stream(4)
+        correlator = ResponseCorrelator()
+        bounded = BoundedReadStream(inbound_receive, 41_943_040, correlator=correlator)
+        write = CorrelatingWriteStream(outbound_send, correlator)
+
+        slots: dict[str, ResponseSize] = {}
+
+        async with inbound_send, outbound_receive, ClientSession(bounded, write) as session:
+
+            async def call(name: str, payload: str):
+                with measured_response() as slot:
+                    slots[name] = slot
+                    return await session.call_tool(name, {})
+
+            small = asyncio.create_task(call("small", "x" * 10))
+            big = asyncio.create_task(call("big", "y" * 5_000))
+
+            payloads = {"small": "x" * 10, "big": "y" * 5_000}
+            expected: dict[str, int] = {}
+
+            async def answer_upstream():
+                # ``call_tool`` follows its result with a ``list_tools`` of its
+                # own to validate the output schema, so a responder — not two
+                # fixed replies — is what this session actually needs.
+                while True:
+                    outbound = await outbound_receive.receive()
+                    request = outbound.message
+                    if request.method == "tools/call":
+                        name = request.params["name"]
+                        response = _sized_response(request.id, payloads[name])
+                        expected[name] = json_utf8_size(response.message, limit=10**9)
+                        await inbound_send.send(response)
+                    else:
+                        await inbound_send.send(
+                            SessionMessage(
+                                mcp_types.JSONRPCResponse(
+                                    jsonrpc="2.0", id=request.id, result={"tools": []}
+                                )
+                            )
+                        )
+
+            responder = asyncio.create_task(answer_upstream())
+            await asyncio.wait_for(asyncio.gather(small, big), 5)
+            responder.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await responder
+
+        assert slots["small"].envelope_bytes == expected["small"]
+        assert slots["big"].envelope_bytes == expected["big"]
+        assert slots["small"].envelope_bytes != slots["big"].envelope_bytes
+        assert correlator.pending == {}
+
+
+def test_the_cap_measures_the_decoded_message_not_the_bytes_on_the_wire():
+    """What ``max_upstream_bytes`` bounds, stated as a test.
+
+    The SDK parses a frame before this wrapper ever sees it, so the number the
+    cap compares is the decoded message's compact JSON size. An upstream that
+    pads its JSON with whitespace is not spending budget on it — the contract
+    in ``docs/configuration.md`` says so, and this pins the claim.
+    """
+    raw = '{"jsonrpc":"2.0","id":1,' + " " * 10_000 + '"result":{"content":[]}}'
+    message = mcp_types.JSONRPCResponse.model_validate(json.loads(raw))
+
+    measured = json_utf8_size(message, limit=10**9)
+    assert len(raw.encode()) > 10_000
+    assert measured < 100

@@ -314,3 +314,114 @@ class TestEnvelopeCache:
         assert cache.stats()["total_entries"] == 1
         assert isinstance(miss, str)
         assert hit == miss  # hit == miss text contract
+
+
+# ── #957: the result-level byte check defers to the wire measurement ─────
+
+
+class TestResultSizeMeasurementGate:
+    """``max_upstream_bytes`` caps the inbound MCP envelope, and for a response
+    the bounded stream measured, those are the bytes the cap is about. The
+    parsed result is NOT a stand-in for them — validation fills in defaults the
+    wire may omit, per content block — so the skip is granted per response, on
+    the strength of a measurement correlated to this very call, never inferred
+    from the connection it arrived on."""
+
+    @staticmethod
+    def _probe(monkeypatch) -> list[int]:
+        """Record the limit each result-level measurement was given."""
+        limits: list[int] = []
+
+        async def measured(value, *, limit):
+            limits.append(limit)
+            return 0
+
+        monkeypatch.setattr("memtomem_stm.proxy.manager.json_utf8_size_async", measured)
+        return limits
+
+    @staticmethod
+    def _fill_slot_on_call(mgr, *, envelope_bytes: int, result):
+        """Answer the upstream the way a bounded stream would: with the reply
+        AND the measurement of the envelope that carried it."""
+        from memtomem_stm.utils.mcp_transport import current_response_size
+
+        async def answer(*args, **kwargs):
+            slot = current_response_size()
+            assert slot is not None, "the call path opened no measurement slot"
+            slot.envelope_bytes = envelope_bytes
+            slot.limit_applied = envelope_bytes
+            return result
+
+        mgr._connections["srv"].session.call_tool = AsyncMock(side_effect=answer)
+
+    async def test_a_measured_envelope_is_not_measured_again(self, make_mgr, monkeypatch):
+        mgr, _, _ = make_mgr(max_upstream_bytes=10_000)
+        limits = self._probe(monkeypatch)
+        self._fill_slot_on_call(mgr, envelope_bytes=500, result=_result("payload text"))
+
+        assert await mgr._call_tool_inner("srv", "tool", {}, cfg_snap=mgr._config) is not None
+        assert limits == []
+
+    async def test_an_unmeasured_response_is_still_measured(self, make_mgr, monkeypatch):
+        """An injected or legacy session never went through the bounded stream,
+        so nothing measured its envelope and the fallback has to run."""
+        mgr, _, _ = make_mgr(max_upstream_bytes=10_000)
+        limits = self._probe(monkeypatch)
+        _set_upstream(mgr, _result("payload text"))
+
+        assert await mgr._call_tool_inner("srv", "tool", {}, cfg_snap=mgr._config) is not None
+        assert limits == [10_000]
+
+    async def test_an_envelope_over_this_call_s_snapshot_is_rejected(self, make_mgr):
+        """The stream applies the LIVE limit; a reload can raise it mid-call.
+        The verdict belongs to the limit this call pinned, and the envelope size
+        it holds is a fact no reload changes."""
+        from mcp.server.mcpserver.exceptions import ToolError
+
+        mgr, store, _ = make_mgr(max_upstream_bytes=200)
+        self._fill_slot_on_call(mgr, envelope_bytes=5_000, result=_result("payload text"))
+
+        with pytest.raises(ToolError, match="max_upstream_bytes=200"):
+            await mgr._call_tool_inner("srv", "tool", {}, cfg_snap=mgr._config)
+
+        row = store._db.execute(
+            "SELECT error_category FROM proxy_metrics ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert row[0] == "oversize"
+
+    async def test_a_retry_does_not_inherit_the_previous_attempt_s_measurement(
+        self, make_mgr, monkeypatch
+    ):
+        """A measurement describes one reply. The attempt that produced it
+        failed, so the attempt that succeeds must stand on its own."""
+        from memtomem_stm.utils.mcp_transport import current_response_size
+
+        mgr, _, _ = make_mgr(max_upstream_bytes=10_000)
+        conn = mgr._connections["srv"]
+        conn.config.max_retries = 1
+        # A retry only happens for a replay-safe tool: the boundary fails closed
+        # on an ambiguous transport failure otherwise (#958).
+        conn.tools = [
+            SimpleNamespace(
+                name="tool",
+                annotations=SimpleNamespace(read_only_hint=True, destructive_hint=False),
+            )
+        ]
+        limits = self._probe(monkeypatch)
+        attempts: list[int] = []
+
+        async def answer(*args, **kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                slot = current_response_size()
+                assert slot is not None
+                slot.envelope_bytes = 500  # measured, then the attempt fails
+                raise ConnectionError("transport went away")
+            return _result("payload text")  # second attempt: nothing measured it
+
+        conn.session.call_tool = AsyncMock(side_effect=answer)
+        monkeypatch.setattr(mgr, "_reconnect_server", AsyncMock())
+
+        assert await mgr._call_tool_inner("srv", "tool", {}, cfg_snap=mgr._config) is not None
+        assert len(attempts) == 2
+        assert limits == [10_000], "the second attempt reused the first's measurement"

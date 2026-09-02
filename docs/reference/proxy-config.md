@@ -46,8 +46,10 @@ preserved for forward compatibility but reported by `mms config validate`.
 `max_upstream_bytes` caps the complete inbound MCP result envelope at 40 MiB
 by default. Text, images, `structuredContent`, result `_meta`, and error
 payloads all count. An oversized result is rejected before caching,
-compression, indexing, or surfacing. This is separate from
-`max_upstream_chars`, which is a text-only shaping guard.
+compression, indexing, or surfacing. The cap is measured on the decoded
+message's compact JSON size, not on the result re-measured after parsing —
+validation fills in defaults the wire may omit, so the two differ. This is
+separate from `max_upstream_chars`, which is a text-only shaping guard.
 
 ## Upstream servers
 

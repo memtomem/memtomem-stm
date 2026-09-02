@@ -443,6 +443,14 @@ and error payloads. The default is 40 MiB. It is distinct from
 whereas the byte limit rejects the whole oversized result before it can enter
 the cache, compression, indexing, or surfacing pipeline.
 
+The cap is measured on each decoded message's compact JSON size, where the
+transport hands it to the client session. Insignificant whitespace an upstream
+sent is not counted, and neither are the defaults validation fills in further
+along: a validated result can serialize larger than the envelope that carried
+it, because a content block's omitted `type` discriminator is added per block.
+The envelope is the boundary the proxy enforces; the parsed result's size is a
+different number and is not.
+
 The limit applies to every inbound message, and what happens next depends on
 who is waiting for it. An oversized result fails only the one call it belongs
 to. An oversized server-to-client request — a reverse RPC such as sampling,

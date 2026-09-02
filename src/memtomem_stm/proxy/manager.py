@@ -167,8 +167,12 @@ from memtomem_stm.utils.json_out import escape_lone_surrogates, scrub_lone_surro
 from memtomem_stm.utils.keyed_locks import KeyedLocks
 from memtomem_stm.utils.mcp_transport import (
     BoundedReadStream,
+    CorrelatingWriteStream,
+    ResponseCorrelator,
     SSE_READ_TIMEOUT_SECONDS,
+    current_response_size,
     is_inbound_message_too_large_error,
+    measured_response,
     streamable_http_transport,
 )
 from memtomem_stm.utils.json_size import json_utf8_size_async
@@ -2099,14 +2103,22 @@ class ProxyManager:
             deadline = asyncio.get_running_loop().time() + cfg.connect_timeout_seconds
             async with asyncio.timeout_at(deadline):
                 streams = await stack.enter_async_context(self._open_transport(cfg))
+                # One correlator per connection, shared by the two wrappers: the
+                # write side records the id of each request sent inside an open
+                # ``measured_response`` slot, the read side fills that slot with
+                # what it measured for the reply (#957). ``BoundedReadStream``
+                # keeps the RAW write stream for its oversize rejections — those
+                # are replies, never requests, so they register nothing.
+                correlator = ResponseCorrelator()
                 session = await stack.enter_async_context(
                     ClientSession(
                         BoundedReadStream(
                             streams[0],
                             self._live_max_upstream_bytes,
                             write_stream=streams[1],
+                            correlator=correlator,
                         ),
-                        streams[1],
+                        CorrelatingWriteStream(streams[1], correlator),
                         message_handler=self._make_message_handler(name),
                     )
                 )
@@ -5735,6 +5747,14 @@ class ProxyManager:
             if remaining <= 0:
                 raise deadline_failure(attempt)
             per_attempt_timeout = min(cfg.call_timeout_seconds, remaining)
+            # Each attempt measures its own reply. A slot filled by an earlier
+            # attempt describes a response this one is not returning, so clear
+            # it before dispatching. A timeout already tears the session down
+            # and drops the orphaned id, so this is belt-and-braces — but the
+            # cost of being wrong here is a skipped size check.
+            size_slot = current_response_size()
+            if size_slot is not None:
+                size_slot.rearm()
             try:
                 session, generation = self._acquire_connection_session(conn)
                 try:
@@ -7156,38 +7176,58 @@ class ProxyManager:
         # the split a call-graph consumer cares about — upstream time versus
         # STM pipeline time.
         with traced("upstream_rpc", metadata={"server": server, "tool": tool}):
-            result = await self._fetch_upstream(
-                server, tool, upstream_args, trace_id=trace_id, cfg_snap=cfg_snap
-            )
-
-        result_bytes = await json_utf8_size_async(result, limit=cfg_snap.max_upstream_bytes)
-        if result_bytes > cfg_snap.max_upstream_bytes:
-            msg = (
-                f"Upstream '{server}/{tool}' response exceeded "
-                f"max_upstream_bytes={cfg_snap.max_upstream_bytes}"
-            )
-            logger.warning(msg)
-            self.tracker.record_error(
-                CallMetrics(
-                    server=server,
-                    tool=tool,
-                    original_chars=0,
-                    compressed_chars=0,
-                    is_error=True,
-                    error_category=ErrorCategory.OVERSIZE,
-                    error_message=msg[:MAX_ERROR_MESSAGE_CHARS],
-                    trace_id=trace_id,
+            # The slot is filled by the bounded stream when it delivers the
+            # reply to the request sent inside this block, correlated by
+            # request id (#957). It stays empty for a session that was never
+            # wrapped, which is what keeps the measurement below alive there.
+            with measured_response() as response_size:
+                result = await self._fetch_upstream(
+                    server, tool, upstream_args, trace_id=trace_id, cfg_snap=cfg_snap
                 )
-            )
-            self._invalidate_disabled_cache(
-                server, tool, cache_args, cfg_snap=cfg_snap, context_query=context_query
-            )
-            from mcp.server.mcpserver.exceptions import ToolError
 
-            exc = ToolError(msg)
-            _mark_recorded(exc)
-            _mark_cache_invalidated(exc)
-            raise exc
+        # ``max_upstream_bytes`` caps the inbound MCP envelope (docs/configuration.md),
+        # and for a correlated response the wire check already measured exactly
+        # those bytes. Compare that measurement against THIS call's pinned
+        # snapshot rather than trusting the limit the stream happened to apply:
+        # a hot reload can move the live limit mid-call, but the number held
+        # here is the envelope's own size, which no reload changes. Measure the
+        # parsed result only when there is no such measurement to compare —
+        # note the two differ slightly, since validation fills in defaults the
+        # wire may omit, so this branch is a fallback and not a second opinion.
+        envelope_bytes = response_size.envelope_bytes
+        if envelope_bytes is None or envelope_bytes > cfg_snap.max_upstream_bytes:
+            result_bytes = (
+                envelope_bytes
+                if envelope_bytes is not None
+                else await json_utf8_size_async(result, limit=cfg_snap.max_upstream_bytes)
+            )
+            if result_bytes > cfg_snap.max_upstream_bytes:
+                msg = (
+                    f"Upstream '{server}/{tool}' response exceeded "
+                    f"max_upstream_bytes={cfg_snap.max_upstream_bytes}"
+                )
+                logger.warning(msg)
+                self.tracker.record_error(
+                    CallMetrics(
+                        server=server,
+                        tool=tool,
+                        original_chars=0,
+                        compressed_chars=0,
+                        is_error=True,
+                        error_category=ErrorCategory.OVERSIZE,
+                        error_message=msg[:MAX_ERROR_MESSAGE_CHARS],
+                        trace_id=trace_id,
+                    )
+                )
+                self._invalidate_disabled_cache(
+                    server, tool, cache_args, cfg_snap=cfg_snap, context_query=context_query
+                )
+                from mcp.server.mcpserver.exceptions import ToolError
+
+                exc = ToolError(msg)
+                _mark_recorded(exc)
+                _mark_cache_invalidated(exc)
+                raise exc
 
         # ── Stage 2: INGEST SCRUB (lone surrogates) ──
         # Escape here, once, rather than at each place the text is later
