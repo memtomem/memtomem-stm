@@ -33,6 +33,8 @@ import click
 from memtomem_stm.logging_setup import FILE_FORMAT, open_private_log_handler
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from memtomem_stm.config import STMConfig
 
 
@@ -307,6 +309,24 @@ def stop_cmd(stop_all: bool) -> None:
         raise current_stop_error
 
 
+def _handshake_removed(path: Path) -> bool:
+    """``True`` only when the handshake file is really gone.
+
+    ``read_handshake`` folds absent, unreadable and malformed into ``None``,
+    which is what its readers want but the wrong question for a terminal
+    condition: teardown removes the file last, so a handshake we merely cannot
+    parse — a truncated write, a transient read error — must keep us waiting
+    rather than announce a stop that may not have happened (#954).
+    """
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def _stop_current_config_daemon(config: STMConfig) -> None:
     """Stop the daemon for *this* config (graceful, then SIGTERM-by-pid fallback)."""
     from memtomem_stm.daemon import client
@@ -335,7 +355,7 @@ def _stop_current_config_daemon(config: STMConfig) -> None:
         # a failure.
         deadline = time.time() + 5.0
         while time.time() < deadline:
-            if read_handshake(hs_path) is None:
+            if _handshake_removed(hs_path):
                 click.echo(_ok("daemon stopped"))
                 return
             time.sleep(0.05)

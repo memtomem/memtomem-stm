@@ -740,10 +740,6 @@ class TestDaemonStopCli:
             return True
 
         monkeypatch.setattr("memtomem_stm.daemon.client.shutdown", fake_shutdown)
-        monkeypatch.setattr(
-            "memtomem_stm.daemon.client.probe_listening",
-            lambda host, port, **kwargs: True,
-        )
         clock = {"t": 0.0}
         monkeypatch.setattr(
             "memtomem_stm.cli.daemon_cmd.time",
@@ -788,6 +784,42 @@ class TestDaemonStopCli:
         assert result.exit_code == 0, result.output
         assert "daemon stopped" in result.output
         assert "still cleaning up" not in result.output
+
+    def test_graceful_ack_does_not_read_an_unparseable_handshake_as_removed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#954: ``read_handshake`` returns None for absent, unreadable AND
+        malformed files. Only actual removal ends the wait — a handshake we
+        cannot parse means teardown may still be running, so the command must
+        keep waiting rather than announce a stop that never happened."""
+        from types import SimpleNamespace
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        hs_path = _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 4567, "token": "t"})
+
+        async def fake_shutdown(config):
+            # Accepted, and the record is now unparseable but still present.
+            hs_path.write_text("{ truncated", encoding="utf-8")
+            return True
+
+        monkeypatch.setattr("memtomem_stm.daemon.client.shutdown", fake_shutdown)
+        clock = {"t": 0.0}
+        monkeypatch.setattr(
+            "memtomem_stm.cli.daemon_cmd.time",
+            SimpleNamespace(
+                time=lambda: clock["t"],
+                sleep=lambda seconds: clock.__setitem__("t", clock["t"] + seconds),
+            ),
+        )
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+
+        assert result.exit_code == 1, result.output
+        assert "accepted shutdown but is still cleaning up" in result.output
+        assert "daemon stopped" not in result.output
+        assert hs_path.exists()
 
     def test_no_daemon_no_handshake(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         from click.testing import CliRunner
