@@ -72,7 +72,7 @@ Core 0.3.8 is the tested legacy baseline, 0.3.9 first advertises schema 2,
 Core 0.3.10 first advertises schema 3, and Core 0.3.12 first advertises schema
 4. Runtime behavior always follows the connected server's advertised
 capability, not its package version. The released-Core compatibility smoke also
-covers the current Core 0.3.13 release.
+covers Core 0.3.13, 0.3.14, 0.4.0 and the current Core 0.5.0 release.
 
 ## Upgrade
 
