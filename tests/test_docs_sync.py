@@ -29,6 +29,104 @@ def _read(relative: str) -> str:
     return (REPO_ROOT / relative).read_text(encoding="utf-8")
 
 
+def _matrix_block(workflow: str) -> str:
+    """The text of a workflow's ``include:`` block.
+
+    Read inside the matrix block rather than over the whole file: row-shaped
+    text is legal in a ``run: |`` script, so a file-wide search proves the
+    shape exists somewhere, not that the workflow runs it. The block ends at
+    the first *content* line indented no deeper than ``include:`` itself —
+    pyyaml is not a test dependency, and this needs no parser.
+    """
+    # Horizontal spaces only, here and in the row scan: ``\s`` matches a
+    # newline, so a blank line would be read as indentation and merge the
+    # constructs on either side of it.
+    include = re.search(r"^([ ]*)include:[ ]*$", workflow, re.MULTILINE)
+    assert include is not None, "core-compat advisory lost its matrix include block"
+    body: list[str] = []
+    for line in workflow[include.end() :].splitlines():
+        stripped = line.strip()
+        # A comment ends nothing in YAML, at any column, so it must not end the
+        # block here either: treating one as the boundary hides every row below
+        # it, and a hidden row is a row no guard checks.
+        if stripped and not stripped.startswith("#"):
+            if len(line) - len(line.lstrip()) <= len(include.group(1)):
+                break
+        body.append(line)
+    return "\n".join(body)
+
+
+def _matrix_rows(matrix: str) -> list[str]:
+    """Every row of an ``include:`` block, as text, in order."""
+    # A sequence marker may be followed by its first key or stand alone with
+    # the mapping indented beneath it; both are rows, and a row spelling this
+    # misses is a row the guards never see.
+    marks = list(re.finditer(r"^([ ]*)-(?:[ ]|$)", matrix, re.MULTILINE))
+    assert marks, "core-compat matrix declares no rows"
+    # Rows are the items at the shallowest bullet indentation; a deeper bullet
+    # is a nested sequence belonging to the row above it.
+    indent = min(len(mark.group(1)) for mark in marks)
+    bounds = [mark.start() for mark in marks if len(mark.group(1)) == indent] + [len(matrix)]
+    return [matrix[start:end] for start, end in zip(bounds[:-1], bounds[1:], strict=True)]
+
+
+def _row_values(row: str, key: str) -> list[str]:
+    """The values a matrix row declares for ``key`` at its own key column.
+
+    A row is a mapping, so its keys can be written in any order — a pattern
+    anchored on ``- core:`` cannot see a row that opens with ``expected:``, and
+    a row invisible to a guard is a row the guard never checks. Depth still
+    matters: a ``core`` nested under some other key is not ``matrix.core``, and
+    reading it as one would let the workflow install an empty version while the
+    guard reports a covered release. Any YAML scalar spelling is accepted —
+    matching only ``key: "`` would let ``'0.3.14'`` or a bare value slip past.
+    """
+    bullet = re.match(r"([ ]*)-([ ]*)", row)
+    assert bullet is not None, f"core-compat matrix row is not a bullet:\n{row}"
+    if bullet.group(2):
+        key_column = len(bullet.group(1)) + 1 + len(bullet.group(2))
+    else:
+        # A bare marker puts the mapping on the following lines; its keys sit
+        # at the indentation of the first content line under the marker.
+        following = [
+            line
+            for line in row.splitlines()[1:]
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        assert following, f"core-compat matrix row declares no keys:\n{row}"
+        key_column = len(following[0]) - len(following[0].lstrip())
+        assert key_column > len(bullet.group(1)), (
+            f"core-compat matrix row's keys are not indented under it:\n{row}"
+        )
+    return re.findall(
+        rf"^(?:[ ]|-){{{key_column}}}{re.escape(key)}:[ ]*[\"\']?([^\"\'\s]*)[\"\']?[ ]*$",
+        row,
+        re.MULTILINE,
+    )
+
+
+def _core_compat_rows() -> list[str]:
+    """Every matrix row the core-compat advisory declares, in order."""
+    return _matrix_rows(_matrix_block(_read(".github/workflows/core-compat-advisory.yml")))
+
+
+def _core_compat_versions() -> list[str]:
+    """Every ``core:`` version the advisory matrix declares, in matrix order."""
+    versions: list[str] = []
+    for row in _core_compat_rows():
+        found = _row_values(row, "core")
+        assert len(found) == 1, (
+            f"core-compat matrix row declares {len(found)} `core:` keys, expected one:\n{row}"
+        )
+        # The docs guard orders rows numerically to find the newest; a
+        # pre-release spelling would mis-order silently, so refuse it loudly.
+        assert re.fullmatch(r"\d+(\.\d+)*", found[0]), (
+            f"core-compat row {found[0]!r} is not a dotted release version"
+        )
+        versions.append(found[0])
+    return versions
+
+
 def _json_fences(relative: str) -> list[dict[str, object]]:
     """Parse every JSON fence in a public Markdown file."""
     blocks = re.findall(r"```json\n(.*?)\n```", _read(relative), re.DOTALL)
@@ -1311,12 +1409,46 @@ def test_surfacing_docs_pin_current_core_and_library_boundaries() -> None:
         "ProxyManager(index_engine=...)",
     ):
         assert phrase in surfacing, f"surfacing guide lost {phrase!r}"
-    for body in (readme, surfacing):
-        assert "Core 0.3.12" in body
-        assert "Core 0.3.13" in body
-        # The smoke's coverage claim has to move with the matrix, or both docs
-        # keep telling a reader the newest verified Core is an older one.
-        assert "Core 0.5.0" in body
+    # The smoke's coverage claim has to move with the matrix, or both docs keep
+    # telling a reader the newest verified Core is an older one. Derive the
+    # versions from the matrix instead of naming them: hard-coded literals stay
+    # green when a row is added, which is the drift this guards against.
+    versions = _core_compat_versions()
+    newest = max(versions, key=lambda version: tuple(int(part) for part in version.split(".")))
+    for name, body in (("README.md", readme), ("docs/surfacing.md", surfacing)):
+        # Read the coverage claim itself, not the whole document: version
+        # strings live all over both files (install pins, prose about older
+        # cores), so a document-wide search would report a release as covered
+        # on the strength of an unrelated example.
+        claim = [
+            paragraph
+            for paragraph in re.split(r"\n\s*\n", body)
+            if "tested legacy baseline" in paragraph
+        ]
+        assert len(claim) == 1, (
+            f"{name} must state its released-Core coverage in exactly one "
+            f"paragraph naming the tested legacy baseline; found {len(claim)}"
+        )
+        # Every row must be named there, and as a bare token: both docs spell
+        # most rows without a "Core " prefix ("0.3.9 first advertises schema
+        # 2", "covers Core 0.3.13, 0.3.14, 0.4.0"), so a "Core X" literal
+        # would only ever cover the rows someone remembered to prefix. The
+        # lookaround keeps 0.3.1 from matching inside 0.3.14.
+        for version in versions:
+            assert re.search(rf"(?<![\w.]){re.escape(version)}(?![\w.])", claim[0]), (
+                f"{name} does not name Core {version}, which the core-compat "
+                "matrix verifies; the docs' coverage claim is missing a release"
+            )
+        # ...and the newest row is the one the docs call current. Read every
+        # "current Core X" claim rather than looking the newest one up: a
+        # membership check passes on a doc that adds the new claim and leaves
+        # the old one standing beside it, which still reads as a stale ceiling.
+        claims = set(re.findall(r"current Core (\d+(?:\.\d+)*)", body))
+        assert claims == {newest}, (
+            f"{name} calls Core {sorted(claims) or 'nothing'} the current "
+            f"release; the core-compat matrix's newest row is {newest}, and "
+            "every claim in the document has to say so"
+        )
         assert "schema 4" in body
         assert "planned first release" not in body
     assert "planned for Core 0.3.12" not in surfacing
@@ -1778,6 +1910,56 @@ def test_mcp_pin_expiry_probe_refuses_a_pin_it_cannot_judge() -> None:
         smoke.mcp_pin_is_redundant("mcp>=1", "mcp<2", "3.12.8")
 
 
+def test_core_compat_matrix_parser_reads_every_valid_row_spelling() -> None:
+    """A row the parser cannot see is a row every guard above silently skips.
+
+    The guards that read the advisory matrix are only as strong as this scan:
+    a version it misses is a version the docs never have to name, and a stale
+    coverage claim then passes. YAML accepts more row spellings than the
+    workflow happens to use today, so pin the ones a maintainer could write.
+    """
+    workflow = (
+        "jobs:\n"
+        "  smoke:\n"
+        "    strategy:\n"
+        "      matrix:\n"
+        "        include:\n"
+        '          - core: "0.3.8"\n'
+        "            expected: legacy\n"
+        "\n"
+        "          # a comment between rows, and a blank line above it\n"
+        "          - expected: schema4\n"
+        "            core: '0.4.0'\n"
+        "          - core: 0.5.0\n"
+        "            expected: schema4\n"
+        "            metadata:\n"
+        "              core: 9.9.9\n"
+        "          -\n"
+        '            core: "0.6.0"\n'
+        "            expected: schema4\n"
+        "# a comment at column zero ends nothing in YAML\n"
+        '          - core: "0.7.0"\n'
+        "            expected: schema4\n"
+        "    steps:\n"
+        "      - run: |\n"
+        "          echo '- core: \"9.9.9\"'\n"
+    )
+    matrix = _matrix_block(workflow)
+    rows = _matrix_rows(matrix)
+    versions = [_row_values(row, "core") for row in rows]
+    assert versions == [["0.3.8"], ["0.4.0"], ["0.5.0"], ["0.6.0"], ["0.7.0"]], (
+        "the matrix parser lost a row spelling: quoting, key order, a bare "
+        "sequence marker, comments and blank lines are all legal YAML, and a "
+        "row it cannot see is a release the docs guard never demands"
+    )
+    # ...and depth is not order: the nested ``core`` under ``metadata`` is not
+    # ``matrix.core``, so it must not be read as one.
+    assert _row_values(rows[2], "expected") == ["schema4"]
+    # Row-shaped text inside a `run:` script is not a row: the block ends at
+    # `steps:`, the first content line no deeper than `include:`.
+    assert "echo" not in matrix
+
+
 def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     """Keep the copy/paste core CLI flow tied to the released-core advisory."""
     guide = _read("docs/guides/reviewed-memory-resume.md")
@@ -1837,17 +2019,8 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     #
     # Match inside the matrix block rather than the whole file: row-shaped text
     # is legal in a `run: |` script, so a file-wide search proves the shape
-    # exists somewhere, not that the workflow runs it. The block ends at the
-    # first line indented no deeper than `include:` itself — pyyaml is not a
-    # test dependency, and this needs no parser.
-    include = re.search(r"^(\s*)include:\s*$", workflow, re.MULTILINE)
-    assert include is not None, "core-compat advisory lost its matrix include block"
-    body: list[str] = []
-    for line in workflow[include.end() :].splitlines():
-        if line.strip() and len(line) - len(line.lstrip()) <= len(include.group(1)):
-            break
-        body.append(line)
-    matrix = "\n".join(body)
+    # exists somewhere, not that the workflow runs it.
+    matrix = _matrix_block(_read(".github/workflows/core-compat-advisory.yml"))
     newest = re.search(
         r"^\s*- core:\s*[\"']?0\.5\.0[\"']?\n\s+expected:\s*(\w+)\n\s+mcp_pin:\s*[\"']([^\"']*)[\"']\s*$",
         matrix,
@@ -1881,23 +2054,33 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     assert workflow.count("MCP_PIN: ${{ matrix.mcp_pin }}") == 2, (
         "the matrix pin must reach both the install step and the expiry probe"
     )
-    # Every matrix row must declare an expectation. Counting matches of a regex
-    # that *requires* ``expected`` proves nothing on its own — a malformed row
-    # simply would not match — so compare against the number of rows present.
-    # Both patterns accept any YAML scalar spelling: counting only `- core: "`
-    # would let `- core: '0.3.14'` or an unquoted value slip past both sides.
-    scalar = r"[\"']?[^\"'\s]+[\"']?"
-    # Counted over the matrix block for the same reason the row above is
-    # matched there: row-shaped text elsewhere in the file is not a row.
-    declared_rows = len(re.findall(r"^\s*- core:\s*\S", matrix, re.MULTILINE))
-    well_formed = re.findall(
-        rf"- core:\s*{scalar}\n\s+expected:\s*(\w+)(?:\n\s+mcp_pin:\s*{scalar})?\n", matrix
-    )
-    assert declared_rows >= 5, "core-compat matrix lost rows"
-    assert len(well_formed) == declared_rows, (
-        f"{declared_rows - len(well_formed)} core-compat row(s) do not declare "
-        "`expected` immediately after `core`"
-    )
+    # Every matrix row must declare both the Core it installs and the
+    # capability it expects. Checked over the same row slices the docs guard
+    # reads, so the two cannot disagree about what a row is: a pattern that
+    # counted `- core:` lines would miss a row whose keys are ordered the other
+    # way round, and pass it as well-formed while the smoke runs with an empty
+    # `--expect`.
+    rows = _core_compat_rows()
+    assert len(rows) >= 5, "core-compat matrix lost rows"
+    # Read the accepted expectations off the smoke itself rather than listing
+    # them here, so a row cannot name one the smoke would reject and a new one
+    # does not have to be added in two places. ``null``, a typo and a trailing
+    # comment all land outside this set, which is the point: each of them
+    # reaches the smoke as an ``--expect`` it refuses.
+    choices = re.search(r'"--expect",\s*choices=\(([^)]*)\)', _read("scripts/core_compat_smoke.py"))
+    assert choices is not None, "core-compat smoke lost its --expect choices"
+    allowed = set(re.findall(r'"([^"]+)"', choices.group(1)))
+    assert allowed, "core-compat smoke declares no --expect choices"
+    for row in rows:
+        expectations = _row_values(row, "expected")
+        assert len(expectations) == 1, (
+            f"core-compat matrix row declares {len(expectations)} `expected:` "
+            f"keys, expected one:\n{row}"
+        )
+        assert expectations[0] in allowed, (
+            f"core-compat row expects {expectations[0]!r}, which the smoke does "
+            f"not accept (choices: {sorted(allowed)}):\n{row}"
+        )
 
     smoke = re.sub(r"\s+", " ", _read("scripts/core_compat_smoke.py"))
     for token in (
