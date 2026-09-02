@@ -2268,7 +2268,14 @@ class ProxyManager:
         ):
             return
         task = asyncio.create_task(self._close_retired_generation(conn, generation))
-        conn.retiring_tasks[generation] = task
+        # Registering after the spawn is what keeps the entry and its task in
+        # step under the default factory (the coroutine cannot run before this
+        # line). An eager task factory can run it to completion first, though,
+        # and its ``finally`` would then pop nothing — so a task that already
+        # finished is never registered, rather than left behind as an entry no
+        # ``finally`` will ever clear.
+        if not task.done():
+            conn.retiring_tasks[generation] = task
         self._background_tasks.add(task)
         task.add_done_callback(
             functools.partial(

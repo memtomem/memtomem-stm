@@ -1575,9 +1575,9 @@ class TestConnectionGenerationLeases:
         assert generation not in conn.retired_resources
 
     async def test_stop_closes_retired_generation_whose_retire_task_never_started(self):
-        """#952: a retire task cancelled before its first step never discards its
-        ``retiring_generations`` marker, and stop() used to skip exactly those
-        generations — leaving the retired transport open."""
+        """#952: a retire task cancelled before its first step never runs the
+        ``finally`` that drops its ``retiring_tasks`` entry, and stop() used to
+        skip exactly those generations — leaving the retired transport open."""
         cfg = UpstreamServerConfig(prefix="docs")
         mgr = _make_manager(servers={"docs": cfg})
         old_stack = AsyncMock()
