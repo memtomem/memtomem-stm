@@ -821,6 +821,43 @@ class TestDaemonStopCli:
         assert "daemon stopped" not in result.output
         assert hs_path.exists()
 
+    def test_graceful_ack_does_not_read_a_dangling_symlink_as_removed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#954: the wait asks whether the directory entry teardown removes is
+        gone. ``stat()`` answers for a link's target, so a dangling handshake
+        symlink would read as removed while the entry is still there."""
+        from types import SimpleNamespace
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        hs_path = _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 4567, "token": "t"})
+
+        async def fake_shutdown(config):
+            hs_path.unlink()
+            try:
+                hs_path.symlink_to(tmp_path / "gone.json")
+            except (OSError, NotImplementedError):  # unprivileged Windows
+                pytest.skip("symlink creation not permitted here")
+            return True
+
+        monkeypatch.setattr("memtomem_stm.daemon.client.shutdown", fake_shutdown)
+        clock = {"t": 0.0}
+        monkeypatch.setattr(
+            "memtomem_stm.cli.daemon_cmd.time",
+            SimpleNamespace(
+                time=lambda: clock["t"],
+                sleep=lambda seconds: clock.__setitem__("t", clock["t"] + seconds),
+            ),
+        )
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+
+        assert result.exit_code == 1, result.output
+        assert "accepted shutdown but is still cleaning up" in result.output
+        assert "daemon stopped" not in result.output
+
     def test_no_daemon_no_handshake(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         from click.testing import CliRunner
 

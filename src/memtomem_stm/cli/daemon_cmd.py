@@ -317,9 +317,13 @@ def _handshake_removed(path: Path) -> bool:
     condition: teardown removes the file last, so a handshake we merely cannot
     parse — a truncated write, a transient read error — must keep us waiting
     rather than announce a stop that may not have happened (#954).
+
+    ``lstat`` rather than ``stat``: the question is whether the directory entry
+    teardown removes is gone, and following a link would answer for its target
+    instead — a dangling symlink left in place would read as removed.
     """
     try:
-        path.stat()
+        path.lstat()
     except FileNotFoundError:
         return True
     except OSError:
