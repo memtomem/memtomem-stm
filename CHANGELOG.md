@@ -27,11 +27,13 @@ changes inline only. See the deprecation policy in
 
 - **Shutdown now really ends the process, and its children** (#910, #911,
   #913, #961, #884, #883). `SIGTERM`/`SIGINT` run the full teardown and exit
-  `0` instead of dying or hanging; a second signal exits `128 + signum`.
-  Selected cancellable waits in the teardown carry best-effort ceilings, and
-  while `MEMTOMEM_STM_TEARDOWN_WATCHDOG_SECONDS` is non-zero — it defaults to
-  60 — an overrunning teardown exits 1 after a CRITICAL line. Surviving direct
-  children are SIGTERM'd then SIGKILL'd with their pids logged. `stop()` returns within its drain budget and cancels the
+  `0` instead of dying or hanging, and a second signal exits `128 + signum` —
+  where the handlers install, which is POSIX on a main-thread event loop.
+  Ceilings inside the teardown are best-effort; the exit guarantee is a
+  watchdog that exits 1 after a CRITICAL line on overrun, while
+  `MEMTOMEM_STM_TEARDOWN_WATCHDOG_SECONDS` is non-zero (default 60) and its
+  thread starts. Surviving direct children are SIGTERM'd then SIGKILL'd with
+  their pids logged. `stop()` returns within its drain budget and cancels the
   survivors, refusing new background work while it runs. A background index or
   extract stage is shed past 64 in flight, and a shed auto-index records
   `index_ok=False` and `shed` instead of returning the
@@ -81,8 +83,9 @@ changes inline only. See the deprecation policy in
 - **`mms tune` deletes aged compression-feedback rows** (#942). It now opens
   the compression-feedback store with the configured `retention_days`, where it
   previously opened it bare and kept every row forever. Rows past the retention
-  the config already declares are purged — the same purge the daemon has run at
-  startup all along, with the same value and the same SQL. If you have been
+  the config already declares are purged, unless that value is `0`, which
+  disables the purge — the same behavior the daemon has had at startup all
+  along, with the same value and the same SQL. If you have been
   reading history older than `compression_feedback.retention_days` out of that
   file, raise the setting before running the command. The command only reaches
   the store when a proxy-metrics database exists and the feedback file itself
@@ -144,7 +147,7 @@ changes inline only. See the deprecation policy in
   still needs a new version (#965, issue #953).
 
 - **Required CI now names its supported interpreter lanes and enforces branch
-  coverage.** Tests run on Python 3.12 for Ubuntu/Windows and Python 3.13 for
+  coverage** (#958). Tests run on Python 3.12 for Ubuntu/Windows and Python 3.13 for
   Ubuntu; the Ubuntu 3.12 lane fails below 90% branch coverage. CI and release
   jobs use the repository-tested uv 0.12.5 instead of floating on `latest`.
 
@@ -400,7 +403,7 @@ changes inline only. See the deprecation policy in
 ### Changed
 
 - **Behavior change**: **retries after an ambiguous tool-call failure now
-  require affirmative idempotence evidence.** Previously only a per-attempt
+  require affirmative idempotence evidence** (#958). Previously only a per-attempt
   timeout was replay-gated; a connection reset or EOF was retried for every
   tool. Once `session.call_tool` has been entered, any failure — reset, EOF,
   timeout, retryable MCP error — may have committed the upstream side effect,
@@ -579,29 +582,32 @@ changes inline only. See the deprecation policy in
   teardown — handing the signals back would put SIGTERM's default disposition
   in charge of the very window this shutdown exists to survive — and a second
   signal instead takes the immediate-exit path and exits `128 + signum`, while
-  the signal that started the teardown does not re-enter it. Ceilings cover
-  selected cancellable waits — the manager and engine stops, the watcher and
-  warm-up joins — and they are best-effort even there, since a step that
-  swallows `CancelledError` or wedges in a synchronous call parks past its
-  timeout. Other steps carry no ceiling at all: the synchronous `close()` of
-  each store and cache, and the MCP adapter's own stop. The whole-process
-  guarantee is therefore a watchdog, armed only between teardown starting and
-  finishing, which exits the process 1 after a CRITICAL line if the teardown
-  overruns `MEMTOMEM_STM_TEARDOWN_WATCHDOG_SECONDS` (default 60; `0` disables
-  the backstop and with it the guarantee). What survives teardown
-  is then swept: direct children still alive are SIGTERM'd,
-  then SIGKILL'd, and their pids logged at WARNING under
-  `memtomem_stm.utils.child_reaper`.
+  the signal that started the teardown does not re-enter it. Some of the
+  cancellable waits inside the teardown carry ceilings and some steps carry
+  none; read `server.py`'s lifespan for which is which, since that division
+  moves with the code. What matters for a reader is that no ceiling is the
+  exit guarantee: cancelling a wait does not stop work that swallows
+  `CancelledError`, and it cannot touch a synchronous call at all. The
+  guarantee is a watchdog, armed only between teardown starting and finishing,
+  which exits the process 1 after a CRITICAL line when the teardown overruns
+  `MEMTOMEM_STM_TEARDOWN_WATCHDOG_SECONDS` (default 60). It is a backstop and
+  says so: `0` disables it, and a thread it cannot start leaves the shutdown
+  running without it rather than failing the shutdown. What survives teardown
+  is then swept: direct children still alive are SIGTERM'd, then SIGKILL'd, and
+  their pids logged at WARNING under `memtomem_stm.utils.child_reaper`.
 
-  **Behavior change**: signalled shutdown exits `0` after a real teardown rather
-  than dying or hanging, a ceilinged step that overruns while still taking
-  cancellation is abandoned with a WARNING naming it, an overrunning teardown
-  exits 1 rather than living on unless the watchdog is disabled, and a leaked
-  child is killed rather than orphaned. A clean shutdown finds nothing and logs nothing. The sweep is a
-  no-op on Windows and
-  wherever `pgrep` is unavailable, so it can never itself be why the process
-  fails to exit. Signal installation never fails startup — a non-main thread
-  cannot install one, and Windows has no `add_signal_handler`. The fourth
+  **Behavior change**: where the handlers install — POSIX, on a main-thread
+  event loop — a signalled shutdown exits `0` after a real teardown rather than
+  dying or hanging, and a ceilinged step that overruns while still taking
+  cancellation is abandoned with a WARNING naming it. An overrunning teardown
+  exits 1 rather than living on, while the watchdog is enabled and armed. A
+  leaked child is killed rather than orphaned, and a clean shutdown that could
+  take a startup baseline and finds nothing logs nothing; without a baseline
+  the sweep is skipped with a WARNING saying so. The sweep is a no-op on
+  Windows and wherever `pgrep` is unavailable, so it can never itself be why
+  the process fails to exit. Signal installation never fails startup — a
+  non-main thread cannot install one, and Windows has no
+  `add_signal_handler`, so on those the old behavior stands. The fourth
   direction, a client that leaves without closing stdin, is the opt-in backstop
   under Added (#915).
 
@@ -914,7 +920,7 @@ changes inline only. See the deprecation policy in
   regex work.
 
 - **The proxy boundary now fails closed across trust, retries, response size,
-  and surfacing state.** Project-local `.mcp.json` entries selected by
+  and surfacing state** (#958). Project-local `.mcp.json` entries selected by
   `mms add --from-clients` require `--allow-project-configs` before any probe,
   write, or prune. Upstream URL/header/env credentials are redacted from
   client errors, logs, and metrics. Once a tool RPC may have reached an
@@ -927,13 +933,13 @@ changes inline only. See the deprecation policy in
   images, structured content, metadata, and error payloads.
 
 - **Surfacing cache hits no longer manufacture dependency health or consume
-  LTM rate slots.** Circuit-breaker recovery is recorded only after a healthy
+  LTM rate slots** (#958). Circuit-breaker recovery is recorded only after a healthy
   live LTM round trip, cached calls refund their eager rate claim, cache keys
   use injective component framing, and configured per-minute limits above 200
   are enforced instead of silently evicting live claims.
 
-- **Operational CLI success now means the requested state was reached.** A
-  bulk `mms add --from-clients --validate` is all-or-nothing unless
+- **Operational CLI success now means the requested state was reached** (#958).
+  A bulk `mms add --from-clients --validate` is all-or-nothing unless
   `--save-unverified` explicitly acknowledges saving the complete failed
   batch. `mms daemon start` exits non-zero when readiness never arrives, and
   `mms daemon stop` waits for the daemon's handshake to be removed after the
@@ -1107,9 +1113,10 @@ changes inline only. See the deprecation policy in
 
   **Behavior change**: `mms tune` now purges compression-feedback rows older
   than the configured `compression_feedback.retention_days` when it opens that
-  store, where it previously opened it bare and kept them forever — the same
-  purge the daemon has always run at startup, with the same value and the same
-  SQL. It is the only feedback store the command opens, and it opens it only
+  store, where it previously opened it bare — always at `0`, which disables the
+  purge — and kept them forever. It is the same purge the daemon has always run
+  at startup, with the same value and the same SQL, and a configured `0` still
+  disables it. It is the only feedback store the command opens, and it opens it only
   when a proxy-metrics database exists and the feedback file itself exists, so
   a run that finds neither deletes nothing. The proxy and the daemon are
   unaffected. A caller that omits `retention_days` now raises `TypeError`,
