@@ -2408,17 +2408,33 @@ def test_release_publish_steps_scope_skip_existing_to_the_dry_run_lane() -> None
     which is exactly the failure this pins.
     """
     workflow = _read(".github/workflows/release.yml")
+    # One step, anywhere in the file, may carry the flag. Locating it by step
+    # NAME alone would miss it landing in an unnamed ``- uses:`` step or in a
+    # second production upload added later.
+    assert workflow.count("skip-existing:") == 1, (
+        "exactly one publish step may skip files the index already has"
+    )
+    # ``skip_existing`` is the action's deprecated alias: accepted today, but a
+    # silent no-op the moment it is dropped.
+    assert "skip_existing" not in workflow, "use the canonical skip-existing spelling"
+
     steps = workflow.split("      - name: ")
     pypi = [s for s in steps if s.startswith("Publish to PyPI\n")]
     testpypi = [s for s in steps if s.startswith("Publish to TestPyPI\n")]
     assert len(pypi) == 1 and len(testpypi) == 1, "release.yml lost a named publish step"
 
+    # The names are labels; the ``if:`` is what actually routes a tag. Pin both,
+    # so swapping the conditions cannot leave the flag on the production lane
+    # while the assertions below still read as satisfied.
+    assert "if: ${{ startsWith(github.ref_name, 'test-') }}" in testpypi[0], (
+        "the TestPyPI step must be the one gated ON the test- prefix"
+    )
+    assert "if: ${{ !startsWith(github.ref_name, 'test-') }}" in pypi[0], (
+        "the PyPI step must be the one gated on the ABSENCE of the test- prefix"
+    )
     assert "skip-existing" not in pypi[0], (
         "the production upload must fail on an already-published file, not skip it"
     )
     assert "skip-existing: true" in testpypi[0], (
         "the TestPyPI dry-run lane must skip existing files so a test-v* tag can be re-pushed"
     )
-    # ``skip_existing`` is the action's deprecated alias: accepted today, but a
-    # silent no-op the moment it is dropped.
-    assert "skip_existing" not in workflow, "use the canonical skip-existing spelling"
