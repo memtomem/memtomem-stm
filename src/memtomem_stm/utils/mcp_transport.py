@@ -19,6 +19,7 @@ Timeout mapping from the old two-parameter shape:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -51,6 +52,11 @@ _T = TypeVar("_T")
 INBOUND_MESSAGE_TOO_LARGE_CODE = -32098
 _INBOUND_MESSAGE_TOO_LARGE_MARKER = "memtomem_stm.inbound_message_too_large"
 
+# Ceiling on rejections still waiting for the write side. Each one is a small
+# error frame, but a peer that floods oversize reverse requests must not be
+# able to grow an unbounded task set behind a stalled writer.
+_MAX_PENDING_REJECTIONS = 32
+
 
 class BoundedReadStream(Generic[_T]):
     """Read-stream wrapper enforcing a per-message UTF-8 JSON byte limit.
@@ -59,11 +65,26 @@ class BoundedReadStream(Generic[_T]):
     This wrapper sits at the next shared boundary, before ``ClientSession``
     dispatch and result-model validation, and works for stdio, SSE, and
     streamable HTTP without forking SDK transport implementations.
+
+    Given the paired write stream it also *answers* an oversize server->client
+    request instead of dropping it (#960); the read side alone cannot, and the
+    sender of such a request is blocked until it gets a reply. The write stream
+    is borrowed, never closed here: ``JSONRPCDispatcher.run`` owns its
+    lifetime.
     """
 
-    def __init__(self, stream: Any, max_bytes: int | Callable[[], int]) -> None:
+    def __init__(
+        self,
+        stream: Any,
+        max_bytes: int | Callable[[], int],
+        write_stream: Any | None = None,
+    ) -> None:
         self._stream = stream
         self._max_bytes = max_bytes
+        self._write_stream = write_stream
+        # Rejections in flight. Held so the tasks are not garbage collected
+        # mid-send, and so their number can be capped.
+        self._pending_rejections: set[asyncio.Task[None]] = set()
 
     def _current_max_bytes(self) -> int:
         value = self._max_bytes() if callable(self._max_bytes) else self._max_bytes
@@ -108,17 +129,93 @@ class BoundedReadStream(Generic[_T]):
                         metadata=getattr(item, "metadata", None),
                     ),
                 )
-            # An uncorrelated message (notification, or a server->client
-            # request) has no pending waiter to fail. Raising here would escape
+            if isinstance(message, mcp_types.JSONRPCRequest) and self._write_stream is not None:
+                # A server->client request IS correlated, just the other way
+                # round: its id identifies a reverse RPC (sampling, roots,
+                # elicitation) whose upstream sender is blocked on our answer.
+                # Dropping it left that handler waiting until its own timeout,
+                # or until our call timeout tore the session down (#960).
+                self._spawn_oversize_rejection(self._write_stream, message.id, max_bytes)
+                continue
+            # A notification has no waiter to fail, and neither does a request
+            # we have no write side for. Raising here would escape
             # ``JSONRPCDispatcher.run``'s ``async for`` — it catches only
             # ``ClosedResourceError`` — tearing down the task group and waking
             # EVERY in-flight call with the indistinguishable "Connection
-            # closed" error, which is exactly what the correlated branch above
-            # exists to avoid. Drop the over-budget message and keep reading.
+            # closed" error, which is exactly what the branches above exist to
+            # avoid. Drop the over-budget message and keep reading.
             logger.warning(
                 "Dropping inbound MCP %s exceeding max_upstream_bytes=%d",
                 type(message).__name__,
                 max_bytes,
+            )
+
+    def _spawn_oversize_rejection(self, write_stream: Any, request_id: Any, max_bytes: int) -> None:
+        """Send the rejection from its own task, never from the read loop.
+
+        Client transports create both directions with a buffer size of 0, so a
+        ``send`` is a rendezvous with the transport's writer task. Awaiting it
+        here would park ``JSONRPCDispatcher.run``'s only read loop, and for
+        stdio that is a deadlock rather than a stall: an upstream blocked
+        writing to a stdout pipe we have stopped draining will not read its
+        stdin, so the writer we are waiting on never drains either. The SDK
+        keeps its own read loop clear the same way, spawning ``_write_error``
+        instead of awaiting it.
+        """
+        if len(self._pending_rejections) >= _MAX_PENDING_REJECTIONS:
+            logger.warning(
+                "Dropping oversize-request rejection for %r: %d already awaiting the write side",
+                request_id,
+                len(self._pending_rejections),
+            )
+            return
+        task = asyncio.create_task(
+            self._reject_oversize_request(write_stream, request_id, max_bytes)
+        )
+        self._pending_rejections.add(task)
+        task.add_done_callback(self._pending_rejections.discard)
+
+    async def _reject_oversize_request(
+        self, write_stream: Any, request_id: Any, max_bytes: int
+    ) -> None:
+        """Answer an oversize server->client request with a same-id error.
+
+        The reply travels to the upstream server, so it carries a spec error
+        code rather than ``INBOUND_MESSAGE_TOO_LARGE_CODE`` — that private code
+        and its marker exist only for local correlation of an oversize
+        *response* to the pending call it belongs to, and must not become an
+        outbound convention.
+        """
+        logger.warning(
+            "Rejecting inbound MCP JSONRPCRequest %r exceeding max_upstream_bytes=%d",
+            request_id,
+            max_bytes,
+        )
+        try:
+            await write_stream.send(
+                SessionMessage(
+                    mcp_types.JSONRPCError(
+                        jsonrpc="2.0",
+                        id=request_id,
+                        error=mcp_types.ErrorData(
+                            code=mcp_types.INVALID_REQUEST,
+                            message=(
+                                f"Inbound MCP request exceeded max_upstream_bytes={max_bytes}"
+                            ),
+                        ),
+                    )
+                )
+            )
+        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+            # Mirrors ``JSONRPCDispatcher._write_error``. A write side that is
+            # gone cannot be answered by any route, and failing the session
+            # here would wake every in-flight call with the indistinguishable
+            # "Connection closed" error this whole path exists to avoid; the
+            # call timeout and reconnect own that recovery. Logged at WARNING
+            # rather than DEBUG because the sender does stay unanswered.
+            logger.warning(
+                "Could not deliver oversize-request rejection for %r: write stream closed",
+                request_id,
             )
 
     def __aiter__(self) -> BoundedReadStream[_T]:
