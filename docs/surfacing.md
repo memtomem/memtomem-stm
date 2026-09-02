@@ -81,7 +81,8 @@ windows retain the original request budget.
 
 Core 0.3.8 is the tested legacy baseline, 0.3.9 carries schema 2, and 0.3.10 is
 the first release to carry schema 3. Core 0.3.12 is the first release to carry
-schema 4, and the released-Core smoke also covers Core 0.3.13. The intermediate
+schema 4, and the released-Core smoke also covers Core 0.3.13, 0.3.14, 0.4.0
+and the current Core 0.5.0 release, each of which still advertises schema 4. The intermediate
 schema 1 contract was never included in a tagged PyPI release, although
 source-installed builds may exist. Capability negotiation, not these version
 labels, controls runtime behavior; a Core that does not advertise schema 4

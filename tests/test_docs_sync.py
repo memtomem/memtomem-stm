@@ -1314,6 +1314,9 @@ def test_surfacing_docs_pin_current_core_and_library_boundaries() -> None:
     for body in (readme, surfacing):
         assert "Core 0.3.12" in body
         assert "Core 0.3.13" in body
+        # The smoke's coverage claim has to move with the matrix, or both docs
+        # keep telling a reader the newest verified Core is an older one.
+        assert "Core 0.5.0" in body
         assert "schema 4" in body
         assert "planned first release" not in body
     assert "planned for Core 0.3.12" not in surfacing
@@ -1826,6 +1829,24 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     workflow = _read(".github/workflows/core-compat-advisory.yml")
     for version in ('core: "0.3.12"', 'core: "0.3.13"'):
         assert version in workflow
+    # The newest released Core must be a row, with the expectation and the
+    # (empty) pin it was verified under. A membership check on the version
+    # alone would pass on a commented-out row, and the well-formedness count
+    # below passes whether or not this row exists at all — deleting it outright
+    # is exactly the regression that check cannot see.
+    newest = re.search(
+        r"^\s*- core:\s*[\"']?0\.5\.0[\"']?\n\s+expected:\s*(\w+)\n\s+mcp_pin:\s*[\"']([^\"']*)[\"']\s*$",
+        workflow,
+        re.MULTILINE,
+    )
+    assert newest is not None, (
+        "core-compat matrix lost its Core 0.5.0 row; a released Core that no "
+        "row covers is a Core nothing verifies"
+    )
+    assert newest.group(1) == "schema4", "Core 0.5.0 advertises context_compose schema 4"
+    assert newest.group(2) == "", (
+        "Core 0.5.0 declares mcp[cli]>=2.0.0,<3 itself; a pin it never asked for would hold it back"
+    )
     # The pin is per matrix row, so a newly added Core does not inherit it, and
     # it announces its own expiry rather than outliving the Core gap. Pin every
     # link of that wiring: declaring the field is worthless if the install step

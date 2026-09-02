@@ -56,8 +56,13 @@ jobs:
             expected: schema4
             mcp_pin: ""
           # 0.5.0 changes no capability STM negotiates: its breaking changes are
-          # CLI (`mm init -y`), a removed `mem_context_migrate` alias, and
-          # chunk-id project boundaries on read-by-id surfaces STM does not use.
+          # CLI (`mm init -y`), a removed `mem_context_migrate` alias, and the
+          # chunk-id project boundary (#2238). That boundary names the surfaces
+          # it re-scopes — mem_read, mem_expand, mem_related/link/unlink,
+          # agent_share, edit/delete, the chunks resource and the web routes —
+          # and STM calls none of them. It does pass chunk ids back through
+          # `mem_do(increment_access)`, which is not on that list and takes ids
+          # the same server just returned from the same project context.
           # Its advertisement still reads context_compose schema_version 4, and
           # it caps mcp itself (`mcp[cli]>=2.0.0,<3`), so no pin.
           - core: "0.5.0"
