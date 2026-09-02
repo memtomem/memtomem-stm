@@ -929,8 +929,14 @@ Commands:
 prefer `start`, while service wrappers can choose the explicit run mode.
 `start` exits 1 if the detached process does not become ready. `stop` reports
 success only after the shutdown acknowledgement is followed by confirmed
-endpoint closure and handshake removal; an accepted request whose teardown is
-still running exits 1 instead of claiming the daemon has stopped.
+removal of the daemon's handshake — the record teardown deletes last, after
+closing the listener and stopping the engine and LTM child, so its absence
+means the whole teardown finished. An accepted request whose teardown is still
+running exits 1 instead of claiming the daemon has stopped, as does one whose
+handshake is still present but unreadable. `stop` reports "no running daemon"
+only when there is really no handshake for this config — a record it cannot
+parse could belong to a daemon that declined the graceful shutdown, so it
+exits 1 and points at `status` rather than inviting a replacement.
 
 Daemons are keyed by config, so `start`/`stop`/`restart` for one config never
 touch a daemon serving another config. The one escape hatch is `stop --all`:

@@ -670,9 +670,15 @@ def test_single_owner_lock_excludes_second(tmp_path: Path):
 # Zero direct CliRunner coverage existed for stop_cmd / status_cmd /
 # restart_cmd — the commands carrying the unguarded int()/float() handshake
 # casts and the SIGTERM-fallback + handshake-cleanup branches. These pin the
-# contract that ops commands degrade (exit 0) instead of raising on a
-# corrupted / hand-edited handshake, which read_handshake's docstring calls
-# an anticipated input (it validates dict-ness only, not field types).
+# contract that ops commands degrade instead of raising on a corrupted /
+# hand-edited handshake, which read_handshake's docstring calls an anticipated
+# input (it validates dict-ness only, not field types).
+#
+# Degrading means exit 0 for a handshake that still PARSES: garbage field
+# values are read tolerantly and the command completes. One that does not
+# parse is a different answer — it leaves the daemon's state unknown, and a
+# command that cannot confirm the state it was asked for exits 1 rather than
+# claiming it (#954).
 
 
 def _cli():
@@ -703,6 +709,105 @@ def _no_daemon(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr("memtomem_stm.daemon.client.shutdown", fake_shutdown)
     monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
+
+
+class TestHandshakeRemovedPredicate:
+    """``_handshake_removed`` decides when ``mms daemon stop`` may report a stop.
+
+    Exercised directly as well as through the CLI: the symlink cases below need
+    a real filesystem *and* the privilege to create links, which an unelevated
+    Windows lane does not have — and Windows gates merge here, so the
+    distinction this predicate exists for must be pinned somewhere that runs
+    everywhere.
+    """
+
+    def test_reports_removed_only_for_a_missing_entry(self, tmp_path: Path):
+        from memtomem_stm.cli.daemon_cmd import _handshake_removed
+
+        present = tmp_path / "hs.json"
+        present.write_text("{}", encoding="utf-8")
+        assert _handshake_removed(present) is False
+        assert _handshake_removed(tmp_path / "absent.json") is True
+
+    def test_does_not_follow_the_entry(self, tmp_path: Path):
+        """``stat`` would answer for the target and call this removed."""
+        from memtomem_stm.cli.daemon_cmd import _handshake_removed
+
+        path = SimpleNamespace(
+            lstat=lambda: SimpleNamespace(st_mode=0),
+            stat=lambda: (_ for _ in ()).throw(FileNotFoundError()),
+        )
+        assert _handshake_removed(path) is False  # type: ignore[arg-type]
+
+    def test_keeps_waiting_when_the_entry_cannot_be_reached(self, tmp_path: Path):
+        """A read error is not an absence — teardown removes the file last, so
+        an unanswerable path must hold the wait open rather than end it."""
+        from memtomem_stm.cli.daemon_cmd import _handshake_removed
+
+        path = SimpleNamespace(lstat=lambda: (_ for _ in ()).throw(PermissionError()))
+        assert _handshake_removed(path) is False  # type: ignore[arg-type]
+
+    def test_a_dangling_ancestor_is_not_a_removed_entry(self, tmp_path: Path):
+        """A broken directory link raises the same FileNotFoundError while
+        saying nothing about the handshake."""
+        from memtomem_stm.cli.daemon_cmd import _handshake_removed
+
+        link = tmp_path / "data"
+        try:
+            link.symlink_to(tmp_path / "gone", target_is_directory=True)
+        except (OSError, NotImplementedError):  # unprivileged Windows
+            pytest.skip("symlink creation not permitted here")
+        assert _handshake_removed(link / "hs.json") is False
+
+    def test_a_working_ancestor_link_still_reports_a_removed_entry(self, tmp_path: Path):
+        """The dangling-ancestor guard must not hang the wait on a data_dir
+        that is simply a symlink to a real directory."""
+        from memtomem_stm.cli.daemon_cmd import _handshake_removed
+
+        real = tmp_path / "real"
+        real.mkdir()
+        link = tmp_path / "data"
+        try:
+            link.symlink_to(real, target_is_directory=True)
+        except (OSError, NotImplementedError):  # unprivileged Windows
+            pytest.skip("symlink creation not permitted here")
+        assert _handshake_removed(link / "hs.json") is True
+
+    def test_a_missing_directory_reports_a_removed_entry(self, tmp_path: Path):
+        from memtomem_stm.cli.daemon_cmd import _handshake_removed
+
+        assert _handshake_removed(tmp_path / "never" / "made" / "hs.json") is True
+
+    def test_an_ancestor_that_raises_is_not_a_removed_entry(self, tmp_path: Path):
+        """The walk runs inside the FileNotFoundError handler, where the
+        function's own ``except OSError`` cannot see what it raises — so it
+        guards itself rather than leaving the command as a traceback."""
+        from memtomem_stm.cli.daemon_cmd import _handshake_removed
+
+        def _boom() -> bool:
+            raise PermissionError()
+
+        blocked = SimpleNamespace(exists=_boom, is_symlink=_boom, is_junction=_boom)
+        path = SimpleNamespace(
+            lstat=lambda: (_ for _ in ()).throw(FileNotFoundError()),
+            parents=[blocked],
+        )
+        assert _handshake_removed(path) is False  # type: ignore[arg-type]
+
+    def test_no_existing_ancestor_at_all_is_not_a_removed_entry(self, tmp_path: Path):
+        """Only an ancestor that EXISTS proves the path was walkable. A root
+        that is itself unreachable — a disconnected drive or UNC share on
+        Windows — answers nothing, so the wait must stay open rather than
+        report a stop."""
+        from memtomem_stm.cli.daemon_cmd import _handshake_removed
+
+        unreachable = SimpleNamespace(exists=lambda: False, is_symlink=lambda: False)
+        unreachable.is_junction = lambda: False  # type: ignore[attr-defined]
+        path = SimpleNamespace(
+            lstat=lambda: (_ for _ in ()).throw(FileNotFoundError()),
+            parents=[unreachable, unreachable],
+        )
+        assert _handshake_removed(path) is False  # type: ignore[arg-type]
 
 
 class TestDaemonStopCli:
@@ -740,10 +845,6 @@ class TestDaemonStopCli:
             return True
 
         monkeypatch.setattr("memtomem_stm.daemon.client.shutdown", fake_shutdown)
-        monkeypatch.setattr(
-            "memtomem_stm.daemon.client.probe_listening",
-            lambda host, port, **kwargs: True,
-        )
         clock = {"t": 0.0}
         monkeypatch.setattr(
             "memtomem_stm.cli.daemon_cmd.time",
@@ -758,6 +859,130 @@ class TestDaemonStopCli:
         assert result.exit_code == 1, result.output
         assert "accepted shutdown but is still cleaning up" in result.output
         assert "daemon stopped" not in result.output
+
+    def test_graceful_ack_reports_stop_when_recorded_port_is_reassigned(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#954: the recorded host/port identified the daemon only when we read
+        it. Once teardown removed the handshake the daemon is stopped, even if
+        the OS handed that ephemeral port to an unrelated listener meanwhile —
+        probing it used to spin out the full wait and exit 1 on a clean stop."""
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        hs_path = _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 4567, "token": "t"})
+
+        async def fake_shutdown(config):
+            # Teardown completes: the handshake, removed last, is gone.
+            hs_path.unlink()
+            return True
+
+        monkeypatch.setattr("memtomem_stm.daemon.client.shutdown", fake_shutdown)
+        # Something else now answers on the port the handshake recorded.
+        monkeypatch.setattr(
+            "memtomem_stm.daemon.client.probe_listening",
+            lambda host, port, **kwargs: True,
+        )
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+
+        assert result.exit_code == 0, result.output
+        assert "daemon stopped" in result.output
+        assert "still cleaning up" not in result.output
+
+    def test_graceful_ack_does_not_read_an_unparseable_handshake_as_removed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#954: ``read_handshake`` returns None for absent, unreadable AND
+        malformed files. Only actual removal ends the wait — a handshake we
+        cannot parse means teardown may still be running, so the command must
+        keep waiting rather than announce a stop that never happened."""
+        from types import SimpleNamespace
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        hs_path = _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 4567, "token": "t"})
+
+        async def fake_shutdown(config):
+            # Accepted, and the record is now unparseable but still present.
+            hs_path.write_text("{ truncated", encoding="utf-8")
+            return True
+
+        monkeypatch.setattr("memtomem_stm.daemon.client.shutdown", fake_shutdown)
+        clock = {"t": 0.0}
+        monkeypatch.setattr(
+            "memtomem_stm.cli.daemon_cmd.time",
+            SimpleNamespace(
+                time=lambda: clock["t"],
+                sleep=lambda seconds: clock.__setitem__("t", clock["t"] + seconds),
+            ),
+        )
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+
+        assert result.exit_code == 1, result.output
+        assert "accepted shutdown but is still cleaning up" in result.output
+        assert "daemon stopped" not in result.output
+        assert hs_path.exists()
+
+    def test_graceful_ack_does_not_read_a_dangling_symlink_as_removed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#954: the wait asks whether the directory entry teardown removes is
+        gone. ``stat()`` answers for a link's target, so a dangling handshake
+        symlink would read as removed while the entry is still there."""
+        from types import SimpleNamespace
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        hs_path = _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 4567, "token": "t"})
+
+        async def fake_shutdown(config):
+            hs_path.unlink()
+            try:
+                hs_path.symlink_to(tmp_path / "gone.json")
+            except (OSError, NotImplementedError):  # unprivileged Windows
+                pytest.skip("symlink creation not permitted here")
+            return True
+
+        monkeypatch.setattr("memtomem_stm.daemon.client.shutdown", fake_shutdown)
+        clock = {"t": 0.0}
+        monkeypatch.setattr(
+            "memtomem_stm.cli.daemon_cmd.time",
+            SimpleNamespace(
+                time=lambda: clock["t"],
+                sleep=lambda seconds: clock.__setitem__("t", clock["t"] + seconds),
+            ),
+        )
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+
+        assert result.exit_code == 1, result.output
+        assert "accepted shutdown but is still cleaning up" in result.output
+        assert "daemon stopped" not in result.output
+
+    def test_declined_shutdown_with_an_unreadable_handshake_is_not_no_daemon(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#954: a handshake that was already unparseable when `stop` ran makes
+        both the read and the graceful call come back empty — but 'no daemon'
+        is only one of the three things that produces that, and the record may
+        belong to a daemon that merely declined. Say so instead."""
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        hs_path = _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 4567, "token": "t"})
+        hs_path.write_text("{ truncated", encoding="utf-8")
+        _no_daemon(monkeypatch)
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+
+        assert result.exit_code == 1, result.output
+        assert "unreadable" in result.output
+        assert "no running daemon" not in result.output
+        assert hs_path.exists()  # never unlinked on a record we cannot read
 
     def test_no_daemon_no_handshake(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         from click.testing import CliRunner
@@ -910,6 +1135,33 @@ class TestDaemonStatusCli:
         assert info["uptime_seconds"] >= 0.0
         assert "hook_will_use_daemon" in info
         assert "standalone_will_use_daemon" in info
+
+    def test_unreadable_handshake_is_stale_not_stopped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#954: a record we cannot parse is still a record. Reporting it as
+        `stopped` is what sends someone off to start a replacement beside a
+        daemon that may be mid-teardown — and `stop`'s timeout now points here
+        for exactly this case."""
+        import json
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        hs_path = _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 4567, "token": "t"})
+        hs_path.write_text("{ truncated", encoding="utf-8")
+        _no_daemon(monkeypatch)
+
+        result = CliRunner().invoke(_cli(), ["daemon", "status", "--json"])
+        assert result.exit_code == 0, result.output
+        info = json.loads(result.output)
+        assert info["state"] == "stale"
+        assert info["handshake_unreadable"] is True
+
+        plain = CliRunner().invoke(_cli(), ["daemon", "status"])
+        assert plain.exit_code == 0, plain.output
+        assert "unreadable" in plain.output
+        assert "stopped" not in plain.output
 
     def test_running_corrupted_created_at_degrades(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
