@@ -22,11 +22,15 @@ changes inline only. See the deprecation policy in
   which was a fresh HTTP round trip costing up to `embedding_timeout` on a cold
   or slow backend. A request now carries only the texts not already held, and a
   call whose texts are all held issues none. The cache lives on the scorer
-  instance, so any `relevance_scorer` edit discards it along with the scorer it
-  rebuilds. Only the `embedding` scorer is affected; BM25 never made a request.
+  instance, so a `relevance_scorer` edit discards it along with the scorer it
+  rebuilds — except on the SELECTIVE path, where a compressor holds the scorer
+  it was built with until a `selective` edit rebuilds it, which is the
+  pre-existing hot-reload boundary that behaviour has always had. Only the
+  `embedding` scorer is affected; BM25 never made a request.
   **Behavior change**: an embedding provider that returns a different number of
   vectors than it was given inputs now falls back to BM25 for that call instead
   of scoring against a reply whose positional correspondence is already lost.
+  That check runs whether or not the cache is enabled.
 
 ### Changed
 

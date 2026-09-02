@@ -480,6 +480,28 @@ class TestEmbeddingCache:
 
         assert post.call_count == 2
 
+    def test_a_short_reply_is_refused_with_the_cache_disabled_too(self):
+        """``0`` means "no cache", not "no checking".
+
+        The length guard lives on the path both settings share, so turning the
+        cache off cannot turn it into the old silent mis-ranking.
+        """
+        scorer = self._make_scorer(cache_size=0)
+        sections = [("## A", "alpha"), ("## B", "beta")]
+        with self._post([[1.0, 0.0]]):
+            scores = scorer.score_sections("q", sections)
+
+        assert scorer.fallback_count == 1
+        assert len(scores) == 2
+
+    def test_a_capacity_of_one_still_holds_an_entry(self):
+        """``cap // 2`` is 0 at cap 1, which would empty the map every insert."""
+        scorer = self._make_scorer(cache_size=1)
+        with self._post([[1.0, 0.0], [1.0, 0.0]]):
+            scorer.score_sections("q", [("## A", "alpha")])
+
+        assert len(scorer._cache) == 1
+
     def test_the_cache_is_bounded(self):
         """Twelve distinct texts under a cap of four, and the first one is gone.
 
@@ -516,35 +538,62 @@ class TestEmbeddingCache:
         assert len(scores) == 2
 
     def test_concurrent_scoring_stays_consistent(self):
-        """``uses_blocking_io`` puts several worker threads on one instance."""
+        """``uses_blocking_io`` puts several worker threads on one instance.
+
+        Every thread works on texts of its own under a capacity that cannot
+        hold them all, so writes and evictions from different threads
+        interleave. What this pins is that concurrent use returns correct
+        scores, raises nothing, and leaves the map bounded — it does **not**
+        prove the lock: removing it leaves this green, and a heavier probe (16
+        threads x 80 passes at capacity 2) produced no failure either, because
+        the GIL makes each dict step atomic on its own. The lock covers the
+        prune's read-then-delete, which is not atomic as a unit.
+
+        One patch for all the threads: nesting a ``patch("httpx.post")`` per
+        thread restores the global in whatever order they finish and can leave
+        a mock installed.
+        """
         import threading
 
-        scorer = self._make_scorer(cache_size=8)
-        sections = [("## A", "alpha"), ("## B", "beta")]
-        results: list[list[float]] = []
+        scorer = self._make_scorer(cache_size=6)
+        started = threading.Barrier(8)
+        results: list[tuple[int, list[float]]] = []
         errors: list[BaseException] = []
+        results_lock = threading.Lock()
 
-        def run() -> None:
+        def fake_post(url, json=None, timeout=None, headers=None):
+            # One vector per input, all parallel: the assertion is about the
+            # cache surviving concurrency, not about the scores.
+            return self._mock_response({"embeddings": [[1.0, 0.0]] * len(json["input"])})
+
+        def run(idx: int) -> None:
             try:
-                with self._post([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]):
-                    for _ in range(5):
-                        results.append(scorer.score_sections("q", sections))
+                started.wait(timeout=10)
+                for _ in range(5):
+                    scores = scorer.score_sections(
+                        f"query {idx}",
+                        [("## S", f"body {idx}"), ("## shared", "every thread has this one")],
+                    )
+                    with results_lock:
+                        results.append((idx, scores))
             except BaseException as exc:  # pragma: no cover - failure path
-                errors.append(exc)
+                with results_lock:
+                    errors.append(exc)
 
-        threads = [threading.Thread(target=run) for _ in range(8)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        with patch("httpx.post", side_effect=fake_post):
+            threads = [threading.Thread(target=run, args=(i,)) for i in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
 
+        assert not any(t.is_alive() for t in threads)
         assert errors == []
         assert scorer.fallback_count == 0
         assert len(results) == 40
-        assert all(r == pytest.approx([1.0, 0.0]) for r in results)
-        # Three distinct texts, whichever thread wrote them: a lost update or a
-        # torn prune would show as a short or oversized map.
-        assert len(scorer._cache) == 3
+        assert all(scores == pytest.approx([1.0, 1.0]) for _, scores in results)
+        # Evictions ran throughout; the bound holds and the map is not empty.
+        assert 0 < len(scorer._cache) <= 6
 
 
 class TestEmbeddingProviderPaths:

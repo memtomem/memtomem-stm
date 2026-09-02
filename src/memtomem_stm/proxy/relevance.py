@@ -29,7 +29,10 @@ def _fifo_prune(d: dict[str, Any], cap: int) -> None:
     """
     if len(d) <= cap:
         return
-    excess = len(d) - cap // 2
+    # Floor the target at one entry: ``cap // 2`` is 0 at ``cap = 1``, which
+    # would empty the map on every insert and make a legal capacity behave
+    # like the disabled setting.
+    excess = len(d) - max(1, cap // 2)
     for k in list(d)[:excess]:
         del d[k]
 
@@ -200,7 +203,13 @@ class EmbeddingScorer:
         # discards the cache with it, so nothing has to invalidate on a model
         # or provider edit. Guarded by its own lock for the same reason
         # `fallback_count` is — with `uses_blocking_io` the scorer runs on
-        # worker threads, several at once, on one shared instance.
+        # worker threads, several at once, on one shared instance. The prune
+        # below reads the key order and then deletes from it, which is not one
+        # atomic step; two threads pruning together can delete the same key
+        # twice. CPython's GIL makes that narrow enough that a contention test
+        # does not reliably reproduce it (16 threads x 80 passes at capacity 2
+        # produced none), so the lock is here on the argument, not on a red
+        # test — and a free-threaded build removes even that narrowness.
         self._cache_size = max(0, cache_size)
         self._cache: dict[str, list[float]] = {}
         self._cache_lock = threading.Lock()
@@ -247,7 +256,7 @@ class EmbeddingScorer:
         an embedding is a function of (provider, model, text).
         """
         if self._cache_size == 0:
-            return self._embed_batch(texts)
+            return self._embed_exact(texts)
 
         keys = [framed_digest((self._provider, self._model, text)) for text in texts]
         with self._cache_lock:
@@ -266,17 +275,7 @@ class EmbeddingScorer:
             misses.append(text)
 
         if misses:
-            fetched = self._embed_batch(misses)
-            if len(fetched) != len(misses):
-                # Positional: the nth vector answers the nth text. A short or
-                # long reply means that correspondence is already lost, so
-                # scoring it would silently mis-rank and caching it would keep
-                # doing so for every later call. Raising lands in
-                # ``score_sections``'s fallback, which is where a provider that
-                # cannot be trusted belongs.
-                raise ValueError(
-                    f"embedding provider returned {len(fetched)} vectors for {len(misses)} inputs"
-                )
+            fetched = self._embed_exact(misses)
             with self._cache_lock:
                 for key, embedding in zip(miss_keys, fetched):
                     self._cache[key] = embedding
@@ -284,6 +283,24 @@ class EmbeddingScorer:
             held.update(zip(miss_keys, fetched))
 
         return [held[key] for key in keys]
+
+    def _embed_exact(self, texts: list[str]) -> list[list[float]]:
+        """One vector per text, or an error naming the mismatch.
+
+        The correspondence is positional: the nth vector answers the nth text.
+        A reply with a different count has already lost it, so scoring it
+        mis-ranks silently, and caching it would keep doing so for every later
+        call. Raising lands in ``score_sections``'s fallback, which is where a
+        provider that cannot be trusted belongs. Checked on the cached and
+        uncached paths alike — a guard only the cache enforces would make
+        ``embedding_cache_size = 0`` mean something other than "no cache".
+        """
+        embeddings = self._embed_batch(texts)
+        if len(embeddings) != len(texts):
+            raise ValueError(
+                f"embedding provider returned {len(embeddings)} vectors for {len(texts)} inputs"
+            )
+        return embeddings
 
     def _embed_batch(self, texts: list[str]) -> list[list[float]]:
         try:
