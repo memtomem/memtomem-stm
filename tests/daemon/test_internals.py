@@ -941,6 +941,27 @@ class TestDaemonStopCli:
         assert "accepted shutdown but is still cleaning up" in result.output
         assert "daemon stopped" not in result.output
 
+    def test_declined_shutdown_with_an_unreadable_handshake_is_not_no_daemon(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#954: a handshake that was already unparseable when `stop` ran makes
+        both the read and the graceful call come back empty — but 'no daemon'
+        is only one of the three things that produces that, and the record may
+        belong to a daemon that merely declined. Say so instead."""
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        hs_path = _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 4567, "token": "t"})
+        hs_path.write_text("{ truncated", encoding="utf-8")
+        _no_daemon(monkeypatch)
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+
+        assert result.exit_code == 1, result.output
+        assert "unreadable" in result.output
+        assert "no running daemon" not in result.output
+        assert hs_path.exists()  # never unlinked on a record we cannot read
+
     def test_no_daemon_no_handshake(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         from click.testing import CliRunner
 

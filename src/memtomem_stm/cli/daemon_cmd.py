@@ -390,6 +390,21 @@ def _stop_current_config_daemon(config: STMConfig) -> None:
     # own config's handshake; a different-config daemon owns a different file and
     # is handled by ``--all`` (``_stop_foreign_daemons``), not here.
     if raw is None:
+        # ``raw`` is None for a handshake that is absent, unreadable OR
+        # malformed, and only the first of those means no daemon. A record we
+        # could not parse may belong to one that simply declined the graceful
+        # shutdown, so claiming success here is what sends someone off to start
+        # a replacement beside it (#954) — the same conflation the wait above
+        # and ``status`` no longer make.
+        if not _handshake_removed(hs_path):
+            click.echo(
+                _warn(
+                    "a handshake is present but unreadable, so whether a daemon is "
+                    "running cannot be determined — run `mms daemon status`"
+                ),
+                err=True,
+            )
+            raise SystemExit(1)
         click.echo("no running daemon")
         return
     pid = _as_int(raw.get("pid", -1))

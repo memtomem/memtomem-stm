@@ -453,11 +453,15 @@ changes inline only. See the deprecation policy in
   daemon closes its listener first and removes the handshake last. Only an
   entry that is really gone counts — one that is unreadable, unreachable, or
   behind a broken directory link keeps the wait open rather than announcing a
-  stop that may not have happened. **Behavior change**: `mms daemon status`
-  reports a handshake it cannot parse as `stale` with `handshake_unreadable:
-  true` (plain output: "handshake present but unreadable — daemon state
-  unknown") instead of `stopped`; a record that cannot be read is not proof
-  the daemon is gone, and `stop` now sends users here for exactly that case.
+  stop that may not have happened. **Behavior change**: an unreadable
+  handshake is no longer reported as no daemon anywhere. `mms daemon status`
+  reports one as `stale` with `handshake_unreadable: true` (plain output:
+  "handshake present but unreadable — daemon state unknown") instead of
+  `stopped`, and `mms daemon stop` exits 1 pointing at `status` instead of
+  printing "no running daemon" when a graceful shutdown is declined and the
+  record cannot be parsed. A record that cannot be read is not proof the
+  daemon is gone; treating it as proof is what starts a replacement beside a
+  live one.
 
 - **Response-cache warm starts no longer rescan every cached body for privacy**
   (#950, issue #872). `ProxyCache` now stamps the fingerprint of its storage privacy
