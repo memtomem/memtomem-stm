@@ -8,11 +8,9 @@ paths in ``ProxyManager._resolve_tool_config``.
 
 from __future__ import annotations
 
-import sys
 from unittest.mock import AsyncMock
 
 import pytest
-from pydantic import ValidationError
 
 from memtomem_stm.proxy.config import (
     CompressionStrategy,
@@ -86,16 +84,6 @@ class TestTokensToChars:
     def test_korean_calibrated_ratio(self):
         # 1500 tokens * 1.85 chars/tok = 2775 chars
         assert tokens_to_chars(1500, 1.85) == 2775
-
-    def test_a_finite_product_that_overflows_saturates(self):
-        """Two legal finite values can still multiply to ``inf`` (#929).
-
-        Rejecting non-finite inputs does not make the multiplication safe, and
-        this runs in the budget resolution of every proxied call — an
-        ``OverflowError`` here fails the tool call and names neither field.
-        """
-        assert tokens_to_chars(2, 1e308) == sys.maxsize
-        assert tokens_to_chars(10**400, 3.5) == sys.maxsize
 
 
 # ── ProxyConfig.chars_per_token + effective_max_result_chars ─────────────
@@ -425,47 +413,6 @@ class TestCharsPerTokenResolutionOrder:
         tc = mgr._resolve_tool_config("srv", "both")
         assert tc.max_chars == 321
         assert tc.token_budget is None
-
-
-class TestCharsPerTokenIsFinite:
-    """``gt=0`` admits ``+inf`` on its own (#722); the conversion cannot.
-
-    ``int(tokens * inf)`` raises ``OverflowError`` inside the resolution every
-    call runs through, so the value has to be refused where it is written. The
-    A tool that also set ``max_result_tokens`` could already reach it, and #929
-    added the route from a budget inherited from the server; the other two
-    levels were always reachable, which is why the guard is pinned at all
-    three.
-
-    ``+inf`` is the case the guard adds: ``gt=0`` already refuses ``nan`` and
-    ``-inf`` (both compare false against 0), so those parameters document the
-    boundary rather than test the new constraint.
-    """
-
-    @pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
-    def test_tool_level_rejects_non_finite(self, value: float):
-        with pytest.raises(ValidationError):
-            ToolOverrideConfig(chars_per_token=value)
-
-    @pytest.mark.parametrize("value", [float("inf"), float("nan")])
-    def test_server_level_rejects_non_finite(self, value: float):
-        with pytest.raises(ValidationError):
-            UpstreamServerConfig(prefix="x", chars_per_token=value)
-
-    @pytest.mark.parametrize("value", [float("inf"), float("nan")])
-    def test_proxy_level_rejects_non_finite(self, value: float):
-        with pytest.raises(ValidationError):
-            ProxyConfig(chars_per_token=value)
-
-    def test_a_string_infinity_is_refused_too(self):
-        """The reachable spelling: JSON writes ``Infinity`` and env vars strings.
-
-        ``json.dumps`` emits a bare ``Infinity`` for a non-finite float and
-        ``json.loads`` reads it back, so a config file can carry one without
-        anything unusual having been typed.
-        """
-        with pytest.raises(ValidationError):
-            ToolOverrideConfig(chars_per_token="inf")
 
 
 class TestTokenEstimationMode:

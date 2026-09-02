@@ -62,16 +62,6 @@ changes inline only. See the deprecation policy in
   an affected tool's cached entries are rotated once regardless. A per-tool
   `max_result_chars` with no per-tool token budget beside it still outranks the
   ratio and is unaffected.
-- **`chars_per_token` rejects a non-finite value at all three levels, and an
-  overflowing budget saturates instead of failing the call.** `gt=0` admits
-  `+inf` on its own (#722) and `int(tokens * inf)` raises `OverflowError`
-  inside the resolution every proxied call runs through. A tool setting both
-  the ratio and its own token budget could already reach it before this
-  release, as could either of the other two levels; the fix above added the
-  inherited-budget route, so all three fields are guarded together. Rejecting
-  non-finite input does not make the multiplication safe, so two finite values
-  that overflow (a ratio near the float ceiling, or a token budget past the
-  float range) now yield the largest representable budget rather than raising.
 
 ## [0.3.0] — 2026-09-02
 

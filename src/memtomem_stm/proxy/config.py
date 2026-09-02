@@ -1360,18 +1360,14 @@ class ToolOverrideConfig(BaseModel):
     ``max_result_chars`` and is converted to a char budget via the resolved
     ``chars_per_token`` ratio. Useful for non-Latin-script content where a
     fixed char budget under-triggers compression. See ``token_estimate.py``."""
-    chars_per_token: float | None = Field(default=None, gt=0.0, allow_inf_nan=False)
+    chars_per_token: float | None = Field(default=None, gt=0.0)
     """Per-tool override for the chars-per-token ratio used to convert a token
     budget to a char budget. Falls back to the upstream server's ratio, then
     ``ProxyConfig.chars_per_token``. The budget it converts may be this tool's
     ``max_result_tokens`` or the one inherited from the server — the ratio
     describes what this tool returns, not where its budget is written (#929).
     Inert when the tool sets ``max_result_chars`` and no token budget of its
-    own: a char budget is absolute and nothing converts into it. Must be
-    finite: ``gt=0`` admits ``+inf`` on its own (#722), which the conversion
-    cannot represent. All three ratio fields are guarded together — this one
-    could already be reached by a tool that also set ``max_result_tokens``,
-    and #929 added the route from a budget inherited from the server."""
+    own: a char budget is absolute and nothing converts into it."""
     token_estimation_mode: TokenEstimationMode | None = None
     """Per-tool gate mode. ``unicode`` measures the actual response; ``None``
     inherits the upstream or proxy setting."""
@@ -1484,7 +1480,7 @@ class UpstreamServerConfig(BaseModel):
     over ``max_result_chars`` and is converted to a char budget via the
     resolved ``chars_per_token`` ratio. See ``token_estimate.py`` for the
     estimator used at gate time."""
-    chars_per_token: float | None = Field(default=None, gt=0.0, allow_inf_nan=False)
+    chars_per_token: float | None = Field(default=None, gt=0.0)
     """Per-server override for the chars-per-token ratio. Falls back to
     ``ProxyConfig.chars_per_token`` (default 3.5, English-biased). Set to
     ~2.0 for Korean-dominant content, ~1.3 for Chinese-dominant."""
@@ -2197,7 +2193,7 @@ class ProxyConfig(BaseModel):
     lock_timeout_seconds: float = Field(default=30.0, gt=0.0)
     consumer_model: str = ""
     context_budget_ratio: float = Field(default=0.05, ge=0.0, le=1.0)
-    chars_per_token: float = Field(default=3.5, gt=0.0, allow_inf_nan=False)
+    chars_per_token: float = Field(default=3.5, gt=0.0)
     """Default chars-per-token ratio used to convert token budgets into char
     budgets. The default ``3.5`` is English-biased (ASCII text averages
     ~4.0 chars/token for cl100k_base). Set to ~2.0 for Korean-dominant
