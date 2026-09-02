@@ -366,7 +366,8 @@ When an agent provides `_context_query` in tool arguments, compression allocates
     "embedding_provider": "ollama",
     "embedding_model": "nomic-embed-text",
     "embedding_base_url": "http://localhost:11434",
-    "embedding_timeout": 10.0
+    "embedding_timeout": 10.0,
+    "embedding_cache_size": 256
   }
 }
 ```

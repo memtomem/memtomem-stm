@@ -1969,6 +1969,14 @@ class RelevanceScorerConfig(BaseModel):
     Only used when scorer="embedding"."""
     embedding_timeout: float = Field(default=10.0, gt=0.0)
     """Embedding API timeout in seconds."""
+    embedding_cache_size: int = Field(default=256, ge=0)
+    """How many embeddings one scorer instance holds, keyed on provider, model
+    and text. Section bodies repeat across calls while the query rotates, and
+    each miss costs an HTTP round trip up to ``embedding_timeout``. ``0``
+    disables the cache. Held in memory per instance and dropped whenever a
+    ``relevance_scorer`` edit rebuilds the scorer, so it never outlives the
+    configuration it was filled under; budget roughly 3 KB per entry for a
+    768-dimension model. Only used when scorer="embedding"."""
 
     @model_validator(mode="after")
     def _apply_provider_default_url(self) -> "RelevanceScorerConfig":

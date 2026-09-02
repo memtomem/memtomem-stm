@@ -387,6 +387,166 @@ class TestEmbeddingOpenAIResponseParsing:
         assert result == []
 
 
+class TestEmbeddingCache:
+    """Repeat texts cost a dict lookup instead of a round trip (#873).
+
+    Section bodies are derived deterministically from an upstream response and
+    truncated, so the same text recurs call after call while only the query
+    rotates; the tool ranker re-scores one catalogue every pass. Every miss is
+    an HTTP request that can take up to ``embedding_timeout``.
+    """
+
+    def _make_scorer(self, cache_size: int = 256):
+        from memtomem_stm.proxy.relevance import EmbeddingScorer
+
+        return EmbeddingScorer(
+            provider="ollama",
+            model="test-model",
+            base_url="http://ollama:11434",
+            cache_size=cache_size,
+        )
+
+    def _mock_response(self, payload: dict):
+        from unittest.mock import MagicMock
+
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value=payload)
+        return resp
+
+    def _post(self, vectors: list[list[float]]):
+        return patch("httpx.post", return_value=self._mock_response({"embeddings": vectors}))
+
+    def test_an_identical_call_issues_no_second_request(self):
+        scorer = self._make_scorer()
+        sections = [("## A", "matches the query"), ("## B", "unrelated")]
+        vectors = [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
+
+        with self._post(vectors) as post:
+            first = scorer.score_sections("the query", sections)
+            second = scorer.score_sections("the query", sections)
+
+        assert post.call_count == 1
+        assert first == second == pytest.approx([1.0, 0.0])
+
+    def test_only_the_unseen_text_is_requested(self):
+        """The batch keeps its shape and loses the texts already held.
+
+        The vectors are distinct per text, so a reassembly that lined the reply
+        up against the wrong inputs would score differently rather than merely
+        cost an extra request.
+        """
+        scorer = self._make_scorer()
+        first_sections = [("## A", "alpha"), ("## B", "beta")]
+        with self._post([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]):
+            scorer.score_sections("q", first_sections)
+
+        # Same query, same section A, one new section C.
+        with self._post([[1.0, 0.0, 0.0]]) as post:
+            scores = scorer.score_sections("q", [("## A", "alpha"), ("## C", "gamma")])
+
+        assert post.call_count == 1
+        assert post.call_args.kwargs["json"]["input"] == ["## C\ngamma"]
+        # A stayed orthogonal to the query, C came back parallel to it.
+        assert scores == pytest.approx([0.0, 1.0])
+
+    def test_a_rotated_query_reuses_the_sections(self):
+        scorer = self._make_scorer()
+        sections = [("## A", "alpha"), ("## B", "beta")]
+        with self._post([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]):
+            scorer.score_sections("first query", sections)
+
+        with self._post([[0.0, 1.0]]) as post:
+            scores = scorer.score_sections("second query", sections)
+
+        assert post.call_args.kwargs["json"]["input"] == ["second query"]
+        assert scores == pytest.approx([0.0, 1.0])
+
+    def test_a_repeated_section_within_one_call_is_asked_for_once(self):
+        """One response can carry the same section twice."""
+        scorer = self._make_scorer()
+        with self._post([[1.0, 0.0], [1.0, 0.0]]) as post:
+            scores = scorer.score_sections("q", [("## A", "alpha"), ("## A", "alpha")])
+
+        assert post.call_args.kwargs["json"]["input"] == ["q", "## A\nalpha"]
+        assert scores == pytest.approx([1.0, 1.0])
+
+    def test_cache_size_zero_requests_every_time(self):
+        scorer = self._make_scorer(cache_size=0)
+        sections = [("## A", "alpha")]
+        with self._post([[1.0, 0.0], [1.0, 0.0]]) as post:
+            scorer.score_sections("q", sections)
+            scorer.score_sections("q", sections)
+
+        assert post.call_count == 2
+
+    def test_the_cache_is_bounded(self):
+        """Twelve distinct texts under a cap of four, and the first one is gone.
+
+        Asserting only the ceiling would hold on an empty cache, which is what
+        every one of these tests looks like with the feature removed.
+        """
+        scorer = self._make_scorer(cache_size=4)
+        for i in range(6):
+            with self._post([[1.0, 0.0], [1.0, 0.0]]):
+                scorer.score_sections(f"query {i}", [("## S", f"body {i}")])
+
+        assert 0 < len(scorer._cache) <= 4
+        assert self._key(scorer, "query 0") not in scorer._cache
+        assert self._key(scorer, "query 5") in scorer._cache
+
+    def _key(self, scorer, text: str) -> str:
+        from memtomem_stm.utils.digest import framed_digest
+
+        return framed_digest((scorer._provider, scorer._model, text))
+
+    def test_a_short_provider_reply_falls_back_and_caches_nothing(self):
+        """A reply that does not answer every input has lost its ordering.
+
+        Scoring it would mis-rank once; caching it would keep doing so for
+        every later call, which is why the check runs before the write.
+        """
+        scorer = self._make_scorer()
+        sections = [("## A", "alpha"), ("## B", "beta")]
+        with self._post([[1.0, 0.0]]):
+            scores = scorer.score_sections("q", sections)
+
+        assert scorer.fallback_count == 1
+        assert scorer._cache == {}
+        assert len(scores) == 2
+
+    def test_concurrent_scoring_stays_consistent(self):
+        """``uses_blocking_io`` puts several worker threads on one instance."""
+        import threading
+
+        scorer = self._make_scorer(cache_size=8)
+        sections = [("## A", "alpha"), ("## B", "beta")]
+        results: list[list[float]] = []
+        errors: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                with self._post([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]):
+                    for _ in range(5):
+                        results.append(scorer.score_sections("q", sections))
+            except BaseException as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        assert scorer.fallback_count == 0
+        assert len(results) == 40
+        assert all(r == pytest.approx([1.0, 0.0]) for r in results)
+        # Three distinct texts, whichever thread wrote them: a lost update or a
+        # torn prune would show as a short or oversized map.
+        assert len(scorer._cache) == 3
+
+
 class TestEmbeddingProviderPaths:
     """Non-network branches of ``EmbeddingScorer`` (#619): the Ollama
     ``/api/embed`` parsing, provider dispatch, error mapping into the BM25
