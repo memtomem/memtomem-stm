@@ -11,6 +11,23 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Added
+
+- **The embedding relevance scorer now holds a bounded cache of the embeddings
+  it has already fetched** (#873), sized by the new
+  `relevance_scorer.embedding_cache_size` (default `256`, `0` disables it).
+  Section texts are derived deterministically from an upstream response and
+  truncated, so the same ones recur call after call while only the query
+  rotates, and the tool ranker re-scores one catalogue every pass — each of
+  which was a fresh HTTP round trip costing up to `embedding_timeout` on a cold
+  or slow backend. A request now carries only the texts not already held, and a
+  call whose texts are all held issues none. The cache lives on the scorer
+  instance, so any `relevance_scorer` edit discards it along with the scorer it
+  rebuilds. Only the `embedding` scorer is affected; BM25 never made a request.
+  **Behavior change**: an embedding provider that returns a different number of
+  vectors than it was given inputs now falls back to BM25 for that call instead
+  of scoring against a reply whose positional correspondence is already lost.
+
 ### Changed
 
 - **A successful tool result is no longer byte-measured a second time** when the
