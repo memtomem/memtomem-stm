@@ -98,3 +98,11 @@ jobs:
         with:
           repository-url: https://test.pypi.org/legacy/
           packages-dir: dist
+          # Dry-run lane only (#953). Re-pushing a `test-v*` tag to iterate is
+          # what the `test-` prefix is for, and TestPyPI has already taken the
+          # files from the first attempt — without this every later attempt at
+          # the same version dies on "file already exists". The PyPI step above
+          # keeps failing on a re-upload on purpose: for a real release an
+          # existing file means the version was already published, which the
+          # verification steps exist to catch rather than paper over.
+          skip-existing: true
