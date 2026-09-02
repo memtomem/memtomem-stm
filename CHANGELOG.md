@@ -489,7 +489,12 @@ changes inline only. See the deprecation policy in
   blocked on a reply, so the upstream handler stayed blocked until its own
   timeout, or until the proxy's call timeout and reconnect tore the session
   down. The bounded stream now holds the paired write side and answers such a
-  request with an `Invalid Request` error carrying the same id. Oversized
+  request with an `Invalid Request` error carrying the same id. The reply is
+  sent from its own task, never from the read loop: client transports create
+  both directions with a buffer size of 0, so awaiting the send there would
+  park the dispatcher's only reader — and for stdio that deadlocks, since an
+  upstream blocked writing to a pipe nobody drains never reads its own stdin.
+  Rejections still waiting on a stalled writer are capped. Oversized
   notifications are still dropped, since nothing waits on them, and an
   oversized result still fails only the single call it belongs to.
 
