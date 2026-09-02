@@ -1645,6 +1645,85 @@ class TestConnectionGenerationLeases:
         old_stack.aclose.assert_awaited_once()
         assert conn.retired_resources == {}
 
+    async def test_stop_finishes_a_retire_close_cancelled_mid_unwind(self):
+        """#963: ``AsyncExitStack.aclose()`` pops each callback off the stack
+        BEFORE awaiting it. A retire task cancelled while a callback is in
+        flight leaves that callback gone from the stack and unfinished, so the
+        retry in ``stop()`` used to unwind an empty stack, return cleanly, and
+        drop the resources as closed — while ``_connections.clear()`` took the
+        last reference to the transport that was never released."""
+        cfg = UpstreamServerConfig(prefix="docs")
+        mgr = _make_manager(servers={"docs": cfg})
+        gate = asyncio.Event()
+        closed = False
+
+        async def _slow_close() -> None:
+            nonlocal closed
+            await gate.wait()
+            closed = True
+
+        stack = contextlib.AsyncExitStack()
+        stack.push_async_callback(_slow_close)
+        conn = UpstreamConnection(name="docs", config=cfg, session=AsyncMock(), tools=[])
+        mgr._connections["docs"] = conn
+        conn.retired_resources[0] = _RetiredConnectionResources(
+            owner=None, stack=stack, config=cfg
+        )
+        conn.active_calls[0] = 1
+        conn.reconnect_generation = 1
+
+        mgr._release_connection_session(conn, 0)
+        retire_task = conn.retiring_tasks[0]
+        # Let the retire task reach the callback and park on the gate.
+        await asyncio.sleep(0.05)
+        assert not retire_task.done()
+
+        stop_task = asyncio.create_task(mgr.stop())
+        # stop() cancels the retire task mid-unwind, then reaches its retry.
+        await asyncio.sleep(0.05)
+        assert retire_task.done()
+        # The retry must WAIT for the unwind the cancelled task started. On the
+        # old code it returned here, having re-entered an emptied stack.
+        assert not stop_task.done()
+
+        gate.set()
+        await asyncio.wait_for(stop_task, 5)
+
+        assert closed is True
+        assert conn.retired_resources == {}
+
+    async def test_close_connection_resources_retry_joins_the_same_unwind(self):
+        """#963: a second close of the same resources joins the one unwind
+        instead of re-entering ``aclose()`` on a stack whose callbacks have
+        already been popped."""
+        cfg = UpstreamServerConfig(prefix="docs")
+        mgr = _make_manager(servers={"docs": cfg})
+        gate = asyncio.Event()
+        calls = 0
+
+        async def _slow_close() -> None:
+            nonlocal calls
+            calls += 1
+            await gate.wait()
+
+        stack = contextlib.AsyncExitStack()
+        stack.push_async_callback(_slow_close)
+        resources = _RetiredConnectionResources(owner=None, stack=stack, config=cfg)
+
+        first = asyncio.create_task(mgr._close_connection_resources(resources))
+        await asyncio.sleep(0.05)
+        first.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await first
+
+        second = asyncio.create_task(mgr._close_connection_resources(resources))
+        await asyncio.sleep(0.05)
+        assert not second.done()
+
+        gate.set()
+        await asyncio.wait_for(second, 5)
+        assert calls == 1
+
     async def test_retired_generation_error_keeps_old_credentials_client_safe(self):
         old_url_token = "old-url-token"
         old_header_token = "old-header-token"

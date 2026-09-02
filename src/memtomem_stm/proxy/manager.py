@@ -435,6 +435,12 @@ class _RetiredConnectionResources:
     owner: _UpstreamConnectionOwner | None
     stack: AsyncExitStack | None
     config: UpstreamServerConfig
+    # The one task that unwinds ``stack``. ``AsyncExitStack.aclose()`` pops
+    # each callback off the stack *before* awaiting it, so a caller cancelled
+    # mid-unwind leaves a callback that is gone from the stack and never
+    # finished; re-entering ``aclose()`` then unwinds an empty stack and
+    # returns cleanly, reporting a close that never happened (#963).
+    stack_close: asyncio.Task[None] | None = None
 
 
 @dataclass
@@ -448,6 +454,9 @@ class UpstreamConnection:
     # remains for injected/legacy connections used by library callers and
     # tests; exactly one of ``owner`` and ``stack`` should be populated.
     owner: _UpstreamConnectionOwner | None = None
+    # The one task that unwinds ``stack``; see ``_RetiredConnectionResources``
+    # for why the unwind may not be re-entered after a cancellation (#963).
+    stack_close: asyncio.Task[None] | None = None
     # Serialize concurrent ``_reconnect_server`` calls for this server (#586).
     # Four unserialized retry-loop sites can reconnect the same connection at
     # once; without this, two interleaving reconnects each build a fresh
@@ -861,7 +870,7 @@ class ProxyManager:
             for conn in self._connections.values():
                 if conn.owner is not None or conn.stack is not None:
                     try:
-                        await self._close_connection_resources(conn.owner, conn.stack)
+                        await self._close_connection_resources(conn)
                     except Exception as cleanup_exc:
                         # Redact + no exc_info (#605): these resources wrap a
                         # transport opened with the credentialed
@@ -2171,14 +2180,32 @@ class ProxyManager:
 
     @staticmethod
     async def _close_connection_resources(
-        owner: _UpstreamConnectionOwner | None,
-        stack: AsyncExitStack | None,
+        resources: UpstreamConnection | _RetiredConnectionResources,
     ) -> None:
-        """Close owner-managed or legacy/injected connection resources."""
-        if owner is not None:
-            await owner.close()
-        elif stack is not None:
-            await stack.aclose()
+        """Close owner-managed or legacy/injected connection resources.
+
+        Both paths track the unwind through a task rather than through the
+        caller's return, so a cancelled caller cannot report a close that
+        never finished. ``_UpstreamConnectionOwner.close`` already awaits its
+        shielded owner task; the legacy/injected stack gets the same treatment
+        here, because ``AsyncExitStack.aclose()`` pops a callback before
+        awaiting it and a retry would otherwise unwind an emptied stack (#963).
+        """
+        if resources.owner is not None:
+            await resources.owner.close()
+            return
+        if resources.stack is None:
+            return
+        task = resources.stack_close
+        if task is None:
+            # Deliberately NOT registered in ``_background_tasks``: ``stop()``
+            # cancels those, and this task exists to survive exactly that
+            # cancellation and finish the unwind.
+            task = asyncio.create_task(resources.stack.aclose())
+            resources.stack_close = task
+        # A failure stays failed: awaiting a done task re-raises its exception,
+        # so every retry sees the same outcome instead of a fresh empty unwind.
+        await asyncio.shield(task)
 
     async def _connect_server(self, name: str, cfg: UpstreamServerConfig) -> None:
         if self._stack is None:
@@ -2292,7 +2319,7 @@ class ProxyManager:
             conn.retiring_tasks.pop(generation, None)
             return
         try:
-            await self._close_connection_resources(resources.owner, resources.stack)
+            await self._close_connection_resources(resources)
         except Exception as exc:
             logger.debug(
                 "Failed to close retired generation %d for '%s': %s",
@@ -2466,6 +2493,10 @@ class ProxyManager:
 
             old_owner = conn.owner
             old_stack = conn.stack
+            # Carry any in-flight unwind of the outgoing stack with it, so a
+            # close already started on the live connection is joined rather
+            # than re-entered once the resources are retired (#963).
+            old_stack_close = conn.stack_close
             old_generation = conn.reconnect_generation
             # The old stack wraps a transport opened with the OLD credentialed
             # url — capture it before the swap so the cleanup log redacts the
@@ -2474,6 +2505,7 @@ class ProxyManager:
             conn.session = session
             conn.owner = owner
             conn.stack = None
+            conn.stack_close = None
             conn.tools = tools
             self._tool_catalog_revision += 1
             # ``prefix`` composes the client-visible tool name, which is the
@@ -2502,15 +2534,17 @@ class ProxyManager:
             conn.reconnect_generation += 1
 
             if old_owner is not None or old_stack is not None:
+                retired = _RetiredConnectionResources(
+                    owner=old_owner,
+                    stack=old_stack,
+                    config=old_cfg,
+                    stack_close=old_stack_close,
+                )
                 if conn.active_calls.get(old_generation, 0) > 0:
-                    conn.retired_resources[old_generation] = _RetiredConnectionResources(
-                        owner=old_owner,
-                        stack=old_stack,
-                        config=old_cfg,
-                    )
+                    conn.retired_resources[old_generation] = retired
                 else:
                     try:
-                        await self._close_connection_resources(old_owner, old_stack)
+                        await self._close_connection_resources(retired)
                     except Exception as cleanup_exc:
                         # Redact + no exc_info (#605): a close failure's traceback
                         # tail could leak the token at DEBUG.
@@ -2922,12 +2956,15 @@ class ProxyManager:
                 # ``_connections`` is cleared just below, taking the last
                 # reference to the stdio child and its fds with it. A task that
                 # finished has either popped its own entry or, having closed
-                # nothing, left the resources here for this loop.
+                # nothing, left the resources here for this loop. A retire task
+                # cancelled *mid-unwind* also lands here, and the close below
+                # joins the unwind it already started rather than re-entering
+                # an emptied stack (#963).
                 retiring = conn.retiring_tasks.get(generation)
                 if retiring is not None and not retiring.done():
                     continue
                 try:
-                    await self._close_connection_resources(resources.owner, resources.stack)
+                    await self._close_connection_resources(resources)
                 except Exception as cleanup_exc:
                     logger.debug(
                         "Failed to close retired generation %d for '%s' during stop: %s",
@@ -2939,7 +2976,7 @@ class ProxyManager:
                     conn.retired_resources.pop(generation, None)
             if conn.owner is not None or conn.stack is not None:
                 try:
-                    await self._close_connection_resources(conn.owner, conn.stack)
+                    await self._close_connection_resources(conn)
                 except Exception as cleanup_exc:
                     # Redact + no exc_info (#605): these resources wrap a
                     # transport opened with the credentialed
