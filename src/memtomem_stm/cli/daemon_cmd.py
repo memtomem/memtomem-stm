@@ -33,6 +33,8 @@ import click
 from memtomem_stm.logging_setup import FILE_FORMAT, open_private_log_handler
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from memtomem_stm.config import STMConfig
 
 
@@ -307,6 +309,52 @@ def stop_cmd(stop_all: bool) -> None:
         raise current_stop_error
 
 
+def _handshake_removed(path: Path) -> bool:
+    """``True`` only when the handshake file is really gone.
+
+    ``read_handshake`` folds absent, unreadable and malformed into ``None``,
+    which is what its readers want but the wrong question for a terminal
+    condition: teardown removes the file last, so a handshake we merely cannot
+    parse — a truncated write, a transient read error — must keep us waiting
+    rather than announce a stop that may not have happened (#954).
+
+    ``lstat`` rather than ``stat``: the question is whether the directory entry
+    teardown removes is gone, and following a link would answer for its target
+    instead — a dangling symlink left in place would read as removed.
+    """
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        # ``lstat`` does not follow the entry itself, but it still resolves
+        # everything above it — a broken ancestor raises the same error while
+        # saying nothing about whether teardown removed the handshake. Only an
+        # ancestor that EXISTS proves the path was walkable and the entry
+        # really is gone; anything else leaves the question unanswered, so the
+        # wait stays open. ``is_junction`` covers the Windows spelling of a
+        # link, which ``is_symlink`` reports as False.
+        #
+        # The walk carries its own guard: an error raised in here is raised
+        # INSIDE this handler, where the ``except OSError`` below cannot see
+        # it, and it would leave the command as a traceback rather than as the
+        # conservative answer everything else in this function gives.
+        try:
+            for ancestor in path.parents:
+                if ancestor.exists():
+                    return True
+                if ancestor.is_symlink() or ancestor.is_junction():
+                    # An entry that is there but does not resolve. ``exists``
+                    # has to be asked first: a WORKING link resolves, and
+                    # treating it as unwalkable would hang the wait on every
+                    # such layout.
+                    return False
+        except OSError:
+            return False
+        return False
+    except OSError:
+        return False
+    return False
+
+
 def _stop_current_config_daemon(config: STMConfig) -> None:
     """Stop the daemon for *this* config (graceful, then SIGTERM-by-pid fallback)."""
     from memtomem_stm.daemon import client
@@ -320,17 +368,22 @@ def _stop_current_config_daemon(config: STMConfig) -> None:
     hs_path = handshake_path(config.data_dir, config_fingerprint(config))
     raw = read_handshake(hs_path)
     if asyncio.run(client.shutdown(config)):
-        # The wire response means only "shutdown accepted". Teardown still
-        # has to stop the engine/LTM child and remove the handshake, so do not
-        # tell scripts the daemon is stopped until both its endpoint and
-        # ownership record are gone.
+        # The wire response means only "shutdown accepted". Teardown still has
+        # to stop the engine/LTM child before it removes the handshake, so do
+        # not tell scripts the daemon is stopped until that record is gone.
+        #
+        # The handshake alone is the terminal condition (#954). It is also the
+        # strictest one: the daemon closes its listener when the serve block
+        # exits, then tears down engine, tracker and LTM child, and removes the
+        # handshake LAST — so an absent handshake already implies an absent
+        # endpoint. Probing the recorded port on top of that asked about a
+        # host/port that identified this daemon only at the moment we read it;
+        # an ephemeral port the OS reassigned to an unrelated listener inside
+        # this window kept the probe true forever and reported a clean stop as
+        # a failure.
         deadline = time.time() + 5.0
         while time.time() < deadline:
-            handshake_gone = read_handshake(hs_path) is None
-            endpoint_gone = raw is None or not client.probe_listening(
-                raw.get("host"), raw.get("port"), timeout=0.1
-            )
-            if handshake_gone and endpoint_gone:
+            if _handshake_removed(hs_path):
                 click.echo(_ok("daemon stopped"))
                 return
             time.sleep(0.05)
@@ -346,6 +399,21 @@ def _stop_current_config_daemon(config: STMConfig) -> None:
     # own config's handshake; a different-config daemon owns a different file and
     # is handled by ``--all`` (``_stop_foreign_daemons``), not here.
     if raw is None:
+        # ``raw`` is None for a handshake that is absent, unreadable OR
+        # malformed, and only the first of those means no daemon. A record we
+        # could not parse may belong to one that simply declined the graceful
+        # shutdown, so claiming success here is what sends someone off to start
+        # a replacement beside it (#954) — the same conflation the wait above
+        # and ``status`` no longer make.
+        if not _handshake_removed(hs_path):
+            click.echo(
+                _warn(
+                    "a handshake is present but unreadable, so whether a daemon is "
+                    "running cannot be determined — run `mms daemon status`"
+                ),
+                err=True,
+            )
+            raise SystemExit(1)
         click.echo("no running daemon")
         return
     pid = _as_int(raw.get("pid", -1))
@@ -459,12 +527,26 @@ def status_cmd(as_json: bool) -> None:
             "standalone_will_use_daemon": standalone_use_daemon,
         }
     else:
-        raw = read_handshake(handshake_path(config.data_dir, config_fingerprint(config)))
+        hs_path = handshake_path(config.data_dir, config_fingerprint(config))
+        raw = read_handshake(hs_path)
         if raw is not None:
             info = {
                 "state": "stale",
                 "pid": raw.get("pid"),
                 "pid_alive": is_pid_alive(_as_int(raw.get("pid", -1))),
+                "hook_will_use_daemon": use_daemon,
+                "standalone_will_use_daemon": standalone_use_daemon,
+            }
+        elif not _handshake_removed(hs_path):
+            # A record we cannot parse is still a record: the daemon that owns
+            # it may be mid-teardown or merely unresponsive to a ping, and
+            # teardown removes this file last. Calling that "stopped" is what
+            # sends someone off to start a replacement beside a live daemon —
+            # and it is the answer `stop` now sends them here to get (#954).
+            # No pid to report: reading it is the thing that failed.
+            info = {
+                "state": "stale",
+                "handshake_unreadable": True,
                 "hook_will_use_daemon": use_daemon,
                 "standalone_will_use_daemon": standalone_use_daemon,
             }
@@ -501,6 +583,9 @@ def status_cmd(as_json: bool) -> None:
                 f"capacity={queue.get('capacity', 0)} "
                 f"busy_rejections={queue.get('busy_rejections', 0)}"
             )
+    elif state == "stale" and info.get("handshake_unreadable"):
+        # No pid line: reading the record is what failed.
+        click.echo(_warn("handshake present but unreadable — daemon state unknown"))
     elif state == "stale":
         click.echo(
             _warn(

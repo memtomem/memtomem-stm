@@ -448,6 +448,27 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **`mms daemon stop` no longer reports failure on a daemon that stopped
+  correctly** (#964, issue #954). The wait for teardown also probed the
+  host/port read from the handshake *before* shutdown, and that probe carries
+  no identity — when the OS handed the daemon's ephemeral port to an unrelated
+  listener inside the 5s window, a clean stop timed out and exited 1. The
+  handshake alone now ends the wait, which is also the stricter signal: the
+  daemon closes its listener first and removes the handshake last. Only an
+  entry that is really gone counts — one that is unreadable, unreachable, or
+  behind a broken directory link keeps the wait open rather than announcing a
+  stop that may not have happened. **Behavior change**: an unreadable
+  handshake is no longer reported as no daemon for the *current* config —
+  the foreign-fingerprint listing behind `--all` still skips records it
+  cannot parse, having no pid or endpoint to act on. `mms daemon status`
+  reports one as `stale` with `handshake_unreadable: true` (plain output:
+  "handshake present but unreadable — daemon state unknown") instead of
+  `stopped`, and `mms daemon stop` exits 1 pointing at `status` instead of
+  printing "no running daemon" when a graceful shutdown is declined and the
+  record cannot be parsed. A record that cannot be read is not proof the
+  daemon is gone; treating it as proof is what starts a replacement beside a
+  live one.
+
 - **Response-cache warm starts no longer rescan every cached body for privacy**
   (#950, issue #872). `ProxyCache` now stamps the fingerprint of its storage privacy
   patterns in a component-owned SQLite metadata table. A missing or changed
@@ -493,7 +514,7 @@ changes inline only. See the deprecation policy in
   bulk `mms add --from-clients --validate` is all-or-nothing unless
   `--save-unverified` explicitly acknowledges saving the complete failed
   batch. `mms daemon start` exits non-zero when readiness never arrives, and
-  `mms daemon stop` waits for endpoint closure and handshake removal after the
+  `mms daemon stop` waits for the daemon's handshake to be removed after the
   shutdown acknowledgement before reporting success.
 
 - **The cleaner keeps its markers out of the text entirely** (#948).
