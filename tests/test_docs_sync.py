@@ -2423,14 +2423,31 @@ def test_release_publish_steps_scope_skip_existing_to_the_dry_run_lane() -> None
     testpypi = [s for s in steps if s.startswith("Publish to TestPyPI\n")]
     assert len(pypi) == 1 and len(testpypi) == 1, "release.yml lost a named publish step"
 
-    # The names are labels; the ``if:`` is what actually routes a tag. Pin both,
-    # so swapping the conditions cannot leave the flag on the production lane
-    # while the assertions below still read as satisfied.
+    # The names are labels; three other things decide where a tag's files
+    # actually land, and each can be edited on its own — so pin all three.
+    #
+    # The ``if:`` routes the tag...
     assert "if: ${{ startsWith(github.ref_name, 'test-') }}" in testpypi[0], (
         "the TestPyPI step must be the one gated ON the test- prefix"
     )
     assert "if: ${{ !startsWith(github.ref_name, 'test-') }}" in pypi[0], (
         "the PyPI step must be the one gated on the ABSENCE of the test- prefix"
+    )
+    # ...``repository-url`` picks the index, and the action defaults to
+    # PRODUCTION without it: dropping that one line silently turns the
+    # skip-existing step into a production upload that accepts existing files.
+    assert "repository-url: https://test.pypi.org/legacy/" in testpypi[0], (
+        "the skipping lane must name TestPyPI — the publisher defaults to PyPI"
+    )
+    assert "repository-url" not in pypi[0], (
+        "the production step must publish to the default index, not a redirect"
+    )
+    # ...and both must be the pinned publisher itself. Without this a refactor
+    # to a composite or reusable action would carry the inputs somewhere this
+    # test cannot see, and pass by looking unchanged.
+    action = "uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33"
+    assert action in pypi[0] and action in testpypi[0], (
+        "both publish steps must call the pinned publisher action directly"
     )
     assert "skip-existing" not in pypi[0], (
         "the production upload must fail on an already-published file, not skip it"
