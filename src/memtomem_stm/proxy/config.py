@@ -1428,8 +1428,10 @@ class OriginSource(BaseModel):
     ``mcp-json`` / ``claude-desktop`` / ``cursor-user`` / ``cursor-project``.
     Kept in lockstep with the CLI's shared source table (``cli/proxy.py``); a
     plain ``str`` rather than an enum so a config written by a newer CLI with a
-    new kind still validates here. The ``cursor-*`` kinds are recorded but not
-    ejectable — nothing writes a Cursor config (#955)."""
+    new kind still validates here. The ``cursor-*`` kinds are recorded but are
+    not writable eject targets — nothing here writes a Cursor config, so an
+    entry carrying one restores to an explicit ``--to`` target instead of to
+    its own origin (#955)."""
     path: str | None = None
     """Filesystem anchor for path-scoped kinds: the resolved project dir for
     ``claude-project``, the ``.mcp.json`` path for ``mcp-json``, the

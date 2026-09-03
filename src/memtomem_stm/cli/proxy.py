@@ -2377,9 +2377,10 @@ def stats(
     is_flag=True,
     default=False,
     help="After a successful --from-clients/--import, remove the direct "
-    "registrations from each source MCP client so tools are only reachable "
-    "via STM. Default: interactive prompt on TTY, skip on non-TTY. Only "
-    "valid with --from-clients/--import.",
+    "registrations from each source MCP client mms can write, so tools are "
+    "only reachable via STM. A Cursor registration is reported with the "
+    "manual edit instead. Default: interactive prompt on TTY, skip on "
+    "non-TTY. Only valid with --from-clients/--import.",
 )
 @click.option(
     "--allow-project-configs",
@@ -4317,9 +4318,10 @@ def _confirm_validation() -> bool:
     default=False,
     help=(
         "After a successful import + registration, remove the direct "
-        "registrations from source MCP clients so tools route through STM "
-        "only. TTY callers get a single y/N prompt (default No); non-TTY "
-        "scripted callers must pass the flag explicitly."
+        "registrations from the source MCP clients mms can write, so tools "
+        "route through STM only; a Cursor registration is reported with the "
+        "manual edit instead. TTY callers get a single y/N prompt (default "
+        "No); non-TTY scripted callers must pass the flag explicitly."
     ),
 )
 @click.option(
@@ -6287,8 +6289,9 @@ def eject(
 
     Reverse of ``mms add --import --prune``: writes the verbatim host entry
     captured at import time (``origin.original``) back to where it came
-    from, verifies the restore against the host config, and only then
-    removes the STM entry. Any failure leaves the server registered in at
+    from — or to a ``--to`` target, for an entry whose recorded origin is one
+    nothing here writes — verifies the restore against the host config, and
+    only then removes the STM entry. Any failure leaves the server registered in at
     least one place — worst case is dual registration, never disappearance.
     """
     config_path = resolve_cli_config_path(config_path).path

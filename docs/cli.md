@@ -113,8 +113,10 @@ Options:
   --save-unverified        Explicitly acknowledge saving after a failed probe.
   --json                   Emit one secret-safe JSON result document.
   --prune-originals         After a successful import + registration, remove
-                            the direct registrations from source MCP clients
-                            so tools route through STM only. TTY callers get
+                            the direct registrations from the source MCP
+                            clients mms can write, so tools route through STM
+                            only; a Cursor registration is reported with the
+                            manual edit instead. TTY callers get
                             a single y/N prompt (default No); non-TTY
                             scripted callers must pass the flag explicitly.
   --lang [en|ko]            Primary content language preset for token-aware
@@ -243,9 +245,11 @@ Options:
                                   A name no client advertises is an error;
                                   one already registered here is skipped.
   --prune                         After a successful --import, remove the
-                                  direct registrations from source MCP
-                                  clients so tools are reachable via STM
-                                  only. TTY callers get a (name, source)
+                                  direct registrations from each source MCP
+                                  client mms can write, so tools are only
+                                  reachable via STM. A Cursor registration is
+                                  reported with the manual edit instead. TTY
+                                  callers get a (name, source)
                                   confirm prompt (default No); non-TTY
                                   callers must pass the flag explicitly.
                                   Requires --from-clients / --import.
@@ -306,7 +310,7 @@ scripted import stays idempotent.
 
 To remove the original direct registrations after a successful import, pass `--prune`. On a TTY you get a `(name, source)` confirm prompt that defaults to **No** before any file edits; in non-TTY callers (CI, scripts) you must pass `--prune` explicitly — the flag never auto-fires on inferred consent. A candidate registered in more than one source client is pruned from every source, not just the one it was imported from. Prune failures are non-fatal: the import stays, and each failed entry prints the exact manual `claude mcp remove` or config edit to retry — which is also how a Cursor entry is reported, since `mms` never writes those files. `--prune` without `--from-clients` is a usage error rather than a silent no-op.
 
-The import→prune transition is reversible: every import records an `origin` provenance block per entry (the structured source plus the verbatim host entry), and every prune backs the deleted host entry up to `~/.memtomem/pruned_upstreams.json` before removing it. [`mms eject`](#eject) walks the whole path back — it restores the captured host entry to where it came from and removes the entry from STM.
+The import→prune transition is reversible: every import records an `origin` provenance block per entry (the structured source plus the verbatim host entry), and every prune backs the deleted host entry up to `~/.memtomem/pruned_upstreams.json` before removing it. [`mms eject`](#eject) walks the whole path back — it restores the captured host entry to where it came from (or, for a `cursor-*` origin, to a `--to` target you name) and removes the entry from STM.
 
 > **Note**: The CLI's `--compression` flag exposes 5 of the 10 strategies. The remaining five (`extract_fields`, `schema_pruning`, `skeleton`, `progressive`, `llm_summary`) are configured by editing `stm_proxy.json` directly. See [Compression Strategies](compression.md).
 
