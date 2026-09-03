@@ -3739,6 +3739,7 @@ class TestInitDiscoverySources:
         assert cands[0]["source_ref"] == {"kind": "cursor-user"}
         assert cands[0]["is_repo_local"] is False
         assert cands[0]["entry"]["command"] == "node"
+        assert "cwd" not in cands[0]["entry"]
 
     def test_discovers_cursor_project_config_as_repo_local(self, tmp_path, monkeypatch):
         """The checkout's own ``.cursor/mcp.json`` carries the repo-local marker.
@@ -3764,6 +3765,7 @@ class TestInitDiscoverySources:
             "kind": "cursor-project",
             "path": str((cwd / ".cursor" / "mcp.json").resolve()),
         }
+        assert cands[0]["entry"]["cwd"] == str(cwd.resolve())
 
     def test_cursor_labels_match_the_import_scanner(self, tmp_path, monkeypatch):
         """Two discovery tables, one set of names.
@@ -3972,9 +3974,7 @@ class TestInitImportFlow:
         assert servers["filesystem"]["prefix"] == "filesystem"  # default suggestion
         assert servers["docs"]["url"] == "https://docs.example/mcp"
 
-    def test_init_filters_every_repo_local_source_not_one_label(
-        self, runner, config, monkeypatch
-    ):
+    def test_init_filters_every_repo_local_source_not_one_label(self, runner, config, monkeypatch):
         """``init``'s filter compared a label; the marker is what carries the rule.
 
         Discovery grew a second repo-local source (#955), and a label-equality
@@ -4009,9 +4009,7 @@ class TestInitImportFlow:
         servers = json.loads(config.read_text(encoding="utf-8"))["upstream_servers"]
         assert set(servers) == {"user-tool"}
 
-    def test_init_still_filters_a_marker_less_project_candidate(
-        self, runner, config, monkeypatch
-    ):
+    def test_init_still_filters_a_marker_less_project_candidate(self, runner, config, monkeypatch):
         """Switching to the marker must not ADMIT what the label refused (#955).
 
         Discovery always sets the marker, so this shape comes from elsewhere —
@@ -6063,6 +6061,43 @@ class TestAddFromClients:
             encoding="utf-8",
         )
 
+    def test_help_names_cursor_sources(self, runner):
+        result = runner.invoke(cli, ["add", "--help"])
+
+        assert result.exit_code == 0, result.output
+        assert "Cursor" in result.output
+        assert ".cursor/mcp.json" in result.output
+
+    def test_cursor_project_import_persists_checkout_cwd(
+        self, runner, config, monkeypatch, tmp_path
+    ):
+        """A global proxy keeps Cursor's implicit project execution context."""
+        project = tmp_path / "cursor-project"
+        cursor_dir = project / ".cursor"
+        cursor_dir.mkdir(parents=True)
+        (cursor_dir / "mcp.json").write_text(
+            json.dumps({"mcpServers": {"repo-tool": {"command": "./run.sh"}}}),
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(project)
+        self._seed_config(config, {})
+
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "--from-clients",
+                "--all",
+                "--allow-project-configs",
+                *_cfg_args(config),
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        saved = json.loads(config.read_text(encoding="utf-8"))["upstream_servers"]["repo-tool"]
+        assert saved["command"] == "./run.sh"
+        assert saved["cwd"] == str(project.resolve())
+
     def test_from_clients_happy_path_imports_new_server(self, runner, config, monkeypatch):
         """Fresh candidate + existing server in config → imports candidate,
         preserves existing entry, and shows the discovery header."""
@@ -6652,6 +6687,86 @@ class TestUnmanagedSources:
         assert err is not None and "cannot be ejected" in err
         assert desktop.read_bytes() == before
 
+    @pytest.mark.parametrize(
+        ("kind", "expected_file"),
+        [
+            ("cursor-user", "~/.cursor/mcp.json"),
+            ("cursor-project", ".cursor/mcp.json in this checkout"),
+        ],
+    )
+    def test_the_manual_eject_hint_names_the_cursor_file(self, kind, expected_file):
+        """The failure-reporting path had the same fallthrough as the writer.
+
+        ``_eject_manual_hint`` names Claude Desktop's config for every kind it
+        does not recognize, so a refused Cursor eject would have told the
+        operator to hand-edit a file the entry is not in.
+        """
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        hint = proxy_mod._eject_manual_hint("cursor-tool", kind, None, {"command": "node"})
+
+        assert expected_file in hint
+        assert str(proxy_mod._desktop_config_path()) not in hint
+
+    def test_the_manual_hint_still_names_the_desktop_file(self):
+        """Positive control for the branch the guard sits in front of."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        hint = proxy_mod._eject_manual_hint(
+            "desk-tool", "claude-desktop", None, {"command": "node"}
+        )
+
+        assert str(proxy_mod._desktop_config_path()) in hint
+
+    def test_a_backup_row_never_suggests_an_unmanaged_retry_target(self, tmp_path, monkeypatch):
+        """A row eject cannot act on must not be rendered as advice.
+
+        Prune no longer writes one for an unmanaged source, but the log is
+        append-only and predates that rule, so a legacy row can still name a
+        `cursor-*` kind — and `--to cursor-user` is rejected outright.
+        """
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        backup = tmp_path / "pruned_upstreams.json"
+
+        def _seed(kind: str) -> None:
+            backup.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "entries": [
+                            {
+                                "name": "tool",
+                                "source": {"kind": kind},
+                                "original": {"command": "node"},
+                                "pruned_at": "2026-09-01T00:00:00Z",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        monkeypatch.setattr(proxy_mod, "_pruned_backup_path", lambda: backup)
+
+        def _plan_error(kind: str) -> str:
+            _seed(kind)
+            plan = proxy_mod._resolve_eject_plan(
+                "tool",
+                {"command": "node", "prefix": "c"},
+                None,
+                force=False,
+                allow_argv_secrets=False,
+                interactive=False,
+            )
+            assert plan.error is not None
+            return plan.error
+
+        # Positive control: a managed row IS rendered as a retry target, so a
+        # silent branch cannot be mistaken for the guard working.
+        assert "`--to claude-user`" in _plan_error("claude-user")
+        assert "--to cursor-user" not in _plan_error("cursor-user")
+
     def test_eject_still_accepts_a_managed_target(self):
         """Positive control for the same refusal."""
         from memtomem_stm.cli.proxy import _parse_eject_to
@@ -6745,9 +6860,7 @@ class TestAddFromClientsNonInteractive:
             "is_repo_local": True,
         }
 
-    def test_a_cursor_project_entry_is_gated_like_mcp_json(
-        self, runner, config, monkeypatch
-    ):
+    def test_a_cursor_project_entry_is_gated_like_mcp_json(self, runner, config, monkeypatch):
         """The gate keys on the repo-local marker, not on one label (#955).
 
         Both files live in the checkout and can name a command it supplies, so
@@ -6774,9 +6887,7 @@ class TestAddFromClientsNonInteractive:
         assert payload["names"] == ["cursor-repo-server"]
         assert config.read_bytes() == before
 
-    def test_project_local_json_gate_is_atomic_for_mixed_batch(
-        self, runner, config, monkeypatch
-    ):
+    def test_project_local_json_gate_is_atomic_for_mixed_batch(self, runner, config, monkeypatch):
         self._seed_config(config, {})
         self._stub_candidates(
             monkeypatch,
@@ -8563,6 +8674,13 @@ class TestEjectCommand:
     against the backing host config, and only then removes the STM entry
     (#475 PR3). Order invariant: host write first, STM removal second —
     every failure mode is dual registration, never disappearance."""
+
+    def test_help_names_cursor_origins_as_requiring_a_writable_target(self, runner):
+        result = runner.invoke(cli, ["eject", "--help"])
+
+        assert result.exit_code == 0, result.output
+        assert "including cursor-*" in result.output
+        assert "Entries with a writable recorded origin ignore this" in result.output
 
     @pytest.mark.parametrize("kind", ["claude-user", "claude-project"])
     def test_manual_hint_shell_quotes_name(self, kind):

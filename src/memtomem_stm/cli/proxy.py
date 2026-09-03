@@ -3033,6 +3033,14 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
             entry = _normalize_client_entry(raw)
             if entry is None or _is_self_reference(entry):
                 continue
+            if spec.kind == "cursor-project" and entry.get("transport") == "stdio":
+                # Cursor launches project-scoped stdio servers from the
+                # checkout that owns ``.cursor/mcp.json``. Once imported, STM
+                # is registered globally and may start from any directory, so
+                # preserve that implicit execution context explicitly. Use
+                # setdefault so a future normalizer that retains an explicit
+                # client-provided cwd will keep the more specific value.
+                entry.setdefault("cwd", str(cwd.resolve()))
             bad_field = unencodable_field(entry)
             if bad_field is not None:
                 # Same reasoning as the name above, for the fields that get
@@ -5651,7 +5659,9 @@ def prune(
 #
 # Reverse of the import(+prune) forward path: write the entry back to its
 # host config (``origin.original`` verbatim when captured), then remove it
-# from STM. Order invariant: host write FIRST, STM removal SECOND — every
+# from STM. "Its host config" means the recorded origin when that origin is
+# one this file writes; an unmanaged origin (``cursor-*``, #955) restores to
+# an explicit ``--to`` target instead. Order invariant: host write FIRST, STM removal SECOND — every
 # failure mode degrades to dual registration (visible, recoverable), never
 # to a server registered nowhere. Like prune, this is an explicit opt-in
 # writer; discovery itself stays read-only (#202/#226 lineage).
@@ -5900,6 +5910,14 @@ def _eject_manual_hint(name: str, kind: str, path: str | None, payload: dict[str
             f"{_shell_join(['cd', path or '.'])} && "
             f"{_shell_join(['claude', 'mcp', 'add-json', name, payload_json, '-s', 'local'])}"
         )
+    spec = _SOURCE_BY_KIND.get(kind)
+    if spec is not None and not spec.managed:
+        # Same wrong-file class as the writer backstop (#955), on the path that
+        # reports the failure rather than the one that writes: the branch below
+        # names Claude Desktop's config for every kind it does not recognize,
+        # and an unmanaged source is not in that file.
+        where = _UNMANAGED_SOURCE_FILES.get(kind, f"the {spec.label} config")
+        return f"# Add '{_disp(name)}' to {where} under mcpServers, by hand."
     target = path if kind == "mcp-json" else str(_desktop_config_path())
     # Both JSON halves need ``_disp`` on top of ``json.dumps``:
     # ``ensure_ascii=False`` escapes only what JSON requires — the C0 subset —
@@ -6013,7 +6031,7 @@ def _resolve_eject_plan(
                     # Render a copy-paste-safe shell argument. This is POSIX/
                     # PowerShell-oriented quoting, not cmd.exe syntax.
                     retry_target = f"`--to {shlex.quote(target_value)}`"
-                elif hint in _SOURCE_BY_KIND:
+                elif (spec := _SOURCE_BY_KIND.get(hint)) is not None and spec.managed:
                     retry_target = f"`--to {hint}`"
                 else:
                     retry_target = f"`--to TARGET` ({_EJECT_TARGETS_HELP})"
@@ -6224,8 +6242,9 @@ def _eject_verify(plan: _EjectPlan) -> list[str]:
     default=None,
     metavar="TARGET",
     help=(
-        f"Restore target for entries without a usable origin: {_EJECT_TARGETS_HELP}. Entries "
-        "with a usable, writable recorded origin ignore this."
+        "Restore target for entries without a usable, writable origin "
+        f"(including cursor-*): {_EJECT_TARGETS_HELP}. Entries with a writable recorded "
+        "origin ignore this."
     ),
 )
 @click.option(
