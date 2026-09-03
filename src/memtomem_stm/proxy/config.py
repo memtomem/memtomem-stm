@@ -1974,6 +1974,19 @@ class RelevanceScorerConfig(BaseModel):
     Only used when scorer="embedding"."""
     embedding_timeout: float = Field(default=10.0, gt=0.0)
     """Embedding API timeout in seconds."""
+    embedding_cache_size: int = Field(default=256, ge=0)
+    """How many embeddings one scorer instance holds, keyed on provider, model
+    and text. Section bodies repeat across calls while the query rotates, so a
+    pass that would have re-sent them now sends only what is new — and a pass
+    with nothing new sends no request at all, saving a round trip that costs up
+    to ``embedding_timeout`` on a cold backend. ``0`` disables the cache.
+    Budget roughly 25 KB per entry for a 768-dimension model (a Python list of
+    boxed floats). Held per scorer instance, so it is dropped when a
+    ``relevance_scorer`` edit rebuilds the scorer — with the exception the
+    SELECTIVE path documents and HYBRID shares: both run the compressor that
+    caches the scorer it was built with, and that compressor is keyed on
+    ``selective``, so a scorer-only edit reaches them at the next selective
+    rebuild. Only used when scorer="embedding"."""
 
     @model_validator(mode="after")
     def _apply_provider_default_url(self) -> "RelevanceScorerConfig":

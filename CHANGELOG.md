@@ -11,28 +11,27 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
-### Fixed
+### Added
 
-- **`mms add --from-clients` and `mms init` now scan Cursor's MCP configs**
-  (#955). `mms add --from-clients` prints a gate message naming
-  `.mcp.json / .cursor/mcp.json` as the files a checkout can contain, but its
-  discovery only ever read `.mcp.json` — the message was accurate for
-  `mms import`, which shares it, and overstated there. A user who read it
-  reasonably concluded their project-local Cursor entries had been considered
-  and acknowledged, when the command never looked at them. `~/.cursor/mcp.json`
-  and the checkout's `.cursor/mcp.json` are now discovered under the same
-  labels `mms import` uses, and the project one carries the repo-local marker,
-  so selecting it requires `--allow-project-configs` before any probe, write or
-  prune. `mms init` filters repo-local candidates out silently rather than
-  printing that message, and now keys that filter on the marker rather than on
-  the `.mcp.json (project)` label, which a second repo-local source would
-  otherwise have walked past. **Behavior change**: both commands list Cursor
-  entries they previously ignored, so a `--all` import adopts more servers than
-  before on a machine that has them. Cursor entries are reported but never
-  written: `prune` refuses them with the manual edit to make — before writing
-  anything to the pruned-originals backup log — and `eject` does not accept a
-  `cursor-*` target, so neither can dispatch to the one direct-edit writer that
-  exists and delete from Claude Desktop's config instead.
+- **The embedding relevance scorer now holds a bounded cache of the embeddings
+  it has already fetched** (#873), sized by the new
+  `relevance_scorer.embedding_cache_size` (default `256`, `0` disables it).
+  Section texts are derived deterministically from an upstream response and
+  truncated, so the same ones recur across calls while only the query rotates,
+  and each pass re-sent all of them in a request costing up to
+  `embedding_timeout` on a cold or slow backend. A request now carries only the
+  texts not already held, and a pass whose texts are all held issues none. The
+  cache lives on the scorer instance, so a `relevance_scorer` edit discards it
+  along with the scorer it rebuilds — except on the SELECTIVE and HYBRID paths,
+  which share a compressor that holds the scorer it was built with until a
+  `selective` edit rebuilds it, the pre-existing hot-reload boundary that
+  behaviour has always had. Only query-aware compression under the `embedding`
+  scorer is affected: BM25 never made a request, and the tool ranker is
+  BM25-only by design (its scores have to be reproducible for offline replay).
+  **Behavior change**: an embedding provider that returns a different number of
+  vectors than it was given inputs now falls back to BM25 for that call instead
+  of scoring against a reply whose positional correspondence is already lost.
+  That check runs whether or not the cache is enabled.
 
 ### Changed
 
@@ -68,6 +67,27 @@ changes inline only. See the deprecation policy in
   than trusted. **Behavior change**: none external.
 
 ### Fixed
+
+- **`mms add --from-clients` and `mms init` now scan Cursor's MCP configs**
+  (#955). `mms add --from-clients` prints a gate message naming
+  `.mcp.json / .cursor/mcp.json` as the files a checkout can contain, but its
+  discovery only ever read `.mcp.json` — the message was accurate for
+  `mms import`, which shares it, and overstated there. A user who read it
+  reasonably concluded their project-local Cursor entries had been considered
+  and acknowledged, when the command never looked at them. `~/.cursor/mcp.json`
+  and the checkout's `.cursor/mcp.json` are now discovered under the same
+  labels `mms import` uses, and the project one carries the repo-local marker,
+  so selecting it requires `--allow-project-configs` before any probe, write or
+  prune. `mms init` filters repo-local candidates out silently rather than
+  printing that message, and now keys that filter on the marker rather than on
+  the `.mcp.json (project)` label, which a second repo-local source would
+  otherwise have walked past. **Behavior change**: both commands list Cursor
+  entries they previously ignored, so a `--all` import adopts more servers than
+  before on a machine that has them. Cursor entries are reported but never
+  written: `prune` refuses them with the manual edit to make — before writing
+  anything to the pruned-originals backup log — and `eject` does not accept a
+  `cursor-*` target, so neither can dispatch to the one direct-edit writer that
+  exists and delete from Claude Desktop's config instead.
 
 - **A per-tool `chars_per_token` now applies to a token budget inherited from
   its upstream server** (#929). The ratio was read only beside a per-tool

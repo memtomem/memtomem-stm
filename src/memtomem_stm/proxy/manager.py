@@ -3519,6 +3519,7 @@ class ProxyManager:
             model=sc.embedding_model,
             base_url=sc.embedding_base_url,
             timeout=sc.embedding_timeout,
+            cache_size=sc.embedding_cache_size,
         )
 
     def _distinct_sqlite_selective_cfgs(
