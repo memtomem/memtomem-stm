@@ -3071,7 +3071,7 @@ def _candidate_identity_entry(cand: dict[str, Any], cwd: Path) -> dict[str, Any]
     was handed.
     """
     entry = cand.get("entry") or {}
-    if entry.get("cwd") is not None:
+    if entry.get("cwd") is not None or entry.get("transport", "stdio") != "stdio":
         return entry
     source_ref = cand.get("source_ref")
     if isinstance(source_ref, dict):
@@ -3107,15 +3107,27 @@ def _stm_identity_entry(cfg: dict[str, Any]) -> dict[str, Any] | None:
     closed on ``None``: the destructive side skips the entry, the dedup side
     declines to call it a duplicate.
 
-    An entry with no origin block at all (a manual ``mms add``, an import
-    predating provenance capture) is a different case — it makes no claim, so
-    it keeps the documented wildcard.
+    An entry with NO origin block — the key absent, or ``null`` — is a
+    different case: a manual ``mms add`` or an import predating provenance
+    capture makes no claim at all, so it keeps the documented wildcard. A
+    block that is *present* but malformed does make a claim, just an
+    unreadable one, and is refused like any other (#955 review 4). These
+    configs are read by the CLI without pydantic validation, so a block that
+    the server would reject still reaches this comparison.
+
+    Only stdio identity has a checkout at all; an HTTP entry is its URL,
+    wherever it was registered from, so it never goes down this path and a
+    broken origin cannot make it incomparable.
     """
     if not isinstance(cfg, dict) or cfg.get("cwd") is not None:
         return cfg
-    origin = cfg.get("origin")
-    if not isinstance(origin, dict) or not isinstance(origin.get("source"), dict):
+    if cfg.get("transport", "stdio") != "stdio":
         return cfg
+    if "origin" not in cfg or cfg["origin"] is None:
+        return cfg
+    origin = cfg["origin"]
+    if not isinstance(origin, dict) or not isinstance(origin.get("source"), dict):
+        return None
     kind, checkout = _checkout_of_source(origin["source"])
     if kind == _CHECKOUT_UNKNOWN:
         return None
@@ -4284,14 +4296,26 @@ def _add_from_clients(
     # Compared pairwise through ``_same_server`` rather than against a set of
     # signatures: identity folds in a stdio ``cwd`` when both sides record
     # one, which a shared key cannot express (#955 review).
-    # An entry whose origin names an unresolvable checkout drops out of the
-    # comparison entirely: it cannot claim a candidate as its duplicate, so the
-    # candidate stays importable rather than being silently skipped.
-    existing_identities = [
-        identity
-        for cfg in servers.values()
-        if isinstance(cfg, dict) and (identity := _stm_identity_entry(cfg)) is not None
-    ]
+    #
+    # An entry whose origin claims a checkout nothing here can resolve is held
+    # apart rather than dropped. Dropping it was fail-OPEN for this direction:
+    # a genuine alias of that same server would import again, and two upstream
+    # entries pointing at one server means the proxy starts or dials it twice
+    # and advertises its tools twice (#955 review 4). It cannot be treated as a
+    # match either — which checkout it belongs to is exactly what is unknown —
+    # so a candidate sharing its base signature is declined with a reason the
+    # operator can act on, instead of being silently duplicated or silently
+    # skipped.
+    existing_identities: list[dict[str, Any]] = []
+    unresolved_signatures: list[tuple[str, ...]] = []
+    for cfg in servers.values():
+        if not isinstance(cfg, dict):
+            continue
+        identity = _stm_identity_entry(cfg)
+        if identity is not None:
+            existing_identities.append(identity)
+        elif (sig := _server_signature(cfg)) is not None:
+            unresolved_signatures.append(sig)
 
     new_candidates: list[dict[str, Any]] = []
     for cand in all_candidates:
@@ -4312,6 +4336,17 @@ def _add_from_clients(
                 err=True,
             )
             skipped.append({"name": cand_name, "reason": "duplicate_signature"})
+            continue
+        cand_sig = _server_signature(identity)
+        if cand_sig is not None and cand_sig in unresolved_signatures:
+            click.echo(
+                f"  {_warn('Skipping:')} '{_disp(cand_name)}' — an existing server runs the "
+                "same command but records an origin whose checkout cannot be read, so STM "
+                "cannot tell whether it is the same server. Fix that entry's `origin.source` "
+                "in the config, or add this one with `mms add`.",
+                err=True,
+            )
+            skipped.append({"name": cand_name, "reason": "ambiguous_identity"})
             continue
         new_candidates.append(cand)
 

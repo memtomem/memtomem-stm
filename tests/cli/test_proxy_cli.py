@@ -6866,6 +6866,200 @@ class TestCheckoutScopedIdentity:
         }
         assert _stm_identity_entry(cfg) is None, why
 
+    @pytest.mark.parametrize(
+        "origin",
+        [
+            {},
+            {"source": None},
+            {"source": "mcp-json"},
+            {"duplicates": []},
+        ],
+        ids=["empty", "null-source", "source-not-an-object", "no-source-key"],
+    )
+    def test_a_malformed_origin_block_is_a_claim_too(self, origin):
+        """Present-but-unreadable is refused; only *absent* is a wildcard.
+
+        The CLI reads these configs without pydantic validation, so a block the
+        server would reject still reaches the comparison — and reading it as
+        "runs anywhere" is the same data-loss class as an unresolvable path
+        (#955 review 4).
+        """
+        from memtomem_stm.cli.proxy import _stm_identity_entry
+
+        cfg = {"transport": "stdio", "command": "./run.sh", "origin": origin}
+        assert _stm_identity_entry(cfg) is None
+
+    @pytest.mark.parametrize("origin", [None, "absent"])
+    def test_no_origin_at_all_is_not_a_claim(self, origin):
+        """Positive control for the line above: the wildcard must survive for
+        a manual ``mms add`` and a pre-provenance import."""
+        from memtomem_stm.cli.proxy import _stm_identity_entry
+
+        cfg: dict = {"transport": "stdio", "command": "./run.sh"}
+        if origin is not None:
+            cfg["origin"] = None
+        identity = _stm_identity_entry(cfg)
+        assert identity is not None and "cwd" not in identity
+
+    @pytest.mark.parametrize("transport", ["sse", "streamable_http"])
+    def test_an_http_entry_has_no_checkout_to_lose(self, transport):
+        """``_same_server`` ignores cwd for HTTP, so a broken origin there must
+        not make an exact URL match incomparable — that would block a prune and
+        force a duplicate import for no reason (#955 review 4)."""
+        from memtomem_stm.cli.proxy import _stm_identity_entry
+
+        cfg = {
+            "transport": transport,
+            "url": "https://example.test/mcp",
+            "origin": {"source": {"kind": "mcp-json"}},
+        }
+        identity = _stm_identity_entry(cfg)
+        assert identity is not None and "cwd" not in identity
+
+    def test_prune_refuses_an_entry_with_a_malformed_origin(
+        self, runner, config, tmp_path, monkeypatch
+    ):
+        """The destructive caller, on the malformed-block shape."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        home, _desktop = self._setup_home(tmp_path, monkeypatch)
+        repo_b = tmp_path / "repo-b"
+        repo_b.mkdir()
+
+        removals: list[list[str]] = []
+
+        def fake_run(cmd, timeout=5, cwd=None):
+            removals.append(list(cmd))
+            return _FakeClaudeResult(returncode=0)
+
+        monkeypatch.setattr(proxy_mod, "_run_claude_mcp", fake_run)
+        self._write_source("mcp-json", home, repo_b)
+        monkeypatch.chdir(repo_b)
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "repo-tool": {
+                            "prefix": "repo",
+                            "transport": "stdio",
+                            "command": "./run.sh",
+                            "origin": {},
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert "No dual-registered upstreams found" in result.output
+        assert removals == []
+
+    def test_an_unresolved_entry_declines_a_matching_candidate(
+        self, runner, config, tmp_path, monkeypatch
+    ):
+        """Dedup must not fail OPEN on the incomparable state.
+
+        Dropping the entry from the comparison let a genuine alias import
+        again, and two upstreams pointing at one server means the proxy runs
+        and advertises it twice. Declining with a reason is the visible,
+        actionable outcome (#955 review 4).
+        """
+        home, _desktop = self._setup_home(tmp_path, monkeypatch)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._write_source("mcp-json", home, repo)
+        (repo / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"repo-tool-alias": {"command": "./run.sh"}}}),
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(repo)
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "repo-tool": {
+                            "prefix": "repo",
+                            "transport": "stdio",
+                            "command": "./run.sh",
+                            "origin": {"source": {"kind": "mcp-json"}},
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "--from-clients",
+                "--all",
+                "--allow-project-configs",
+                "--json",
+                *_cfg_args(config),
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["imported"] == []
+        assert payload["skipped"] == [{"name": "repo-tool-alias", "reason": "ambiguous_identity"}]
+        saved = json.loads(config.read_text(encoding="utf-8"))["upstream_servers"]
+        assert set(saved) == {"repo-tool"}
+
+    def test_an_unresolved_entry_does_not_block_a_different_command(
+        self, runner, config, tmp_path, monkeypatch
+    ):
+        """Positive control: the decline is keyed on the base signature, so an
+        unrelated server is still importable."""
+        home, _desktop = self._setup_home(tmp_path, monkeypatch)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"other-tool": {"command": "./other.sh"}}}),
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(repo)
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "repo-tool": {
+                            "prefix": "repo",
+                            "transport": "stdio",
+                            "command": "./run.sh",
+                            "origin": {"source": {"kind": "mcp-json"}},
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "--from-clients",
+                "--all",
+                "--allow-project-configs",
+                "--json",
+                *_cfg_args(config),
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert [row["name"] for row in payload["imported"]] == ["other-tool"]
+        assert payload["skipped"] == []
+
     def test_a_checkout_less_origin_is_still_a_wildcard(self):
         """Positive control: the tri-state must not collapse into "refuse
         whenever there is an origin". A user-scope import really does run

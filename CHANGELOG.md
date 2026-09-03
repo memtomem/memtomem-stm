@@ -97,7 +97,10 @@ changes inline only. See the deprecation policy in
   A checkout-less source contributes nothing and matches any `cwd` — as does an
   entry with no `origin` block — because those servers do run from wherever the
   client starts, while an `origin` that names a checkout this build cannot
-  resolve is skipped rather than pruned. Identical relative commands in two
+  resolve is skipped rather than pruned, and declines a same-command candidate
+  on import with a new `ambiguous_identity` skip reason rather than adopting a
+  second copy of a server it may already proxy. Only stdio identity has a
+  checkout — an HTTP entry is its URL wherever it was registered from. Identical relative commands in two
   checkouts therefore stay distinct: `mms prune` run from the second one no
   longer removes that checkout's unrelated entry.
 
