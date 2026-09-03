@@ -447,7 +447,8 @@ Options:
   --config TEXT         [default: (~/.memtomem/stm_proxy.json)]
   --to TARGET           Restore target for entries without a usable origin:
                         claude-user | claude-project[:PATH] | mcp-json[:PATH]
-                        | claude-desktop. Entries with a recorded origin
+                        | claude-desktop. Entries with a usable, writable
+                        recorded origin
                         ignore this.
   --keep                Restore to the host but keep the STM entry (dual
                         registration).
@@ -468,7 +469,7 @@ Options:
                         --dry-run).
 ```
 
-The reverse of `mms add --import --prune`: stop proxying a server **without losing it**. Imports capture an `origin` provenance block per entry in `stm_proxy.json` — the structured source (`claude-user`, `claude-project`, `mcp-json`, `claude-desktop`, `cursor-user`, `cursor-project`) plus the verbatim host entry as it existed at import time. `eject` writes that original back to where it came from, verifies the restore by re-reading the host config, and only then removes the entry from STM. The order is the safety invariant: host write first, STM removal second — any failure leaves the server registered in at least one place (worst case dual registration, never disappearance).
+The reverse of `mms add --import --prune`: stop proxying a server **without losing it**. Imports capture an `origin` provenance block per entry in `stm_proxy.json` — the structured source (`claude-user`, `claude-project`, `mcp-json`, `claude-desktop`, `cursor-user`, `cursor-project`) plus the verbatim host entry as it existed at import time. `eject` writes that original back to where it came from — or, where that origin is one nothing here writes (`cursor-*`), to a target you name — verifies the restore by re-reading the host config, and only then removes the entry from STM. The order is the safety invariant: host write first, STM removal second — any failure leaves the server registered in at least one place (worst case dual registration, never disappearance).
 
 `origin.original` may carry secrets (`env`, `headers`), so `mms list --json` / `mms status --json` redact it — the summary keys stay, plus `has_original` so scripts can tell a redacted block from one that never captured an original.
 

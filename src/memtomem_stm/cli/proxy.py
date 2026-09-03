@@ -6223,7 +6223,7 @@ def _eject_verify(plan: _EjectPlan) -> list[str]:
     metavar="TARGET",
     help=(
         f"Restore target for entries without a usable origin: {_EJECT_TARGETS_HELP}. Entries "
-        "with a recorded origin ignore this."
+        "with a usable, writable recorded origin ignore this."
     ),
 )
 @click.option(
