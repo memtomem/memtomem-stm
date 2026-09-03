@@ -282,10 +282,14 @@ A selected entry from a project-local file in the current checkout —
 `.mcp.json` or `.cursor/mcp.json` — is refused before probing, saving, or
 pruning unless `--allow-project-configs` is passed. Selecting a repository
 file is not by itself consent to adopt a command supplied by that checkout.
+When a Cursor project stdio entry is accepted, the saved STM entry records the
+checkout root as `cwd`, so relative commands and arguments still resolve when
+the globally registered proxy starts elsewhere.
 
-Cursor entries are discovered and reported but never written: `prune` refuses
-them with the manual edit to make instead, and `eject` does not accept a
-`cursor-*` target. Only the Claude sources have a writer.
+Cursor entries are discovered and reported but never written: standalone
+`prune` lists them as manual-only, import-time `--prune` reports the refused
+removal with the manual edit, and `eject` does not accept a `cursor-*` target.
+Only the Claude sources have a writer.
 
 Bulk validation is atomic by default: if any selected server fails its probe,
 none of the imported servers are written and the command exits 1
@@ -310,7 +314,7 @@ scripted import stays idempotent.
 
 To remove the original direct registrations after a successful import, pass `--prune`. On a TTY you get a `(name, source)` confirm prompt that defaults to **No** before any file edits; in non-TTY callers (CI, scripts) you must pass `--prune` explicitly — the flag never auto-fires on inferred consent. A candidate registered in more than one source client is pruned from every source `mms` can write, not just the one it was imported from. Prune failures are non-fatal: the import stays, and each failed entry prints the exact manual `claude mcp remove` or config edit to retry — which is also how a Cursor entry is reported, since `mms` never writes those files. `--prune` without `--from-clients` is a usage error rather than a silent no-op.
 
-The import→prune transition is reversible: every import records an `origin` provenance block per entry (the structured source plus the verbatim host entry), and every prune backs the deleted host entry up to `~/.memtomem/pruned_upstreams.json` before removing it (a Cursor source is neither backed up nor removed — nothing deletes it to back up). [`mms eject`](#eject) walks the whole path back — it restores the captured host entry to where it came from (or, for a `cursor-*` origin, to a `--to` target you name) and removes the entry from STM.
+The import→prune transition is reversible: every import records an `origin` provenance block per entry (the structured source plus the verbatim host entry), and every prune backs the deleted host entry up to `~/.memtomem/pruned_upstreams.json` before removing it. A Cursor source is neither backed up nor removed because it is never sent to a writer. [`mms eject`](#eject) walks the whole path back — it restores the captured host entry to where it came from (or, for a `cursor-*` origin, to a `--to` target you name) and removes the entry from STM.
 
 > **Note**: The CLI's `--compression` flag exposes 5 of the 10 strategies. The remaining five (`extract_fields`, `schema_pruning`, `skeleton`, `progressive`, `llm_summary`) are configured by editing `stm_proxy.json` directly. See [Compression Strategies](compression.md).
 
@@ -423,17 +427,17 @@ Options:
   --json         Output as JSON for scripting (requires --yes, or --dry-run).
 ```
 
-Removes direct registrations for STM upstreams that are still registered in a source MCP client (`~/.claude.json`, `.mcp.json`, Claude Desktop). Cursor entries are reported rather than removed — `mms` never writes a Cursor config, so each one prints the manual edit to make. Use this to collapse the dual-path state that `mms init` and `mms add --import` leave behind when you didn't opt into pruning at import time — the tools then route through STM only, picking up compression, caching, and LTM surfacing.
+Removes direct registrations for STM upstreams that are still registered in a source MCP client (`~/.claude.json`, `.mcp.json`, Claude Desktop). Cursor entries are reported separately as manual-only rather than planned, attempted, or failed — `mms` never writes a Cursor config, so each one carries the manual edit to make. Use this to collapse the dual-path state that `mms init` and `mms add --import` leave behind when you didn't opt into pruning at import time — the tools then route through STM only, picking up compression, caching, and LTM surfacing.
 
 Scope selection is explicit by design: pass `--all` to act on every dual-registered upstream, or pass one or more `NAMES` to limit the action. Either way the run only writes the sources `mms` can write; the rest are listed as `(manual)` with the edit to make. Running `mms prune` with no arguments is a usage error rather than defaulting to "everything" — this is a destructive operation against external config files and the default should be visible.
 
-"Dual-registered" requires both the name **and** the identity to match: the source-client entry must share the STM upstream's `(transport, command, args)` or `(transport, url)` signature. If you've edited either side to point at a different server that happens to share a name, `mms prune` skips it rather than clobbering the unrelated entry.
+"Dual-registered" requires both the name **and** the identity to match: the source-client entry must share the STM upstream's `(transport, cwd, command, args)` or `(transport, url)` signature. The `cwd` component keeps identical relative commands in different checkouts distinct. If you've edited either side to point at a different server that happens to share a name, `mms prune` skips it rather than clobbering the unrelated entry.
 
 STM's own config (`stm_proxy.json`) is never modified. Only source-client files change. Failures are surfaced via non-zero exit and the exact manual `claude mcp remove` command for each failed entry, so scripting callers can retry.
 
 Before deleting a host entry, every prune path appends the verbatim entry (with its source and timestamp) to `~/.memtomem/pruned_upstreams.json` (mode `0600`) — backup-before-delete, so a crash mid-prune never loses the only copy. The log is append-only and advisory: [`mms eject`](#eject) suggests it when an entry has no recorded origin, but never restores from it without your confirmation.
 
-With `--json`, stdout carries a single result document: `{"action": "prune", "ok": ..., "dry_run": ..., "config_path": ..., "planned": [{"name", "source"}], "manual": [{"name", "source", "hint"}], "pruned": [...], "failed": [{"name", "source", "error", "hint"}]}` — `planned` is built from the same iteration as the human preview and holds only sources `mms` can write; `manual` holds the rest (today, Cursor) with the edit to make, and each `failed` row's `hint` is the exact manual removal command. `--json` never prompts: without `--yes` (or `--dry-run`) it refuses with exit 2 and `{"error": "confirmation_required", ...}`. Partial failures keep `ok: false` + exit 1, with the human diagnostics still on stderr.
+With `--json`, stdout carries a single result document: `{"action": "prune", "ok": ..., "dry_run": ..., "config_path": ..., "planned": [{"name", "source"}], "manual": [{"name", "source", "hint"}], "pruned": [...], "failed": [{"name", "source", "error", "hint"}]}` — `planned` contains only sources `mms` will attempt to write; `manual` contains unmanaged sources (currently Cursor) with the edit to make. Each actual `failed` row's `hint` is the exact manual removal command. A manual-only run exits 0 with `ok: true` because no planned action failed. `--json` never prompts: without `--yes` (or `--dry-run`) it refuses with exit 2 and `{"error": "confirmation_required", ...}`. Partial failures keep `ok: false` + exit 1, with the human diagnostics still on stderr.
 
 ```bash
 mms prune --all              # remove every writable dual registration (TTY: confirm prompt)

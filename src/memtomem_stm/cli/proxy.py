@@ -2917,29 +2917,30 @@ _SOURCE_BY_LABEL: dict[str, _SourceSpec] = {spec.label: spec for spec in _SOURCE
 
 
 def _prune_targets(
-    cands: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     """Split ``(name, source)`` prune targets into writable and manual-only.
 
-    One iteration feeds the human preview, the confirm prompt and the ``--json``
-    plan, so those three cannot disagree about what a run would do — and since
-    #955 they must also not agree on something false: a source with no writer
-    is guaranteed to fail, so listing it as "would be pruned" promises an
-    action the writer refuses. Deduped on ``(name, source)`` because a
-    candidate can name the same source twice (primary plus a duplicate row).
+    One iteration feeds the human preview, confirm prompt, JSON plan, and
+    standalone writer allowlist. Unmanaged sources such as Cursor stay visible
+    to the operator but are never executed or counted as failures. Deduped on
+    ``(name, source)`` because a candidate can name the same source twice.
     """
     writable: list[dict[str, str]] = []
     manual: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
-    for cand in cands:
-        for src in [cand["source"], *(cand.get("duplicate_in") or [])]:
-            key = (cand["name"], src)
+    for cand in candidates:
+        for source in [cand["source"], *(cand.get("duplicate_in") or [])]:
+            key = (cand["name"], source)
             if key in seen:
                 continue
             seen.add(key)
-            spec = _SOURCE_BY_LABEL.get(src)
-            row = {"name": cand["name"], "source": src}
-            (manual if spec is not None and not spec.managed else writable).append(row)
+            row = {"name": cand["name"], "source": source}
+            spec = _SOURCE_BY_LABEL.get(source)
+            if spec is not None and not spec.managed:
+                manual.append(row)
+            else:
+                writable.append(row)
     return writable, manual
 
 
@@ -3400,6 +3401,7 @@ def _prune_imported_candidates(
     imported_candidates: list[dict[str, Any]],
     *,
     pruned_at: str,
+    allowed_sources: set[tuple[str, str]] | None = None,
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str, str]]]:
     """Prune each imported candidate from every source that registered it.
 
@@ -3412,6 +3414,10 @@ def _prune_imported_candidates(
     ordering rationale); an append failure fails that source's prune
     outright and the delete is skipped.
 
+    ``allowed_sources`` narrows execution to a precomputed standalone-prune
+    plan. When omitted, the import-time ``--prune`` path retains its existing
+    behavior and reports unmanaged sources as failures with manual hints.
+
     Returns ``(pruned, failed)`` where ``pruned`` is ``[(name, source), ...]``
     and ``failed`` is ``[(name, source, error), ...]``.
     """
@@ -3419,6 +3425,8 @@ def _prune_imported_candidates(
     failed: list[tuple[str, str, str]] = []
     for cand in imported_candidates:
         for src, source_ref, raw in _candidate_source_records(cand):
+            if allowed_sources is not None and (cand["name"], src) not in allowed_sources:
+                continue
             spec = _SOURCE_BY_LABEL.get(src)
             if spec is not None and not spec.managed:
                 # Refuse BEFORE the backup append (#955). The log is
@@ -3902,10 +3910,12 @@ def _pick_imports(candidates: list[dict[str, Any]]) -> list[int]:
 def _server_signature(cfg: dict[str, Any]) -> tuple[str, ...] | None:
     """Best-effort content signature for dedup between discovered + registered.
 
-    Same ``(transport, command, *args)`` or ``(transport, url)`` → assume
-    the user already imported this server under a different name. Returns
-    ``None`` when the entry is missing the identifying field (caller falls
-    back to name-based match only).
+    Same ``(transport, cwd, command, *args)`` or ``(transport, url)`` → assume
+    the user already imported this server under a different name. ``cwd`` is
+    part of stdio identity because identical relative commands in different
+    project checkouts can be different servers. Returns ``None`` when the
+    entry is missing the identifying field (caller falls back to name-based
+    match only).
     """
     transport = cfg.get("transport", "stdio")
     if transport == "stdio":
@@ -3915,7 +3925,9 @@ def _server_signature(cfg: dict[str, Any]) -> tuple[str, ...] | None:
         args = cfg.get("args") or []
         if not isinstance(args, list):
             args = []
-        return ("stdio", cmd, *(str(a) for a in args))
+        cwd = cfg.get("cwd")
+        cwd_key = "" if cwd is None else str(cwd)
+        return ("stdio", cwd_key, cmd, *(str(a) for a in args))
     url = cfg.get("url", "") or ""
     if not url:
         return None
@@ -5519,8 +5531,8 @@ def prune(
     duplicate tool advertisement. STM's own config is not touched.
 
     Cursor registrations are found but never removed: nothing here writes a
-    Cursor config, so each one is reported as a failed prune carrying the
-    manual edit to make (#955).
+    Cursor config, so each one is reported separately as a manual-only row and
+    excluded from the execution plan (#955).
     """
     config_path = resolve_cli_config_path(config_path).path
     if names and all_servers:
@@ -5620,12 +5632,9 @@ def prune(
         click.echo("No dual-registered upstreams found.")
         return
 
-    # Preview iteration must cover the same ``source + duplicate_in`` set
-    # that ``_prune_imported_candidates`` acts on — otherwise a user could
-    # approve fewer entries than get written. See
-    # ``test_duplicate_in_sources_all_pruned`` for the contract pin. The
-    # ``--json`` ``planned`` rows come from this same loop so the machine
-    # plan and the human preview cannot drift.
+    # Preview iteration and execution use the same writable target set, so a
+    # user cannot approve fewer entries than get written. Manual-only rows
+    # remain visible but sit outside the plan and writer allowlist.
     if not as_json:
         click.echo(_hdr(f"Dual-registered upstream(s): {len(dual)}"))
     # Width over the *displayed* names, not the stored ones: an escaped
@@ -5685,7 +5694,15 @@ def prune(
         return
 
     pruned_at = utc_now_iso()
-    pruned, failed = _prune_imported_candidates(dual, pruned_at=pruned_at)
+    allowed_sources = {(row["name"], row["source"]) for row in planned}
+    if allowed_sources:
+        pruned, failed = _prune_imported_candidates(
+            dual,
+            pruned_at=pruned_at,
+            allowed_sources=allowed_sources,
+        )
+    else:
+        pruned, failed = [], []
     # Same step-③ metadata save as the inline import path: flip the matching
     # per-source ``origin`` rows for entries that have one. The save only
     # happens when a row actually flipped — entries without origin leave the

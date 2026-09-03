@@ -6273,6 +6273,57 @@ class TestAddFromClients:
         data = json.loads(config.read_text(encoding="utf-8"))
         assert set(data["upstream_servers"]) == {"my-fs"}
 
+    def test_relative_stdio_commands_in_different_cwds_are_not_deduplicated(
+        self, runner, config, monkeypatch
+    ):
+        """Project cwd is part of stdio identity for relative commands.
+
+        Two checkouts can each carry a distinct ``./run.sh`` server. Treating
+        only command and args as identity would silently skip the second one.
+        """
+        self._seed_config(
+            config,
+            {
+                "repo-a-tool": {
+                    "prefix": "repo_a",
+                    "transport": "stdio",
+                    "command": "./run.sh",
+                    "cwd": "/repo/a",
+                }
+            },
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "repo-b-tool",
+                    "source": "Cursor (project)",
+                    "entry": {
+                        "transport": "stdio",
+                        "command": "./run.sh",
+                        "cwd": "/repo/b",
+                    },
+                    "is_repo_local": True,
+                }
+            ],
+        )
+
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "--from-clients",
+                "--all",
+                "--allow-project-configs",
+                *_cfg_args(config),
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(config.read_text(encoding="utf-8"))
+        assert set(data["upstream_servers"]) == {"repo-a-tool", "repo-b-tool"}
+        assert data["upstream_servers"]["repo-b-tool"]["cwd"] == "/repo/b"
+
     def test_all_registered_exits_cleanly(self, runner, config, monkeypatch):
         """When every discovered candidate is already registered, we exit
         with a no-op message instead of prompting for an empty selection."""
@@ -6840,9 +6891,7 @@ class TestUnmanagedSources:
             ],
         )
 
-        result = runner.invoke(
-            cli, ["prune", "--all", "--dry-run", "--json", *_cfg_args(config)]
-        )
+        result = runner.invoke(cli, ["prune", "--all", "--dry-run", "--json", *_cfg_args(config)])
 
         assert result.exit_code == 0, result.output
         payload = json.loads(result.stdout)
@@ -8118,6 +8167,46 @@ class TestPruneCommand:
         assert "No dual-registered upstreams found" in result.output
         assert not any(c[:3] == ["claude", "mcp", "remove"] for c in fake_claude["calls"])
 
+    def test_divergent_cwd_not_dual_registered(self, runner, config, monkeypatch, fake_claude):
+        """The same relative command in another checkout is not a prune target."""
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "repo-tool": {
+                            "prefix": "repo",
+                            "transport": "stdio",
+                            "command": "./run.sh",
+                            "cwd": "/repo/a",
+                        }
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "repo-tool",
+                    "source": "Cursor (project)",
+                    "entry": {
+                        "transport": "stdio",
+                        "command": "./run.sh",
+                        "cwd": "/repo/b",
+                    },
+                }
+            ],
+        )
+
+        result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert "No dual-registered upstreams found" in result.output
+        assert not any(c[:3] == ["claude", "mcp", "remove"] for c in fake_claude["calls"])
+
     def test_dry_run_with_names_filters_before_preview(
         self, runner, config, monkeypatch, fake_claude
     ):
@@ -8219,6 +8308,7 @@ class TestPruneCommand:
         data = json.loads(result.stdout)
         assert data["action"] == "prune" and data["ok"] is True and data["dry_run"] is True
         assert data["planned"] == [{"name": "docs-langchain", "source": "Claude Code (user)"}]
+        assert data["manual"] == []
         assert data["pruned"] == [] and data["failed"] == []
         assert fake_claude["calls"] == []
 
@@ -8243,8 +8333,78 @@ class TestPruneCommand:
         assert result.exit_code == 0, result.output
         data = json.loads(result.stdout)
         assert data["ok"] is True and data["dry_run"] is False
+        assert data["manual"] == []
         assert data["pruned"] == [{"name": "docs-langchain", "source": "Claude Code (user)"}]
         assert data["failed"] == []
+
+    def test_json_manual_only_cursor_is_not_executed_or_failed(self, runner, config, monkeypatch):
+        """A manual-only plan is a successful no-op, not a failed attempt."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._seed_config(config, ["cursor-tool"])
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "cursor-tool",
+                    "source": "Cursor (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                }
+            ],
+        )
+
+        def fail_if_called(*_args, **_kwargs):
+            raise AssertionError("manual-only source reached the prune writer")
+
+        monkeypatch.setattr(proxy_mod, "_prune_from_source", fail_if_called)
+        result = runner.invoke(cli, ["prune", "--all", "--yes", "--json", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)
+        assert data["ok"] is True
+        assert data["planned"] == []
+        assert data["pruned"] == []
+        assert data["failed"] == []
+        assert [(row["name"], row["source"]) for row in data["manual"]] == [
+            ("cursor-tool", "Cursor (user)")
+        ]
+        assert "~/.cursor/mcp.json" in data["manual"][0]["hint"]
+
+    def test_json_mixed_plan_executes_only_writable_sources(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """Manual rows stay visible while writable rows execute normally."""
+        self._seed_config(config, ["cursor-tool", "managed-tool"])
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "cursor-tool",
+                    "source": "Cursor (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+                {
+                    "name": "managed-tool",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+
+        result = runner.invoke(cli, ["prune", "--all", "--yes", "--json", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)
+        assert data["planned"] == [{"name": "managed-tool", "source": "Claude Code (user)"}]
+        assert [(row["name"], row["source"]) for row in data["manual"]] == [
+            ("cursor-tool", "Cursor (user)")
+        ]
+        assert data["pruned"] == [{"name": "managed-tool", "source": "Claude Code (user)"}]
+        assert data["failed"] == []
+        remove_calls = [
+            call for call in fake_claude["calls"] if call[:3] == ["claude", "mcp", "remove"]
+        ]
+        assert remove_calls == [["claude", "mcp", "remove", "managed-tool", "-s", "user"]]
 
     def test_json_partial_failure_carries_hint_and_exits_1(
         self, runner, config, monkeypatch, fake_claude
@@ -8280,7 +8440,8 @@ class TestPruneCommand:
         assert result.exit_code == 0
         data = json.loads(result.stdout)
         assert data["ok"] is True
-        assert data["planned"] == [] and data["pruned"] == [] and data["failed"] == []
+        assert data["planned"] == [] and data["manual"] == []
+        assert data["pruned"] == [] and data["failed"] == []
 
 
 # ── prune backup log + per-source pruned metadata (#475 PR2) ─────────────
