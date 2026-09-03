@@ -54,6 +54,7 @@ from memtomem_stm.mms.import_hosts import (
     _DANGEROUS_ENV_KEYS,
     _desktop_config_path,
     _is_self_reference,
+    _mcp_servers,
     _read_json_safely,
     project_local_gate_message,
 )
@@ -2876,14 +2877,21 @@ def _normalize_client_entry(raw: dict[str, Any]) -> dict[str, Any] | None:
 # (`_prune_from_source`). ``kind`` is the machine-readable identifier
 # persisted in ``origin.source.kind`` (see ``UpstreamOrigin`` in
 # ``proxy/config.py``); ``claude_scope`` is the ``claude mcp remove -s``
-# scope for shell-out sources, ``None`` marking the one source (Claude
-# Desktop) handled by direct JSON edit instead.
+# scope for shell-out sources, ``None`` marking the sources handled by direct
+# JSON edit or not written at all. ``managed`` says which of those two: an
+# unmanaged source is discovered and reported but never written, so the
+# removal hint, the prune writer and eject must refuse it rather than fall
+# through to the one direct-edit writer that exists (Claude Desktop's), which
+# would delete from the wrong file (#955). Labels are shared with
+# ``mms/import_hosts.py``'s scanners — the two discovery paths name the same
+# file the same way or the gate message describes neither.
 @dataclass(frozen=True)
 class _SourceSpec:
     label: str
     kind: str
     claude_scope: str | None
     is_repo_local: bool = False
+    managed: bool = True
 
 
 _SOURCE_SPECS: tuple[_SourceSpec, ...] = (
@@ -2891,7 +2899,18 @@ _SOURCE_SPECS: tuple[_SourceSpec, ...] = (
     _SourceSpec("Claude Code (user)", "claude-user", "user"),
     _SourceSpec("Claude Code (project)", "claude-project", "local"),
     _SourceSpec("Claude Desktop", "claude-desktop", None),
+    # Appended last so the labels above keep winning the first-wins dedupe
+    # they have always won.
+    _SourceSpec("Cursor (user)", "cursor-user", None, managed=False),
+    _SourceSpec("Cursor (project)", "cursor-project", None, is_repo_local=True, managed=False),
 )
+# Where an unmanaged source lives, for the removal hint. App-owned strings, so
+# they need no display escaping; the project entry is relative on purpose —
+# the hint is for the checkout the operator is standing in.
+_UNMANAGED_SOURCE_FILES: dict[str, str] = {
+    "cursor-user": "~/.cursor/mcp.json",
+    "cursor-project": ".cursor/mcp.json in this checkout",
+}
 _SOURCE_BY_LABEL: dict[str, _SourceSpec] = {spec.label: spec for spec in _SOURCE_SPECS}
 _SOURCE_BY_KIND: dict[str, _SourceSpec] = {spec.kind: spec for spec in _SOURCE_SPECS}
 _EJECT_TARGETS_HELP = "claude-user | claude-project[:PATH] | mcp-json[:PATH] | claude-desktop"
@@ -2948,6 +2967,22 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
     desktop = _read_json_safely(_desktop_config_path())
     if desktop and isinstance(desktop.get("mcpServers"), dict):
         sources.append((_SOURCE_BY_LABEL["Claude Desktop"], None, desktop["mcpServers"]))
+
+    # 4-5. Cursor, user then project. Same files and labels as
+    # ``import_hosts.scan_cursor``: the gate message this command prints names
+    # ``.cursor/mcp.json``, which was true of ``mms import`` and not of this
+    # path (#955). Discovery only — see ``managed`` on the specs above.
+    for label, path in (
+        ("Cursor (user)", Path("~/.cursor/mcp.json").expanduser()),
+        ("Cursor (project)", cwd / ".cursor" / "mcp.json"),
+    ):
+        cursor = _read_json_safely(path)
+        if not cursor:
+            continue
+        servers = _mcp_servers(cursor)
+        if servers:
+            spec = _SOURCE_BY_LABEL[label]
+            sources.append((spec, str(path.resolve()) if spec.is_repo_local else None, servers))
 
     seen: dict[str, dict[str, Any]] = {}
     for spec, src_path, servers in sources:
@@ -3078,6 +3113,13 @@ def _source_removal_hint(name: str, source: str) -> str:
         return f"# Remove '{_disp(name)}' from {_disp(source)}."
     if spec.claude_scope is not None:
         return _shell_join(["claude", "mcp", "remove", name, "-s", spec.claude_scope])
+    if not spec.managed:
+        # The Desktop hint below names one fixed path. An unmanaged source has
+        # its own file, so falling through would point the operator at a file
+        # the entry is not in (#955). Name the file, not just the client: this
+        # hint is the whole remediation for a source nothing here writes.
+        where = _UNMANAGED_SOURCE_FILES.get(spec.kind, f"the {spec.label} config")
+        return f"# Edit {where} and remove '{_disp(name)}' under mcpServers."
     return f"# Edit {_desktop_config_path()} and remove '{_disp(name)}' under mcpServers."
 
 
@@ -3197,6 +3239,13 @@ def _prune_from_source(name: str, source: str) -> tuple[bool, str | None]:
         return (False, f"unknown source label: {source}")
     if spec.claude_scope is not None:
         return _claude_mcp_remove(name, spec.claude_scope)
+    if not spec.managed:
+        # Refused, not guessed: the only direct-edit writer here is Claude
+        # Desktop's, and dispatching to it would delete the entry from a file
+        # the operator never named. A prune failure is non-fatal and prints the
+        # manual edit from `_source_removal_hint`, so the entry stays where it
+        # is and the operator is told where that is (#955).
+        return (False, f"{spec.label} entries are not pruned by mms — remove '{name}' by hand")
     return _desktop_json_remove_entry(name)
 
 
@@ -4316,9 +4365,10 @@ def init(
 
     candidates = [] if demo else _discover_candidates(Path.cwd())
     if not allow_project_configs:
-        candidates = [
-            cand for cand in candidates if str(cand.get("source", "")) != ".mcp.json (project)"
-        ]
+        # Keyed on the marker, not on one label: the marker is what says "this
+        # file came from the checkout", and a second repo-local source would
+        # otherwise walk straight past this filter (#955).
+        candidates = [cand for cand in candidates if cand.get("is_repo_local") is not True]
     imported: dict[str, dict[str, Any]] = {}
     # Parallel list of the source-client candidate dicts for entries we
     # actually import. Needed so the end-of-flow prune step can address the
@@ -5617,8 +5667,12 @@ def _parse_eject_to(value: str) -> tuple[_SourceSpec, str | None]:
     """
     kind, _, path_part = value.partition(":")
     spec = _SOURCE_BY_KIND.get(kind)
+    if spec is not None and not spec.managed:
+        # Discovered but never written (#955): eject restores an entry to its
+        # host config, and there is no writer for this one.
+        spec = None
     if spec is None:
-        kinds = " | ".join(s.kind for s in _SOURCE_SPECS)
+        kinds = " | ".join(s.kind for s in _SOURCE_SPECS if s.managed)
         raise click.UsageError(f"--to must be one of: {kinds} (got {value!r})")
     if kind == "claude-project":
         return spec, str(Path(path_part or ".").expanduser().resolve())
@@ -5886,9 +5940,15 @@ def _resolve_eject_plan(
     # origin-less entries or a vanished origin path.
     kind = path = None
     no_origin = "no usable origin recorded"
-    if source and source.get("kind") in _SOURCE_BY_KIND:
+    origin_spec = _SOURCE_BY_KIND.get(source.get("kind", "")) if source else None
+    if source and origin_spec is not None and origin_spec.managed:
         kind = source["kind"]
         path = source.get("path") if isinstance(source.get("path"), str) else None
+    elif origin_spec is not None:
+        # Recorded, but nothing can write it back (#955). Falls through to the
+        # `--to` escape hatch rather than claiming the origin is unusable for
+        # the usual reason (a vanished path).
+        no_origin = f"{origin_spec.label} entries cannot be ejected — mms never writes that config"
     if kind == "claude-project" and (path is None or not Path(path).is_dir()):
         no_origin = f"origin project directory no longer exists: {path}"
         kind = path = None

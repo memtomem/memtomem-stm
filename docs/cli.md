@@ -147,7 +147,7 @@ It only seeds the initial value; edit `cache.default_ttl_seconds` (or per-tool/p
 
 Validation is **advisory**: probe failures are reported as warnings but the config is still written. That way a flaky network or a cold upstream doesn't block setup; re-run `mms health` later once things are up.
 
-When you import servers that were already directly registered in a source MCP client (`~/.claude.json`, `.mcp.json`, Claude Desktop), `init` leaves the direct registrations in place by default — source-client configs are read-only unless you opt in. Pass `--prune-originals` to collapse the dual-path in the same session; on a TTY you instead get a single y/N prompt (default No). Skipped the prompt or didn't pass the flag? Run [`prune`](#prune) afterwards to clean up without re-running the wizard.
+When you import servers that were already directly registered in a source MCP client (`~/.claude.json`, `.mcp.json`, Claude Desktop, Cursor), `init` leaves the direct registrations in place by default — source-client configs are read-only unless you opt in. Pass `--prune-originals` to collapse the dual-path in the same session; on a TTY you instead get a single y/N prompt (default No). Skipped the prompt or didn't pass the flag? Run [`prune`](#prune) afterwards to clean up without re-running the wizard.
 
 ```bash
 mms init                          # interactive wizard
@@ -263,6 +263,7 @@ With `--json`, stdout carries a single result document — `{"action": "add", "o
 
 Use `--from-clients` (alias `--import`) to bulk-pick additional servers from
 the same MCP clients `mms init` scans: `~/.claude.json`, project `.mcp.json`,
+Cursor's `~/.cursor/mcp.json` and the checkout's `.cursor/mcp.json`,
 and the OS-specific Claude Desktop config — macOS
 `~/Library/Application Support/Claude/claude_desktop_config.json`, Windows
 `%APPDATA%\Claude\claude_desktop_config.json`, or Linux
@@ -272,10 +273,14 @@ filtered out by name and by `(transport, command, args)` / `(transport, url)`
 signature before the selection UI. `--validate` and `--timeout` work on the
 selected subset.
 
-A selected entry from the current checkout's project-local `.mcp.json` is
-refused before probing, saving, or pruning unless
-`--allow-project-configs` is passed. Selecting a repository file is not by
-itself consent to adopt a command supplied by that checkout.
+A selected entry from a project-local file in the current checkout —
+`.mcp.json` or `.cursor/mcp.json` — is refused before probing, saving, or
+pruning unless `--allow-project-configs` is passed. Selecting a repository
+file is not by itself consent to adopt a command supplied by that checkout.
+
+Cursor entries are discovered and reported but never written: `prune` refuses
+them with the manual edit to make instead, and `eject` does not accept a
+`cursor-*` target. Only the Claude sources have a writer.
 
 Bulk validation is atomic by default: if any selected server fails its probe,
 none of the imported servers are written and the command exits 1
@@ -298,7 +303,7 @@ run exits 1 (`unknown_server`) before writing anything, while a name already
 registered here is skipped with a warning and exit 0 — re-running the same
 scripted import stays idempotent.
 
-To remove the original direct registrations after a successful import, pass `--prune`. On a TTY you get a `(name, source)` confirm prompt that defaults to **No** before any file edits; in non-TTY callers (CI, scripts) you must pass `--prune` explicitly — the flag never auto-fires on inferred consent. A candidate registered in more than one source client is pruned from every source, not just the one it was imported from. Prune failures are non-fatal: the import stays, and each failed entry prints the exact manual `claude mcp remove` or Claude Desktop edit to retry. `--prune` without `--from-clients` is a usage error rather than a silent no-op.
+To remove the original direct registrations after a successful import, pass `--prune`. On a TTY you get a `(name, source)` confirm prompt that defaults to **No** before any file edits; in non-TTY callers (CI, scripts) you must pass `--prune` explicitly — the flag never auto-fires on inferred consent. A candidate registered in more than one source client is pruned from every source, not just the one it was imported from. Prune failures are non-fatal: the import stays, and each failed entry prints the exact manual `claude mcp remove` or config edit to retry — which is also how a Cursor entry is reported, since `mms` never writes those files. `--prune` without `--from-clients` is a usage error rather than a silent no-op.
 
 The import→prune transition is reversible: every import records an `origin` provenance block per entry (the structured source plus the verbatim host entry), and every prune backs the deleted host entry up to `~/.memtomem/pruned_upstreams.json` before removing it. [`mms eject`](#eject) walks the whole path back — it restores the captured host entry to where it came from and removes the entry from STM.
 
@@ -364,7 +369,7 @@ mms add filesystem \
   --prefix fs \
   --validate
 
-# Bulk-import servers already configured in Claude Desktop / Code / .mcp.json
+# Bulk-import servers already configured in Claude Desktop / Code / Cursor / .mcp.json
 mms add --import            # or --from-clients; skips anything already registered
 
 # Import AND prune originals from source clients
@@ -412,7 +417,7 @@ Options:
   --json         Output as JSON for scripting (requires --yes, or --dry-run).
 ```
 
-Removes direct registrations for STM upstreams that are still registered in a source MCP client (`~/.claude.json`, `.mcp.json`, Claude Desktop). Use this to collapse the dual-path state that `mms init` and `mms add --import` leave behind when you didn't opt into pruning at import time — the tools then route through STM only, picking up compression, caching, and LTM surfacing.
+Removes direct registrations for STM upstreams that are still registered in a source MCP client (`~/.claude.json`, `.mcp.json`, Claude Desktop). Cursor entries are reported rather than removed — `mms` never writes a Cursor config, so each one prints the manual edit to make. Use this to collapse the dual-path state that `mms init` and `mms add --import` leave behind when you didn't opt into pruning at import time — the tools then route through STM only, picking up compression, caching, and LTM surfacing.
 
 Scope selection is explicit by design: pass `--all` to act on every dual-registered upstream, or pass one or more `NAMES` to limit the action. Running `mms prune` with no arguments is a usage error rather than defaulting to "everything" — this is a destructive operation against external config files and the default should be visible.
 

@@ -3551,10 +3551,11 @@ class TestInitDiscoveryHelpers:
 
 
 class TestInitDiscoverySources:
-    """`_discover_candidates` reads three source files (project `.mcp.json`,
-    `~/.claude.json`, Claude Desktop config) and dedupes by name in that
-    priority order. Each test sets up a sandbox HOME + cwd to simulate a
-    user with specific configs already present."""
+    """`_discover_candidates` reads five source files (project `.mcp.json`,
+    `~/.claude.json`, Claude Desktop config, and Cursor's user and project
+    `mcp.json`) and dedupes by name in that priority order. Each test sets up
+    a sandbox HOME + cwd to simulate a user with specific configs already
+    present."""
 
     def _setup_home(self, tmp_path: Path, monkeypatch):
         home = tmp_path / "home"
@@ -3715,6 +3716,118 @@ class TestInitDiscoverySources:
             "path": str((cwd / ".mcp.json").resolve()),
         }
 
+    def test_discovers_cursor_user_config(self, tmp_path, monkeypatch):
+        """The gate message names ``.cursor/mcp.json``; this path never read it.
+
+        ``mms import`` scans both Cursor files and marks the project one
+        repo-local, so the shared message was accurate there and overstated
+        here — a user who read it concluded their Cursor entries had been
+        considered (#955).
+        """
+        from memtomem_stm.cli.proxy import _discover_candidates
+
+        home, cwd, _ = self._setup_home(tmp_path, monkeypatch)
+        (home / ".cursor").mkdir()
+        (home / ".cursor" / "mcp.json").write_text(
+            json.dumps({"mcpServers": {"cursor-tool": {"command": "node", "args": ["c.js"]}}}),
+            encoding="utf-8",
+        )
+
+        cands = _discover_candidates(cwd)
+        assert len(cands) == 1
+        assert cands[0]["source"] == "Cursor (user)"
+        assert cands[0]["source_ref"] == {"kind": "cursor-user"}
+        assert cands[0]["is_repo_local"] is False
+        assert cands[0]["entry"]["command"] == "node"
+
+    def test_discovers_cursor_project_config_as_repo_local(self, tmp_path, monkeypatch):
+        """The checkout's own ``.cursor/mcp.json`` carries the repo-local marker.
+
+        Same rule as ``.mcp.json``: the marker keys on where the file lives,
+        not on which client wrote it, because that is what makes the command
+        inside it untrusted.
+        """
+        from memtomem_stm.cli.proxy import _discover_candidates
+
+        _, cwd, _ = self._setup_home(tmp_path, monkeypatch)
+        (cwd / ".cursor").mkdir()
+        (cwd / ".cursor" / "mcp.json").write_text(
+            json.dumps({"mcpServers": {"repo-tool": {"command": "./run.sh"}}}),
+            encoding="utf-8",
+        )
+
+        cands = _discover_candidates(cwd)
+        assert len(cands) == 1
+        assert cands[0]["source"] == "Cursor (project)"
+        assert cands[0]["is_repo_local"] is True
+        assert cands[0]["source_ref"] == {
+            "kind": "cursor-project",
+            "path": str((cwd / ".cursor" / "mcp.json").resolve()),
+        }
+
+    def test_cursor_labels_match_the_import_scanner(self, tmp_path, monkeypatch):
+        """Two discovery tables, one set of names.
+
+        ``mms import`` and ``mms add --from-clients`` read the same files
+        through different code. A label that drifts between them makes the
+        same entry look like two different registrations to anyone reading
+        both commands' output.
+        """
+        from memtomem_stm.cli.proxy import _SOURCE_BY_LABEL
+        from memtomem_stm.mms import import_hosts
+
+        _, cwd, _ = self._setup_home(tmp_path, monkeypatch)
+        (cwd / ".cursor").mkdir()
+        (cwd / ".cursor" / "mcp.json").write_text(
+            json.dumps({"mcpServers": {"t": {"command": "node"}}}),
+            encoding="utf-8",
+        )
+
+        scanned = import_hosts.scan_cursor(cwd)
+        assert scanned, "positive control: the scanner must find the file too"
+        for cand in scanned:
+            assert cand.source_label in _SOURCE_BY_LABEL
+            spec = _SOURCE_BY_LABEL[cand.source_label]
+            assert spec.is_repo_local == cand.is_repo_local
+
+    def test_cursor_loses_the_dedupe_to_a_claude_source(self, tmp_path, monkeypatch):
+        """Appended last, so no existing entry changes the label it reports."""
+        from memtomem_stm.cli.proxy import _discover_candidates
+
+        home, cwd, _ = self._setup_home(tmp_path, monkeypatch)
+        (home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"shared": {"command": "claude-side"}}}),
+            encoding="utf-8",
+        )
+        (home / ".cursor").mkdir()
+        (home / ".cursor" / "mcp.json").write_text(
+            json.dumps({"mcpServers": {"shared": {"command": "cursor-side"}}}),
+            encoding="utf-8",
+        )
+
+        cands = _discover_candidates(cwd)
+        assert len(cands) == 1
+        assert cands[0]["source"] == "Claude Code (user)"
+        assert cands[0]["entry"]["command"] == "claude-side"
+        assert cands[0]["duplicate_in"] == ["Cursor (user)"]
+
+    def test_a_wrong_typed_cursor_mcp_servers_is_silent(self, tmp_path, monkeypatch):
+        """A truthy non-dict ``mcpServers`` must not crash the whole scan."""
+        from memtomem_stm.cli.proxy import _discover_candidates
+
+        home, cwd, _ = self._setup_home(tmp_path, monkeypatch)
+        (home / ".cursor").mkdir()
+        (home / ".cursor" / "mcp.json").write_text(
+            json.dumps({"mcpServers": ["not", "a", "dict"]}), encoding="utf-8"
+        )
+        (home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"survivor": {"command": "node"}}}),
+            encoding="utf-8",
+        )
+
+        cands = _discover_candidates(cwd)
+        assert {c["name"] for c in cands} == {"survivor"}
+
     def test_dedupes_by_name_priority(self, tmp_path, monkeypatch):
         """Same name in multiple sources → first-priority wins, others
         recorded in ``duplicate_in`` so the UI can show the overlap."""
@@ -3858,6 +3971,66 @@ class TestInitImportFlow:
         assert servers["filesystem"]["command"] == "npx"
         assert servers["filesystem"]["prefix"] == "filesystem"  # default suggestion
         assert servers["docs"]["url"] == "https://docs.example/mcp"
+
+    def test_init_filters_every_repo_local_source_not_one_label(
+        self, runner, config, monkeypatch
+    ):
+        """``init``'s filter compared a label; the marker is what carries the rule.
+
+        Discovery grew a second repo-local source (#955), and a label-equality
+        filter walks straight past it — adopting a command the checkout
+        supplied without the acknowledgement the flag exists to collect.
+        """
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "user-tool",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                    "is_repo_local": False,
+                },
+                {
+                    "name": "cursor-repo-tool",
+                    "source": "Cursor (project)",
+                    "entry": {"transport": "stdio", "command": "./run.sh"},
+                    "is_repo_local": True,
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            input="all\n\n",
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Found 1 MCP server" in result.output
+        servers = json.loads(config.read_text(encoding="utf-8"))["upstream_servers"]
+        assert set(servers) == {"user-tool"}
+
+    def test_init_adopts_a_repo_local_source_with_the_flag(self, runner, config, monkeypatch):
+        """Positive control: the filter is the flag's, not a blanket refusal."""
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "cursor-repo-tool",
+                    "source": "Cursor (project)",
+                    "entry": {"transport": "stdio", "command": "./run.sh"},
+                    "is_repo_local": True,
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", "--allow-project-configs", *_cfg_args(config)],
+            input="all\n\n",
+        )
+
+        assert result.exit_code == 0, result.output
+        servers = json.loads(config.read_text(encoding="utf-8"))["upstream_servers"]
+        assert set(servers) == {"cursor-repo-tool"}
 
     def test_user_typed_duplicate_prefix_reprompts(self, runner, config, monkeypatch):
         """Overriding the suggested prefix with one already claimed in the
@@ -6289,6 +6462,88 @@ class TestAddFromClients:
         )
 
 
+class TestUnmanagedSources:
+    """Cursor is discovered but never written (#955).
+
+    The removal hint and the prune writer both dispatch on
+    ``claude_scope is None``, which used to mean exactly one thing: Claude
+    Desktop, edited directly. Adding a second such source without a guard
+    would have pointed the operator at Desktop's file and deleted the entry
+    from it.
+    """
+
+    @pytest.mark.parametrize(
+        ("label", "expected_file"),
+        [
+            ("Cursor (user)", "~/.cursor/mcp.json"),
+            ("Cursor (project)", ".cursor/mcp.json in this checkout"),
+        ],
+    )
+    def test_removal_hint_names_the_file_not_the_desktop_config(self, label, expected_file):
+        """The hint is the whole remediation for a source nothing here writes."""
+        from memtomem_stm.cli.proxy import _desktop_config_path, _source_removal_hint
+
+        hint = _source_removal_hint("cursor-tool", label)
+        assert expected_file in hint
+        assert str(_desktop_config_path()) not in hint
+
+    @pytest.mark.parametrize("label", ["Cursor (user)", "Cursor (project)"])
+    def test_prune_refuses_rather_than_editing_the_desktop_config(
+        self, label, tmp_path, monkeypatch
+    ):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        desktop = tmp_path / "claude_desktop_config.json"
+        desktop.write_text(
+            json.dumps({"mcpServers": {"cursor-tool": {"command": "node"}}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(proxy_mod, "_desktop_config_path", lambda: desktop)
+        before = desktop.read_bytes()
+
+        ok, err = proxy_mod._prune_from_source("cursor-tool", label)
+
+        assert ok is False
+        assert err is not None and "by hand" in err
+        assert desktop.read_bytes() == before
+
+    def test_the_desktop_writer_still_works(self, tmp_path, monkeypatch):
+        """Positive control: the guard must not disarm the one real writer."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        desktop = tmp_path / "claude_desktop_config.json"
+        desktop.write_text(
+            json.dumps({"mcpServers": {"cursor-tool": {"command": "node"}}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(proxy_mod, "_desktop_config_path", lambda: desktop)
+
+        ok, err = proxy_mod._prune_from_source("cursor-tool", "Claude Desktop")
+
+        assert (ok, err) == (True, None)
+        assert json.loads(desktop.read_text(encoding="utf-8"))["mcpServers"] == {}
+
+    @pytest.mark.parametrize("kind", ["cursor-user", "cursor-project"])
+    def test_eject_refuses_an_unmanaged_target(self, kind):
+        import click
+
+        from memtomem_stm.cli.proxy import _parse_eject_to
+
+        with pytest.raises(click.UsageError) as excinfo:
+            _parse_eject_to(kind)
+        message = str(excinfo.value)
+        assert kind not in message.split("(got")[0]
+        assert "claude-user" in message
+
+    def test_eject_still_accepts_a_managed_target(self):
+        """Positive control for the same refusal."""
+        from memtomem_stm.cli.proxy import _parse_eject_to
+
+        spec, path = _parse_eject_to("claude-user")
+        assert spec.kind == "claude-user"
+        assert path is None
+
+
 class TestAddFromClientsNonInteractive:
     """`mms add --from-clients --all/--select` (#817) — the scripted path.
 
@@ -6361,6 +6616,45 @@ class TestAddFromClientsNonInteractive:
 
         assert result.exit_code == 2, result.output
         assert "--allow-project-configs" in result.output
+        assert config.read_bytes() == before
+
+    def _cursor_repo_local_candidate(self):
+        return {
+            "name": "cursor-repo-server",
+            "source": "Cursor (project)",
+            "entry": {"transport": "stdio", "command": "untrusted-command"},
+            "raw": {"command": "untrusted-command"},
+            "source_ref": {"kind": "cursor-project", "path": "/repo/.cursor/mcp.json"},
+            "is_repo_local": True,
+        }
+
+    def test_a_cursor_project_entry_is_gated_like_mcp_json(
+        self, runner, config, monkeypatch
+    ):
+        """The gate keys on the repo-local marker, not on one label (#955).
+
+        Both files live in the checkout and can name a command it supplies, so
+        selecting either is not by itself consent to run it.
+        """
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, [self._cursor_repo_local_candidate()])
+        before = config.read_bytes()
+
+        async def probe_must_not_run(*_args, **_kwargs):
+            raise AssertionError("project-local server was probed before consent")
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", probe_must_not_run)
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--all", "--json", "--validate", *_cfg_args(config)],
+        )
+
+        assert result.exit_code == 2, result.output
+        payload = json.loads(result.stdout)
+        assert payload["error"] == "project_config_ack_required"
+        assert payload["names"] == ["cursor-repo-server"]
         assert config.read_bytes() == before
 
     def test_project_local_json_gate_is_atomic_for_mixed_batch(
