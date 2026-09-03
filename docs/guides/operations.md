@@ -128,8 +128,9 @@ mms daemon stop --all
    writes). They are verbatim copies of a host config, which can carry API
    keys, so delete them here rather than assuming step 5 catches them.
 2. **Upstreams** — if you pruned direct registrations, `mms eject NAME` first
-   restores each upstream to its original host client; plain `mms remove NAME`
-   just drops it from STM.
+   restores each upstream to its original host client (an entry imported from
+   Cursor needs an explicit `--to`, since `mms` never writes those configs);
+   plain `mms remove NAME` just drops it from STM.
 3. **Client registration** — remove STM itself from the client, e.g.
    `claude mcp remove memtomem-stm` (the exact command is printed by `mms
    eject` when the last upstream leaves).
@@ -152,7 +153,8 @@ mms daemon stop --all
 - `mms hook install`, `mms hook uninstall`, import, and host-sync operations
   default to previews and require `--apply` to write.
 - Use `mms eject` to restore an imported upstream to its original host after
-  pruning it from direct registration.
+  pruning it from direct registration — or, for a Cursor origin, to an
+  explicit `--to` target.
 
 See the [gateway CLI reference](../reference/cli-gateway.md),
 [surfacing guide](../surfacing.md), and [configuration hub](../configuration.md).

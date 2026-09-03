@@ -54,6 +54,7 @@ from memtomem_stm.mms.import_hosts import (
     _DANGEROUS_ENV_KEYS,
     _desktop_config_path,
     _is_self_reference,
+    _mcp_servers,
     _read_json_safely,
     project_local_gate_message,
 )
@@ -1823,11 +1824,19 @@ def _origin_cell(cfg: Any) -> str:
     legend under the table points at ``mms eject``. Unknown kinds print as
     recorded — the cell is a display of stored provenance, not a
     validation of it.
+
+    A block that is *present* but unreadable prints ``invalid`` rather than
+    sharing ``-`` with an entry that has none. The identity guard treats those
+    two states differently — one keeps the wildcard, the other is refused by
+    prune and declines an import — so a table rendering them identically would
+    hide the only visible cause of that behavior (#955 review 5).
     """
-    origin = cfg.get("origin") if isinstance(cfg, dict) else None
+    if not isinstance(cfg, dict) or "origin" not in cfg or cfg["origin"] is None:
+        return "-"
+    origin = cfg["origin"]
     source = origin.get("source") if isinstance(origin, dict) else None
     if not isinstance(source, dict) or not isinstance(source.get("kind"), str):
-        return "-"
+        return "invalid"
     return source["kind"] + ("*" if _origin_fully_pruned(origin) else "")
 
 
@@ -2346,8 +2355,9 @@ def stats(
     is_flag=True,
     default=False,
     help="Import additional servers interactively from existing MCP clients "
-    "(Claude Desktop / Code, project .mcp.json). Reuses init's discovery + "
-    "TUI flow. Skips candidates already registered in this config. "
+    "(Claude Desktop / Code, Cursor, project .mcp.json / .cursor/mcp.json). "
+    "Reuses init's discovery + TUI flow. Skips candidates already registered "
+    "in this config. "
     "Incompatible with NAME / --prefix / --command / --args / --url / --env "
     "/ --header.",
 )
@@ -2375,14 +2385,15 @@ def stats(
     is_flag=True,
     default=False,
     help="After a successful --from-clients/--import, remove the direct "
-    "registrations from each source MCP client so tools are only reachable "
-    "via STM. Default: interactive prompt on TTY, skip on non-TTY. Only "
-    "valid with --from-clients/--import.",
+    "registrations from each source MCP client mms can write, so tools are "
+    "only reachable via STM. A Cursor registration is reported with the "
+    "manual edit instead. Default: interactive prompt on TTY, skip on "
+    "non-TTY. Only valid with --from-clients/--import.",
 )
 @click.option(
     "--allow-project-configs",
     is_flag=True,
-    help="Acknowledge importing MCP entries from project-local .mcp.json.",
+    help="Acknowledge importing MCP entries from a project-local .mcp.json or .cursor/mcp.json.",
 )
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
 @with_config_write_lock(json_envelope=True)
@@ -2876,24 +2887,263 @@ def _normalize_client_entry(raw: dict[str, Any]) -> dict[str, Any] | None:
 # (`_prune_from_source`). ``kind`` is the machine-readable identifier
 # persisted in ``origin.source.kind`` (see ``UpstreamOrigin`` in
 # ``proxy/config.py``); ``claude_scope`` is the ``claude mcp remove -s``
-# scope for shell-out sources, ``None`` marking the one source (Claude
-# Desktop) handled by direct JSON edit instead.
+# scope for shell-out sources, ``None`` marking the sources handled by direct
+# JSON edit or not written at all. ``managed`` says which of those two: an
+# unmanaged source is discovered and reported but never written, so the
+# removal hint, the prune writer and eject must refuse it rather than fall
+# through to the one direct-edit writer that exists (Claude Desktop's), which
+# would delete from the wrong file (#955). Labels are shared with
+# ``mms/import_hosts.py``'s scanners — the two discovery paths name the same
+# file the same way or the gate message describes neither.
 @dataclass(frozen=True)
 class _SourceSpec:
     label: str
     kind: str
     claude_scope: str | None
     is_repo_local: bool = False
+    managed: bool = True
+    is_checkout_scoped: bool = False
 
 
+# ``is_repo_local`` and ``is_checkout_scoped`` look alike and are not the same
+# question, so they are separate flags (#955 review 2). ``is_repo_local`` is a
+# TRUST gate: "the checkout supplied this file, so adopting a command out of it
+# needs --allow-project-configs". ``is_checkout_scoped`` is an IDENTITY fact:
+# "the client launches this server from the checkout the config belongs to".
+# ``claude-project`` splits them — its entries live in ``~/.claude.json``, which
+# the checkout cannot write (not repo-local), yet they run in the project the
+# slot is keyed by (checkout-scoped). Reading the trust gate as the identity
+# fact left that source out of every checkout comparison while the docs said it
+# was in.
 _SOURCE_SPECS: tuple[_SourceSpec, ...] = (
-    _SourceSpec(".mcp.json (project)", "mcp-json", "project", is_repo_local=True),
+    _SourceSpec(
+        ".mcp.json (project)", "mcp-json", "project", is_repo_local=True, is_checkout_scoped=True
+    ),
     _SourceSpec("Claude Code (user)", "claude-user", "user"),
-    _SourceSpec("Claude Code (project)", "claude-project", "local"),
+    _SourceSpec("Claude Code (project)", "claude-project", "local", is_checkout_scoped=True),
     _SourceSpec("Claude Desktop", "claude-desktop", None),
+    # Appended last so the labels above keep winning the first-wins dedupe
+    # they have always won.
+    _SourceSpec("Cursor (user)", "cursor-user", None, managed=False),
+    _SourceSpec(
+        "Cursor (project)",
+        "cursor-project",
+        None,
+        is_repo_local=True,
+        managed=False,
+        is_checkout_scoped=True,
+    ),
 )
+# Where an unmanaged source lives, for the removal hint. App-owned strings, so
+# they need no display escaping; the project entry is relative on purpose —
+# the hint is for the checkout the operator is standing in.
+_UNMANAGED_SOURCE_FILES: dict[str, str] = {
+    "cursor-user": "~/.cursor/mcp.json",
+    "cursor-project": ".cursor/mcp.json in this checkout",
+}
 _SOURCE_BY_LABEL: dict[str, _SourceSpec] = {spec.label: spec for spec in _SOURCE_SPECS}
+
+
+def _prune_targets(
+    candidates: list[dict[str, Any]],
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Split ``(name, source)`` prune targets into writable and manual-only.
+
+    One iteration feeds the human preview, confirm prompt, JSON plan, and
+    standalone writer allowlist. Unmanaged sources such as Cursor stay visible
+    to the operator but are never executed or counted as failures. Deduped on
+    ``(name, source)`` because a candidate can name the same source twice.
+    """
+    writable: list[dict[str, str]] = []
+    manual: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for cand in candidates:
+        for source in [cand["source"], *(cand.get("duplicate_in") or [])]:
+            key = (cand["name"], source)
+            if key in seen:
+                continue
+            seen.add(key)
+            row = {"name": cand["name"], "source": source}
+            spec = _SOURCE_BY_LABEL.get(source)
+            if spec is not None and not spec.managed:
+                manual.append(row)
+            else:
+                writable.append(row)
+    return writable, manual
+
+
+def _is_repo_local_candidate(cand: dict[str, Any]) -> bool:
+    """Whether this candidate came from a file inside the current checkout.
+
+    ``_discover_candidates`` always sets the marker, so the label fallback is
+    for candidates built elsewhere (tests, and any future caller) — without it,
+    switching the ``mms init`` filter from a label comparison to the marker
+    would ADMIT a marker-less project candidate the comparison refused (#955).
+
+    Used by ``mms init`` only. The ``--from-clients`` gate reads the marker
+    directly, which is what it has always done — extending the fallback there
+    would tighten a second command's gate on the same commit that widened its
+    discovery, and that is a decision of its own, not a consequence of this
+    one.
+    """
+    marker = cand.get("is_repo_local")
+    if isinstance(marker, bool):
+        return marker
+    spec = _SOURCE_BY_LABEL.get(str(cand.get("source", "")))
+    return spec is not None and spec.is_repo_local
+
+
 _SOURCE_BY_KIND: dict[str, _SourceSpec] = {spec.kind: spec for spec in _SOURCE_SPECS}
+
+
+# What a source record says about the checkout its servers run in. Three
+# answers, not two: a checkout-less source states "anywhere", which
+# :func:`_same_server` reads as a match, while a record that *should* name a
+# checkout and cannot is not the same claim and must not be spent as one
+# (#955 review 3).
+_CHECKOUT_NONE = "none"
+_CHECKOUT_UNKNOWN = "unknown"
+
+# Where each checkout-scoped kind's recorded path sits relative to its
+# checkout, and the anchor that proves the path is the one it claims to be.
+# ``origin.source`` is user-editable and ``OriginSource.kind`` is deliberately
+# an open string (``proxy/config.py``) so a config written by a newer CLI still
+# validates — an anchor that does not match is a record this build cannot read,
+# not a checkout.
+_CHECKOUT_ANCHORS: dict[str, tuple[int, tuple[str, ...]]] = {
+    "claude-project": (0, ()),
+    "mcp-json": (1, (".mcp.json",)),
+    "cursor-project": (2, ("mcp.json", ".cursor")),
+}
+
+
+def _checkout_of_source(source_ref: dict[str, Any] | None) -> tuple[str, str | None]:
+    """What a ``{kind, path}`` source record says about its checkout.
+
+    Returns ``(_CHECKOUT_NONE, None)`` for a source that runs wherever the
+    client starts, ``(_CHECKOUT_UNKNOWN, None)`` for a record this build cannot
+    resolve — an unrecognized kind, or a checkout-scoped one whose path is
+    missing, relative, or not anchored where that kind anchors it — and
+    ``(kind, checkout)`` otherwise. Each checkout-scoped kind anchors its path
+    differently (``claude-project`` records the project directory itself,
+    ``mcp-json`` the ``.mcp.json`` file, ``cursor-project`` the
+    ``.cursor/mcp.json`` file), so the offset lives here once rather than at
+    each comparison.
+    """
+    if not isinstance(source_ref, dict):
+        return (_CHECKOUT_UNKNOWN, None)
+    kind = str(source_ref.get("kind", ""))
+    spec = _SOURCE_BY_KIND.get(kind)
+    if spec is None:
+        return (_CHECKOUT_UNKNOWN, None)
+    if not spec.is_checkout_scoped:
+        return (_CHECKOUT_NONE, None)
+    path = source_ref.get("path")
+    if not isinstance(path, str) or not path:
+        return (_CHECKOUT_UNKNOWN, None)
+    anchored = Path(path)
+    if not anchored.is_absolute():
+        # A relative anchor cannot name a checkout without a base this
+        # function does not have, and resolving it against the process cwd
+        # would invent one.
+        return (_CHECKOUT_UNKNOWN, None)
+    depth, expected = _CHECKOUT_ANCHORS[spec.kind]
+    parts = anchored.parts[-len(expected) :] if expected else ()
+    if tuple(reversed(parts)) != expected:
+        return (_CHECKOUT_UNKNOWN, None)
+    for _ in range(depth):
+        anchored = anchored.parent
+    return (kind, str(anchored))
+
+
+def _candidate_identity_entry(cand: dict[str, Any], cwd: Path) -> dict[str, Any]:
+    """The candidate's entry as identity should read it, cwd included.
+
+    A host config has no ``cwd`` field, but a *checkout-scoped* source states
+    one anyway: ``.mcp.json``, a Claude Code project slot and
+    ``.cursor/mcp.json`` are all read out of the checkout the client launches
+    them from. Leaving that implicit made a stdio ``cwd`` on the STM side match
+    any same-command host row, so running ``mms prune`` from a second checkout
+    could remove that checkout's unrelated entry (#955 review 2).
+
+    A checkout-less source — a Claude Code user scope, Claude Desktop,
+    ``~/.cursor/mcp.json`` — implies nothing, and its absent ``cwd`` stays the
+    "unknown" that :func:`_same_server` treats as a match. That asymmetry is
+    the point: those servers really do run from wherever the client starts.
+
+    Never mutates the candidate. An explicit ``cwd`` always wins — the value
+    materialized on a Cursor-project entry at discovery time already sits in
+    ``entry``, so it is not recomputed here. ``cwd`` is the fallback anchor for
+    a candidate carrying no source record (hand-built ones, and tests):
+    discovery only ever reads the checkout-scoped configs of the directory it
+    was handed.
+    """
+    entry = cand.get("entry") or {}
+    if entry.get("cwd") is not None or entry.get("transport", "stdio") != "stdio":
+        return entry
+    source_ref = cand.get("source_ref")
+    if isinstance(source_ref, dict):
+        _kind, checkout = _checkout_of_source(source_ref)
+        if checkout is not None:
+            return {**entry, "cwd": checkout}
+    # No usable record. Discovery only ever reads the checkout-scoped configs
+    # of the directory it was handed, so that directory is the anchor for a
+    # candidate built without one (hand-built candidates, and tests) — unlike
+    # the registered side, where nothing stands in for a missing origin.
+    spec = _SOURCE_BY_LABEL.get(str(cand.get("source", "")))
+    if spec is None or not spec.is_checkout_scoped:
+        return entry
+    return {**entry, "cwd": str(cwd.resolve())}
+
+
+def _stm_identity_entry(cfg: dict[str, Any]) -> dict[str, Any] | None:
+    """The registered upstream as identity should read it, cwd included.
+
+    Mirror of :func:`_candidate_identity_entry` for the other operand, and
+    needed for the same rule to hold: inferring the checkout on the discovered
+    side alone still left an entry imported from repo A's ``.mcp.json`` — which
+    records its origin but persists no ``cwd`` — matching a same-name row found
+    in repo B (#955 review 2).
+
+    An explicit ``cwd`` wins; otherwise ``origin.source`` supplies it. Returns
+    ``None`` when the origin claims a checkout this build cannot resolve — an
+    unrecognized kind, or a checkout-scoped one with a missing, relative or
+    wrongly anchored path. ``origin.source`` is user-editable and its ``kind``
+    is an open string by design, so those records exist; reading one as "runs
+    anywhere" would spend a broken claim as a wildcard and let a prune in
+    another checkout delete that checkout's row (#955 review 3). Callers fail
+    closed on ``None``: the destructive side skips the entry, the dedup side
+    declines to call it a duplicate.
+
+    An entry with NO origin block — the key absent, or ``null`` — is a
+    different case: a manual ``mms add`` or an import predating provenance
+    capture makes no claim at all, so it keeps the documented wildcard. A
+    block that is *present* but malformed does make a claim, just an
+    unreadable one, and is refused like any other (#955 review 4). These
+    configs are read by the CLI without pydantic validation, so a block that
+    the server would reject still reaches this comparison.
+
+    Only stdio identity has a checkout at all; an HTTP entry is its URL,
+    wherever it was registered from, so it never goes down this path and a
+    broken origin cannot make it incomparable.
+    """
+    if not isinstance(cfg, dict) or cfg.get("cwd") is not None:
+        return cfg
+    if cfg.get("transport", "stdio") != "stdio":
+        return cfg
+    if "origin" not in cfg or cfg["origin"] is None:
+        return cfg
+    origin = cfg["origin"]
+    if not isinstance(origin, dict) or not isinstance(origin.get("source"), dict):
+        return None
+    kind, checkout = _checkout_of_source(origin["source"])
+    if kind == _CHECKOUT_UNKNOWN:
+        return None
+    if checkout is None:
+        return cfg
+    return {**cfg, "cwd": checkout}
+
+
 _EJECT_TARGETS_HELP = "claude-user | claude-project[:PATH] | mcp-json[:PATH] | claude-desktop"
 
 
@@ -2949,6 +3199,24 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
     if desktop and isinstance(desktop.get("mcpServers"), dict):
         sources.append((_SOURCE_BY_LABEL["Claude Desktop"], None, desktop["mcpServers"]))
 
+    # 4-5. Cursor, user then project. Same files and labels as
+    # ``import_hosts.scan_cursor``: the gate message this command prints names
+    # ``.cursor/mcp.json``, which was true of ``mms import`` and not of this
+    # path (#955). Discovery only — see ``managed`` on the specs above.
+    for label, path in (
+        ("Cursor (user)", Path("~/.cursor/mcp.json").expanduser()),
+        ("Cursor (project)", cwd / ".cursor" / "mcp.json"),
+    ):
+        cursor = _read_json_safely(path)
+        if not cursor:
+            continue
+        servers = _mcp_servers(cursor)
+        if servers:
+            spec = _SOURCE_BY_LABEL[label]
+            sources.append(
+                (spec, str(path.resolve()) if spec.is_checkout_scoped else None, servers)
+            )
+
     seen: dict[str, dict[str, Any]] = {}
     for spec, src_path, servers in sources:
         if not isinstance(servers, dict):
@@ -2973,6 +3241,14 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
             entry = _normalize_client_entry(raw)
             if entry is None or _is_self_reference(entry):
                 continue
+            if spec.kind == "cursor-project" and entry.get("transport") == "stdio":
+                # Cursor launches project-scoped stdio servers from the
+                # checkout that owns ``.cursor/mcp.json``. Once imported, STM
+                # is registered globally and may start from any directory, so
+                # preserve that implicit execution context explicitly. Use
+                # setdefault so a future normalizer that retains an explicit
+                # client-provided cwd will keep the more specific value.
+                entry.setdefault("cwd", str(cwd.resolve()))
             bad_field = unencodable_field(entry)
             if bad_field is not None:
                 # Same reasoning as the name above, for the fields that get
@@ -3078,7 +3354,29 @@ def _source_removal_hint(name: str, source: str) -> str:
         return f"# Remove '{_disp(name)}' from {_disp(source)}."
     if spec.claude_scope is not None:
         return _shell_join(["claude", "mcp", "remove", name, "-s", spec.claude_scope])
+    if not spec.managed:
+        # The Desktop hint below names one fixed path. An unmanaged source has
+        # its own file, so falling through would point the operator at a file
+        # the entry is not in (#955). Name the file, not just the client: this
+        # hint is the whole remediation for a source nothing here writes.
+        where = _UNMANAGED_SOURCE_FILES.get(spec.kind, f"the {spec.label} config")
+        return f"# Edit {where} and remove '{_disp(name)}' under mcpServers."
     return f"# Edit {_desktop_config_path()} and remove '{_disp(name)}' under mcpServers."
+
+
+def _print_manual_prune_rows(manual: list[dict[str, str]]) -> None:
+    """Print the manual-only prune rows plus the edit each one needs.
+
+    Shared by the standalone ``prune`` preview and the import-time prune
+    report so a row nothing writes reads the same on both surfaces (#955
+    review). No-op on an empty list.
+    """
+    if not manual:
+        return
+    click.echo("")
+    click.echo("  (manual) — mms does not write these configs; remove by hand:")
+    for row in manual:
+        click.echo(f"    {_source_removal_hint(row['name'], row['source'])}")
 
 
 def _print_source_removal_hints(imported_candidates: list[dict[str, Any]]) -> None:
@@ -3184,6 +3482,16 @@ def _desktop_json_remove_entry(name: str) -> tuple[bool, str | None]:
     return (True, None)
 
 
+def _unmanaged_prune_refusal(spec: _SourceSpec, name: str) -> str:
+    """The one wording for "this source has no writer".
+
+    Both readers of the ``managed`` rule render it — the writer's own guard
+    and the caller that never reaches the writer — so the operator sees the
+    same sentence whichever path refused (#955 review).
+    """
+    return f"{spec.label} entries are not pruned by mms — remove '{name}' by hand"
+
+
 def _prune_from_source(name: str, source: str) -> tuple[bool, str | None]:
     """Dispatch the prune action per source label used by ``_discover_candidates``.
 
@@ -3195,6 +3503,19 @@ def _prune_from_source(name: str, source: str) -> tuple[bool, str | None]:
     spec = _SOURCE_BY_LABEL.get(source)
     if spec is None:
         return (False, f"unknown source label: {source}")
+    if not spec.managed:
+        # Refused, not guessed: neither the shell-out below nor the one
+        # direct-edit writer (Claude Desktop's) targets this source's file, so
+        # dispatching would delete the entry from a file the operator never
+        # named. A prune failure is non-fatal and prints the manual edit from
+        # `_source_removal_hint`, so the entry stays where it is and the
+        # operator is told where that is (#955).
+        #
+        # Ordered ahead of ``claude_scope`` so this guard and its caller's copy
+        # (``_prune_imported_candidates``) agree on precedence: a future
+        # unmanaged spec that also carries a scope must not shell out here
+        # while the caller reports it as untouched (#955 review).
+        return (False, _unmanaged_prune_refusal(spec, name))
     if spec.claude_scope is not None:
         return _claude_mcp_remove(name, spec.claude_scope)
     return _desktop_json_remove_entry(name)
@@ -3291,23 +3612,50 @@ def _prune_imported_candidates(
     imported_candidates: list[dict[str, Any]],
     *,
     pruned_at: str,
+    allowed_sources: set[tuple[str, str]] | None = None,
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str, str]]]:
     """Prune each imported candidate from every source that registered it.
 
     A single candidate can show up in multiple sources (primary ``source``
-    plus ``duplicate_in``) — all are pruned so the dual-path collapses.
-    Per source, the verbatim host entry is appended to the backup log
-    *before* the delete runs (see :func:`_append_pruned_backup` for the
+    plus ``duplicate_in``) — every source with a writer is pruned so the
+    dual-path collapses; a source without one is refused here and reported
+    with the manual edit instead (#955), before any backup row is written for
+    it. Per pruned source, the verbatim host entry is appended to the backup
+    log *before* the delete runs (see :func:`_append_pruned_backup` for the
     ordering rationale); an append failure fails that source's prune
     outright and the delete is skipped.
+
+    ``allowed_sources`` narrows execution to a caller-computed plan. Omitting
+    it means "every writable source of these candidates" — the same
+    :func:`_prune_targets` split the standalone command passes in, so the two
+    prune surfaces classify a row identically instead of one calling it manual
+    and the other a failure (#955 review).
 
     Returns ``(pruned, failed)`` where ``pruned`` is ``[(name, source), ...]``
     and ``failed`` is ``[(name, source, error), ...]``.
     """
+    if allowed_sources is None:
+        writable, _manual = _prune_targets(imported_candidates)
+        allowed_sources = {(row["name"], row["source"]) for row in writable}
     pruned: list[tuple[str, str]] = []
     failed: list[tuple[str, str, str]] = []
     for cand in imported_candidates:
         for src, source_ref, raw in _candidate_source_records(cand):
+            if (cand["name"], src) not in allowed_sources:
+                continue
+            spec = _SOURCE_BY_LABEL.get(src)
+            if spec is not None and not spec.managed:
+                # Backstop for a caller that put an unmanaged row in its own
+                # allowlist. Refuses BEFORE the backup append (#955): the log
+                # is append-only and its newest row for a name is what the
+                # eject retry hint reads, so a row written for a prune that
+                # then refuses would shadow an older real backup and point the
+                # operator at a `--to` target eject does not accept. The
+                # message is rendered here rather than fetched from the writer
+                # — calling a writer for its error string is how the two
+                # copies of the ``managed`` rule drift apart.
+                failed.append((cand["name"], src, _unmanaged_prune_refusal(spec, cand["name"])))
+                continue
             if isinstance(raw, dict) and isinstance(source_ref, dict):
                 ok, err = _append_pruned_backup(cand["name"], source_ref, raw, pruned_at)
                 if not ok:
@@ -3378,14 +3726,14 @@ def _confirm_prune_prompt(imported_candidates: list[dict[str, Any]]) -> bool:
         "(adds compression / caching / LTM surfacing; avoids duplicate tool advertisements)."
     )
     click.echo("Affected entries:")
-    seen: set[tuple[str, str]] = set()
-    for cand in imported_candidates:
-        for src in [cand["source"], *(cand.get("duplicate_in") or [])]:
-            key = (cand["name"], src)
-            if key in seen:
-                continue
-            seen.add(key)
-            click.echo(f"    {_disp(cand['name'])} — {src}")
+    writable, manual = _prune_targets(imported_candidates)
+    for row in writable:
+        click.echo(f"    {_disp(row['name'])} — {row['source']}")
+    for row in manual:
+        # Consent is for what will happen. These are listed because they are
+        # still dual-registered, marked because this prompt cannot change
+        # that (#955).
+        click.echo(f"    {_disp(row['name'])} — {row['source']}  (manual, not removed)")
     return click.confirm("Remove from source(s)?", default=False)
 
 
@@ -3397,15 +3745,23 @@ def _handle_source_prune(
     data: dict[str, Any],
     interactive: bool = True,
     quiet: bool = False,
-) -> tuple[list[tuple[str, str]], list[tuple[str, str, str]]]:
-    """Post-import prune + reporting. Returns ``(pruned, failed)``.
+) -> tuple[list[tuple[str, str]], list[tuple[str, str, str]], list[dict[str, str]]]:
+    """Post-import prune + reporting. Returns ``(pruned, failed, manual)``.
 
     Three paths based on the caller's ``prune`` flag and the TTY gate:
 
     * ``prune=True`` → prune unconditionally.
-    * ``prune=False`` + TTY → interactive prompt, default No.
-    * ``prune=False`` + non-TTY → skip prune entirely, fall through to the
-      #203 hint-only warning.
+    * ``prune=False`` + TTY + at least one writable source → interactive
+      prompt, default No.
+    * ``prune=False`` + non-TTY, or nothing writable → skip prune entirely,
+      fall through to the #203 hint-only warning.
+
+    "Nothing writable" is its own skip because consent is for an action:
+    answering yes to a prompt whose whole plan is unmanaged would suppress
+    the hint block and leave the run printing only what it could not do
+    (#955 review). Manual-only rows are reported either way — through the
+    hints on the skip path, through :func:`_print_manual_prune_rows` after
+    a real prune — and are never attempted or counted as failures.
 
     ``interactive=False`` (``add --from-clients --all/--select``, #817)
     suppresses the prompt even on a TTY, so a scripted import never blocks:
@@ -3427,9 +3783,13 @@ def _handle_source_prune(
     a failed ③ only loses the metadata flip, never the origin or backup.
     """
     if not imported_candidates:
-        return [], []
+        return [], [], []
 
-    if prune:
+    writable, manual = _prune_targets(imported_candidates)
+
+    if not writable:
+        should_prune = False
+    elif prune:
         should_prune = True
     elif interactive and _should_use_tui():
         should_prune = _confirm_prune_prompt(imported_candidates)
@@ -3439,17 +3799,23 @@ def _handle_source_prune(
     if not should_prune:
         if not quiet:
             _print_source_removal_hints(imported_candidates)
-        return [], []
+        return [], [], manual
 
     pruned_at = utc_now_iso()
-    pruned, failed = _prune_imported_candidates(imported_candidates, pruned_at=pruned_at)
+    pruned, failed = _prune_imported_candidates(
+        imported_candidates,
+        pruned_at=pruned_at,
+        allowed_sources={(row["name"], row["source"]) for row in writable},
+    )
     servers = data.get("upstream_servers")
     if isinstance(servers, dict) and _mark_pruned_sources(
         servers, imported_candidates, pruned, pruned_at
     ):
         _save(config_path, data)
     _report_prune_results(pruned, failed, quiet_success=quiet)
-    return pruned, failed
+    if not quiet:
+        _print_manual_prune_rows(manual)
+    return pruned, failed, manual
 
 
 def _report_prune_results(
@@ -3500,7 +3866,7 @@ def _find_dual_registered(
     the same name in a source client (different command / URL / args) and
     would reasonably expect ``mms prune`` not to touch it. Mirrors the dedup
     logic :func:`_add_from_clients` uses in the other direction (name +
-    :func:`_server_signature` match), so the two sides of the import↔prune
+    :func:`_same_server` match), so the two sides of the import↔prune
     round-trip agree on what "the same server" means.
 
     An entry with no extractable signature (missing command / URL) is a
@@ -3516,11 +3882,15 @@ def _find_dual_registered(
         name = cand["name"]
         if name not in stm_upstreams:
             continue
-        stm_sig = _server_signature(stm_upstreams[name])
-        src_sig = _server_signature(cand["entry"])
         # Both sides have a signature and they differ → intentionally distinct
         # servers sharing a name. Skip rather than prune the unrelated entry.
-        if stm_sig is not None and src_sig is not None and stm_sig != src_sig:
+        stm_identity = _stm_identity_entry(stm_upstreams[name])
+        if stm_identity is None:
+            # The entry claims a checkout nothing here can resolve. Refuse
+            # rather than fall back to the name, which is the whole reason
+            # this function compares identities at all.
+            continue
+        if _same_server(stm_identity, _candidate_identity_entry(cand, cwd)) is False:
             continue
         dual.append(cand)
     return dual
@@ -3785,6 +4155,12 @@ def _server_signature(cfg: dict[str, Any]) -> tuple[str, ...] | None:
     the user already imported this server under a different name. Returns
     ``None`` when the entry is missing the identifying field (caller falls
     back to name-based match only).
+
+    A stdio ``cwd`` is deliberately NOT part of the tuple: compare entries
+    with :func:`_same_server`, which folds cwd in only when both sides record
+    one. Putting it here would make the tuple unequal whenever one side has a
+    cwd and the other cannot — see that function for why that is every host
+    row.
     """
     transport = cfg.get("transport", "stdio")
     if transport == "stdio":
@@ -3799,6 +4175,39 @@ def _server_signature(cfg: dict[str, Any]) -> tuple[str, ...] | None:
     if not url:
         return None
     return (transport, url)
+
+
+def _same_server(a: dict[str, Any], b: dict[str, Any]) -> bool | None:
+    """Whether two upstream-shaped entries name the same server.
+
+    ``None`` when either side has no :func:`_server_signature` (the caller
+    decides what a name-only hit means); otherwise signature equality, plus
+    — for stdio — ``cwd`` equality **only when both sides declare one**.
+
+    The asymmetry is the point. ``_normalize_client_entry`` never emits a
+    ``cwd``, so a host row and any candidate built from one carry none; a
+    cwd exists only on the STM side (hand-edited ``stm_proxy.json``, or the
+    checkout ``_discover_candidates`` materializes for a Cursor-project
+    import) and on that same Cursor-project candidate. Requiring it on both
+    sides made every cwd-bearing STM entry a stranger to its own host row:
+    ``mms prune foo`` reported it "not dual-registered" and
+    ``add --from-clients`` stopped skipping it (#955 review). Two recorded
+    cwds that differ are still two servers — identical relative commands in
+    different checkouts, the case cwd was added to identity for.
+    """
+    sig_a = _server_signature(a)
+    sig_b = _server_signature(b)
+    if sig_a is None or sig_b is None:
+        return None
+    if sig_a != sig_b:
+        return False
+    if sig_a[0] != "stdio":
+        return True
+    cwd_a = a.get("cwd")
+    cwd_b = b.get("cwd")
+    if cwd_a is None or cwd_b is None:
+        return True
+    return str(cwd_a) == str(cwd_b)
 
 
 def _add_from_clients(
@@ -3862,7 +4271,8 @@ def _add_from_clients(
     skipped: list[dict[str, str]] = []
     warnings_json: list[str] = []
 
-    all_candidates = _discover_candidates(Path.cwd())
+    discovery_cwd = Path.cwd()
+    all_candidates = _discover_candidates(discovery_cwd)
 
     if select_names:
         # Resolve the requested names against *everything* discovered, not
@@ -3885,15 +4295,35 @@ def _add_from_clients(
         all_candidates = [cand for cand in all_candidates if cand["name"] in requested]
 
     if not all_candidates:
-        info("No MCP servers found in Claude Desktop / Code / .mcp.json.")
+        info("No MCP servers found in Claude Desktop / Code / Cursor / .mcp.json.")
         info("Use `mms add <NAME> --prefix ... --command ...` to register one manually.")
         emit([], skipped, warnings_json)
         return
 
     existing_names = set(servers.keys())
-    existing_signatures = {
-        sig for srv_cfg in servers.values() if (sig := _server_signature(srv_cfg)) is not None
-    }
+    # Compared pairwise through ``_same_server`` rather than against a set of
+    # signatures: identity folds in a stdio ``cwd`` when both sides record
+    # one, which a shared key cannot express (#955 review).
+    #
+    # An entry whose origin claims a checkout nothing here can resolve is held
+    # apart rather than dropped. Dropping it was fail-OPEN for this direction:
+    # a genuine alias of that same server would import again, and two upstream
+    # entries pointing at one server means the proxy starts or dials it twice
+    # and advertises its tools twice (#955 review 4). It cannot be treated as a
+    # match either — which checkout it belongs to is exactly what is unknown —
+    # so a candidate sharing its base signature is declined with a reason the
+    # operator can act on, instead of being silently duplicated or silently
+    # skipped.
+    existing_identities: list[dict[str, Any]] = []
+    unresolved_signatures: list[tuple[str, ...]] = []
+    for cfg in servers.values():
+        if not isinstance(cfg, dict):
+            continue
+        identity = _stm_identity_entry(cfg)
+        if identity is not None:
+            existing_identities.append(identity)
+        elif (sig := _server_signature(cfg)) is not None:
+            unresolved_signatures.append(sig)
 
     new_candidates: list[dict[str, Any]] = []
     for cand in all_candidates:
@@ -3906,8 +4336,8 @@ def _add_from_clients(
             )
             skipped.append({"name": cand_name, "reason": "already_registered"})
             continue
-        sig = _server_signature(entry)
-        if sig is not None and sig in existing_signatures:
+        identity = _candidate_identity_entry(cand, discovery_cwd)
+        if any(_same_server(identity, cfg) for cfg in existing_identities):
             click.echo(
                 f"  {_warn('Skipping:')} '{_disp(cand_name)}' — matches an existing server "
                 "by command/url.",
@@ -3915,12 +4345,31 @@ def _add_from_clients(
             )
             skipped.append({"name": cand_name, "reason": "duplicate_signature"})
             continue
+        cand_sig = _server_signature(identity)
+        if cand_sig is not None and cand_sig in unresolved_signatures:
+            click.echo(
+                f"  {_warn('Skipping:')} '{_disp(cand_name)}' — an existing server runs the "
+                "same command but records an origin whose checkout cannot be read, so STM "
+                "cannot tell whether it is the same server. Fix that entry's `origin.source` "
+                "in the config, or add this one with `mms add`.",
+                err=True,
+            )
+            skipped.append({"name": cand_name, "reason": "ambiguous_identity"})
+            continue
         new_candidates.append(cand)
 
     if not new_candidates:
-        # Everything requested is already registered. Not an error: re-running
-        # the same scripted import has to stay idempotent.
-        info("All discovered servers are already registered.")
+        # Nothing left to offer. Not an error: re-running the same scripted
+        # import has to stay idempotent. ``already_registered`` and
+        # ``duplicate_signature`` both mean the server IS registered here —
+        # under this name or another — so the original wording holds. Only
+        # ``ambiguous_identity`` makes it false: those servers were declined,
+        # not adopted, and claiming otherwise contradicts the remediation
+        # printed a line earlier (#955 review 5).
+        if any(row["reason"] == "ambiguous_identity" for row in skipped):
+            info("No discovered servers were imported — see the notes above.")
+        else:
+            info("All discovered servers are already registered.")
         emit([], skipped, warnings_json)
         return
 
@@ -4056,7 +4505,7 @@ def _add_from_clients(
     # surfacing. ``_handle_source_prune`` picks between the --prune flag,
     # the interactive prompt (TTY), and the hint-only fallback (non-TTY /
     # non-interactive selection / user declined).
-    pruned, failed = _handle_source_prune(
+    pruned, failed, manual = _handle_source_prune(
         selected_candidates,
         prune=prune,
         config_path=config_path,
@@ -4071,6 +4520,12 @@ def _add_from_clients(
         {
             "pruned": [{"name": n, "source": src} for n, src in pruned],
             "failed": [{"name": n, "source": src, "error": err} for n, src, err in failed],
+            # Same row shape as `prune --json`'s `manual`: a source with no
+            # writer is a reported outcome, not a failed attempt, and a script
+            # branching on `failed` must not see it there (#955 review).
+            "manual": [
+                {**row, "hint": _source_removal_hint(row["name"], row["source"])} for row in manual
+            ],
         }
         if prune
         else None,
@@ -4234,9 +4689,10 @@ def _confirm_validation() -> bool:
     default=False,
     help=(
         "After a successful import + registration, remove the direct "
-        "registrations from source MCP clients so tools route through STM "
-        "only. TTY callers get a single y/N prompt (default No); non-TTY "
-        "scripted callers must pass the flag explicitly."
+        "registrations from the source MCP clients mms can write, so tools "
+        "route through STM only; a Cursor registration is reported with the "
+        "manual edit instead. TTY callers get a single y/N prompt (default "
+        "No); non-TTY scripted callers must pass the flag explicitly."
     ),
 )
 @click.option(
@@ -4316,9 +4772,12 @@ def init(
 
     candidates = [] if demo else _discover_candidates(Path.cwd())
     if not allow_project_configs:
-        candidates = [
-            cand for cand in candidates if str(cand.get("source", "")) != ".mcp.json (project)"
-        ]
+        # Keyed on the marker, not on one label: the marker is what says "this
+        # file came from the checkout", and a second repo-local source would
+        # otherwise walk straight past a label comparison (#955). The label is
+        # still consulted when a candidate carries no marker at all, so this
+        # cannot admit a shape the old comparison refused.
+        candidates = [cand for cand in candidates if not _is_repo_local_candidate(cand)]
     imported: dict[str, dict[str, Any]] = {}
     # Parallel list of the source-client candidate dicts for entries we
     # actually import. Needed so the end-of-flow prune step can address the
@@ -5354,7 +5813,8 @@ def tune(
     "--all",
     "all_servers",
     is_flag=True,
-    help="Prune every dual-registered upstream. Required when no NAMES given.",
+    help="Select every dual-registered upstream; sources mms cannot write are "
+    "reported, not pruned. Required when no NAMES given.",
 )
 @click.option(
     "--yes",
@@ -5391,6 +5851,10 @@ def prune(
     and removes the direct registration so tool calls route through STM —
     picking up compression, caching, and LTM surfacing, and collapsing the
     duplicate tool advertisement. STM's own config is not touched.
+
+    Cursor registrations are found but never removed: nothing here writes a
+    Cursor config, so each one is reported separately as a manual-only row and
+    excluded from the execution plan (#955).
     """
     config_path = resolve_cli_config_path(config_path).path
     if names and all_servers:
@@ -5418,6 +5882,7 @@ def prune(
         planned: list[dict[str, str]],
         pruned: list[tuple[str, str]],
         failed: list[tuple[str, str, str]],
+        manual: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         # All keys always present (locked shape — `host sync --json` doctrine)
         # so scripts can branch without existence checks.
@@ -5427,6 +5892,13 @@ def prune(
             "dry_run": dry_run,
             "config_path": str(resolved),
             "planned": planned,
+            # Rows this command will not attempt: their source has no writer,
+            # so listing them under `planned` would promise an action the
+            # writer refuses (#955). Each carries the manual edit to make.
+            "manual": [
+                {**row, "hint": _source_removal_hint(row["name"], row["source"])}
+                for row in manual or []
+            ],
             "pruned": [{"name": n, "source": s} for n, s in pruned],
             "failed": [
                 {"name": n, "source": s, "error": e, "hint": _source_removal_hint(n, s)}
@@ -5482,12 +5954,9 @@ def prune(
         click.echo("No dual-registered upstreams found.")
         return
 
-    # Preview iteration must cover the same ``source + duplicate_in`` set
-    # that ``_prune_imported_candidates`` acts on — otherwise a user could
-    # approve fewer entries than get written. See
-    # ``test_duplicate_in_sources_all_pruned`` for the contract pin. The
-    # ``--json`` ``planned`` rows come from this same loop so the machine
-    # plan and the human preview cannot drift.
+    # Preview iteration and execution use the same writable target set, so a
+    # user cannot approve fewer entries than get written. Manual-only rows
+    # remain visible but sit outside the plan and writer allowlist.
     if not as_json:
         click.echo(_hdr(f"Dual-registered upstream(s): {len(dual)}"))
     # Width over the *displayed* names, not the stored ones: an escaped
@@ -5497,22 +5966,26 @@ def prune(
     # plan, and its consumer matches it against the config.
     disp_names = {c["name"]: _disp(c["name"]) for c in dual}
     name_width = max((len(n) for n in disp_names.values()), default=0)
-    planned: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for cand in dual:
-        detail = _format_candidate_detail(cand["entry"])
-        for src in [cand["source"], *(cand.get("duplicate_in") or [])]:
-            key = (cand["name"], src)
-            if key in seen:
-                continue
-            seen.add(key)
-            planned.append({"name": cand["name"], "source": src})
-            if not as_json:
-                click.echo(f"  {disp_names[cand['name']]:<{name_width}}  {detail}  — {src}")
+    details = {c["name"]: _format_candidate_detail(c["entry"]) for c in dual}
+    planned, manual = _prune_targets(dual)
+    if not as_json:
+        for row in planned:
+            click.echo(
+                f"  {disp_names[row['name']]:<{name_width}}  "
+                f"{details[row['name']]}  — {row['source']}"
+            )
+        for row in manual:
+            # Named apart from the plan, not inside it: this run will not touch
+            # these, and the removal hint is the whole remediation (#955).
+            click.echo(
+                f"  {disp_names[row['name']]:<{name_width}}  "
+                f"{details[row['name']]}  — {row['source']}  (manual)"
+            )
+        _print_manual_prune_rows(manual)
 
     if dry_run:
         if as_json:
-            _echo_json(_prune_json_payload(planned, [], []))
+            _echo_json(_prune_json_payload(planned, [], [], manual))
             return
         click.echo("")
         click.echo(f"{_ok('Dry run:')} no writes performed.")
@@ -5539,7 +6012,15 @@ def prune(
         return
 
     pruned_at = utc_now_iso()
-    pruned, failed = _prune_imported_candidates(dual, pruned_at=pruned_at)
+    allowed_sources = {(row["name"], row["source"]) for row in planned}
+    if allowed_sources:
+        pruned, failed = _prune_imported_candidates(
+            dual,
+            pruned_at=pruned_at,
+            allowed_sources=allowed_sources,
+        )
+    else:
+        pruned, failed = [], []
     # Same step-③ metadata save as the inline import path: flip the matching
     # per-source ``origin`` rows for entries that have one. The save only
     # happens when a row actually flipped — entries without origin leave the
@@ -5550,7 +6031,7 @@ def prune(
     # the stderr failure diagnostics keep printing (stdout stays pure JSON).
     had_failures = _report_prune_results(pruned, failed, quiet_success=as_json)
     if as_json:
-        _echo_json(_prune_json_payload(planned, pruned, failed))
+        _echo_json(_prune_json_payload(planned, pruned, failed, manual))
     if had_failures:
         sys.exit(1)
 
@@ -5559,7 +6040,9 @@ def prune(
 #
 # Reverse of the import(+prune) forward path: write the entry back to its
 # host config (``origin.original`` verbatim when captured), then remove it
-# from STM. Order invariant: host write FIRST, STM removal SECOND — every
+# from STM. "Its host config" means the recorded origin when that origin is
+# one this file writes; an unmanaged origin (``cursor-*``, #955) restores to
+# an explicit ``--to`` target instead. Order invariant: host write FIRST, STM removal SECOND — every
 # failure mode degrades to dual registration (visible, recoverable), never
 # to a server registered nowhere. Like prune, this is an explicit opt-in
 # writer; discovery itself stays read-only (#202/#226 lineage).
@@ -5617,8 +6100,12 @@ def _parse_eject_to(value: str) -> tuple[_SourceSpec, str | None]:
     """
     kind, _, path_part = value.partition(":")
     spec = _SOURCE_BY_KIND.get(kind)
+    if spec is not None and not spec.managed:
+        # Discovered but never written (#955): eject restores an entry to its
+        # host config, and there is no writer for this one.
+        spec = None
     if spec is None:
-        kinds = " | ".join(s.kind for s in _SOURCE_SPECS)
+        kinds = " | ".join(s.kind for s in _SOURCE_SPECS if s.managed)
         raise click.UsageError(f"--to must be one of: {kinds} (got {value!r})")
     if kind == "claude-project":
         return spec, str(Path(path_part or ".").expanduser().resolve())
@@ -5804,6 +6291,32 @@ def _eject_manual_hint(name: str, kind: str, path: str | None, payload: dict[str
             f"{_shell_join(['cd', path or '.'])} && "
             f"{_shell_join(['claude', 'mcp', 'add-json', name, payload_json, '-s', 'local'])}"
         )
+    spec = _SOURCE_BY_KIND.get(kind)
+    if spec is not None and not spec.managed:
+        # Same wrong-file class as the writer backstop (#955): the branch below
+        # names Claude Desktop's config for every kind it does not recognize,
+        # and an unmanaged source is not in that file.
+        #
+        # Unreachable through an ``_EjectPlan`` today — both call sites pass
+        # ``plan.kind``, and ``_resolve_eject_plan`` takes that from a managed
+        # origin or from ``_parse_eject_to``, which refuses unmanaged kinds. It
+        # stays as the third reader of the ``managed`` rule, kept in lockstep
+        # with the writer and the prune refusal, and is pinned by direct unit
+        # calls rather than by a command-level test (#955 review).
+        # Same fragment as every other kind: this helper's contract is a
+        # copy-pasteable restore, and an unmanaged source is the one case
+        # where hand-editing is the ONLY route — dropping the payload here
+        # would leave the operator to reconstruct it from the config.
+        where = (
+            path
+            if kind == "cursor-project" and path
+            else _UNMANAGED_SOURCE_FILES.get(kind, f"the {spec.label} config")
+        )
+        name_json = json.dumps(name, ensure_ascii=False)
+        return (
+            f"# Edit {_disp(str(where))} and add under mcpServers: "
+            f"{_disp(name_json)}: {_disp(payload_json)}"
+        )
     target = path if kind == "mcp-json" else str(_desktop_config_path())
     # Both JSON halves need ``_disp`` on top of ``json.dumps``:
     # ``ensure_ascii=False`` escapes only what JSON requires — the C0 subset —
@@ -5886,9 +6399,15 @@ def _resolve_eject_plan(
     # origin-less entries or a vanished origin path.
     kind = path = None
     no_origin = "no usable origin recorded"
-    if source and source.get("kind") in _SOURCE_BY_KIND:
+    origin_spec = _SOURCE_BY_KIND.get(source.get("kind", "")) if source else None
+    if source and origin_spec is not None and origin_spec.managed:
         kind = source["kind"]
         path = source.get("path") if isinstance(source.get("path"), str) else None
+    elif origin_spec is not None:
+        # Recorded, but nothing can write it back (#955). Falls through to the
+        # `--to` escape hatch rather than claiming the origin is unusable for
+        # the usual reason (a vanished path).
+        no_origin = f"{origin_spec.label} entries cannot be ejected — mms never writes that config"
     if kind == "claude-project" and (path is None or not Path(path).is_dir()):
         no_origin = f"origin project directory no longer exists: {path}"
         kind = path = None
@@ -5911,7 +6430,7 @@ def _resolve_eject_plan(
                     # Render a copy-paste-safe shell argument. This is POSIX/
                     # PowerShell-oriented quoting, not cmd.exe syntax.
                     retry_target = f"`--to {shlex.quote(target_value)}`"
-                elif hint in _SOURCE_BY_KIND:
+                elif (spec := _SOURCE_BY_KIND.get(hint)) is not None and spec.managed:
                     retry_target = f"`--to {hint}`"
                 else:
                     retry_target = f"`--to TARGET` ({_EJECT_TARGETS_HELP})"
@@ -5943,9 +6462,22 @@ def _resolve_eject_plan(
         verbatim = True
         normalized = _normalize_client_entry(original)
         if normalized is not None:
-            stm_sig = _server_signature(entry)
-            orig_sig = _server_signature(normalized)
-            if stm_sig is not None and orig_sig is not None and stm_sig != orig_sig:
+            if (
+                source
+                and source.get("kind") == "cursor-project"
+                and normalized.get("transport") == "stdio"
+                and isinstance(source.get("path"), str)
+            ):
+                # Cursor's project config omits cwd because the client
+                # supplies the checkout implicitly. Discovery materializes
+                # that context on the STM entry, while ``origin.original``
+                # intentionally stays verbatim. Reconstruct the same value
+                # from the recorded ``<checkout>/.cursor/mcp.json`` path so
+                # an unchanged import does not look edited. Deriving rather
+                # than copying ``entry["cwd"]`` keeps a real STM-side cwd
+                # change visible to the drift guard.
+                normalized["cwd"] = str(Path(source["path"]).parent.parent)
+            if _same_server(entry, normalized) is False:
                 warnings.append(
                     "STM entry was modified after import — restoring the original "
                     "host entry as imported (STM-side changes are not carried over)"
@@ -5962,10 +6494,17 @@ def _resolve_eject_plan(
     if existing is not None:
         existing_norm = _normalize_client_entry(existing)
         payload_norm = _normalize_client_entry(payload)
-        existing_sig = _server_signature(existing_norm) if existing_norm else None
-        payload_sig = _server_signature(payload_norm) if payload_norm else None
-        if existing_sig is not None and payload_sig is not None:
-            if existing_sig == payload_sig:
+        # Same comparator as every other identity check here (#955 review).
+        # Both operands are normalized host entries, so neither carries a
+        # ``cwd`` and this reduces to signature equality — routing through it
+        # is about having one reader of the rule, not about cwd.
+        match = (
+            _same_server(existing_norm, payload_norm)
+            if existing_norm is not None and payload_norm is not None
+            else None
+        )
+        if match is not None:
+            if match:
                 skip_write = True
             elif force:
                 overwrite = True
@@ -6055,6 +6594,13 @@ def _eject_host_write(plan: _EjectPlan) -> tuple[bool, str | None]:
     """Dispatch the host write for one resolved plan (RFC §4.1 writer table)."""
     assert plan.payload is not None
     spec = _SOURCE_BY_KIND[plan.kind]
+    if not spec.managed:
+        # Plan resolution already refuses these, so this is the backstop rather
+        # than the gate — but the final branch below writes Claude Desktop's
+        # config for every kind it does not recognize, which is exactly the
+        # wrong-file write #955 exists to prevent. A second reader of a rule
+        # goes wrong one copy at a time, so both copies say it.
+        return (False, f"{spec.label} entries cannot be ejected — mms never writes that config")
     if plan.kind in ("claude-user", "claude-project"):
         scope = spec.claude_scope or "user"
         cwd = plan.path if plan.kind == "claude-project" else None
@@ -6115,8 +6661,9 @@ def _eject_verify(plan: _EjectPlan) -> list[str]:
     default=None,
     metavar="TARGET",
     help=(
-        f"Restore target for entries without a usable origin: {_EJECT_TARGETS_HELP}. Entries "
-        "with a recorded origin ignore this."
+        "Restore target for entries without a usable, writable origin "
+        f"(including cursor-*): {_EJECT_TARGETS_HELP}. Entries with a writable recorded "
+        "origin ignore this."
     ),
 )
 @click.option(
@@ -6180,8 +6727,9 @@ def eject(
 
     Reverse of ``mms add --import --prune``: writes the verbatim host entry
     captured at import time (``origin.original``) back to where it came
-    from, verifies the restore against the host config, and only then
-    removes the STM entry. Any failure leaves the server registered in at
+    from — or to a ``--to`` target, for an entry whose recorded origin is one
+    nothing here writes — verifies the restore against the host config, and
+    only then removes the STM entry. Any failure leaves the server registered in at
     least one place — worst case is dual registration, never disappearance.
     """
     config_path = resolve_cli_config_path(config_path).path

@@ -68,6 +68,42 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **`mms add --from-clients` and `mms init` now scan Cursor's MCP configs**
+  (#955). `mms add --from-clients` prints a gate message naming
+  `.mcp.json / .cursor/mcp.json` as the files a checkout can contain, but its
+  discovery only ever read `.mcp.json` — the message was accurate for
+  `mms import`, which shares it, and overstated there. A user who read it
+  reasonably concluded their project-local Cursor entries had been considered
+  and acknowledged, when the command never looked at them. `~/.cursor/mcp.json`
+  and the checkout's `.cursor/mcp.json` are now discovered under the same
+  labels `mms import` uses, and the project one carries the repo-local marker,
+  so selecting it requires `--allow-project-configs` before any probe, write or
+  prune. `mms init` filters repo-local candidates out silently rather than
+  printing that message, and now keys that filter on the marker rather than on
+  the `.mcp.json (project)` label, which a second repo-local source would
+  otherwise have walked past. **Behavior change**: both commands list Cursor
+  entries they previously ignored, so a `--all` import adopts more servers than
+  before on a machine that has them. Cursor entries are reported but never
+  written: both prune surfaces — standalone `prune` and import-time `--prune` —
+  list them as manual-only rows carrying the edit to make, never attempted,
+  never counted as failures, and nothing written to the pruned-originals backup
+  log for them; `eject` does not accept a `cursor-*` target. So neither can
+  dispatch to the one direct-edit writer that exists and delete from Claude
+  Desktop's config instead. A stdio `cwd` also joins server identity, but only
+  where both sides state one. Host configs have no `cwd` field, so the checkout
+  is inferred per side: a checkout-scoped source (`.mcp.json`, a Claude Code
+  project slot, `.cursor/mcp.json`) contributes the checkout its config belongs
+  to, and a registered upstream contributes the one recorded in its `origin`.
+  A checkout-less source contributes nothing and matches any `cwd` — as does an
+  entry with no `origin` block — because those servers do run from wherever the
+  client starts, while an `origin` that names a checkout this build cannot
+  resolve is skipped rather than pruned, and declines a same-command candidate
+  on import with a new `ambiguous_identity` skip reason rather than adopting a
+  second copy of a server it may already proxy. Only stdio identity has a
+  checkout — an HTTP entry is its URL wherever it was registered from. Identical relative commands in two
+  checkouts therefore stay distinct: `mms prune` run from the second one no
+  longer removes that checkout's unrelated entry.
+
 - **A per-tool `chars_per_token` now applies to a token budget inherited from
   its upstream server** (#929). The ratio was read only beside a per-tool
   `max_result_tokens`, so a tool that stated only its ratio ran at the server's
