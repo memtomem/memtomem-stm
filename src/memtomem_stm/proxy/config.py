@@ -1361,9 +1361,13 @@ class ToolOverrideConfig(BaseModel):
     ``chars_per_token`` ratio. Useful for non-Latin-script content where a
     fixed char budget under-triggers compression. See ``token_estimate.py``."""
     chars_per_token: float | None = Field(default=None, gt=0.0)
-    """Per-tool override for the chars-per-token ratio used to convert
-    ``max_result_tokens`` to a char budget. Falls back to the upstream
-    server's ratio, then ``ProxyConfig.chars_per_token``."""
+    """Per-tool override for the chars-per-token ratio used to convert a token
+    budget to a char budget. Falls back to the upstream server's ratio, then
+    ``ProxyConfig.chars_per_token``. The budget it converts may be this tool's
+    ``max_result_tokens`` or the one inherited from the server — the ratio
+    describes what this tool returns, not where its budget is written (#929).
+    Inert when the tool sets ``max_result_chars`` and no token budget of its
+    own: a char budget is absolute and nothing converts into it."""
     token_estimation_mode: TokenEstimationMode | None = None
     """Per-tool gate mode. ``unicode`` measures the actual response; ``None``
     inherits the upstream or proxy setting."""
@@ -2526,32 +2530,43 @@ def effective_max_result_chars(
     Shared for the same reason as the strategy pair (#926): the tuner reading
     the nominal ``max_result_chars`` saw 8000 where a call ran under a global
     16000, and recommended an "increase" that was a cut.
+
+    ``chars_per_token`` resolves on its own axis — tool override → server →
+    proxy default — independently of the level the token budget comes from
+    (#929). The ratio describes the *content a tool returns* (a tool serving
+    CJK text needs a different one than its English neighbour), so a tool that
+    states its ratio and inherits the server's token budget gets both. Reading
+    the tool ratio only beside a tool token budget silently dropped it, against
+    what the field docstrings and the configuration guide both promise. A
+    per-tool ``max_result_chars`` with no per-tool token budget beside it still
+    ends the question before any ratio applies: a char budget is absolute, and
+    nothing converts into it. Set both on one tool and tokens win, as they do
+    at every other level, so the ratio stays live.
+
+    What this returns is the *nominal* budget, resolved on every call whatever
+    the mode. ``token_estimation_mode`` set to ``unicode`` measures the
+    response and derives its own char budget from that, and ``progressive`` has
+    no result-size gate at all, so neither lets this value decide how a
+    response is compressed — but both still carry it into the response-cache
+    fingerprint.
     """
     default_server_max = UpstreamServerConfig.model_fields["max_result_chars"].default
     token_budget = cfg.max_result_tokens
-    if token_budget is not None:
-        cpt = cfg.chars_per_token if cfg.chars_per_token is not None else proxy_cfg.chars_per_token
-        max_chars = tokens_to_chars(token_budget, cpt)
-    elif cfg.max_result_chars == default_server_max:
-        max_chars = proxy_cfg.effective_max_result_chars()
-    else:
-        max_chars = cfg.max_result_chars
+    cpt = cfg.chars_per_token if cfg.chars_per_token is not None else proxy_cfg.chars_per_token
 
     if override is not None:
+        if override.max_result_chars is not None and override.max_result_tokens is None:
+            return override.max_result_chars, None
         if override.max_result_tokens is not None:
             token_budget = override.max_result_tokens
-            cpt = (
-                override.chars_per_token
-                if override.chars_per_token is not None
-                else cfg.chars_per_token
-                if cfg.chars_per_token is not None
-                else proxy_cfg.chars_per_token
-            )
-            max_chars = tokens_to_chars(override.max_result_tokens, cpt)
-        elif override.max_result_chars is not None:
-            token_budget = None
-            max_chars = override.max_result_chars
-    return max_chars, token_budget
+        if override.chars_per_token is not None:
+            cpt = override.chars_per_token
+
+    if token_budget is not None:
+        return tokens_to_chars(token_budget, cpt), token_budget
+    if cfg.max_result_chars == default_server_max:
+        return proxy_cfg.effective_max_result_chars(), None
+    return cfg.max_result_chars, None
 
 
 def _resolve_config_path_for_completion(
