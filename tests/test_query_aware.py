@@ -387,6 +387,218 @@ class TestEmbeddingOpenAIResponseParsing:
         assert result == []
 
 
+class TestEmbeddingCache:
+    """Repeat texts are looked up instead of re-sent (#873).
+
+    Section bodies are derived deterministically from an upstream response and
+    truncated, so the same text recurs call after call while only the query
+    rotates. A pass sends one batch, so a hit saves that text's share of it and
+    a pass that hits on everything saves the request — which can take up to
+    ``embedding_timeout``.
+    """
+
+    def _make_scorer(self, cache_size: int = 256):
+        from memtomem_stm.proxy.relevance import EmbeddingScorer
+
+        return EmbeddingScorer(
+            provider="ollama",
+            model="test-model",
+            base_url="http://ollama:11434",
+            cache_size=cache_size,
+        )
+
+    def _mock_response(self, payload: dict):
+        from unittest.mock import MagicMock
+
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value=payload)
+        return resp
+
+    def _post(self, vectors: list[list[float]]):
+        return patch("httpx.post", return_value=self._mock_response({"embeddings": vectors}))
+
+    def test_an_identical_call_issues_no_second_request(self):
+        scorer = self._make_scorer()
+        sections = [("## A", "matches the query"), ("## B", "unrelated")]
+        vectors = [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
+
+        with self._post(vectors) as post:
+            first = scorer.score_sections("the query", sections)
+            second = scorer.score_sections("the query", sections)
+
+        assert post.call_count == 1
+        assert first == second == pytest.approx([1.0, 0.0])
+
+    def test_only_the_unseen_text_is_requested(self):
+        """The batch keeps its shape and loses the texts already held.
+
+        The vectors are distinct per text, so a reassembly that lined the reply
+        up against the wrong inputs would score differently rather than merely
+        cost an extra request.
+        """
+        scorer = self._make_scorer()
+        first_sections = [("## A", "alpha"), ("## B", "beta")]
+        with self._post([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]):
+            scorer.score_sections("q", first_sections)
+
+        # Same query, same section A, one new section C.
+        with self._post([[1.0, 0.0, 0.0]]) as post:
+            scores = scorer.score_sections("q", [("## A", "alpha"), ("## C", "gamma")])
+
+        assert post.call_count == 1
+        assert post.call_args.kwargs["json"]["input"] == ["## C\ngamma"]
+        # A stayed orthogonal to the query, C came back parallel to it.
+        assert scores == pytest.approx([0.0, 1.0])
+
+    def test_a_rotated_query_reuses_the_sections(self):
+        scorer = self._make_scorer()
+        sections = [("## A", "alpha"), ("## B", "beta")]
+        with self._post([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]):
+            scorer.score_sections("first query", sections)
+
+        with self._post([[0.0, 1.0]]) as post:
+            scores = scorer.score_sections("second query", sections)
+
+        assert post.call_args.kwargs["json"]["input"] == ["second query"]
+        assert scores == pytest.approx([0.0, 1.0])
+
+    def test_a_repeated_section_within_one_call_is_asked_for_once(self):
+        """One response can carry the same section twice."""
+        scorer = self._make_scorer()
+        with self._post([[1.0, 0.0], [1.0, 0.0]]) as post:
+            scores = scorer.score_sections("q", [("## A", "alpha"), ("## A", "alpha")])
+
+        assert post.call_args.kwargs["json"]["input"] == ["q", "## A\nalpha"]
+        assert scores == pytest.approx([1.0, 1.0])
+
+    def test_cache_size_zero_requests_every_time(self):
+        scorer = self._make_scorer(cache_size=0)
+        sections = [("## A", "alpha")]
+        with self._post([[1.0, 0.0], [1.0, 0.0]]) as post:
+            scorer.score_sections("q", sections)
+            scorer.score_sections("q", sections)
+
+        assert post.call_count == 2
+
+    def test_a_short_reply_is_refused_with_the_cache_disabled_too(self):
+        """``0`` means "no cache", not "no checking".
+
+        The length guard lives on the path both settings share, so turning the
+        cache off cannot turn it into the old silent mis-ranking.
+        """
+        scorer = self._make_scorer(cache_size=0)
+        sections = [("## A", "alpha"), ("## B", "beta")]
+        with self._post([[1.0, 0.0]]):
+            scores = scorer.score_sections("q", sections)
+
+        assert scorer.fallback_count == 1
+        assert len(scores) == 2
+
+    def test_a_capacity_of_one_still_holds_an_entry(self):
+        """``cap // 2`` is 0 at cap 1, which would empty the map every insert."""
+        scorer = self._make_scorer(cache_size=1)
+        with self._post([[1.0, 0.0], [1.0, 0.0]]):
+            scorer.score_sections("q", [("## A", "alpha")])
+
+        assert len(scorer._cache) == 1
+
+    def test_the_cache_is_bounded(self):
+        """Twelve distinct texts under a cap of four, and the first one is gone.
+
+        Asserting only the ceiling would hold on an empty cache, which is what
+        every one of these tests looks like with the feature removed.
+        """
+        scorer = self._make_scorer(cache_size=4)
+        for i in range(6):
+            with self._post([[1.0, 0.0], [1.0, 0.0]]):
+                scorer.score_sections(f"query {i}", [("## S", f"body {i}")])
+
+        assert 0 < len(scorer._cache) <= 4
+        assert self._key(scorer, "query 0") not in scorer._cache
+        assert self._key(scorer, "query 5") in scorer._cache
+
+    def _key(self, scorer, text: str) -> str:
+        from memtomem_stm.utils.digest import framed_digest
+
+        return framed_digest((scorer._provider, scorer._model, text))
+
+    def test_a_short_provider_reply_falls_back_and_caches_nothing(self):
+        """A reply that does not answer every input has lost its ordering.
+
+        Scoring it would mis-rank once; caching it would keep doing so for
+        every later call, which is why the check runs before the write.
+        """
+        scorer = self._make_scorer()
+        sections = [("## A", "alpha"), ("## B", "beta")]
+        with self._post([[1.0, 0.0]]):
+            scores = scorer.score_sections("q", sections)
+
+        assert scorer.fallback_count == 1
+        assert scorer._cache == {}
+        assert len(scores) == 2
+
+    def test_concurrent_scoring_stays_consistent(self):
+        """``uses_blocking_io`` puts several worker threads on one instance.
+
+        Every thread works on texts of its own under a capacity that cannot
+        hold them all, so each is writing and evicting on a map the others are
+        using — though nothing here forces those steps to overlap, only to run
+        against one shared instance. What this pins is that concurrent use
+        returns correct
+        scores, raises nothing, and leaves the map bounded — it does **not**
+        prove the lock: removing it leaves this green, and a heavier probe (16
+        threads x 80 passes at capacity 2) produced no failure either, because
+        the GIL makes each dict step atomic on its own. The lock covers the
+        prune's read-then-delete, which is not atomic as a unit.
+
+        One patch for all the threads: nesting a ``patch("httpx.post")`` per
+        thread restores the global in whatever order they finish and can leave
+        a mock installed.
+        """
+        import threading
+
+        scorer = self._make_scorer(cache_size=6)
+        started = threading.Barrier(8)
+        results: list[tuple[int, list[float]]] = []
+        errors: list[BaseException] = []
+        results_lock = threading.Lock()
+
+        def fake_post(url, json=None, timeout=None, headers=None):
+            # One vector per input, all parallel: the assertion is about the
+            # cache surviving concurrency, not about the scores.
+            return self._mock_response({"embeddings": [[1.0, 0.0]] * len(json["input"])})
+
+        def run(idx: int) -> None:
+            try:
+                started.wait(timeout=10)
+                for _ in range(5):
+                    scores = scorer.score_sections(
+                        f"query {idx}",
+                        [("## S", f"body {idx}"), ("## shared", "every thread has this one")],
+                    )
+                    with results_lock:
+                        results.append((idx, scores))
+            except BaseException as exc:  # pragma: no cover - failure path
+                with results_lock:
+                    errors.append(exc)
+
+        with patch("httpx.post", side_effect=fake_post):
+            threads = [threading.Thread(target=run, args=(i,)) for i in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+
+        assert not any(t.is_alive() for t in threads)
+        assert errors == []
+        assert scorer.fallback_count == 0
+        assert len(results) == 40
+        assert all(scores == pytest.approx([1.0, 1.0]) for _, scores in results)
+        # Evictions ran throughout; the bound holds and the map is not empty.
+        assert 0 < len(scorer._cache) <= 6
+
+
 class TestEmbeddingProviderPaths:
     """Non-network branches of ``EmbeddingScorer`` (#619): the Ollama
     ``/api/embed`` parsing, provider dispatch, error mapping into the BM25

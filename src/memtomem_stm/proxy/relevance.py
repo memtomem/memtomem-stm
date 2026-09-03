@@ -12,9 +12,29 @@ import math
 import os
 import re
 import threading
-from typing import Protocol
+from typing import Any, Protocol
+
+from memtomem_stm.utils.digest import framed_digest
 
 logger = logging.getLogger(__name__)
+
+
+def _fifo_prune(d: dict[str, Any], cap: int) -> None:
+    """Evict oldest (first-inserted) entries once *cap* is exceeded.
+
+    Prunes to roughly half the cap so steady-state inserts don't re-trip on
+    every call. Same policy as the surfacing engine's bounded guard maps,
+    copied rather than imported: ``proxy`` does not depend on ``surfacing`` at
+    runtime, and five lines are cheaper than that edge.
+    """
+    if len(d) <= cap:
+        return
+    # Floor the target at one entry: ``cap // 2`` is 0 at ``cap = 1``, which
+    # would empty the map on every insert and make a legal capacity behave
+    # like the disabled setting.
+    excess = len(d) - max(1, cap // 2)
+    for k in list(d)[:excess]:
+        del d[k]
 
 
 class RelevanceScorer(Protocol):
@@ -151,6 +171,7 @@ class EmbeddingScorer:
         model: str = "nomic-embed-text",
         base_url: str = "http://localhost:11434",
         timeout: float = 10.0,
+        cache_size: int = 256,
     ) -> None:
         api_key = ""
         if provider == "openai":
@@ -172,6 +193,27 @@ class EmbeddingScorer:
         # keeps concurrent increments from losing a count (the metrics
         # boolean-delta would silently flip to False).
         self._fallback_lock = threading.Lock()
+        # Section bodies are derived deterministically from upstream responses
+        # (JSON keys, markdown headings) and truncated, so the same text comes
+        # back call after call while only the query rotates. A pass sends one
+        # batch, so what a hit saves is that text's share of it — and a pass
+        # that hits on everything saves the whole request, up to the full
+        # timeout on a cold or slow backend. Keyed per instance rather than per
+        # module: a config change
+        # rebuilds the scorer (`ProxyManager._relevance_scorer_for`), which
+        # discards the cache with it, so nothing has to invalidate on a model
+        # or provider edit. Guarded by its own lock for the same reason
+        # `fallback_count` is — with `uses_blocking_io` the scorer runs on
+        # worker threads, several at once, on one shared instance. The prune
+        # below reads the key order and then deletes from it, which is not one
+        # atomic step; two threads pruning together can delete the same key
+        # twice. CPython's GIL makes that narrow enough that a contention test
+        # does not reliably reproduce it (16 threads x 80 passes at capacity 2
+        # produced none), so the lock is here on the argument, not on a red
+        # test — and a free-threaded build removes even that narrowness.
+        self._cache_size = max(0, cache_size)
+        self._cache: dict[str, list[float]] = {}
+        self._cache_lock = threading.Lock()
 
     def score_sections(self, query: str, sections: list[tuple[str, str]]) -> list[float]:
         if not query or not sections:
@@ -197,9 +239,69 @@ class EmbeddingScorer:
             section_text = f"{title}\n{body[:500]}"
             texts.append(section_text)
 
-        embeddings = self._embed_batch(texts)
+        embeddings = self._embed_cached(texts)
         query_emb = embeddings[0]
         return [_cosine_similarity(query_emb, emb) for emb in embeddings[1:]]
+
+    def _embed_cached(self, texts: list[str]) -> list[list[float]]:
+        """One embedding per text, fetching only the ones not already held.
+
+        A repeat text costs a dict lookup instead of its share of an HTTP
+        round trip, and a call whose texts are all held issues no request at
+        all. The request keeps the shape it had — one batch — so a provider
+        sees the same traffic pattern, only shorter.
+
+        The lock is taken twice for as long as a dict operation, never across
+        the request: two threads racing on the same miss both fetch it, which
+        costs one redundant round trip and cannot produce a wrong answer, since
+        an embedding is a function of (provider, model, text).
+        """
+        if self._cache_size == 0:
+            return self._embed_exact(texts)
+
+        keys = [framed_digest((self._provider, self._model, text)) for text in texts]
+        with self._cache_lock:
+            held = {key: self._cache[key] for key in keys if key in self._cache}
+
+        # Deduplicated and order-preserving: the same section can appear twice
+        # in one response, and asking for it twice would pay for it twice.
+        misses: list[str] = []
+        miss_keys: list[str] = []
+        seen: set[str] = set()
+        for key, text in zip(keys, texts):
+            if key in held or key in seen:
+                continue
+            seen.add(key)
+            miss_keys.append(key)
+            misses.append(text)
+
+        if misses:
+            fetched = self._embed_exact(misses)
+            with self._cache_lock:
+                for key, embedding in zip(miss_keys, fetched):
+                    self._cache[key] = embedding
+                _fifo_prune(self._cache, self._cache_size)
+            held.update(zip(miss_keys, fetched))
+
+        return [held[key] for key in keys]
+
+    def _embed_exact(self, texts: list[str]) -> list[list[float]]:
+        """One vector per text, or an error naming the mismatch.
+
+        The correspondence is positional: the nth vector answers the nth text.
+        A reply with a different count has already lost it, so scoring it
+        mis-ranks silently, and caching it would keep doing so for every later
+        call. Raising lands in ``score_sections``'s fallback, which is where a
+        provider that cannot be trusted belongs. Checked on the cached and
+        uncached paths alike — a guard only the cache enforces would make
+        ``embedding_cache_size = 0`` mean something other than "no cache".
+        """
+        embeddings = self._embed_batch(texts)
+        if len(embeddings) != len(texts):
+            raise ValueError(
+                f"embedding provider returned {len(embeddings)} vectors for {len(texts)} inputs"
+            )
+        return embeddings
 
     def _embed_batch(self, texts: list[str]) -> list[list[float]]:
         try:
@@ -254,6 +356,7 @@ def create_scorer(
     model: str = "nomic-embed-text",
     base_url: str = "http://localhost:11434",
     timeout: float = 10.0,
+    cache_size: int = 256,
 ) -> RelevanceScorer:
     """Create a relevance scorer from config.
 
@@ -263,7 +366,14 @@ def create_scorer(
         model: embedding model name
         base_url: embedding API base URL
         timeout: embedding API timeout in seconds
+        cache_size: embeddings held per scorer instance; 0 disables the cache
     """
     if scorer_type == "embedding":
-        return EmbeddingScorer(provider=provider, model=model, base_url=base_url, timeout=timeout)
+        return EmbeddingScorer(
+            provider=provider,
+            model=model,
+            base_url=base_url,
+            timeout=timeout,
+            cache_size=cache_size,
+        )
     return BM25Scorer()
