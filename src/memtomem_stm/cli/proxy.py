@@ -6138,6 +6138,21 @@ def _resolve_eject_plan(
         verbatim = True
         normalized = _normalize_client_entry(original)
         if normalized is not None:
+            if (
+                source
+                and source.get("kind") == "cursor-project"
+                and normalized.get("transport") == "stdio"
+                and isinstance(source.get("path"), str)
+            ):
+                # Cursor's project config omits cwd because the client
+                # supplies the checkout implicitly. Discovery materializes
+                # that context on the STM entry, while ``origin.original``
+                # intentionally stays verbatim. Reconstruct the same value
+                # from the recorded ``<checkout>/.cursor/mcp.json`` path so
+                # an unchanged import does not look edited. Deriving rather
+                # than copying ``entry["cwd"]`` keeps a real STM-side cwd
+                # change visible to the drift guard.
+                normalized["cwd"] = str(Path(source["path"]).parent.parent)
             stm_sig = _server_signature(entry)
             orig_sig = _server_signature(normalized)
             if stm_sig is not None and orig_sig is not None and stm_sig != orig_sig:

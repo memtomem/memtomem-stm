@@ -9644,6 +9644,49 @@ class TestEjectCommand:
         assert "modified after import" in result.output
         assert self._claude_user_servers(_hermetic_home)["demo"] == original
 
+    def test_cursor_project_synthetic_cwd_does_not_trigger_drift_warning(
+        self, runner, config, fake_claude_host, _hermetic_home, tmp_path
+    ):
+        """Cursor's implicit project cwd is not an STM-side edit (#955)."""
+        project = tmp_path / "repo"
+        original = {"command": "npx", "args": ["-y", "@demo"]}
+        entry = _eject_entry(
+            kind="cursor-project",
+            path=str(project / ".cursor" / "mcp.json"),
+            original=original,
+        )
+        entry["cwd"] = str(project)
+        self._seed_config(config, {"demo": entry})
+
+        result = runner.invoke(
+            cli,
+            ["eject", "demo", "--yes", "--to", "claude-user", *_cfg_args(config)],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "modified after import" not in result.output
+        assert self._claude_user_servers(_hermetic_home)["demo"] == original
+
+    def test_cursor_project_changed_cwd_still_triggers_drift_warning(
+        self, runner, config, fake_claude_host, tmp_path
+    ):
+        """The origin path anchors cwd identity instead of hiding real edits."""
+        project = tmp_path / "repo"
+        entry = _eject_entry(
+            kind="cursor-project",
+            path=str(project / ".cursor" / "mcp.json"),
+        )
+        entry["cwd"] = str(tmp_path / "different-repo")
+        self._seed_config(config, {"demo": entry})
+
+        result = runner.invoke(
+            cli,
+            ["eject", "demo", "--yes", "--to", "claude-user", *_cfg_args(config)],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "modified after import" in result.output
+
     def test_pruned_duplicates_reported_not_restored(self, runner, config, fake_claude_host):
         self._seed_config(
             config,
