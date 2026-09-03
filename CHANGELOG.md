@@ -96,9 +96,10 @@ changes inline only. See the deprecation policy in
   to, and a registered upstream contributes the one recorded in its `origin`.
   A checkout-less source contributes nothing and matches any `cwd` — as does an
   entry with no `origin` block — because those servers do run from wherever the
-  client starts. Identical relative commands in two checkouts therefore stay
-  distinct: `mms prune` run from the second one no longer removes that
-  checkout's unrelated entry.
+  client starts, while an `origin` that names a checkout this build cannot
+  resolve is skipped rather than pruned. Identical relative commands in two
+  checkouts therefore stay distinct: `mms prune` run from the second one no
+  longer removes that checkout's unrelated entry.
 
 - **A per-tool `chars_per_token` now applies to a token budget inherited from
   its upstream server** (#929). The ratio was read only beside a per-tool

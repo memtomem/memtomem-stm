@@ -2988,26 +2988,64 @@ def _is_repo_local_candidate(cand: dict[str, Any]) -> bool:
 _SOURCE_BY_KIND: dict[str, _SourceSpec] = {spec.kind: spec for spec in _SOURCE_SPECS}
 
 
-def _checkout_of_source(source_ref: dict[str, Any] | None) -> str | None:
-    """The checkout a ``{kind, path}`` source record launches its servers from.
+# What a source record says about the checkout its servers run in. Three
+# answers, not two: a checkout-less source states "anywhere", which
+# :func:`_same_server` reads as a match, while a record that *should* name a
+# checkout and cannot is not the same claim and must not be spent as one
+# (#955 review 3).
+_CHECKOUT_NONE = "none"
+_CHECKOUT_UNKNOWN = "unknown"
 
-    Each checkout-scoped kind anchors its path differently — ``claude-project``
-    records the project directory itself, ``mcp-json`` the ``.mcp.json`` file,
-    ``cursor-project`` the ``.cursor/mcp.json`` file — so the offset from path
-    to checkout lives here once rather than at each comparison. ``None`` for a
-    checkout-less kind, an unknown kind, or a record with no path.
+# Where each checkout-scoped kind's recorded path sits relative to its
+# checkout, and the anchor that proves the path is the one it claims to be.
+# ``origin.source`` is user-editable and ``OriginSource.kind`` is deliberately
+# an open string (``proxy/config.py``) so a config written by a newer CLI still
+# validates — an anchor that does not match is a record this build cannot read,
+# not a checkout.
+_CHECKOUT_ANCHORS: dict[str, tuple[int, tuple[str, ...]]] = {
+    "claude-project": (0, ()),
+    "mcp-json": (1, (".mcp.json",)),
+    "cursor-project": (2, ("mcp.json", ".cursor")),
+}
+
+
+def _checkout_of_source(source_ref: dict[str, Any] | None) -> tuple[str, str | None]:
+    """What a ``{kind, path}`` source record says about its checkout.
+
+    Returns ``(_CHECKOUT_NONE, None)`` for a source that runs wherever the
+    client starts, ``(_CHECKOUT_UNKNOWN, None)`` for a record this build cannot
+    resolve — an unrecognized kind, or a checkout-scoped one whose path is
+    missing, relative, or not anchored where that kind anchors it — and
+    ``(kind, checkout)`` otherwise. Each checkout-scoped kind anchors its path
+    differently (``claude-project`` records the project directory itself,
+    ``mcp-json`` the ``.mcp.json`` file, ``cursor-project`` the
+    ``.cursor/mcp.json`` file), so the offset lives here once rather than at
+    each comparison.
     """
     if not isinstance(source_ref, dict):
-        return None
-    spec = _SOURCE_BY_KIND.get(str(source_ref.get("kind", "")))
+        return (_CHECKOUT_UNKNOWN, None)
+    kind = str(source_ref.get("kind", ""))
+    spec = _SOURCE_BY_KIND.get(kind)
+    if spec is None:
+        return (_CHECKOUT_UNKNOWN, None)
+    if not spec.is_checkout_scoped:
+        return (_CHECKOUT_NONE, None)
     path = source_ref.get("path")
-    if spec is None or not spec.is_checkout_scoped or not isinstance(path, str) or not path:
-        return None
-    if spec.kind == "claude-project":
-        return path
-    if spec.kind == "cursor-project":
-        return str(Path(path).parent.parent)
-    return str(Path(path).parent)
+    if not isinstance(path, str) or not path:
+        return (_CHECKOUT_UNKNOWN, None)
+    anchored = Path(path)
+    if not anchored.is_absolute():
+        # A relative anchor cannot name a checkout without a base this
+        # function does not have, and resolving it against the process cwd
+        # would invent one.
+        return (_CHECKOUT_UNKNOWN, None)
+    depth, expected = _CHECKOUT_ANCHORS[spec.kind]
+    parts = anchored.parts[-len(expected) :] if expected else ()
+    if tuple(reversed(parts)) != expected:
+        return (_CHECKOUT_UNKNOWN, None)
+    for _ in range(depth):
+        anchored = anchored.parent
+    return (kind, str(anchored))
 
 
 def _candidate_identity_entry(cand: dict[str, Any], cwd: Path) -> dict[str, Any]:
@@ -3036,17 +3074,21 @@ def _candidate_identity_entry(cand: dict[str, Any], cwd: Path) -> dict[str, Any]
     if entry.get("cwd") is not None:
         return entry
     source_ref = cand.get("source_ref")
-    spec = (
-        _SOURCE_BY_KIND.get(str(source_ref.get("kind", "")))
-        if isinstance(source_ref, dict)
-        else _SOURCE_BY_LABEL.get(str(cand.get("source", "")))
-    )
+    if isinstance(source_ref, dict):
+        _kind, checkout = _checkout_of_source(source_ref)
+        if checkout is not None:
+            return {**entry, "cwd": checkout}
+    # No usable record. Discovery only ever reads the checkout-scoped configs
+    # of the directory it was handed, so that directory is the anchor for a
+    # candidate built without one (hand-built candidates, and tests) — unlike
+    # the registered side, where nothing stands in for a missing origin.
+    spec = _SOURCE_BY_LABEL.get(str(cand.get("source", "")))
     if spec is None or not spec.is_checkout_scoped:
         return entry
-    return {**entry, "cwd": _checkout_of_source(source_ref) or str(cwd.resolve())}
+    return {**entry, "cwd": str(cwd.resolve())}
 
 
-def _stm_identity_entry(cfg: dict[str, Any]) -> dict[str, Any]:
+def _stm_identity_entry(cfg: dict[str, Any]) -> dict[str, Any] | None:
     """The registered upstream as identity should read it, cwd included.
 
     Mirror of :func:`_candidate_identity_entry` for the other operand, and
@@ -3055,15 +3097,28 @@ def _stm_identity_entry(cfg: dict[str, Any]) -> dict[str, Any]:
     records its origin but persists no ``cwd`` — matching a same-name row found
     in repo B (#955 review 2).
 
-    An explicit ``cwd`` wins; otherwise ``origin.source`` supplies it. An entry
-    with no origin block (a manual ``mms add``, an import predating provenance
-    capture) has no checkout to state and keeps the documented wildcard.
+    An explicit ``cwd`` wins; otherwise ``origin.source`` supplies it. Returns
+    ``None`` when the origin claims a checkout this build cannot resolve — an
+    unrecognized kind, or a checkout-scoped one with a missing, relative or
+    wrongly anchored path. ``origin.source`` is user-editable and its ``kind``
+    is an open string by design, so those records exist; reading one as "runs
+    anywhere" would spend a broken claim as a wildcard and let a prune in
+    another checkout delete that checkout's row (#955 review 3). Callers fail
+    closed on ``None``: the destructive side skips the entry, the dedup side
+    declines to call it a duplicate.
+
+    An entry with no origin block at all (a manual ``mms add``, an import
+    predating provenance capture) is a different case — it makes no claim, so
+    it keeps the documented wildcard.
     """
     if not isinstance(cfg, dict) or cfg.get("cwd") is not None:
         return cfg
     origin = cfg.get("origin")
-    source = origin.get("source") if isinstance(origin, dict) else None
-    checkout = _checkout_of_source(source if isinstance(source, dict) else None)
+    if not isinstance(origin, dict) or not isinstance(origin.get("source"), dict):
+        return cfg
+    kind, checkout = _checkout_of_source(origin["source"])
+    if kind == _CHECKOUT_UNKNOWN:
+        return None
     if checkout is None:
         return cfg
     return {**cfg, "cwd": checkout}
@@ -3138,7 +3193,9 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
         servers = _mcp_servers(cursor)
         if servers:
             spec = _SOURCE_BY_LABEL[label]
-            sources.append((spec, str(path.resolve()) if spec.is_repo_local else None, servers))
+            sources.append(
+                (spec, str(path.resolve()) if spec.is_checkout_scoped else None, servers)
+            )
 
     seen: dict[str, dict[str, Any]] = {}
     for spec, src_path, servers in sources:
@@ -3808,6 +3865,11 @@ def _find_dual_registered(
         # Both sides have a signature and they differ → intentionally distinct
         # servers sharing a name. Skip rather than prune the unrelated entry.
         stm_identity = _stm_identity_entry(stm_upstreams[name])
+        if stm_identity is None:
+            # The entry claims a checkout nothing here can resolve. Refuse
+            # rather than fall back to the name, which is the whole reason
+            # this function compares identities at all.
+            continue
         if _same_server(stm_identity, _candidate_identity_entry(cand, cwd)) is False:
             continue
         dual.append(cand)
@@ -4222,8 +4284,13 @@ def _add_from_clients(
     # Compared pairwise through ``_same_server`` rather than against a set of
     # signatures: identity folds in a stdio ``cwd`` when both sides record
     # one, which a shared key cannot express (#955 review).
+    # An entry whose origin names an unresolvable checkout drops out of the
+    # comparison entirely: it cannot claim a candidate as its duplicate, so the
+    # candidate stays importable rather than being silently skipped.
     existing_identities = [
-        _stm_identity_entry(cfg) for cfg in servers.values() if isinstance(cfg, dict)
+        identity
+        for cfg in servers.values()
+        if isinstance(cfg, dict) and (identity := _stm_identity_entry(cfg)) is not None
     ]
 
     new_candidates: list[dict[str, Any]] = []

@@ -6840,6 +6840,163 @@ class TestCheckoutScopedIdentity:
         cfg = {"prefix": "repo", "transport": "stdio", "command": "./run.sh"}
         assert "cwd" not in _stm_identity_entry(cfg)
 
+    @pytest.mark.parametrize(
+        ("source", "why"),
+        [
+            ({"kind": "mcp-json"}, "checkout-scoped kind with no path"),
+            ({"kind": "mcp-json", "path": "repo/.mcp.json"}, "relative path"),
+            ({"kind": "mcp-json", "path": "/repo/other.json"}, "wrong anchor for the kind"),
+            ({"kind": "cursor-project", "path": "/repo/mcp.json"}, "missing the .cursor segment"),
+            ({"kind": "windsurf-project", "path": "/repo/x.json"}, "kind this build cannot read"),
+        ],
+    )
+    def test_an_unresolvable_origin_is_incomparable_not_a_wildcard(self, source, why):
+        """A broken claim must not be spent as "runs anywhere" (#955 r3).
+
+        ``origin.source`` is user-editable and ``OriginSource.kind`` is an open
+        string by design, so these records exist. Reading one as a wildcard let
+        a prune in another checkout delete that checkout's row.
+        """
+        from memtomem_stm.cli.proxy import _stm_identity_entry
+
+        cfg = {
+            "transport": "stdio",
+            "command": "./run.sh",
+            "origin": {"source": source},
+        }
+        assert _stm_identity_entry(cfg) is None, why
+
+    def test_a_checkout_less_origin_is_still_a_wildcard(self):
+        """Positive control: the tri-state must not collapse into "refuse
+        whenever there is an origin". A user-scope import really does run
+        wherever the client starts."""
+        from memtomem_stm.cli.proxy import _stm_identity_entry
+
+        cfg = {
+            "transport": "stdio",
+            "command": "./run.sh",
+            "origin": {"source": {"kind": "claude-user"}},
+        }
+        identity = _stm_identity_entry(cfg)
+        assert identity is not None and "cwd" not in identity
+
+    def test_prune_refuses_an_entry_with_an_unresolvable_origin(
+        self, runner, config, tmp_path, monkeypatch
+    ):
+        """The destructive caller fails closed on the incomparable state."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        home, _desktop = self._setup_home(tmp_path, monkeypatch)
+        repo_b = tmp_path / "repo-b"
+        repo_b.mkdir()
+
+        removals: list[list[str]] = []
+
+        def fake_run(cmd, timeout=5, cwd=None):
+            removals.append(list(cmd))
+            return _FakeClaudeResult(returncode=0)
+
+        monkeypatch.setattr(proxy_mod, "_run_claude_mcp", fake_run)
+        self._write_source("mcp-json", home, repo_b)
+        monkeypatch.chdir(repo_b)
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "repo-tool": {
+                            "prefix": "repo",
+                            "transport": "stdio",
+                            "command": "./run.sh",
+                            # Names a checkout, but the anchor is unreadable —
+                            # so which checkout is unknown.
+                            "origin": {"source": {"kind": "mcp-json"}},
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert "No dual-registered upstreams found" in result.output
+        assert removals == []
+
+    def test_add_dedup_uses_the_registered_entry_origin(
+        self, runner, config, tmp_path, monkeypatch
+    ):
+        """The dedup caller reads the STM-side checkout too (#955 r3).
+
+        An import from repo A's ``.mcp.json`` persists no ``cwd`` — only a
+        Cursor-project import does — so without reading its origin, an alias in
+        repo A would not be recognized as the same server and a genuinely
+        different server in repo B would be swallowed as a duplicate. Both
+        directions are asserted here; covering only prune left this caller free
+        to regress.
+        """
+        home, _desktop = self._setup_home(tmp_path, monkeypatch)
+        repo_a = tmp_path / "repo-a"
+        repo_b = tmp_path / "repo-b"
+        repo_a.mkdir()
+        repo_b.mkdir()
+
+        self._write_source("mcp-json", home, repo_a)
+        monkeypatch.chdir(repo_a)
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+        first = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--all", "--allow-project-configs", *_cfg_args(config)],
+        )
+        assert first.exit_code == 0, first.output
+        saved = json.loads(config.read_text(encoding="utf-8"))["upstream_servers"]["repo-tool"]
+        assert "cwd" not in saved, "an .mcp.json import must not persist a cwd"
+
+        # Same checkout, second name: the same server, so it is skipped.
+        (repo_a / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"repo-tool-alias": {"command": "./run.sh"}}}),
+            encoding="utf-8",
+        )
+        alias = runner.invoke(
+            cli,
+            [
+                "add",
+                "--from-clients",
+                "--all",
+                "--allow-project-configs",
+                "--json",
+                *_cfg_args(config),
+            ],
+        )
+        assert alias.exit_code == 0, alias.output
+        assert json.loads(alias.stdout)["skipped"] == [
+            {"name": "repo-tool-alias", "reason": "duplicate_signature"}
+        ]
+
+        # Other checkout, same relative command: a different server, imported.
+        self._write_source("mcp-json", home, repo_b)
+        (repo_b / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"repo-tool-b": {"command": "./run.sh"}}}),
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(repo_b)
+        other = runner.invoke(
+            cli,
+            [
+                "add",
+                "--from-clients",
+                "--all",
+                "--allow-project-configs",
+                "--json",
+                *_cfg_args(config),
+            ],
+        )
+        assert other.exit_code == 0, other.output
+        payload = json.loads(other.stdout)
+        assert [row["name"] for row in payload["imported"]] == ["repo-tool-b"]
+        assert payload["skipped"] == []
+
     @pytest.mark.parametrize("kind", ["mcp-json", "claude-project", "cursor-project"])
     def test_import_in_one_checkout_then_prune_in_another(
         self, kind, runner, config, tmp_path, monkeypatch
