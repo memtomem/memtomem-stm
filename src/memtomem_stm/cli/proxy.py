@@ -2972,6 +2972,36 @@ def _prune_targets(
     return writable, manual
 
 
+def _conflict_rows(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """``(name, source)`` rows for same-name entries that are another server.
+
+    The counterpart to :func:`_prune_targets` for the third state discovery
+    records (#981): a source claiming a name whose identity does not match the
+    winner is neither a target nor a manual row — this run will not touch it,
+    and there is no edit to recommend either, since the entry is not this
+    server's registration at all.
+
+    Deduped on ``(name, source)`` like the prune targets, and deliberately
+    carrying nothing but those two fields: the rows go into ``--json``
+    payloads, and a conflict's ``entry`` is another client's config.
+    """
+    rows: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for cand in candidates:
+        for conflict in cand.get("conflicts") or []:
+            if not isinstance(conflict, dict):
+                continue
+            label = conflict.get("label")
+            if not isinstance(label, str):
+                continue
+            key = (cand["name"], label)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({"name": cand["name"], "source": label})
+    return rows
+
+
 def _is_repo_local_candidate(cand: dict[str, Any]) -> bool:
     """Whether this candidate came from a file inside the current checkout.
 
@@ -3155,10 +3185,18 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
     prefix), ``raw`` is the **verbatim** host entry (normalization is lossy —
     the original is what ``mms eject`` restores, #475), and ``source_ref``
     is the structured ``{kind, path?}`` record persisted as
-    ``origin.source``. The first source to claim a name wins; later
-    duplicates are dropped with a ``duplicate_in`` label note for the UI
-    plus a structured ``duplicates`` record (``{label, source_ref, raw}``)
-    so provenance and the prune backup log can address every source.
+    ``origin.source``. The first source to claim a name wins.
+
+    A later source claiming the same name is one of two things, and the name
+    alone does not say which (#981). A same-name entry whose identity matches
+    the winner is the same server registered twice: it is recorded with a
+    ``duplicate_in`` label note for the UI plus a structured ``duplicates``
+    record (``{label, source_ref, raw}``) so provenance and the prune backup
+    log can address every source. A same-name entry that is a **different**
+    server is recorded in ``conflicts`` (``{label, source_ref}``) instead. No
+    prune execution, backup or provenance consumer reads that list — only the
+    reporting helpers do — so the entry is named to the operator and
+    otherwise left alone.
     """
     sources: list[tuple[_SourceSpec, str | None, dict[str, Any]]] = []
 
@@ -3264,10 +3302,45 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
             if src_path is not None:
                 source_ref["path"] = src_path
             if name in seen:
-                seen[name].setdefault("duplicate_in", []).append(spec.label)
-                seen[name].setdefault("duplicates", []).append(
-                    {"label": spec.label, "source_ref": source_ref, "raw": copy.deepcopy(raw)}
+                # A shared name is not a shared server. Every prune surface
+                # acts on ``[source, *duplicate_in]``, so recording this on the
+                # name alone deleted an unrelated entry that happened to share
+                # one — the exact clobber ``_find_dual_registered`` refuses on
+                # the primary source, arriving through the back door (#981).
+                # The loser is compared through the same identity pair the
+                # prune side uses, so a Cursor-project entry's explicit cwd
+                # (set above) and a ``.mcp.json`` entry's implied one are the
+                # same claim about the same checkout.
+                loser = {
+                    "name": name,
+                    "source": spec.label,
+                    "entry": entry,
+                    "source_ref": source_ref,
+                }
+                same = _same_server(
+                    _candidate_identity_entry(seen[name], cwd),
+                    _candidate_identity_entry(loser, cwd),
                 )
+                # ``is True``, not ``is not False``: a discovered entry always
+                # has a signature (``_normalize_client_entry`` requires a
+                # command or a url), so ``None`` is unreachable here — but an
+                # entry this build cannot compare must never be the one it
+                # deletes.
+                if same is True:
+                    seen[name].setdefault("duplicate_in", []).append(spec.label)
+                    seen[name].setdefault("duplicates", []).append(
+                        {"label": spec.label, "source_ref": source_ref, "raw": copy.deepcopy(raw)}
+                    )
+                else:
+                    # Label and structured source only. A conflict is never
+                    # backed up, pruned or ejected, so there is nothing to
+                    # restore from — and this entry belongs to a server the
+                    # operator is not acting on, whose command line and env can
+                    # carry their credentials. The house rule for those is
+                    # eject's: name the field, never echo the value (codex R1).
+                    seen[name].setdefault("conflicts", []).append(
+                        {"label": spec.label, "source_ref": source_ref}
+                    )
                 continue
             seen[name] = {
                 "name": name,
@@ -3332,6 +3405,31 @@ def _format_candidate_detail(entry: dict[str, Any]) -> str:
     return _disp(f"[{transport}] {entry.get('url', '')}")
 
 
+def _overlap_hint(cand: dict[str, Any]) -> str:
+    """The trailing ``(also in: …)`` / ``(a different server in: …)`` note.
+
+    One definition for both import previews, which is also the reason the
+    conflict half exists: a source that registers a *different* server under
+    this name used to be listed as "also in", telling the operator the
+    opposite of the truth about their own configs (#981). Returns ``""`` when
+    the candidate has neither, so the call sites stay one f-string.
+    """
+    parts: list[str] = []
+    dup = cand.get("duplicate_in")
+    if dup:
+        parts.append(f"also in: {', '.join(dup)}")
+    conflicts = [
+        c["label"]
+        for c in cand.get("conflicts") or []
+        if isinstance(c, dict) and isinstance(c.get("label"), str)
+    ]
+    if conflicts:
+        parts.append(f"a different server in: {', '.join(conflicts)}")
+    if not parts:
+        return ""
+    return f"  ({'; '.join(parts)})"
+
+
 def _source_removal_hint(name: str, source: str) -> str:
     """One informational shell-line telling the user how to remove a server
     from the client that originated it.
@@ -3377,6 +3475,45 @@ def _print_manual_prune_rows(manual: list[dict[str, str]]) -> None:
     click.echo("  (manual) — mms does not write these configs; remove by hand:")
     for row in manual:
         click.echo(f"    {_source_removal_hint(row['name'], row['source'])}")
+
+
+def _print_conflict_rows(candidates: list[dict[str, Any]]) -> None:
+    """Name the same-name entries this run treats as a different server.
+
+    Without this the operator sees nothing at all for a conflict: it is
+    absent from the plan, from the manual rows and from the removal hints, and
+    the only visible difference from a clean single registration would be a
+    prune that quietly does less than the dual-path warning implied (#981).
+
+    Names the server and the source that holds the other one, and stops there.
+    The detail line every other row carries is deliberately absent: this is
+    the one row describing a server the operator did not ask to act on, and a
+    host command line carries `--api-key=` arguments and URL userinfo. Eject
+    sets the house rule for exactly this — it names the secret-classified
+    keys it would put on argv and never their values (codex R1).
+    """
+    rows: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for cand in candidates:
+        for conflict in cand.get("conflicts") or []:
+            if not isinstance(conflict, dict):
+                continue
+            label = conflict.get("label")
+            if not isinstance(label, str):
+                continue
+            key = (cand["name"], label)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                f"another '{_disp(cand['name'])}' in {label} is a different "
+                "server — mms will not touch it"
+            )
+    if not rows:
+        return
+    click.echo("")
+    for row in rows:
+        click.echo(f"{_warn('Note:')} {row}")
 
 
 def _print_source_removal_hints(imported_candidates: list[dict[str, Any]]) -> None:
@@ -3734,6 +3871,10 @@ def _confirm_prune_prompt(imported_candidates: list[dict[str, Any]]) -> bool:
         # still dual-registered, marked because this prompt cannot change
         # that (#955).
         click.echo(f"    {_disp(row['name'])} — {row['source']}  (manual, not removed)")
+    for row in _conflict_rows(imported_candidates):
+        # Listed for the opposite reason: that source's entry is a different
+        # server, so consenting here must not read as consenting to it (#981).
+        click.echo(f"    {_disp(row['name'])} — {row['source']}  (different server, not removed)")
     return click.confirm("Remove from source(s)?", default=False)
 
 
@@ -3799,6 +3940,7 @@ def _handle_source_prune(
     if not should_prune:
         if not quiet:
             _print_source_removal_hints(imported_candidates)
+            _print_conflict_rows(imported_candidates)
         return [], [], manual
 
     pruned_at = utc_now_iso()
@@ -3815,6 +3957,7 @@ def _handle_source_prune(
     _report_prune_results(pruned, failed, quiet_success=quiet)
     if not quiet:
         _print_manual_prune_rows(manual)
+        _print_conflict_rows(imported_candidates)
     return pruned, failed, manual
 
 
@@ -4378,11 +4521,9 @@ def _add_from_clients(
     else:
         click.echo(_hdr(f"Found {len(new_candidates)} new MCP server(s) to import:"))
         for i, cand in enumerate(new_candidates, 1):
-            dup = cand.get("duplicate_in")
-            dup_hint = f"  (also in: {', '.join(dup)})" if dup else ""
             click.echo(
                 f"  {i:>2}. {_disp(cand['name']):<18} {_format_candidate_detail(cand['entry'])}"
-                f"    — from {cand['source']}{dup_hint}"
+                f"    — from {cand['source']}{_overlap_hint(cand)}"
             )
         click.echo("")
         picks = _pick_imports(new_candidates)
@@ -4526,6 +4667,9 @@ def _add_from_clients(
             "manual": [
                 {**row, "hint": _source_removal_hint(row["name"], row["source"])} for row in manual
             ],
+            # A source holding a different server under the same name is
+            # neither attempted nor recommended for a hand-edit (#981).
+            "conflicts": _conflict_rows(selected_candidates),
         }
         if prune
         else None,
@@ -4781,7 +4925,8 @@ def init(
     imported: dict[str, dict[str, Any]] = {}
     # Parallel list of the source-client candidate dicts for entries we
     # actually import. Needed so the end-of-flow prune step can address the
-    # exact ``(name, source, duplicate_in)`` triples via ``_handle_source_prune``.
+    # exact ``(name, source, duplicate_in)`` triples via ``_handle_source_prune``
+    # — and to leave the ``conflicts`` sources out of them (#981).
     imported_candidates: list[dict[str, Any]] = []
 
     if demo:
@@ -4797,15 +4942,14 @@ def init(
         click.echo(f"{_ok('Using bundled read-only demo server.')} No network access required.")
     elif candidates:
         click.echo(_hdr(f"Found {len(candidates)} MCP server(s) in existing client configs:"))
-        # TUI renders its own list; this preview exists so duplicate-source
-        # notes ("also in: X") stay visible — those don't fit inside a
-        # questionary Choice title and otherwise would be invisible.
+        # TUI renders its own list; this preview exists so the overlap notes
+        # ("also in: X", "a different server in: Y") stay visible — those
+        # don't fit inside a questionary Choice title and otherwise would be
+        # invisible.
         for i, cand in enumerate(candidates, 1):
-            dup = cand.get("duplicate_in")
-            dup_hint = f"  (also in: {', '.join(dup)})" if dup else ""
             click.echo(
                 f"  {i:>2}. {_disp(cand['name']):<18} {_format_candidate_detail(cand['entry'])}"
-                f"    — from {cand['source']}{dup_hint}"
+                f"    — from {cand['source']}{_overlap_hint(cand)}"
             )
         click.echo("")
         picks = _pick_imports(candidates)
@@ -5883,6 +6027,7 @@ def prune(
         pruned: list[tuple[str, str]],
         failed: list[tuple[str, str, str]],
         manual: list[dict[str, str]] | None = None,
+        conflicts: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         # All keys always present (locked shape — `host sync --json` doctrine)
         # so scripts can branch without existence checks.
@@ -5899,6 +6044,10 @@ def prune(
                 {**row, "hint": _source_removal_hint(row["name"], row["source"])}
                 for row in manual or []
             ],
+            # Sources holding a different server under the same name (#981).
+            # Neither planned nor manual: there is no edit to recommend,
+            # because that entry is not this server's registration.
+            "conflicts": conflicts or [],
             "pruned": [{"name": n, "source": s} for n, s in pruned],
             "failed": [
                 {"name": n, "source": s, "error": e, "hint": _source_removal_hint(n, s)}
@@ -5982,10 +6131,11 @@ def prune(
                 f"{details[row['name']]}  — {row['source']}  (manual)"
             )
         _print_manual_prune_rows(manual)
+        _print_conflict_rows(dual)
 
     if dry_run:
         if as_json:
-            _echo_json(_prune_json_payload(planned, [], [], manual))
+            _echo_json(_prune_json_payload(planned, [], [], manual, _conflict_rows(dual)))
             return
         click.echo("")
         click.echo(f"{_ok('Dry run:')} no writes performed.")
@@ -6031,7 +6181,7 @@ def prune(
     # the stderr failure diagnostics keep printing (stdout stays pure JSON).
     had_failures = _report_prune_results(pruned, failed, quiet_success=as_json)
     if as_json:
-        _echo_json(_prune_json_payload(planned, pruned, failed, manual))
+        _echo_json(_prune_json_payload(planned, pruned, failed, manual, _conflict_rows(dual)))
     if had_failures:
         sys.exit(1)
 
