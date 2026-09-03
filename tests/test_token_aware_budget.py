@@ -342,6 +342,78 @@ class TestCharsPerTokenResolutionOrder:
         # 2000 * 2.5 = 5000
         assert tc.max_chars == 5000
 
+    def test_tool_ratio_applies_to_an_inherited_token_budget(self):
+        """A tool ratio counts even when the token budget comes from the server (#929).
+
+        The ratio describes the content this tool returns, not the level its
+        budget happens to be written at. Reading it only beside a per-tool
+        ``max_result_tokens`` dropped it here and ran the call at the server
+        ratio, against what the field docstring and the configuration guide
+        both state.
+        """
+        server_cfg = UpstreamServerConfig(
+            prefix="x",
+            max_result_tokens=400,
+            chars_per_token=2.5,
+            tool_overrides={
+                # No budget of its own — only the ratio for its own content.
+                "kr_tool": ToolOverrideConfig(chars_per_token=4.0),
+            },
+        )
+        proxy_cfg = ProxyConfig(upstream_servers={"srv": server_cfg}, chars_per_token=1.0)
+        mgr = _make_manager(proxy_cfg, server_cfg)
+
+        kr = mgr._resolve_tool_config("srv", "kr_tool")
+        # 400 * 4.0 (tool ratio) = 1600, not 400 * 2.5 = 1000.
+        assert kr.max_chars == 1600
+        # The budget is still the server's, so the caller can still tell
+        # "1600 chars because 400 tokens" from a flat char budget.
+        assert kr.token_budget == 400
+        # The sibling tool is untouched: 400 * 2.5 = 1000.
+        assert mgr._resolve_tool_config("srv", "other").max_chars == 1000
+
+    def test_tool_ratio_alone_does_not_create_a_token_budget(self):
+        """Negative control for the rule above.
+
+        Without a token budget at any level there is nothing to convert, so a
+        tool ratio must leave the char budget exactly where it was. A version
+        that reached for ``proxy_cfg.chars_per_token`` as a budget would pass
+        the test above and fail here.
+        """
+        server_cfg = UpstreamServerConfig(
+            prefix="x",
+            max_result_chars=4321,
+            tool_overrides={"kr_tool": ToolOverrideConfig(chars_per_token=4.0)},
+        )
+        proxy_cfg = ProxyConfig(upstream_servers={"srv": server_cfg})
+        mgr = _make_manager(proxy_cfg, server_cfg)
+
+        tc = mgr._resolve_tool_config("srv", "kr_tool")
+        assert tc.max_chars == 4321
+        assert tc.token_budget is None
+
+    def test_tool_char_budget_outranks_a_tool_ratio(self):
+        """A per-tool char budget still ends the question (#929 boundary).
+
+        Both fields on the same tool under an inherited token budget: the char
+        budget is absolute and nothing converts into it, so the ratio is inert
+        rather than re-scaling an inherited budget behind it.
+        """
+        server_cfg = UpstreamServerConfig(
+            prefix="x",
+            max_result_tokens=400,
+            chars_per_token=2.5,
+            tool_overrides={
+                "both": ToolOverrideConfig(max_result_chars=321, chars_per_token=4.0),
+            },
+        )
+        proxy_cfg = ProxyConfig(upstream_servers={"srv": server_cfg})
+        mgr = _make_manager(proxy_cfg, server_cfg)
+
+        tc = mgr._resolve_tool_config("srv", "both")
+        assert tc.max_chars == 321
+        assert tc.token_budget is None
+
 
 class TestTokenEstimationMode:
     def test_server_and_tool_mode_precedence(self):

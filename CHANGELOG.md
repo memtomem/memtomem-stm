@@ -44,6 +44,25 @@ changes inline only. See the deprecation policy in
   (a custom serializer, a computed field, extras) is routed off-loop rather
   than trusted. **Behavior change**: none external.
 
+### Fixed
+
+- **A per-tool `chars_per_token` now applies to a token budget inherited from
+  its upstream server** (#929). The ratio was read only beside a per-tool
+  `max_result_tokens`, so a tool that stated only its ratio ran at the server's
+  — against the cascade `docs/configuration.md` and the 0.1.x entry that
+  introduced the field both describe. **Behavior change**: a deployment that
+  sets `chars_per_token` on a tool and `max_result_tokens` on the server sees
+  that tool's resolved char budget re-scaled to the documented value (for
+  example a server at 400 tokens x 2.5 with a tool ratio of 4.0 moves from 1000
+  to 1600 chars). That resolved budget is the starting point a `static`-mode
+  gate uses (the retention floor can still raise it) and the number `mms tune`
+  reports. `unicode` mode measures the response and derives its own budget and
+  `progressive` has no size gate, so their compression decisions are unchanged
+  — but the resolved budget is part of the response-cache key at every mode, so
+  an affected tool's cached entries are rotated once regardless. A per-tool
+  `max_result_chars` with no per-tool token budget beside it still outranks the
+  ratio and is unaffected.
+
 ## [0.3.0] — 2026-09-02
 
 ### Upgrade notes
