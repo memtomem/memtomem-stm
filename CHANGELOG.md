@@ -90,13 +90,15 @@ changes inline only. See the deprecation policy in
   log for them; `eject` does not accept a `cursor-*` target. So neither can
   dispatch to the one direct-edit writer that exists and delete from Claude
   Desktop's config instead. A stdio `cwd` also joins server identity, but only
-  where both sides state one. Host configs have no `cwd` field, so a
-  checkout-scoped source (`.mcp.json`, a Claude Code project slot,
-  `.cursor/mcp.json`) contributes the checkout it was found in and a
-  checkout-less one contributes nothing: identical relative commands in two
-  checkouts stay distinct — `mms prune` run from the second one no longer
-  removes that checkout's unrelated entry — while a `cwd` recorded only in
-  `stm_proxy.json` still matches its own user-scope host row.
+  where both sides state one. Host configs have no `cwd` field, so the checkout
+  is inferred per side: a checkout-scoped source (`.mcp.json`, a Claude Code
+  project slot, `.cursor/mcp.json`) contributes the checkout its config belongs
+  to, and a registered upstream contributes the one recorded in its `origin`.
+  A checkout-less source contributes nothing and matches any `cwd` — as does an
+  entry with no `origin` block — because those servers do run from wherever the
+  client starts. Identical relative commands in two checkouts therefore stay
+  distinct: `mms prune` run from the second one no longer removes that
+  checkout's unrelated entry.
 
 - **A per-tool `chars_per_token` now applies to a token budget inherited from
   its upstream server** (#929). The ratio was read only beside a per-tool

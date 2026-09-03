@@ -6731,6 +6731,211 @@ class TestServerIdentity:
         assert _server_signature(self._stdio(cwd="/repo/a")) == _server_signature(self._stdio())
 
 
+class TestCheckoutScopedIdentity:
+    """The checkout a source launches from is part of stdio identity (#955 r2).
+
+    Built on real ``_discover_candidates`` output rather than hand-written
+    candidate dicts: the synthetic shape is what let ``Claude Code (project)``
+    — checkout-scoped but deliberately not ``is_repo_local``, since its file
+    lives in ``$HOME`` — sit outside every checkout comparison while the docs
+    said it was inside.
+    """
+
+    def _setup_home(self, tmp_path: Path, monkeypatch):
+        home = tmp_path / "home"
+        home.mkdir()
+        set_home(monkeypatch, home)
+        desktop = home / "Library/Application Support/Claude"
+        desktop.mkdir(parents=True)
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(
+            proxy_mod,
+            "_desktop_config_path",
+            lambda: desktop / "claude_desktop_config.json",
+        )
+        return home, desktop
+
+    @staticmethod
+    def _write_source(kind: str, home: Path, checkout: Path) -> None:
+        """Put one stdio server named ``repo-tool`` in ``kind``'s config."""
+        entry = {"mcpServers": {"repo-tool": {"command": "./run.sh"}}}
+        if kind == "mcp-json":
+            (checkout / ".mcp.json").write_text(json.dumps(entry), encoding="utf-8")
+        elif kind == "cursor-project":
+            (checkout / ".cursor").mkdir(exist_ok=True)
+            (checkout / ".cursor" / "mcp.json").write_text(json.dumps(entry), encoding="utf-8")
+        elif kind == "claude-project":
+            (home / ".claude.json").write_text(
+                json.dumps({"projects": {str(checkout.resolve()): entry}}),
+                encoding="utf-8",
+            )
+        else:  # pragma: no cover - guards a typo in the parametrization
+            raise AssertionError(f"unknown checkout-scoped kind: {kind}")
+
+    @pytest.mark.parametrize("kind", ["mcp-json", "claude-project", "cursor-project"])
+    def test_every_checkout_scoped_source_states_its_checkout(self, kind, tmp_path, monkeypatch):
+        """Discovery-backed: the identity view carries the checkout, whichever
+        way that source anchors its recorded path."""
+        from memtomem_stm.cli.proxy import _candidate_identity_entry, _discover_candidates
+
+        home, _desktop = self._setup_home(tmp_path, monkeypatch)
+        checkout = tmp_path / "repo"
+        checkout.mkdir()
+        self._write_source(kind, home, checkout)
+
+        cands = _discover_candidates(checkout)
+        assert [c["name"] for c in cands] == ["repo-tool"]
+        identity = _candidate_identity_entry(cands[0], checkout)
+        assert identity["cwd"] == str(checkout.resolve())
+
+    @pytest.mark.parametrize("kind", ["claude-user", "claude-desktop"])
+    def test_a_checkout_less_source_states_nothing(self, kind, tmp_path, monkeypatch):
+        """Positive control in the other direction: these really do run from
+        wherever the client starts, so their absent cwd must stay unknown."""
+        from memtomem_stm.cli.proxy import _candidate_identity_entry, _discover_candidates
+
+        home, desktop = self._setup_home(tmp_path, monkeypatch)
+        checkout = tmp_path / "repo"
+        checkout.mkdir()
+        entry = {"mcpServers": {"repo-tool": {"command": "./run.sh"}}}
+        target = (
+            home / ".claude.json"
+            if kind == "claude-user"
+            else desktop / "claude_desktop_config.json"
+        )
+        target.write_text(json.dumps(entry), encoding="utf-8")
+
+        cands = _discover_candidates(checkout)
+        assert [c["name"] for c in cands] == ["repo-tool"]
+        assert "cwd" not in _candidate_identity_entry(cands[0], checkout)
+
+    @pytest.mark.parametrize("kind", ["mcp-json", "claude-project", "cursor-project"])
+    def test_an_origin_supplies_the_checkout_of_a_registered_entry(self, kind, tmp_path):
+        """The STM side of the same rule. An import from one of these sources
+        persists no cwd (only Cursor-project does), so without provenance the
+        registered entry would match any checkout's row."""
+        from memtomem_stm.cli.proxy import _stm_identity_entry
+
+        checkout = tmp_path / "repo"
+        paths = {
+            "mcp-json": checkout / ".mcp.json",
+            "claude-project": checkout,
+            "cursor-project": checkout / ".cursor" / "mcp.json",
+        }
+        cfg = {
+            "prefix": "repo",
+            "transport": "stdio",
+            "command": "./run.sh",
+            "origin": {"source": {"kind": kind, "path": str(paths[kind])}},
+        }
+
+        assert _stm_identity_entry(cfg)["cwd"] == str(checkout)
+
+    def test_an_entry_without_an_origin_keeps_the_wildcard(self):
+        """Manual ``mms add`` and pre-provenance imports have no checkout to
+        state — documented behavior, not an oversight."""
+        from memtomem_stm.cli.proxy import _stm_identity_entry
+
+        cfg = {"prefix": "repo", "transport": "stdio", "command": "./run.sh"}
+        assert "cwd" not in _stm_identity_entry(cfg)
+
+    @pytest.mark.parametrize("kind", ["mcp-json", "claude-project", "cursor-project"])
+    def test_import_in_one_checkout_then_prune_in_another(
+        self, kind, runner, config, tmp_path, monkeypatch
+    ):
+        """The round trip the unit pieces exist for.
+
+        Import ``repo-tool`` from repo A, walk into repo B which has its own
+        unrelated ``repo-tool`` running the same relative command, and prune.
+        Repo B's registration must survive: it is a different server.
+        """
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        home, _desktop = self._setup_home(tmp_path, monkeypatch)
+        repo_a = tmp_path / "repo-a"
+        repo_b = tmp_path / "repo-b"
+        repo_a.mkdir()
+        repo_b.mkdir()
+
+        removals: list[list[str]] = []
+
+        def fake_run(cmd, timeout=5, cwd=None):
+            removals.append(list(cmd))
+            return _FakeClaudeResult(returncode=0)
+
+        monkeypatch.setattr(proxy_mod, "_run_claude_mcp", fake_run)
+
+        self._write_source(kind, home, repo_a)
+        monkeypatch.chdir(repo_a)
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+        imported = runner.invoke(
+            cli,
+            [
+                "add",
+                "--from-clients",
+                "--all",
+                "--allow-project-configs",
+                *_cfg_args(config),
+            ],
+        )
+        assert imported.exit_code == 0, imported.output
+        saved = json.loads(config.read_text(encoding="utf-8"))["upstream_servers"]
+        assert "repo-tool" in saved
+
+        self._write_source(kind, home, repo_b)
+        monkeypatch.chdir(repo_b)
+        pruned = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
+
+        assert pruned.exit_code == 0, pruned.output
+        assert "No dual-registered upstreams found" in pruned.output
+        assert not any(c[:3] == ["claude", "mcp", "remove"] for c in removals)
+
+    def test_the_same_checkout_still_prunes(self, runner, config, tmp_path, monkeypatch):
+        """Positive control for the round trip: standing in the checkout the
+        entry came from, prune must still fire."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        home, _desktop = self._setup_home(tmp_path, monkeypatch)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+
+        removals: list[list[str]] = []
+
+        def fake_run(cmd, timeout=5, cwd=None):
+            removals.append(list(cmd))
+            return _FakeClaudeResult(returncode=0)
+
+        monkeypatch.setattr(proxy_mod, "_run_claude_mcp", fake_run)
+
+        self._write_source("mcp-json", home, repo)
+        monkeypatch.chdir(repo)
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+        imported = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--all", "--allow-project-configs", *_cfg_args(config)],
+        )
+        assert imported.exit_code == 0, imported.output
+
+        pruned = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
+
+        assert pruned.exit_code == 0, pruned.output
+        assert removals == [["claude", "mcp", "remove", "repo-tool", "-s", "project"]]
+
+    def test_an_explicit_cwd_wins_over_provenance(self):
+        """Provenance is the fallback, never an override: a hand-set cwd is
+        what the proxy will actually spawn with."""
+        from memtomem_stm.cli.proxy import _stm_identity_entry
+
+        cfg = {
+            "transport": "stdio",
+            "command": "./run.sh",
+            "cwd": "/elsewhere",
+            "origin": {"source": {"kind": "mcp-json", "path": "/repo/.mcp.json"}},
+        }
+        assert _stm_identity_entry(cfg)["cwd"] == "/elsewhere"
+
+
 class TestUnmanagedSources:
     """Cursor is discovered but never written (#955).
 

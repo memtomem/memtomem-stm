@@ -2894,17 +2894,37 @@ class _SourceSpec:
     claude_scope: str | None
     is_repo_local: bool = False
     managed: bool = True
+    is_checkout_scoped: bool = False
 
 
+# ``is_repo_local`` and ``is_checkout_scoped`` look alike and are not the same
+# question, so they are separate flags (#955 review 2). ``is_repo_local`` is a
+# TRUST gate: "the checkout supplied this file, so adopting a command out of it
+# needs --allow-project-configs". ``is_checkout_scoped`` is an IDENTITY fact:
+# "the client launches this server from the checkout the config belongs to".
+# ``claude-project`` splits them — its entries live in ``~/.claude.json``, which
+# the checkout cannot write (not repo-local), yet they run in the project the
+# slot is keyed by (checkout-scoped). Reading the trust gate as the identity
+# fact left that source out of every checkout comparison while the docs said it
+# was in.
 _SOURCE_SPECS: tuple[_SourceSpec, ...] = (
-    _SourceSpec(".mcp.json (project)", "mcp-json", "project", is_repo_local=True),
+    _SourceSpec(
+        ".mcp.json (project)", "mcp-json", "project", is_repo_local=True, is_checkout_scoped=True
+    ),
     _SourceSpec("Claude Code (user)", "claude-user", "user"),
-    _SourceSpec("Claude Code (project)", "claude-project", "local"),
+    _SourceSpec("Claude Code (project)", "claude-project", "local", is_checkout_scoped=True),
     _SourceSpec("Claude Desktop", "claude-desktop", None),
     # Appended last so the labels above keep winning the first-wins dedupe
     # they have always won.
     _SourceSpec("Cursor (user)", "cursor-user", None, managed=False),
-    _SourceSpec("Cursor (project)", "cursor-project", None, is_repo_local=True, managed=False),
+    _SourceSpec(
+        "Cursor (project)",
+        "cursor-project",
+        None,
+        is_repo_local=True,
+        managed=False,
+        is_checkout_scoped=True,
+    ),
 )
 # Where an unmanaged source lives, for the removal hint. App-owned strings, so
 # they need no display escaping; the project entry is relative on purpose —
@@ -2965,33 +2985,90 @@ def _is_repo_local_candidate(cand: dict[str, Any]) -> bool:
     return spec is not None and spec.is_repo_local
 
 
+_SOURCE_BY_KIND: dict[str, _SourceSpec] = {spec.kind: spec for spec in _SOURCE_SPECS}
+
+
+def _checkout_of_source(source_ref: dict[str, Any] | None) -> str | None:
+    """The checkout a ``{kind, path}`` source record launches its servers from.
+
+    Each checkout-scoped kind anchors its path differently — ``claude-project``
+    records the project directory itself, ``mcp-json`` the ``.mcp.json`` file,
+    ``cursor-project`` the ``.cursor/mcp.json`` file — so the offset from path
+    to checkout lives here once rather than at each comparison. ``None`` for a
+    checkout-less kind, an unknown kind, or a record with no path.
+    """
+    if not isinstance(source_ref, dict):
+        return None
+    spec = _SOURCE_BY_KIND.get(str(source_ref.get("kind", "")))
+    path = source_ref.get("path")
+    if spec is None or not spec.is_checkout_scoped or not isinstance(path, str) or not path:
+        return None
+    if spec.kind == "claude-project":
+        return path
+    if spec.kind == "cursor-project":
+        return str(Path(path).parent.parent)
+    return str(Path(path).parent)
+
+
 def _candidate_identity_entry(cand: dict[str, Any], cwd: Path) -> dict[str, Any]:
     """The candidate's entry as identity should read it, cwd included.
 
     A host config has no ``cwd`` field, but a *checkout-scoped* source states
     one anyway: ``.mcp.json``, a Claude Code project slot and
-    ``.cursor/mcp.json`` are all found in the checkout the client launches
-    them from, and discovery only ever reads the one at ``cwd``. Leaving that
-    implicit made a stdio ``cwd`` on the STM side match any same-command host
-    row, so running ``mms prune`` from a second checkout could remove that
-    checkout's unrelated entry (#955 review 2).
+    ``.cursor/mcp.json`` are all read out of the checkout the client launches
+    them from. Leaving that implicit made a stdio ``cwd`` on the STM side match
+    any same-command host row, so running ``mms prune`` from a second checkout
+    could remove that checkout's unrelated entry (#955 review 2).
 
     A checkout-less source — a Claude Code user scope, Claude Desktop,
     ``~/.cursor/mcp.json`` — implies nothing, and its absent ``cwd`` stays the
     "unknown" that :func:`_same_server` treats as a match. That asymmetry is
     the point: those servers really do run from wherever the client starts.
 
-    Never mutates the candidate. The value materialized on a Cursor-project
-    entry at discovery time already sits in ``entry`` and wins, so a hostile
-    or hand-written ``cwd`` is not overwritten here.
+    Never mutates the candidate. An explicit ``cwd`` always wins — the value
+    materialized on a Cursor-project entry at discovery time already sits in
+    ``entry``, so it is not recomputed here. ``cwd`` is the fallback anchor for
+    a candidate carrying no source record (hand-built ones, and tests):
+    discovery only ever reads the checkout-scoped configs of the directory it
+    was handed.
     """
     entry = cand.get("entry") or {}
-    if entry.get("cwd") is not None or not _is_repo_local_candidate(cand):
+    if entry.get("cwd") is not None:
         return entry
-    return {**entry, "cwd": str(cwd.resolve())}
+    source_ref = cand.get("source_ref")
+    spec = (
+        _SOURCE_BY_KIND.get(str(source_ref.get("kind", "")))
+        if isinstance(source_ref, dict)
+        else _SOURCE_BY_LABEL.get(str(cand.get("source", "")))
+    )
+    if spec is None or not spec.is_checkout_scoped:
+        return entry
+    return {**entry, "cwd": _checkout_of_source(source_ref) or str(cwd.resolve())}
 
 
-_SOURCE_BY_KIND: dict[str, _SourceSpec] = {spec.kind: spec for spec in _SOURCE_SPECS}
+def _stm_identity_entry(cfg: dict[str, Any]) -> dict[str, Any]:
+    """The registered upstream as identity should read it, cwd included.
+
+    Mirror of :func:`_candidate_identity_entry` for the other operand, and
+    needed for the same rule to hold: inferring the checkout on the discovered
+    side alone still left an entry imported from repo A's ``.mcp.json`` — which
+    records its origin but persists no ``cwd`` — matching a same-name row found
+    in repo B (#955 review 2).
+
+    An explicit ``cwd`` wins; otherwise ``origin.source`` supplies it. An entry
+    with no origin block (a manual ``mms add``, an import predating provenance
+    capture) has no checkout to state and keeps the documented wildcard.
+    """
+    if not isinstance(cfg, dict) or cfg.get("cwd") is not None:
+        return cfg
+    origin = cfg.get("origin")
+    source = origin.get("source") if isinstance(origin, dict) else None
+    checkout = _checkout_of_source(source if isinstance(source, dict) else None)
+    if checkout is None:
+        return cfg
+    return {**cfg, "cwd": checkout}
+
+
 _EJECT_TARGETS_HELP = "claude-user | claude-project[:PATH] | mcp-json[:PATH] | claude-desktop"
 
 
@@ -3730,7 +3807,8 @@ def _find_dual_registered(
             continue
         # Both sides have a signature and they differ → intentionally distinct
         # servers sharing a name. Skip rather than prune the unrelated entry.
-        if _same_server(stm_upstreams[name], _candidate_identity_entry(cand, cwd)) is False:
+        stm_identity = _stm_identity_entry(stm_upstreams[name])
+        if _same_server(stm_identity, _candidate_identity_entry(cand, cwd)) is False:
             continue
         dual.append(cand)
     return dual
@@ -4144,7 +4222,9 @@ def _add_from_clients(
     # Compared pairwise through ``_same_server`` rather than against a set of
     # signatures: identity folds in a stdio ``cwd`` when both sides record
     # one, which a shared key cannot express (#955 review).
-    existing_configs = [cfg for cfg in servers.values() if isinstance(cfg, dict)]
+    existing_identities = [
+        _stm_identity_entry(cfg) for cfg in servers.values() if isinstance(cfg, dict)
+    ]
 
     new_candidates: list[dict[str, Any]] = []
     for cand in all_candidates:
@@ -4158,7 +4238,7 @@ def _add_from_clients(
             skipped.append({"name": cand_name, "reason": "already_registered"})
             continue
         identity = _candidate_identity_entry(cand, discovery_cwd)
-        if any(_same_server(identity, cfg) for cfg in existing_configs):
+        if any(_same_server(identity, cfg) for cfg in existing_identities):
             click.echo(
                 f"  {_warn('Skipping:')} '{_disp(cand_name)}' — matches an existing server "
                 "by command/url.",
