@@ -6707,6 +6707,37 @@ class TestUnmanagedSources:
 
         assert expected_file in hint
         assert str(proxy_mod._desktop_config_path()) not in hint
+        # The payload is the point of this helper: hand-editing is the only
+        # route for these, so the operator must not have to rebuild it.
+        assert '"cursor-tool"' in hint
+        assert '"command": "node"' in hint
+
+    def test_the_manual_eject_hint_uses_the_recorded_project_path(self):
+        """``cursor-project`` records which checkout it came from — name it."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        hint = proxy_mod._eject_manual_hint(
+            "cursor-tool", "cursor-project", "/repo/.cursor/mcp.json", {"command": "node"}
+        )
+
+        assert "/repo/.cursor/mcp.json" in hint
+
+    def test_the_manual_eject_hint_escapes_a_hostile_name(self):
+        """Same display rule as every other branch of this helper (#755).
+
+        Pinned as parity with the Desktop branch rather than as a spelling:
+        the escaping is `json.dumps` plus `_disp`, and asserting the output
+        of that pair by hand would just restate it.
+        """
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        payload = {"command": "node"}
+        cursor = proxy_mod._eject_manual_hint("bad\nname", "cursor-user", None, payload)
+        desktop = proxy_mod._eject_manual_hint("bad\nname", "claude-desktop", None, payload)
+
+        assert "\n" not in cursor
+        rendered = cursor.split("under mcpServers: ", 1)[1]
+        assert rendered == desktop.split("under mcpServers: ", 1)[1]
 
     def test_the_manual_hint_still_names_the_desktop_file(self):
         """Positive control for the branch the guard sits in front of."""
@@ -6766,6 +6797,60 @@ class TestUnmanagedSources:
         # silent branch cannot be mistaken for the guard working.
         assert "`--to claude-user`" in _plan_error("claude-user")
         assert "--to cursor-user" not in _plan_error("cursor-user")
+
+    def test_the_prune_preview_does_not_promise_a_cursor_removal(
+        self, runner, config, monkeypatch, tmp_path
+    ):
+        """A dry run must not list an entry it is guaranteed to fail on (#955).
+
+        The preview, the confirm prompt and the ``--json`` plan come from one
+        iteration so they cannot disagree — which also means one false row
+        appears in all three.
+        """
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "cursor-tool": {"prefix": "c", "transport": "stdio", "command": "npx"},
+                        "desk-tool": {"prefix": "d", "transport": "stdio", "command": "npx"},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            proxy_mod,
+            "_discover_candidates",
+            lambda _cwd: [
+                {
+                    "name": "cursor-tool",
+                    "source": "Cursor (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                    "is_repo_local": False,
+                },
+                {
+                    "name": "desk-tool",
+                    "source": "Claude Desktop",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                    "is_repo_local": False,
+                },
+            ],
+        )
+
+        result = runner.invoke(
+            cli, ["prune", "--all", "--dry-run", "--json", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["planned"] == [{"name": "desk-tool", "source": "Claude Desktop"}]
+        assert [(r["name"], r["source"]) for r in payload["manual"]] == [
+            ("cursor-tool", "Cursor (user)")
+        ]
+        assert "~/.cursor/mcp.json" in payload["manual"][0]["hint"]
 
     def test_eject_still_accepts_a_managed_target(self):
         """Positive control for the same refusal."""

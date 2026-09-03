@@ -2916,6 +2916,33 @@ _UNMANAGED_SOURCE_FILES: dict[str, str] = {
 _SOURCE_BY_LABEL: dict[str, _SourceSpec] = {spec.label: spec for spec in _SOURCE_SPECS}
 
 
+def _prune_targets(
+    cands: list[dict[str, Any]],
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Split ``(name, source)`` prune targets into writable and manual-only.
+
+    One iteration feeds the human preview, the confirm prompt and the ``--json``
+    plan, so those three cannot disagree about what a run would do — and since
+    #955 they must also not agree on something false: a source with no writer
+    is guaranteed to fail, so listing it as "would be pruned" promises an
+    action the writer refuses. Deduped on ``(name, source)`` because a
+    candidate can name the same source twice (primary plus a duplicate row).
+    """
+    writable: list[dict[str, str]] = []
+    manual: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for cand in cands:
+        for src in [cand["source"], *(cand.get("duplicate_in") or [])]:
+            key = (cand["name"], src)
+            if key in seen:
+                continue
+            seen.add(key)
+            spec = _SOURCE_BY_LABEL.get(src)
+            row = {"name": cand["name"], "source": src}
+            (manual if spec is not None and not spec.managed else writable).append(row)
+    return writable, manual
+
+
 def _is_repo_local_candidate(cand: dict[str, Any]) -> bool:
     """Whether this candidate came from a file inside the current checkout.
 
@@ -3377,9 +3404,11 @@ def _prune_imported_candidates(
     """Prune each imported candidate from every source that registered it.
 
     A single candidate can show up in multiple sources (primary ``source``
-    plus ``duplicate_in``) — all are pruned so the dual-path collapses.
-    Per source, the verbatim host entry is appended to the backup log
-    *before* the delete runs (see :func:`_append_pruned_backup` for the
+    plus ``duplicate_in``) — every source with a writer is pruned so the
+    dual-path collapses; a source without one is refused here and reported
+    with the manual edit instead (#955), before any backup row is written for
+    it. Per pruned source, the verbatim host entry is appended to the backup
+    log *before* the delete runs (see :func:`_append_pruned_backup` for the
     ordering rationale); an append failure fails that source's prune
     outright and the delete is skipped.
 
@@ -3470,14 +3499,14 @@ def _confirm_prune_prompt(imported_candidates: list[dict[str, Any]]) -> bool:
         "(adds compression / caching / LTM surfacing; avoids duplicate tool advertisements)."
     )
     click.echo("Affected entries:")
-    seen: set[tuple[str, str]] = set()
-    for cand in imported_candidates:
-        for src in [cand["source"], *(cand.get("duplicate_in") or [])]:
-            key = (cand["name"], src)
-            if key in seen:
-                continue
-            seen.add(key)
-            click.echo(f"    {_disp(cand['name'])} — {src}")
+    writable, manual = _prune_targets(imported_candidates)
+    for row in writable:
+        click.echo(f"    {_disp(row['name'])} — {row['source']}")
+    for row in manual:
+        # Consent is for what will happen. These are listed because they are
+        # still dual-registered, marked because this prompt cannot change
+        # that (#955).
+        click.echo(f"    {_disp(row['name'])} — {row['source']}  (manual, not removed)")
     return click.confirm("Remove from source(s)?", default=False)
 
 
@@ -5518,6 +5547,7 @@ def prune(
         planned: list[dict[str, str]],
         pruned: list[tuple[str, str]],
         failed: list[tuple[str, str, str]],
+        manual: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         # All keys always present (locked shape — `host sync --json` doctrine)
         # so scripts can branch without existence checks.
@@ -5527,6 +5557,13 @@ def prune(
             "dry_run": dry_run,
             "config_path": str(resolved),
             "planned": planned,
+            # Rows this command will not attempt: their source has no writer,
+            # so listing them under `planned` would promise an action the
+            # writer refuses (#955). Each carries the manual edit to make.
+            "manual": [
+                {**row, "hint": _source_removal_hint(row["name"], row["source"])}
+                for row in manual or []
+            ],
             "pruned": [{"name": n, "source": s} for n, s in pruned],
             "failed": [
                 {"name": n, "source": s, "error": e, "hint": _source_removal_hint(n, s)}
@@ -5597,22 +5634,30 @@ def prune(
     # plan, and its consumer matches it against the config.
     disp_names = {c["name"]: _disp(c["name"]) for c in dual}
     name_width = max((len(n) for n in disp_names.values()), default=0)
-    planned: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for cand in dual:
-        detail = _format_candidate_detail(cand["entry"])
-        for src in [cand["source"], *(cand.get("duplicate_in") or [])]:
-            key = (cand["name"], src)
-            if key in seen:
-                continue
-            seen.add(key)
-            planned.append({"name": cand["name"], "source": src})
-            if not as_json:
-                click.echo(f"  {disp_names[cand['name']]:<{name_width}}  {detail}  — {src}")
+    details = {c["name"]: _format_candidate_detail(c["entry"]) for c in dual}
+    planned, manual = _prune_targets(dual)
+    if not as_json:
+        for row in planned:
+            click.echo(
+                f"  {disp_names[row['name']]:<{name_width}}  "
+                f"{details[row['name']]}  — {row['source']}"
+            )
+        for row in manual:
+            # Named apart from the plan, not inside it: this run will not touch
+            # these, and the removal hint is the whole remediation (#955).
+            click.echo(
+                f"  {disp_names[row['name']]:<{name_width}}  "
+                f"{details[row['name']]}  — {row['source']}  (manual)"
+            )
+        if manual:
+            click.echo("")
+            click.echo("  (manual) — mms does not write these configs; remove by hand:")
+            for row in manual:
+                click.echo(f"    {_source_removal_hint(row['name'], row['source'])}")
 
     if dry_run:
         if as_json:
-            _echo_json(_prune_json_payload(planned, [], []))
+            _echo_json(_prune_json_payload(planned, [], [], manual))
             return
         click.echo("")
         click.echo(f"{_ok('Dry run:')} no writes performed.")
@@ -5650,7 +5695,7 @@ def prune(
     # the stderr failure diagnostics keep printing (stdout stays pure JSON).
     had_failures = _report_prune_results(pruned, failed, quiet_success=as_json)
     if as_json:
-        _echo_json(_prune_json_payload(planned, pruned, failed))
+        _echo_json(_prune_json_payload(planned, pruned, failed, manual))
     if had_failures:
         sys.exit(1)
 
@@ -5916,8 +5961,20 @@ def _eject_manual_hint(name: str, kind: str, path: str | None, payload: dict[str
         # reports the failure rather than the one that writes: the branch below
         # names Claude Desktop's config for every kind it does not recognize,
         # and an unmanaged source is not in that file.
-        where = _UNMANAGED_SOURCE_FILES.get(kind, f"the {spec.label} config")
-        return f"# Add '{_disp(name)}' to {where} under mcpServers, by hand."
+        # Same fragment as every other kind: this helper's contract is a
+        # copy-pasteable restore, and an unmanaged source is the one case
+        # where hand-editing is the ONLY route — dropping the payload here
+        # would leave the operator to reconstruct it from the config.
+        where = (
+            path
+            if kind == "cursor-project" and path
+            else _UNMANAGED_SOURCE_FILES.get(kind, f"the {spec.label} config")
+        )
+        name_json = json.dumps(name, ensure_ascii=False)
+        return (
+            f"# Edit {_disp(str(where))} and add under mcpServers: "
+            f"{_disp(name_json)}: {_disp(payload_json)}"
+        )
     target = path if kind == "mcp-json" else str(_desktop_config_path())
     # Both JSON halves need ``_disp`` on top of ``json.dumps``:
     # ``ensure_ascii=False`` escapes only what JSON requires — the C0 subset —
