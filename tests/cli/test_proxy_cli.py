@@ -6889,6 +6889,119 @@ class TestCheckoutScopedIdentity:
         cfg = {"transport": "stdio", "command": "./run.sh", "origin": origin}
         assert _stm_identity_entry(cfg) is None
 
+    @pytest.mark.parametrize("origin", ["mcp-json", ["mcp-json"], 7])
+    def test_an_origin_that_is_not_an_object_is_refused(self, origin):
+        """The block need not be a dict to be present, and a scalar there is
+        as unreadable as an empty one."""
+        from memtomem_stm.cli.proxy import _stm_identity_entry
+
+        cfg = {"transport": "stdio", "command": "./run.sh", "origin": origin}
+        assert _stm_identity_entry(cfg) is None
+
+    @pytest.mark.parametrize("transport", ["sse", "streamable_http"])
+    def test_the_candidate_helper_also_skips_http(self, transport):
+        """Mirror of the registered-side guard: a checkout on an HTTP
+        candidate would be dead weight ``_same_server`` never reads."""
+        from memtomem_stm.cli.proxy import _candidate_identity_entry
+
+        cand = {
+            "name": "http-tool",
+            "source": ".mcp.json (project)",
+            "entry": {"transport": transport, "url": "https://example.test/mcp"},
+            "is_repo_local": True,
+        }
+        assert "cwd" not in _candidate_identity_entry(cand, Path("/repo"))
+
+    def test_the_list_origin_cell_separates_missing_from_unreadable(self):
+        """``mms list`` must not render the two states identically (#955 r5).
+
+        The identity guard treats them differently — one keeps the wildcard,
+        the other is refused by prune — so the table is where an operator can
+        see which one their entry is in.
+        """
+        from memtomem_stm.cli.proxy import _origin_cell
+
+        assert _origin_cell({"command": "x"}) == "-"
+        assert _origin_cell({"command": "x", "origin": None}) == "-"
+        assert _origin_cell({"command": "x", "origin": {}}) == "invalid"
+        assert _origin_cell({"command": "x", "origin": {"source": {}}}) == "invalid"
+        assert (
+            _origin_cell({"command": "x", "origin": {"source": {"kind": "mcp-json"}}}) == "mcp-json"
+        )
+
+    def test_a_fully_declined_run_does_not_claim_the_servers_are_registered(
+        self, runner, config, tmp_path, monkeypatch
+    ):
+        """The summary follows the skip reasons. Saying "already registered"
+        after declining every candidate contradicts the remediation printed a
+        line earlier (#955 review 5)."""
+        home, _desktop = self._setup_home(tmp_path, monkeypatch)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"repo-tool-alias": {"command": "./run.sh"}}}),
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(repo)
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "repo-tool": {
+                            "prefix": "repo",
+                            "transport": "stdio",
+                            "command": "./run.sh",
+                            "origin": {"source": {"kind": "mcp-json"}},
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--all", "--allow-project-configs", *_cfg_args(config)],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "already registered" not in result.output
+        assert "No discovered servers were imported" in result.output
+
+    def test_an_all_registered_run_keeps_its_wording(self, runner, config, tmp_path, monkeypatch):
+        """Positive control: the original message must survive for the case it
+        was written for — including ``duplicate_signature``, which also means
+        the server is registered here, just under another name."""
+        home, _desktop = self._setup_home(tmp_path, monkeypatch)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._write_source("mcp-json", home, repo)
+        monkeypatch.chdir(repo)
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "repo-tool": {
+                            "prefix": "repo",
+                            "transport": "stdio",
+                            "command": "./run.sh",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--all", "--allow-project-configs", *_cfg_args(config)],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "All discovered servers are already registered" in result.output
+
     @pytest.mark.parametrize("origin", [None, "absent"])
     def test_no_origin_at_all_is_not_a_claim(self, origin):
         """Positive control for the line above: the wildcard must survive for

@@ -1824,11 +1824,19 @@ def _origin_cell(cfg: Any) -> str:
     legend under the table points at ``mms eject``. Unknown kinds print as
     recorded — the cell is a display of stored provenance, not a
     validation of it.
+
+    A block that is *present* but unreadable prints ``invalid`` rather than
+    sharing ``-`` with an entry that has none. The identity guard treats those
+    two states differently — one keeps the wildcard, the other is refused by
+    prune and declines an import — so a table rendering them identically would
+    hide the only visible cause of that behavior (#955 review 5).
     """
-    origin = cfg.get("origin") if isinstance(cfg, dict) else None
+    if not isinstance(cfg, dict) or "origin" not in cfg or cfg["origin"] is None:
+        return "-"
+    origin = cfg["origin"]
     source = origin.get("source") if isinstance(origin, dict) else None
     if not isinstance(source, dict) or not isinstance(source.get("kind"), str):
-        return "-"
+        return "invalid"
     return source["kind"] + ("*" if _origin_fully_pruned(origin) else "")
 
 
@@ -4351,9 +4359,17 @@ def _add_from_clients(
         new_candidates.append(cand)
 
     if not new_candidates:
-        # Everything requested is already registered. Not an error: re-running
-        # the same scripted import has to stay idempotent.
-        info("All discovered servers are already registered.")
+        # Nothing left to offer. Not an error: re-running the same scripted
+        # import has to stay idempotent. ``already_registered`` and
+        # ``duplicate_signature`` both mean the server IS registered here —
+        # under this name or another — so the original wording holds. Only
+        # ``ambiguous_identity`` makes it false: those servers were declined,
+        # not adopted, and claiming otherwise contradicts the remediation
+        # printed a line earlier (#955 review 5).
+        if any(row["reason"] == "ambiguous_identity" for row in skipped):
+            info("No discovered servers were imported — see the notes above.")
+        else:
+            info("All discovered servers are already registered.")
         emit([], skipped, warnings_json)
         return
 
