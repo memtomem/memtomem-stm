@@ -68,6 +68,41 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **A same-name entry in a second MCP client is compared to the first before
+  being treated as the same server** (#981). `_discover_candidates` keyed
+  discovered entries by name alone, and every prune surface acts on the
+  primary source plus that name's duplicates, so a server registered under one
+  name in two clients with different commands was treated as one server
+  registered twice: `mms prune` and `mms add --from-clients --prune` deleted
+  the losing source's unrelated entry. `mms prune` already refused exactly
+  that clobber when the *first* source's entry diverged from the STM upstream,
+  and `docs/cli.md` stated it as the contract; the guard simply never covered
+  the later sources, which rode in on the name. A same-name entry is now
+  compared to the winning one through the same identity rule -- the
+  `(transport, command, args)` or `(transport, url)` signature, plus a stdio
+  `cwd` where both sides state one -- and only an identity match is recorded
+  as a duplicate -- the same rule as the first source, so the same limits:
+  `env` and `headers` are no more part of identity here than they were there,
+  which is its own gap and tracked as #983.
+  A divergent entry is a third state: named in the import preview, in the
+  prune preview, in the confirm prompt and in a new `conflicts` key on both
+  `--json` prune surfaces, and otherwise left alone -- never planned, written,
+  backed up, or recorded in the entry's `origin`. No manual edit is suggested
+  for one either, unlike a Cursor row: there is nothing to remove, because
+  that entry is not this server's registration. The note names the server and
+  the source and stops there, rather than echoing what that server runs: it
+  describes a registration the operator did not ask to act on, and a host
+  command line carries credentials in its arguments and URLs.
+  **Behavior change**: a prune that previously removed a same-name entry from
+  a second client now removes only the sources that hold the same server, and
+  says which ones it left. The import preview no longer lists a divergent
+  source under "also in", which said the opposite of what those configs
+  contained. Two pre-existing limitations are now documented rather than
+  fixed: `mms init` filters repo-local candidates before the list is built, so
+  a `.mcp.json` entry winning a contested name takes the conflict off that
+  list with it, and when the first source's entry is the divergent one the
+  whole name is skipped, so a matching entry in a later source is not pruned.
+
 - **`mms add --from-clients` and `mms init` now scan Cursor's MCP configs**
   (#955). `mms add --from-clients` prints a gate message naming
   `.mcp.json / .cursor/mcp.json` as the files a checkout can contain, but its

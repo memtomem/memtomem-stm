@@ -3798,19 +3798,19 @@ class TestInitDiscoverySources:
 
         home, cwd, _ = self._setup_home(tmp_path, monkeypatch)
         (home / ".claude.json").write_text(
-            json.dumps({"mcpServers": {"shared": {"command": "claude-side"}}}),
+            json.dumps({"mcpServers": {"shared": {"command": "shared-side"}}}),
             encoding="utf-8",
         )
         (home / ".cursor").mkdir()
         (home / ".cursor" / "mcp.json").write_text(
-            json.dumps({"mcpServers": {"shared": {"command": "cursor-side"}}}),
+            json.dumps({"mcpServers": {"shared": {"command": "shared-side"}}}),
             encoding="utf-8",
         )
 
         cands = _discover_candidates(cwd)
         assert len(cands) == 1
         assert cands[0]["source"] == "Claude Code (user)"
-        assert cands[0]["entry"]["command"] == "claude-side"
+        assert cands[0]["entry"]["command"] == "shared-side"
         assert cands[0]["duplicate_in"] == ["Cursor (user)"]
 
     def test_a_wrong_typed_cursor_mcp_servers_is_silent(self, tmp_path, monkeypatch):
@@ -3831,8 +3831,54 @@ class TestInitDiscoverySources:
         assert {c["name"] for c in cands} == {"survivor"}
 
     def test_dedupes_by_name_priority(self, tmp_path, monkeypatch):
-        """Same name in multiple sources → first-priority wins, others
-        recorded in ``duplicate_in`` so the UI can show the overlap."""
+        """Same name AND same identity in multiple sources → first-priority
+        wins, others recorded in ``duplicate_in`` so the UI can show the
+        overlap."""
+        from memtomem_stm.cli.proxy import _discover_candidates
+
+        home, cwd, desktop = self._setup_home(tmp_path, monkeypatch)
+        (cwd / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"shared": {"command": "a"}}}),
+            encoding="utf-8",
+        )
+        (home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"shared": {"command": "a"}}}),
+            encoding="utf-8",
+        )
+        (desktop / "claude_desktop_config.json").write_text(
+            json.dumps({"mcpServers": {"shared": {"command": "a"}}}),
+            encoding="utf-8",
+        )
+
+        cands = _discover_candidates(cwd)
+        assert len(cands) == 1
+        assert cands[0]["entry"]["command"] == "a"  # .mcp.json wins
+        assert cands[0]["duplicate_in"] == ["Claude Code (user)", "Claude Desktop"]
+        assert "conflicts" not in cands[0]
+        # Structured duplicate records (#475): every losing source keeps its
+        # kind + verbatim raw so origin.duplicates and the prune backup log
+        # (PR2) can address each source individually.
+        assert cands[0]["duplicates"] == [
+            {
+                "label": "Claude Code (user)",
+                "source_ref": {"kind": "claude-user"},
+                "raw": {"command": "a"},
+            },
+            {
+                "label": "Claude Desktop",
+                "source_ref": {"kind": "claude-desktop"},
+                "raw": {"command": "a"},
+            },
+        ]
+
+    def test_a_divergent_same_name_entry_is_a_conflict_not_a_duplicate(
+        self, tmp_path, monkeypatch
+    ):
+        """Three servers that merely share a name are not one server
+        registered three times. Every prune surface acts on ``[source,
+        *duplicate_in]``, so recording the losers there deleted two unrelated
+        registrations (#981). They land in ``conflicts`` instead, which no prune
+        execution, backup or provenance consumer reads."""
         from memtomem_stm.cli.proxy import _discover_candidates
 
         home, cwd, desktop = self._setup_home(tmp_path, monkeypatch)
@@ -3845,29 +3891,186 @@ class TestInitDiscoverySources:
             encoding="utf-8",
         )
         (desktop / "claude_desktop_config.json").write_text(
-            json.dumps({"mcpServers": {"shared": {"command": "c"}}}),
+            json.dumps({"mcpServers": {"shared": {"command": "c", "env": {"TOKEN": "s3cret"}}}}),
             encoding="utf-8",
         )
 
         cands = _discover_candidates(cwd)
         assert len(cands) == 1
-        assert cands[0]["entry"]["command"] == "a"  # .mcp.json wins
-        assert cands[0]["duplicate_in"] == ["Claude Code (user)", "Claude Desktop"]
-        # Structured duplicate records (#475): every losing source keeps its
-        # kind + verbatim raw so origin.duplicates and the prune backup log
-        # (PR2) can address each source individually.
-        assert cands[0]["duplicates"] == [
-            {
-                "label": "Claude Code (user)",
-                "source_ref": {"kind": "claude-user"},
-                "raw": {"command": "b"},
-            },
-            {
-                "label": "Claude Desktop",
-                "source_ref": {"kind": "claude-desktop"},
-                "raw": {"command": "c"},
-            },
+        assert cands[0]["entry"]["command"] == "a"  # .mcp.json still wins
+        assert "duplicate_in" not in cands[0]
+        assert "duplicates" not in cands[0]
+        assert [c["label"] for c in cands[0]["conflicts"]] == [
+            "Claude Code (user)",
+            "Claude Desktop",
         ]
+        assert [c["source_ref"] for c in cands[0]["conflicts"]] == [
+            {"kind": "claude-user"},
+            {"kind": "claude-desktop"},
+        ]
+        # Label and structured source only. Neither the verbatim ``raw`` nor
+        # the normalized ``entry`` is kept: nothing backs up or ejects a
+        # conflict, and both carry the other server's command line and env.
+        assert all(set(c) == {"label", "source_ref"} for c in cands[0]["conflicts"])
+
+    def test_a_same_name_entry_differing_only_in_args_is_a_conflict(self, tmp_path, monkeypatch):
+        """Identity is ``(transport, command, *args)`` — a shared command is
+        not a shared server."""
+        from memtomem_stm.cli.proxy import _discover_candidates
+
+        home, cwd, _ = self._setup_home(tmp_path, monkeypatch)
+        (cwd / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"fs": {"command": "npx", "args": ["-y", "@fs", "/a"]}}}),
+            encoding="utf-8",
+        )
+        (home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"fs": {"command": "npx", "args": ["-y", "@fs", "/b"]}}}),
+            encoding="utf-8",
+        )
+
+        cands = _discover_candidates(cwd)
+        assert len(cands) == 1
+        assert "duplicate_in" not in cands[0]
+        assert [c["label"] for c in cands[0]["conflicts"]] == ["Claude Code (user)"]
+
+    def test_a_same_name_http_entry_on_another_url_is_a_conflict(self, tmp_path, monkeypatch):
+        """An HTTP entry is its URL, so two URLs are two servers."""
+        from memtomem_stm.cli.proxy import _discover_candidates
+
+        home, cwd, _ = self._setup_home(tmp_path, monkeypatch)
+        (cwd / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"api": {"type": "http", "url": "https://a.example/mcp"}}}),
+            encoding="utf-8",
+        )
+        (home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"api": {"type": "http", "url": "https://b.example/mcp"}}}),
+            encoding="utf-8",
+        )
+
+        cands = _discover_candidates(cwd)
+        assert len(cands) == 1
+        assert "duplicate_in" not in cands[0]
+        assert [c["label"] for c in cands[0]["conflicts"]] == ["Claude Code (user)"]
+
+    def test_one_source_can_duplicate_while_another_conflicts(self, tmp_path, monkeypatch):
+        """The two states are per source, not per name: a name can be both
+        genuinely dual-registered and shadowed by an unrelated server."""
+        from memtomem_stm.cli.proxy import _discover_candidates
+
+        home, cwd, desktop = self._setup_home(tmp_path, monkeypatch)
+        (cwd / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"shared": {"command": "same"}}}),
+            encoding="utf-8",
+        )
+        (home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"shared": {"command": "same"}}}),
+            encoding="utf-8",
+        )
+        (desktop / "claude_desktop_config.json").write_text(
+            json.dumps({"mcpServers": {"shared": {"command": "other"}}}),
+            encoding="utf-8",
+        )
+
+        cands = _discover_candidates(cwd)
+        assert len(cands) == 1
+        assert cands[0]["duplicate_in"] == ["Claude Code (user)"]
+        assert [c["label"] for c in cands[0]["conflicts"]] == ["Claude Desktop"]
+
+    def test_a_checkout_less_source_still_duplicates_a_checkout_scoped_winner(
+        self, tmp_path, monkeypatch
+    ):
+        """Positive control for the identity comparison: the winner's cwd is
+        implied by its checkout-scoped source and the loser states none, which
+        :func:`_same_server` reads as a match. Without this the new split
+        would call every ``.mcp.json`` + user-scope pair a conflict and quietly
+        stop pruning the dual path it exists to collapse."""
+        from memtomem_stm.cli.proxy import _discover_candidates
+
+        home, cwd, _ = self._setup_home(tmp_path, monkeypatch)
+        (cwd / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"repo-tool": {"command": "./run.sh"}}}),
+            encoding="utf-8",
+        )
+        (home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"repo-tool": {"command": "./run.sh"}}}),
+            encoding="utf-8",
+        )
+
+        cands = _discover_candidates(cwd)
+        assert len(cands) == 1
+        assert cands[0]["duplicate_in"] == ["Claude Code (user)"]
+        assert "conflicts" not in cands[0]
+
+    def test_an_explicit_cursor_cwd_matches_the_winners_implied_one(self, tmp_path, monkeypatch):
+        """The other half of the control: a Cursor-project entry carries an
+        explicit ``cwd`` while the ``.mcp.json`` winner only implies one. Both
+        name this checkout, so they are one server.
+
+        This outcome does not by itself prove the identity pair is used --
+        ``_same_server`` reads a missing ``cwd`` as a wildcard, so comparing
+        the normalized entries would also call these two a duplicate. What
+        the operands actually are is pinned by
+        ``test_the_comparison_receives_the_identity_pair`` (codex R1)."""
+        from memtomem_stm.cli.proxy import _discover_candidates
+
+        _home, cwd, _ = self._setup_home(tmp_path, monkeypatch)
+        (cwd / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"repo-tool": {"command": "./run.sh"}}}),
+            encoding="utf-8",
+        )
+        (cwd / ".cursor").mkdir()
+        (cwd / ".cursor" / "mcp.json").write_text(
+            json.dumps({"mcpServers": {"repo-tool": {"command": "./run.sh"}}}),
+            encoding="utf-8",
+        )
+
+        cands = _discover_candidates(cwd)
+        assert len(cands) == 1
+        assert cands[0]["duplicate_in"] == ["Cursor (project)"]
+        assert "conflicts" not in cands[0]
+
+    def test_the_comparison_receives_the_identity_pair(self, tmp_path, monkeypatch):
+        """Both operands must go through ``_candidate_identity_entry``.
+
+        Every outcome test here passes against the raw normalized entries too:
+        within one scan each checkout-scoped source resolves to the scanned
+        directory, and ``_same_server`` reads a missing ``cwd`` as a wildcard,
+        so the implied cwd can only agree with what the raw comparison already
+        concluded. That makes the pair unfalsifiable by outcome, and dropping
+        the wrapper would go unnoticed until discovery reads a source that
+        implies some *other* checkout. Pin the operands instead (codex R1).
+        """
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        _home, cwd, _ = self._setup_home(tmp_path, monkeypatch)
+        (cwd / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"repo-tool": {"command": "./run.sh"}}}),
+            encoding="utf-8",
+        )
+        (cwd / ".cursor").mkdir()
+        (cwd / ".cursor" / "mcp.json").write_text(
+            json.dumps({"mcpServers": {"repo-tool": {"command": "./run.sh"}}}),
+            encoding="utf-8",
+        )
+
+        seen_pairs: list[tuple] = []
+        real = proxy_mod._same_server
+
+        def spy(a, b):
+            seen_pairs.append((a.get("cwd"), b.get("cwd")))
+            return real(a, b)
+
+        monkeypatch.setattr(proxy_mod, "_same_server", spy)
+        proxy_mod._discover_candidates(cwd)
+
+        checkout = str(cwd.resolve())
+        # The winner's cwd is implied by its checkout-scoped source and is
+        # absent from its normalized entry, so a raw comparison would pass
+        # None on the left. Membership rather than an exact list: what is
+        # pinned is the operands, and a refactor that adds a comparison
+        # elsewhere in the scan is not this test's business (codex R2).
+        assert seen_pairs, "the classification never called _same_server"
+        assert (checkout, checkout) in seen_pairs
 
     def test_skips_self_reference(self, tmp_path, monkeypatch):
         """Imports of STM (``mms``) or LTM (``memtomem-server``, either as
@@ -8398,6 +8601,7 @@ class TestAddFromClientsNonInteractive:
             "pruned": [{"name": "filesystem", "source": "Claude Code (user)"}],
             "failed": [],
             "manual": [],
+            "conflicts": [],
         }
 
 
@@ -9656,6 +9860,278 @@ def _user_candidate(name: str = "alpha", *, secret: str = "tok_secret") -> dict:
         },
         "source_ref": {"kind": "claude-user"},
     }
+
+
+class TestPruneSameNameConflicts:
+    """A source client can register a *different* server under a name STM
+    already proxies. Discovery used to record it as a duplicate on the name
+    alone, and every prune surface acts on ``[source, *duplicate_in]``, so
+    `mms prune` deleted that unrelated entry (#981).
+
+    These run against real client-config files rather than stubbed candidates:
+    the classification happens inside ``_discover_candidates``, so a stub
+    would assert the fixture rather than the fix.
+    """
+
+    def _setup_home(self, tmp_path: Path, monkeypatch):
+        home = tmp_path / "conflict-home"
+        home.mkdir()
+        cwd = tmp_path / "conflict-cwd"
+        cwd.mkdir()
+        set_home(monkeypatch, home)
+        monkeypatch.chdir(cwd)
+        desktop = home / "Library/Application Support/Claude"
+        desktop.mkdir(parents=True)
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(
+            proxy_mod,
+            "_desktop_config_path",
+            lambda: desktop / "claude_desktop_config.json",
+        )
+        return home, cwd, desktop
+
+    def _write_sources(self, home: Path, desktop: Path) -> Path:
+        """User scope registers the server STM proxies; Claude Desktop
+        registers something else entirely under the same name."""
+        (home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"docs": {"command": "npx", "args": ["-y", "@me/docs"]}}}),
+            encoding="utf-8",
+        )
+        desktop_config = desktop / "claude_desktop_config.json"
+        desktop_config.write_text(
+            json.dumps(
+                {"mcpServers": {"docs": {"command": "python", "args": ["-m", "unrelated"]}}},
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return desktop_config
+
+    def _seed_config(self, config: Path) -> None:
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "docs": {
+                            "prefix": "docs",
+                            "transport": "stdio",
+                            "command": "npx",
+                            "args": ["-y", "@me/docs"],
+                        }
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    @pytest.fixture
+    def fake_claude(self, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        state: dict = {"calls": [], "script": []}
+
+        def fake_run(cmd, timeout=5, cwd=None):
+            state["calls"].append(list(cmd))
+            return _FakeClaudeResult(returncode=0)
+
+        monkeypatch.setattr(proxy_mod, "_run_claude_mcp", fake_run)
+        return state
+
+    def test_prune_leaves_the_conflicting_source_untouched(
+        self, runner, config, tmp_path, monkeypatch, fake_claude
+    ):
+        """The matching source is pruned; the divergent one keeps its entry,
+        gets no backup row, and is named to the operator. Claude Desktop is
+        the direct-edit writer, so a miss here rewrites the user's file."""
+        home, _cwd, desktop = self._setup_home(tmp_path, monkeypatch)
+        desktop_config = self._write_sources(home, desktop)
+        before = desktop_config.read_bytes()
+        self._seed_config(config)
+
+        result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        removals = [c for c in fake_claude["calls"] if c[:3] == ["claude", "mcp", "remove"]]
+        assert removals == [["claude", "mcp", "remove", "docs", "-s", "user"]]
+        # The one writer that edits a config file in place never ran.
+        assert desktop_config.read_bytes() == before
+        assert "Claude Desktop" in result.output
+        assert "is a different server" in result.output
+
+        # Backup-before-delete captured the pruned source only. A row for the
+        # conflict would shadow it as the newest entry for this name and point
+        # `mms eject` at a target it does not accept.
+        log = json.loads((home / ".memtomem" / "pruned_upstreams.json").read_text(encoding="utf-8"))
+        assert [row["source"]["kind"] for row in log["entries"]] == ["claude-user"]
+
+    def test_prune_json_reports_the_conflict_outside_the_plan(
+        self, runner, config, tmp_path, monkeypatch, fake_claude
+    ):
+        """`conflicts` is its own key: a script branching on `planned`,
+        `manual` or `failed` must not find a row it is meant to leave alone."""
+        home, _cwd, desktop = self._setup_home(tmp_path, monkeypatch)
+        self._write_sources(home, desktop)
+        self._seed_config(config)
+
+        result = runner.invoke(cli, ["prune", "--all", "--dry-run", "--json", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)
+        assert data["planned"] == [{"name": "docs", "source": "Claude Code (user)"}]
+        assert data["conflicts"] == [{"name": "docs", "source": "Claude Desktop"}]
+        assert data["manual"] == []
+        assert data["failed"] == []
+        assert data["ok"] is True
+
+    def test_the_conflict_note_does_not_echo_the_other_servers_command_line(
+        self, runner, config, tmp_path, monkeypatch, fake_claude
+    ):
+        """The conflict row is the one line describing a server the operator
+        did not ask to act on, and a host command line carries credentials in
+        `--api-key=` arguments and URL userinfo. Naming the source is the
+        whole message; echoing what it runs is a disclosure the losing entry
+        never made before, when it contributed only a label (codex R1).
+
+        The argument assertion is the one that was red: the detail line this
+        replaces rendered the stdio command and its args. The `env` value is
+        defense in depth — that formatter never emitted `env`, so this case
+        would have passed against the old code, and it is here to fail if a
+        future detail line grows one (codex R2)."""
+        home, _cwd, desktop = self._setup_home(tmp_path, monkeypatch)
+        (home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"docs": {"command": "npx", "args": ["-y", "@me/docs"]}}}),
+            encoding="utf-8",
+        )
+        (desktop / "claude_desktop_config.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "docs": {
+                            "command": "python",
+                            "args": ["-m", "other", "--api-key=sk-live-DO-NOT-PRINT"],
+                            "env": {"DATABASE_URL": "postgres://u:pw-DO-NOT-PRINT@h/db"},
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        self._seed_config(config)
+
+        result = runner.invoke(cli, ["prune", "--all", "--dry-run", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert "Claude Desktop" in result.output
+        assert "is a different server" in result.output
+        assert "DO-NOT-PRINT" not in result.output
+        assert "--api-key" not in result.output
+        assert "postgres://" not in result.output
+
+    def test_import_prune_neither_writes_nor_records_the_conflict(
+        self, runner, config, tmp_path, monkeypatch, fake_claude
+    ):
+        """`add --from-clients --prune` must not carry the conflict into
+        `origin.duplicates` either.
+
+        Not because a persisted row would be deleted later -- a later prune
+        rediscovers live candidates, and eject reads the duplicates only for
+        its report -- but because that block is the entry's provenance. A
+        conflict row sits there permanently at ``pruned: false``, so
+        ``_origin_fully_pruned`` never turns true and ``mms list`` withholds
+        the "host original pruned" marker for an upstream whose own sources
+        are all gone (codex R1)."""
+        home, _cwd, desktop = self._setup_home(tmp_path, monkeypatch)
+        desktop_config = self._write_sources(home, desktop)
+        before = desktop_config.read_bytes()
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--all", "--prune", "--json", *_cfg_args(config)],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["prune"]["pruned"] == [{"name": "docs", "source": "Claude Code (user)"}]
+        assert payload["prune"]["conflicts"] == [{"name": "docs", "source": "Claude Desktop"}]
+        assert payload["prune"]["failed"] == []
+        assert desktop_config.read_bytes() == before
+
+        saved = json.loads(config.read_text(encoding="utf-8"))
+        origin = saved["upstream_servers"]["docs"]["origin"]
+        assert origin["source"]["kind"] == "claude-user"
+        assert origin.get("duplicates", []) == []
+
+    def test_the_hint_only_path_names_the_conflict_without_recommending_an_edit(
+        self, runner, config, tmp_path, monkeypatch, fake_claude
+    ):
+        """Without `--prune` the run prints removal hints. The conflict gets a
+        note instead of a hint: telling the operator to delete that entry is
+        the same clobber, moved into a copy-paste line."""
+        home, _cwd, desktop = self._setup_home(tmp_path, monkeypatch)
+        self._write_sources(home, desktop)
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+
+        result = runner.invoke(cli, ["add", "--from-clients", "--all", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert "claude mcp remove docs -s user" in result.output
+        assert "is a different server" in result.output
+        # No edit is recommended for the desktop entry, by hint or by name.
+        assert "claude_desktop_config" not in result.output
+        assert result.output.count("claude mcp remove") == 1
+
+    def test_the_import_preview_marks_the_divergent_source(
+        self, runner, config, tmp_path, monkeypatch, fake_claude
+    ):
+        """The preview line is where the operator learns a name is contested,
+        and it is the only place that note fits — the picker renders its own
+        titles. Calling that source "also in" told them the opposite about
+        their own configs."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        home, _cwd, desktop = self._setup_home(tmp_path, monkeypatch)
+        self._write_sources(home, desktop)
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+        monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: True)
+        monkeypatch.setattr(proxy_mod, "_pick_imports", lambda _cands: [])
+
+        result = runner.invoke(cli, ["add", "--from-clients", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert "a different server in: Claude Desktop" in result.output
+        assert "also in:" not in result.output
+
+    def test_the_preview_can_carry_both_notes_at_once(
+        self, runner, config, tmp_path, monkeypatch, fake_claude
+    ):
+        """The two states are per source, so one name can be genuinely
+        dual-registered and shadowed by an unrelated server at the same time.
+        Rendering only the first note would hide whichever came second."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        home, cwd, desktop = self._setup_home(tmp_path, monkeypatch)
+        self._write_sources(home, desktop)
+        (cwd / ".cursor").mkdir()
+        (cwd / ".cursor" / "mcp.json").write_text(
+            json.dumps({"mcpServers": {"docs": {"command": "npx", "args": ["-y", "@me/docs"]}}}),
+            encoding="utf-8",
+        )
+        config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+        monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: True)
+        monkeypatch.setattr(proxy_mod, "_pick_imports", lambda _cands: [])
+
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--allow-project-configs", *_cfg_args(config)],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "also in: Cursor (project)" in result.output
+        assert "a different server in: Claude Desktop" in result.output
 
 
 class TestPruneBackupLog:
