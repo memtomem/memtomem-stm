@@ -6324,6 +6324,54 @@ class TestAddFromClients:
         assert set(data["upstream_servers"]) == {"repo-a-tool", "repo-b-tool"}
         assert data["upstream_servers"]["repo-b-tool"]["cwd"] == "/repo/b"
 
+    def test_a_repo_local_candidate_from_another_checkout_is_not_a_duplicate(
+        self, runner, config, monkeypatch
+    ):
+        """The dedup side of the implied-cwd rule (#955 review 2).
+
+        The registered entry is rooted at another checkout, so this checkout's
+        project file describes a different server and must still be offered.
+        """
+        self._seed_config(
+            config,
+            {
+                "repo-a-tool": {
+                    "prefix": "repo_a",
+                    "transport": "stdio",
+                    "command": "./run.sh",
+                    "cwd": "/repo/a",
+                }
+            },
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "repo-b-tool",
+                    "source": ".mcp.json (project)",
+                    "entry": {"transport": "stdio", "command": "./run.sh"},
+                    "is_repo_local": True,
+                }
+            ],
+        )
+
+        result = runner.invoke(
+            cli,
+            [
+                "add",
+                "--from-clients",
+                "--all",
+                "--allow-project-configs",
+                "--json",
+                *_cfg_args(config),
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert [row["name"] for row in payload["imported"]] == ["repo-b-tool"]
+        assert payload["skipped"] == []
+
     def test_a_cwd_only_on_the_registered_side_is_still_a_duplicate(
         self, runner, config, monkeypatch
     ):
@@ -8547,6 +8595,99 @@ class TestPruneCommand:
             call for call in fake_claude["calls"] if call[:3] == ["claude", "mcp", "remove"]
         ]
         assert remove_calls == [["claude", "mcp", "remove", "repo-tool", "-s", "user"]]
+
+    def test_a_repo_local_row_from_another_checkout_is_not_dual_registered(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """A checkout-scoped source states a cwd even without the field.
+
+        ``.mcp.json`` / a Claude Code project slot / ``.cursor/mcp.json`` are
+        found in the checkout the client launches them from, so an STM entry
+        rooted at another checkout is a different server. Treating the absent
+        field as "unknown" here let ``mms prune`` run from the second checkout
+        and delete that checkout's unrelated entry (#955 review 2).
+        """
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "repo-tool": {
+                            "prefix": "repo",
+                            "transport": "stdio",
+                            "command": "./run.sh",
+                            "cwd": "/repo/a",
+                        }
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "repo-tool",
+                    "source": ".mcp.json (project)",
+                    "entry": {"transport": "stdio", "command": "./run.sh"},
+                    "is_repo_local": True,
+                }
+            ],
+        )
+
+        result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert "No dual-registered upstreams found" in result.output
+        assert not any(c[:3] == ["claude", "mcp", "remove"] for c in fake_claude["calls"])
+
+    def test_a_repo_local_row_in_this_checkout_is_dual_registered(
+        self, runner, config, monkeypatch, fake_claude, tmp_path
+    ):
+        """Positive control: the implied cwd must match its own checkout.
+
+        Without this the guard above would read as "never prune a repo-local
+        source", which is not the rule — the rule is that the checkout is part
+        of the identity.
+        """
+        monkeypatch.chdir(tmp_path)
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "repo-tool": {
+                            "prefix": "repo",
+                            "transport": "stdio",
+                            "command": "./run.sh",
+                            "cwd": str(tmp_path.resolve()),
+                        }
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "repo-tool",
+                    "source": ".mcp.json (project)",
+                    "entry": {"transport": "stdio", "command": "./run.sh"},
+                    "is_repo_local": True,
+                }
+            ],
+        )
+
+        result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        remove_calls = [
+            call for call in fake_claude["calls"] if call[:3] == ["claude", "mcp", "remove"]
+        ]
+        assert remove_calls == [["claude", "mcp", "remove", "repo-tool", "-s", "project"]]
 
     def test_a_cursor_project_cwd_still_reaches_the_manual_row(
         self, runner, config, monkeypatch, fake_claude

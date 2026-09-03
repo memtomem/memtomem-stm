@@ -2965,6 +2965,32 @@ def _is_repo_local_candidate(cand: dict[str, Any]) -> bool:
     return spec is not None and spec.is_repo_local
 
 
+def _candidate_identity_entry(cand: dict[str, Any], cwd: Path) -> dict[str, Any]:
+    """The candidate's entry as identity should read it, cwd included.
+
+    A host config has no ``cwd`` field, but a *checkout-scoped* source states
+    one anyway: ``.mcp.json``, a Claude Code project slot and
+    ``.cursor/mcp.json`` are all found in the checkout the client launches
+    them from, and discovery only ever reads the one at ``cwd``. Leaving that
+    implicit made a stdio ``cwd`` on the STM side match any same-command host
+    row, so running ``mms prune`` from a second checkout could remove that
+    checkout's unrelated entry (#955 review 2).
+
+    A checkout-less source — a Claude Code user scope, Claude Desktop,
+    ``~/.cursor/mcp.json`` — implies nothing, and its absent ``cwd`` stays the
+    "unknown" that :func:`_same_server` treats as a match. That asymmetry is
+    the point: those servers really do run from wherever the client starts.
+
+    Never mutates the candidate. The value materialized on a Cursor-project
+    entry at discovery time already sits in ``entry`` and wins, so a hostile
+    or hand-written ``cwd`` is not overwritten here.
+    """
+    entry = cand.get("entry") or {}
+    if entry.get("cwd") is not None or not _is_repo_local_candidate(cand):
+        return entry
+    return {**entry, "cwd": str(cwd.resolve())}
+
+
 _SOURCE_BY_KIND: dict[str, _SourceSpec] = {spec.kind: spec for spec in _SOURCE_SPECS}
 _EJECT_TARGETS_HELP = "claude-user | claude-project[:PATH] | mcp-json[:PATH] | claude-desktop"
 
@@ -3704,7 +3730,7 @@ def _find_dual_registered(
             continue
         # Both sides have a signature and they differ → intentionally distinct
         # servers sharing a name. Skip rather than prune the unrelated entry.
-        if _same_server(stm_upstreams[name], cand["entry"]) is False:
+        if _same_server(stm_upstreams[name], _candidate_identity_entry(cand, cwd)) is False:
             continue
         dual.append(cand)
     return dual
@@ -4085,7 +4111,8 @@ def _add_from_clients(
     skipped: list[dict[str, str]] = []
     warnings_json: list[str] = []
 
-    all_candidates = _discover_candidates(Path.cwd())
+    discovery_cwd = Path.cwd()
+    all_candidates = _discover_candidates(discovery_cwd)
 
     if select_names:
         # Resolve the requested names against *everything* discovered, not
@@ -4130,7 +4157,8 @@ def _add_from_clients(
             )
             skipped.append({"name": cand_name, "reason": "already_registered"})
             continue
-        if any(_same_server(entry, cfg) for cfg in existing_configs):
+        identity = _candidate_identity_entry(cand, discovery_cwd)
+        if any(_same_server(identity, cfg) for cfg in existing_configs):
             click.echo(
                 f"  {_warn('Skipping:')} '{_disp(cand_name)}' — matches an existing server "
                 "by command/url.",
