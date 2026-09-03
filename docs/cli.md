@@ -396,7 +396,8 @@ mms status
 mms remove github
 
 # Stop proxying an imported server WITHOUT losing it: restore the captured
-# host entry to where it came from, then remove it from STM
+# host entry to where it came from (--to picks the target for a Cursor
+# origin), then remove it from STM
 mms eject github
 
 # Toggle proactive surfacing for an upstream (persisted in stm_proxy.json)
@@ -415,8 +416,8 @@ Usage: mms prune [OPTIONS] [NAMES]...
 
 Options:
   --config TEXT  [default: (~/.memtomem/stm_proxy.json)]
-  --all          Prune every dual-registered upstream. Required when no NAMES
-                 given.
+  --all          Select every dual-registered upstream; sources mms cannot
+                 write are reported, not pruned. Required when no NAMES given.
   -y, --yes      Skip the confirm prompt (scripts / CI / non-TTY callers).
   --dry-run      Print what would be pruned; no writes.
   --json         Output as JSON for scripting (requires --yes, or --dry-run).
@@ -424,7 +425,7 @@ Options:
 
 Removes direct registrations for STM upstreams that are still registered in a source MCP client (`~/.claude.json`, `.mcp.json`, Claude Desktop). Cursor entries are reported rather than removed — `mms` never writes a Cursor config, so each one prints the manual edit to make. Use this to collapse the dual-path state that `mms init` and `mms add --import` leave behind when you didn't opt into pruning at import time — the tools then route through STM only, picking up compression, caching, and LTM surfacing.
 
-Scope selection is explicit by design: pass `--all` to act on every dual-registered upstream, or pass one or more `NAMES` to limit the action. Running `mms prune` with no arguments is a usage error rather than defaulting to "everything" — this is a destructive operation against external config files and the default should be visible.
+Scope selection is explicit by design: pass `--all` to act on every dual-registered upstream, or pass one or more `NAMES` to limit the action. Either way the run only writes the sources `mms` can write; the rest are listed as `(manual)` with the edit to make. Running `mms prune` with no arguments is a usage error rather than defaulting to "everything" — this is a destructive operation against external config files and the default should be visible.
 
 "Dual-registered" requires both the name **and** the identity to match: the source-client entry must share the STM upstream's `(transport, command, args)` or `(transport, url)` signature. If you've edited either side to point at a different server that happens to share a name, `mms prune` skips it rather than clobbering the unrelated entry.
 
@@ -435,7 +436,7 @@ Before deleting a host entry, every prune path appends the verbatim entry (with 
 With `--json`, stdout carries a single result document: `{"action": "prune", "ok": ..., "dry_run": ..., "config_path": ..., "planned": [{"name", "source"}], "manual": [{"name", "source", "hint"}], "pruned": [...], "failed": [{"name", "source", "error", "hint"}]}` — `planned` is built from the same iteration as the human preview and holds only sources `mms` can write; `manual` holds the rest (today, Cursor) with the edit to make, and each `failed` row's `hint` is the exact manual removal command. `--json` never prompts: without `--yes` (or `--dry-run`) it refuses with exit 2 and `{"error": "confirmation_required", ...}`. Partial failures keep `ok: false` + exit 1, with the human diagnostics still on stderr.
 
 ```bash
-mms prune --all              # remove every dual-registered upstream (TTY: confirm prompt)
+mms prune --all              # remove every writable dual registration (TTY: confirm prompt)
 mms prune --all --yes        # same, skip the prompt (CI / scripts)
 mms prune --all --dry-run    # preview without writes
 mms prune docs-langchain     # target specific upstreams
@@ -449,11 +450,10 @@ Usage: mms eject [OPTIONS] NAMES...
 
 Options:
   --config TEXT         [default: (~/.memtomem/stm_proxy.json)]
-  --to TARGET           Restore target for entries without a usable origin:
-                        claude-user | claude-project[:PATH] | mcp-json[:PATH]
-                        | claude-desktop. Entries with a usable, writable
-                        recorded origin
-                        ignore this.
+  --to TARGET           Restore target for entries without a usable, writable
+                        origin (including cursor-*): claude-user | claude-
+                        project[:PATH] | mcp-json[:PATH] | claude-desktop.
+                        Entries with a writable recorded origin ignore this.
   --keep                Restore to the host but keep the STM entry (dual
                         registration).
   --force               Overwrite a same-name host entry whose identity
@@ -489,7 +489,7 @@ Key semantics:
 ```bash
 mms eject github                   # restore to its recorded origin, then remove from STM
 mms eject github --keep            # restore but keep proxying (dual registration)
-mms eject legacy --to claude-user  # no recorded origin: pick the restore target
+mms eject legacy --to claude-user  # no writable origin recorded: pick the target
 mms eject github --dry-run         # preview the per-entry plan; no writes
 ```
 

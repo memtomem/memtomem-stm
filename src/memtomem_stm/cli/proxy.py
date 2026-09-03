@@ -5479,7 +5479,8 @@ def tune(
     "--all",
     "all_servers",
     is_flag=True,
-    help="Prune every dual-registered upstream. Required when no NAMES given.",
+    help="Select every dual-registered upstream; sources mms cannot write are "
+    "reported, not pruned. Required when no NAMES given.",
 )
 @click.option(
     "--yes",
