@@ -225,8 +225,9 @@ Options:
                                   --validate is set.  [default: 10; x>=1]
   --from-clients, --import        Import additional servers interactively
                                   from existing MCP clients (Claude
-                                  Desktop / Code, project .mcp.json).
-                                  Reuses init's discovery + TUI flow.
+                                  Desktop / Code, Cursor, project .mcp.json
+                                  / .cursor/mcp.json). Reuses init's
+                                  discovery + TUI flow.
                                   Skips candidates already registered.
                                   Incompatible with NAME / --prefix /
                                   --command / --args / --url / --env /
@@ -467,13 +468,13 @@ Options:
                         --dry-run).
 ```
 
-The reverse of `mms add --import --prune`: stop proxying a server **without losing it**. Imports capture an `origin` provenance block per entry in `stm_proxy.json` — the structured source (`claude-user`, `claude-project`, `mcp-json`, `claude-desktop`) plus the verbatim host entry as it existed at import time. `eject` writes that original back to where it came from, verifies the restore by re-reading the host config, and only then removes the entry from STM. The order is the safety invariant: host write first, STM removal second — any failure leaves the server registered in at least one place (worst case dual registration, never disappearance).
+The reverse of `mms add --import --prune`: stop proxying a server **without losing it**. Imports capture an `origin` provenance block per entry in `stm_proxy.json` — the structured source (`claude-user`, `claude-project`, `mcp-json`, `claude-desktop`, `cursor-user`, `cursor-project`) plus the verbatim host entry as it existed at import time. `eject` writes that original back to where it came from, verifies the restore by re-reading the host config, and only then removes the entry from STM. The order is the safety invariant: host write first, STM removal second — any failure leaves the server registered in at least one place (worst case dual registration, never disappearance).
 
 `origin.original` may carry secrets (`env`, `headers`), so `mms list --json` / `mms status --json` redact it — the summary keys stay, plus `has_original` so scripts can tell a redacted block from one that never captured an original.
 
 Key semantics:
 
-- **Targets.** Entries restore to their recorded origin. Claude Code scopes go through `claude mcp add-json` (the project scope runs at the recorded project path); `.mcp.json` and Claude Desktop are direct atomic JSON edits. Entries without a usable origin (manual `mms add`, imports predating provenance capture, a vanished project directory) need an explicit `--to`; the restore is then a reconstructed entry, with warnings for what import-time normalization lost (filtered env keys, HTTP headers).
+- **Targets.** Entries restore to their recorded origin. Claude Code scopes go through `claude mcp add-json` (the project scope runs at the recorded project path); `.mcp.json` and Claude Desktop are direct atomic JSON edits. A `cursor-*` origin is not a target — nothing here writes a Cursor config — so those entries need an explicit `--to` naming one of the four writable kinds, and `--to cursor-user` / `--to cursor-project` are rejected outright. Entries without a usable origin (manual `mms add`, imports predating provenance capture, a vanished project directory) need an explicit `--to`; the restore is then a reconstructed entry, with warnings for what import-time normalization lost (filtered env keys, HTTP headers).
 - **No-clobber.** A same-name entry already at the target is compared structurally: identical → idempotent skip; different or not comparable → that entry fails with a hint unless `--force` (which replaces it).
 - **Verified release.** The STM entry is only removed once the host entry deep-equals the restore payload. The claude CLI re-serializes through its own schema and silently drops fields it doesn't know, so a clean `add-json` exit isn't proof; on mismatch the entry stays in STM (dual registration) unless you pass `--accept-schema-loss`.
 - **Secret gate.** Payloads with secret-classified `env`/`headers` values would appear on the `claude` argv (visible in the process list). On a TTY you get an explicit per-entry confirmation; non-TTY callers must pass `--allow-argv-secrets`. `--yes` never bypasses this gate.

@@ -2347,8 +2347,9 @@ def stats(
     is_flag=True,
     default=False,
     help="Import additional servers interactively from existing MCP clients "
-    "(Claude Desktop / Code, project .mcp.json). Reuses init's discovery + "
-    "TUI flow. Skips candidates already registered in this config. "
+    "(Claude Desktop / Code, Cursor, project .mcp.json / .cursor/mcp.json). "
+    "Reuses init's discovery + TUI flow. Skips candidates already registered "
+    "in this config. "
     "Incompatible with NAME / --prefix / --command / --args / --url / --env "
     "/ --header.",
 )
@@ -5476,6 +5477,10 @@ def prune(
     and removes the direct registration so tool calls route through STM —
     picking up compression, caching, and LTM surfacing, and collapsing the
     duplicate tool advertisement. STM's own config is not touched.
+
+    Cursor registrations are found but never removed: nothing here writes a
+    Cursor config, so each one is reported as a failed prune carrying the
+    manual edit to make (#955).
     """
     config_path = resolve_cli_config_path(config_path).path
     if names and all_servers:
