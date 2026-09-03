@@ -14,24 +14,25 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - **`mms add --from-clients` and `mms init` now scan Cursor's MCP configs**
-  (#955). Both commands print a gate message naming
-  `.mcp.json / .cursor/mcp.json` as the files a checkout can contain, but their
+  (#955). `mms add --from-clients` prints a gate message naming
+  `.mcp.json / .cursor/mcp.json` as the files a checkout can contain, but its
   discovery only ever read `.mcp.json` — the message was accurate for
-  `mms import`, which shares it, and overstated for these two. A user who read
-  it reasonably concluded their project-local Cursor entries had been
-  considered and acknowledged, when the command never looked at them.
-  `~/.cursor/mcp.json` and the checkout's `.cursor/mcp.json` are now discovered
-  under the same labels `mms import` uses, and the project one carries the
-  repo-local marker, so selecting it requires `--allow-project-configs` before
-  any probe, write or prune. **Behavior change**: these commands list Cursor
+  `mms import`, which shares it, and overstated there. A user who read it
+  reasonably concluded their project-local Cursor entries had been considered
+  and acknowledged, when the command never looked at them. `~/.cursor/mcp.json`
+  and the checkout's `.cursor/mcp.json` are now discovered under the same
+  labels `mms import` uses, and the project one carries the repo-local marker,
+  so selecting it requires `--allow-project-configs` before any probe, write or
+  prune. `mms init` filters repo-local candidates out silently rather than
+  printing that message, and now keys that filter on the marker rather than on
+  the `.mcp.json (project)` label, which a second repo-local source would
+  otherwise have walked past. **Behavior change**: both commands list Cursor
   entries they previously ignored, so a `--all` import adopts more servers than
-  before on a machine that has them. `mms init`'s repo-local filter now keys on
-  that marker rather than on the `.mcp.json (project)` label, which a second
-  repo-local source would otherwise have walked past. Cursor entries are
-  reported but never written: `prune` refuses them with the manual edit to make
-  and `eject` does not accept a `cursor-*` target, so neither can dispatch to
-  the one direct-edit writer that exists and delete from Claude Desktop's
-  config instead.
+  before on a machine that has them. Cursor entries are reported but never
+  written: `prune` refuses them with the manual edit to make — before writing
+  anything to the pruned-originals backup log — and `eject` does not accept a
+  `cursor-*` target, so neither can dispatch to the one direct-edit writer that
+  exists and delete from Claude Desktop's config instead.
 
 ### Changed
 

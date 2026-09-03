@@ -4009,6 +4009,41 @@ class TestInitImportFlow:
         servers = json.loads(config.read_text(encoding="utf-8"))["upstream_servers"]
         assert set(servers) == {"user-tool"}
 
+    def test_init_still_filters_a_marker_less_project_candidate(
+        self, runner, config, monkeypatch
+    ):
+        """Switching to the marker must not ADMIT what the label refused (#955).
+
+        Discovery always sets the marker, so this shape comes from elsewhere —
+        but the old filter compared the label, and a marker-only replacement
+        would let a candidate carrying that label and no marker straight
+        through. The label is still the fallback.
+        """
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "user-tool",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+                {
+                    "name": "legacy-project-tool",
+                    "source": ".mcp.json (project)",
+                    "entry": {"transport": "stdio", "command": "./run.sh"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", *_cfg_args(config)],
+            input="all\n\n",
+        )
+
+        assert result.exit_code == 0, result.output
+        servers = json.loads(config.read_text(encoding="utf-8"))["upstream_servers"]
+        assert set(servers) == {"user-tool"}
+
     def test_init_adopts_a_repo_local_source_with_the_flag(self, runner, config, monkeypatch):
         """Positive control: the filter is the flag's, not a blanket refusal."""
         self._stub_candidates(
@@ -6534,6 +6569,88 @@ class TestUnmanagedSources:
         message = str(excinfo.value)
         assert kind not in message.split("(got")[0]
         assert "claude-user" in message
+
+    def test_prune_writes_no_backup_row_for_a_refused_source(self, tmp_path, monkeypatch):
+        """The refusal comes before the append, not after (#955).
+
+        The backup log is append-only and its newest row for a name is what
+        eject's retry hint reads. A row written for a prune that then refuses
+        would shadow an older real backup and name a ``--to`` target eject
+        does not accept.
+        """
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        backup = tmp_path / "pruned_upstreams.json"
+        monkeypatch.setattr(proxy_mod, "_pruned_backup_path", lambda: backup)
+        cand = {
+            "name": "cursor-tool",
+            "source": "Cursor (user)",
+            "source_ref": {"kind": "cursor-user"},
+            "raw": {"command": "node"},
+        }
+
+        pruned, failed = proxy_mod._prune_imported_candidates(
+            [cand], pruned_at="2026-09-03T00:00:00Z"
+        )
+
+        assert pruned == []
+        assert [(n, src) for n, src, _ in failed] == [("cursor-tool", "Cursor (user)")]
+        assert not backup.exists()
+
+    def test_prune_still_backs_up_a_managed_source(self, tmp_path, monkeypatch):
+        """Positive control: the early refusal must not skip the real backup."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        backup = tmp_path / "pruned_upstreams.json"
+        desktop = tmp_path / "claude_desktop_config.json"
+        desktop.write_text(
+            json.dumps({"mcpServers": {"desk-tool": {"command": "node"}}}), encoding="utf-8"
+        )
+        monkeypatch.setattr(proxy_mod, "_pruned_backup_path", lambda: backup)
+        monkeypatch.setattr(proxy_mod, "_desktop_config_path", lambda: desktop)
+        cand = {
+            "name": "desk-tool",
+            "source": "Claude Desktop",
+            "source_ref": {"kind": "claude-desktop"},
+            "raw": {"command": "node"},
+        }
+
+        pruned, failed = proxy_mod._prune_imported_candidates(
+            [cand], pruned_at="2026-09-03T00:00:00Z"
+        )
+
+        assert failed == []
+        assert pruned == [("desk-tool", "Claude Desktop")]
+        assert backup.exists()
+
+    def test_the_eject_writer_refuses_rather_than_writing_the_desktop_file(
+        self, tmp_path, monkeypatch
+    ):
+        """Backstop under the resolver, at the site that had the fallthrough.
+
+        ``_eject_host_write``'s final branch writes Claude Desktop's config for
+        every kind it does not name. Plan resolution refuses `cursor-*` before
+        it, but a rule with two readers goes wrong one copy at a time, and this
+        copy is the one holding the file handle.
+        """
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        desktop = tmp_path / "claude_desktop_config.json"
+        desktop.write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
+        monkeypatch.setattr(proxy_mod, "_desktop_config_path", lambda: desktop)
+        before = desktop.read_bytes()
+        plan = proxy_mod._EjectPlan(
+            name="cursor-tool",
+            kind="cursor-user",
+            path=None,
+            payload={"command": "node"},
+        )
+
+        ok, err = proxy_mod._eject_host_write(plan)
+
+        assert ok is False
+        assert err is not None and "cannot be ejected" in err
+        assert desktop.read_bytes() == before
 
     def test_eject_still_accepts_a_managed_target(self):
         """Positive control for the same refusal."""

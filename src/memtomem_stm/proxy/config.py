@@ -1432,7 +1432,8 @@ class OriginSource(BaseModel):
     ejectable — nothing writes a Cursor config (#955)."""
     path: str | None = None
     """Filesystem anchor for path-scoped kinds: the resolved project dir for
-    ``claude-project``, the ``.mcp.json`` path for ``mcp-json``."""
+    ``claude-project``, the ``.mcp.json`` path for ``mcp-json``, the
+    ``.cursor/mcp.json`` path for ``cursor-project``."""
     pruned: bool = False
     """``True`` once this source's host entry was removed by a prune writer.
     Per-source rather than per-entry because prune permits partial failure

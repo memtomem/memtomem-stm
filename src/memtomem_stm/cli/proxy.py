@@ -2383,7 +2383,7 @@ def stats(
 @click.option(
     "--allow-project-configs",
     is_flag=True,
-    help="Acknowledge importing MCP entries from project-local .mcp.json.",
+    help="Acknowledge importing MCP entries from a project-local .mcp.json or .cursor/mcp.json.",
 )
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
 @with_config_write_lock(json_envelope=True)
@@ -2912,6 +2912,29 @@ _UNMANAGED_SOURCE_FILES: dict[str, str] = {
     "cursor-project": ".cursor/mcp.json in this checkout",
 }
 _SOURCE_BY_LABEL: dict[str, _SourceSpec] = {spec.label: spec for spec in _SOURCE_SPECS}
+
+
+def _is_repo_local_candidate(cand: dict[str, Any]) -> bool:
+    """Whether this candidate came from a file inside the current checkout.
+
+    ``_discover_candidates`` always sets the marker, so the label fallback is
+    for candidates built elsewhere (tests, and any future caller) — without it,
+    switching the ``mms init`` filter from a label comparison to the marker
+    would ADMIT a marker-less project candidate the comparison refused (#955).
+
+    Used by ``mms init`` only. The ``--from-clients`` gate reads the marker
+    directly, which is what it has always done — extending the fallback there
+    would tighten a second command's gate on the same commit that widened its
+    discovery, and that is a decision of its own, not a consequence of this
+    one.
+    """
+    marker = cand.get("is_repo_local")
+    if isinstance(marker, bool):
+        return marker
+    spec = _SOURCE_BY_LABEL.get(str(cand.get("source", "")))
+    return spec is not None and spec.is_repo_local
+
+
 _SOURCE_BY_KIND: dict[str, _SourceSpec] = {spec.kind: spec for spec in _SOURCE_SPECS}
 _EJECT_TARGETS_HELP = "claude-user | claude-project[:PATH] | mcp-json[:PATH] | claude-desktop"
 
@@ -3357,6 +3380,16 @@ def _prune_imported_candidates(
     failed: list[tuple[str, str, str]] = []
     for cand in imported_candidates:
         for src, source_ref, raw in _candidate_source_records(cand):
+            spec = _SOURCE_BY_LABEL.get(src)
+            if spec is not None and not spec.managed:
+                # Refuse BEFORE the backup append (#955). The log is
+                # append-only and its newest row for a name is what the eject
+                # retry hint reads, so a row written for a prune that then
+                # refuses would shadow an older real backup and point the
+                # operator at a `--to` target eject does not accept.
+                ok, err = _prune_from_source(cand["name"], src)
+                failed.append((cand["name"], src, err or "unknown error"))
+                continue
             if isinstance(raw, dict) and isinstance(source_ref, dict):
                 ok, err = _append_pruned_backup(cand["name"], source_ref, raw, pruned_at)
                 if not ok:
@@ -3934,7 +3967,7 @@ def _add_from_clients(
         all_candidates = [cand for cand in all_candidates if cand["name"] in requested]
 
     if not all_candidates:
-        info("No MCP servers found in Claude Desktop / Code / .mcp.json.")
+        info("No MCP servers found in Claude Desktop / Code / Cursor / .mcp.json.")
         info("Use `mms add <NAME> --prefix ... --command ...` to register one manually.")
         emit([], skipped, warnings_json)
         return
@@ -4367,8 +4400,10 @@ def init(
     if not allow_project_configs:
         # Keyed on the marker, not on one label: the marker is what says "this
         # file came from the checkout", and a second repo-local source would
-        # otherwise walk straight past this filter (#955).
-        candidates = [cand for cand in candidates if cand.get("is_repo_local") is not True]
+        # otherwise walk straight past a label comparison (#955). The label is
+        # still consulted when a candidate carries no marker at all, so this
+        # cannot admit a shape the old comparison refused.
+        candidates = [cand for cand in candidates if not _is_repo_local_candidate(cand)]
     imported: dict[str, dict[str, Any]] = {}
     # Parallel list of the source-client candidate dicts for entries we
     # actually import. Needed so the end-of-flow prune step can address the
@@ -6115,6 +6150,13 @@ def _eject_host_write(plan: _EjectPlan) -> tuple[bool, str | None]:
     """Dispatch the host write for one resolved plan (RFC §4.1 writer table)."""
     assert plan.payload is not None
     spec = _SOURCE_BY_KIND[plan.kind]
+    if not spec.managed:
+        # Plan resolution already refuses these, so this is the backstop rather
+        # than the gate — but the final branch below writes Claude Desktop's
+        # config for every kind it does not recognize, which is exactly the
+        # wrong-file write #955 exists to prevent. A second reader of a rule
+        # goes wrong one copy at a time, so both copies say it.
+        return (False, f"{spec.label} entries cannot be ejected — mms never writes that config")
     if plan.kind in ("claude-user", "claude-project"):
         scope = spec.claude_scope or "user"
         cwd = plan.path if plan.kind == "claude-project" else None

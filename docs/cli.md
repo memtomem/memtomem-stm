@@ -147,7 +147,7 @@ It only seeds the initial value; edit `cache.default_ttl_seconds` (or per-tool/p
 
 Validation is **advisory**: probe failures are reported as warnings but the config is still written. That way a flaky network or a cold upstream doesn't block setup; re-run `mms health` later once things are up.
 
-When you import servers that were already directly registered in a source MCP client (`~/.claude.json`, `.mcp.json`, Claude Desktop, Cursor), `init` leaves the direct registrations in place by default — source-client configs are read-only unless you opt in. Pass `--prune-originals` to collapse the dual-path in the same session; on a TTY you instead get a single y/N prompt (default No). Skipped the prompt or didn't pass the flag? Run [`prune`](#prune) afterwards to clean up without re-running the wizard.
+When you import servers that were already directly registered in a source MCP client (`~/.claude.json`, `.mcp.json`, Claude Desktop, Cursor), `init` leaves the direct registrations in place by default — and for Cursor it always does, since `mms` never writes those files: `--prune-originals` reports them with the manual edit to make — source-client configs are read-only unless you opt in. Pass `--prune-originals` to collapse the dual-path in the same session; on a TTY you instead get a single y/N prompt (default No). Skipped the prompt or didn't pass the flag? Run [`prune`](#prune) afterwards to clean up without re-running the wizard.
 
 ```bash
 mms init                          # interactive wizard
@@ -249,7 +249,7 @@ Options:
                                   callers must pass the flag explicitly.
                                   Requires --from-clients / --import.
   --allow-project-configs         Acknowledge importing MCP entries from a
-                                  project-local .mcp.json.
+                                  project-local .mcp.json or .cursor/mcp.json.
   --json                          Output as JSON for scripting.
 ```
 
@@ -321,7 +321,7 @@ Options:
 
 Prints the configured upstream servers in a table — name, prefix, transport, compression strategy, surfacing toggle, origin, and the command (stdio) or URL (SSE / HTTP). This is the per-server view; [`mms status`](#status) is the config summary (#614). The SURFACING column is the visible home of the per-server [`mms surfacing`](#surfacing) toggle. `max_result_chars` deliberately has no column — the effective value is per-tool once [`mms tune --apply`](#tune) writes `tool_overrides`, so read it via `--json` or the config file. Reads the config only; does not probe connectivity (use `mms health` for that). With `--json` the output becomes `{"config_path": ..., "config_valid": ..., "config_error": ..., "servers": {...}}` for scripting; a missing config file returns `{"error": "config_not_found", "path": ...}` instead of a text fallthrough so callers can branch on shape. `config_valid` / `config_error` mirror [`mms status --json`](#status), including the env overlay — a file that only validates once `MEMTOMEM_STM_PROXY__*` vars are applied reports valid here, because the warning is about what a running server does.
 
-The ORIGIN column summarizes import provenance: `-` for entries added manually (or imported before provenance capture), otherwise the recorded source kind (`claude-user`, `claude-project`, `mcp-json`, `claude-desktop`). A trailing `*` marks an entry whose recorded host sources — the primary origin **and** any duplicate registrations — were all pruned: it now exists only behind STM, and [`mms eject`](#eject) can restore it. The same condition drives the [`mms remove`](#remove) hint, so the two surfaces never disagree about which entries removal would orphan. In `--json` output the `origin` block appears with `origin.original` redacted (`has_original` tells you whether one was captured) because the verbatim host entry may carry secrets. Every server's own active `env` and `headers` values are also masked (`<REDACTED>`, keys preserved) in `--json` output, since that output is routinely piped to scripts, CI logs, or issue comments.
+The ORIGIN column summarizes import provenance: `-` for entries added manually (or imported before provenance capture), otherwise the recorded source kind (`claude-user`, `claude-project`, `mcp-json`, `claude-desktop`, `cursor-user`, `cursor-project`). A trailing `*` marks an entry whose recorded host sources — the primary origin **and** any duplicate registrations — were all pruned: it now exists only behind STM, and [`mms eject`](#eject) can restore it. A `cursor-*` origin never reaches that state on its own, because nothing here prunes one; eject refuses those targets for the same reason. The same condition drives the [`mms remove`](#remove) hint, so the two surfaces never disagree about which entries removal would orphan. In `--json` output the `origin` block appears with `origin.original` redacted (`has_original` tells you whether one was captured) because the verbatim host entry may carry secrets. Every server's own active `env` and `headers` values are also masked (`<REDACTED>`, keys preserved) in `--json` output, since that output is routinely piped to scripts, CI logs, or issue comments.
 
 ### `remove`
 
