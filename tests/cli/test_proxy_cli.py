@@ -3923,7 +3923,7 @@ class TestInitImportFlow:
         from memtomem_stm.cli import proxy as proxy_mod
 
         monkeypatch.setattr(proxy_mod, "_run_mcp_integration", lambda *_a, **_kw: None)
-        monkeypatch.setattr(proxy_mod, "_handle_source_prune", lambda *_a, **_kw: ([], []))
+        monkeypatch.setattr(proxy_mod, "_handle_source_prune", lambda *_a, **_kw: ([], [], []))
 
     def _stub_candidates(self, monkeypatch, candidates):
         from memtomem_stm.cli import proxy as proxy_mod
@@ -4527,7 +4527,7 @@ class TestImportOriginCapture:
         from memtomem_stm.cli import proxy as proxy_mod
 
         monkeypatch.setattr(proxy_mod, "_run_mcp_integration", lambda *_a, **_kw: None)
-        monkeypatch.setattr(proxy_mod, "_handle_source_prune", lambda *_a, **_kw: ([], []))
+        monkeypatch.setattr(proxy_mod, "_handle_source_prune", lambda *_a, **_kw: ([], [], []))
 
     def _stub_candidates(self, monkeypatch, candidates):
         from memtomem_stm.cli import proxy as proxy_mod
@@ -6324,6 +6324,48 @@ class TestAddFromClients:
         assert set(data["upstream_servers"]) == {"repo-a-tool", "repo-b-tool"}
         assert data["upstream_servers"]["repo-b-tool"]["cwd"] == "/repo/b"
 
+    def test_a_cwd_only_on_the_registered_side_is_still_a_duplicate(
+        self, runner, config, monkeypatch
+    ):
+        """Dedup reads the same identity rule as prune (#955 review).
+
+        The registered entry records a cwd; the discovered candidate cannot.
+        Treating that as a difference would re-import the server the user
+        already has under another name.
+        """
+        self._seed_config(
+            config,
+            {
+                "repo-a-tool": {
+                    "prefix": "repo_a",
+                    "transport": "stdio",
+                    "command": "./run.sh",
+                    "cwd": "/repo/a",
+                }
+            },
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "same-server-other-name",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "./run.sh"},
+                }
+            ],
+        )
+
+        result = runner.invoke(
+            cli, ["add", "--from-clients", "--all", "--json", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["imported"] == []
+        assert payload["skipped"] == [
+            {"name": "same-server-other-name", "reason": "duplicate_signature"}
+        ]
+
     def test_all_registered_exits_cleanly(self, runner, config, monkeypatch):
         """When every discovered candidate is already registered, we exit
         with a no-op message instead of prompting for an empty selection."""
@@ -6583,6 +6625,64 @@ class TestAddFromClients:
         )
 
 
+class TestServerIdentity:
+    """Stdio ``cwd`` joins identity, but only where both sides record one.
+
+    ``_normalize_client_entry`` emits no ``cwd``, so a host row and every
+    candidate built from one carry none. Folding ``cwd`` into
+    ``_server_signature`` unconditionally therefore made a cwd-bearing STM
+    entry a stranger to its own host registration (#955 review).
+    """
+
+    @staticmethod
+    def _stdio(**extra):
+        return {"transport": "stdio", "command": "./run.sh", **extra}
+
+    def test_two_recorded_cwds_that_differ_are_two_servers(self):
+        from memtomem_stm.cli.proxy import _same_server
+
+        assert _same_server(self._stdio(cwd="/repo/a"), self._stdio(cwd="/repo/b")) is False
+
+    def test_two_recorded_cwds_that_match_are_one_server(self):
+        from memtomem_stm.cli.proxy import _same_server
+
+        assert _same_server(self._stdio(cwd="/repo/a"), self._stdio(cwd="/repo/a")) is True
+
+    def test_a_cwd_on_one_side_only_still_matches(self):
+        """The host side cannot express a cwd, so its absence is not a
+        difference — this is the pair every prune and dedup hit."""
+        from memtomem_stm.cli.proxy import _same_server
+
+        assert _same_server(self._stdio(cwd="/repo/a"), self._stdio()) is True
+        assert _same_server(self._stdio(), self._stdio(cwd="/repo/a")) is True
+
+    def test_a_different_command_is_not_the_same_server(self):
+        from memtomem_stm.cli.proxy import _same_server
+
+        assert _same_server(self._stdio(), self._stdio(command="other")) is False
+
+    def test_no_signature_on_either_side_is_undecided(self):
+        """``None`` is not ``False``: the caller falls back to a name match."""
+        from memtomem_stm.cli.proxy import _same_server
+
+        assert _same_server({"transport": "stdio"}, self._stdio()) is None
+        assert _same_server(self._stdio(), {"transport": "stdio"}) is None
+
+    def test_cwd_is_ignored_for_http_transports(self):
+        from memtomem_stm.cli.proxy import _same_server
+
+        a = {"transport": "streamable_http", "url": "https://x/mcp", "cwd": "/repo/a"}
+        b = {"transport": "streamable_http", "url": "https://x/mcp", "cwd": "/repo/b"}
+        assert _same_server(a, b) is True
+
+    def test_the_signature_itself_carries_no_cwd(self):
+        """It is used as a set/equality key elsewhere; cwd belongs to the
+        comparator, which can treat a missing value as "unknown"."""
+        from memtomem_stm.cli.proxy import _server_signature
+
+        assert _server_signature(self._stdio(cwd="/repo/a")) == _server_signature(self._stdio())
+
+
 class TestUnmanagedSources:
     """Cursor is discovered but never written (#955).
 
@@ -6656,6 +6756,41 @@ class TestUnmanagedSources:
         assert kind not in message.split("(got")[0]
         assert "claude-user" in message
 
+    @staticmethod
+    def _cursor_candidate() -> dict:
+        return {
+            "name": "cursor-tool",
+            "source": "Cursor (user)",
+            "source_ref": {"kind": "cursor-user"},
+            "raw": {"command": "node"},
+        }
+
+    def test_the_default_plan_never_reaches_an_unmanaged_source(self, tmp_path, monkeypatch):
+        """Import-time prune classifies a Cursor row the way standalone does.
+
+        With no explicit allowlist the writable half of ``_prune_targets`` is
+        the plan, so the row is neither attempted nor reported as a failure —
+        the standalone command has always called it manual, and one row must
+        not be an error on one surface and a normal outcome on the other
+        (#955 review).
+        """
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        backup = tmp_path / "pruned_upstreams.json"
+        monkeypatch.setattr(proxy_mod, "_pruned_backup_path", lambda: backup)
+
+        def fail_if_called(*_args, **_kwargs):
+            raise AssertionError("manual-only source reached the prune writer")
+
+        monkeypatch.setattr(proxy_mod, "_prune_from_source", fail_if_called)
+
+        pruned, failed = proxy_mod._prune_imported_candidates(
+            [self._cursor_candidate()], pruned_at="2026-09-03T00:00:00Z"
+        )
+
+        assert (pruned, failed) == ([], [])
+        assert not backup.exists()
+
     def test_prune_writes_no_backup_row_for_a_refused_source(self, tmp_path, monkeypatch):
         """The refusal comes before the append, not after (#955).
 
@@ -6663,25 +6798,55 @@ class TestUnmanagedSources:
         eject's retry hint reads. A row written for a prune that then refuses
         would shadow an older real backup and name a ``--to`` target eject
         does not accept.
+
+        Reached by naming the unmanaged row in ``allowed_sources`` explicitly,
+        which is what a caller that computed its own plan wrongly would do.
+        The refusal is rendered here rather than fetched from the writer, so
+        the writer must not be called at all.
         """
         from memtomem_stm.cli import proxy as proxy_mod
 
         backup = tmp_path / "pruned_upstreams.json"
         monkeypatch.setattr(proxy_mod, "_pruned_backup_path", lambda: backup)
-        cand = {
-            "name": "cursor-tool",
-            "source": "Cursor (user)",
-            "source_ref": {"kind": "cursor-user"},
-            "raw": {"command": "node"},
-        }
+
+        def fail_if_called(*_args, **_kwargs):
+            raise AssertionError("manual-only source reached the prune writer")
+
+        monkeypatch.setattr(proxy_mod, "_prune_from_source", fail_if_called)
 
         pruned, failed = proxy_mod._prune_imported_candidates(
-            [cand], pruned_at="2026-09-03T00:00:00Z"
+            [self._cursor_candidate()],
+            pruned_at="2026-09-03T00:00:00Z",
+            allowed_sources={("cursor-tool", "Cursor (user)")},
         )
 
         assert pruned == []
         assert [(n, src) for n, src, _ in failed] == [("cursor-tool", "Cursor (user)")]
+        assert "by hand" in failed[0][2]
         assert not backup.exists()
+
+    def test_the_writer_refuses_an_unmanaged_spec_before_its_scope(self, monkeypatch):
+        """The two readers of ``managed`` agree on precedence (#955 review).
+
+        ``_prune_imported_candidates`` checks ``managed`` first. A spec that is
+        unmanaged *and* carries a ``claude_scope`` would, under the opposite
+        order inside the writer, delete the host entry while the caller
+        reported the row as untouched.
+        """
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        spec = proxy_mod._SourceSpec("Ghost", "ghost", "user", managed=False)
+        monkeypatch.setitem(proxy_mod._SOURCE_BY_LABEL, "Ghost", spec)
+
+        def fail_if_called(*_args, **_kwargs):
+            raise AssertionError("an unmanaged source shelled out to `claude mcp remove`")
+
+        monkeypatch.setattr(proxy_mod, "_claude_mcp_remove", fail_if_called)
+
+        ok, err = proxy_mod._prune_from_source("ghost-tool", "Ghost")
+
+        assert ok is False
+        assert err is not None and "by hand" in err
 
     def test_prune_still_backs_up_a_managed_source(self, tmp_path, monkeypatch):
         """Positive control: the early refusal must not skip the real backup."""
@@ -7499,7 +7664,10 @@ class TestAddFromClientsNonInteractive:
         monkeypatch.setattr(
             proxy_mod,
             "_prune_imported_candidates",
-            lambda cands, pruned_at: ([("filesystem", "Claude Code (user)")], []),
+            lambda cands, pruned_at, allowed_sources=None: (
+                [("filesystem", "Claude Code (user)")],
+                [],
+            ),
         )
 
         result = runner.invoke(
@@ -7512,6 +7680,7 @@ class TestAddFromClientsNonInteractive:
         assert payload["prune"] == {
             "pruned": [{"name": "filesystem", "source": "Claude Code (user)"}],
             "failed": [],
+            "manual": [],
         }
 
 
@@ -7569,6 +7738,130 @@ class TestAddFromClientsPrune:
                 "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@p"]},
             },
         ]
+
+    @staticmethod
+    def _cursor_candidate():
+        return {
+            "name": "cursor-tool",
+            "source": "Cursor (user)",
+            "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@c"]},
+        }
+
+    def test_json_reports_a_cursor_row_as_manual_not_failed(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """One row, one classification across both prune surfaces.
+
+        Standalone ``prune`` has always called a Cursor row manual; the
+        import-time path reported the same row under ``failed`` with an
+        ``error``, so ``mms add --from-clients --prune --json`` announced a
+        failure for something the code never attempts and a script branching
+        on ``prune.failed`` treated a normal outcome as an error (#955 review).
+        """
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, [self._cursor_candidate()])
+
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--all", "--prune", "--json", *_cfg_args(config)],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["prune"]["pruned"] == []
+        assert payload["prune"]["failed"] == []
+        assert [(r["name"], r["source"]) for r in payload["prune"]["manual"]] == [
+            ("cursor-tool", "Cursor (user)")
+        ]
+        assert "~/.cursor/mcp.json" in payload["prune"]["manual"][0]["hint"]
+        assert "could not remove" not in result.stderr
+
+    def test_json_mixed_import_prunes_only_the_writable_source(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """Positive control: the manual split must not disarm the real writer."""
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, [self._cursor_candidate(), self._all_cc_candidates()[0]])
+
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", "--all", "--prune", "--json", *_cfg_args(config)],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["prune"]["pruned"] == [{"name": "from-user", "source": "Claude Code (user)"}]
+        assert payload["prune"]["failed"] == []
+        assert [r["name"] for r in payload["prune"]["manual"]] == ["cursor-tool"]
+        remove_calls = [
+            call for call in fake_claude["calls"] if call[:3] == ["claude", "mcp", "remove"]
+        ]
+        assert remove_calls == [["claude", "mcp", "remove", "from-user", "-s", "user"]]
+
+    def _interactive_import(self, runner, config, monkeypatch, candidates):
+        """Run the TTY import path with pick stubbed (CliRunner vs questionary),
+        returning ``(result, asked)`` where ``asked`` records prompt calls."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: True)
+        monkeypatch.setattr(proxy_mod, "_pick_imports", lambda cands: list(range(len(cands))))
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, candidates)
+        asked: list[bool] = []
+
+        def confirm(_cands):
+            asked.append(True)
+            return False
+
+        monkeypatch.setattr(proxy_mod, "_confirm_prune_prompt", confirm)
+        result = runner.invoke(
+            cli,
+            ["add", "--from-clients", *_cfg_args(config)],
+            input="\n" * len(candidates),  # accept each default prefix
+        )
+        return result, asked
+
+    def test_no_prompt_when_the_whole_plan_is_manual(self, runner, config, monkeypatch):
+        """Consent is for an action. Answering yes to a plan with nothing in it
+        skipped the hint block and left the run reporting only what it could
+        not do (#955 review)."""
+        result, asked = self._interactive_import(
+            runner, config, monkeypatch, [self._cursor_candidate()]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert asked == []
+        assert "~/.cursor/mcp.json" in result.output
+        assert "could not remove" not in result.output
+
+    def test_the_prompt_still_fires_when_something_is_writable(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """Positive control for the skip above."""
+        result, asked = self._interactive_import(
+            runner,
+            config,
+            monkeypatch,
+            [self._cursor_candidate(), self._all_cc_candidates()[0]],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert asked == [True]
+
+    def test_the_manual_rows_are_printed_after_a_real_prune(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """A pruned run must still say what it left behind, and where."""
+        self._seed_config(config, {})
+        self._stub_candidates(monkeypatch, [self._cursor_candidate(), self._all_cc_candidates()[0]])
+
+        result = runner.invoke(
+            cli, ["add", "--from-clients", "--all", "--prune", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "mms does not write these configs" in result.output
+        assert "~/.cursor/mcp.json" in result.output
 
     def test_prune_flag_shells_out_with_correct_scope_per_source(
         self, runner, config, monkeypatch, fake_claude
@@ -8206,6 +8499,86 @@ class TestPruneCommand:
         assert result.exit_code == 0, result.output
         assert "No dual-registered upstreams found" in result.output
         assert not any(c[:3] == ["claude", "mcp", "remove"] for c in fake_claude["calls"])
+
+    def test_a_cwd_only_on_the_stm_side_is_still_dual_registered(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """A host config cannot record a cwd, so STM's own must not exclude it.
+
+        ``cwd`` is a documented upstream field a user can hand-edit into
+        ``stm_proxy.json``, and a Cursor-project import writes one. Requiring
+        it on both sides made ``mms prune`` call such an entry
+        "not dual-registered" and refuse to collapse the dual path
+        (#955 review).
+        """
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "repo-tool": {
+                            "prefix": "repo",
+                            "transport": "stdio",
+                            "command": "./run.sh",
+                            "cwd": "/repo/a",
+                        }
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "repo-tool",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "./run.sh"},
+                }
+            ],
+        )
+
+        result = runner.invoke(cli, ["prune", "repo-tool", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert "not dual-registered" not in result.output
+        remove_calls = [
+            call for call in fake_claude["calls"] if call[:3] == ["claude", "mcp", "remove"]
+        ]
+        assert remove_calls == [["claude", "mcp", "remove", "repo-tool", "-s", "user"]]
+
+    def test_a_cursor_project_cwd_still_reaches_the_manual_row(
+        self, runner, config, monkeypatch, fake_claude
+    ):
+        """The mirror case: the cwd is on the *candidate* side.
+
+        A route-created STM entry records none, so an identity rule that
+        demanded a match on both sides dropped the Cursor row out of the dual
+        set entirely — and with it the manual-edit hint that is the whole
+        remediation for a source nothing here writes.
+        """
+        self._seed_config(config, ["repo-tool"])
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "repo-tool",
+                    "source": "Cursor (project)",
+                    "entry": {"transport": "stdio", "command": "npx", "cwd": "/repo/a"},
+                }
+            ],
+        )
+
+        result = runner.invoke(cli, ["prune", "--all", "--yes", "--json", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["planned"] == []
+        assert [(r["name"], r["source"]) for r in payload["manual"]] == [
+            ("repo-tool", "Cursor (project)")
+        ]
+        assert ".cursor/mcp.json" in payload["manual"][0]["hint"]
 
     def test_dry_run_with_names_filters_before_preview(
         self, runner, config, monkeypatch, fake_claude
@@ -10279,6 +10652,30 @@ class TestInitPruneOriginals:
         argvs = [c for c in fake_claude["calls"] if c[:3] == ["claude", "mcp", "remove"]]
         assert argvs == [["claude", "mcp", "remove", "docs-langchain", "-s", "user"]]
         assert "Removed from source client(s)" in result.output
+
+    def test_flag_reports_a_cursor_row_as_manual(self, runner, config, monkeypatch, fake_claude):
+        """``--prune-originals`` on a Cursor-only import writes nothing and
+        says so as a manual row, not as a failed removal (#955 review)."""
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "cursor-tool",
+                    "source": "Cursor (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                },
+            ],
+        )
+        result = runner.invoke(
+            cli,
+            ["init", "--no-validate", "--prune-originals", *_cfg_args(config)],
+            input="all\n\n",
+        )
+        assert result.exit_code == 0, result.output
+
+        assert not any(c[:3] == ["claude", "mcp", "remove"] for c in fake_claude["calls"])
+        assert "could not remove" not in result.output
+        assert "~/.cursor/mcp.json" in result.output
 
     def test_no_flag_non_tty_preserves_hint_only(self, runner, config, monkeypatch, fake_claude):
         """Regression guard: the existing ``mms init`` scripted flow (no flag,

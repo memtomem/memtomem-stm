@@ -3184,6 +3184,21 @@ def _source_removal_hint(name: str, source: str) -> str:
     return f"# Edit {_desktop_config_path()} and remove '{_disp(name)}' under mcpServers."
 
 
+def _print_manual_prune_rows(manual: list[dict[str, str]]) -> None:
+    """Print the manual-only prune rows plus the edit each one needs.
+
+    Shared by the standalone ``prune`` preview and the import-time prune
+    report so a row nothing writes reads the same on both surfaces (#955
+    review). No-op on an empty list.
+    """
+    if not manual:
+        return
+    click.echo("")
+    click.echo("  (manual) — mms does not write these configs; remove by hand:")
+    for row in manual:
+        click.echo(f"    {_source_removal_hint(row['name'], row['source'])}")
+
+
 def _print_source_removal_hints(imported_candidates: list[dict[str, Any]]) -> None:
     """Print the post-import dual-registration warning, deduped across sources.
 
@@ -3287,6 +3302,16 @@ def _desktop_json_remove_entry(name: str) -> tuple[bool, str | None]:
     return (True, None)
 
 
+def _unmanaged_prune_refusal(spec: _SourceSpec, name: str) -> str:
+    """The one wording for "this source has no writer".
+
+    Both readers of the ``managed`` rule render it — the writer's own guard
+    and the caller that never reaches the writer — so the operator sees the
+    same sentence whichever path refused (#955 review).
+    """
+    return f"{spec.label} entries are not pruned by mms — remove '{name}' by hand"
+
+
 def _prune_from_source(name: str, source: str) -> tuple[bool, str | None]:
     """Dispatch the prune action per source label used by ``_discover_candidates``.
 
@@ -3298,15 +3323,21 @@ def _prune_from_source(name: str, source: str) -> tuple[bool, str | None]:
     spec = _SOURCE_BY_LABEL.get(source)
     if spec is None:
         return (False, f"unknown source label: {source}")
+    if not spec.managed:
+        # Refused, not guessed: neither the shell-out below nor the one
+        # direct-edit writer (Claude Desktop's) targets this source's file, so
+        # dispatching would delete the entry from a file the operator never
+        # named. A prune failure is non-fatal and prints the manual edit from
+        # `_source_removal_hint`, so the entry stays where it is and the
+        # operator is told where that is (#955).
+        #
+        # Ordered ahead of ``claude_scope`` so this guard and its caller's copy
+        # (``_prune_imported_candidates``) agree on precedence: a future
+        # unmanaged spec that also carries a scope must not shell out here
+        # while the caller reports it as untouched (#955 review).
+        return (False, _unmanaged_prune_refusal(spec, name))
     if spec.claude_scope is not None:
         return _claude_mcp_remove(name, spec.claude_scope)
-    if not spec.managed:
-        # Refused, not guessed: the only direct-edit writer here is Claude
-        # Desktop's, and dispatching to it would delete the entry from a file
-        # the operator never named. A prune failure is non-fatal and prints the
-        # manual edit from `_source_removal_hint`, so the entry stays where it
-        # is and the operator is told where that is (#955).
-        return (False, f"{spec.label} entries are not pruned by mms — remove '{name}' by hand")
     return _desktop_json_remove_entry(name)
 
 
@@ -3414,28 +3445,36 @@ def _prune_imported_candidates(
     ordering rationale); an append failure fails that source's prune
     outright and the delete is skipped.
 
-    ``allowed_sources`` narrows execution to a precomputed standalone-prune
-    plan. When omitted, the import-time ``--prune`` path retains its existing
-    behavior and reports unmanaged sources as failures with manual hints.
+    ``allowed_sources`` narrows execution to a caller-computed plan. Omitting
+    it means "every writable source of these candidates" — the same
+    :func:`_prune_targets` split the standalone command passes in, so the two
+    prune surfaces classify a row identically instead of one calling it manual
+    and the other a failure (#955 review).
 
     Returns ``(pruned, failed)`` where ``pruned`` is ``[(name, source), ...]``
     and ``failed`` is ``[(name, source, error), ...]``.
     """
+    if allowed_sources is None:
+        writable, _manual = _prune_targets(imported_candidates)
+        allowed_sources = {(row["name"], row["source"]) for row in writable}
     pruned: list[tuple[str, str]] = []
     failed: list[tuple[str, str, str]] = []
     for cand in imported_candidates:
         for src, source_ref, raw in _candidate_source_records(cand):
-            if allowed_sources is not None and (cand["name"], src) not in allowed_sources:
+            if (cand["name"], src) not in allowed_sources:
                 continue
             spec = _SOURCE_BY_LABEL.get(src)
             if spec is not None and not spec.managed:
-                # Refuse BEFORE the backup append (#955). The log is
-                # append-only and its newest row for a name is what the eject
-                # retry hint reads, so a row written for a prune that then
-                # refuses would shadow an older real backup and point the
-                # operator at a `--to` target eject does not accept.
-                ok, err = _prune_from_source(cand["name"], src)
-                failed.append((cand["name"], src, err or "unknown error"))
+                # Backstop for a caller that put an unmanaged row in its own
+                # allowlist. Refuses BEFORE the backup append (#955): the log
+                # is append-only and its newest row for a name is what the
+                # eject retry hint reads, so a row written for a prune that
+                # then refuses would shadow an older real backup and point the
+                # operator at a `--to` target eject does not accept. The
+                # message is rendered here rather than fetched from the writer
+                # — calling a writer for its error string is how the two
+                # copies of the ``managed`` rule drift apart.
+                failed.append((cand["name"], src, _unmanaged_prune_refusal(spec, cand["name"])))
                 continue
             if isinstance(raw, dict) and isinstance(source_ref, dict):
                 ok, err = _append_pruned_backup(cand["name"], source_ref, raw, pruned_at)
@@ -3526,15 +3565,23 @@ def _handle_source_prune(
     data: dict[str, Any],
     interactive: bool = True,
     quiet: bool = False,
-) -> tuple[list[tuple[str, str]], list[tuple[str, str, str]]]:
-    """Post-import prune + reporting. Returns ``(pruned, failed)``.
+) -> tuple[list[tuple[str, str]], list[tuple[str, str, str]], list[dict[str, str]]]:
+    """Post-import prune + reporting. Returns ``(pruned, failed, manual)``.
 
     Three paths based on the caller's ``prune`` flag and the TTY gate:
 
     * ``prune=True`` → prune unconditionally.
-    * ``prune=False`` + TTY → interactive prompt, default No.
-    * ``prune=False`` + non-TTY → skip prune entirely, fall through to the
-      #203 hint-only warning.
+    * ``prune=False`` + TTY + at least one writable source → interactive
+      prompt, default No.
+    * ``prune=False`` + non-TTY, or nothing writable → skip prune entirely,
+      fall through to the #203 hint-only warning.
+
+    "Nothing writable" is its own skip because consent is for an action:
+    answering yes to a prompt whose whole plan is unmanaged would suppress
+    the hint block and leave the run printing only what it could not do
+    (#955 review). Manual-only rows are reported either way — through the
+    hints on the skip path, through :func:`_print_manual_prune_rows` after
+    a real prune — and are never attempted or counted as failures.
 
     ``interactive=False`` (``add --from-clients --all/--select``, #817)
     suppresses the prompt even on a TTY, so a scripted import never blocks:
@@ -3556,9 +3603,13 @@ def _handle_source_prune(
     a failed ③ only loses the metadata flip, never the origin or backup.
     """
     if not imported_candidates:
-        return [], []
+        return [], [], []
 
-    if prune:
+    writable, manual = _prune_targets(imported_candidates)
+
+    if not writable:
+        should_prune = False
+    elif prune:
         should_prune = True
     elif interactive and _should_use_tui():
         should_prune = _confirm_prune_prompt(imported_candidates)
@@ -3568,17 +3619,23 @@ def _handle_source_prune(
     if not should_prune:
         if not quiet:
             _print_source_removal_hints(imported_candidates)
-        return [], []
+        return [], [], manual
 
     pruned_at = utc_now_iso()
-    pruned, failed = _prune_imported_candidates(imported_candidates, pruned_at=pruned_at)
+    pruned, failed = _prune_imported_candidates(
+        imported_candidates,
+        pruned_at=pruned_at,
+        allowed_sources={(row["name"], row["source"]) for row in writable},
+    )
     servers = data.get("upstream_servers")
     if isinstance(servers, dict) and _mark_pruned_sources(
         servers, imported_candidates, pruned, pruned_at
     ):
         _save(config_path, data)
     _report_prune_results(pruned, failed, quiet_success=quiet)
-    return pruned, failed
+    if not quiet:
+        _print_manual_prune_rows(manual)
+    return pruned, failed, manual
 
 
 def _report_prune_results(
@@ -3629,7 +3686,7 @@ def _find_dual_registered(
     the same name in a source client (different command / URL / args) and
     would reasonably expect ``mms prune`` not to touch it. Mirrors the dedup
     logic :func:`_add_from_clients` uses in the other direction (name +
-    :func:`_server_signature` match), so the two sides of the import↔prune
+    :func:`_same_server` match), so the two sides of the import↔prune
     round-trip agree on what "the same server" means.
 
     An entry with no extractable signature (missing command / URL) is a
@@ -3645,11 +3702,9 @@ def _find_dual_registered(
         name = cand["name"]
         if name not in stm_upstreams:
             continue
-        stm_sig = _server_signature(stm_upstreams[name])
-        src_sig = _server_signature(cand["entry"])
         # Both sides have a signature and they differ → intentionally distinct
         # servers sharing a name. Skip rather than prune the unrelated entry.
-        if stm_sig is not None and src_sig is not None and stm_sig != src_sig:
+        if _same_server(stm_upstreams[name], cand["entry"]) is False:
             continue
         dual.append(cand)
     return dual
@@ -3910,12 +3965,16 @@ def _pick_imports(candidates: list[dict[str, Any]]) -> list[int]:
 def _server_signature(cfg: dict[str, Any]) -> tuple[str, ...] | None:
     """Best-effort content signature for dedup between discovered + registered.
 
-    Same ``(transport, cwd, command, *args)`` or ``(transport, url)`` → assume
-    the user already imported this server under a different name. ``cwd`` is
-    part of stdio identity because identical relative commands in different
-    project checkouts can be different servers. Returns ``None`` when the
-    entry is missing the identifying field (caller falls back to name-based
-    match only).
+    Same ``(transport, command, *args)`` or ``(transport, url)`` → assume
+    the user already imported this server under a different name. Returns
+    ``None`` when the entry is missing the identifying field (caller falls
+    back to name-based match only).
+
+    A stdio ``cwd`` is deliberately NOT part of the tuple: compare entries
+    with :func:`_same_server`, which folds cwd in only when both sides record
+    one. Putting it here would make the tuple unequal whenever one side has a
+    cwd and the other cannot — see that function for why that is every host
+    row.
     """
     transport = cfg.get("transport", "stdio")
     if transport == "stdio":
@@ -3925,13 +3984,44 @@ def _server_signature(cfg: dict[str, Any]) -> tuple[str, ...] | None:
         args = cfg.get("args") or []
         if not isinstance(args, list):
             args = []
-        cwd = cfg.get("cwd")
-        cwd_key = "" if cwd is None else str(cwd)
-        return ("stdio", cwd_key, cmd, *(str(a) for a in args))
+        return ("stdio", cmd, *(str(a) for a in args))
     url = cfg.get("url", "") or ""
     if not url:
         return None
     return (transport, url)
+
+
+def _same_server(a: dict[str, Any], b: dict[str, Any]) -> bool | None:
+    """Whether two upstream-shaped entries name the same server.
+
+    ``None`` when either side has no :func:`_server_signature` (the caller
+    decides what a name-only hit means); otherwise signature equality, plus
+    — for stdio — ``cwd`` equality **only when both sides declare one**.
+
+    The asymmetry is the point. ``_normalize_client_entry`` never emits a
+    ``cwd``, so a host row and any candidate built from one carry none; a
+    cwd exists only on the STM side (hand-edited ``stm_proxy.json``, or the
+    checkout ``_discover_candidates`` materializes for a Cursor-project
+    import) and on that same Cursor-project candidate. Requiring it on both
+    sides made every cwd-bearing STM entry a stranger to its own host row:
+    ``mms prune foo`` reported it "not dual-registered" and
+    ``add --from-clients`` stopped skipping it (#955 review). Two recorded
+    cwds that differ are still two servers — identical relative commands in
+    different checkouts, the case cwd was added to identity for.
+    """
+    sig_a = _server_signature(a)
+    sig_b = _server_signature(b)
+    if sig_a is None or sig_b is None:
+        return None
+    if sig_a != sig_b:
+        return False
+    if sig_a[0] != "stdio":
+        return True
+    cwd_a = a.get("cwd")
+    cwd_b = b.get("cwd")
+    if cwd_a is None or cwd_b is None:
+        return True
+    return str(cwd_a) == str(cwd_b)
 
 
 def _add_from_clients(
@@ -4024,9 +4114,10 @@ def _add_from_clients(
         return
 
     existing_names = set(servers.keys())
-    existing_signatures = {
-        sig for srv_cfg in servers.values() if (sig := _server_signature(srv_cfg)) is not None
-    }
+    # Compared pairwise through ``_same_server`` rather than against a set of
+    # signatures: identity folds in a stdio ``cwd`` when both sides record
+    # one, which a shared key cannot express (#955 review).
+    existing_configs = [cfg for cfg in servers.values() if isinstance(cfg, dict)]
 
     new_candidates: list[dict[str, Any]] = []
     for cand in all_candidates:
@@ -4039,8 +4130,7 @@ def _add_from_clients(
             )
             skipped.append({"name": cand_name, "reason": "already_registered"})
             continue
-        sig = _server_signature(entry)
-        if sig is not None and sig in existing_signatures:
+        if any(_same_server(entry, cfg) for cfg in existing_configs):
             click.echo(
                 f"  {_warn('Skipping:')} '{_disp(cand_name)}' — matches an existing server "
                 "by command/url.",
@@ -4189,7 +4279,7 @@ def _add_from_clients(
     # surfacing. ``_handle_source_prune`` picks between the --prune flag,
     # the interactive prompt (TTY), and the hint-only fallback (non-TTY /
     # non-interactive selection / user declined).
-    pruned, failed = _handle_source_prune(
+    pruned, failed, manual = _handle_source_prune(
         selected_candidates,
         prune=prune,
         config_path=config_path,
@@ -4204,6 +4294,12 @@ def _add_from_clients(
         {
             "pruned": [{"name": n, "source": src} for n, src in pruned],
             "failed": [{"name": n, "source": src, "error": err} for n, src, err in failed],
+            # Same row shape as `prune --json`'s `manual`: a source with no
+            # writer is a reported outcome, not a failed attempt, and a script
+            # branching on `failed` must not see it there (#955 review).
+            "manual": [
+                {**row, "hint": _source_removal_hint(row["name"], row["source"])} for row in manual
+            ],
         }
         if prune
         else None,
@@ -5659,11 +5755,7 @@ def prune(
                 f"  {disp_names[row['name']]:<{name_width}}  "
                 f"{details[row['name']]}  — {row['source']}  (manual)"
             )
-        if manual:
-            click.echo("")
-            click.echo("  (manual) — mms does not write these configs; remove by hand:")
-            for row in manual:
-                click.echo(f"    {_source_removal_hint(row['name'], row['source'])}")
+        _print_manual_prune_rows(manual)
 
     if dry_run:
         if as_json:
@@ -5975,10 +6067,16 @@ def _eject_manual_hint(name: str, kind: str, path: str | None, payload: dict[str
         )
     spec = _SOURCE_BY_KIND.get(kind)
     if spec is not None and not spec.managed:
-        # Same wrong-file class as the writer backstop (#955), on the path that
-        # reports the failure rather than the one that writes: the branch below
+        # Same wrong-file class as the writer backstop (#955): the branch below
         # names Claude Desktop's config for every kind it does not recognize,
         # and an unmanaged source is not in that file.
+        #
+        # Unreachable through an ``_EjectPlan`` today — both call sites pass
+        # ``plan.kind``, and ``_resolve_eject_plan`` takes that from a managed
+        # origin or from ``_parse_eject_to``, which refuses unmanaged kinds. It
+        # stays as the third reader of the ``managed`` rule, kept in lockstep
+        # with the writer and the prune refusal, and is pinned by direct unit
+        # calls rather than by a command-level test (#955 review).
         # Same fragment as every other kind: this helper's contract is a
         # copy-pasteable restore, and an unmanaged source is the one case
         # where hand-editing is the ONLY route — dropping the payload here
@@ -6153,9 +6251,7 @@ def _resolve_eject_plan(
                 # than copying ``entry["cwd"]`` keeps a real STM-side cwd
                 # change visible to the drift guard.
                 normalized["cwd"] = str(Path(source["path"]).parent.parent)
-            stm_sig = _server_signature(entry)
-            orig_sig = _server_signature(normalized)
-            if stm_sig is not None and orig_sig is not None and stm_sig != orig_sig:
+            if _same_server(entry, normalized) is False:
                 warnings.append(
                     "STM entry was modified after import — restoring the original "
                     "host entry as imported (STM-side changes are not carried over)"
@@ -6172,10 +6268,17 @@ def _resolve_eject_plan(
     if existing is not None:
         existing_norm = _normalize_client_entry(existing)
         payload_norm = _normalize_client_entry(payload)
-        existing_sig = _server_signature(existing_norm) if existing_norm else None
-        payload_sig = _server_signature(payload_norm) if payload_norm else None
-        if existing_sig is not None and payload_sig is not None:
-            if existing_sig == payload_sig:
+        # Same comparator as every other identity check here (#955 review).
+        # Both operands are normalized host entries, so neither carries a
+        # ``cwd`` and this reduces to signature equality — routing through it
+        # is about having one reader of the rule, not about cwd.
+        match = (
+            _same_server(existing_norm, payload_norm)
+            if existing_norm is not None and payload_norm is not None
+            else None
+        )
+        if match is not None:
+            if match:
                 skip_write = True
             elif force:
                 overwrite = True

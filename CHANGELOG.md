@@ -84,10 +84,15 @@ changes inline only. See the deprecation policy in
   otherwise have walked past. **Behavior change**: both commands list Cursor
   entries they previously ignored, so a `--all` import adopts more servers than
   before on a machine that has them. Cursor entries are reported but never
-  written: `prune` refuses them with the manual edit to make — before writing
-  anything to the pruned-originals backup log — and `eject` does not accept a
-  `cursor-*` target, so neither can dispatch to the one direct-edit writer that
-  exists and delete from Claude Desktop's config instead.
+  written: both prune surfaces — standalone `prune` and import-time `--prune` —
+  list them as manual-only rows carrying the edit to make, never attempted,
+  never counted as failures, and nothing written to the pruned-originals backup
+  log for them; `eject` does not accept a `cursor-*` target. So neither can
+  dispatch to the one direct-edit writer that exists and delete from Claude
+  Desktop's config instead. A stdio `cwd` also joins server identity, but only
+  where both entries record one: host configs never do, so a `cwd` on the STM
+  side alone still matches its own host row, while two recorded and different
+  `cwd`s keep identical relative commands in separate checkouts distinct.
 
 - **A per-tool `chars_per_token` now applies to a token budget inherited from
   its upstream server** (#929). The ratio was read only beside a per-tool
