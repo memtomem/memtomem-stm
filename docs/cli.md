@@ -149,14 +149,14 @@ It only seeds the initial value; edit `cache.default_ttl_seconds` (or per-tool/p
 
 Validation is **advisory**: probe failures are reported as warnings but the config is still written. That way a flaky network or a cold upstream doesn't block setup; re-run `mms health` later once things are up.
 
-When you import servers that were already directly registered in a source MCP client (`~/.claude.json`, `.mcp.json`, Claude Desktop, Cursor), `init` leaves the direct registrations in place by default — and for Cursor it always does, since `mms` never writes those files: `--prune-originals` reports them with the manual edit to make — source-client configs are read-only unless you opt in. Pass `--prune-originals` to collapse the dual-path in the same session; on a TTY you instead get a single y/N prompt (default No). Skipped the prompt or didn't pass the flag? Run [`prune`](#prune) afterwards to clean up without re-running the wizard.
+When you import servers that were already directly registered in a source MCP client (`~/.claude.json`, `.mcp.json`, Claude Desktop, Cursor), `init` leaves the direct registrations in place by default — source-client configs are read-only unless you opt in. Pass `--prune-originals` to collapse the dual-path in the same session for the sources `mms` can write; on a TTY you instead get a single y/N prompt (default No). A Cursor registration is never collapsed: `mms` writes no Cursor config, so it is reported with the edit to make and the dual path stays until you make it. Skipped the prompt or didn't pass the flag? Run [`prune`](#prune) afterwards to clean up without re-running the wizard.
 
 ```bash
 mms init                          # interactive wizard
 mms init --no-validate            # skip the connectivity probe prompt entirely
 mms init --mcp claude             # scripted: auto-register with Claude Code
 mms init --mcp skip               # scripted: write config, print paste hints, exit
-mms init --mcp claude --prune-originals  # scripted: import, register, and remove direct registrations
+mms init --mcp claude --prune-originals  # scripted: import, register, remove writable direct registrations
 mms init --lang ko                # Korean-content preset for token-aware budgets
 mms init --demo --client auto     # shortest native Windows/macOS/Linux path
 mms init --resume --client codex  # continue an existing setup
