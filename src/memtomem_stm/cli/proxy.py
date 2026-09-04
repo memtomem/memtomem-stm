@@ -3126,6 +3126,23 @@ def _candidate_identity_entry(cand: dict[str, Any], cwd: Path) -> dict[str, Any]
     return {**entry, "cwd": str(cwd.resolve())}
 
 
+def _identity_fields_unreadable(cfg: dict[str, Any]) -> bool:
+    """Whether this entry's own ``env`` / ``headers`` block cannot be read.
+
+    Present, but not a mapping. Split out from :func:`_stm_identity_entry`
+    because the two reasons that function returns ``None`` are not
+    interchangeable for every caller: an unreadable ``origin`` leaves the
+    *checkout* unknown while ``env`` still separates servers, whereas an
+    unreadable ``env`` leaves that field itself unknown. The import side
+    tells them apart — see ``unresolved_signatures`` in
+    :func:`_add_from_clients`.
+    """
+    return any(
+        cfg.get(key) is not None and not isinstance(cfg.get(key), dict)
+        for key in ("env", "headers")
+    )
+
+
 def _stm_identity_entry(cfg: dict[str, Any]) -> dict[str, Any] | None:
     """The registered upstream as identity should read it, cwd included.
 
@@ -3162,10 +3179,8 @@ def _stm_identity_entry(cfg: dict[str, Any]) -> dict[str, Any] | None:
     """
     if not isinstance(cfg, dict):
         return cfg
-    for key in ("env", "headers"):
-        value = cfg.get(key)
-        if value is not None and not isinstance(value, dict):
-            return None
+    if _identity_fields_unreadable(cfg):
+        return None
     if cfg.get("cwd") is not None:
         return cfg
     if cfg.get("transport", "stdio") != "stdio":
@@ -4536,12 +4551,13 @@ def _add_from_clients(
     # match either — which checkout it belongs to is exactly what is unknown —
     # so a candidate sharing its base signature is declined with a reason the
     # operator can act on, instead of being silently duplicated or silently
-    # skipped. The comparison against those entries deliberately drops the
-    # env/headers slot the rest of identity gained in #983: an unreadable
-    # entry cannot state one, so requiring a match there would decline
-    # nothing.
+    # skipped. The comparison against those entries drops the env/headers
+    # slot the rest of identity gained in #983 only when that slot is what
+    # cannot be read; an entry whose origin alone is broken still compares
+    # on it.
     existing_identities: list[dict[str, Any]] = []
-    unresolved_signatures: list[tuple[str, str, tuple[str, ...]]] = []
+    unresolved_signatures: list[_Signature] = []
+    unresolved_base_signatures: list[tuple[str, str, tuple[str, ...]]] = []
     for cfg in servers.values():
         if not isinstance(cfg, dict):
             continue
@@ -4549,13 +4565,19 @@ def _add_from_clients(
         if identity is not None:
             existing_identities.append(identity)
         elif (sig := _server_signature(cfg)) is not None:
-            # The BASE signature, without the env/headers slot: what makes
-            # this entry unresolved may be that very slot, and the whole
-            # point is that STM cannot tell which server it is. Keeping the
-            # slot here would let a candidate that merely states an env the
-            # broken entry cannot state slip past as "not the same" — the
-            # fail-open this list exists to close (#955 review 4, #983).
-            unresolved_signatures.append(sig[:3])
+            # Which part of the entry is unreadable decides how much of the
+            # signature can still speak. An unreadable ``origin`` leaves only
+            # the checkout unknown, so ``env`` / ``headers`` still separate
+            # servers and the full tuple applies. An unreadable ``env`` or
+            # ``headers`` block leaves that slot itself unknown, so the
+            # comparison drops to the base signature — keeping the slot there
+            # would let a candidate that merely states an env the broken
+            # entry cannot state slip past as "not the same", the fail-open
+            # this list exists to close (#955 review 4, #983).
+            if _identity_fields_unreadable(cfg):
+                unresolved_base_signatures.append(sig[:3])
+            else:
+                unresolved_signatures.append(sig)
 
     new_candidates: list[dict[str, Any]] = []
     for cand in all_candidates:
@@ -4578,7 +4600,9 @@ def _add_from_clients(
             skipped.append({"name": cand_name, "reason": "duplicate_signature"})
             continue
         cand_sig = _server_signature(identity)
-        if cand_sig is not None and cand_sig[:3] in unresolved_signatures:
+        if cand_sig is not None and (
+            cand_sig in unresolved_signatures or cand_sig[:3] in unresolved_base_signatures
+        ):
             click.echo(
                 f"  {_warn('Skipping:')} '{_disp(cand_name)}' — an existing server runs the "
                 "same command but records an origin, `env` or `headers` block this build "
@@ -6881,8 +6905,9 @@ def _eject_verify(plan: _EjectPlan) -> list[str]:
     after a write — the claude CLI re-serializes through its own schema and
     silently drops unknown fields (probed on 2.1.173), so a clean
     `add-json` exit does not prove the verbatim-restore contract held —
-    AND on the skipped-write path, where the no-clobber signature match
-    ignores env/headers/unknown fields. Only a host entry deep-equal to
+    AND on the skipped-write path, where the no-clobber identity match
+    normalizes (dangerous env keys dropped, header names folded) and
+    ignores host-only fields. Only a host entry deep-equal to
     the payload may release the STM entry. A `None` read (entry not where
     expected) reports as a full mismatch rather than crashing.
     """

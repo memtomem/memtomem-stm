@@ -105,7 +105,11 @@ changes inline only. See the deprecation policy in
   broken `origin` is: prune skips the entry, and an import declines a
   same-command candidate with `ambiguous_identity` whether or not that
   candidate states an env of its own, since the unreadable field is exactly
-  what a comparison would have to read. The same shape in a *host* config is
+  what a comparison would have to read. That widening is scoped to the field
+  that is actually unreadable: an entry whose `origin` alone is broken still
+  compares on `env` / `headers`, so a candidate whose connection settings
+  differ is imported rather than declined -- those already prove the two are
+  different servers whatever the unknown checkout is. The same shape in a *host* config is
   still dropped at import normalization and reads as an absent block, which
   is unchanged and tracked as #984.
   **Behavior change**: `mms prune` and `mms add --from-clients --prune` no
@@ -137,12 +141,13 @@ changes inline only. See the deprecation policy in
   that clobber when the *first* source's entry diverged from the STM upstream,
   and `docs/cli.md` stated it as the contract; the guard simply never covered
   the later sources, which rode in on the name. A same-name entry is now
-  compared to the winning one through the same identity rule -- the
-  `(transport, command, args)` or `(transport, url)` signature, plus a stdio
-  `cwd` where both sides state one -- and only an identity match is recorded
-  as a duplicate -- the same rule as the first source, so the same limits.
-  (One of those limits, `env` and `headers` sitting outside identity, is
-  closed by the entry below.)
+  compared to the winning one through the same identity rule -- as of this
+  change the `(transport, command, args)` or `(transport, url)` signature
+  plus a stdio `cwd` where both sides state one -- and only an identity match
+  is recorded as a duplicate -- the same rule as the first source, so the
+  same limits. (One of those limits, `env` and `headers` sitting outside
+  identity, is closed by the #983 entry above, which is what that rule now
+  compares.)
   A divergent entry is a third state: named in the import preview, in the
   prune preview, in the confirm prompt and in a new `conflicts` key on both
   `--json` prune surfaces, and otherwise left alone -- never planned, written,

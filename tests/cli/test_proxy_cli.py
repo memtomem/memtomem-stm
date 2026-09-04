@@ -3977,14 +3977,16 @@ class TestInitDiscoverySources:
         """The two differences identity normalizes away must not split a
         pair, or a prune could never collapse the dual path an import
         created. They are normalized for different reasons: a dangerous env
-        key because import strips it, so no registered entry can hold it; a
-        header name's case because HTTP says the name is case-insensitive
-        (import preserves its spelling — identity, not the normalizer, folds
-        it).
+        key because import strips it *before* identity ever sees it, so this
+        half pins the end-to-end outcome rather than the comparator's own
+        filter (``TestServerIdentity`` pins that); a header name's case
+        because HTTP says the name is case-insensitive, and here it is
+        identity that folds it — the normalizer preserves the spelling, so
+        this half does exercise the comparator.
 
         Green against the pre-#983 code, which compared neither field;
-        verified red against the rejected variant that compares env verbatim
-        and header names case-sensitively."""
+        verified red against the rejected variant that compares header names
+        case-sensitively."""
         from memtomem_stm.cli.proxy import _discover_candidates
 
         home, cwd, desktop = self._setup_home(tmp_path, monkeypatch)
@@ -4039,8 +4041,8 @@ class TestInitDiscoverySources:
         assert "conflicts" not in by_name["api"]
 
     def test_a_same_name_entry_differing_only_in_args_is_a_conflict(self, tmp_path, monkeypatch):
-        """Identity is ``(transport, command, *args)`` — a shared command is
-        not a shared server."""
+        """Args are their own part of identity — a shared command is not a
+        shared server."""
         from memtomem_stm.cli.proxy import _discover_candidates
 
         home, cwd, _ = self._setup_home(tmp_path, monkeypatch)
@@ -6943,6 +6945,94 @@ class TestAddFromClients:
             {"name": "db-alias", "reason": "ambiguous_identity"}
         ]
 
+    def test_a_broken_origin_still_lets_a_different_env_through(
+        self, runner, config, monkeypatch
+    ):
+        """The two reasons an entry is unresolved are not the same reason. An
+        unreadable ``origin`` leaves only the checkout unknown, and a
+        different env already proves these are different servers whatever
+        that checkout is — so the decline is scoped to the field that is
+        actually unreadable (codex round 2)."""
+        self._seed_config(
+            config,
+            {
+                "db": {
+                    "prefix": "db",
+                    "transport": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@db"],
+                    "env": {"DB": "staging"},
+                    "origin": {"schema_version": 1, "source": {"kind": "not-a-real-kind"}},
+                },
+            },
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "db-prod",
+                    "source": "Claude Code (user)",
+                    "entry": {
+                        "transport": "stdio",
+                        "command": "npx",
+                        "args": ["-y", "@db"],
+                        "env": {"DB": "prod"},
+                    },
+                }
+            ],
+        )
+
+        result = runner.invoke(
+            cli, ["add", "--from-clients", "--all", "--json", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["skipped"] == []
+        assert [row["name"] for row in payload["imported"]] == ["db-prod"]
+
+    def test_a_broken_origin_still_declines_a_matching_env(self, runner, config, monkeypatch):
+        """Positive control for the test above: with the env equal, the
+        unknown checkout is the only thing left to tell these apart, so the
+        candidate is still declined."""
+        self._seed_config(
+            config,
+            {
+                "db": {
+                    "prefix": "db",
+                    "transport": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@db"],
+                    "env": {"DB": "staging"},
+                    "origin": {"schema_version": 1, "source": {"kind": "not-a-real-kind"}},
+                },
+            },
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "db-alias",
+                    "source": "Claude Code (user)",
+                    "entry": {
+                        "transport": "stdio",
+                        "command": "npx",
+                        "args": ["-y", "@db"],
+                        "env": {"DB": "staging"},
+                    },
+                }
+            ],
+        )
+
+        result = runner.invoke(
+            cli, ["add", "--from-clients", "--all", "--json", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["skipped"] == [
+            {"name": "db-alias", "reason": "ambiguous_identity"}
+        ]
+
     def test_an_unreadable_entry_still_lets_a_different_command_through(
         self, runner, config, monkeypatch
     ):
@@ -7444,8 +7534,10 @@ class TestServerIdentity:
         assert _same_server(self._http(env={"DB": "prod"}), self._http()) is True
 
     def test_the_signature_itself_separates_env(self):
-        """``unresolved_signatures`` compares tuples directly rather than
-        going through ``_same_server``, so the split has to be in the tuple."""
+        """The import side compares these tuples directly rather than going
+        through ``_same_server`` — an entry whose origin cannot be read is
+        held as its signature — so the split has to live in the tuple, not
+        only in the comparator."""
         from memtomem_stm.cli.proxy import _server_signature
 
         assert _server_signature(self._stdio(env={"DB": "prod"})) != _server_signature(
