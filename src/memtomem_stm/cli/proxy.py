@@ -3126,6 +3126,28 @@ def _candidate_identity_entry(cand: dict[str, Any], cwd: Path) -> dict[str, Any]
     return {**entry, "cwd": str(cwd.resolve())}
 
 
+def _candidate_identity_unreadable(cand: dict[str, Any]) -> bool:
+    """Whether the host entry behind this candidate states identity it cannot read.
+
+    The candidate-side name for the state :func:`_stm_identity_entry` reports
+    as ``None`` for an ``env`` / ``headers`` block that is present but is not a
+    mapping. It has to be asked of ``raw``, not of the normalized ``entry``:
+    :func:`_normalize_client_entry` takes those blocks only when they are
+    already mappings, so by the time identity sees a candidate the broken block
+    is gone and the entry reads as one holding no env at all. Against an STM
+    upstream that holds none either, identity then says "same server" and
+    ``mms prune`` deletes the host entry — the erasure making the deletion look
+    justified (#984). The registered side refuses that claim; this is the
+    mirror.
+
+    Returns ``False`` for a candidate carrying no ``raw`` (hand-built ones, and
+    tests): there is no host entry to have broken, and inventing one would
+    make a candidate that states nothing incomparable.
+    """
+    raw = cand.get("raw")
+    return isinstance(raw, dict) and _identity_fields_unreadable(raw)
+
+
 def _identity_fields_unreadable(cfg: dict[str, Any]) -> bool:
     """Whether this entry's own ``env`` / ``headers`` block cannot be read.
 
@@ -3135,7 +3157,9 @@ def _identity_fields_unreadable(cfg: dict[str, Any]) -> bool:
     *checkout* unknown while ``env`` still separates servers, whereas an
     unreadable ``env`` leaves that field itself unknown. The import side
     tells them apart — see ``unresolved_signatures`` in
-    :func:`_add_from_clients`.
+    :func:`_add_from_clients`. Shared with the host side through
+    :func:`_candidate_identity_unreadable`, so one rule decides the shape on
+    both operands (#984).
     """
     return any(
         cfg.get(key) is not None and not isinstance(cfg.get(key), dict)
@@ -3322,6 +3346,26 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
                     err=True,
                 )
                 continue
+            if _identity_fields_unreadable(raw):
+                # Nothing else says so. The normalizer takes ``env`` /
+                # ``headers`` only when they are already mappings, and drops
+                # the rest without a word, so an operator whose hand-edited
+                # config carries ``"env": ["DB=prod"]`` would otherwise learn
+                # it from the refusals below rather than from the config.
+                # Named, never echoed — an env block is where a host entry
+                # keeps its secrets (#984).
+                bad = ", ".join(
+                    key
+                    for key in ("env", "headers")
+                    if raw.get(key) is not None and not isinstance(raw.get(key), dict)
+                )
+                click.echo(
+                    f"{_warn('Note:')} '{_disp(name)}' in {spec.label} has a {bad} block "
+                    "that is not a mapping (value withheld) — STM cannot tell which "
+                    "server it names, so this entry is neither imported nor pruned. "
+                    "Fix that block in the client config to import it.",
+                    err=True,
+                )
             source_ref: dict[str, Any] = {"kind": spec.kind}
             if src_path is not None:
                 source_ref["path"] = src_path
@@ -3339,17 +3383,30 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
                     "name": name,
                     "source": spec.label,
                     "entry": entry,
+                    "raw": raw,
                     "source_ref": source_ref,
                 }
-                same = _same_server(
-                    _candidate_identity_entry(seen[name], cwd),
-                    _candidate_identity_entry(loser, cwd),
-                )
+                if _candidate_identity_unreadable(seen[name]) or _candidate_identity_unreadable(
+                    loser
+                ):
+                    # One of the two states an ``env`` / ``headers`` block
+                    # this build cannot read. Their normalized entries can
+                    # still compare equal — the broken block is erased before
+                    # identity sees it — and folding them together would put
+                    # the other file on the prune list of an entry whose
+                    # identity was never established (#984).
+                    same = None
+                else:
+                    same = _same_server(
+                        _candidate_identity_entry(seen[name], cwd),
+                        _candidate_identity_entry(loser, cwd),
+                    )
                 # ``is True``, not ``is not False``: a discovered entry always
                 # has a signature (``_normalize_client_entry`` requires a
-                # command or a url), so ``None`` is unreachable here — but an
-                # entry this build cannot compare must never be the one it
-                # deletes.
+                # command or a url), so ``None`` from :func:`_same_server` is
+                # unreachable here — but the gate above reaches it deliberately,
+                # and an entry this build cannot compare must never be the one
+                # it deletes.
                 if same is True:
                     seen[name].setdefault("duplicate_in", []).append(spec.label)
                     seen[name].setdefault("duplicates", []).append(
@@ -4037,6 +4094,11 @@ def _find_dual_registered(
     :func:`_same_server` match), so the two sides of the import↔prune
     round-trip agree on what "the same server" means.
 
+    Both operands can also state an identity this build cannot read — a
+    checkout-scoped ``origin`` it cannot resolve on the registered side, an
+    ``env`` / ``headers`` block that is not a mapping on either — and both
+    fail closed here, because this is the destructive direction (#984).
+
     An entry with no extractable signature (missing command / URL) is a
     degraded match: we still include it on a name hit rather than silently
     dropping it, since refusing to prune would surprise users who onboarded
@@ -4057,6 +4119,13 @@ def _find_dual_registered(
             # The entry claims a checkout nothing here can resolve. Refuse
             # rather than fall back to the name, which is the whole reason
             # this function compares identities at all.
+            continue
+        if _candidate_identity_unreadable(cand):
+            # Mirror of the refusal above on the host operand: the entry
+            # states an ``env`` / ``headers`` block normalization erased, so
+            # the candidate identity compared here is not the host entry's.
+            # Deleting on that comparison destroys the only copy of the value
+            # the block held (#984).
             continue
         if _same_server(stm_identity, _candidate_identity_entry(cand, cwd)) is False:
             continue
@@ -4590,6 +4659,21 @@ def _add_from_clients(
             )
             skipped.append({"name": cand_name, "reason": "already_registered"})
             continue
+        if _candidate_identity_unreadable(cand):
+            # The host operand's mirror of ``ambiguous_identity`` below. The
+            # normalizer erased the block, so importing would adopt a server
+            # stripped of settings its host entry states, and calling it a
+            # duplicate of a no-env upstream would claim an identity nothing
+            # established. Decline with the fix to make (#984).
+            click.echo(
+                f"  {_warn('Skipping:')} '{_disp(cand_name)}' — its host entry has an "
+                "`env` or `headers` block that is not a mapping, so STM cannot tell "
+                "which server it names. Fix that block in the client config, or add "
+                "this one with `mms add`.",
+                err=True,
+            )
+            skipped.append({"name": cand_name, "reason": "ambiguous_identity"})
+            continue
         identity = _candidate_identity_entry(cand, discovery_cwd)
         if any(_same_server(identity, cfg) for cfg in existing_identities):
             click.echo(
@@ -5035,6 +5119,13 @@ def init(
         # still consulted when a candidate carries no marker at all, so this
         # cannot admit a shape the old comparison refused.
         candidates = [cand for cand in candidates if not _is_repo_local_candidate(cand)]
+    # Same refusal ``mms add --from-clients`` makes, applied at the other
+    # entry point so the class has one answer: normalization erased the
+    # entry's ``env`` / ``headers`` block, so importing adopts a server
+    # stripped of settings its host entry states — and this flow offers to
+    # delete that host entry afterwards, which would leave the block only in
+    # the backup log. Discovery already named the entry and the field (#984).
+    candidates = [cand for cand in candidates if not _candidate_identity_unreadable(cand)]
     imported: dict[str, dict[str, Any]] = {}
     # Parallel list of the source-client candidate dicts for entries we
     # actually import. Needed so the end-of-flow prune step can address the
