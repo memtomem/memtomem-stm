@@ -11086,6 +11086,63 @@ class TestUnreadableHostIdentityPrune:
             _candidate_identity_unreadable({"name": "docs", "raw": stdio_inert, "entry": {}})
             is True
         )
+        # A transport string this build does not recognize is not "the other
+        # transport": reading it that way ignored `env` on {"transport":
+        # "bogus"} and `headers` on {"transport": ""} (codex R4).
+        for unknown in ("bogus", ""):
+            assert (
+                _candidate_identity_unreadable(
+                    {"name": "docs", "raw": stdio_inert, "entry": {"transport": unknown}}
+                )
+                is True
+            )
+            assert (
+                _candidate_identity_unreadable(
+                    {
+                        "name": "docs",
+                        "raw": {"command": "npx", "env": ["DB=prod"]},
+                        "entry": {"transport": unknown},
+                    }
+                )
+                is True
+            )
+
+    def test_two_paths_aliased_to_one_config_warn_once(
+        self, runner, config, tmp_path, monkeypatch, fake_claude
+    ):
+        """The locator is the file itself, not the string a client is
+        configured with. Claude Code's path was compared unresolved while
+        Cursor's was resolved, so symlinking one client's config to another's
+        warned twice for one entry (codex R4)."""
+        home, _cwd, _desktop = self._setup_home(tmp_path, monkeypatch)
+        self._write_client(
+            home, {"command": "npx", "args": ["-y", "@me/docs"], "env": ["DB=prod"]}
+        )
+        cursor = home / ".cursor"
+        cursor.mkdir()
+        try:
+            (cursor / "mcp.json").symlink_to(home / ".claude.json")
+        except OSError as exc:  # pragma: no cover - platform privilege
+            pytest.skip(f"symlinks unavailable: {exc}")
+        self._seed_config(
+            config,
+            {"prefix": "docs", "transport": "stdio", "command": "npx", "args": ["-y", "@me/docs"]},
+        )
+
+        result = runner.invoke(cli, ["prune", "docs", "--yes", *_cfg_args(config)])
+
+        assert result.output.count("block is not a mapping") == 1
+
+    def test_the_recorded_status_is_what_the_refusals_read(self):
+        """Discovery answers the question once and the readers consume that
+        answer. Re-deriving it at each site is what let the scoped gate read
+        an unknown transport differently from the scan that produced it."""
+        from memtomem_stm.cli.proxy import _candidate_identity_unreadable
+
+        assert _candidate_identity_unreadable({"name": "docs", "identity_unreadable": ("env",)})
+        assert not _candidate_identity_unreadable(
+            {"name": "docs", "identity_unreadable": (), "raw": {"command": "npx"}}
+        )
 
     def test_a_same_name_entry_with_an_unreadable_block_is_a_conflict(
         self, runner, config, tmp_path, monkeypatch, fake_claude

@@ -3143,39 +3143,120 @@ def _candidate_identity_unreadable(cand: dict[str, Any]) -> bool:
     The transport comes from the normalized ``entry`` rather than from ``raw``:
     a host config states its transport as a ``type`` hint the normalizer
     resolves, and which of the two fields identity reads follows that
-    resolution. A candidate whose ``entry`` cannot say — absent, or not a
-    mapping — is asked about **both** blocks instead of being defaulted to
-    stdio: defaulting reads an HTTP entry's broken ``headers`` as inert, and
-    the caller that would then see it is ``_find_dual_registered``, which
-    treats a candidate with no signature as a degraded name match and deletes
-    it. Discovery always supplies ``entry``, so this is the malformed-caller
-    boundary rather than a reachable file shape — and a destructive boundary
-    fails closed (codex R3).
+    resolution. A candidate whose ``entry`` cannot say — absent, not a mapping,
+    or naming a transport this build does not recognize — is asked about
+    **both** blocks instead of being defaulted to stdio: defaulting reads an
+    HTTP entry's broken ``headers`` as inert, and the caller that would then
+    see it is ``_find_dual_registered``, which treats a candidate with no
+    signature as a degraded name match and deletes it. Discovery always
+    supplies ``entry``, so this is the malformed-caller boundary rather than a
+    reachable file shape — and a destructive boundary fails closed (codex R3,
+    widened in R4).
+
+    Discovery records the answer on the candidate as ``identity_unreadable``
+    and this reads it; the derivation below is for candidates built elsewhere
+    (other callers, and tests), so one scan cannot hold two answers.
 
     Returns ``False`` for a candidate carrying no ``raw`` (hand-built ones, and
     tests): there is no host entry to have broken, and inventing one would
     make a candidate that states nothing incomparable.
     """
+    recorded = cand.get("identity_unreadable")
+    if isinstance(recorded, tuple):
+        return bool(recorded)
     raw = cand.get("raw")
     if not isinstance(raw, dict):
         return False
     entry = cand.get("entry")
     transport = entry.get("transport") if isinstance(entry, dict) else None
-    if not isinstance(transport, str):
-        return any(
-            _identity_fields_unreadable(raw, transport=t) for t in ("stdio", "streamable_http")
-        )
-    return _identity_fields_unreadable(raw, transport=transport)
+    return _identity_fields_unreadable(
+        raw, transport=transport if isinstance(transport, str) else ""
+    )
 
 
-def _identity_field(transport: str | None) -> str:
-    """Which connection block identity reads for this transport.
+@dataclass(frozen=True)
+class _DiscoveredSource:
+    """One host config's server table, with everything the scan needs of it.
 
-    ``env`` for stdio, ``headers`` for HTTP — the split :func:`_server_signature`
-    already makes. The other field is inert: a stdio ``headers`` and an HTTP
-    ``env`` are carried by no signature and separate no pair of servers.
+    ``src_path`` is *provenance* — recorded on the candidate's ``source_ref``
+    and therefore only set for the kinds whose origin names a path — while
+    ``path``/``slot`` are the *physical* location the table was read from,
+    which every source has. The two are not interchangeable: two labels can
+    share a location (running from ``$HOME`` makes ``~/.cursor/mcp.json`` both
+    the Cursor user and the Cursor project source) and two locations can share
+    a file (Claude Code's user scope and its per-project slot both live in
+    ``~/.claude.json``), so a message that should be said once per entry keys
+    on :attr:`locator` and not on the label (#984 codex R3/R4).
     """
-    return "env" if (transport or "stdio") == "stdio" else "headers"
+
+    spec: _SourceSpec
+    src_path: str | None
+    path: str
+    slot: tuple[str, ...]
+    servers: dict[str, Any]
+
+    @property
+    def locator(self) -> tuple[str, ...]:
+        """Where this table physically is: canonical file, then JSON slot.
+
+        A tuple rather than a joined string — a path may contain any
+        separator character one would pick, ``#`` included.
+        """
+        return (self.path, *self.slot)
+
+
+def _canonical_path(path: Path) -> str:
+    """Best-effort physical identity of a file, for comparing two locations.
+
+    ``resolve()`` follows symlinks, so two client paths aliased to one config
+    compare equal; it can still raise on an unreadable parent, and a location
+    that cannot be canonicalized falls back to the path as given rather than
+    dropping the source.
+    """
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path)
+
+
+def _identity_fields(transport: str | None) -> tuple[str, ...]:
+    """Which connection blocks identity reads for this transport.
+
+    ``env`` for stdio, ``headers`` for the HTTP transports — the split
+    :func:`_server_signature` already makes. The other field is inert: a stdio
+    ``headers`` and an HTTP ``env`` are carried by no signature and separate no
+    pair of servers.
+
+    A transport this build does not recognize — absent, empty, or a string
+    naming none of the three — resolves to **both**, because which field is
+    inert is exactly what is then unknown. Reading an unrecognized string as
+    "not stdio, therefore HTTP" is how ``{"transport": "bogus"}`` came to have
+    its ``env`` ignored while ``{"transport": ""}`` had its ``headers``
+    ignored, on the one path whose caller deletes on a bare name match
+    (codex R4).
+    """
+    if transport == "stdio":
+        return ("env",)
+    if transport in ("sse", "streamable_http"):
+        return ("headers",)
+    return ("env", "headers")
+
+
+def _unreadable_identity_fields(
+    cfg: dict[str, Any], *, transport: str | None = None
+) -> tuple[str, ...]:
+    """The blocks this entry states that identity cannot read, in order.
+
+    Present, but not a mapping. ``transport`` is passed by callers holding a
+    normalized entry; without it the config's own record is read, and either
+    way an unrecognized one widens the question to both fields.
+    """
+    resolved = transport if transport is not None else cfg.get("transport", "stdio")
+    return tuple(
+        key
+        for key in _identity_fields(resolved if isinstance(resolved, str) else None)
+        if cfg.get(key) is not None and not isinstance(cfg.get(key), dict)
+    )
 
 
 def _identity_fields_unreadable(cfg: dict[str, Any], *, transport: str | None = None) -> bool:
@@ -3200,9 +3281,7 @@ def _identity_fields_unreadable(cfg: dict[str, Any], *, transport: str | None = 
     ``transport`` is passed by callers holding a normalized entry; the
     registered side reads the field the config itself records.
     """
-    key = _identity_field(transport if transport is not None else cfg.get("transport", "stdio"))
-    value = cfg.get(key)
-    return value is not None and not isinstance(value, dict)
+    return bool(_unreadable_identity_fields(cfg, transport=transport))
 
 
 def _stm_identity_entry(cfg: dict[str, Any]) -> dict[str, Any] | None:
@@ -3268,10 +3347,14 @@ _EJECT_TARGETS_HELP = "claude-user | claude-project[:PATH] | mcp-json[:PATH] | c
 def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
     """Scan known MCP-client configs and return importable candidates.
 
-    Each candidate dict is ``{name, source, entry, raw, source_ref}`` where
+    Each candidate dict is
+    ``{name, source, entry, raw, identity_unreadable, source_ref}`` where
     ``entry`` is an already-normalized STM upstream-server entry (sans
     prefix), ``raw`` is the **verbatim** host entry (normalization is lossy —
-    the original is what ``mms eject`` restores, #475), and ``source_ref``
+    the original is what ``mms eject`` restores, #475),
+    ``identity_unreadable`` names the connection blocks this entry states that
+    identity cannot read (empty for the ordinary entry — see
+    :func:`_candidate_identity_unreadable`), and ``source_ref``
     is the structured ``{kind, path?}`` record persisted as
     ``origin.source``. The first source to claim a name wins.
 
@@ -3286,26 +3369,19 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
     reporting helpers do — so the entry is named to the operator and
     otherwise left alone.
     """
-    # ``origin`` is the physical location the servers were read from —
-    # ``<file>#<slot>``, since two sources can share a file (Claude Code's
-    # user scope and its per-project slot both live in ``~/.claude.json``) and
-    # two labels can share a slot (running from ``$HOME`` makes
-    # ``~/.cursor/mcp.json`` both the Cursor user and the Cursor project
-    # source). It is not ``src_path``: that one is provenance, recorded only
-    # for checkout-scoped kinds. Used to say a thing once per entry rather
-    # than once per label (#984 codex R3).
-    sources: list[tuple[_SourceSpec, str | None, str, dict[str, Any]]] = []
+    sources: list[_DiscoveredSource] = []
 
     # 1. Project-scope ``.mcp.json`` in cwd (Claude Code project config).
     mcp_json_path = cwd / ".mcp.json"
     proj = _read_json_safely(mcp_json_path)
     if proj and isinstance(proj.get("mcpServers"), dict):
         sources.append(
-            (
-                _SOURCE_BY_LABEL[".mcp.json (project)"],
-                str(mcp_json_path.resolve()),
-                f"{mcp_json_path.resolve()}#mcpServers",
-                proj["mcpServers"],
+            _DiscoveredSource(
+                spec=_SOURCE_BY_LABEL[".mcp.json (project)"],
+                src_path=str(mcp_json_path.resolve()),
+                path=_canonical_path(mcp_json_path),
+                slot=("mcpServers",),
+                servers=proj["mcpServers"],
             )
         )
 
@@ -3315,11 +3391,12 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
     if cc:
         if isinstance(cc.get("mcpServers"), dict):
             sources.append(
-                (
-                    _SOURCE_BY_LABEL["Claude Code (user)"],
-                    None,
-                    f"{claude_json}#mcpServers",
-                    cc["mcpServers"],
+                _DiscoveredSource(
+                    spec=_SOURCE_BY_LABEL["Claude Code (user)"],
+                    src_path=None,
+                    path=_canonical_path(claude_json),
+                    slot=("mcpServers",),
+                    servers=cc["mcpServers"],
                 )
             )
         projects = cc.get("projects")
@@ -3329,11 +3406,12 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
             proj_entry = projects.get(resolved_cwd)
             if isinstance(proj_entry, dict) and isinstance(proj_entry.get("mcpServers"), dict):
                 sources.append(
-                    (
-                        _SOURCE_BY_LABEL["Claude Code (project)"],
-                        resolved_cwd,
-                        f"{claude_json}#projects/{resolved_cwd}/mcpServers",
-                        proj_entry["mcpServers"],
+                    _DiscoveredSource(
+                        spec=_SOURCE_BY_LABEL["Claude Code (project)"],
+                        src_path=resolved_cwd,
+                        path=_canonical_path(claude_json),
+                        slot=("projects", resolved_cwd, "mcpServers"),
+                        servers=proj_entry["mcpServers"],
                     )
                 )
 
@@ -3343,11 +3421,12 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
     desktop = _read_json_safely(desktop_path)
     if desktop and isinstance(desktop.get("mcpServers"), dict):
         sources.append(
-            (
-                _SOURCE_BY_LABEL["Claude Desktop"],
-                None,
-                f"{desktop_path}#mcpServers",
-                desktop["mcpServers"],
+            _DiscoveredSource(
+                spec=_SOURCE_BY_LABEL["Claude Desktop"],
+                src_path=None,
+                path=_canonical_path(desktop_path),
+                slot=("mcpServers",),
+                servers=desktop["mcpServers"],
             )
         )
 
@@ -3366,17 +3445,22 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
         if servers:
             spec = _SOURCE_BY_LABEL[label]
             sources.append(
-                (
-                    spec,
-                    str(path.resolve()) if spec.is_checkout_scoped else None,
-                    f"{path.resolve()}#servers",
-                    servers,
+                _DiscoveredSource(
+                    spec=spec,
+                    src_path=str(path.resolve()) if spec.is_checkout_scoped else None,
+                    path=_canonical_path(path),
+                    # ``_mcp_servers`` reads exactly ``mcpServers``, so every
+                    # source's leaf slot is that key — naming it anything else
+                    # here would split two aliases of one table.
+                    slot=("mcpServers",),
+                    servers=servers,
                 )
             )
 
     seen: dict[str, dict[str, Any]] = {}
-    warned_unreadable: set[tuple[str, str, str]] = set()
-    for spec, src_path, origin, servers in sources:
+    warned_unreadable: set[tuple[tuple[str, ...], str, str]] = set()
+    for source in sources:
+        spec, src_path, servers = source.spec, source.src_path, source.servers
         if not isinstance(servers, dict):
             continue
         for name, raw in servers.items():
@@ -3418,7 +3502,14 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
                     err=True,
                 )
                 continue
-            if _identity_fields_unreadable(raw, transport=entry["transport"]):
+            # Computed once, here, and carried on the candidate: which
+            # blocks identity cannot read is a fact about the host entry, and
+            # every later reader that re-derived it from ``raw`` plus a
+            # transport had its own chance to derive it differently — which is
+            # how the scoped gate came to read an unknown transport as HTTP
+            # (#984 codex R4).
+            identity = _unreadable_identity_fields(raw, transport=entry["transport"])
+            if identity:
                 # Nothing else says so. The normalizer takes ``env`` /
                 # ``headers`` only when they are already mappings, and drops
                 # the rest without a word, so an operator whose hand-edited
@@ -3434,8 +3525,8 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
                 # Keying on the content instead merged two clients that
                 # genuinely hold identical broken entries into one note, which
                 # is the same silence this note exists to break (codex R3).
-                bad = _identity_field(entry["transport"])
-                warn_key = (origin, name, bad)
+                bad = ", ".join(identity)
+                warn_key = (source.locator, name, bad)
                 if warn_key not in warned_unreadable:
                     warned_unreadable.add(warn_key)
                     click.echo(
@@ -3463,6 +3554,7 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
                     "source": spec.label,
                     "entry": entry,
                     "raw": raw,
+                    "identity_unreadable": identity,
                     "source_ref": source_ref,
                 }
                 if _candidate_identity_unreadable(seen[name]) or _candidate_identity_unreadable(
@@ -3507,6 +3599,7 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
                 "source": spec.label,
                 "entry": entry,
                 "raw": copy.deepcopy(raw),
+                "identity_unreadable": identity,
                 "source_ref": source_ref,
                 "is_repo_local": spec.is_repo_local,
             }

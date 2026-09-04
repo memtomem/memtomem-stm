@@ -102,9 +102,14 @@ changes inline only. See the deprecation policy in
   Only the block the transport actually reads counts, on both operands: a
   stdio `headers` or an HTTP `env` carries no signature and separates no pair
   of servers, so refusing on one would have contradicted the comparator this
-  gate defends. A candidate whose entry names no transport at all -- which
-  discovery never produces -- is asked about both, since the reader that would
-  see it deletes on a name match.
+  gate defends. A transport this build does not recognize -- absent, empty, or
+  a string naming none of the three -- is asked about both, since which field
+  is inert is then exactly what is unknown, and the reader that would see such
+  a candidate deletes on a bare name match. Discovery answers that question
+  once, on the candidate, rather than leaving each reader to re-derive it --
+  every one of those defects was a reader re-deriving a fact the scan had
+  established. Typing the candidate record itself, so the compiler says which
+  facts a candidate carries, is issue #987.
 
 - **`env` and `headers` are part of server identity, so a registration that
   differs only there is no longer treated as the same server** (#983).
