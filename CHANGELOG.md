@@ -68,6 +68,65 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **`env` and `headers` are part of server identity, so a registration that
+  differs only there is no longer treated as the same server** (#983).
+  Identity was the `(transport, command, args)` or `(transport, url)`
+  signature plus a stdio `cwd`, so two registrations of the same command line
+  against a different database, tenant or API token -- or the same URL with
+  different authorization headers -- compared equal. `mms prune` deleted the
+  source-client entry, discovery recorded a second client's differently
+  configured entry as a duplicate and pruned every source holding it, and
+  `mms add --from-clients` skipped the candidate as `duplicate_signature`.
+  Import strips dangerous `env` keys and captures no host `cwd`, so the
+  surviving entry did not carry what the deleted one held: the host entry's
+  current configuration was left only in the prune backup log, which is
+  silent and advisory (the `origin` capture holds the entry as it was at
+  import time, not as it had since been edited). The gap reproduced with one
+  client and one upstream, no duplicates involved.
+  Both fields now join the signature for every reader of the rule rather than
+  only the destructive one -- a comparator that means two different things is
+  how the first-source guard and the second-source one drifted apart in #981.
+  They are compared in the form an import produces, plus one fold of its own:
+  values as strings, absent/`null`/empty as one state, and header names
+  case-folded (RFC 9110) though the normalizer preserves their spelling.
+  Environment names are compared case-sensitively by choice rather than by
+  platform -- Windows resolves them case-insensitively, but a config is
+  portable and which server it names must not depend on the machine reading
+  it; the cost there is a prune that declines and an import that adopts a
+  second entry, never a deletion. A difference confined to a
+  `_DANGEROUS_ENV_KEYS` name is deliberately not a difference, since no
+  import carries those either way and comparing them would leave a prune
+  unable to collapse the dual path an import had just created; a prune can
+  therefore still remove a host entry whose only divergence is such a key,
+  with the verbatim entry going to the backup log as before. An `env` or
+  `headers` block on a *registered* entry that is present but is not a
+  mapping is a claim this build cannot read -- the CLI reads these configs
+  without the validation the server applies -- so it is refused the way a
+  broken `origin` is: prune skips the entry, and an import declines a
+  same-command candidate with `ambiguous_identity` whether or not that
+  candidate states an env of its own, since the unreadable field is exactly
+  what a comparison would have to read. The same shape in a *host* config is
+  still dropped at import normalization and reads as an absent block, which
+  is unchanged and tracked as #984.
+  **Behavior change**: `mms prune` and `mms add --from-clients --prune` no
+  longer remove a source entry whose `env` or `headers` diverge from the STM
+  upstream; a divergence in a *second* client is reported as a conflict, and
+  one in the first is reported by name (`mms prune <name>` says so; `--all`
+  still says nothing for that name, the pre-existing limitation documented in
+  the entry below). Import dedup gets *more* permissive in one case: a
+  candidate under a different name whose command matches an existing upstream
+  but whose `env`/`headers` do not is now imported as its own server instead
+  of skipped, and `ambiguous_identity` correspondingly narrows. A same-name
+  candidate is still declined as `already_registered`, before identity is
+  consulted at all. `mms eject` now fails a same-name target entry whose
+  `env`/`headers` differ at plan time with the `--force` hint, rather than
+  calling it an idempotent skip and failing later at the verify step, where
+  `--accept-schema-loss` could release the STM entry over a host entry that
+  is a different server; and it warns "modified after import" when an STM
+  `env` was edited after import, as it already did for an edited command or
+  args. Header-name case is folded for identity but not by that verify step,
+  which stays a deep-equality check on the raw entry.
+
 - **A same-name entry in a second MCP client is compared to the first before
   being treated as the same server** (#981). `_discover_candidates` keyed
   discovered entries by name alone, and every prune surface acts on the
@@ -81,9 +140,9 @@ changes inline only. See the deprecation policy in
   compared to the winning one through the same identity rule -- the
   `(transport, command, args)` or `(transport, url)` signature, plus a stdio
   `cwd` where both sides state one -- and only an identity match is recorded
-  as a duplicate -- the same rule as the first source, so the same limits:
-  `env` and `headers` are no more part of identity here than they were there,
-  which is its own gap and tracked as #983.
+  as a duplicate -- the same rule as the first source, so the same limits.
+  (One of those limits, `env` and `headers` sitting outside identity, is
+  closed by the entry below.)
   A divergent entry is a third state: named in the import preview, in the
   prune preview, in the confirm prompt and in a new `conflicts` key on both
   `--json` prune surfaces, and otherwise left alone -- never planned, written,
