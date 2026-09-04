@@ -610,7 +610,9 @@ class TestSuffixBudget:
         fits = _make_manager_with_tools(
             tools, compression=CompressionStrategy.SELECTIVE, max_description_chars=boundary
         ).get_proxy_tools()[0]
-        assert fits.description == SELECTIVE_SUFFIX  # whole suffix, zero body
+        # Whole suffix, zero body — and without its leading space, which the
+        # prefix's trailing one supplies once registration prepends it (#922).
+        assert fits.description == SELECTIVE_SUFFIX.lstrip()
 
         just_short = _make_manager_with_tools(
             tools, compression=CompressionStrategy.SELECTIVE, max_description_chars=boundary - 1
@@ -634,22 +636,107 @@ class TestSuffixBudget:
         assert "short" not in desc
         assert len(desc) <= 60 - len(PROXIED_PREFIX)
 
-    def test_empty_description_contributes_no_text(self):
-        """An upstream that sets no description contributes none.
+    def test_empty_description_falls_back_to_the_prefixed_name(self):
+        """An upstream that sets no description advertises its own name (#922).
 
-        With no suffix that leaves the bare prefix once registration adds it —
-        not a cap violation, but the shape the floor does NOT prevent, pinned
-        so the claim stays honest (polish tracked in #922). Where a suffix
-        fits, that is what the client sees instead of a bare prefix.
+        Before, nothing survived to be truncated and the client saw the bare
+        ``[proxied] `` prefix once registration added it. The prefixed name is
+        the only text the proxy can supply without inventing a claim about what
+        the tool does, and it is what the client would have to call anyway.
         """
         bare = _make_manager_with_tools([_fake_tool("t", description="")])
-        assert bare.get_proxy_tools()[0].description == ""
+        assert bare.get_proxy_tools()[0].description == "test__t"
 
         suffixed = _make_manager_with_tools(
             [_fake_tool("t", description="")],
             compression=CompressionStrategy.SELECTIVE,
         )
-        assert suffixed.get_proxy_tools()[0].description == SELECTIVE_SUFFIX
+        assert suffixed.get_proxy_tools()[0].description == "test__t" + SELECTIVE_SUFFIX
+
+    def test_whitespace_only_description_counts_as_empty(self):
+        """Whitespace is not text, so it takes the fallback too (#922).
+
+        The override case is the one worth pinning: an operator who types a
+        blank ``description_override`` does not thereby silence the fallback and
+        get a bare prefix back.
+        """
+        upstream = _make_manager_with_tools([_fake_tool("t", description="  \n ")])
+        assert upstream.get_proxy_tools()[0].description == "test__t"
+
+        overridden = _make_manager_with_tools(
+            [_fake_tool("t", description="Reads a file.")],
+            tool_overrides={"t": ToolOverrideConfig(description_override="   ")},
+        )
+        assert overridden.get_proxy_tools()[0].description == "test__t"
+
+    def test_surrounding_whitespace_is_stripped_from_source_text(self):
+        """Source text is stripped before budgeting, from either source (#922).
+
+        Leading whitespace lands against the prefix's own trailing space, and
+        trailing whitespace against the suffix's leading one.
+        """
+        upstream = _make_manager_with_tools([_fake_tool("t", description="  Reads a file. ")])
+        assert upstream.get_proxy_tools()[0].description == "Reads a file."
+
+        overridden = _make_manager_with_tools(
+            [_fake_tool("t", description="")],
+            tool_overrides={"t": ToolOverrideConfig(description_override=" Custom desc. ")},
+        )
+        assert overridden.get_proxy_tools()[0].description == "Custom desc."
+
+    def test_fallback_is_budgeted_like_upstream_text(self):
+        """The fallback competes for the same budget, and loses to the suffix.
+
+        It is text like any other: truncated to what is left after the prefix
+        and the suffix, never exempted from the cap (#922).
+        """
+        # Long enough that both caps below must truncate it, short enough that
+        # the eligibility filter's own name-length rule does not withhold it.
+        long_name = "a" * 20
+        tools = [_fake_tool(long_name, description="")]
+
+        suffixed = _make_manager_with_tools(
+            tools, compression=CompressionStrategy.SELECTIVE, max_description_chars=60
+        ).get_proxy_tools()[0]
+        assert suffixed.description.endswith(SELECTIVE_SUFFIX)
+        assert len(suffixed.description) <= 60 - len(PROXIED_PREFIX)
+        # Equality against the same truncation upstream text would get: the
+        # suffix still takes its budget first, and what is left of the name is
+        # cut exactly as any text would be — six characters here.
+        assert suffixed.description == (
+            truncate_description(
+                f"test__{long_name}", 60 - len(PROXIED_PREFIX) - len(SELECTIVE_SUFFIX)
+            )
+            + SELECTIVE_SUFFIX
+        )
+
+        # At the floor the suffix cannot fit and is dropped whole; the fallback
+        # is then truncated exactly as upstream text would be. Equality, so a
+        # regression that exempted the fallback from the cap cannot pass.
+        dropped = _make_manager_with_tools(
+            tools, compression=CompressionStrategy.SELECTIVE, max_description_chars=32
+        ).get_proxy_tools()[0]
+        assert dropped.description == truncate_description(
+            f"test__{long_name}", 32 - len(PROXIED_PREFIX)
+        )
+
+    def test_empty_body_drops_the_suffix_separator(self):
+        """A suffix with no body keeps one space, not two (#922).
+
+        The suffix opens with `` | ``; the prefix registration prepends closes
+        with a space. With a body between them both are needed, and with none
+        the client used to see ``[proxied]  | …``. Any source text can be
+        budgeted to zero this way, not just a fallback or an override: the cap
+        here is the suffix's own boundary, where the suffix wins the whole
+        budget and leaves nothing for the upstream text below.
+        """
+        boundary = len(SELECTIVE_SUFFIX) + len(PROXIED_PREFIX)  # 54
+        mgr = _make_manager_with_tools(
+            [_fake_tool("t", description="A" * 100)],
+            compression=CompressionStrategy.SELECTIVE,
+            max_description_chars=boundary,
+        )
+        assert mgr.get_proxy_tools()[0].description == SELECTIVE_SUFFIX.lstrip()
 
 
 # ── Client-visible cap, end to end ─────────────────────────────────────
@@ -717,13 +804,20 @@ class TestClientVisibleCap:
             assert tool.description is not None
             assert tool.description.startswith(PROXIED_PREFIX)
             assert len(tool.description) <= cap, (tool.name, tool.description)
+            # No cap produces a prefix and nothing else, and none doubles the
+            # space between the prefix and what follows it (#922).
+            assert tool.description != PROXIED_PREFIX.rstrip()
+            assert tool.description != PROXIED_PREFIX
+            assert not tool.description.startswith(PROXIED_PREFIX + " ")
             if suffix and len(suffix) <= cap - len(PROXIED_PREFIX):
+                # Holds in the zero-body case too: the suffix is stored without
+                # its leading space, and the prefix's trailing one supplies it.
                 assert tool.description.endswith(suffix)
             elif suffix:
                 # Dropped whole: not one fragment of the suffix may survive,
                 # which absence of "stm_proxy_" alone would not catch. Only the
                 # one-character fragment is excluded — it is a bare space, and
-                # a prefix-only description legitimately ends with one.
+                # a raw mid-word slice may legitimately end on one.
                 fragments = [suffix[:n] for n in range(2, len(suffix) + 1)]
                 assert not any(tool.description.endswith(f) for f in fragments)
             if tool.name.endswith("overridden"):
