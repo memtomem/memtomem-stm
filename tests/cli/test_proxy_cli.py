@@ -3913,9 +3913,136 @@ class TestInitDiscoverySources:
         # conflict, and both carry the other server's command line and env.
         assert all(set(c) == {"label", "source_ref"} for c in cands[0]["conflicts"])
 
+    def test_a_same_name_entry_differing_only_in_env_is_a_conflict(self, tmp_path, monkeypatch):
+        """Same command line, different database: two servers (#983). The
+        loser used to ride in on the name and be pruned with the winner."""
+        from memtomem_stm.cli.proxy import _discover_candidates
+
+        home, cwd, _ = self._setup_home(tmp_path, monkeypatch)
+        (cwd / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"db": {"command": "npx", "env": {"DB": "prod"}}}}),
+            encoding="utf-8",
+        )
+        (home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"db": {"command": "npx", "env": {"DB": "staging"}}}}),
+            encoding="utf-8",
+        )
+
+        cands = _discover_candidates(cwd)
+        assert len(cands) == 1
+        assert "duplicate_in" not in cands[0]
+        assert [c["label"] for c in cands[0]["conflicts"]] == ["Claude Code (user)"]
+
+    def test_a_same_name_http_entry_with_other_headers_is_a_conflict(self, tmp_path, monkeypatch):
+        from memtomem_stm.cli.proxy import _discover_candidates
+
+        home, cwd, _ = self._setup_home(tmp_path, monkeypatch)
+        (cwd / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "api": {
+                            "type": "http",
+                            "url": "https://x/mcp",
+                            "headers": {"Authorization": "Bearer a"},
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        (home / ".claude.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "api": {
+                            "type": "http",
+                            "url": "https://x/mcp",
+                            "headers": {"Authorization": "Bearer b"},
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        cands = _discover_candidates(cwd)
+        assert len(cands) == 1
+        assert "duplicate_in" not in cands[0]
+        assert [c["label"] for c in cands[0]["conflicts"]] == ["Claude Code (user)"]
+
+    def test_a_difference_identity_normalizes_away_is_still_a_duplicate(
+        self, tmp_path, monkeypatch
+    ):
+        """The two differences identity normalizes away must not split a
+        pair, or a prune could never collapse the dual path an import
+        created. They are normalized for different reasons: a dangerous env
+        key because import strips it *before* identity ever sees it, so this
+        half pins the end-to-end outcome rather than the comparator's own
+        filter (``TestServerIdentity`` pins that); a header name's case
+        because HTTP says the name is case-insensitive, and here it is
+        identity that folds it — the normalizer preserves the spelling, so
+        this half does exercise the comparator.
+
+        Green against the pre-#983 code, which compared neither field;
+        verified red against the rejected variant that compares header names
+        case-sensitively."""
+        from memtomem_stm.cli.proxy import _discover_candidates
+
+        home, cwd, desktop = self._setup_home(tmp_path, monkeypatch)
+        (cwd / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "db": {"command": "npx", "env": {"DB": "prod", "NODE_OPTIONS": "a"}}
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        (home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"db": {"command": "npx", "env": {"DB": "prod"}}}}),
+            encoding="utf-8",
+        )
+        (desktop / "claude_desktop_config.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "api": {
+                            "type": "http",
+                            "url": "https://x/mcp",
+                            "headers": {"AUTHORIZATION": "Bearer a"},
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        (home / ".cursor").mkdir()
+        (home / ".cursor" / "mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "api": {
+                            "type": "http",
+                            "url": "https://x/mcp",
+                            "headers": {"authorization": "Bearer a"},
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        by_name = {c["name"]: c for c in _discover_candidates(cwd)}
+        assert by_name["db"]["duplicate_in"] == ["Claude Code (user)"]
+        assert "conflicts" not in by_name["db"]
+        assert by_name["api"]["duplicate_in"] == ["Cursor (user)"]
+        assert "conflicts" not in by_name["api"]
+
     def test_a_same_name_entry_differing_only_in_args_is_a_conflict(self, tmp_path, monkeypatch):
-        """Identity is ``(transport, command, *args)`` — a shared command is
-        not a shared server."""
+        """Args are their own part of identity — a shared command is not a
+        shared server."""
         from memtomem_stm.cli.proxy import _discover_candidates
 
         home, cwd, _ = self._setup_home(tmp_path, monkeypatch)
@@ -6617,6 +6744,368 @@ class TestAddFromClients:
             {"name": "same-server-other-name", "reason": "duplicate_signature"}
         ]
 
+    def test_a_different_env_under_another_name_is_imported(self, runner, config, monkeypatch):
+        """The import direction of #983, and the direction that gets *more*
+        permissive: the same command against a different database is a
+        different server, so dedup must stop collapsing the two."""
+        self._seed_config(
+            config,
+            {
+                "db-staging": {
+                    "prefix": "stg",
+                    "transport": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@db"],
+                    "env": {"DB": "staging"},
+                },
+            },
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "db-prod",
+                    "source": "Claude Code (user)",
+                    "entry": {
+                        "transport": "stdio",
+                        "command": "npx",
+                        "args": ["-y", "@db"],
+                        "env": {"DB": "prod"},
+                    },
+                }
+            ],
+        )
+
+        result = runner.invoke(
+            cli, ["add", "--from-clients", "--all", "--json", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["skipped"] == []
+        assert [row["name"] for row in payload["imported"]] == ["db-prod"]
+
+    def test_the_same_env_under_another_name_is_still_deduped(self, runner, config, monkeypatch):
+        """Positive control: identical env keeps the ``duplicate_signature``
+        skip, which exists so one server is not proxied and advertised twice."""
+        self._seed_config(
+            config,
+            {
+                "db-prod": {
+                    "prefix": "db",
+                    "transport": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@db"],
+                    "env": {"DB": "prod"},
+                },
+            },
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "db-alias",
+                    "source": "Claude Code (user)",
+                    "entry": {
+                        "transport": "stdio",
+                        "command": "npx",
+                        "args": ["-y", "@db"],
+                        "env": {"DB": "prod"},
+                    },
+                }
+            ],
+        )
+
+        result = runner.invoke(
+            cli, ["add", "--from-clients", "--all", "--json", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["skipped"] == [
+            {"name": "db-alias", "reason": "duplicate_signature"}
+        ]
+
+    def test_a_same_name_env_difference_is_still_already_registered(
+        self, runner, config, monkeypatch
+    ):
+        """The name check runs before identity, so the issue's own shape --
+        one name, two envs -- is declined on the name and never reaches the
+        comparator. Widening identity must not turn it into an import."""
+        self._seed_config(
+            config,
+            {
+                "docs": {
+                    "prefix": "docs",
+                    "transport": "stdio",
+                    "command": "npx",
+                    "env": {"DB": "staging"},
+                },
+            },
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "docs",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx", "env": {"DB": "prod"}},
+                }
+            ],
+        )
+
+        result = runner.invoke(
+            cli, ["add", "--from-clients", "--all", "--json", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["imported"] == []
+        assert payload["skipped"] == [{"name": "docs", "reason": "already_registered"}]
+
+    def test_an_unreadable_env_block_declines_a_same_command_candidate(
+        self, runner, config, monkeypatch
+    ):
+        """Fail-closed on the non-destructive side too: an entry whose ``env``
+        cannot be read may be this candidate's server, so importing a second
+        copy is refused with a reason rather than done silently (#955 rule,
+        #983 fields)."""
+        self._seed_config(
+            config,
+            {
+                "db": {
+                    "prefix": "db",
+                    "transport": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@db"],
+                    "env": ["DB=prod"],
+                },
+            },
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "db-alias",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@db"]},
+                }
+            ],
+        )
+
+        result = runner.invoke(
+            cli, ["add", "--from-clients", "--all", "--json", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["skipped"] == [
+            {"name": "db-alias", "reason": "ambiguous_identity"}
+        ]
+
+    def test_an_unreadable_env_declines_a_candidate_that_states_its_own_env(
+        self, runner, config, monkeypatch
+    ):
+        """The decline must not depend on the candidate being silent about
+        env. What cannot be read is precisely the field the unreadable entry
+        would compare on, so a candidate stating one is exactly as ambiguous
+        — comparing the full signature here would let it through (codex)."""
+        self._seed_config(
+            config,
+            {
+                "db": {
+                    "prefix": "db",
+                    "transport": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@db"],
+                    "env": ["DB=prod"],
+                },
+            },
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "db-alias",
+                    "source": "Claude Code (user)",
+                    "entry": {
+                        "transport": "stdio",
+                        "command": "npx",
+                        "args": ["-y", "@db"],
+                        "env": {"DB": "prod"},
+                    },
+                }
+            ],
+        )
+
+        result = runner.invoke(
+            cli, ["add", "--from-clients", "--all", "--json", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["skipped"] == [
+            {"name": "db-alias", "reason": "ambiguous_identity"}
+        ]
+
+    def test_a_broken_origin_still_lets_a_different_env_through(
+        self, runner, config, monkeypatch
+    ):
+        """The two reasons an entry is unresolved are not the same reason. An
+        unreadable ``origin`` leaves only the checkout unknown, and a
+        different env already proves these are different servers whatever
+        that checkout is — so the decline is scoped to the field that is
+        actually unreadable (codex round 2)."""
+        self._seed_config(
+            config,
+            {
+                "db": {
+                    "prefix": "db",
+                    "transport": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@db"],
+                    "env": {"DB": "staging"},
+                    "origin": {"schema_version": 1, "source": {"kind": "not-a-real-kind"}},
+                },
+            },
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "db-prod",
+                    "source": "Claude Code (user)",
+                    "entry": {
+                        "transport": "stdio",
+                        "command": "npx",
+                        "args": ["-y", "@db"],
+                        "env": {"DB": "prod"},
+                    },
+                }
+            ],
+        )
+
+        result = runner.invoke(
+            cli, ["add", "--from-clients", "--all", "--json", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["skipped"] == []
+        assert [row["name"] for row in payload["imported"]] == ["db-prod"]
+
+    def test_a_broken_origin_still_declines_a_matching_env(self, runner, config, monkeypatch):
+        """Positive control for the test above: with the env equal, the
+        unknown checkout is the only thing left to tell these apart, so the
+        candidate is still declined."""
+        self._seed_config(
+            config,
+            {
+                "db": {
+                    "prefix": "db",
+                    "transport": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@db"],
+                    "env": {"DB": "staging"},
+                    "origin": {"schema_version": 1, "source": {"kind": "not-a-real-kind"}},
+                },
+            },
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "db-alias",
+                    "source": "Claude Code (user)",
+                    "entry": {
+                        "transport": "stdio",
+                        "command": "npx",
+                        "args": ["-y", "@db"],
+                        "env": {"DB": "staging"},
+                    },
+                }
+            ],
+        )
+
+        result = runner.invoke(
+            cli, ["add", "--from-clients", "--all", "--json", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["skipped"] == [
+            {"name": "db-alias", "reason": "ambiguous_identity"}
+        ]
+
+    def test_an_unreadable_entry_still_lets_a_different_command_through(
+        self, runner, config, monkeypatch
+    ):
+        """Positive control: the decline is scoped to the command it cannot
+        resolve, not to every candidate in the run."""
+        self._seed_config(
+            config,
+            {
+                "db": {
+                    "prefix": "db",
+                    "transport": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@db"],
+                    "env": ["DB=prod"],
+                },
+            },
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "other",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@other"]},
+                }
+            ],
+        )
+
+        result = runner.invoke(
+            cli, ["add", "--from-clients", "--all", "--json", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["skipped"] == []
+        assert [row["name"] for row in payload["imported"]] == ["other"]
+
+    def test_an_unreadable_headers_block_declines_a_same_url_candidate(
+        self, runner, config, monkeypatch
+    ):
+        """Headers apply to HTTP, so the readability check runs before the
+        transport branch that only stdio identity would reach."""
+        self._seed_config(
+            config,
+            {
+                "api": {
+                    "prefix": "api",
+                    "transport": "streamable_http",
+                    "url": "https://x/mcp",
+                    "headers": "Authorization: Bearer a",
+                },
+            },
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "api-alias",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "streamable_http", "url": "https://x/mcp"},
+                }
+            ],
+        )
+
+        result = runner.invoke(
+            cli, ["add", "--from-clients", "--all", "--json", *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["skipped"] == [
+            {"name": "api-alias", "reason": "ambiguous_identity"}
+        ]
+
     def test_all_registered_exits_cleanly(self, runner, config, monkeypatch):
         """When every discovered candidate is already registered, we exit
         with a no-op message instead of prompting for an empty selection."""
@@ -6932,6 +7421,145 @@ class TestServerIdentity:
         from memtomem_stm.cli.proxy import _server_signature
 
         assert _server_signature(self._stdio(cwd="/repo/a")) == _server_signature(self._stdio())
+
+    # ── env / headers (#983) ──
+
+    @staticmethod
+    def _http(**extra):
+        return {"transport": "streamable_http", "url": "https://x/mcp", **extra}
+
+    def test_the_same_command_with_a_different_env_is_a_different_server(self):
+        """The whole of #983: one command line against two databases is two
+        servers, and prune deleted the host entry holding the only copy of
+        the other one's configuration."""
+        from memtomem_stm.cli.proxy import _same_server
+
+        assert (
+            _same_server(self._stdio(env={"DB": "prod"}), self._stdio(env={"DB": "stg"})) is False
+        )
+
+    def test_an_absent_env_equals_an_empty_one(self):
+        """Absent, ``None`` and ``{}`` are one state: the normalizer drops an
+        empty dict, so an imported entry must still match its host row."""
+        from memtomem_stm.cli.proxy import _same_server
+
+        assert _same_server(self._stdio(), self._stdio(env={})) is True
+        assert _same_server(self._stdio(env=None), self._stdio()) is True
+        assert _same_server(self._stdio(env={}), self._stdio(env=None)) is True
+        # Positive control: the same pair with a value present is not a match.
+        assert _same_server(self._stdio(), self._stdio(env={"DB": "prod"})) is False
+
+    def test_a_dangerous_env_key_is_outside_identity(self):
+        """Import filters ``_DANGEROUS_ENV_KEYS`` out, so comparing them would
+        make every imported entry a stranger to the row it came from. The
+        verbatim value still lives in ``origin.original`` and the prune backup
+        log, and eject deep-equals the raw entry before releasing anything."""
+        from memtomem_stm.cli.proxy import _same_server
+
+        host = self._stdio(env={"DB": "prod", "LD_PRELOAD": "/tmp/a.so"})
+        stm = self._stdio(env={"DB": "prod"})
+        assert _same_server(host, stm) is True
+        assert (
+            _same_server(host, self._stdio(env={"DB": "prod", "LD_PRELOAD": "/tmp/b.so"})) is True
+        )
+        # Positive control: a non-filtered key at the same position does split.
+        assert _same_server(host, self._stdio(env={"DB": "prod", "EXTRA": "1"})) is False
+
+    def test_env_values_are_compared_as_strings(self):
+        """Host JSON carries ``8080``; the config carries ``"8080"``. One
+        setting, so one server — the normalizer str-coerces both sides.
+
+        Green against the pre-#983 code, which read no env at all; verified
+        red against the rejected variant that keeps values uncoerced."""
+        from memtomem_stm.cli.proxy import _same_server
+
+        assert (
+            _same_server(self._stdio(env={"PORT": 8080}), self._stdio(env={"PORT": "8080"})) is True
+        )
+
+    def test_env_keys_stay_case_sensitive(self):
+        """Environment names are compared case-sensitively — unlike header
+        names, and unlike the dangerous-key test, which folds case as import
+        does. That is a deliberate choice rather than a platform reading:
+        Windows resolves env names case-insensitively, but a config is
+        portable and identity must not depend on the machine reading it, so
+        `DB` and `db` are two settings everywhere. The cost is confined to
+        Windows and to the safe direction — a prune declines, an import
+        adopts a second entry — since nothing here is deleted on a mismatch."""
+        from memtomem_stm.cli.proxy import _same_server
+
+        assert (
+            _same_server(self._stdio(env={"db": "prod"}), self._stdio(env={"DB": "prod"})) is False
+        )
+        assert _same_server(self._stdio(env={"ld_preload": "x"}), self._stdio()) is True
+
+    def test_the_same_url_with_different_headers_is_a_different_server(self):
+        from memtomem_stm.cli.proxy import _same_server
+
+        a = self._http(headers={"Authorization": "Bearer a"})
+        b = self._http(headers={"Authorization": "Bearer b"})
+        assert _same_server(a, b) is False
+        assert _same_server(a, self._http()) is False
+        assert _same_server(self._http(), self._http(headers={})) is True
+
+    def test_header_names_fold_case_but_values_do_not(self):
+        """Header names are case-insensitive (RFC 9110); values are not."""
+        from memtomem_stm.cli.proxy import _same_server
+
+        assert (
+            _same_server(
+                self._http(headers={"Authorization": "Bearer a"}),
+                self._http(headers={"authorization": "Bearer a"}),
+            )
+            is True
+        )
+        assert (
+            _same_server(
+                self._http(headers={"Authorization": "Bearer a"}),
+                self._http(headers={"Authorization": "bearer a"}),
+            )
+            is False
+        )
+
+    def test_env_is_not_folded_into_the_headers_slot(self):
+        """An stdio ``headers`` and an HTTP ``env`` are inert: each transport
+        reads the field that applies to it, so a stray one cannot split a
+        pair that is otherwise the same server.
+
+        Green against the pre-#983 code; verified red against the rejected
+        variant that folds both fields into both transports."""
+        from memtomem_stm.cli.proxy import _same_server
+
+        assert _same_server(self._stdio(headers={"X": "1"}), self._stdio()) is True
+        assert _same_server(self._http(env={"DB": "prod"}), self._http()) is True
+
+    def test_the_signature_itself_separates_env(self):
+        """The import side compares these tuples directly rather than going
+        through ``_same_server`` — an entry whose origin cannot be read is
+        held as its signature — so the split has to live in the tuple, not
+        only in the comparator."""
+        from memtomem_stm.cli.proxy import _server_signature
+
+        assert _server_signature(self._stdio(env={"DB": "prod"})) != _server_signature(
+            self._stdio(env={"DB": "stg"})
+        )
+        assert _server_signature(self._stdio(env={})) == _server_signature(self._stdio())
+
+    def test_args_and_env_occupy_distinct_slots(self):
+        """Flat concatenation let an arg spell an env pair. Both are their
+        own slot in a fixed-arity tuple.
+
+        Green against the pre-#983 code, which had no env slot to collide
+        with; verified red against the rejected flat-concatenation variant."""
+        from memtomem_stm.cli.proxy import _same_server
+
+        assert (
+            _same_server(
+                self._stdio(command="npx", args=["DB", "prod"]),
+                self._stdio(command="npx", env={"DB": "prod"}),
+            )
+            is False
+        )
 
 
 class TestCheckoutScopedIdentity:
@@ -9381,6 +10009,154 @@ class TestPruneCommand:
         assert "No dual-registered upstreams found" in result.output
         assert not any(c[:3] == ["claude", "mcp", "remove"] for c in fake_claude["calls"])
 
+    def test_divergent_env_not_dual_registered(self, runner, config, monkeypatch, fake_claude):
+        """Same command, different database URL: the source holds a server
+        this upstream is not, so prune leaves it alone (#983)."""
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "db": {
+                            "prefix": "db",
+                            "transport": "stdio",
+                            "command": "npx",
+                            "env": {"DB": "staging"},
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "db",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx", "env": {"DB": "prod"}},
+                }
+            ],
+        )
+
+        result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert "No dual-registered upstreams found" in result.output
+        assert not any(c[:3] == ["claude", "mcp", "remove"] for c in fake_claude["calls"])
+
+    def test_matching_env_is_still_dual_registered(self, runner, config, monkeypatch, fake_claude):
+        """Positive control for the two tests around it: identical env on
+        both sides still collapses the dual path."""
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "db": {
+                            "prefix": "db",
+                            "transport": "stdio",
+                            "command": "npx",
+                            "env": {"DB": "prod"},
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "db",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx", "env": {"DB": "prod"}},
+                }
+            ],
+        )
+
+        result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        argvs = [c for c in fake_claude["calls"] if c[:3] == ["claude", "mcp", "remove"]]
+        assert [(c[3], c[5]) for c in argvs] == [("db", "user")]
+
+    def test_divergent_headers_not_dual_registered(self, runner, config, monkeypatch, fake_claude):
+        """The HTTP half of the same rule: one URL, two credentials."""
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "api": {
+                            "prefix": "api",
+                            "transport": "streamable_http",
+                            "url": "https://x/mcp",
+                            "headers": {"Authorization": "Bearer stm"},
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "api",
+                    "source": "Claude Code (user)",
+                    "entry": {
+                        "transport": "streamable_http",
+                        "url": "https://x/mcp",
+                        "headers": {"Authorization": "Bearer host"},
+                    },
+                }
+            ],
+        )
+
+        result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert "No dual-registered upstreams found" in result.output
+        assert not any(c[:3] == ["claude", "mcp", "remove"] for c in fake_claude["calls"])
+
+    def test_an_unreadable_env_block_is_not_pruned(self, runner, config, monkeypatch, fake_claude):
+        """A present-but-unreadable block is a claim this build cannot read,
+        so the destructive side refuses it — the #955 rule, now covering the
+        fields #983 added to identity. The server rejects such a config on
+        load, but the CLI reads it without validation."""
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "db": {
+                            "prefix": "db",
+                            "transport": "stdio",
+                            "command": "npx",
+                            "env": ["DB=prod"],
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        self._stub_candidates(
+            monkeypatch,
+            [
+                {
+                    "name": "db",
+                    "source": "Claude Code (user)",
+                    "entry": {"transport": "stdio", "command": "npx"},
+                }
+            ],
+        )
+
+        result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert not any(c[:3] == ["claude", "mcp", "remove"] for c in fake_claude["calls"])
+
     def test_divergent_cwd_not_dual_registered(self, runner, config, monkeypatch, fake_claude):
         """The same relative command in another checkout is not a prune target."""
         config.write_text(
@@ -9860,6 +10636,112 @@ def _user_candidate(name: str = "alpha", *, secret: str = "tok_secret") -> dict:
         },
         "source_ref": {"kind": "claude-user"},
     }
+
+
+class TestEnvDivergentPrune:
+    """The #983 reproduction, against real client-config files: one client,
+    one upstream, no duplicates. Same command line, different ``env`` — a
+    different database, tenant or token — and `mms prune` deleted the host
+    entry that held the only copy of that configuration."""
+
+    def _setup_home(self, tmp_path: Path, monkeypatch):
+        home = tmp_path / "env-home"
+        home.mkdir()
+        cwd = tmp_path / "env-cwd"
+        cwd.mkdir()
+        set_home(monkeypatch, home)
+        monkeypatch.chdir(cwd)
+        return home, cwd
+
+    def _write_client(self, home: Path, env: dict) -> Path:
+        path = home / ".claude.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "docs": {"command": "npx", "args": ["-y", "@me/docs"], "env": env}
+                    }
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def _seed_config(self, config: Path, env: dict) -> None:
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "docs": {
+                            "prefix": "docs",
+                            "transport": "stdio",
+                            "command": "npx",
+                            "args": ["-y", "@me/docs"],
+                            "env": env,
+                        }
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    @pytest.fixture
+    def fake_claude(self, monkeypatch):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        state: dict = {"calls": []}
+
+        def fake_run(cmd, timeout=5, cwd=None):
+            state["calls"].append(list(cmd))
+            return _FakeClaudeResult(returncode=0)
+
+        monkeypatch.setattr(proxy_mod, "_run_claude_mcp", fake_run)
+        return state
+
+    def test_named_prune_refuses_and_says_why(
+        self, runner, config, tmp_path, monkeypatch, fake_claude
+    ):
+        home, _cwd = self._setup_home(tmp_path, monkeypatch)
+        client = self._write_client(home, {"DB": "prod"})
+        before = client.read_text(encoding="utf-8")
+        self._seed_config(config, {"DB": "staging"})
+
+        result = runner.invoke(cli, ["prune", "docs", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 1
+        assert "not dual-registered: docs" in result.output
+        assert "`env`" in result.output
+        assert fake_claude["calls"] == []
+        assert client.read_text(encoding="utf-8") == before
+
+    def test_prune_all_removes_nothing(self, runner, config, tmp_path, monkeypatch, fake_claude):
+        home, _cwd = self._setup_home(tmp_path, monkeypatch)
+        client = self._write_client(home, {"DB": "prod"})
+        before = client.read_text(encoding="utf-8")
+        self._seed_config(config, {"DB": "staging"})
+
+        result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert "No dual-registered upstreams found" in result.output
+        assert fake_claude["calls"] == []
+        assert client.read_text(encoding="utf-8") == before
+
+    def test_the_same_env_still_prunes(self, runner, config, tmp_path, monkeypatch, fake_claude):
+        """Positive control on the same fixtures: without the divergence this
+        is an ordinary dual registration and prune collapses it."""
+        home, _cwd = self._setup_home(tmp_path, monkeypatch)
+        self._write_client(home, {"DB": "prod"})
+        self._seed_config(config, {"DB": "prod"})
+
+        result = runner.invoke(cli, ["prune", "docs", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        argvs = [c for c in fake_claude["calls"] if c[:3] == ["claude", "mcp", "remove"]]
+        assert [(c[3], c[5]) for c in argvs] == [("docs", "user")]
 
 
 class TestPruneSameNameConflicts:
@@ -10940,6 +11822,82 @@ class TestEjectCommand:
         assert verbs == ["remove", "add-json"]
         assert "demo" not in self._stm_servers(config)
 
+    def test_no_clobber_env_difference_requires_force(
+        self, runner, config, fake_claude_host, _hermetic_home
+    ):
+        """Same command line, different database: the target holds a server
+        this entry is not, so the plan fails with the ``--force`` hint rather
+        than calling it an idempotent restore and skipping the write (#983).
+        The old path reached the verify instead, where the only way past was
+        ``--accept-schema-loss`` — which would have released the STM entry
+        over a host entry that is a different server."""
+        (_hermetic_home / ".claude.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "demo": {
+                            "command": "npx",
+                            "args": ["-y", "@demo"],
+                            "env": {"DB": "prod"},
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        original = {"command": "npx", "args": ["-y", "@demo"], "env": {"DB": "staging"}}
+        self._seed_config(config, {"demo": _eject_entry(original=original)})
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 1
+        assert "--force" in result.output
+        assert "--accept-schema-loss" not in result.output
+        assert fake_claude_host["calls"] == []
+        assert "demo" in self._stm_servers(config)
+
+        forced = runner.invoke(cli, ["eject", "demo", "--yes", "--force", *_cfg_args(config)])
+        assert forced.exit_code == 0, forced.output
+        # The failed run above shelled out to nothing, so these are its calls.
+        assert [c["cmd"][2] for c in fake_claude_host["calls"]] == ["remove", "add-json"]
+        assert "demo" not in self._stm_servers(config)
+
+    def test_no_clobber_matching_env_is_still_an_idempotent_skip(
+        self, runner, config, fake_claude_host, _hermetic_home
+    ):
+        """Positive control for the test above: the same fixtures with one
+        env restore idempotently, so the new check cannot be passing because
+        every eject now errors."""
+        original = {"command": "npx", "args": ["-y", "@demo"], "env": {"DB": "prod"}}
+        (_hermetic_home / ".claude.json").write_text(
+            json.dumps({"mcpServers": {"demo": dict(original)}}), encoding="utf-8"
+        )
+        self._seed_config(config, {"demo": _eject_entry(original=original)})
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert fake_claude_host["calls"] == []
+        assert "skip write" in result.output
+        assert "demo" not in self._stm_servers(config)
+
+    def test_drift_guard_warns_on_an_env_edited_after_import(
+        self, runner, config, fake_claude_host, _hermetic_home
+    ):
+        """An STM-side ``env`` edit is a real divergence from what the host
+        entry holds, and the restore drops it — so it is warned about, like
+        an edited args list."""
+        original = {"command": "npx", "args": ["-y", "@demo"], "env": {"DB": "prod"}}
+        entry = _eject_entry(original=original)
+        entry["env"] = {"DB": "edited-after-import"}
+        self._seed_config(config, {"demo": entry})
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        assert "modified after import" in result.output
+        assert self._claude_user_servers(_hermetic_home)["demo"] == original
+
     def test_signature_none_is_never_an_idempotent_match(
         self, runner, config, fake_claude_host, _hermetic_home
     ):
@@ -10961,11 +11919,13 @@ class TestEjectCommand:
     def test_same_signature_different_content_never_releases_stm(
         self, runner, config, fake_claude_host, _hermetic_home
     ):
-        """A host entry matching by signature (command/args) but NOT
-        structurally (missing env / host-only fields) must not satisfy the
-        verbatim-restore invariant: the write is skipped, but the pre-removal
-        verify keeps the STM entry — signature alone ignores exactly the
-        fields the original exists to preserve (codex R1 Blocker)."""
+        """A host entry matching by identity (command/args/env) but NOT
+        structurally (a host-only field the captured original has) must not
+        satisfy the verbatim-restore invariant: the write is skipped, but the
+        pre-removal verify keeps the STM entry — identity ignores exactly the
+        fields the original exists to preserve (codex R1 Blocker). ``env``
+        joined identity in #983, so the mismatch here rests on the host-only
+        key alone."""
         original = {
             "command": "npx",
             "args": ["-y", "@demo"],
@@ -10973,7 +11933,17 @@ class TestEjectCommand:
             "hostOnly": True,
         }
         (_hermetic_home / ".claude.json").write_text(
-            json.dumps({"mcpServers": {"demo": {"command": "npx", "args": ["-y", "@demo"]}}}),
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "demo": {
+                            "command": "npx",
+                            "args": ["-y", "@demo"],
+                            "env": {"PLAIN": "1"},
+                        }
+                    }
+                }
+            ),
             encoding="utf-8",
         )
         self._seed_config(config, {"demo": _eject_entry(original=original)})

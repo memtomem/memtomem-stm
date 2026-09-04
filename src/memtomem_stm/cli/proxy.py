@@ -3126,6 +3126,23 @@ def _candidate_identity_entry(cand: dict[str, Any], cwd: Path) -> dict[str, Any]
     return {**entry, "cwd": str(cwd.resolve())}
 
 
+def _identity_fields_unreadable(cfg: dict[str, Any]) -> bool:
+    """Whether this entry's own ``env`` / ``headers`` block cannot be read.
+
+    Present, but not a mapping. Split out from :func:`_stm_identity_entry`
+    because the two reasons that function returns ``None`` are not
+    interchangeable for every caller: an unreadable ``origin`` leaves the
+    *checkout* unknown while ``env`` still separates servers, whereas an
+    unreadable ``env`` leaves that field itself unknown. The import side
+    tells them apart — see ``unresolved_signatures`` in
+    :func:`_add_from_clients`.
+    """
+    return any(
+        cfg.get(key) is not None and not isinstance(cfg.get(key), dict)
+        for key in ("env", "headers")
+    )
+
+
 def _stm_identity_entry(cfg: dict[str, Any]) -> dict[str, Any] | None:
     """The registered upstream as identity should read it, cwd included.
 
@@ -3154,10 +3171,17 @@ def _stm_identity_entry(cfg: dict[str, Any]) -> dict[str, Any] | None:
     the server would reject still reaches this comparison.
 
     Only stdio identity has a checkout at all; an HTTP entry is its URL,
-    wherever it was registered from, so it never goes down this path and a
-    broken origin cannot make it incomparable.
+    wherever it was registered from, so it never goes down that path and a
+    broken origin cannot make it incomparable. A broken ``env`` or
+    ``headers`` block can, on either transport: those joined identity in
+    #983, and a block that is present but not a mapping is a claim this
+    build cannot read, refused for the same reason a broken ``origin`` is.
     """
-    if not isinstance(cfg, dict) or cfg.get("cwd") is not None:
+    if not isinstance(cfg, dict):
+        return cfg
+    if _identity_fields_unreadable(cfg):
+        return None
+    if cfg.get("cwd") is not None:
         return cfg
     if cfg.get("transport", "stdio") != "stdio":
         return cfg
@@ -4006,8 +4030,9 @@ def _find_dual_registered(
     """Return source-client candidates whose name **and identity** match an STM upstream.
 
     Name alone isn't enough: a user can register an unrelated server under
-    the same name in a source client (different command / URL / args) and
-    would reasonably expect ``mms prune`` not to touch it. Mirrors the dedup
+    the same name in a source client (a different command, URL, args,
+    ``env`` or ``headers``) and would reasonably expect ``mms prune`` not to
+    touch it. Mirrors the dedup
     logic :func:`_add_from_clients` uses in the other direction (name +
     :func:`_same_server` match), so the two sides of the import↔prune
     round-trip agree on what "the same server" means.
@@ -4291,13 +4316,75 @@ def _pick_imports(candidates: list[dict[str, Any]]) -> list[int]:
         )
 
 
-def _server_signature(cfg: dict[str, Any]) -> tuple[str, ...] | None:
+_Signature = tuple[str, str, tuple[str, ...], tuple[tuple[str, str], ...]]
+"""``(transport, command|url, args, env|headers)`` — see :func:`_server_signature`."""
+
+
+def _identity_env(value: Any) -> tuple[tuple[str, str], ...]:
+    """A stdio entry's ``env`` as identity compares it: normalized, sorted.
+
+    Mirrors :func:`_normalize_client_entry` so an imported entry stays
+    identical to the host row it came from: keys in ``_DANGEROUS_ENV_KEYS``
+    are dropped (import never carries them, so comparing them would make
+    every imported entry a stranger to its own source), non-``str`` keys are
+    ignored and values are ``str``-coerced (a host JSON ``8080`` and a config
+    ``"8080"`` are one setting). Absent, ``None``, empty and *non-dict* all
+    normalize to ``()``; a non-dict is refused one layer up, on the entry, by
+    :func:`_stm_identity_entry` — this function stays lenient because its
+    remaining reader is the ``unresolved_signatures`` list, where the empty
+    tuple is the conservative answer.
+
+    The dangerous-key filter is a deliberate hole: two host rows differing
+    only in, say, ``LD_PRELOAD`` compare equal here. Neither value would
+    survive an import, the verbatim entry is still kept in ``origin.original``
+    and the prune backup log, and ``mms eject`` deep-equals the raw entry
+    before releasing an STM registration.
+
+    Env keys are case-sensitive (POSIX); only the dangerous-key test folds
+    case, as the normalizer's does.
+    """
+    if not isinstance(value, dict):
+        return ()
+    return tuple(
+        sorted(
+            (str(k), str(v))
+            for k, v in value.items()
+            if isinstance(k, str) and k.upper() not in _DANGEROUS_ENV_KEYS
+        )
+    )
+
+
+def _identity_headers(value: Any) -> tuple[tuple[str, str], ...]:
+    """An HTTP entry's ``headers`` as identity compares them.
+
+    Like :func:`_identity_env` minus the dangerous-key filter, which the
+    header path deliberately does not have (a header named ``PATH`` is legal
+    — see ``mms add --header``). Header *names* are case-insensitive
+    (RFC 9110), so they fold to lower case; values are compared exactly.
+    """
+    if not isinstance(value, dict):
+        return ()
+    pairs = ((str(k).lower(), str(v)) for k, v in value.items() if isinstance(k, str))
+    return tuple(sorted(pairs))
+
+
+def _server_signature(cfg: dict[str, Any]) -> _Signature | None:
     """Best-effort content signature for dedup between discovered + registered.
 
-    Same ``(transport, command, *args)`` or ``(transport, url)`` → assume
-    the user already imported this server under a different name. Returns
-    ``None`` when the entry is missing the identifying field (caller falls
-    back to name-based match only).
+    Same ``(transport, command, args, env)`` or ``(transport, url, (),
+    headers)`` → assume the user already imported this server under a
+    different name. Returns ``None`` when the entry is missing the
+    identifying field (caller falls back to name-based match only).
+
+    ``env`` / ``headers`` are part of it: the same command line against a
+    different database, tenant or token is a different server, and treating
+    two such registrations as one made ``mms prune`` delete a host entry
+    holding configuration nothing else held (#983). They are compared in the
+    normalized form :func:`_identity_env` / :func:`_identity_headers`
+    produce, and only ever compared — no caller renders a signature.
+
+    Fixed arity so the tuple has one concrete type and no slot is ambiguous;
+    an HTTP entry carries an empty ``args`` slot.
 
     A stdio ``cwd`` is deliberately NOT part of the tuple: compare entries
     with :func:`_same_server`, which folds cwd in only when both sides record
@@ -4313,19 +4400,26 @@ def _server_signature(cfg: dict[str, Any]) -> tuple[str, ...] | None:
         args = cfg.get("args") or []
         if not isinstance(args, list):
             args = []
-        return ("stdio", cmd, *(str(a) for a in args))
+        return ("stdio", cmd, tuple(str(a) for a in args), _identity_env(cfg.get("env")))
     url = cfg.get("url", "") or ""
     if not url:
         return None
-    return (transport, url)
+    return (transport, url, (), _identity_headers(cfg.get("headers")))
 
 
 def _same_server(a: dict[str, Any], b: dict[str, Any]) -> bool | None:
     """Whether two upstream-shaped entries name the same server.
 
     ``None`` when either side has no :func:`_server_signature` (the caller
-    decides what a name-only hit means); otherwise signature equality, plus
-    — for stdio — ``cwd`` equality **only when both sides declare one**.
+    decides what a name-only hit means); otherwise signature equality —
+    which covers ``env`` / ``headers`` (#983) — plus, for stdio, ``cwd``
+    equality **only when both sides declare one**.
+
+    ``cwd`` sits outside the signature and ``env`` / ``headers`` sit inside
+    it for the same reason: a host row *cannot express* a cwd, so requiring
+    one on both sides compares a field only one operand can fill, while both
+    operands do state env and headers and "absent equals empty" is a
+    well-defined answer for them.
 
     The asymmetry is the point. ``_normalize_client_entry`` never emits a
     ``cwd``, so a host row and any candidate built from one carry none; a
@@ -4448,7 +4542,8 @@ def _add_from_clients(
     # signatures: identity folds in a stdio ``cwd`` when both sides record
     # one, which a shared key cannot express (#955 review).
     #
-    # An entry whose origin claims a checkout nothing here can resolve is held
+    # An entry whose origin claims a checkout nothing here can resolve — or
+    # whose ``env`` / ``headers`` block is present but unreadable — is held
     # apart rather than dropped. Dropping it was fail-OPEN for this direction:
     # a genuine alias of that same server would import again, and two upstream
     # entries pointing at one server means the proxy starts or dials it twice
@@ -4456,9 +4551,13 @@ def _add_from_clients(
     # match either — which checkout it belongs to is exactly what is unknown —
     # so a candidate sharing its base signature is declined with a reason the
     # operator can act on, instead of being silently duplicated or silently
-    # skipped.
+    # skipped. The comparison against those entries drops the env/headers
+    # slot the rest of identity gained in #983 only when that slot is what
+    # cannot be read; an entry whose origin alone is broken still compares
+    # on it.
     existing_identities: list[dict[str, Any]] = []
-    unresolved_signatures: list[tuple[str, ...]] = []
+    unresolved_signatures: list[_Signature] = []
+    unresolved_base_signatures: list[tuple[str, str, tuple[str, ...]]] = []
     for cfg in servers.values():
         if not isinstance(cfg, dict):
             continue
@@ -4466,7 +4565,19 @@ def _add_from_clients(
         if identity is not None:
             existing_identities.append(identity)
         elif (sig := _server_signature(cfg)) is not None:
-            unresolved_signatures.append(sig)
+            # Which part of the entry is unreadable decides how much of the
+            # signature can still speak. An unreadable ``origin`` leaves only
+            # the checkout unknown, so ``env`` / ``headers`` still separate
+            # servers and the full tuple applies. An unreadable ``env`` or
+            # ``headers`` block leaves that slot itself unknown, so the
+            # comparison drops to the base signature — keeping the slot there
+            # would let a candidate that merely states an env the broken
+            # entry cannot state slip past as "not the same", the fail-open
+            # this list exists to close (#955 review 4, #983).
+            if _identity_fields_unreadable(cfg):
+                unresolved_base_signatures.append(sig[:3])
+            else:
+                unresolved_signatures.append(sig)
 
     new_candidates: list[dict[str, Any]] = []
     for cand in all_candidates:
@@ -4483,18 +4594,20 @@ def _add_from_clients(
         if any(_same_server(identity, cfg) for cfg in existing_identities):
             click.echo(
                 f"  {_warn('Skipping:')} '{_disp(cand_name)}' — matches an existing server "
-                "by command/url.",
+                "by command/url and env/headers.",
                 err=True,
             )
             skipped.append({"name": cand_name, "reason": "duplicate_signature"})
             continue
         cand_sig = _server_signature(identity)
-        if cand_sig is not None and cand_sig in unresolved_signatures:
+        if cand_sig is not None and (
+            cand_sig in unresolved_signatures or cand_sig[:3] in unresolved_base_signatures
+        ):
             click.echo(
                 f"  {_warn('Skipping:')} '{_disp(cand_name)}' — an existing server runs the "
-                "same command but records an origin whose checkout cannot be read, so STM "
-                "cannot tell whether it is the same server. Fix that entry's `origin.source` "
-                "in the config, or add this one with `mms add`.",
+                "same command but records an origin, `env` or `headers` block this build "
+                "cannot read, so STM cannot tell whether it is the same server. Fix that "
+                "entry in the config, or add this one with `mms add`.",
                 err=True,
             )
             skipped.append({"name": cand_name, "reason": "ambiguous_identity"})
@@ -6082,7 +6195,8 @@ def prune(
             )
             click.echo(
                 "  These names are either not STM upstreams, not in any source "
-                "client, or registered with a different command/URL in the source.",
+                "client, or registered with a different command/URL, `env` or "
+                "`headers` in the source.",
                 err=True,
             )
             if as_json:
@@ -6663,7 +6777,8 @@ def _resolve_eject_plan(
                     name=name,
                     error=(
                         f"a different '{name}' already exists in the target "
-                        "(command/url mismatch) — pass --force to overwrite it"
+                        "(command/url, args or env/headers mismatch) — pass --force "
+                        "to overwrite it"
                     ),
                 )
         # A missing signature on either side is NEVER an idempotent match:
@@ -6790,8 +6905,9 @@ def _eject_verify(plan: _EjectPlan) -> list[str]:
     after a write — the claude CLI re-serializes through its own schema and
     silently drops unknown fields (probed on 2.1.173), so a clean
     `add-json` exit does not prove the verbatim-restore contract held —
-    AND on the skipped-write path, where the no-clobber signature match
-    ignores env/headers/unknown fields. Only a host entry deep-equal to
+    AND on the skipped-write path, where the no-clobber identity match
+    normalizes (dangerous env keys dropped, header names folded) and
+    ignores host-only fields. Only a host entry deep-equal to
     the payload may release the STM entry. A `None` read (entry not where
     expected) reports as a full mismatch rather than crashing.
     """
@@ -7073,10 +7189,11 @@ def eject(
                 continue
             wrote = True
 
-        # Verify on BOTH paths — written and skipped. A same-signature host
-        # entry is not necessarily structurally equal to the original
-        # (signatures ignore env/headers/unknown fields), so removing the
-        # STM entry on signature alone could destroy the only complete copy.
+        # Verify on BOTH paths — written and skipped. A same-identity host
+        # entry is not necessarily structurally equal to the original:
+        # identity normalizes (dangerous env keys dropped, header names
+        # folded) and ignores host-only fields, so removing the STM entry on
+        # identity alone could destroy the only complete copy.
         # The invariant: STM removal requires a host entry deep-equal to the
         # payload, or the operator's explicit --accept-schema-loss.
         mismatches = _eject_verify(plan)
