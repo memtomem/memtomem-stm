@@ -3205,6 +3205,151 @@ class _DiscoveredSource:
         return (self.path, *self.slot)
 
 
+@dataclass(frozen=True)
+class _ConflictRecord:
+    """A source claiming a discovered name for a **different** server (#981).
+
+    Label and structured source only, by construction. A conflict is never
+    imported, backed up, pruned or ejected, so there is nothing to restore
+    from — and the entry belongs to a server the operator is not acting on,
+    whose command line, ``env`` and ``headers`` can carry their credentials.
+    The house rule for those is eject's: name the field, never echo the value
+    (#981 codex R1). Typing that as the absence of a ``raw`` field is what
+    keeps the next reporting helper from reaching for one.
+    """
+
+    source: str
+    source_ref: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _DiscoveredCandidate:
+    """One importable server found in a host config, with the scan's answers.
+
+    Every fact a consumer needs about the host entry is established once, by
+    the scan, and carried here — rather than each reader re-deriving it from
+    ``raw`` plus a transport. Three consecutive defects came out of that
+    re-derivation, each introduced by the fix for the previous one, and the
+    last of them deleted host entries on the one path that matches by bare
+    name (#984 codex R2/R3/R4). The required fields are the point: a candidate
+    with no ``raw``, or an ``entry`` that cannot name its transport, is not a
+    shape a reader has to have an opinion about.
+
+    ``entry`` is an already-normalized STM upstream-server entry (sans
+    prefix); ``raw`` is the **verbatim** host entry, because normalization is
+    lossy and the original is what ``mms eject`` restores (#475).
+    ``identity_unreadable`` names the connection blocks this entry states that
+    identity cannot read — see :meth:`from_scan`. ``source_ref`` is the
+    structured ``{kind, path?}`` record persisted as ``origin.source``; it
+    stays a plain dict because that is the shape written to the config and
+    compared against origin rows read back from it.
+
+    ``duplicates`` holds the same server registered in later sources, each a
+    record of its own, so provenance and the prune backup log can address
+    every source; ``conflicts`` holds the same *name* naming another server.
+    Both are tuples so a candidate cannot be edited after the scan decided —
+    accumulation during the scan goes through :func:`dataclasses.replace`.
+
+    Not hashable: ``eq`` is synthesized over fields that include dicts, so
+    ``hash()`` raises. Nothing keys a set or dict on a candidate (the scan
+    keys on the name), and equality is worth more here than hashing.
+    """
+
+    name: str
+    spec: _SourceSpec
+    entry: dict[str, Any]
+    raw: dict[str, Any]
+    identity_unreadable: tuple[str, ...]
+    source_ref: dict[str, Any]
+    duplicates: tuple[_DiscoveredCandidate, ...] = ()
+    conflicts: tuple[_ConflictRecord, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.raw, dict):
+            raise ValueError(f"candidate {self.name!r}: raw must be the verbatim host entry")
+        transport = self.entry.get("transport") if isinstance(self.entry, dict) else None
+        if not isinstance(transport, str) or not transport:
+            # Which connection block identity reads follows the transport, so
+            # a candidate that cannot state one leaves every reader to pick a
+            # default — and the reader that picked stdio read an HTTP entry's
+            # broken ``headers`` as inert (#984 codex R3). Refused here
+            # instead. Deliberately not checked against a list of known
+            # transports: ``""`` and ``"bogus"`` are answered by
+            # :func:`_identity_fields` widening to both blocks, and a second
+            # transport table beside :func:`_normalize_client_entry`'s is the
+            # drift this record exists to end.
+            raise ValueError(f"candidate {self.name!r}: entry must name a transport")
+
+    @property
+    def source(self) -> str:
+        """Human label of the host config this candidate was read from."""
+        return self.spec.label
+
+    @property
+    def is_repo_local(self) -> bool:
+        """Whether the file came from the current checkout (the trust gate)."""
+        return self.spec.is_repo_local
+
+    @property
+    def transport(self) -> str:
+        """The normalized entry's transport. Always a non-empty string."""
+        return str(self.entry["transport"])
+
+    @property
+    def duplicate_in(self) -> tuple[str, ...]:
+        """Labels of the later sources registering this same server, in order."""
+        return tuple(dup.source for dup in self.duplicates)
+
+    @property
+    def registrations(self) -> tuple[_DiscoveredCandidate, ...]:
+        """Every source registering this server: the winner, then duplicates.
+
+        The exact sequence the prune loop has always acted on (pinned by
+        ``test_duplicate_in_sources_all_pruned``). Each element carries its
+        own spec, ``source_ref`` and ``raw``, so the backup writer and the
+        provenance matcher read one record rather than three parallel lists.
+        """
+        return (self, *self.duplicates)
+
+    @classmethod
+    def from_scan(
+        cls,
+        name: str,
+        spec: _SourceSpec,
+        *,
+        raw: dict[str, Any],
+        entry: dict[str, Any],
+        source_ref: dict[str, Any],
+    ) -> _DiscoveredCandidate:
+        """Build a candidate from one scanned host entry, deriving identity.
+
+        The single place ``identity_unreadable`` is computed. It has to be
+        asked of ``raw``, not of the normalized ``entry``:
+        :func:`_normalize_client_entry` takes ``env`` / ``headers`` only when
+        they are already mappings, so by the time identity sees a candidate a
+        broken block is gone and the entry reads as one holding no env at all.
+        Against an STM upstream that holds none either, identity then says
+        "same server" and ``mms prune`` deletes the host entry — the erasure
+        making the deletion look justified (#984).
+
+        The transport comes from the normalized ``entry`` rather than from
+        ``raw``: a host config states its transport as a ``type`` hint the
+        normalizer resolves, and which of the two fields identity reads
+        follows that resolution.
+
+        ``raw`` is deep-copied here, so a scan can hand in the object it read
+        out of the host file. Direct construction does not copy.
+        """
+        return cls(
+            name=name,
+            spec=spec,
+            entry=entry,
+            raw=copy.deepcopy(raw),
+            identity_unreadable=_unreadable_identity_fields(raw, transport=entry["transport"]),
+            source_ref=source_ref,
+        )
+
+
 def _canonical_path(path: Path) -> str:
     """Best-effort physical identity of a file, for comparing two locations.
 

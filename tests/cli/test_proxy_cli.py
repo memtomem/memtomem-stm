@@ -3550,6 +3550,181 @@ class TestInitDiscoveryHelpers:
         assert not _is_self_reference({"command": "uvx", "args": ["--from", "memtomem-notes"]})
 
 
+class TestDiscoveredCandidateRecord:
+    """The typed record every discovery consumer reads (#987).
+
+    These pin what the type itself guarantees, so no consumer has to have an
+    opinion about a missing field: a candidate carries a verbatim ``raw``, an
+    ``entry`` that names its transport, and one derivation of
+    ``identity_unreadable``. The fail-closed reasoning three rounds of #984
+    spread across four readers lives here now.
+    """
+
+    @staticmethod
+    def _spec(label: str = "Claude Code (user)"):
+        from memtomem_stm.cli.proxy import _SOURCE_BY_LABEL
+
+        return _SOURCE_BY_LABEL[label]
+
+    def _record(self, **overrides):
+        from memtomem_stm.cli.proxy import _DiscoveredCandidate
+
+        kwargs = {
+            "name": "docs",
+            "spec": self._spec(),
+            "entry": {"transport": "stdio", "command": "npx"},
+            "raw": {"command": "npx"},
+            "identity_unreadable": (),
+            "source_ref": {"kind": "claude-user"},
+        }
+        kwargs.update(overrides)
+        return _DiscoveredCandidate(**kwargs)
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            {},
+            {"command": "npx"},
+            {"transport": None, "command": "npx"},
+            {"transport": "", "command": "npx"},
+            {"transport": 3, "command": "npx"},
+            None,
+        ],
+    )
+    def test_construction_refuses_an_entry_that_cannot_name_a_transport(self, entry):
+        """Which block identity reads follows the transport, so a candidate
+        that cannot state one has no answer to give — and the reader that
+        defaulted it to stdio read an HTTP entry's broken `headers` as inert,
+        on the one path that deletes on a bare name match (#984 codex R3)."""
+        with pytest.raises(ValueError, match="transport"):
+            self._record(entry=entry)
+
+    @pytest.mark.parametrize("raw", [None, ["command=npx"], "npx"])
+    def test_construction_refuses_a_candidate_with_no_verbatim_entry(self, raw):
+        """`raw` is what eject restores and what identity is asked about; a
+        candidate without one used to make both silently degrade."""
+        with pytest.raises(ValueError, match="raw"):
+            self._record(raw=raw)
+
+    def test_an_unrecognized_transport_is_still_constructible(self):
+        """Deliberately not validated against a list: `_identity_fields`
+        answers an unknown string by widening to both blocks, and a second
+        transport table here would be the drift this record ends."""
+        rec = self._record(entry={"transport": "bogus", "command": "npx"})
+        assert rec.transport == "bogus"
+
+    @pytest.mark.parametrize(
+        ("transport", "raw", "expected"),
+        [
+            ("stdio", {"command": "npx", "env": {"TOKEN": "t"}}, ()),
+            # A stray `headers` on a stdio entry is inert — no signature
+            # carries it, so refusing on it would contradict `_same_server`.
+            ("stdio", {"command": "npx", "headers": ["X: 1"]}, ()),
+            ("stdio", {"command": "npx", "env": ["DB=prod"]}, ("env",)),
+            ("sse", {"url": "https://x/sse", "headers": ["A: 1"]}, ("headers",)),
+            ("sse", {"url": "https://x/sse", "env": ["DB=prod"]}, ()),
+            ("streamable_http", {"url": "https://x", "headers": "A: 1"}, ("headers",)),
+            # Unknown transport → both blocks are asked, because which one is
+            # inert is exactly what is unknown (#984 codex R4).
+            ("bogus", {"command": "npx", "env": ["DB=prod"]}, ("env",)),
+            ("http2", {"command": "npx", "headers": ["A: 1"]}, ("headers",)),
+            (
+                "bogus",
+                {"command": "npx", "env": ["DB=prod"], "headers": ["A: 1"]},
+                ("env", "headers"),
+            ),
+        ],
+    )
+    def test_from_scan_derives_identity_from_raw_with_the_entrys_transport(
+        self, transport, raw, expected
+    ):
+        """One derivation, from the verbatim entry, keyed on the *normalized*
+        transport — the host config states a `type` hint the normalizer
+        resolves, and normalization erases a broken block before identity
+        could see it (#984)."""
+        from memtomem_stm.cli.proxy import _DiscoveredCandidate
+
+        rec = _DiscoveredCandidate.from_scan(
+            "docs",
+            self._spec(),
+            raw=raw,
+            entry={"transport": transport, **raw},
+            source_ref={"kind": "claude-user"},
+        )
+        assert rec.identity_unreadable == expected
+
+    def test_from_scan_copies_the_verbatim_entry(self):
+        """The scan hands in the object it read out of the host file."""
+        from memtomem_stm.cli.proxy import _DiscoveredCandidate
+
+        raw = {"command": "npx", "env": {"TOKEN": "t"}}
+        rec = _DiscoveredCandidate.from_scan(
+            "docs",
+            self._spec(),
+            raw=raw,
+            entry={"transport": "stdio", "command": "npx"},
+            source_ref={"kind": "claude-user"},
+        )
+        raw["env"]["TOKEN"] = "mutated"
+        raw["added"] = True
+        assert rec.raw == {"command": "npx", "env": {"TOKEN": "t"}}
+
+    def test_duplicate_in_is_the_labels_of_the_duplicates_in_order(self):
+        dup_a = self._record(spec=self._spec("Claude Desktop"))
+        dup_b = self._record(spec=self._spec("Cursor (user)"))
+        rec = self._record(duplicates=(dup_a, dup_b))
+        assert rec.duplicate_in == ("Claude Desktop", "Cursor (user)")
+
+    def test_registrations_is_the_winner_then_its_duplicates(self):
+        """The sequence every prune surface acts on."""
+        dup = self._record(spec=self._spec("Claude Desktop"))
+        rec = self._record(duplicates=(dup,))
+        assert [r.source for r in rec.registrations] == [
+            "Claude Code (user)",
+            "Claude Desktop",
+        ]
+        assert rec.registrations[0] is rec
+
+    def test_a_candidate_with_no_duplicates_registers_only_itself(self):
+        rec = self._record()
+        assert rec.duplicate_in == ()
+        assert rec.registrations == (rec,)
+
+    def test_source_and_repo_local_come_from_the_spec(self):
+        """One table answers both, so a label with no spec — the third state
+        four readers each handled differently — cannot be built."""
+        from memtomem_stm.cli.proxy import _SOURCE_SPECS
+
+        for spec in _SOURCE_SPECS:
+            rec = self._record(spec=spec)
+            assert rec.source == spec.label
+            assert rec.is_repo_local is spec.is_repo_local
+
+    def test_the_record_is_frozen_and_accumulates_by_replacement(self):
+        import dataclasses
+
+        rec = self._record(identity_unreadable=("env",))
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            rec.name = "other"
+        grown = dataclasses.replace(rec, duplicates=(self._record(),))
+        assert grown.identity_unreadable == ("env",)
+        assert rec.duplicates == ()
+
+    def test_a_conflict_record_carries_no_verbatim_entry(self):
+        """A conflict names a server the operator is not acting on, whose
+        command line and env can carry their credentials: name the field,
+        never echo the value (#981 codex R1). Typed as the absence of the
+        field so a reporting helper cannot reach for one."""
+        import dataclasses
+
+        from memtomem_stm.cli.proxy import _ConflictRecord
+
+        assert {f.name for f in dataclasses.fields(_ConflictRecord)} == {
+            "source",
+            "source_ref",
+        }
+
+
 class TestInitDiscoverySources:
     """`_discover_candidates` reads five source files (project `.mcp.json`,
     `~/.claude.json`, Claude Desktop config, and Cursor's user and project
