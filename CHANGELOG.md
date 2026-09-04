@@ -86,8 +86,12 @@ changes inline only. See the deprecation policy in
   list. Discovery also says so when it reads one, naming the field and the
   source and never the value -- an env block is where a host entry keeps its
   secrets, and the normalizer's silence was the mechanism: nothing warned, and
-  `mms list` showed the imported entry as ordinary. Every MCP client writes a
-  mapping, so this is a config a hand edit or a generator broke. `mms init`
+  `mms list` showed the imported entry as ordinary. The reachable path is a
+  config a hand edit or a generator broke rather than one a client wrote.
+  Only the block the transport actually reads counts, on both operands: a
+  stdio `headers` or an HTTP `env` carries no signature and separates no pair
+  of servers, so refusing on one would have contradicted the comparator this
+  gate defends. `mms init`
   compares nothing -- the config it writes is new -- but it imports the
   stripped entry and then offers to delete the host entry that holds the
   block, so the candidate is withheld from its selection for the same reason

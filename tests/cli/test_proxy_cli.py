@@ -10893,7 +10893,7 @@ class TestUnreadableHostIdentityPrune:
 
         result = runner.invoke(cli, ["prune", "docs", "--yes", *_cfg_args(config)])
 
-        assert "env" in result.output
+        assert "its env block is not a mapping" in result.output
         assert "Claude Code (user)" in result.output
         assert "DO-NOT-PRINT" not in result.output
 
@@ -10954,6 +10954,89 @@ class TestUnreadableHostIdentityPrune:
         payload = json.loads(result.stdout)
         assert payload["imported"] == []
         assert payload["skipped"] == [{"name": "docs-alias", "reason": "ambiguous_identity"}]
+
+    def test_an_inert_block_on_the_other_transport_still_prunes(
+        self, runner, config, tmp_path, monkeypatch, fake_claude
+    ):
+        """The gate must not refuse what the comparator accepts. A stdio
+        entry's ``headers`` is inert — no signature carries it, and
+        ``_same_server`` calls such a pair the same server — so refusing on
+        it declined a prune over a difference nothing else in the CLI reads
+        (codex R2)."""
+        home, _cwd, _desktop = self._setup_home(tmp_path, monkeypatch)
+        self._write_client(
+            home, {"command": "npx", "args": ["-y", "@me/docs"], "headers": ["X: 1"]}
+        )
+        self._seed_config(
+            config,
+            {"prefix": "docs", "transport": "stdio", "command": "npx", "args": ["-y", "@me/docs"]},
+        )
+
+        result = runner.invoke(cli, ["prune", "docs", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        removals = [c for c in fake_claude["calls"] if c[:3] == ["claude", "mcp", "remove"]]
+        assert removals == [["claude", "mcp", "remove", "docs", "-s", "user"]]
+        assert "block is not a mapping" not in result.output
+
+    def test_an_inert_env_on_an_http_entry_still_prunes(
+        self, runner, config, tmp_path, monkeypatch, fake_claude
+    ):
+        """The mirror on the other transport: an HTTP entry's ``env`` is the
+        inert one."""
+        home, _cwd, _desktop = self._setup_home(tmp_path, monkeypatch)
+        self._write_client(
+            home,
+            {"type": "http", "url": "https://docs.example/mcp", "env": ["DB=prod"]},
+        )
+        self._seed_config(
+            config,
+            {"prefix": "docs", "transport": "streamable_http", "url": "https://docs.example/mcp"},
+        )
+
+        result = runner.invoke(cli, ["prune", "docs", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 0, result.output
+        removals = [c for c in fake_claude["calls"] if c[:3] == ["claude", "mcp", "remove"]]
+        assert removals == [["claude", "mcp", "remove", "docs", "-s", "user"]]
+
+    def test_a_registered_entry_is_read_the_same_way(self):
+        """Both operands read one rule, so the registered side gains the same
+        split: an upstream carrying an inert broken block stays comparable,
+        while the applicable one still makes it unreadable."""
+        from memtomem_stm.cli.proxy import _stm_identity_entry
+
+        stdio_inert = {"transport": "stdio", "command": "npx", "headers": ["X: 1"]}
+        stdio_broken = {"transport": "stdio", "command": "npx", "env": ["DB=prod"]}
+        http_inert = {"transport": "streamable_http", "url": "https://x/mcp", "env": ["DB=prod"]}
+        assert _stm_identity_entry(stdio_inert) is not None
+        assert _stm_identity_entry(stdio_broken) is None
+        assert _stm_identity_entry(http_inert) is not None
+
+    def test_one_entry_scanned_twice_warns_once(
+        self, runner, config, tmp_path, monkeypatch, fake_claude
+    ):
+        """Run from ``$HOME`` and ``~/.cursor/mcp.json`` is both the user and
+        the project Cursor source, so discovery reads one physical entry
+        twice. Two notes read as two broken entries."""
+        home, _cwd, _desktop = self._setup_home(tmp_path, monkeypatch)
+        monkeypatch.chdir(home)
+        cursor = home / ".cursor"
+        cursor.mkdir()
+        (cursor / "mcp.json").write_text(
+            json.dumps(
+                {"mcpServers": {"docs": {"command": "npx", "env": ["DB=prod"]}}},
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        self._seed_config(
+            config, {"prefix": "docs", "transport": "stdio", "command": "npx"}
+        )
+
+        result = runner.invoke(cli, ["prune", "docs", "--yes", *_cfg_args(config)])
+
+        assert result.output.count("block is not a mapping") == 1
 
     def test_a_same_name_entry_with_an_unreadable_block_is_a_conflict(
         self, runner, config, tmp_path, monkeypatch, fake_claude

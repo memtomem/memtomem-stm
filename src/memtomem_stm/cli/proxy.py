@@ -3140,16 +3140,34 @@ def _candidate_identity_unreadable(cand: dict[str, Any]) -> bool:
     justified (#984). The registered side refuses that claim; this is the
     mirror.
 
+    The transport comes from the normalized ``entry`` rather than from ``raw``:
+    a host config states its transport as a ``type`` hint the normalizer
+    resolves, and which of the two fields identity reads follows that
+    resolution.
+
     Returns ``False`` for a candidate carrying no ``raw`` (hand-built ones, and
     tests): there is no host entry to have broken, and inventing one would
     make a candidate that states nothing incomparable.
     """
     raw = cand.get("raw")
-    return isinstance(raw, dict) and _identity_fields_unreadable(raw)
+    if not isinstance(raw, dict):
+        return False
+    entry = cand.get("entry") or {}
+    return _identity_fields_unreadable(raw, transport=entry.get("transport", "stdio"))
 
 
-def _identity_fields_unreadable(cfg: dict[str, Any]) -> bool:
-    """Whether this entry's own ``env`` / ``headers`` block cannot be read.
+def _identity_field(transport: str | None) -> str:
+    """Which connection block identity reads for this transport.
+
+    ``env`` for stdio, ``headers`` for HTTP — the split :func:`_server_signature`
+    already makes. The other field is inert: a stdio ``headers`` and an HTTP
+    ``env`` are carried by no signature and separate no pair of servers.
+    """
+    return "env" if (transport or "stdio") == "stdio" else "headers"
+
+
+def _identity_fields_unreadable(cfg: dict[str, Any], *, transport: str | None = None) -> bool:
+    """Whether this entry's own connection block cannot be read.
 
     Present, but not a mapping. Split out from :func:`_stm_identity_entry`
     because the two reasons that function returns ``None`` are not
@@ -3160,11 +3178,19 @@ def _identity_fields_unreadable(cfg: dict[str, Any]) -> bool:
     :func:`_add_from_clients`. Shared with the host side through
     :func:`_candidate_identity_unreadable`, so one rule decides the shape on
     both operands (#984).
+
+    Only the field this transport reads is asked. Refusing on the other one
+    made the gate contradict the comparator it defends: ``_same_server``
+    answers ``True`` for a stdio pair differing only in a stray ``headers``
+    block, so an entry carrying one was declared incomparable while identity
+    called it the same server — a prune that declines and an import that
+    refuses, on a difference nothing else in the CLI reads (codex R2).
+    ``transport`` is passed by callers holding a normalized entry; the
+    registered side reads the field the config itself records.
     """
-    return any(
-        cfg.get(key) is not None and not isinstance(cfg.get(key), dict)
-        for key in ("env", "headers")
-    )
+    key = _identity_field(transport if transport is not None else cfg.get("transport", "stdio"))
+    value = cfg.get(key)
+    return value is not None and not isinstance(value, dict)
 
 
 def _stm_identity_entry(cfg: dict[str, Any]) -> dict[str, Any] | None:
@@ -3196,10 +3222,12 @@ def _stm_identity_entry(cfg: dict[str, Any]) -> dict[str, Any] | None:
 
     Only stdio identity has a checkout at all; an HTTP entry is its URL,
     wherever it was registered from, so it never goes down that path and a
-    broken origin cannot make it incomparable. A broken ``env`` or
-    ``headers`` block can, on either transport: those joined identity in
-    #983, and a block that is present but not a mapping is a claim this
-    build cannot read, refused for the same reason a broken ``origin`` is.
+    broken origin cannot make it incomparable. The connection block this
+    transport reads can, on either transport: ``env`` and ``headers`` joined
+    identity in #983, and a block that is present but not a mapping is a
+    claim this build cannot read, refused for the same reason a broken
+    ``origin`` is. The block the transport does not read is inert here as it
+    is in the signature — see :func:`_identity_fields_unreadable`.
     """
     if not isinstance(cfg, dict):
         return cfg
@@ -3304,6 +3332,7 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
             )
 
     seen: dict[str, dict[str, Any]] = {}
+    warned_unreadable: set[tuple[str, str, str]] = set()
     for spec, src_path, servers in sources:
         if not isinstance(servers, dict):
             continue
@@ -3346,7 +3375,7 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
                     err=True,
                 )
                 continue
-            if _identity_fields_unreadable(raw):
+            if _identity_fields_unreadable(raw, transport=entry["transport"]):
                 # Nothing else says so. The normalizer takes ``env`` /
                 # ``headers`` only when they are already mappings, and drops
                 # the rest without a word, so an operator whose hand-edited
@@ -3354,18 +3383,24 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
                 # it from the refusals below rather than from the config.
                 # Named, never echoed — an env block is where a host entry
                 # keeps its secrets (#984).
-                bad = ", ".join(
-                    key
-                    for key in ("env", "headers")
-                    if raw.get(key) is not None and not isinstance(raw.get(key), dict)
-                )
-                click.echo(
-                    f"{_warn('Note:')} '{_disp(name)}' in {spec.label} has a {bad} block "
-                    "that is not a mapping (value withheld) — STM cannot tell which "
-                    "server it names, so this entry is neither imported nor pruned. "
-                    "Fix that block in the client config to import it.",
-                    err=True,
-                )
+                #
+                # Keyed on the entry itself, not on the source: running from
+                # ``$HOME`` makes ``~/.cursor/mcp.json`` both the user and the
+                # project Cursor source, so one physical entry is scanned
+                # twice and warned twice. Two clients that really do hold a
+                # broken entry of the same name hold different ones, and each
+                # still gets its note (codex R2).
+                bad = _identity_field(entry["transport"])
+                warn_key = (name, bad, json.dumps(raw, sort_keys=True, default=str))
+                if warn_key not in warned_unreadable:
+                    warned_unreadable.add(warn_key)
+                    click.echo(
+                        f"{_warn('Note:')} '{_disp(name)}' in {spec.label} — its {bad} "
+                        "block is not a mapping (value withheld), so STM cannot tell which "
+                        "server it names and this entry is neither imported nor pruned. "
+                        "Fix that block in the client config to import it.",
+                        err=True,
+                    )
             source_ref: dict[str, Any] = {"kind": spec.kind}
             if src_path is not None:
                 source_ref["path"] = src_path
