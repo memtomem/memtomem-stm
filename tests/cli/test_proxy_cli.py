@@ -3652,6 +3652,18 @@ class TestIdentityFieldsWidening:
         cfg = {"transport": transport, "command": "npx", "env": ["DB=prod"], "headers": ["A: 1"]}
         assert _unreadable_identity_fields(cfg) == ("env", "headers")
 
+    def test_the_registered_reader_refuses_a_broken_block_it_would_otherwise_ignore(self):
+        """The caller path, not just the rule. `_stm_identity_entry` is what
+        `mms prune` and `--from-clients` ask, and it reads the transport out
+        of the config dict `_load` returns verbatim -- no pydantic, no
+        normalizer. A `headers` block would be inert on stdio, so a build
+        that resolved this entry's empty transport to stdio would call it
+        readable and compare it as an identity the config never stated."""
+        from memtomem_stm.cli.proxy import _stm_identity_entry
+
+        cfg = {"prefix": "p", "transport": "", "command": "npx", "headers": ["A: 1"]}
+        assert _stm_identity_entry(cfg) is None
+
 
 class TestDiscoveredCandidateRecord:
     """The typed record every discovery consumer reads (#987).
@@ -3703,7 +3715,7 @@ class TestDiscoveredCandidateRecord:
         `""` is refused here rather than widened: an empty string names no
         transport, so it belongs with the absent case. The widening it used
         to take is still `_identity_fields`' answer for the registered
-        operand — pinned in `TestIdentityFieldsWidening` below."""
+        operand — pinned in `TestIdentityFieldsWidening`."""
         with pytest.raises(ValueError, match="transport"):
             self._record(entry=entry)
 
@@ -4186,7 +4198,11 @@ class TestInitDiscoverySources:
         # Label and structured source only. Neither the verbatim ``raw`` nor
         # the normalized ``entry`` is kept: nothing backs up or ejects a
         # conflict, and both carry the other server's command line and env.
-        # Stated of the type, so no future record can grow one.
+        # The type is asserted before its fields are: a `_DiscoveredCandidate`
+        # answers `.source` and `.source_ref` too, so a scan that appended one
+        # here would satisfy every assertion above while carrying the other
+        # server's `raw` and `entry` (#988 review 2).
+        assert [type(c) for c in cands[0].conflicts] == [_ConflictRecord, _ConflictRecord]
         assert {f.name for f in fields(_ConflictRecord)} == {"source", "source_ref"}
 
     def test_a_same_name_entry_differing_only_in_env_is_a_conflict(self, tmp_path, monkeypatch):
