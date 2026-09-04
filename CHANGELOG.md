@@ -35,6 +35,27 @@ changes inline only. See the deprecation policy in
 
 ### Changed
 
+- **Client-config discovery returns a typed candidate record, and its readers
+  consume the identity facts the scan established** (#987). The scan used to
+  hand back bare dicts, so which of `raw`, the normalized entry and the
+  transport a reader consulted -- and how it combined them -- was decided
+  separately at each of the ~22 places that read one. Three consecutive
+  defects came out of that in #984, each introduced by the fix for the
+  previous one, and the last of them deleted host entries on the path that
+  matches by bare name. `_DiscoveredCandidate` now carries the verbatim host
+  entry, the source spec, the structured source reference and the answer to
+  "which connection blocks can identity not read", derived once when the entry
+  is scanned. `mms prune`, `mms add --from-clients`, `mms init` and the
+  discovery dedup read that answer instead of recomputing it; the repo-local
+  trust marker and the duplicate/conflict split come off the same record. A
+  candidate whose entry cannot name a transport is refused at construction
+  rather than defaulted, which is the shape that made an HTTP entry's broken
+  `headers` read as inert. **Behavior change**: none external. Two internal
+  fallbacks are gone with the shapes that needed them: an import always writes
+  its `origin` provenance block, and a prune always appends its backup row
+  before deleting -- previously a candidate carrying no verbatim entry pruned
+  with no backup at all. Real discovery has always supplied both.
+
 - **A successful tool result is no longer byte-measured a second time** when the
   wire check already measured its envelope (issue #957). `BoundedReadStream`
   reports what it measured back to the call that is waiting for that response,

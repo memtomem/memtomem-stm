@@ -37,6 +37,73 @@ from helpers import set_home
 _FAKE_SERVER = Path(__file__).resolve().parents[1] / "_fake_memtomem_server.py"
 
 
+def _cand(
+    name: str,
+    source: str = "Claude Code (user)",
+    *,
+    entry: dict | None = None,
+    raw: dict | None = None,
+    source_ref: dict | None = None,
+    duplicates: tuple = (),
+    conflicts: tuple = (),
+):
+    """Build a discovery-shaped candidate record for tests.
+
+    One builder rather than a literal per test: the record's required fields
+    are the point of #987, and a hand-built dict that omitted one is exactly
+    what the four refusal sites used to disagree about. ``entry`` and ``raw``
+    each derive from the other when only one is given, so a test states the
+    half it cares about; a label with no source spec gets a synthetic one
+    (``managed`` defaults to true, which is how an unrecognized label was
+    classified before).
+    """
+    import dataclasses
+
+    from memtomem_stm.cli.proxy import (
+        _SOURCE_BY_LABEL,
+        _DiscoveredCandidate,
+        _normalize_client_entry,
+        _SourceSpec,
+    )
+
+    spec = _SOURCE_BY_LABEL.get(source)
+    if spec is None:
+        spec = _SourceSpec(source, source.lower().replace(" ", "-"), None)
+    if entry is None:
+        assert raw is not None, "give the builder an entry, a raw entry, or both"
+        entry = _normalize_client_entry(raw)
+        assert entry is not None, f"raw entry is not importable: {raw!r}"
+    else:
+        entry = {"transport": "stdio", **entry}
+    if raw is None:
+        raw = {
+            k: v
+            for k, v in entry.items()
+            if k not in ("transport", "compression", "max_result_chars")
+        }
+    record = _DiscoveredCandidate.from_scan(
+        name,
+        spec,
+        raw=raw,
+        entry=entry,
+        source_ref=source_ref if source_ref is not None else {"kind": spec.kind},
+    )
+    if duplicates or conflicts:
+        record = dataclasses.replace(
+            record, duplicates=tuple(duplicates), conflicts=tuple(conflicts)
+        )
+    return record
+
+
+def _conflict(source: str, source_ref: dict | None = None):
+    """A `_ConflictRecord` for the label, with its structured source."""
+    from memtomem_stm.cli.proxy import _SOURCE_BY_LABEL, _ConflictRecord
+
+    spec = _SOURCE_BY_LABEL.get(source)
+    kind = spec.kind if spec is not None else source.lower().replace(" ", "-")
+    return _ConflictRecord(source, source_ref if source_ref is not None else {"kind": kind})
+
+
 def _probe_ok(tools: int = 1, overflowing: tuple[str, ...] = ()) -> StagedProbeResult:
     """Fully-successful staged probe result for fake ``_probe_servers``."""
     return StagedProbeResult(
@@ -3351,13 +3418,7 @@ class TestInitLangPreset:
         monkeypatch.setattr(
             proxy_mod,
             "_discover_candidates",
-            lambda _cwd: [
-                {
-                    "name": "fs",
-                    "entry": {"command": "npx", "args": ["-y", "fs"]},
-                    "source": "test",
-                }
-            ],
+            lambda _cwd: [_cand("fs", "test", raw={"command": "npx", "args": ["-y", "fs"]})],
         )
         monkeypatch.setattr(proxy_mod, "_pick_imports", lambda _c: [])
 
@@ -3550,6 +3611,240 @@ class TestInitDiscoveryHelpers:
         assert not _is_self_reference({"command": "uvx", "args": ["--from", "memtomem-notes"]})
 
 
+class TestIdentityFieldsWidening:
+    """Which blocks identity reads, per transport — the rule both operands
+    share (#984 codex R2/R4).
+
+    Owned by a test of its own because the candidate side no longer reaches
+    every input: `_DiscoveredCandidate` refuses an entry that cannot name a
+    transport, so the empty-string row here is exercised through the
+    registered operand, which reads its transport out of a hand-editable
+    `stm_proxy.json`. Deleting the candidate-side case without this would
+    have left the widening branch with no test at all.
+    """
+
+    @pytest.mark.parametrize(
+        ("transport", "expected"),
+        [
+            ("stdio", ("env",)),
+            ("sse", ("headers",)),
+            ("streamable_http", ("headers",)),
+            # Unknown means "which field is inert is unknown", not "the other
+            # transport": reading it the other way ignored `env` on
+            # {"transport": "bogus"} and `headers` on {"transport": ""}.
+            ("bogus", ("env", "headers")),
+            ("", ("env", "headers")),
+            (None, ("env", "headers")),
+        ],
+    )
+    def test_only_an_unknown_transport_widens_to_both_blocks(self, transport, expected):
+        from memtomem_stm.cli.proxy import _identity_fields
+
+        assert _identity_fields(transport) == expected
+
+    @pytest.mark.parametrize("transport", ["", "bogus"])
+    def test_a_registered_entry_naming_no_known_transport_is_asked_about_both(self, transport):
+        """The registered operand's path to the same rule. Both blocks are
+        broken here so the answer names both; asking about only one is what
+        let a prune delete on an identity nothing established."""
+        from memtomem_stm.cli.proxy import _unreadable_identity_fields
+
+        cfg = {"transport": transport, "command": "npx", "env": ["DB=prod"], "headers": ["A: 1"]}
+        assert _unreadable_identity_fields(cfg) == ("env", "headers")
+
+    def test_the_registered_reader_refuses_a_broken_block_it_would_otherwise_ignore(self):
+        """The caller path, not just the rule. `_stm_identity_entry` is what
+        `mms prune` and `--from-clients` ask, and it reads the transport out
+        of the config dict `_load` returns verbatim -- no pydantic, no
+        normalizer. A `headers` block would be inert on stdio, so a build
+        that resolved this entry's empty transport to stdio would call it
+        readable and compare it as an identity the config never stated."""
+        from memtomem_stm.cli.proxy import _stm_identity_entry
+
+        cfg = {"prefix": "p", "transport": "", "command": "npx", "headers": ["A: 1"]}
+        assert _stm_identity_entry(cfg) is None
+
+
+class TestDiscoveredCandidateRecord:
+    """The typed record every discovery consumer reads (#987).
+
+    These pin what the type itself guarantees, so no consumer has to have an
+    opinion about a missing field: a candidate carries a verbatim ``raw``, an
+    ``entry`` that names its transport, and one derivation of
+    ``identity_unreadable``. The fail-closed reasoning three rounds of #984
+    spread across four readers lives here now.
+    """
+
+    @staticmethod
+    def _spec(label: str = "Claude Code (user)"):
+        from memtomem_stm.cli.proxy import _SOURCE_BY_LABEL
+
+        return _SOURCE_BY_LABEL[label]
+
+    def _record(self, **overrides):
+        from memtomem_stm.cli.proxy import _DiscoveredCandidate
+
+        kwargs = {
+            "name": "docs",
+            "spec": self._spec(),
+            "entry": {"transport": "stdio", "command": "npx"},
+            "raw": {"command": "npx"},
+            "identity_unreadable": (),
+            "source_ref": {"kind": "claude-user"},
+        }
+        kwargs.update(overrides)
+        return _DiscoveredCandidate(**kwargs)
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            {},
+            {"command": "npx"},
+            {"transport": None, "command": "npx"},
+            {"transport": "", "command": "npx"},
+            {"transport": 3, "command": "npx"},
+            None,
+        ],
+    )
+    def test_construction_refuses_an_entry_that_cannot_name_a_transport(self, entry):
+        """Which block identity reads follows the transport, so a candidate
+        that cannot state one has no answer to give — and the reader that
+        defaulted it to stdio read an HTTP entry's broken `headers` as inert,
+        on the one path that deletes on a bare name match (#984 codex R3).
+
+        `""` is refused here rather than widened: an empty string names no
+        transport, so it belongs with the absent case. The widening it used
+        to take is still `_identity_fields`' answer for the registered
+        operand — pinned in `TestIdentityFieldsWidening`."""
+        with pytest.raises(ValueError, match="transport"):
+            self._record(entry=entry)
+
+    @pytest.mark.parametrize("raw", [None, ["command=npx"], "npx"])
+    def test_construction_refuses_a_candidate_with_no_verbatim_entry(self, raw):
+        """`raw` is what eject restores and what identity is asked about; a
+        candidate without one used to make both silently degrade."""
+        with pytest.raises(ValueError, match="raw"):
+            self._record(raw=raw)
+
+    def test_an_unrecognized_transport_is_still_constructible(self):
+        """Deliberately not validated against a list: `_identity_fields`
+        answers an unknown string by widening to both blocks, and a second
+        transport table here would be the drift this record ends."""
+        rec = self._record(entry={"transport": "bogus", "command": "npx"})
+        assert rec.transport == "bogus"
+
+    @pytest.mark.parametrize(
+        ("transport", "raw", "expected"),
+        [
+            ("stdio", {"command": "npx", "env": {"TOKEN": "t"}}, ()),
+            # A stray `headers` on a stdio entry is inert — no signature
+            # carries it, so refusing on it would contradict `_same_server`.
+            ("stdio", {"command": "npx", "headers": ["X: 1"]}, ()),
+            ("stdio", {"command": "npx", "env": ["DB=prod"]}, ("env",)),
+            ("sse", {"url": "https://x/sse", "headers": ["A: 1"]}, ("headers",)),
+            ("sse", {"url": "https://x/sse", "env": ["DB=prod"]}, ()),
+            ("streamable_http", {"url": "https://x", "headers": "A: 1"}, ("headers",)),
+            # Unknown transport → both blocks are asked, because which one is
+            # inert is exactly what is unknown (#984 codex R4).
+            ("bogus", {"command": "npx", "env": ["DB=prod"]}, ("env",)),
+            ("http2", {"command": "npx", "headers": ["A: 1"]}, ("headers",)),
+            (
+                "bogus",
+                {"command": "npx", "env": ["DB=prod"], "headers": ["A: 1"]},
+                ("env", "headers"),
+            ),
+        ],
+    )
+    def test_from_scan_derives_identity_from_raw_with_the_entrys_transport(
+        self, transport, raw, expected
+    ):
+        """One derivation, from the verbatim entry, keyed on the *normalized*
+        transport — the host config states a `type` hint the normalizer
+        resolves, and normalization erases a broken block before identity
+        could see it (#984)."""
+        from memtomem_stm.cli.proxy import _DiscoveredCandidate
+
+        rec = _DiscoveredCandidate.from_scan(
+            "docs",
+            self._spec(),
+            raw=raw,
+            entry={"transport": transport, **raw},
+            source_ref={"kind": "claude-user"},
+        )
+        assert rec.identity_unreadable == expected
+
+    def test_from_scan_copies_the_verbatim_entry(self):
+        """The scan hands in the object it read out of the host file."""
+        from memtomem_stm.cli.proxy import _DiscoveredCandidate
+
+        raw = {"command": "npx", "env": {"TOKEN": "t"}}
+        rec = _DiscoveredCandidate.from_scan(
+            "docs",
+            self._spec(),
+            raw=raw,
+            entry={"transport": "stdio", "command": "npx"},
+            source_ref={"kind": "claude-user"},
+        )
+        raw["env"]["TOKEN"] = "mutated"
+        raw["added"] = True
+        assert rec.raw == {"command": "npx", "env": {"TOKEN": "t"}}
+
+    def test_duplicate_in_is_the_labels_of_the_duplicates_in_order(self):
+        dup_a = self._record(spec=self._spec("Claude Desktop"))
+        dup_b = self._record(spec=self._spec("Cursor (user)"))
+        rec = self._record(duplicates=(dup_a, dup_b))
+        assert rec.duplicate_in == ("Claude Desktop", "Cursor (user)")
+
+    def test_registrations_is_the_winner_then_its_duplicates(self):
+        """The sequence every prune surface acts on."""
+        dup = self._record(spec=self._spec("Claude Desktop"))
+        rec = self._record(duplicates=(dup,))
+        assert [r.source for r in rec.registrations] == [
+            "Claude Code (user)",
+            "Claude Desktop",
+        ]
+        assert rec.registrations[0] is rec
+
+    def test_a_candidate_with_no_duplicates_registers_only_itself(self):
+        rec = self._record()
+        assert rec.duplicate_in == ()
+        assert rec.registrations == (rec,)
+
+    def test_source_and_repo_local_come_from_the_spec(self):
+        """One table answers both, so a label with no spec — the third state
+        four readers each handled differently — cannot be built."""
+        from memtomem_stm.cli.proxy import _SOURCE_SPECS
+
+        for spec in _SOURCE_SPECS:
+            rec = self._record(spec=spec)
+            assert rec.source == spec.label
+            assert rec.is_repo_local is spec.is_repo_local
+
+    def test_the_record_is_frozen_and_accumulates_by_replacement(self):
+        import dataclasses
+
+        rec = self._record(identity_unreadable=("env",))
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            rec.name = "other"
+        grown = dataclasses.replace(rec, duplicates=(self._record(),))
+        assert grown.identity_unreadable == ("env",)
+        assert rec.duplicates == ()
+
+    def test_a_conflict_record_carries_no_verbatim_entry(self):
+        """A conflict names a server the operator is not acting on, whose
+        command line and env can carry their credentials: name the field,
+        never echo the value (#981 codex R1). Typed as the absence of the
+        field so a reporting helper cannot reach for one."""
+        import dataclasses
+
+        from memtomem_stm.cli.proxy import _ConflictRecord
+
+        assert {f.name for f in dataclasses.fields(_ConflictRecord)} == {
+            "source",
+            "source_ref",
+        }
+
+
 class TestInitDiscoverySources:
     """`_discover_candidates` reads five source files (project `.mcp.json`,
     `~/.claude.json`, Claude Desktop config, and Cursor's user and project
@@ -3598,7 +3893,7 @@ class TestInitDiscoverySources:
 
         cands = _discover_candidates(cwd)
 
-        assert {c["name"] for c in cands} == {"filesystem"}
+        assert {c.name for c in cands} == {"filesystem"}
         err = capsys.readouterr().err
         assert "not valid UTF-8" in err
         # The diagnostic names the entry without echoing the raw code unit —
@@ -3622,14 +3917,14 @@ class TestInitDiscoverySources:
         )
 
         cands = _discover_candidates(cwd)
-        names = {c["name"] for c in cands}
+        names = {c.name for c in cands}
         assert names == {"filesystem", "docs"}
-        fs = next(c for c in cands if c["name"] == "filesystem")
-        assert fs["source"] == "Claude Code (user)"
-        assert fs["entry"]["transport"] == "stdio"
+        fs = next(c for c in cands if c.name == "filesystem")
+        assert fs.source == "Claude Code (user)"
+        assert fs.entry["transport"] == "stdio"
         # Origin capture (#475): verbatim raw + structured source ref.
-        assert fs["raw"] == {"command": "npx", "args": ["-y", "@fs"]}
-        assert fs["source_ref"] == {"kind": "claude-user"}
+        assert fs.raw == {"command": "npx", "args": ["-y", "@fs"]}
+        assert fs.source_ref == {"kind": "claude-user"}
 
     def test_discovers_claude_code_project_scope_with_path(self, tmp_path, monkeypatch):
         """Per-project entries in ``~/.claude.json`` carry the resolved cwd in
@@ -3653,12 +3948,12 @@ class TestInitDiscoverySources:
 
         cands = _discover_candidates(cwd)
         assert len(cands) == 1
-        assert cands[0]["source"] == "Claude Code (project)"
-        assert cands[0]["source_ref"] == {
+        assert cands[0].source == "Claude Code (project)"
+        assert cands[0].source_ref == {
             "kind": "claude-project",
             "path": str(cwd.resolve()),
         }
-        assert cands[0]["raw"] == {"command": "node", "args": ["a.js"]}
+        assert cands[0].raw == {"command": "node", "args": ["a.js"]}
 
     def test_raw_is_verbatim_where_normalization_is_lossy(self, tmp_path, monkeypatch):
         """``_normalize_client_entry`` drops dangerous env keys and unknown
@@ -3681,9 +3976,9 @@ class TestInitDiscoverySources:
 
         cands = _discover_candidates(cwd)
         assert len(cands) == 1
-        assert cands[0]["raw"] == raw_entry
-        assert cands[0]["entry"]["headers"] == {"Authorization": "Bearer tok"}
-        assert "unknown_host_field" not in cands[0]["entry"]
+        assert cands[0].raw == raw_entry
+        assert cands[0].entry["headers"] == {"Authorization": "Bearer tok"}
+        assert "unknown_host_field" not in cands[0].entry
 
     def test_discovers_desktop_config(self, tmp_path, monkeypatch):
         from memtomem_stm.cli.proxy import _discover_candidates
@@ -3696,8 +3991,8 @@ class TestInitDiscoverySources:
 
         cands = _discover_candidates(cwd)
         assert len(cands) == 1
-        assert cands[0]["name"] == "fetch"
-        assert cands[0]["source"] == "Claude Desktop"
+        assert cands[0].name == "fetch"
+        assert cands[0].source == "Claude Desktop"
 
     def test_discovers_project_mcp_json_in_cwd(self, tmp_path, monkeypatch):
         from memtomem_stm.cli.proxy import _discover_candidates
@@ -3710,8 +4005,8 @@ class TestInitDiscoverySources:
 
         cands = _discover_candidates(cwd)
         assert len(cands) == 1
-        assert cands[0]["source"] == ".mcp.json (project)"
-        assert cands[0]["source_ref"] == {
+        assert cands[0].source == ".mcp.json (project)"
+        assert cands[0].source_ref == {
             "kind": "mcp-json",
             "path": str((cwd / ".mcp.json").resolve()),
         }
@@ -3735,11 +4030,11 @@ class TestInitDiscoverySources:
 
         cands = _discover_candidates(cwd)
         assert len(cands) == 1
-        assert cands[0]["source"] == "Cursor (user)"
-        assert cands[0]["source_ref"] == {"kind": "cursor-user"}
-        assert cands[0]["is_repo_local"] is False
-        assert cands[0]["entry"]["command"] == "node"
-        assert "cwd" not in cands[0]["entry"]
+        assert cands[0].source == "Cursor (user)"
+        assert cands[0].source_ref == {"kind": "cursor-user"}
+        assert cands[0].is_repo_local is False
+        assert cands[0].entry["command"] == "node"
+        assert "cwd" not in cands[0].entry
 
     def test_discovers_cursor_project_config_as_repo_local(self, tmp_path, monkeypatch):
         """The checkout's own ``.cursor/mcp.json`` carries the repo-local marker.
@@ -3759,13 +4054,13 @@ class TestInitDiscoverySources:
 
         cands = _discover_candidates(cwd)
         assert len(cands) == 1
-        assert cands[0]["source"] == "Cursor (project)"
-        assert cands[0]["is_repo_local"] is True
-        assert cands[0]["source_ref"] == {
+        assert cands[0].source == "Cursor (project)"
+        assert cands[0].is_repo_local is True
+        assert cands[0].source_ref == {
             "kind": "cursor-project",
             "path": str((cwd / ".cursor" / "mcp.json").resolve()),
         }
-        assert cands[0]["entry"]["cwd"] == str(cwd.resolve())
+        assert cands[0].entry["cwd"] == str(cwd.resolve())
 
     def test_cursor_labels_match_the_import_scanner(self, tmp_path, monkeypatch):
         """Two discovery tables, one set of names.
@@ -3809,9 +4104,9 @@ class TestInitDiscoverySources:
 
         cands = _discover_candidates(cwd)
         assert len(cands) == 1
-        assert cands[0]["source"] == "Claude Code (user)"
-        assert cands[0]["entry"]["command"] == "shared-side"
-        assert cands[0]["duplicate_in"] == ["Cursor (user)"]
+        assert cands[0].source == "Claude Code (user)"
+        assert cands[0].entry["command"] == "shared-side"
+        assert cands[0].duplicate_in == ("Cursor (user)",)
 
     def test_a_wrong_typed_cursor_mcp_servers_is_silent(self, tmp_path, monkeypatch):
         """A truthy non-dict ``mcpServers`` must not crash the whole scan."""
@@ -3828,7 +4123,7 @@ class TestInitDiscoverySources:
         )
 
         cands = _discover_candidates(cwd)
-        assert {c["name"] for c in cands} == {"survivor"}
+        assert {c.name for c in cands} == {"survivor"}
 
     def test_dedupes_by_name_priority(self, tmp_path, monkeypatch):
         """Same name AND same identity in multiple sources → first-priority
@@ -3852,34 +4147,26 @@ class TestInitDiscoverySources:
 
         cands = _discover_candidates(cwd)
         assert len(cands) == 1
-        assert cands[0]["entry"]["command"] == "a"  # .mcp.json wins
-        assert cands[0]["duplicate_in"] == ["Claude Code (user)", "Claude Desktop"]
-        assert "conflicts" not in cands[0]
+        assert cands[0].entry["command"] == "a"  # .mcp.json wins
+        assert cands[0].duplicate_in == ("Claude Code (user)", "Claude Desktop")
+        assert cands[0].conflicts == ()
         # Structured duplicate records (#475): every losing source keeps its
         # kind + verbatim raw so origin.duplicates and the prune backup log
         # (PR2) can address each source individually.
-        assert cands[0]["duplicates"] == [
-            {
-                "label": "Claude Code (user)",
-                "source_ref": {"kind": "claude-user"},
-                "raw": {"command": "a"},
-            },
-            {
-                "label": "Claude Desktop",
-                "source_ref": {"kind": "claude-desktop"},
-                "raw": {"command": "a"},
-            },
+        assert [(d.source, d.source_ref, d.raw) for d in cands[0].duplicates] == [
+            ("Claude Code (user)", {"kind": "claude-user"}, {"command": "a"}),
+            ("Claude Desktop", {"kind": "claude-desktop"}, {"command": "a"}),
         ]
 
-    def test_a_divergent_same_name_entry_is_a_conflict_not_a_duplicate(
-        self, tmp_path, monkeypatch
-    ):
+    def test_a_divergent_same_name_entry_is_a_conflict_not_a_duplicate(self, tmp_path, monkeypatch):
         """Three servers that merely share a name are not one server
         registered three times. Every prune surface acts on ``[source,
         *duplicate_in]``, so recording the losers there deleted two unrelated
         registrations (#981). They land in ``conflicts`` instead, which no prune
         execution, backup or provenance consumer reads."""
-        from memtomem_stm.cli.proxy import _discover_candidates
+        from dataclasses import fields
+
+        from memtomem_stm.cli.proxy import _ConflictRecord, _discover_candidates
 
         home, cwd, desktop = self._setup_home(tmp_path, monkeypatch)
         (cwd / ".mcp.json").write_text(
@@ -3897,21 +4184,26 @@ class TestInitDiscoverySources:
 
         cands = _discover_candidates(cwd)
         assert len(cands) == 1
-        assert cands[0]["entry"]["command"] == "a"  # .mcp.json still wins
-        assert "duplicate_in" not in cands[0]
-        assert "duplicates" not in cands[0]
-        assert [c["label"] for c in cands[0]["conflicts"]] == [
+        assert cands[0].entry["command"] == "a"  # .mcp.json still wins
+        assert cands[0].duplicate_in == ()
+        assert cands[0].duplicates == ()
+        assert [c.source for c in cands[0].conflicts] == [
             "Claude Code (user)",
             "Claude Desktop",
         ]
-        assert [c["source_ref"] for c in cands[0]["conflicts"]] == [
+        assert [c.source_ref for c in cands[0].conflicts] == [
             {"kind": "claude-user"},
             {"kind": "claude-desktop"},
         ]
         # Label and structured source only. Neither the verbatim ``raw`` nor
         # the normalized ``entry`` is kept: nothing backs up or ejects a
         # conflict, and both carry the other server's command line and env.
-        assert all(set(c) == {"label", "source_ref"} for c in cands[0]["conflicts"])
+        # The type is asserted before its fields are: a `_DiscoveredCandidate`
+        # answers `.source` and `.source_ref` too, so a scan that appended one
+        # here would satisfy every assertion above while carrying the other
+        # server's `raw` and `entry` (#988 review 2).
+        assert [type(c) for c in cands[0].conflicts] == [_ConflictRecord, _ConflictRecord]
+        assert {f.name for f in fields(_ConflictRecord)} == {"source", "source_ref"}
 
     def test_a_same_name_entry_differing_only_in_env_is_a_conflict(self, tmp_path, monkeypatch):
         """Same command line, different database: two servers (#983). The
@@ -3930,8 +4222,8 @@ class TestInitDiscoverySources:
 
         cands = _discover_candidates(cwd)
         assert len(cands) == 1
-        assert "duplicate_in" not in cands[0]
-        assert [c["label"] for c in cands[0]["conflicts"]] == ["Claude Code (user)"]
+        assert cands[0].duplicate_in == ()
+        assert [c.source for c in cands[0].conflicts] == ["Claude Code (user)"]
 
     def test_a_same_name_http_entry_with_other_headers_is_a_conflict(self, tmp_path, monkeypatch):
         from memtomem_stm.cli.proxy import _discover_candidates
@@ -3968,8 +4260,8 @@ class TestInitDiscoverySources:
 
         cands = _discover_candidates(cwd)
         assert len(cands) == 1
-        assert "duplicate_in" not in cands[0]
-        assert [c["label"] for c in cands[0]["conflicts"]] == ["Claude Code (user)"]
+        assert cands[0].duplicate_in == ()
+        assert [c.source for c in cands[0].conflicts] == ["Claude Code (user)"]
 
     def test_a_difference_identity_normalizes_away_is_still_a_duplicate(
         self, tmp_path, monkeypatch
@@ -4034,11 +4326,11 @@ class TestInitDiscoverySources:
             encoding="utf-8",
         )
 
-        by_name = {c["name"]: c for c in _discover_candidates(cwd)}
-        assert by_name["db"]["duplicate_in"] == ["Claude Code (user)"]
-        assert "conflicts" not in by_name["db"]
-        assert by_name["api"]["duplicate_in"] == ["Cursor (user)"]
-        assert "conflicts" not in by_name["api"]
+        by_name = {c.name: c for c in _discover_candidates(cwd)}
+        assert by_name["db"].duplicate_in == ("Claude Code (user)",)
+        assert by_name["db"].conflicts == ()
+        assert by_name["api"].duplicate_in == ("Cursor (user)",)
+        assert by_name["api"].conflicts == ()
 
     def test_a_same_name_entry_differing_only_in_args_is_a_conflict(self, tmp_path, monkeypatch):
         """Args are their own part of identity — a shared command is not a
@@ -4057,8 +4349,8 @@ class TestInitDiscoverySources:
 
         cands = _discover_candidates(cwd)
         assert len(cands) == 1
-        assert "duplicate_in" not in cands[0]
-        assert [c["label"] for c in cands[0]["conflicts"]] == ["Claude Code (user)"]
+        assert cands[0].duplicate_in == ()
+        assert [c.source for c in cands[0].conflicts] == ["Claude Code (user)"]
 
     def test_a_same_name_http_entry_on_another_url_is_a_conflict(self, tmp_path, monkeypatch):
         """An HTTP entry is its URL, so two URLs are two servers."""
@@ -4076,8 +4368,8 @@ class TestInitDiscoverySources:
 
         cands = _discover_candidates(cwd)
         assert len(cands) == 1
-        assert "duplicate_in" not in cands[0]
-        assert [c["label"] for c in cands[0]["conflicts"]] == ["Claude Code (user)"]
+        assert cands[0].duplicate_in == ()
+        assert [c.source for c in cands[0].conflicts] == ["Claude Code (user)"]
 
     def test_one_source_can_duplicate_while_another_conflicts(self, tmp_path, monkeypatch):
         """The two states are per source, not per name: a name can be both
@@ -4100,8 +4392,8 @@ class TestInitDiscoverySources:
 
         cands = _discover_candidates(cwd)
         assert len(cands) == 1
-        assert cands[0]["duplicate_in"] == ["Claude Code (user)"]
-        assert [c["label"] for c in cands[0]["conflicts"]] == ["Claude Desktop"]
+        assert cands[0].duplicate_in == ("Claude Code (user)",)
+        assert [c.source for c in cands[0].conflicts] == ["Claude Desktop"]
 
     def test_a_checkout_less_source_still_duplicates_a_checkout_scoped_winner(
         self, tmp_path, monkeypatch
@@ -4125,8 +4417,8 @@ class TestInitDiscoverySources:
 
         cands = _discover_candidates(cwd)
         assert len(cands) == 1
-        assert cands[0]["duplicate_in"] == ["Claude Code (user)"]
-        assert "conflicts" not in cands[0]
+        assert cands[0].duplicate_in == ("Claude Code (user)",)
+        assert cands[0].conflicts == ()
 
     def test_an_explicit_cursor_cwd_matches_the_winners_implied_one(self, tmp_path, monkeypatch):
         """The other half of the control: a Cursor-project entry carries an
@@ -4153,8 +4445,8 @@ class TestInitDiscoverySources:
 
         cands = _discover_candidates(cwd)
         assert len(cands) == 1
-        assert cands[0]["duplicate_in"] == ["Cursor (project)"]
-        assert "conflicts" not in cands[0]
+        assert cands[0].duplicate_in == ("Cursor (project)",)
+        assert cands[0].conflicts == ()
 
     def test_the_comparison_receives_the_identity_pair(self, tmp_path, monkeypatch):
         """Both operands must go through ``_candidate_identity_entry``.
@@ -4224,7 +4516,7 @@ class TestInitDiscoverySources:
         )
 
         cands = _discover_candidates(cwd)
-        assert [c["name"] for c in cands] == ["real"]
+        assert [c.name for c in cands] == ["real"]
 
     def test_missing_and_malformed_sources_are_silent(self, tmp_path, monkeypatch):
         """Discovery is best-effort: a malformed JSON file shouldn't crash
@@ -4266,27 +4558,27 @@ class TestInitImportFlow:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "filesystem",
-                    "source": "Claude Code (user)",
-                    "entry": {
+                _cand(
+                    "filesystem",
+                    "Claude Code (user)",
+                    entry={
                         "transport": "stdio",
                         "command": "npx",
                         "args": ["-y", "@fs"],
                         "compression": "auto",
                         "max_result_chars": 8000,
                     },
-                },
-                {
-                    "name": "docs",
-                    "source": "Claude Desktop",
-                    "entry": {
+                ),
+                _cand(
+                    "docs",
+                    "Claude Desktop",
+                    entry={
                         "transport": "streamable_http",
                         "url": "https://docs.example/mcp",
                         "compression": "auto",
                         "max_result_chars": 8000,
                     },
-                },
+                ),
             ],
         )
         result = runner.invoke(
@@ -4314,18 +4606,16 @@ class TestInitImportFlow:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "user-tool",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                    "is_repo_local": False,
-                },
-                {
-                    "name": "cursor-repo-tool",
-                    "source": "Cursor (project)",
-                    "entry": {"transport": "stdio", "command": "./run.sh"},
-                    "is_repo_local": True,
-                },
+                _cand(
+                    "user-tool",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx"},
+                ),
+                _cand(
+                    "cursor-repo-tool",
+                    "Cursor (project)",
+                    entry={"transport": "stdio", "command": "./run.sh"},
+                ),
             ],
         )
         result = runner.invoke(
@@ -4350,16 +4640,16 @@ class TestInitImportFlow:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "user-tool",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
-                {
-                    "name": "legacy-project-tool",
-                    "source": ".mcp.json (project)",
-                    "entry": {"transport": "stdio", "command": "./run.sh"},
-                },
+                _cand(
+                    "user-tool",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx"},
+                ),
+                _cand(
+                    "legacy-project-tool",
+                    ".mcp.json (project)",
+                    entry={"transport": "stdio", "command": "./run.sh"},
+                ),
             ],
         )
         result = runner.invoke(
@@ -4377,12 +4667,11 @@ class TestInitImportFlow:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "cursor-repo-tool",
-                    "source": "Cursor (project)",
-                    "entry": {"transport": "stdio", "command": "./run.sh"},
-                    "is_repo_local": True,
-                },
+                _cand(
+                    "cursor-repo-tool",
+                    "Cursor (project)",
+                    entry={"transport": "stdio", "command": "./run.sh"},
+                ),
             ],
         )
         result = runner.invoke(
@@ -4402,16 +4691,8 @@ class TestInitImportFlow:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "a",
-                    "source": "X",
-                    "entry": {"transport": "stdio", "command": "ca"},
-                },
-                {
-                    "name": "b",
-                    "source": "Y",
-                    "entry": {"transport": "stdio", "command": "cb"},
-                },
+                _cand("a", "X", entry={"transport": "stdio", "command": "ca"}),
+                _cand("b", "Y", entry={"transport": "stdio", "command": "cb"}),
             ],
         )
         result = runner.invoke(
@@ -4432,21 +4713,9 @@ class TestInitImportFlow:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "a",
-                    "source": "X",
-                    "entry": {"transport": "stdio", "command": "ca"},
-                },
-                {
-                    "name": "b",
-                    "source": "Y",
-                    "entry": {"transport": "stdio", "command": "cb"},
-                },
-                {
-                    "name": "c",
-                    "source": "Z",
-                    "entry": {"transport": "stdio", "command": "cc"},
-                },
+                _cand("a", "X", entry={"transport": "stdio", "command": "ca"}),
+                _cand("b", "Y", entry={"transport": "stdio", "command": "cb"}),
+                _cand("c", "Z", entry={"transport": "stdio", "command": "cc"}),
             ],
         )
         result = runner.invoke(
@@ -4469,11 +4738,7 @@ class TestInitImportFlow:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "filesystem",
-                    "source": "Claude Code",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand("filesystem", "Claude Code", entry={"transport": "stdio", "command": "npx"}),
             ],
         )
         result = runner.invoke(
@@ -4494,11 +4759,7 @@ class TestInitImportFlow:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "one",
-                    "source": "X",
-                    "entry": {"transport": "stdio", "command": "x"},
-                },
+                _cand("one", "X", entry={"transport": "stdio", "command": "x"}),
             ],
         )
         result = runner.invoke(
@@ -4546,21 +4807,9 @@ class TestInitImportFlow:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "a",
-                    "source": "X",
-                    "entry": {"transport": "stdio", "command": "ca"},
-                },
-                {
-                    "name": "b",
-                    "source": "Y",
-                    "entry": {"transport": "stdio", "command": "cb"},
-                },
-                {
-                    "name": "c",
-                    "source": "Z",
-                    "entry": {"transport": "stdio", "command": "cc"},
-                },
+                _cand("a", "X", entry={"transport": "stdio", "command": "ca"}),
+                _cand("b", "Y", entry={"transport": "stdio", "command": "cb"}),
+                _cand("c", "Z", entry={"transport": "stdio", "command": "cc"}),
             ],
         )
         result = runner.invoke(
@@ -4596,11 +4845,7 @@ class TestInitImportFlow:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "x",
-                    "source": "src",
-                    "entry": {"transport": "stdio", "command": "xx"},
-                },
+                _cand("x", "src", entry={"transport": "stdio", "command": "xx"}),
             ],
         )
         result = runner.invoke(
@@ -4633,11 +4878,7 @@ class TestInitImportFlow:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "x",
-                    "source": "src",
-                    "entry": {"transport": "stdio", "command": "xx"},
-                },
+                _cand("x", "src", entry={"transport": "stdio", "command": "xx"}),
             ],
         )
         result = runner.invoke(
@@ -4658,11 +4899,7 @@ class TestInitImportFlow:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "only",
-                    "source": "X",
-                    "entry": {"transport": "stdio", "command": "c"},
-                },
+                _cand("only", "X", entry={"transport": "stdio", "command": "c"}),
             ],
         )
         result = runner.invoke(
@@ -4690,11 +4927,7 @@ class TestInitImportFlow:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "only",
-                    "source": "X",
-                    "entry": {"transport": "stdio", "command": "c"},
-                },
+                _cand("only", "X", entry={"transport": "stdio", "command": "c"}),
             ],
         )
         result = runner.invoke(
@@ -4728,11 +4961,7 @@ class TestInitImportFlow:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "only",
-                    "source": "X",
-                    "entry": {"transport": "stdio", "command": "c"},
-                },
+                _cand("only", "X", entry={"transport": "stdio", "command": "c"}),
             ],
         )
         # Invoke without --config so the command picks up the (patched) default.
@@ -4750,16 +4979,8 @@ class TestInitImportFlow:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "filesystem",
-                    "source": "X",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
-                {
-                    "name": "github",
-                    "source": "Y",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand("filesystem", "X", entry={"transport": "stdio", "command": "npx"}),
+                _cand("github", "Y", entry={"transport": "stdio", "command": "npx"}),
             ],
         )
         result = runner.invoke(
@@ -4865,36 +5086,34 @@ class TestImportOriginCapture:
         monkeypatch.setattr(proxy_mod, "_discover_candidates", lambda _cwd: candidates)
 
     @staticmethod
-    def _github_candidate() -> dict:
+    def _github_candidate():
         """Full discovery-shaped candidate: lossy-normalized entry + verbatim
         raw (keeps the env secret + a field normalization drops) + one
         duplicate source."""
-        return {
-            "name": "github",
-            "source": "Claude Code (user)",
-            "entry": {
+        return _cand(
+            "github",
+            "Claude Code (user)",
+            entry={
                 "transport": "stdio",
                 "command": "npx",
                 "args": ["-y", "@gh"],
                 "compression": "auto",
                 "max_result_chars": 8000,
             },
-            "raw": {
+            raw={
                 "command": "npx",
                 "args": ["-y", "@gh"],
                 "env": {"GITHUB_TOKEN": "ghp_secret"},
                 "host_only_field": True,
             },
-            "source_ref": {"kind": "claude-user"},
-            "duplicate_in": ["Claude Desktop"],
-            "duplicates": [
-                {
-                    "label": "Claude Desktop",
-                    "source_ref": {"kind": "claude-desktop"},
-                    "raw": {"command": "npx", "args": ["-y", "@gh"]},
-                }
-            ],
-        }
+            duplicates=(
+                _cand(
+                    "github",
+                    "Claude Desktop",
+                    raw={"command": "npx", "args": ["-y", "@gh"]},
+                ),
+            ),
+        )
 
     def _assert_origin_block(self, entry: dict, cand: dict) -> None:
         origin = entry["origin"]
@@ -4903,7 +5122,7 @@ class TestImportOriginCapture:
         assert origin["duplicates"] == [{"kind": "claude-desktop", "pruned": False}]
         # Verbatim deep-equality — normalization loss must not leak into the
         # provenance copy.
-        assert origin["original"] == cand["raw"]
+        assert origin["original"] == cand.raw
         assert origin["imported_at"].endswith("Z")
         # Lockstep pin: what the CLI wrote validates against the schema the
         # server documents.
@@ -4937,30 +5156,6 @@ class TestImportOriginCapture:
 
         data = json.loads(config.read_text(encoding="utf-8"))
         self._assert_origin_block(data["upstream_servers"]["github"], cand)
-
-    def test_candidate_without_raw_gets_no_origin(self, runner, config, monkeypatch):
-        """A candidate that never captured a verbatim raw (hand-constructed)
-        produces no origin block at all — a partial block could not drive a
-        faithful restore."""
-        self._stub_candidates(
-            monkeypatch,
-            [
-                {
-                    "name": "legacy",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                }
-            ],
-        )
-        result = runner.invoke(
-            cli,
-            ["init", "--no-validate", *_cfg_args(config)],
-            input="all\n\n",
-        )
-        assert result.exit_code == 0, result.output
-
-        data = json.loads(config.read_text(encoding="utf-8"))
-        assert "origin" not in data["upstream_servers"]["legacy"]
 
     def test_manual_init_flow_writes_no_origin(self, runner, config, no_discovery):
         """Origin is import-only provenance — the manual prompt flow has no
@@ -6437,17 +6632,17 @@ class TestAddFromClients:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "filesystem",
-                    "source": "Claude Code (user)",
-                    "entry": {
+                _cand(
+                    "filesystem",
+                    "Claude Code (user)",
+                    entry={
                         "transport": "stdio",
                         "command": "npx",
                         "args": ["-y", "@fs"],
                         "compression": "auto",
                         "max_result_chars": 8000,
                     },
-                },
+                ),
             ],
         )
         result = runner.invoke(
@@ -6475,11 +6670,9 @@ class TestAddFromClients:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "filesystem",
-                    "source": "X",
-                    "entry": {"transport": "stdio", "command": "npx", "args": []},
-                },
+                _cand(
+                    "filesystem", "X", entry={"transport": "stdio", "command": "npx", "args": []}
+                ),
             ],
         )
         result = runner.invoke(
@@ -6500,11 +6693,9 @@ class TestAddFromClients:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "filesystem",
-                    "source": "X",
-                    "entry": {"transport": "stdio", "command": "npx", "args": []},
-                },
+                _cand(
+                    "filesystem", "X", entry={"transport": "stdio", "command": "npx", "args": []}
+                ),
             ],
         )
         result = runner.invoke(
@@ -6533,16 +6724,12 @@ class TestAddFromClients:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "filesystem",
-                    "source": "X",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
-                {
-                    "name": "github",
-                    "source": "Y",
-                    "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@gh"]},
-                },
+                _cand("filesystem", "X", entry={"transport": "stdio", "command": "npx"}),
+                _cand(
+                    "github",
+                    "Y",
+                    entry={"transport": "stdio", "command": "npx", "args": ["-y", "@gh"]},
+                ),
             ],
         )
         result = runner.invoke(
@@ -6578,15 +6765,11 @@ class TestAddFromClients:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "filesystem",  # different name...
-                    "source": "X",
-                    "entry": {
-                        "transport": "stdio",
-                        "command": "npx",
-                        "args": ["-y", "@fs"],  # ...same command+args
-                    },
-                },
+                _cand(
+                    "filesystem",
+                    "X",
+                    entry={"transport": "stdio", "command": "npx", "args": ["-y", "@fs"]},
+                ),
             ],
         )
         result = runner.invoke(
@@ -6625,16 +6808,11 @@ class TestAddFromClients:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "repo-b-tool",
-                    "source": "Cursor (project)",
-                    "entry": {
-                        "transport": "stdio",
-                        "command": "./run.sh",
-                        "cwd": "/repo/b",
-                    },
-                    "is_repo_local": True,
-                }
+                _cand(
+                    "repo-b-tool",
+                    "Cursor (project)",
+                    entry={"transport": "stdio", "command": "./run.sh", "cwd": "/repo/b"},
+                )
             ],
         )
 
@@ -6676,12 +6854,11 @@ class TestAddFromClients:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "repo-b-tool",
-                    "source": ".mcp.json (project)",
-                    "entry": {"transport": "stdio", "command": "./run.sh"},
-                    "is_repo_local": True,
-                }
+                _cand(
+                    "repo-b-tool",
+                    ".mcp.json (project)",
+                    entry={"transport": "stdio", "command": "./run.sh"},
+                )
             ],
         )
 
@@ -6725,11 +6902,11 @@ class TestAddFromClients:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "same-server-other-name",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "./run.sh"},
-                }
+                _cand(
+                    "same-server-other-name",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "./run.sh"},
+                )
             ],
         )
 
@@ -6763,16 +6940,16 @@ class TestAddFromClients:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "db-prod",
-                    "source": "Claude Code (user)",
-                    "entry": {
+                _cand(
+                    "db-prod",
+                    "Claude Code (user)",
+                    entry={
                         "transport": "stdio",
                         "command": "npx",
                         "args": ["-y", "@db"],
                         "env": {"DB": "prod"},
                     },
-                }
+                )
             ],
         )
 
@@ -6803,16 +6980,16 @@ class TestAddFromClients:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "db-alias",
-                    "source": "Claude Code (user)",
-                    "entry": {
+                _cand(
+                    "db-alias",
+                    "Claude Code (user)",
+                    entry={
                         "transport": "stdio",
                         "command": "npx",
                         "args": ["-y", "@db"],
                         "env": {"DB": "prod"},
                     },
-                }
+                )
             ],
         )
 
@@ -6845,11 +7022,11 @@ class TestAddFromClients:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "docs",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx", "env": {"DB": "prod"}},
-                }
+                _cand(
+                    "docs",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx", "env": {"DB": "prod"}},
+                )
             ],
         )
 
@@ -6884,11 +7061,11 @@ class TestAddFromClients:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "db-alias",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@db"]},
-                }
+                _cand(
+                    "db-alias",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx", "args": ["-y", "@db"]},
+                )
             ],
         )
 
@@ -6923,16 +7100,16 @@ class TestAddFromClients:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "db-alias",
-                    "source": "Claude Code (user)",
-                    "entry": {
+                _cand(
+                    "db-alias",
+                    "Claude Code (user)",
+                    entry={
                         "transport": "stdio",
                         "command": "npx",
                         "args": ["-y", "@db"],
                         "env": {"DB": "prod"},
                     },
-                }
+                )
             ],
         )
 
@@ -6945,9 +7122,7 @@ class TestAddFromClients:
             {"name": "db-alias", "reason": "ambiguous_identity"}
         ]
 
-    def test_a_broken_origin_still_lets_a_different_env_through(
-        self, runner, config, monkeypatch
-    ):
+    def test_a_broken_origin_still_lets_a_different_env_through(self, runner, config, monkeypatch):
         """The two reasons an entry is unresolved are not the same reason. An
         unreadable ``origin`` leaves only the checkout unknown, and a
         different env already proves these are different servers whatever
@@ -6969,16 +7144,16 @@ class TestAddFromClients:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "db-prod",
-                    "source": "Claude Code (user)",
-                    "entry": {
+                _cand(
+                    "db-prod",
+                    "Claude Code (user)",
+                    entry={
                         "transport": "stdio",
                         "command": "npx",
                         "args": ["-y", "@db"],
                         "env": {"DB": "prod"},
                     },
-                }
+                )
             ],
         )
 
@@ -7011,16 +7186,16 @@ class TestAddFromClients:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "db-alias",
-                    "source": "Claude Code (user)",
-                    "entry": {
+                _cand(
+                    "db-alias",
+                    "Claude Code (user)",
+                    entry={
                         "transport": "stdio",
                         "command": "npx",
                         "args": ["-y", "@db"],
                         "env": {"DB": "staging"},
                     },
-                }
+                )
             ],
         )
 
@@ -7053,11 +7228,11 @@ class TestAddFromClients:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "other",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@other"]},
-                }
+                _cand(
+                    "other",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx", "args": ["-y", "@other"]},
+                )
             ],
         )
 
@@ -7089,11 +7264,11 @@ class TestAddFromClients:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "api-alias",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "streamable_http", "url": "https://x/mcp"},
-                }
+                _cand(
+                    "api-alias",
+                    "Claude Code (user)",
+                    entry={"transport": "streamable_http", "url": "https://x/mcp"},
+                )
             ],
         )
 
@@ -7116,11 +7291,7 @@ class TestAddFromClients:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "filesystem",
-                    "source": "X",
-                    "entry": {"transport": "stdio", "command": "x"},
-                },
+                _cand("filesystem", "X", entry={"transport": "stdio", "command": "x"}),
             ],
         )
         result = runner.invoke(
@@ -7180,16 +7351,8 @@ class TestAddFromClients:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "a",
-                    "source": "X",
-                    "entry": {"transport": "stdio", "command": "ca"},
-                },
-                {
-                    "name": "b",
-                    "source": "Y",
-                    "entry": {"transport": "stdio", "command": "cb"},
-                },
+                _cand("a", "X", entry={"transport": "stdio", "command": "ca"}),
+                _cand("b", "Y", entry={"transport": "stdio", "command": "cb"}),
             ],
         )
 
@@ -7226,11 +7389,9 @@ class TestAddFromClients:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "ev\ril",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand(
+                    "ev\ril", "Claude Code (user)", entry={"transport": "stdio", "command": "npx"}
+                ),
             ],
         )
 
@@ -7261,32 +7422,41 @@ class TestAddFromClients:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "from-user",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@u"]},
-                },
-                {
-                    "name": "from-local",
-                    "source": "Claude Code (project)",
-                    "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@l"]},
-                },
-                {
-                    "name": "from-proj",
-                    "source": ".mcp.json (project)",
-                    "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@p"]},
-                },
-                {
-                    "name": "from-desktop",
-                    "source": "Claude Desktop",
-                    "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@d"]},
-                    "duplicate_in": ["Claude Code (user)"],
-                },
+                _cand(
+                    "from-user",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx", "args": ["-y", "@u"]},
+                ),
+                _cand(
+                    "from-local",
+                    "Claude Code (project)",
+                    entry={"transport": "stdio", "command": "npx", "args": ["-y", "@l"]},
+                ),
+                _cand(
+                    "from-proj",
+                    ".mcp.json (project)",
+                    entry={"transport": "stdio", "command": "npx", "args": ["-y", "@p"]},
+                ),
+                _cand(
+                    "from-desktop",
+                    "Claude Desktop",
+                    entry={"transport": "stdio", "command": "npx", "args": ["-y", "@d"]},
+                    duplicates=(
+                        _cand(
+                            "from-desktop",
+                            "Claude Code (user)",
+                            entry={"transport": "stdio", "command": "npx", "args": ["-y", "@d"]},
+                        ),
+                    ),
+                ),
             ],
         )
         result = runner.invoke(
             cli,
-            ["add", "--from-clients", *_cfg_args(config)],
+            # The set spans every Claude Code scope, and a `.mcp.json` row is
+            # repo-local by definition, so the trust gate is acknowledged here
+            # rather than the row being dropped — the subject is the hint.
+            ["add", "--from-clients", "--allow-project-configs", *_cfg_args(config)],
             input="all\n\n\n\n\n",  # pick all + accept suggested prefix for each
         )
         assert result.exit_code == 0, result.output
@@ -7308,11 +7478,9 @@ class TestAddFromClients:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "skipme",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand(
+                    "skipme", "Claude Code (user)", entry={"transport": "stdio", "command": "npx"}
+                ),
             ],
         )
         result = runner.invoke(
@@ -7616,7 +7784,7 @@ class TestCheckoutScopedIdentity:
         self._write_source(kind, home, checkout)
 
         cands = _discover_candidates(checkout)
-        assert [c["name"] for c in cands] == ["repo-tool"]
+        assert [c.name for c in cands] == ["repo-tool"]
         identity = _candidate_identity_entry(cands[0], checkout)
         assert identity["cwd"] == str(checkout.resolve())
 
@@ -7638,7 +7806,7 @@ class TestCheckoutScopedIdentity:
         target.write_text(json.dumps(entry), encoding="utf-8")
 
         cands = _discover_candidates(checkout)
-        assert [c["name"] for c in cands] == ["repo-tool"]
+        assert [c.name for c in cands] == ["repo-tool"]
         assert "cwd" not in _candidate_identity_entry(cands[0], checkout)
 
     @pytest.mark.parametrize("kind", ["mcp-json", "claude-project", "cursor-project"])
@@ -7735,12 +7903,11 @@ class TestCheckoutScopedIdentity:
         candidate would be dead weight ``_same_server`` never reads."""
         from memtomem_stm.cli.proxy import _candidate_identity_entry
 
-        cand = {
-            "name": "http-tool",
-            "source": ".mcp.json (project)",
-            "entry": {"transport": transport, "url": "https://example.test/mcp"},
-            "is_repo_local": True,
-        }
+        cand = _cand(
+            "http-tool",
+            ".mcp.json (project)",
+            entry={"transport": transport, "url": "https://example.test/mcp"},
+        )
         assert "cwd" not in _candidate_identity_entry(cand, Path("/repo"))
 
     def test_the_list_origin_cell_separates_missing_from_unreadable(self):
@@ -8305,13 +8472,8 @@ class TestUnmanagedSources:
         assert "claude-user" in message
 
     @staticmethod
-    def _cursor_candidate() -> dict:
-        return {
-            "name": "cursor-tool",
-            "source": "Cursor (user)",
-            "source_ref": {"kind": "cursor-user"},
-            "raw": {"command": "node"},
-        }
+    def _cursor_candidate():
+        return _cand("cursor-tool", "Cursor (user)", raw={"command": "node"})
 
     def test_the_default_plan_never_reaches_an_unmanaged_source(self, tmp_path, monkeypatch):
         """Import-time prune classifies a Cursor row the way standalone does.
@@ -8407,12 +8569,12 @@ class TestUnmanagedSources:
         )
         monkeypatch.setattr(proxy_mod, "_pruned_backup_path", lambda: backup)
         monkeypatch.setattr(proxy_mod, "_desktop_config_path", lambda: desktop)
-        cand = {
-            "name": "desk-tool",
-            "source": "Claude Desktop",
-            "source_ref": {"kind": "claude-desktop"},
-            "raw": {"command": "node"},
-        }
+        cand = _cand(
+            "desk-tool",
+            "Claude Desktop",
+            raw={"command": "node"},
+            source_ref={"kind": "claude-desktop"},
+        )
 
         pruned, failed = proxy_mod._prune_imported_candidates(
             [cand], pruned_at="2026-09-03T00:00:00Z"
@@ -8589,18 +8751,12 @@ class TestUnmanagedSources:
             proxy_mod,
             "_discover_candidates",
             lambda _cwd: [
-                {
-                    "name": "cursor-tool",
-                    "source": "Cursor (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                    "is_repo_local": False,
-                },
-                {
-                    "name": "desk-tool",
-                    "source": "Claude Desktop",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                    "is_repo_local": False,
-                },
+                _cand(
+                    "cursor-tool", "Cursor (user)", entry={"transport": "stdio", "command": "npx"}
+                ),
+                _cand(
+                    "desk-tool", "Claude Desktop", entry={"transport": "stdio", "command": "npx"}
+                ),
             ],
         )
 
@@ -8645,31 +8801,29 @@ class TestAddFromClientsNonInteractive:
 
     def _two_candidates(self):
         return [
-            {
-                "name": "filesystem",
-                "source": "Claude Code (user)",
-                "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@fs"]},
-                "raw": {"command": "npx", "args": ["-y", "@fs"]},
-                "source_ref": {"kind": "claude-code-user"},
-            },
-            {
-                "name": "github",
-                "source": "Claude Desktop",
-                "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@gh"]},
-                "raw": {"command": "npx", "args": ["-y", "@gh"]},
-                "source_ref": {"kind": "claude-desktop"},
-            },
+            _cand(
+                "filesystem",
+                "Claude Code (user)",
+                raw={"command": "npx", "args": ["-y", "@fs"]},
+                # Deliberately not the label's own kind: ``OriginSource.kind``
+                # is an open string, and one origin block asserts this value
+                # round-trips verbatim from the candidate.
+                source_ref={"kind": "claude-code-user"},
+            ),
+            _cand(
+                "github",
+                "Claude Desktop",
+                raw={"command": "npx", "args": ["-y", "@gh"]},
+            ),
         ]
 
     def _repo_local_candidate(self):
-        return {
-            "name": "repo-server",
-            "source": ".mcp.json (project)",
-            "entry": {"transport": "stdio", "command": "untrusted-command"},
-            "raw": {"command": "untrusted-command"},
-            "source_ref": {"kind": "mcp-json", "path": "/repo/.mcp.json"},
-            "is_repo_local": True,
-        }
+        return _cand(
+            "repo-server",
+            ".mcp.json (project)",
+            raw={"command": "untrusted-command"},
+            source_ref={"kind": "mcp-json", "path": "/repo/.mcp.json"},
+        )
 
     @pytest.mark.parametrize(
         "selection",
@@ -8698,14 +8852,12 @@ class TestAddFromClientsNonInteractive:
         assert config.read_bytes() == before
 
     def _cursor_repo_local_candidate(self):
-        return {
-            "name": "cursor-repo-server",
-            "source": "Cursor (project)",
-            "entry": {"transport": "stdio", "command": "untrusted-command"},
-            "raw": {"command": "untrusted-command"},
-            "source_ref": {"kind": "cursor-project", "path": "/repo/.cursor/mcp.json"},
-            "is_repo_local": True,
-        }
+        return _cand(
+            "cursor-repo-server",
+            "Cursor (project)",
+            raw={"command": "untrusted-command"},
+            source_ref={"kind": "cursor-project", "path": "/repo/.cursor/mcp.json"},
+        )
 
     def test_a_cursor_project_entry_is_gated_like_mcp_json(self, runner, config, monkeypatch):
         """The gate keys on the repo-local marker, not on one label (#955).
@@ -8839,11 +8991,7 @@ class TestAddFromClientsNonInteractive:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": long_name,
-                    "source": "X",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand(long_name, "X", entry={"transport": "stdio", "command": "npx"}),
             ],
         )
 
@@ -8873,14 +9021,7 @@ class TestAddFromClientsNonInteractive:
         self._seed_config(config, {})
         self._stub_candidates(
             monkeypatch,
-            [
-                {
-                    "name": name,
-                    "source": "X",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                }
-                for name in names
-            ],
+            [_cand(name, "X", entry={"transport": "stdio", "command": "npx"}) for name in names],
         )
 
         result = runner.invoke(cli, ["add", "--from-clients", "--all", *_cfg_args(config)])
@@ -8917,11 +9058,7 @@ class TestAddFromClientsNonInteractive:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": long_name,
-                    "source": "X",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand(long_name, "X", entry={"transport": "stdio", "command": "npx"}),
             ],
         )
 
@@ -9034,15 +9171,15 @@ class TestAddFromClientsNonInteractive:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "github",
-                    "source": "Claude Desktop",
-                    "entry": {
+                _cand(
+                    "github",
+                    "Claude Desktop",
+                    entry={
                         "transport": "stdio",
                         "command": "npx",
                         "env": {"GITHUB_TOKEN": "ghp_supersecret"},
                     },
-                },
+                ),
             ],
         )
 
@@ -9271,30 +9408,16 @@ class TestAddFromClientsPrune:
     def _all_cc_candidates(self):
         """Candidate set covering every Claude Code scope the writer handles."""
         return [
-            {
-                "name": "from-user",
-                "source": "Claude Code (user)",
-                "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@u"]},
-            },
-            {
-                "name": "from-local",
-                "source": "Claude Code (project)",
-                "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@l"]},
-            },
-            {
-                "name": "from-proj",
-                "source": ".mcp.json (project)",
-                "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@p"]},
-            },
+            _cand("from-user", "Claude Code (user)", raw={"command": "npx", "args": ["-y", "@u"]}),
+            _cand(
+                "from-local", "Claude Code (project)", raw={"command": "npx", "args": ["-y", "@l"]}
+            ),
+            _cand("from-proj", ".mcp.json (project)", raw={"command": "npx", "args": ["-y", "@p"]}),
         ]
 
     @staticmethod
     def _cursor_candidate():
-        return {
-            "name": "cursor-tool",
-            "source": "Cursor (user)",
-            "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@c"]},
-        }
+        return _cand("cursor-tool", "Cursor (user)", raw={"command": "npx", "args": ["-y", "@c"]})
 
     def test_json_reports_a_cursor_row_as_manual_not_failed(
         self, runner, config, monkeypatch, fake_claude
@@ -9423,7 +9546,9 @@ class TestAddFromClientsPrune:
 
         result = runner.invoke(
             cli,
-            ["add", "--from-clients", "--prune", *_cfg_args(config)],
+            # `.mcp.json (project)` is repo-local, so its scope can only be
+            # exercised past the acknowledged trust gate.
+            ["add", "--from-clients", "--prune", "--allow-project-configs", *_cfg_args(config)],
             input="all\n\n\n\n",  # pick all + accept each default prefix
         )
         assert result.exit_code == 0, result.output
@@ -9465,11 +9590,11 @@ class TestAddFromClientsPrune:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "from-desktop",
-                    "source": "Claude Desktop",
-                    "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@d"]},
-                },
+                _cand(
+                    "from-desktop",
+                    "Claude Desktop",
+                    entry={"transport": "stdio", "command": "npx", "args": ["-y", "@d"]},
+                ),
             ],
         )
 
@@ -9498,11 +9623,11 @@ class TestAddFromClientsPrune:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "from-user",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@u"]},
-                },
+                _cand(
+                    "from-user",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx", "args": ["-y", "@u"]},
+                ),
             ],
         )
         fake_claude["script"] = [_FakeClaudeResult(returncode=1, stderr="boom")]
@@ -9562,11 +9687,11 @@ class TestAddFromClientsPrune:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "from-user",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand(
+                    "from-user",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx"},
+                ),
             ],
         )
         result = runner.invoke(
@@ -9594,11 +9719,11 @@ class TestAddFromClientsPrune:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "from-user",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand(
+                    "from-user",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx"},
+                ),
             ],
         )
         result = runner.invoke(
@@ -9622,11 +9747,11 @@ class TestAddFromClientsPrune:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "from-user",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand(
+                    "from-user",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx"},
+                ),
             ],
         )
         result = runner.invoke(
@@ -9649,12 +9774,18 @@ class TestAddFromClientsPrune:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "filesystem",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                    "duplicate_in": ["Claude Code (project)"],
-                },
+                _cand(
+                    "filesystem",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx"},
+                    duplicates=(
+                        _cand(
+                            "filesystem",
+                            "Claude Code (project)",
+                            entry={"transport": "stdio", "command": "npx"},
+                        ),
+                    ),
+                ),
             ],
         )
         result = runner.invoke(
@@ -9752,16 +9883,16 @@ class TestPruneCommand:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "docs-langchain",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
-                {
-                    "name": "langfuse-docs",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand(
+                    "docs-langchain",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx"},
+                ),
+                _cand(
+                    "langfuse-docs",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx"},
+                ),
             ],
         )
         result = runner.invoke(cli, ["prune", "docs-langchain", "--yes", *_cfg_args(config)])
@@ -9778,11 +9909,11 @@ class TestPruneCommand:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "docs-langchain",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand(
+                    "docs-langchain",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx"},
+                ),
             ],
         )
         result = runner.invoke(
@@ -9802,16 +9933,8 @@ class TestPruneCommand:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "a",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
-                {
-                    "name": "b",
-                    "source": ".mcp.json (project)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand("a", "Claude Code (user)", entry={"transport": "stdio", "command": "npx"}),
+                _cand("b", ".mcp.json (project)", entry={"transport": "stdio", "command": "npx"}),
             ],
         )
         result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
@@ -9830,11 +9953,11 @@ class TestPruneCommand:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "docs-langchain",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand(
+                    "docs-langchain",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx"},
+                ),
             ],
         )
         result = runner.invoke(cli, ["prune", "--all", "--dry-run", *_cfg_args(config)])
@@ -9852,11 +9975,11 @@ class TestPruneCommand:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "docs-langchain",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand(
+                    "docs-langchain",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx"},
+                ),
             ],
         )
         result = runner.invoke(cli, ["prune", "--all", *_cfg_args(config)])
@@ -9874,11 +9997,11 @@ class TestPruneCommand:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "docs-langchain",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand(
+                    "docs-langchain",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx"},
+                ),
             ],
         )
         result = runner.invoke(cli, ["prune", "--all", *_cfg_args(config)], input="y\n")
@@ -9897,11 +10020,11 @@ class TestPruneCommand:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "docs-langchain",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand(
+                    "docs-langchain",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx"},
+                ),
             ],
         )
         result = runner.invoke(cli, ["prune", "--all", *_cfg_args(config)], input="n\n")
@@ -9916,12 +10039,18 @@ class TestPruneCommand:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "filesystem",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                    "duplicate_in": ["Claude Code (project)"],
-                },
+                _cand(
+                    "filesystem",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx"},
+                    duplicates=(
+                        _cand(
+                            "filesystem",
+                            "Claude Code (project)",
+                            entry={"transport": "stdio", "command": "npx"},
+                        ),
+                    ),
+                ),
             ],
         )
         result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
@@ -9944,16 +10073,12 @@ class TestPruneCommand:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "clean",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
-                {
-                    "name": "ev\ril",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand(
+                    "clean", "Claude Code (user)", entry={"transport": "stdio", "command": "npx"}
+                ),
+                _cand(
+                    "ev\ril", "Claude Code (user)", entry={"transport": "stdio", "command": "npx"}
+                ),
             ],
         )
         result = runner.invoke(cli, ["prune", "--all", "--dry-run", *_cfg_args(config)])
@@ -9993,15 +10118,15 @@ class TestPruneCommand:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "docs",
-                    "source": "Claude Code (user)",
-                    "entry": {
+                _cand(
+                    "docs",
+                    "Claude Code (user)",
+                    entry={
                         "transport": "stdio",
                         "command": "python",
                         "args": ["-m", "unrelated_server"],
                     },
-                },
+                ),
             ],
         )
         result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
@@ -10031,11 +10156,11 @@ class TestPruneCommand:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "db",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx", "env": {"DB": "prod"}},
-                }
+                _cand(
+                    "db",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx", "env": {"DB": "prod"}},
+                )
             ],
         )
 
@@ -10067,11 +10192,11 @@ class TestPruneCommand:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "db",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx", "env": {"DB": "prod"}},
-                }
+                _cand(
+                    "db",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx", "env": {"DB": "prod"}},
+                )
             ],
         )
 
@@ -10102,15 +10227,15 @@ class TestPruneCommand:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "api",
-                    "source": "Claude Code (user)",
-                    "entry": {
+                _cand(
+                    "api",
+                    "Claude Code (user)",
+                    entry={
                         "transport": "streamable_http",
                         "url": "https://x/mcp",
                         "headers": {"Authorization": "Bearer host"},
                     },
-                }
+                )
             ],
         )
 
@@ -10143,13 +10268,7 @@ class TestPruneCommand:
         )
         self._stub_candidates(
             monkeypatch,
-            [
-                {
-                    "name": "db",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                }
-            ],
+            [_cand("db", "Claude Code (user)", entry={"transport": "stdio", "command": "npx"})],
         )
 
         result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
@@ -10179,15 +10298,11 @@ class TestPruneCommand:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "repo-tool",
-                    "source": "Cursor (project)",
-                    "entry": {
-                        "transport": "stdio",
-                        "command": "./run.sh",
-                        "cwd": "/repo/b",
-                    },
-                }
+                _cand(
+                    "repo-tool",
+                    "Cursor (project)",
+                    entry={"transport": "stdio", "command": "./run.sh", "cwd": "/repo/b"},
+                )
             ],
         )
 
@@ -10228,11 +10343,11 @@ class TestPruneCommand:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "repo-tool",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "./run.sh"},
-                }
+                _cand(
+                    "repo-tool",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "./run.sh"},
+                )
             ],
         )
 
@@ -10276,12 +10391,11 @@ class TestPruneCommand:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "repo-tool",
-                    "source": ".mcp.json (project)",
-                    "entry": {"transport": "stdio", "command": "./run.sh"},
-                    "is_repo_local": True,
-                }
+                _cand(
+                    "repo-tool",
+                    ".mcp.json (project)",
+                    entry={"transport": "stdio", "command": "./run.sh"},
+                )
             ],
         )
 
@@ -10321,12 +10435,11 @@ class TestPruneCommand:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "repo-tool",
-                    "source": ".mcp.json (project)",
-                    "entry": {"transport": "stdio", "command": "./run.sh"},
-                    "is_repo_local": True,
-                }
+                _cand(
+                    "repo-tool",
+                    ".mcp.json (project)",
+                    entry={"transport": "stdio", "command": "./run.sh"},
+                )
             ],
         )
 
@@ -10352,11 +10465,11 @@ class TestPruneCommand:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "repo-tool",
-                    "source": "Cursor (project)",
-                    "entry": {"transport": "stdio", "command": "npx", "cwd": "/repo/a"},
-                }
+                _cand(
+                    "repo-tool",
+                    "Cursor (project)",
+                    entry={"transport": "stdio", "command": "npx", "cwd": "/repo/a"},
+                )
             ],
         )
 
@@ -10381,16 +10494,8 @@ class TestPruneCommand:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "a",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
-                {
-                    "name": "b",
-                    "source": ".mcp.json (project)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand("a", "Claude Code (user)", entry={"transport": "stdio", "command": "npx"}),
+                _cand("b", ".mcp.json (project)", entry={"transport": "stdio", "command": "npx"}),
             ],
         )
         result = runner.invoke(cli, ["prune", "a", "--dry-run", *_cfg_args(config)])
@@ -10413,11 +10518,11 @@ class TestPruneCommand:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "docs-langchain",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand(
+                    "docs-langchain",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx"},
+                ),
             ],
         )
         fake_claude["script"] = [_FakeClaudeResult(returncode=1, stderr="boom")]
@@ -10439,11 +10544,11 @@ class TestPruneCommand:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "docs-langchain",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand(
+                    "docs-langchain",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx"},
+                ),
             ],
         )
         fake_claude["script"] = [
@@ -10457,15 +10562,13 @@ class TestPruneCommand:
 
     # ── --json result summary (#614) ──
 
-    _DUAL_CANDIDATE = {
-        "name": "docs-langchain",
-        "source": "Claude Code (user)",
-        "entry": {"transport": "stdio", "command": "npx"},
-    }
+    @staticmethod
+    def _dual_candidate():
+        return _cand("docs-langchain", "Claude Code (user)", raw={"command": "npx"})
 
     def test_json_dry_run_shape_and_no_writes(self, runner, config, monkeypatch, fake_claude):
         self._seed_config(config, ["docs-langchain"])
-        self._stub_candidates(monkeypatch, [dict(self._DUAL_CANDIDATE)])
+        self._stub_candidates(monkeypatch, [self._dual_candidate()])
         result = runner.invoke(cli, ["prune", "--all", "--dry-run", "--json", *_cfg_args(config)])
         assert result.exit_code == 0, result.output
         data = json.loads(result.stdout)
@@ -10482,7 +10585,7 @@ class TestPruneCommand:
 
         monkeypatch.setattr(proxy_mod, "_should_use_tui", lambda: True)
         self._seed_config(config, ["docs-langchain"])
-        self._stub_candidates(monkeypatch, [dict(self._DUAL_CANDIDATE)])
+        self._stub_candidates(monkeypatch, [self._dual_candidate()])
         result = runner.invoke(cli, ["prune", "--all", "--json", *_cfg_args(config)])
         assert result.exit_code == 2
         data = json.loads(result.stdout)
@@ -10491,7 +10594,7 @@ class TestPruneCommand:
 
     def test_json_success_shape(self, runner, config, monkeypatch, fake_claude):
         self._seed_config(config, ["docs-langchain"])
-        self._stub_candidates(monkeypatch, [dict(self._DUAL_CANDIDATE)])
+        self._stub_candidates(monkeypatch, [self._dual_candidate()])
         result = runner.invoke(cli, ["prune", "--all", "--yes", "--json", *_cfg_args(config)])
         assert result.exit_code == 0, result.output
         data = json.loads(result.stdout)
@@ -10507,13 +10610,7 @@ class TestPruneCommand:
         self._seed_config(config, ["cursor-tool"])
         self._stub_candidates(
             monkeypatch,
-            [
-                {
-                    "name": "cursor-tool",
-                    "source": "Cursor (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                }
-            ],
+            [_cand("cursor-tool", "Cursor (user)", entry={"transport": "stdio", "command": "npx"})],
         )
 
         def fail_if_called(*_args, **_kwargs):
@@ -10541,16 +10638,14 @@ class TestPruneCommand:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "cursor-tool",
-                    "source": "Cursor (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
-                {
-                    "name": "managed-tool",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand(
+                    "cursor-tool", "Cursor (user)", entry={"transport": "stdio", "command": "npx"}
+                ),
+                _cand(
+                    "managed-tool",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx"},
+                ),
             ],
         )
 
@@ -10573,7 +10668,7 @@ class TestPruneCommand:
         self, runner, config, monkeypatch, fake_claude
     ):
         self._seed_config(config, ["docs-langchain"])
-        self._stub_candidates(monkeypatch, [dict(self._DUAL_CANDIDATE)])
+        self._stub_candidates(monkeypatch, [self._dual_candidate()])
         fake_claude["script"] = [_FakeClaudeResult(returncode=1, stderr="boom")]
         result = runner.invoke(cli, ["prune", "--all", "--yes", "--json", *_cfg_args(config)])
         assert result.exit_code == 1
@@ -10618,24 +10713,24 @@ def _read_backup_log(home: Path) -> dict:
     return json.loads(_backup_log_path(home).read_text(encoding="utf-8"))
 
 
-def _user_candidate(name: str = "alpha", *, secret: str = "tok_secret") -> dict:
+def _user_candidate(name: str = "alpha", *, secret: str = "tok_secret", duplicates: tuple = ()):
     """Discovery-shaped candidate from Claude Code (user) with verbatim raw.
 
     ``raw`` deliberately differs from ``entry`` (env secret + a field
     normalization drops) so verbatim-copy assertions can't pass by accident.
     """
-    return {
-        "name": name,
-        "source": "Claude Code (user)",
-        "entry": {"transport": "stdio", "command": "npx", "args": ["-y", f"@{name}"]},
-        "raw": {
+    return _cand(
+        name,
+        "Claude Code (user)",
+        entry={"transport": "stdio", "command": "npx", "args": ["-y", f"@{name}"]},
+        raw={
             "command": "npx",
             "args": ["-y", f"@{name}"],
             "env": {"TOKEN": secret},
             "host_only_field": True,
         },
-        "source_ref": {"kind": "claude-user"},
-    }
+        duplicates=duplicates,
+    )
 
 
 class TestEnvDivergentPrune:
@@ -10905,9 +11000,7 @@ class TestUnreadableHostIdentityPrune:
         then offers to delete the host entry that holds the block, so the
         candidate is withheld from the selection there too."""
         home, _cwd, _desktop = self._setup_home(tmp_path, monkeypatch)
-        self._write_client(
-            home, {"command": "npx", "args": ["-y", "@me/docs"], "env": ["DB=prod"]}
-        )
+        self._write_client(home, {"command": "npx", "args": ["-y", "@me/docs"], "env": ["DB=prod"]})
         fresh = tmp_path / "fresh_stm_proxy.json"
 
         result = runner.invoke(cli, ["init", "--no-validate", *_cfg_args(fresh)], input="\n")
@@ -11030,9 +11123,7 @@ class TestUnreadableHostIdentityPrune:
             ),
             encoding="utf-8",
         )
-        self._seed_config(
-            config, {"prefix": "docs", "transport": "stdio", "command": "npx"}
-        )
+        self._seed_config(config, {"prefix": "docs", "transport": "stdio", "command": "npx"})
 
         result = runner.invoke(cli, ["prune", "docs", "--yes", *_cfg_args(config)])
 
@@ -11062,51 +11153,6 @@ class TestUnreadableHostIdentityPrune:
         assert "Claude Code (user)" in result.output
         assert "Claude Desktop" in result.output
 
-    def test_a_candidate_whose_entry_cannot_name_a_transport_fails_closed(self):
-        """The transport comes from the normalized entry, so a candidate
-        without one has to be asked about both blocks. Defaulting to stdio
-        read an HTTP entry's broken `headers` as inert, and the caller that
-        sees such a candidate — `_find_dual_registered` — treats a missing
-        signature as a degraded name match and deletes it (codex R3)."""
-        from memtomem_stm.cli.proxy import _candidate_identity_unreadable
-
-        raw = {"type": "http", "url": "https://docs.example/mcp", "headers": ["Auth: t"]}
-        assert _candidate_identity_unreadable({"name": "docs", "raw": raw}) is True
-        assert _candidate_identity_unreadable({"name": "docs", "raw": raw, "entry": None}) is True
-        # An entry that does name the transport keeps the scoped reading; an
-        # empty one names none, so it is asked about both blocks like the rest.
-        stdio_inert = {"command": "npx", "headers": ["X: 1"]}
-        assert (
-            _candidate_identity_unreadable(
-                {"name": "docs", "raw": stdio_inert, "entry": {"transport": "stdio"}}
-            )
-            is False
-        )
-        assert (
-            _candidate_identity_unreadable({"name": "docs", "raw": stdio_inert, "entry": {}})
-            is True
-        )
-        # A transport string this build does not recognize is not "the other
-        # transport": reading it that way ignored `env` on {"transport":
-        # "bogus"} and `headers` on {"transport": ""} (codex R4).
-        for unknown in ("bogus", ""):
-            assert (
-                _candidate_identity_unreadable(
-                    {"name": "docs", "raw": stdio_inert, "entry": {"transport": unknown}}
-                )
-                is True
-            )
-            assert (
-                _candidate_identity_unreadable(
-                    {
-                        "name": "docs",
-                        "raw": {"command": "npx", "env": ["DB=prod"]},
-                        "entry": {"transport": unknown},
-                    }
-                )
-                is True
-            )
-
     def test_two_paths_aliased_to_one_config_warn_once(
         self, runner, config, tmp_path, monkeypatch, fake_claude
     ):
@@ -11115,9 +11161,7 @@ class TestUnreadableHostIdentityPrune:
         Cursor's was resolved, so symlinking one client's config to another's
         warned twice for one entry (codex R4)."""
         home, _cwd, _desktop = self._setup_home(tmp_path, monkeypatch)
-        self._write_client(
-            home, {"command": "npx", "args": ["-y", "@me/docs"], "env": ["DB=prod"]}
-        )
+        self._write_client(home, {"command": "npx", "args": ["-y", "@me/docs"], "env": ["DB=prod"]})
         cursor = home / ".cursor"
         cursor.mkdir()
         try:
@@ -11132,17 +11176,6 @@ class TestUnreadableHostIdentityPrune:
         result = runner.invoke(cli, ["prune", "docs", "--yes", *_cfg_args(config)])
 
         assert result.output.count("block is not a mapping") == 1
-
-    def test_the_recorded_status_is_what_the_refusals_read(self):
-        """Discovery answers the question once and the readers consume that
-        answer. Re-deriving it at each site is what let the scoped gate read
-        an unknown transport differently from the scan that produced it."""
-        from memtomem_stm.cli.proxy import _candidate_identity_unreadable
-
-        assert _candidate_identity_unreadable({"name": "docs", "identity_unreadable": ("env",)})
-        assert not _candidate_identity_unreadable(
-            {"name": "docs", "identity_unreadable": (), "raw": {"command": "npx"}}
-        )
 
     def test_a_same_name_entry_with_an_unreadable_block_is_a_conflict(
         self, runner, config, tmp_path, monkeypatch, fake_claude
@@ -11503,15 +11536,17 @@ class TestPruneBackupLog:
         and duplicate each with their OWN verbatim raw — at 0600."""
         import stat as stat_mod
 
-        cand = _user_candidate("github")
-        cand["duplicate_in"] = ["Claude Code (project)"]
-        cand["duplicates"] = [
-            {
-                "label": "Claude Code (project)",
-                "source_ref": {"kind": "claude-project", "path": "/proj"},
-                "raw": {"command": "npx", "args": ["-y", "@github"], "type": "stdio"},
-            }
-        ]
+        cand = _user_candidate(
+            "github",
+            duplicates=(
+                _cand(
+                    "github",
+                    "Claude Code (project)",
+                    raw={"command": "npx", "args": ["-y", "@github"], "type": "stdio"},
+                    source_ref={"kind": "claude-project", "path": "/proj"},
+                ),
+            ),
+        )
         self._seed_config(config, {})
         self._stub_candidates(monkeypatch, [cand])
 
@@ -11528,11 +11563,11 @@ class TestPruneBackupLog:
         log = _read_backup_log(_hermetic_home)
         assert log["schema_version"] == 1
         assert [(r["name"], r["source"], r["original"]) for r in log["entries"]] == [
-            ("github", {"kind": "claude-user"}, cand["raw"]),
+            ("github", {"kind": "claude-user"}, cand.raw),
             (
                 "github",
                 {"kind": "claude-project", "path": "/proj"},
-                cand["duplicates"][0]["raw"],
+                cand.duplicates[0].raw,
             ),
         ]
         assert all(r["pruned_at"] for r in log["entries"])
@@ -11577,14 +11612,14 @@ class TestPruneBackupLog:
         )
         monkeypatch.setattr(proxy_mod, "_desktop_config_path", lambda: desktop_path)
 
-        cand = {
-            "name": "crashy",
-            "source": "Claude Desktop",
-            "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@d"]},
-            "raw": dict(desktop_entry),
-            "source_ref": {"kind": "claude-desktop"},
-        }
-        self._seed_config(config, {"crashy": {"prefix": "cr", **cand["entry"]}})
+        cand = _cand(
+            "crashy",
+            "Claude Desktop",
+            entry={"transport": "stdio", "command": "npx", "args": ["-y", "@d"]},
+            raw=dict(desktop_entry),
+            source_ref={"kind": "claude-desktop"},
+        )
+        self._seed_config(config, {"crashy": {"prefix": "cr", **cand.entry}})
         self._stub_candidates(monkeypatch, [cand])
 
         def boom(name, source):
@@ -11647,14 +11682,14 @@ class TestPruneBackupLog:
         )
         monkeypatch.setattr(proxy_mod, "_desktop_config_path", lambda: desktop_path)
 
-        cand = {
-            "name": "keep",
-            "source": "Claude Desktop",
-            "entry": {"transport": "stdio", "command": "npx", "args": ["-y", "@d"]},
-            "raw": dict(desktop_entry),
-            "source_ref": {"kind": "claude-desktop"},
-        }
-        self._seed_config(config, {"keep": {"prefix": "k", **cand["entry"]}})
+        cand = _cand(
+            "keep",
+            "Claude Desktop",
+            entry={"transport": "stdio", "command": "npx", "args": ["-y", "@d"]},
+            raw=dict(desktop_entry),
+            source_ref={"kind": "claude-desktop"},
+        )
+        self._seed_config(config, {"keep": {"prefix": "k", **cand.entry}})
         self._stub_candidates(monkeypatch, [cand])
 
         result = runner.invoke(cli, ["prune", "--all", "--yes", *_cfg_args(config)])
@@ -11665,32 +11700,6 @@ class TestPruneBackupLog:
         assert log_path.read_text(encoding="utf-8") == "{not json"
         host = json.loads(desktop_path.read_text(encoding="utf-8"))
         assert "keep" in host["mcpServers"]
-
-    def test_old_shape_candidate_without_raw_prunes_without_backup(
-        self, runner, config, monkeypatch, fake_claude, _hermetic_home
-    ):
-        """Candidates lacking verbatim ``raw`` (pre-#475 shape) still prune —
-        there is just nothing to back up. Pins backward compatibility for
-        the hand-constructed-candidate paths."""
-        self._seed_config(config, {})
-        self._stub_candidates(
-            monkeypatch,
-            [
-                {
-                    "name": "legacy",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                }
-            ],
-        )
-        result = runner.invoke(
-            cli,
-            ["add", "--from-clients", "--prune", *_cfg_args(config)],
-            input="all\n\n",
-        )
-        assert result.exit_code == 0, result.output
-        assert "Removed from source client(s)" in result.output
-        assert not _backup_log_path(_hermetic_home).exists()
 
 
 class TestPerSourcePrunedMetadata:
@@ -11746,7 +11755,7 @@ class TestPerSourcePrunedMetadata:
         assert origin["source"]["pruned"] is True
         assert origin["source"]["pruned_at"]
         # The verbatim restore payload must survive the metadata save.
-        assert origin["original"] == cand["raw"]
+        assert origin["original"] == cand.raw
 
     def test_partial_failure_marks_only_successful_source(
         self, runner, config, monkeypatch, fake_claude
@@ -11758,15 +11767,16 @@ class TestPerSourcePrunedMetadata:
         monkeypatch.setattr(
             proxy_mod, "_desktop_config_path", lambda: Path("/nonexistent/desktop.json")
         )
-        cand = _user_candidate("github")
-        cand["duplicate_in"] = ["Claude Desktop"]
-        cand["duplicates"] = [
-            {
-                "label": "Claude Desktop",
-                "source_ref": {"kind": "claude-desktop"},
-                "raw": {"command": "npx", "args": ["-y", "@github"]},
-            }
-        ]
+        cand = _user_candidate(
+            "github",
+            duplicates=(
+                _cand(
+                    "github",
+                    "Claude Desktop",
+                    raw={"command": "npx", "args": ["-y", "@github"]},
+                ),
+            ),
+        )
         self._seed_config(config, {})
         self._stub_candidates(monkeypatch, [cand])
 
@@ -11790,13 +11800,13 @@ class TestPerSourcePrunedMetadata:
         cand = _user_candidate("github")
         entry = {
             "prefix": "gh",
-            **cand["entry"],
+            **cand.entry,
             "origin": {
                 "schema_version": 1,
                 "source": {"kind": "claude-user", "pruned": False},
                 "duplicates": [],
                 "imported_at": "2026-06-11T00:00:00+00:00",
-                "original": cand["raw"],
+                "original": cand.raw,
             },
         }
         self._seed_config(config, {"github": entry})
@@ -11809,14 +11819,14 @@ class TestPerSourcePrunedMetadata:
         origin = saved["upstream_servers"]["github"]["origin"]
         assert origin["source"]["pruned"] is True
         assert origin["source"]["pruned_at"]
-        assert origin["original"] == cand["raw"]
+        assert origin["original"] == cand.raw
 
     def test_standalone_prune_without_origin_leaves_config_untouched(
         self, runner, config, monkeypatch, fake_claude
     ):
         """No origin row to flip → no config rewrite (byte-identical)."""
         cand = _user_candidate("github")
-        self._seed_config(config, {"github": {"prefix": "gh", **cand["entry"]}})
+        self._seed_config(config, {"github": {"prefix": "gh", **cand.entry}})
         before = config.read_text(encoding="utf-8")
         self._stub_candidates(monkeypatch, [cand])
 
@@ -11859,7 +11869,7 @@ class TestPerSourcePrunedMetadata:
         # Step-① save survived: origin (with verbatim original) is on disk.
         saved = json.loads(config.read_text(encoding="utf-8"))
         origin = saved["upstream_servers"]["github"]["origin"]
-        assert origin["original"] == cand["raw"]
+        assert origin["original"] == cand.raw
         assert origin["source"]["pruned"] is False
         # Step ② ran: backup row appended and host delete executed.
         log = _read_backup_log(_hermetic_home)
@@ -13335,11 +13345,11 @@ class TestInitPruneOriginals:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "docs-langchain",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand(
+                    "docs-langchain",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx"},
+                ),
             ],
         )
         result = runner.invoke(
@@ -13359,11 +13369,9 @@ class TestInitPruneOriginals:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "cursor-tool",
-                    "source": "Cursor (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand(
+                    "cursor-tool", "Cursor (user)", entry={"transport": "stdio", "command": "npx"}
+                ),
             ],
         )
         result = runner.invoke(
@@ -13384,11 +13392,11 @@ class TestInitPruneOriginals:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "docs-langchain",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand(
+                    "docs-langchain",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx"},
+                ),
             ],
         )
         result = runner.invoke(
@@ -13416,11 +13424,11 @@ class TestInitPruneOriginals:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "docs-langchain",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand(
+                    "docs-langchain",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx"},
+                ),
             ],
         )
         result = runner.invoke(
@@ -13444,11 +13452,11 @@ class TestInitPruneOriginals:
         self._stub_candidates(
             monkeypatch,
             [
-                {
-                    "name": "docs-langchain",
-                    "source": "Claude Code (user)",
-                    "entry": {"transport": "stdio", "command": "npx"},
-                },
+                _cand(
+                    "docs-langchain",
+                    "Claude Code (user)",
+                    entry={"transport": "stdio", "command": "npx"},
+                ),
             ],
         )
         result = runner.invoke(

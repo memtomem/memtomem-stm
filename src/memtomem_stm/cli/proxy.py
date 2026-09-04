@@ -19,7 +19,7 @@ import tomllib
 from collections.abc import Iterator
 from contextlib import AsyncExitStack, contextmanager, redirect_stderr, redirect_stdout
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from functools import wraps
@@ -2945,7 +2945,7 @@ _SOURCE_BY_LABEL: dict[str, _SourceSpec] = {spec.label: spec for spec in _SOURCE
 
 
 def _prune_targets(
-    candidates: list[dict[str, Any]],
+    candidates: list[_DiscoveredCandidate],
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     """Split ``(name, source)`` prune targets into writable and manual-only.
 
@@ -2958,21 +2958,20 @@ def _prune_targets(
     manual: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for cand in candidates:
-        for source in [cand["source"], *(cand.get("duplicate_in") or [])]:
-            key = (cand["name"], source)
+        for registration in cand.registrations:
+            key = (cand.name, registration.source)
             if key in seen:
                 continue
             seen.add(key)
-            row = {"name": cand["name"], "source": source}
-            spec = _SOURCE_BY_LABEL.get(source)
-            if spec is not None and not spec.managed:
-                manual.append(row)
-            else:
+            row = {"name": cand.name, "source": registration.source}
+            if registration.spec.managed:
                 writable.append(row)
+            else:
+                manual.append(row)
     return writable, manual
 
 
-def _conflict_rows(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
+def _conflict_rows(candidates: list[_DiscoveredCandidate]) -> list[dict[str, str]]:
     """``(name, source)`` rows for same-name entries that are another server.
 
     The counterpart to :func:`_prune_targets` for the third state discovery
@@ -2988,39 +2987,13 @@ def _conflict_rows(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for cand in candidates:
-        for conflict in cand.get("conflicts") or []:
-            if not isinstance(conflict, dict):
-                continue
-            label = conflict.get("label")
-            if not isinstance(label, str):
-                continue
-            key = (cand["name"], label)
+        for conflict in cand.conflicts:
+            key = (cand.name, conflict.source)
             if key in seen:
                 continue
             seen.add(key)
-            rows.append({"name": cand["name"], "source": label})
+            rows.append({"name": cand.name, "source": conflict.source})
     return rows
-
-
-def _is_repo_local_candidate(cand: dict[str, Any]) -> bool:
-    """Whether this candidate came from a file inside the current checkout.
-
-    ``_discover_candidates`` always sets the marker, so the label fallback is
-    for candidates built elsewhere (tests, and any future caller) — without it,
-    switching the ``mms init`` filter from a label comparison to the marker
-    would ADMIT a marker-less project candidate the comparison refused (#955).
-
-    Used by ``mms init`` only. The ``--from-clients`` gate reads the marker
-    directly, which is what it has always done — extending the fallback there
-    would tighten a second command's gate on the same commit that widened its
-    discovery, and that is a decision of its own, not a consequence of this
-    one.
-    """
-    marker = cand.get("is_repo_local")
-    if isinstance(marker, bool):
-        return marker
-    spec = _SOURCE_BY_LABEL.get(str(cand.get("source", "")))
-    return spec is not None and spec.is_repo_local
 
 
 _SOURCE_BY_KIND: dict[str, _SourceSpec] = {spec.kind: spec for spec in _SOURCE_SPECS}
@@ -3086,7 +3059,7 @@ def _checkout_of_source(source_ref: dict[str, Any] | None) -> tuple[str, str | N
     return (kind, str(anchored))
 
 
-def _candidate_identity_entry(cand: dict[str, Any], cwd: Path) -> dict[str, Any]:
+def _candidate_identity_entry(cand: _DiscoveredCandidate, cwd: Path) -> dict[str, Any]:
     """The candidate's entry as identity should read it, cwd included.
 
     A host config has no ``cwd`` field, but a *checkout-scoped* source states
@@ -3103,75 +3076,22 @@ def _candidate_identity_entry(cand: dict[str, Any], cwd: Path) -> dict[str, Any]
 
     Never mutates the candidate. An explicit ``cwd`` always wins — the value
     materialized on a Cursor-project entry at discovery time already sits in
-    ``entry``, so it is not recomputed here. ``cwd`` is the fallback anchor for
-    a candidate carrying no source record (hand-built ones, and tests):
-    discovery only ever reads the checkout-scoped configs of the directory it
-    was handed.
+    ``entry``, so it is not recomputed here. ``cwd`` is the fallback anchor
+    for a checkout-scoped source whose ``source_ref`` this build cannot
+    resolve (a relative recorded path, or a kind it does not know): discovery
+    only ever reads the checkout-scoped configs of the directory it was
+    handed, so that directory is the anchor — unlike the registered side,
+    where nothing stands in for an origin that cannot be read.
     """
-    entry = cand.get("entry") or {}
-    if entry.get("cwd") is not None or entry.get("transport", "stdio") != "stdio":
+    entry = cand.entry
+    if entry.get("cwd") is not None or cand.transport != "stdio":
         return entry
-    source_ref = cand.get("source_ref")
-    if isinstance(source_ref, dict):
-        _kind, checkout = _checkout_of_source(source_ref)
-        if checkout is not None:
-            return {**entry, "cwd": checkout}
-    # No usable record. Discovery only ever reads the checkout-scoped configs
-    # of the directory it was handed, so that directory is the anchor for a
-    # candidate built without one (hand-built candidates, and tests) — unlike
-    # the registered side, where nothing stands in for a missing origin.
-    spec = _SOURCE_BY_LABEL.get(str(cand.get("source", "")))
-    if spec is None or not spec.is_checkout_scoped:
+    _kind, checkout = _checkout_of_source(cand.source_ref)
+    if checkout is not None:
+        return {**entry, "cwd": checkout}
+    if not cand.spec.is_checkout_scoped:
         return entry
     return {**entry, "cwd": str(cwd.resolve())}
-
-
-def _candidate_identity_unreadable(cand: dict[str, Any]) -> bool:
-    """Whether the host entry behind this candidate states identity it cannot read.
-
-    The candidate-side name for the state :func:`_stm_identity_entry` reports
-    as ``None`` for an ``env`` / ``headers`` block that is present but is not a
-    mapping. It has to be asked of ``raw``, not of the normalized ``entry``:
-    :func:`_normalize_client_entry` takes those blocks only when they are
-    already mappings, so by the time identity sees a candidate the broken block
-    is gone and the entry reads as one holding no env at all. Against an STM
-    upstream that holds none either, identity then says "same server" and
-    ``mms prune`` deletes the host entry — the erasure making the deletion look
-    justified (#984). The registered side refuses that claim; this is the
-    mirror.
-
-    The transport comes from the normalized ``entry`` rather than from ``raw``:
-    a host config states its transport as a ``type`` hint the normalizer
-    resolves, and which of the two fields identity reads follows that
-    resolution. A candidate whose ``entry`` cannot say — absent, not a mapping,
-    or naming a transport this build does not recognize — is asked about
-    **both** blocks instead of being defaulted to stdio: defaulting reads an
-    HTTP entry's broken ``headers`` as inert, and the caller that would then
-    see it is ``_find_dual_registered``, which treats a candidate with no
-    signature as a degraded name match and deletes it. Discovery always
-    supplies ``entry``, so this is the malformed-caller boundary rather than a
-    reachable file shape — and a destructive boundary fails closed (codex R3,
-    widened in R4).
-
-    Discovery records the answer on the candidate as ``identity_unreadable``
-    and this reads it; the derivation below is for candidates built elsewhere
-    (other callers, and tests), so one scan cannot hold two answers.
-
-    Returns ``False`` for a candidate carrying no ``raw`` (hand-built ones, and
-    tests): there is no host entry to have broken, and inventing one would
-    make a candidate that states nothing incomparable.
-    """
-    recorded = cand.get("identity_unreadable")
-    if isinstance(recorded, tuple):
-        return bool(recorded)
-    raw = cand.get("raw")
-    if not isinstance(raw, dict):
-        return False
-    entry = cand.get("entry")
-    transport = entry.get("transport") if isinstance(entry, dict) else None
-    return _identity_fields_unreadable(
-        raw, transport=transport if isinstance(transport, str) else ""
-    )
 
 
 @dataclass(frozen=True)
@@ -3203,6 +3123,157 @@ class _DiscoveredSource:
         separator character one would pick, ``#`` included.
         """
         return (self.path, *self.slot)
+
+
+@dataclass(frozen=True)
+class _ConflictRecord:
+    """A source claiming a discovered name for a **different** server (#981).
+
+    Label and structured source only, by construction. A conflict is never
+    imported, backed up, pruned or ejected, so there is nothing to restore
+    from — and the entry belongs to a server the operator is not acting on,
+    whose command line, ``env`` and ``headers`` can carry their credentials.
+    The house rule for those is eject's: name the field, never echo the value
+    (#981 codex R1). Typing that as the absence of a ``raw`` field is what
+    keeps the next reporting helper from reaching for one.
+    """
+
+    source: str
+    source_ref: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _DiscoveredCandidate:
+    """One importable server found in a host config, with the scan's answers.
+
+    Every fact a consumer needs about the host entry is established once, by
+    the scan, and carried here — rather than each reader re-deriving it from
+    ``raw`` plus a transport. Three consecutive defects came out of that
+    re-derivation, each introduced by the fix for the previous one, and the
+    last of them deleted host entries on the one path that matches by bare
+    name (#984 codex R2/R3/R4). The required fields are the point: a candidate
+    with no ``raw``, or an ``entry`` that cannot name its transport, is not a
+    shape a reader has to have an opinion about.
+
+    ``entry`` is an already-normalized STM upstream-server entry (sans
+    prefix); ``raw`` is the **verbatim** host entry, because normalization is
+    lossy and the original is what ``mms eject`` restores (#475).
+    ``identity_unreadable`` names the connection blocks this entry states that
+    identity cannot read — see :meth:`from_scan`. ``source_ref`` is the
+    structured ``{kind, path?}`` record persisted as ``origin.source``; it
+    stays a plain dict because that is the shape written to the config and
+    compared against origin rows read back from it.
+
+    ``duplicates`` holds the same server registered in later sources, each a
+    record of its own, so provenance and the prune backup log can address
+    every source; ``conflicts`` holds the same *name* naming another server.
+    Both are tuples so a candidate cannot be edited after the scan decided —
+    accumulation during the scan goes through :func:`dataclasses.replace`.
+
+    Not hashable: ``eq`` is synthesized over fields that include dicts, so
+    ``hash()`` raises. Nothing keys a set or dict on a candidate (the scan
+    keys on the name), and equality is worth more here than hashing.
+    """
+
+    name: str
+    spec: _SourceSpec
+    entry: dict[str, Any]
+    raw: dict[str, Any]
+    identity_unreadable: tuple[str, ...]
+    source_ref: dict[str, Any]
+    duplicates: tuple[_DiscoveredCandidate, ...] = ()
+    conflicts: tuple[_ConflictRecord, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.raw, dict):
+            raise ValueError(f"candidate {self.name!r}: raw must be the verbatim host entry")
+        transport = self.entry.get("transport") if isinstance(self.entry, dict) else None
+        if not isinstance(transport, str) or not transport:
+            # Which connection block identity reads follows the transport, so
+            # a candidate that cannot state one leaves every reader to pick a
+            # default — and the reader that picked stdio read an HTTP entry's
+            # broken ``headers`` as inert (#984 codex R3). Refused here
+            # instead. ``""`` is refused with the absent case rather than
+            # widened: an empty string names no transport either.
+            #
+            # An unrecognized *non-empty* string is a different answer and is
+            # deliberately NOT refused — :func:`_identity_fields` widens
+            # ``"bogus"`` to both blocks, which is the fail-closed reading
+            # this record must not pre-empt, and a second transport table
+            # beside :func:`_normalize_client_entry`'s is the drift it exists
+            # to end. The empty-string branch of that widening stays live for
+            # the registered operand, which reads a transport straight out of
+            # a hand-editable ``stm_proxy.json``.
+            raise ValueError(f"candidate {self.name!r}: entry must name a transport")
+
+    @property
+    def source(self) -> str:
+        """Human label of the host config this candidate was read from."""
+        return self.spec.label
+
+    @property
+    def is_repo_local(self) -> bool:
+        """Whether the file came from the current checkout (the trust gate)."""
+        return self.spec.is_repo_local
+
+    @property
+    def transport(self) -> str:
+        """The normalized entry's transport. Always a non-empty string."""
+        return str(self.entry["transport"])
+
+    @property
+    def duplicate_in(self) -> tuple[str, ...]:
+        """Labels of the later sources registering this same server, in order."""
+        return tuple(dup.source for dup in self.duplicates)
+
+    @property
+    def registrations(self) -> tuple[_DiscoveredCandidate, ...]:
+        """Every source registering this server: the winner, then duplicates.
+
+        The exact sequence the prune loop has always acted on (pinned by
+        ``test_duplicate_in_sources_all_pruned``). Each element carries its
+        own spec, ``source_ref`` and ``raw``, so the backup writer and the
+        provenance matcher read one record rather than three parallel lists.
+        """
+        return (self, *self.duplicates)
+
+    @classmethod
+    def from_scan(
+        cls,
+        name: str,
+        spec: _SourceSpec,
+        *,
+        raw: dict[str, Any],
+        entry: dict[str, Any],
+        source_ref: dict[str, Any],
+    ) -> _DiscoveredCandidate:
+        """Build a candidate from one scanned host entry, deriving identity.
+
+        The single place ``identity_unreadable`` is computed. It has to be
+        asked of ``raw``, not of the normalized ``entry``:
+        :func:`_normalize_client_entry` takes ``env`` / ``headers`` only when
+        they are already mappings, so by the time identity sees a candidate a
+        broken block is gone and the entry reads as one holding no env at all.
+        Against an STM upstream that holds none either, identity then says
+        "same server" and ``mms prune`` deletes the host entry — the erasure
+        making the deletion look justified (#984).
+
+        The transport comes from the normalized ``entry`` rather than from
+        ``raw``: a host config states its transport as a ``type`` hint the
+        normalizer resolves, and which of the two fields identity reads
+        follows that resolution.
+
+        ``raw`` is deep-copied here, so a scan can hand in the object it read
+        out of the host file. Direct construction does not copy.
+        """
+        return cls(
+            name=name,
+            spec=spec,
+            entry=entry,
+            raw=copy.deepcopy(raw),
+            identity_unreadable=_unreadable_identity_fields(raw, transport=entry["transport"]),
+            source_ref=source_ref,
+        )
 
 
 def _canonical_path(path: Path) -> str:
@@ -3268,9 +3339,9 @@ def _identity_fields_unreadable(cfg: dict[str, Any], *, transport: str | None = 
     *checkout* unknown while ``env`` still separates servers, whereas an
     unreadable ``env`` leaves that field itself unknown. The import side
     tells them apart — see ``unresolved_signatures`` in
-    :func:`_add_from_clients`. Shared with the host side through
-    :func:`_candidate_identity_unreadable`, so one rule decides the shape on
-    both operands (#984).
+    :func:`_add_from_clients`. Shares its rule with the host side, where
+    :meth:`_DiscoveredCandidate.from_scan` records the answer once, so one
+    rule decides the shape on both operands (#984).
 
     Only the field this transport reads is asked. Refusing on the other one
     made the gate contradict the comparator it defends: ``_same_server``
@@ -3344,30 +3415,20 @@ def _stm_identity_entry(cfg: dict[str, Any]) -> dict[str, Any] | None:
 _EJECT_TARGETS_HELP = "claude-user | claude-project[:PATH] | mcp-json[:PATH] | claude-desktop"
 
 
-def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
+def _discover_candidates(cwd: Path) -> list[_DiscoveredCandidate]:
     """Scan known MCP-client configs and return importable candidates.
 
-    Each candidate dict is
-    ``{name, source, entry, raw, identity_unreadable, source_ref}`` where
-    ``entry`` is an already-normalized STM upstream-server entry (sans
-    prefix), ``raw`` is the **verbatim** host entry (normalization is lossy —
-    the original is what ``mms eject`` restores, #475),
-    ``identity_unreadable`` names the connection blocks this entry states that
-    identity cannot read (empty for the ordinary entry — see
-    :func:`_candidate_identity_unreadable`), and ``source_ref``
-    is the structured ``{kind, path?}`` record persisted as
-    ``origin.source``. The first source to claim a name wins.
+    Each is a :class:`_DiscoveredCandidate`, which is where the shape of one
+    scanned host entry is documented. The first source to claim a name wins.
 
     A later source claiming the same name is one of two things, and the name
     alone does not say which (#981). A same-name entry whose identity matches
-    the winner is the same server registered twice: it is recorded with a
-    ``duplicate_in`` label note for the UI plus a structured ``duplicates``
-    record (``{label, source_ref, raw}``) so provenance and the prune backup
+    the winner is the same server registered twice, and joins the winner's
+    ``duplicates`` as a record of its own so provenance and the prune backup
     log can address every source. A same-name entry that is a **different**
-    server is recorded in ``conflicts`` (``{label, source_ref}``) instead. No
-    prune execution, backup or provenance consumer reads that list — only the
-    reporting helpers do — so the entry is named to the operator and
-    otherwise left alone.
+    server joins ``conflicts`` instead. No prune execution, backup or
+    provenance consumer reads that list — only the reporting helpers do — so
+    the entry is named to the operator and otherwise left alone.
     """
     sources: list[_DiscoveredSource] = []
 
@@ -3457,7 +3518,7 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
                 )
             )
 
-    seen: dict[str, dict[str, Any]] = {}
+    seen: dict[str, _DiscoveredCandidate] = {}
     warned_unreadable: set[tuple[tuple[str, ...], str, str]] = set()
     for source in sources:
         spec, src_path, servers = source.spec, source.src_path, source.servers
@@ -3502,14 +3563,18 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
                     err=True,
                 )
                 continue
-            # Computed once, here, and carried on the candidate: which
-            # blocks identity cannot read is a fact about the host entry, and
-            # every later reader that re-derived it from ``raw`` plus a
-            # transport had its own chance to derive it differently — which is
-            # how the scoped gate came to read an unknown transport as HTTP
-            # (#984 codex R4).
-            identity = _unreadable_identity_fields(raw, transport=entry["transport"])
-            if identity:
+            source_ref: dict[str, Any] = {"kind": spec.kind}
+            if src_path is not None:
+                source_ref["path"] = src_path
+            # The record derives which blocks identity cannot read, once, and
+            # every reader below consumes that answer — including this note.
+            # Each reader that re-derived it from ``raw`` plus a transport had
+            # its own chance to derive it differently, which is how the scoped
+            # gate came to read an unknown transport as HTTP (#984 codex R4).
+            candidate = _DiscoveredCandidate.from_scan(
+                name, spec, raw=raw, entry=entry, source_ref=source_ref
+            )
+            if candidate.identity_unreadable:
                 # Nothing else says so. The normalizer takes ``env`` /
                 # ``headers`` only when they are already mappings, and drops
                 # the rest without a word, so an operator whose hand-edited
@@ -3525,7 +3590,7 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
                 # Keying on the content instead merged two clients that
                 # genuinely hold identical broken entries into one note, which
                 # is the same silence this note exists to break (codex R3).
-                bad = ", ".join(identity)
+                bad = ", ".join(candidate.identity_unreadable)
                 warn_key = (source.locator, name, bad)
                 if warn_key not in warned_unreadable:
                     warned_unreadable.add(warn_key)
@@ -3536,9 +3601,6 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
                         "Fix that block in the client config to import it.",
                         err=True,
                     )
-            source_ref: dict[str, Any] = {"kind": spec.kind}
-            if src_path is not None:
-                source_ref["path"] = src_path
             if name in seen:
                 # A shared name is not a shared server. Every prune surface
                 # acts on ``[source, *duplicate_in]``, so recording this on the
@@ -3549,17 +3611,7 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
                 # prune side uses, so a Cursor-project entry's explicit cwd
                 # (set above) and a ``.mcp.json`` entry's implied one are the
                 # same claim about the same checkout.
-                loser = {
-                    "name": name,
-                    "source": spec.label,
-                    "entry": entry,
-                    "raw": raw,
-                    "identity_unreadable": identity,
-                    "source_ref": source_ref,
-                }
-                if _candidate_identity_unreadable(seen[name]) or _candidate_identity_unreadable(
-                    loser
-                ):
+                if seen[name].identity_unreadable or candidate.identity_unreadable:
                     # One of the two states an ``env`` / ``headers`` block
                     # this build cannot read. Their normalized entries can
                     # still compare equal — the broken block is erased before
@@ -3570,7 +3622,7 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
                 else:
                     same = _same_server(
                         _candidate_identity_entry(seen[name], cwd),
-                        _candidate_identity_entry(loser, cwd),
+                        _candidate_identity_entry(candidate, cwd),
                     )
                 # ``is True``, not ``is not False``: a discovered entry always
                 # has a signature (``_normalize_client_entry`` requires a
@@ -3579,10 +3631,7 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
                 # and an entry this build cannot compare must never be the one
                 # it deletes.
                 if same is True:
-                    seen[name].setdefault("duplicate_in", []).append(spec.label)
-                    seen[name].setdefault("duplicates", []).append(
-                        {"label": spec.label, "source_ref": source_ref, "raw": copy.deepcopy(raw)}
-                    )
+                    seen[name] = replace(seen[name], duplicates=(*seen[name].duplicates, candidate))
                 else:
                     # Label and structured source only. A conflict is never
                     # backed up, pruned or ejected, so there is nothing to
@@ -3590,53 +3639,33 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
                     # operator is not acting on, whose command line and env can
                     # carry their credentials. The house rule for those is
                     # eject's: name the field, never echo the value (codex R1).
-                    seen[name].setdefault("conflicts", []).append(
-                        {"label": spec.label, "source_ref": source_ref}
+                    seen[name] = replace(
+                        seen[name],
+                        conflicts=(*seen[name].conflicts, _ConflictRecord(spec.label, source_ref)),
                     )
                 continue
-            seen[name] = {
-                "name": name,
-                "source": spec.label,
-                "entry": entry,
-                "raw": copy.deepcopy(raw),
-                "identity_unreadable": identity,
-                "source_ref": source_ref,
-                "is_repo_local": spec.is_repo_local,
-            }
+            seen[name] = candidate
     return list(seen.values())
 
 
-def _build_origin(cand: dict[str, Any], imported_at: str) -> dict[str, Any] | None:
+def _build_origin(cand: _DiscoveredCandidate, imported_at: str) -> dict[str, Any]:
     """Build the per-entry ``origin`` provenance block for an import (#475).
-
-    Returns ``None`` when the candidate carries no verbatim ``raw`` /
-    ``source_ref`` (hand-constructed candidates) — a partial block could not
-    drive a faithful restore, so none is written.
 
     Construction goes through the ``UpstreamOrigin`` pydantic model so the
     shape the CLI writes cannot drift from the schema the server documents
     (``proxy/config.py``). ``pruned`` / ``pruned_at`` stay at their defaults
     here; the prune writers update them per source (PR2 of #475).
     """
-    raw = cand.get("raw")
-    source_ref = cand.get("source_ref")
-    if not isinstance(raw, dict) or not isinstance(source_ref, dict):
-        return None
-
     # Deferred import: ``proxy.config`` materializes the full pydantic model
     # tree, which only the two import commands need — keep it off the CLI's
     # cold-start path.
     from memtomem_stm.proxy.config import OriginSource, UpstreamOrigin
 
     origin = UpstreamOrigin(
-        source=OriginSource(**source_ref),
-        duplicates=[
-            OriginSource(**dup["source_ref"])
-            for dup in cand.get("duplicates") or []
-            if isinstance(dup.get("source_ref"), dict)
-        ],
+        source=OriginSource(**cand.source_ref),
+        duplicates=[OriginSource(**dup.source_ref) for dup in cand.duplicates],
         imported_at=imported_at,
-        original=raw,
+        original=cand.raw,
     )
     return origin.model_dump(mode="json", exclude_none=True)
 
@@ -3658,7 +3687,7 @@ def _format_candidate_detail(entry: dict[str, Any]) -> str:
     return _disp(f"[{transport}] {entry.get('url', '')}")
 
 
-def _overlap_hint(cand: dict[str, Any]) -> str:
+def _overlap_hint(cand: _DiscoveredCandidate) -> str:
     """The trailing ``(also in: …)`` / ``(a different server in: …)`` note.
 
     One definition for both import previews, which is also the reason the
@@ -3668,14 +3697,10 @@ def _overlap_hint(cand: dict[str, Any]) -> str:
     the candidate has neither, so the call sites stay one f-string.
     """
     parts: list[str] = []
-    dup = cand.get("duplicate_in")
+    dup = cand.duplicate_in
     if dup:
         parts.append(f"also in: {', '.join(dup)}")
-    conflicts = [
-        c["label"]
-        for c in cand.get("conflicts") or []
-        if isinstance(c, dict) and isinstance(c.get("label"), str)
-    ]
+    conflicts = [c.source for c in cand.conflicts]
     if conflicts:
         parts.append(f"a different server in: {', '.join(conflicts)}")
     if not parts:
@@ -3730,7 +3755,7 @@ def _print_manual_prune_rows(manual: list[dict[str, str]]) -> None:
         click.echo(f"    {_source_removal_hint(row['name'], row['source'])}")
 
 
-def _print_conflict_rows(candidates: list[dict[str, Any]]) -> None:
+def _print_conflict_rows(candidates: list[_DiscoveredCandidate]) -> None:
     """Name the same-name entries this run treats as a different server.
 
     Without this the operator sees nothing at all for a conflict: it is
@@ -3748,18 +3773,13 @@ def _print_conflict_rows(candidates: list[dict[str, Any]]) -> None:
     rows: list[str] = []
     seen: set[tuple[str, str]] = set()
     for cand in candidates:
-        for conflict in cand.get("conflicts") or []:
-            if not isinstance(conflict, dict):
-                continue
-            label = conflict.get("label")
-            if not isinstance(label, str):
-                continue
-            key = (cand["name"], label)
+        for conflict in cand.conflicts:
+            key = (cand.name, conflict.source)
             if key in seen:
                 continue
             seen.add(key)
             rows.append(
-                f"another '{_disp(cand['name'])}' in {label} is a different "
+                f"another '{_disp(cand.name)}' in {conflict.source} is a different "
                 "server — mms will not touch it"
             )
     if not rows:
@@ -3769,7 +3789,7 @@ def _print_conflict_rows(candidates: list[dict[str, Any]]) -> None:
         click.echo(f"{_warn('Note:')} {row}")
 
 
-def _print_source_removal_hints(imported_candidates: list[dict[str, Any]]) -> None:
+def _print_source_removal_hints(imported_candidates: list[_DiscoveredCandidate]) -> None:
     """Print the post-import dual-registration warning, deduped across sources.
 
     A single server can be discovered in more than one client (e.g. Claude
@@ -3781,8 +3801,8 @@ def _print_source_removal_hints(imported_candidates: list[dict[str, Any]]) -> No
     lines: list[str] = []
     seen: set[str] = set()
     for cand in imported_candidates:
-        for src in [cand["source"], *(cand.get("duplicate_in") or [])]:
-            line = _source_removal_hint(cand["name"], src)
+        for registration in cand.registrations:
+            line = _source_removal_hint(cand.name, registration.source)
             if line in seen:
                 continue
             seen.add(line)
@@ -3974,32 +3994,8 @@ def _append_pruned_backup(
     return (True, None)
 
 
-def _candidate_source_records(
-    cand: dict[str, Any],
-) -> list[tuple[str, dict[str, Any] | None, dict[str, Any] | None]]:
-    """``(label, source_ref, raw)`` for every source registering this candidate.
-
-    Primary source first, then ``duplicate_in`` order — the exact label
-    sequence the prune loop has always acted on (pinned by
-    ``test_duplicate_in_sources_all_pruned``). ``source_ref`` / ``raw``
-    come from the structured ``duplicates`` records discovery captures
-    (#475 PR1); both are ``None`` for old-shape candidates, where there is
-    nothing verbatim to back up or match against an origin row.
-    """
-    records: list[tuple[str, dict[str, Any] | None, dict[str, Any] | None]] = [
-        (cand["source"], cand.get("source_ref"), cand.get("raw"))
-    ]
-    by_label = {
-        dup.get("label"): dup for dup in cand.get("duplicates") or [] if isinstance(dup, dict)
-    }
-    for label in cand.get("duplicate_in") or []:
-        dup = by_label.get(label) or {}
-        records.append((label, dup.get("source_ref"), dup.get("raw")))
-    return records
-
-
 def _prune_imported_candidates(
-    imported_candidates: list[dict[str, Any]],
+    imported_candidates: list[_DiscoveredCandidate],
     *,
     pruned_at: str,
     allowed_sources: set[tuple[str, str]] | None = None,
@@ -4030,11 +4026,11 @@ def _prune_imported_candidates(
     pruned: list[tuple[str, str]] = []
     failed: list[tuple[str, str, str]] = []
     for cand in imported_candidates:
-        for src, source_ref, raw in _candidate_source_records(cand):
-            if (cand["name"], src) not in allowed_sources:
+        for registration in cand.registrations:
+            src = registration.source
+            if (cand.name, src) not in allowed_sources:
                 continue
-            spec = _SOURCE_BY_LABEL.get(src)
-            if spec is not None and not spec.managed:
+            if not registration.spec.managed:
                 # Backstop for a caller that put an unmanaged row in its own
                 # allowlist. Refuses BEFORE the backup append (#955): the log
                 # is append-only and its newest row for a name is what the
@@ -4044,24 +4040,31 @@ def _prune_imported_candidates(
                 # message is rendered here rather than fetched from the writer
                 # — calling a writer for its error string is how the two
                 # copies of the ``managed`` rule drift apart.
-                failed.append((cand["name"], src, _unmanaged_prune_refusal(spec, cand["name"])))
+                failed.append(
+                    (
+                        cand.name,
+                        src,
+                        _unmanaged_prune_refusal(registration.spec, cand.name),
+                    )
+                )
                 continue
-            if isinstance(raw, dict) and isinstance(source_ref, dict):
-                ok, err = _append_pruned_backup(cand["name"], source_ref, raw, pruned_at)
-                if not ok:
-                    failed.append((cand["name"], src, err or "backup log append failed"))
-                    continue
-            ok, err = _prune_from_source(cand["name"], src)
+            ok, err = _append_pruned_backup(
+                cand.name, registration.source_ref, registration.raw, pruned_at
+            )
+            if not ok:
+                failed.append((cand.name, src, err or "backup log append failed"))
+                continue
+            ok, err = _prune_from_source(cand.name, src)
             if ok:
-                pruned.append((cand["name"], src))
+                pruned.append((cand.name, src))
             else:
-                failed.append((cand["name"], src, err or "unknown error"))
+                failed.append((cand.name, src, err or "unknown error"))
     return pruned, failed
 
 
 def _mark_pruned_sources(
     servers: dict[str, Any],
-    candidates: list[dict[str, Any]],
+    candidates: list[_DiscoveredCandidate],
     pruned: list[tuple[str, str]],
     pruned_at: str,
 ) -> bool:
@@ -4077,9 +4080,8 @@ def _mark_pruned_sources(
     """
     refs: dict[tuple[str, str], dict[str, Any]] = {}
     for cand in candidates:
-        for label, source_ref, _raw in _candidate_source_records(cand):
-            if isinstance(source_ref, dict):
-                refs[(cand["name"], label)] = source_ref
+        for registration in cand.registrations:
+            refs[(cand.name, registration.source)] = registration.source_ref
     changed = False
     for name, label in pruned:
         ref = refs.get((name, label))
@@ -4101,7 +4103,7 @@ def _mark_pruned_sources(
     return changed
 
 
-def _confirm_prune_prompt(imported_candidates: list[dict[str, Any]]) -> bool:
+def _confirm_prune_prompt(imported_candidates: list[_DiscoveredCandidate]) -> bool:
     """Post-import prompt offering to prune direct registrations. Default No.
 
     Only called on TTY (callers gate via :func:`_should_use_tui`). Lists the
@@ -4132,7 +4134,7 @@ def _confirm_prune_prompt(imported_candidates: list[dict[str, Any]]) -> bool:
 
 
 def _handle_source_prune(
-    imported_candidates: list[dict[str, Any]],
+    imported_candidates: list[_DiscoveredCandidate],
     *,
     prune: bool,
     config_path: Path,
@@ -4255,7 +4257,7 @@ def _report_prune_results(
 
 def _find_dual_registered(
     stm_upstreams: dict[str, dict[str, Any]], cwd: Path
-) -> list[dict[str, Any]]:
+) -> list[_DiscoveredCandidate]:
     """Return source-client candidates whose name **and identity** match an STM upstream.
 
     Name alone isn't enough: a user can register an unrelated server under
@@ -4279,9 +4281,9 @@ def _find_dual_registered(
     :func:`_prune_imported_candidates` / the ``_handle_source_prune`` machinery.
     """
     all_candidates = _discover_candidates(cwd)
-    dual: list[dict[str, Any]] = []
+    dual: list[_DiscoveredCandidate] = []
     for cand in all_candidates:
-        name = cand["name"]
+        name = cand.name
         if name not in stm_upstreams:
             continue
         # Both sides have a signature and they differ → intentionally distinct
@@ -4292,7 +4294,7 @@ def _find_dual_registered(
             # rather than fall back to the name, which is the whole reason
             # this function compares identities at all.
             continue
-        if _candidate_identity_unreadable(cand):
+        if cand.identity_unreadable:
             # Mirror of the refusal above on the host operand: the entry
             # states an ``env`` / ``headers`` block normalization erased, so
             # the candidate identity compared here is not the host entry's.
@@ -4461,7 +4463,7 @@ def _tui_style() -> Any:
     )
 
 
-def _pick_imports_tui(candidates: list[dict[str, Any]]) -> list[int]:
+def _pick_imports_tui(candidates: list[_DiscoveredCandidate]) -> list[int]:
     """Enter-to-toggle select loop with explicit Confirm / Cancel.
 
     Chose this over ``questionary.checkbox`` after user feedback:
@@ -4485,8 +4487,8 @@ def _pick_imports_tui(candidates: list[dict[str, Any]]) -> list[int]:
         for i, c in enumerate(candidates):
             marker = "[v]" if i in picks else "[ ]"
             title = (
-                f"{marker}  {_disp(c['name']):<18}  "
-                f"{_format_candidate_detail(c['entry'])}  — from {c['source']}"
+                f"{marker}  {_disp(c.name):<18}  "
+                f"{_format_candidate_detail(c.entry)}  — from {c.source}"
             )
             choices.append(questionary.Choice(title=title, value=i))
         choices.append(questionary.Separator())
@@ -4531,7 +4533,7 @@ def _pick_imports_tui(candidates: list[dict[str, Any]]) -> list[int]:
             picks.add(result)
 
 
-def _pick_imports(candidates: list[dict[str, Any]]) -> list[int]:
+def _pick_imports(candidates: list[_DiscoveredCandidate]) -> list[int]:
     """Prompt the user to choose which discovered candidates to import.
 
     TTY → :func:`_pick_imports_tui` (enter-to-toggle loop). Non-TTY → the
@@ -4757,7 +4759,7 @@ def _add_from_clients(
         # just the importable remainder: a name no client advertises is a
         # typo, and a typo must not half-succeed by importing the names that
         # did resolve. Checked before any write.
-        discovered = {cand["name"] for cand in all_candidates}
+        discovered = {cand.name for cand in all_candidates}
         unknown = [n for n in dict.fromkeys(select_names) if n not in discovered]
         if unknown:
             available = sorted(discovered)
@@ -4770,7 +4772,7 @@ def _add_from_clients(
                 _json_fail("add", "unknown_server", msg, unknown=unknown, available=available)
             sys.exit(1)
         requested = set(select_names)
-        all_candidates = [cand for cand in all_candidates if cand["name"] in requested]
+        all_candidates = [cand for cand in all_candidates if cand.name in requested]
 
     if not all_candidates:
         info("No MCP servers found in Claude Desktop / Code / Cursor / .mcp.json.")
@@ -4820,10 +4822,10 @@ def _add_from_clients(
             else:
                 unresolved_signatures.append(sig)
 
-    new_candidates: list[dict[str, Any]] = []
+    new_candidates: list[_DiscoveredCandidate] = []
     for cand in all_candidates:
-        cand_name = cand["name"]
-        entry = cand["entry"]
+        cand_name = cand.name
+        entry = cand.entry
         if cand_name in existing_names:
             click.echo(
                 f"  {_warn('Skipping:')} '{_disp(cand_name)}' — already registered.",
@@ -4831,7 +4833,7 @@ def _add_from_clients(
             )
             skipped.append({"name": cand_name, "reason": "already_registered"})
             continue
-        if _candidate_identity_unreadable(cand):
+        if cand.identity_unreadable:
             # The host operand's mirror of ``ambiguous_identity`` below. The
             # normalizer erased the block, so importing would adopt a server
             # stripped of settings its host entry states, and calling it a
@@ -4891,8 +4893,8 @@ def _add_from_clients(
         click.echo(_hdr(f"Found {len(new_candidates)} new MCP server(s) to import:"))
         for i, cand in enumerate(new_candidates, 1):
             click.echo(
-                f"  {i:>2}. {_disp(cand['name']):<18} {_format_candidate_detail(cand['entry'])}"
-                f"    — from {cand['source']}{_overlap_hint(cand)}"
+                f"  {i:>2}. {_disp(cand.name):<18} {_format_candidate_detail(cand.entry)}"
+                f"    — from {cand.source}{_overlap_hint(cand)}"
             )
         click.echo("")
         picks = _pick_imports(new_candidates)
@@ -4903,9 +4905,9 @@ def _add_from_clients(
             return
 
     selected_candidates = [new_candidates[i] for i in picks]
-    repo_local = [cand for cand in selected_candidates if cand.get("is_repo_local") is True]
+    repo_local = [cand for cand in selected_candidates if cand.is_repo_local]
     if repo_local and not allow_project_configs:
-        names = [str(cand["name"]) for cand in repo_local]
+        names = [cand.name for cand in repo_local]
         msg = project_local_gate_message([_disp(name) for name in names])
         click.echo(f"{_err('Error:')} {msg}", err=True)
         if as_json:
@@ -4928,21 +4930,18 @@ def _add_from_clients(
     for idx in picks:
         cand = new_candidates[idx]
         if noninteractive:
-            prefix = _auto_prefix(cand["name"], used_prefixes, warnings_json)
+            prefix = _auto_prefix(cand.name, used_prefixes, warnings_json)
         else:
             # Escape the value, never the styled result: ``_hdr`` wraps this
             # line in a bold SGR span whose own escapes must stay real (#755).
-            click.echo(_hdr(f"Configuring '{_disp(cand['name'])}'"))
-            suggested = _suggest_prefix(cand["name"], used_prefixes)
+            click.echo(_hdr(f"Configuring '{_disp(cand.name)}'"))
+            suggested = _suggest_prefix(cand.name, used_prefixes)
             prefix = _prompt_prefix(default=suggested, taken=used_prefixes)
         used_prefixes.add(prefix)
-        entry = {"prefix": prefix, **cand["entry"]}
-        origin = _build_origin(cand, imported_at)
-        if origin is not None:
-            entry["origin"] = origin
-        imported[cand["name"]] = entry
+        entry = {"prefix": prefix, **cand.entry, "origin": _build_origin(cand, imported_at)}
+        imported[cand.name] = entry
         imported_rows.append(
-            {"name": cand["name"], "prefix": prefix, "source": cand["source"], "server": None}
+            {"name": cand.name, "prefix": prefix, "source": cand.source, "server": None}
         )
 
     if validate:
@@ -5285,25 +5284,23 @@ def init(
 
     candidates = [] if demo else _discover_candidates(Path.cwd())
     if not allow_project_configs:
-        # Keyed on the marker, not on one label: the marker is what says "this
-        # file came from the checkout", and a second repo-local source would
-        # otherwise walk straight past a label comparison (#955). The label is
-        # still consulted when a candidate carries no marker at all, so this
-        # cannot admit a shape the old comparison refused.
-        candidates = [cand for cand in candidates if not _is_repo_local_candidate(cand)]
+        # Keyed on the source's own marker, not on one label: the marker is
+        # what says "this file came from the checkout", and a second repo-local
+        # source would otherwise walk straight past a label comparison (#955).
+        candidates = [cand for cand in candidates if not cand.is_repo_local]
     # Same refusal ``mms add --from-clients`` makes, applied at the other
     # entry point so the class has one answer: normalization erased the
     # entry's ``env`` / ``headers`` block, so importing adopts a server
     # stripped of settings its host entry states — and this flow offers to
     # delete that host entry afterwards, which would leave the block only in
     # the backup log. Discovery already named the entry and the field (#984).
-    candidates = [cand for cand in candidates if not _candidate_identity_unreadable(cand)]
+    candidates = [cand for cand in candidates if not cand.identity_unreadable]
     imported: dict[str, dict[str, Any]] = {}
     # Parallel list of the source-client candidate dicts for entries we
     # actually import. Needed so the end-of-flow prune step can address the
     # exact ``(name, source, duplicate_in)`` triples via ``_handle_source_prune``
     # — and to leave the ``conflicts`` sources out of them (#981).
-    imported_candidates: list[dict[str, Any]] = []
+    imported_candidates: list[_DiscoveredCandidate] = []
 
     if demo:
         imported["demo"] = {
@@ -5324,8 +5321,8 @@ def init(
         # invisible.
         for i, cand in enumerate(candidates, 1):
             click.echo(
-                f"  {i:>2}. {_disp(cand['name']):<18} {_format_candidate_detail(cand['entry'])}"
-                f"    — from {cand['source']}{_overlap_hint(cand)}"
+                f"  {i:>2}. {_disp(cand.name):<18} {_format_candidate_detail(cand.entry)}"
+                f"    — from {cand.source}{_overlap_hint(cand)}"
             )
         click.echo("")
         picks = _pick_imports(candidates)
@@ -5350,15 +5347,15 @@ def init(
             cand = candidates[idx]
             # Escape the value, never the styled result: ``_hdr`` wraps this
             # line in a bold SGR span whose own escapes must stay real (#755).
-            click.echo(_hdr(f"Configuring '{_disp(cand['name'])}'"))
-            suggested = _suggest_prefix(cand["name"], used_prefixes)
+            click.echo(_hdr(f"Configuring '{_disp(cand.name)}'"))
+            suggested = _suggest_prefix(cand.name, used_prefixes)
             prefix = _prompt_prefix(default=suggested, taken=used_prefixes)
             used_prefixes.add(prefix)
-            entry = {"prefix": prefix, **cand["entry"]}
-            origin = _build_origin(cand, imported_at)
-            if origin is not None:
-                entry["origin"] = origin
-            imported[cand["name"]] = entry
+            imported[cand.name] = {
+                "prefix": prefix,
+                **cand.entry,
+                "origin": _build_origin(cand, imported_at),
+            }
             imported_candidates.append(cand)
     else:
         # Zero discovered candidates → true first-time user without any
@@ -6449,7 +6446,7 @@ def prune(
         # but with a divergent identity (``_find_dual_registered`` skipped it
         # precisely because the source-client entry looks like a different
         # server). The error surfaces all three branches in one message.
-        dual_names = {c["name"] for c in dual}
+        dual_names = {c.name for c in dual}
         missing = set(names) - dual_names
         if missing:
             click.echo(
@@ -6471,7 +6468,7 @@ def prune(
                 )
             sys.exit(1)
         requested = set(names)
-        dual = [c for c in dual if c["name"] in requested]
+        dual = [c for c in dual if c.name in requested]
 
     if not dual:
         if as_json:
@@ -6490,9 +6487,9 @@ def prune(
     # leave the detail column ragged for exactly the rows the escaping is
     # for (#755). ``planned`` keeps the stored name — it is the ``--json``
     # plan, and its consumer matches it against the config.
-    disp_names = {c["name"]: _disp(c["name"]) for c in dual}
+    disp_names = {c.name: _disp(c.name) for c in dual}
     name_width = max((len(n) for n in disp_names.values()), default=0)
-    details = {c["name"]: _format_candidate_detail(c["entry"]) for c in dual}
+    details = {c.name: _format_candidate_detail(c.entry) for c in dual}
     planned, manual = _prune_targets(dual)
     if not as_json:
         for row in planned:
