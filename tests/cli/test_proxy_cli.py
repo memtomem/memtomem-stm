@@ -3611,6 +3611,48 @@ class TestInitDiscoveryHelpers:
         assert not _is_self_reference({"command": "uvx", "args": ["--from", "memtomem-notes"]})
 
 
+class TestIdentityFieldsWidening:
+    """Which blocks identity reads, per transport — the rule both operands
+    share (#984 codex R2/R4).
+
+    Owned by a test of its own because the candidate side no longer reaches
+    every input: `_DiscoveredCandidate` refuses an entry that cannot name a
+    transport, so the empty-string row here is exercised through the
+    registered operand, which reads its transport out of a hand-editable
+    `stm_proxy.json`. Deleting the candidate-side case without this would
+    have left the widening branch with no test at all.
+    """
+
+    @pytest.mark.parametrize(
+        ("transport", "expected"),
+        [
+            ("stdio", ("env",)),
+            ("sse", ("headers",)),
+            ("streamable_http", ("headers",)),
+            # Unknown means "which field is inert is unknown", not "the other
+            # transport": reading it the other way ignored `env` on
+            # {"transport": "bogus"} and `headers` on {"transport": ""}.
+            ("bogus", ("env", "headers")),
+            ("", ("env", "headers")),
+            (None, ("env", "headers")),
+        ],
+    )
+    def test_only_an_unknown_transport_widens_to_both_blocks(self, transport, expected):
+        from memtomem_stm.cli.proxy import _identity_fields
+
+        assert _identity_fields(transport) == expected
+
+    @pytest.mark.parametrize("transport", ["", "bogus"])
+    def test_a_registered_entry_naming_no_known_transport_is_asked_about_both(self, transport):
+        """The registered operand's path to the same rule. Both blocks are
+        broken here so the answer names both; asking about only one is what
+        let a prune delete on an identity nothing established."""
+        from memtomem_stm.cli.proxy import _unreadable_identity_fields
+
+        cfg = {"transport": transport, "command": "npx", "env": ["DB=prod"], "headers": ["A: 1"]}
+        assert _unreadable_identity_fields(cfg) == ("env", "headers")
+
+
 class TestDiscoveredCandidateRecord:
     """The typed record every discovery consumer reads (#987).
 
@@ -3656,7 +3698,12 @@ class TestDiscoveredCandidateRecord:
         """Which block identity reads follows the transport, so a candidate
         that cannot state one has no answer to give — and the reader that
         defaulted it to stdio read an HTTP entry's broken `headers` as inert,
-        on the one path that deletes on a bare name match (#984 codex R3)."""
+        on the one path that deletes on a bare name match (#984 codex R3).
+
+        `""` is refused here rather than widened: an empty string names no
+        transport, so it belongs with the absent case. The widening it used
+        to take is still `_identity_fields`' answer for the registered
+        operand — pinned in `TestIdentityFieldsWidening` below."""
         with pytest.raises(ValueError, match="transport"):
             self._record(entry=entry)
 

@@ -3193,11 +3193,17 @@ class _DiscoveredCandidate:
             # a candidate that cannot state one leaves every reader to pick a
             # default — and the reader that picked stdio read an HTTP entry's
             # broken ``headers`` as inert (#984 codex R3). Refused here
-            # instead. Deliberately not checked against a list of known
-            # transports: ``""`` and ``"bogus"`` are answered by
-            # :func:`_identity_fields` widening to both blocks, and a second
-            # transport table beside :func:`_normalize_client_entry`'s is the
-            # drift this record exists to end.
+            # instead. ``""`` is refused with the absent case rather than
+            # widened: an empty string names no transport either.
+            #
+            # An unrecognized *non-empty* string is a different answer and is
+            # deliberately NOT refused — :func:`_identity_fields` widens
+            # ``"bogus"`` to both blocks, which is the fail-closed reading
+            # this record must not pre-empt, and a second transport table
+            # beside :func:`_normalize_client_entry`'s is the drift it exists
+            # to end. The empty-string branch of that widening stays live for
+            # the registered operand, which reads a transport straight out of
+            # a hand-editable ``stm_proxy.json``.
             raise ValueError(f"candidate {self.name!r}: entry must name a transport")
 
     @property
