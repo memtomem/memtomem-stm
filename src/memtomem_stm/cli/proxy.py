@@ -3143,7 +3143,14 @@ def _candidate_identity_unreadable(cand: dict[str, Any]) -> bool:
     The transport comes from the normalized ``entry`` rather than from ``raw``:
     a host config states its transport as a ``type`` hint the normalizer
     resolves, and which of the two fields identity reads follows that
-    resolution.
+    resolution. A candidate whose ``entry`` cannot say — absent, or not a
+    mapping — is asked about **both** blocks instead of being defaulted to
+    stdio: defaulting reads an HTTP entry's broken ``headers`` as inert, and
+    the caller that would then see it is ``_find_dual_registered``, which
+    treats a candidate with no signature as a degraded name match and deletes
+    it. Discovery always supplies ``entry``, so this is the malformed-caller
+    boundary rather than a reachable file shape — and a destructive boundary
+    fails closed (codex R3).
 
     Returns ``False`` for a candidate carrying no ``raw`` (hand-built ones, and
     tests): there is no host entry to have broken, and inventing one would
@@ -3152,8 +3159,13 @@ def _candidate_identity_unreadable(cand: dict[str, Any]) -> bool:
     raw = cand.get("raw")
     if not isinstance(raw, dict):
         return False
-    entry = cand.get("entry") or {}
-    return _identity_fields_unreadable(raw, transport=entry.get("transport", "stdio"))
+    entry = cand.get("entry")
+    transport = entry.get("transport") if isinstance(entry, dict) else None
+    if not isinstance(transport, str):
+        return any(
+            _identity_fields_unreadable(raw, transport=t) for t in ("stdio", "streamable_http")
+        )
+    return _identity_fields_unreadable(raw, transport=transport)
 
 
 def _identity_field(transport: str | None) -> str:
@@ -3274,7 +3286,15 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
     reporting helpers do — so the entry is named to the operator and
     otherwise left alone.
     """
-    sources: list[tuple[_SourceSpec, str | None, dict[str, Any]]] = []
+    # ``origin`` is the physical location the servers were read from —
+    # ``<file>#<slot>``, since two sources can share a file (Claude Code's
+    # user scope and its per-project slot both live in ``~/.claude.json``) and
+    # two labels can share a slot (running from ``$HOME`` makes
+    # ``~/.cursor/mcp.json`` both the Cursor user and the Cursor project
+    # source). It is not ``src_path``: that one is provenance, recorded only
+    # for checkout-scoped kinds. Used to say a thing once per entry rather
+    # than once per label (#984 codex R3).
+    sources: list[tuple[_SourceSpec, str | None, str, dict[str, Any]]] = []
 
     # 1. Project-scope ``.mcp.json`` in cwd (Claude Code project config).
     mcp_json_path = cwd / ".mcp.json"
@@ -3284,15 +3304,24 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
             (
                 _SOURCE_BY_LABEL[".mcp.json (project)"],
                 str(mcp_json_path.resolve()),
+                f"{mcp_json_path.resolve()}#mcpServers",
                 proj["mcpServers"],
             )
         )
 
     # 2. Claude Code ~/.claude.json user-scope + per-project entries.
-    cc = _read_json_safely(Path("~/.claude.json").expanduser())
+    claude_json = Path("~/.claude.json").expanduser()
+    cc = _read_json_safely(claude_json)
     if cc:
         if isinstance(cc.get("mcpServers"), dict):
-            sources.append((_SOURCE_BY_LABEL["Claude Code (user)"], None, cc["mcpServers"]))
+            sources.append(
+                (
+                    _SOURCE_BY_LABEL["Claude Code (user)"],
+                    None,
+                    f"{claude_json}#mcpServers",
+                    cc["mcpServers"],
+                )
+            )
         projects = cc.get("projects")
         if isinstance(projects, dict):
             # Match on resolved cwd so we don't duplicate entries across sibling projects.
@@ -3303,15 +3332,24 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
                     (
                         _SOURCE_BY_LABEL["Claude Code (project)"],
                         resolved_cwd,
+                        f"{claude_json}#projects/{resolved_cwd}/mcpServers",
                         proj_entry["mcpServers"],
                     )
                 )
 
     # 3. Claude Desktop (platform-specific path from `_desktop_config_path`;
     #    absent file → skipped).
-    desktop = _read_json_safely(_desktop_config_path())
+    desktop_path = _desktop_config_path()
+    desktop = _read_json_safely(desktop_path)
     if desktop and isinstance(desktop.get("mcpServers"), dict):
-        sources.append((_SOURCE_BY_LABEL["Claude Desktop"], None, desktop["mcpServers"]))
+        sources.append(
+            (
+                _SOURCE_BY_LABEL["Claude Desktop"],
+                None,
+                f"{desktop_path}#mcpServers",
+                desktop["mcpServers"],
+            )
+        )
 
     # 4-5. Cursor, user then project. Same files and labels as
     # ``import_hosts.scan_cursor``: the gate message this command prints names
@@ -3328,12 +3366,17 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
         if servers:
             spec = _SOURCE_BY_LABEL[label]
             sources.append(
-                (spec, str(path.resolve()) if spec.is_checkout_scoped else None, servers)
+                (
+                    spec,
+                    str(path.resolve()) if spec.is_checkout_scoped else None,
+                    f"{path.resolve()}#servers",
+                    servers,
+                )
             )
 
     seen: dict[str, dict[str, Any]] = {}
     warned_unreadable: set[tuple[str, str, str]] = set()
-    for spec, src_path, servers in sources:
+    for spec, src_path, origin, servers in sources:
         if not isinstance(servers, dict):
             continue
         for name, raw in servers.items():
@@ -3384,14 +3427,15 @@ def _discover_candidates(cwd: Path) -> list[dict[str, Any]]:
                 # Named, never echoed — an env block is where a host entry
                 # keeps its secrets (#984).
                 #
-                # Keyed on the entry itself, not on the source: running from
-                # ``$HOME`` makes ``~/.cursor/mcp.json`` both the user and the
-                # project Cursor source, so one physical entry is scanned
-                # twice and warned twice. Two clients that really do hold a
-                # broken entry of the same name hold different ones, and each
-                # still gets its note (codex R2).
+                # Keyed on where the entry physically lives, not on the label
+                # and not on its content: running from ``$HOME`` makes
+                # ``~/.cursor/mcp.json`` both the user and the project Cursor
+                # source, so one entry is scanned twice and was warned twice.
+                # Keying on the content instead merged two clients that
+                # genuinely hold identical broken entries into one note, which
+                # is the same silence this note exists to break (codex R3).
                 bad = _identity_field(entry["transport"])
-                warn_key = (name, bad, json.dumps(raw, sort_keys=True, default=str))
+                warn_key = (origin, name, bad)
                 if warn_key not in warned_unreadable:
                     warned_unreadable.add(warn_key)
                     click.echo(

@@ -11038,6 +11038,55 @@ class TestUnreadableHostIdentityPrune:
 
         assert result.output.count("block is not a mapping") == 1
 
+    def test_two_clients_holding_identical_broken_entries_each_get_a_note(
+        self, runner, config, tmp_path, monkeypatch, fake_claude
+    ):
+        """The dedup must not buy silence. Two clients can hold the same
+        broken entry, and suppressing the second source's note is the same
+        silence the note exists to break — the first version keyed on the
+        entry's content and did exactly that (codex R3)."""
+        home, _cwd, desktop = self._setup_home(tmp_path, monkeypatch)
+        broken = {"command": "npx", "args": ["-y", "@me/docs"], "env": ["DB=prod"]}
+        self._write_client(home, dict(broken))
+        (desktop / "claude_desktop_config.json").write_text(
+            json.dumps({"mcpServers": {"docs": dict(broken)}}, indent=2), encoding="utf-8"
+        )
+        self._seed_config(
+            config,
+            {"prefix": "docs", "transport": "stdio", "command": "npx", "args": ["-y", "@me/docs"]},
+        )
+
+        result = runner.invoke(cli, ["prune", "docs", "--yes", *_cfg_args(config)])
+
+        assert result.output.count("block is not a mapping") == 2
+        assert "Claude Code (user)" in result.output
+        assert "Claude Desktop" in result.output
+
+    def test_a_candidate_whose_entry_cannot_name_a_transport_fails_closed(self):
+        """The transport comes from the normalized entry, so a candidate
+        without one has to be asked about both blocks. Defaulting to stdio
+        read an HTTP entry's broken `headers` as inert, and the caller that
+        sees such a candidate — `_find_dual_registered` — treats a missing
+        signature as a degraded name match and deletes it (codex R3)."""
+        from memtomem_stm.cli.proxy import _candidate_identity_unreadable
+
+        raw = {"type": "http", "url": "https://docs.example/mcp", "headers": ["Auth: t"]}
+        assert _candidate_identity_unreadable({"name": "docs", "raw": raw}) is True
+        assert _candidate_identity_unreadable({"name": "docs", "raw": raw, "entry": None}) is True
+        # An entry that does name the transport keeps the scoped reading; an
+        # empty one names none, so it is asked about both blocks like the rest.
+        stdio_inert = {"command": "npx", "headers": ["X: 1"]}
+        assert (
+            _candidate_identity_unreadable(
+                {"name": "docs", "raw": stdio_inert, "entry": {"transport": "stdio"}}
+            )
+            is False
+        )
+        assert (
+            _candidate_identity_unreadable({"name": "docs", "raw": stdio_inert, "entry": {}})
+            is True
+        )
+
     def test_a_same_name_entry_with_an_unreadable_block_is_a_conflict(
         self, runner, config, tmp_path, monkeypatch, fake_claude
     ):

@@ -68,34 +68,43 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
-- **`mms prune` no longer deletes a host entry whose `env` or `headers` block
-  is not a mapping** (#984). Those blocks joined server identity in #983 and a
-  registered entry stating an unreadable one is refused there, but the same
-  shape in a *client* config is erased before identity ever sees it:
-  normalization takes `env` / `headers` only when they are already mappings,
-  so a host entry carrying `"env": ["DB=prod"]` became a candidate holding no
-  env at all. Against an STM upstream that held none either, identity then
-  answered "same server" -- the erasure making the deletion look justified --
-  and the block survived only in the prune backup log, which is silent and
-  advisory. That shape is now the host-side name for the state the registered
-  side already refuses, and each of the three readers answers it for itself:
-  `mms prune` skips the entry, `mms add --from-clients` declines the candidate
-  with `ambiguous_identity` instead of skipping it as a `duplicate_signature`
-  it never established, and discovery records a same-name entry in a second
-  client as a conflict rather than folding it onto the first entry's prune
-  list. Discovery also says so when it reads one, naming the field and the
-  source and never the value -- an env block is where a host entry keeps its
-  secrets, and the normalizer's silence was the mechanism: nothing warned, and
-  `mms list` showed the imported entry as ordinary. The reachable path is a
-  config a hand edit or a generator broke rather than one a client wrote.
+- **`mms prune` no longer deletes a host entry whose transport-relevant
+  connection block is not a mapping** (#984) -- `env` for stdio, `headers` for
+  HTTP. Those blocks joined server identity in #983 and a registered entry
+  stating an unreadable one is refused there, but the same shape in a *client*
+  config is erased before identity ever sees it: normalization takes `env` /
+  `headers` only when they are already mappings, so a host entry carrying
+  `"env": ["DB=prod"]` became a candidate holding no env at all. Against an
+  STM upstream that held none either, identity then answered "same server" --
+  the erasure making the deletion look justified -- and the block survived
+  only in the prune backup log, which is silent and advisory.
+  That shape is now the host-side name for the state the registered side
+  already refuses, and each reader answers it for itself: `mms prune` skips
+  the entry, `mms add --from-clients` declines the candidate with
+  `ambiguous_identity` instead of skipping it as a `duplicate_signature` it
+  never established (a candidate whose *name* is already registered stays
+  `already_registered`, which is checked first), discovery records a same-name
+  entry in a second client as a conflict rather than folding it onto the first
+  entry's prune list, and `mms init` withholds it from the servers it offers.
+  That last one compares nothing -- the config it writes is new -- but it
+  imports the stripped entry and then offers to delete the host entry that
+  holds the block, so the candidate is withheld from its selection for the
+  same reason rather than only from the comparing paths.
+  Discovery also says so when it reads one, naming the field and the source
+  and never the value -- an env block is where a host entry keeps its secrets,
+  and the normalizer's silence was the mechanism: nothing warned, and `mms
+  list` showed the imported entry as ordinary. The note is emitted once per
+  entry rather than once per label, since one file can be scanned as two
+  sources (running from `$HOME` makes `~/.cursor/mcp.json` both the Cursor
+  user and the Cursor project source). A hand edit or a config generator can
+  produce the shape; nothing here establishes what any particular client
+  writes.
   Only the block the transport actually reads counts, on both operands: a
   stdio `headers` or an HTTP `env` carries no signature and separates no pair
   of servers, so refusing on one would have contradicted the comparator this
-  gate defends. `mms init`
-  compares nothing -- the config it writes is new -- but it imports the
-  stripped entry and then offers to delete the host entry that holds the
-  block, so the candidate is withheld from its selection for the same reason
-  rather than only from the comparing paths.
+  gate defends. A candidate whose entry names no transport at all -- which
+  discovery never produces -- is asked about both, since the reader that would
+  see it deletes on a name match.
 
 - **`env` and `headers` are part of server identity, so a registration that
   differs only there is no longer treated as the same server** (#983).
