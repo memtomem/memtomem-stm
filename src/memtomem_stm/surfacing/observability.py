@@ -259,11 +259,15 @@ class CallLedger:
         expired) and charges the circuit breaker, but those counters live on
         the *daemon's* engine, which no ``stm_surfacing_stats`` reader can see
         — that tool renders the MCP server process's own engine, a different
-        object in a different process. So the daemon counts these separately
-        as ``pre_rpc_faults`` in its latency snapshot, which is not a duration
-        and never enters the percentiles: it exists only so an operator can
-        tell "requests died before the search went out" from "nobody used this
-        daemon", which every other counter reports identically.
+        object in a different process. (The durable fault store does
+        span both, so ``mms stats`` reports these when a feedback tracker is
+        attached; its scope is shared and retention-windowed rather than this
+        daemon's since-start one.) So the daemon counts them separately as
+        ``pre_rpc_faults`` in its latency snapshot, which is not a duration and
+        never enters the percentiles: it exists only so an operator reading
+        that snapshot can tell "requests died before the search went out" from
+        "nobody used this daemon", which every other counter there reports
+        identically.
         """
         return self.ltm_rpc_issued
 

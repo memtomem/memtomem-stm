@@ -485,6 +485,13 @@ class DaemonServer:
                 surface_deadline = self._surface_deadline(req)
                 if surface_deadline is None:
                     logger.debug("surface skipped: no budget left in the client deadline")
+                    # Shed before the engine is touched, so nothing records a
+                    # terminal and the ledger stays empty -- which the
+                    # classification below reads as "no observation" and drops.
+                    # Counted here instead: a daemon shedding every request at
+                    # this floor is saturated, and without this it looks
+                    # exactly like one nobody is calling (#994).
+                    self._latency.record_pre_rpc_fault("surface")
                     return surface_response({})
                 output = await run_surfacing_hook(
                     call, engine=self._engine, deadline_monotonic=surface_deadline
@@ -846,6 +853,11 @@ class DaemonServer:
                 # question and stays out of the percentiles.
                 if ledger.faulted:
                     self._latency.record_pre_rpc_fault(latency_kind)
+                # A healthy pre-RPC skip -- the hook allowlist, a gate
+                # cooldown, a cache-decided terminal -- is deliberately not
+                # counted. Surfacing does more of those than everything else
+                # combined, so counting them would bury the signal this exists
+                # for under ordinary traffic.
             if latency_kind is not None and activity_observed:
                 elapsed_ms = (time.monotonic() - started) * 1000.0
                 self_timed_out = ledger is not None and ledger.timed_out

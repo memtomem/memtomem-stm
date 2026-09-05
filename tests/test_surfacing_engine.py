@@ -1515,6 +1515,35 @@ class TestLedgerRpcMark:
             await adapter.search("q")
         assert searched.retrieval_attempted is True
 
+    async def test_a_bookkeeping_rpc_does_not_mark(self):
+        # ``_rpc`` also carries the scratch / proposal / access-boost mutations
+        # a surfacing call makes around its search. Marking one would make a
+        # request whose search never went out look like one that did, purely
+        # because some later bookkeeping call did -- and the only reason that
+        # is not already wrong is that today's call graph happens to search
+        # first. The marker names the two search actions instead of trusting
+        # the order.
+        from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+        from memtomem_stm.surfacing.observability import attribute_call
+
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
+        session = AsyncMock()
+        session.call_tool = AsyncMock(return_value=self._hit())
+
+        with attribute_call() as bookkeeping:
+            await adapter._rpc(
+                session, 1, "mem_do", {"action": "increment_access", "params": {}}
+            )
+        assert bookkeeping.retrieval_attempted is False
+
+        with attribute_call() as composed:
+            await adapter._rpc(session, 1, "mem_do", {"action": "context_compose", "params": {}})
+        assert composed.retrieval_attempted is True
+
+        with attribute_call() as searched:
+            await adapter._rpc(session, 1, "mem_search", {"query": "q"})
+        assert searched.retrieval_attempted is True
+
     async def test_a_round_trip_that_times_out_is_still_marked(self):
         # The positive control for the two negatives above: the same
         # ``error_timeout`` terminal, but this time a request did go out and

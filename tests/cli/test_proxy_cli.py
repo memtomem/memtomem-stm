@@ -17087,6 +17087,115 @@ class TestDoctor:
         assert "outer hook deadline truncates" in result.output
         assert "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS=10" in result.output
 
+    def test_doctor_warns_when_every_surfacing_attempt_failed(
+        self, runner, config, monkeypatch
+    ):
+        # A failing dependency used to arrive as successful durations; it now
+        # lands in the failure counters instead (#994). Reading only
+        # ``samples`` therefore turned a daemon whose every search fails into
+        # "PASS -- collecting telemetry", which says the opposite of what is
+        # wrong. Cold samples stay out of the count: not-yet-warm IS still
+        # collecting.
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._healthy_config(config)
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(
+            proxy_mod,
+            "_surfacing_bootstrap_status",
+            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False, config_path=None: {
+                "enabled": True,
+                "feedback_enabled": False,
+                "feedback_db": None,
+                "timeouts": {"surfacing_seconds": 3.0, "hook_daemon_seconds": 2.5},
+                "ltm_server": {
+                    "route": "daemon",
+                    "connected": True,
+                    "display": "mms daemon",
+                    "latency": {
+                        "surface": {
+                            "samples": 0,
+                            "timeout_samples": 2,
+                            "error_samples": 6,
+                            "cold_samples": 3,
+                            "pre_rpc_faults": 4,
+                            "recommendation": {"status": "collecting", "seconds": None},
+                        },
+                        "retrieval": {
+                            "samples": 0,
+                            "recommendation": {"status": "collecting", "seconds": None},
+                        },
+                    },
+                    "measurement": None,
+                },
+            },
+        )
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        # WARN-only keeps doctor at exit 0 by its own contract.
+        assert result.exit_code == 0, result.output
+        timeout_line = next(
+            line for line in result.output.splitlines() if "surfacing timeout" in line
+        )
+        assert "WARN" in timeout_line
+        # 2 timeouts + 6 errors + 4 pre-RPC faults; the 3 cold samples are not
+        # failures and must not be counted.
+        assert "12 failed surfacing attempts" in result.output
+        assert "collecting telemetry" not in result.output
+
+    def test_doctor_still_reports_collecting_for_an_unused_daemon(
+        self, runner, config, monkeypatch
+    ):
+        # The control: zero observations of any kind is genuinely "collecting",
+        # and widening the check must not turn every quiet daemon into a WARN.
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._healthy_config(config)
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(
+            proxy_mod,
+            "_surfacing_bootstrap_status",
+            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False, config_path=None: {
+                "enabled": True,
+                "feedback_enabled": False,
+                "feedback_db": None,
+                "timeouts": {"surfacing_seconds": 3.0, "hook_daemon_seconds": 2.5},
+                "ltm_server": {
+                    "route": "daemon",
+                    "connected": True,
+                    "display": "mms daemon",
+                    "latency": {
+                        "surface": {
+                            "samples": 0,
+                            "timeout_samples": 0,
+                            "error_samples": 0,
+                            "cold_samples": 3,
+                            "pre_rpc_faults": 0,
+                            "recommendation": {"status": "collecting", "seconds": None},
+                        },
+                        "retrieval": {
+                            "samples": 0,
+                            "recommendation": {"status": "collecting", "seconds": None},
+                        },
+                    },
+                    "measurement": None,
+                },
+            },
+        )
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert "collecting telemetry (0/5 successful warm samples)" in result.output
+        assert "failed surfacing attempts" not in result.output
+
     def test_score_scale_mismatch_diagnostic_fails_before_ceiling_heuristic(
         self, runner, config, monkeypatch
     ):

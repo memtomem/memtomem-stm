@@ -98,13 +98,20 @@ class _Series:
     timeout_samples: int = 0
     error_samples: int = 0
     cold_samples: int = 0
-    # Requests that reached a dependency fault without ever issuing a search
-    # RPC: session healing failed, pre-timeout work spent the window, or the
-    # breaker refused the attempt. Deliberately not a duration -- the time is
-    # not a measurement of the LTM (#994) -- but the operator still has to be
-    # able to tell "requests died before the search went out" from "nobody
-    # used this daemon", and every other counter here reads identically for
-    # the two.
+    # Requests that ended badly without ever issuing a search RPC: session
+    # healing failed, pre-timeout work spent the window, the breaker refused
+    # the attempt, or the daemon shed the call because too little of the
+    # client's deadline was left to start one. Deliberately not a duration --
+    # the time is not a measurement of the LTM (#994) -- but the operator still
+    # has to be able to tell "requests died before the search went out" from
+    # "nobody used this daemon", and every other counter here reads identically
+    # for the two. Healthy pre-RPC skips (allowlist, gate, cache) are not
+    # counted; they are the overwhelming majority and would bury the signal.
+    #
+    # Only the ``surface`` series can move: the raw LTM ops run without a
+    # ledger (``attribute=False``) and their operation *is* the round trip, so
+    # they have no pre-RPC stage to report. The key is present on both series
+    # so the snapshot shape stays uniform for a JSON consumer.
     pre_rpc_faults: int = 0
 
     def record_pre_rpc_fault(self) -> None:

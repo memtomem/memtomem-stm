@@ -9551,6 +9551,23 @@ def doctor(
                         value = summary.get("recommendation")
                         return value if isinstance(value, dict) else None
 
+                    def _failure_observations(summary: Any) -> int:
+                        """Observations that were not a completed warm search.
+
+                        Tolerant of a payload from an older daemon that carries
+                        only some of these keys. ``cold_samples`` is excluded:
+                        a cold start is the LTM not being warm yet, which is
+                        what "collecting telemetry" already describes.
+                        """
+                        if not isinstance(summary, dict):
+                            return 0
+                        total = 0
+                        for key in ("timeout_samples", "error_samples", "pre_rpc_faults"):
+                            value = summary.get(key)
+                            if isinstance(value, int) and not isinstance(value, bool):
+                                total += max(0, value)
+                        return total
+
                     surface_rec = recommendation(surface_summary)
                     retrieval_rec = recommendation(retrieval_summary)
                     # Hook traffic populates ``surface``; explicit low-level
@@ -9592,13 +9609,34 @@ def doctor(
                             if isinstance(retrieval_summary, dict)
                             else 0,
                         )
-                        check(
-                            "surfacing_timeout",
-                            "surfacing timeout",
-                            "PASS",
-                            f"collecting telemetry ({samples}/5 successful warm samples)",
-                            "mms doctor --measure-ltm" if samples < 5 else None,
+                        # "Collecting telemetry" is the right answer for a
+                        # daemon nothing has exercised yet. It is the wrong one
+                        # for a daemon whose every search fails: those used to
+                        # arrive as successful durations and now land in the
+                        # failure counters instead (#994), so reading only
+                        # ``samples`` turns a broken dependency into a PASS
+                        # that says it is still waiting for traffic.
+                        failures = _failure_observations(surface_summary) + (
+                            _failure_observations(retrieval_summary)
                         )
+                        if samples == 0 and failures:
+                            check(
+                                "surfacing_timeout",
+                                "surfacing timeout",
+                                "WARN",
+                                f"{failures} failed surfacing attempts since this daemon "
+                                "started and no successful warm search to size a timeout "
+                                "from; the LTM is unreachable or erroring",
+                                "mms daemon status",
+                            )
+                        else:
+                            check(
+                                "surfacing_timeout",
+                                "surfacing timeout",
+                                "PASS",
+                                f"collecting telemetry ({samples}/5 successful warm samples)",
+                                "mms doctor --measure-ltm" if samples < 5 else None,
+                            )
                     elif surfacing_current < recommended:
                         check(
                             "surfacing_timeout",

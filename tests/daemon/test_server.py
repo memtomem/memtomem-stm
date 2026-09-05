@@ -729,6 +729,13 @@ async def test_surface_skips_ltm_when_deadline_leaves_no_budget(tmp_path: Path) 
     assert response["ok"] is True
     assert response["output"] == {}
     assert engine.calls == []
+    # Shedding here leaves the ledger empty, which the classification reads as
+    # "no observation" -- so without an explicit count a daemon shedding every
+    # request at this floor reports the same zeros as one nobody is calling.
+    surface_latency = server._latency.snapshot()["surface"]
+    assert surface_latency["pre_rpc_faults"] == 1
+    assert surface_latency["samples"] == 0
+    assert surface_latency["timeout_samples"] == 0
 
 
 def test_surface_deadline_rejects_non_finite_deadlines(tmp_path: Path) -> None:

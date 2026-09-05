@@ -279,7 +279,10 @@ changes inline only. See the deprecation policy in
   `cold`, and a refusal to attempt (`circuit_open`, `ltm_draining`) is never
   marked, so neither reaches `error_samples` while both count toward the stats
   ratio. A completed search whose candidates were all filtered out
-  (`no_results_*`) is healthy and stays a success duration.
+  (`no_results_score`, `no_results_dedup`, `no_results_demoted`) is healthy and
+  stays a success duration; the cache-decided members of that family
+  (`no_results_invalidated`, `no_results_empty_cache`) issue no RPC and were
+  never samples at all.
 
   `mms daemon status` renders the surface-latency line on any observation
   rather than only on a successful one, and prints every counter that can turn
@@ -290,9 +293,17 @@ changes inline only. See the deprecation policy in
   meant a daemon whose every search was failing printed no line at all, which
   reads exactly like a daemon nothing has used yet -- and after the
   reclassification above that is the daemon an operator most needs the command
-  to describe. `--json` is unchanged; it always carried the full counter set.
-  Found by a Codex review of #993; the fault classification, this status gap
-  and the `pre_rpc_faults` counter by Codex reviews of the change itself.
+  to describe. `--json` passes the daemon's snapshot through as before; its
+  latency schema gains `pre_rpc_faults` as an additive key on both series, and
+  a reader that does not know it is unaffected. `mms doctor` reads the same
+  counters: with no successful warm search but failures recorded it now WARNs
+  instead of reporting "collecting telemetry", which after the reclassification
+  above would have described a daemon with a dead LTM as one still waiting for
+  traffic.
+
+  Found by a Codex review of #993; the fault classification, the status gap,
+  the `pre_rpc_faults` counter and the doctor verdict by Codex reviews of the
+  change itself.
 
 - **A non-finite `chars_per_token` is refused at load, and a char budget whose
   conversion overflows saturates instead of failing the call** (#977). Pydantic's

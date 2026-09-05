@@ -1267,8 +1267,18 @@ class McpClientSearchAdapter:
         LTM (#994): the caller's per-request ledger, if one is open, learns
         that a round trip was issued here and not at any earlier stage, so a
         heal that failed before this point leaves no mark.
+
+        Only a *search* marks. The daemon's percentiles answer "how long does a
+        warm search take", and this method also carries the scratch, proposal
+        and access-boost mutations a surfacing call makes around the search --
+        marking those would make a request whose search never went out look
+        like one that did, purely because some later bookkeeping RPC did. The
+        current call graph happens to search first, so the wrong version is
+        right by accident today; naming the two actions here is what keeps it
+        right when the order changes.
         """
-        record_ltm_rpc()
+        if tool == "mem_search" or (tool == "mem_do" and args.get("action") == "context_compose"):
+            record_ltm_rpc()
         try:
             return await session.call_tool(tool, args)
         except MCPError as exc:
