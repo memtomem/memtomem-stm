@@ -473,9 +473,17 @@ class DaemonConfig(BaseModel):
     child, the tail overruns anyway, and an overrun there is worse than a
     wait, because it cancels an RPC mid-flight and the session has to be
     rebuilt. So this is a choice between ``1`` and a value the LTM can
-    actually serve in parallel, not a dial to tune down. The default suits
-    a core that awaits its searches and offloads the heavy work, which is
-    what ``memtomem`` does.
+    actually serve in parallel, not a dial to tune down.
+
+    The default assumes a core that serves searches concurrently; it is not a
+    measurement of any particular one. ``memtomem`` awaits its searches and
+    offloads heavy SQLite work to threads, but parts of its query path are
+    narrower than this bound — its ONNX embedder advertises
+    ``preferred_concurrency = 1`` and runs a single-worker executor — so the
+    end-to-end capacity is a property of the deployment, not of the async
+    signature. Tune from ``queue.in_flight`` against ``queue.concurrency`` and
+    the surface latency percentiles in ``mms daemon status``, not from this
+    number.
 
     Values above ``max_pending_requests`` are equivalent to admission --
     nothing ever queues.

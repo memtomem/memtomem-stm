@@ -184,12 +184,14 @@ FAULT_OUTCOMES: frozenset[str] = frozenset(
     }
 )
 
-# Terminal decisions that required an LTM round trip to be attempted (#874).
+# Terminal decisions the daemon files a latency sample for (#874).
 #
-# The daemon's latency percentiles are advice about how long a *warm search*
-# takes, so a call that never reached the LTM — an allowlist or gate skip, a
-# response too short, a breaker already open — must not be filed as a
-# near-zero sample. These two sets name that filter.
+# The percentiles are advice about how long a *warm search* takes, so a call
+# that never got as far as the retrieval stage — an allowlist or gate skip, a
+# response too short, a breaker already open — must not be filed as a near-zero
+# sample. These two sets name that filter. They are the daemon's own inputs,
+# moved here verbatim from ``daemon/server.py``; the behavior they select is
+# unchanged.
 #
 # Deliberately narrower than ``SEARCH_COMPLETED_SKIP_REASONS`` +
 # ``SURFACED_OUTCOMES`` + ``FAULT_*``, which answer a different question (the
@@ -201,6 +203,15 @@ FAULT_OUTCOMES: frozenset[str] = frozenset(
 #   outright, so on that path they cannot occur at all.)
 # - ``circuit_open`` and ``ltm_draining`` are refusals to attempt a round trip;
 #   they are faults for the ratio but non-samples for the percentiles.
+#
+# **These name a stage, not a proven round trip.** Two members are recorded on
+# paths where no RPC was issued: ``error_timeout`` when pre-timeout work
+# consumed the whole window (``engine.surface``, #720), and ``ltm_unavailable``
+# when session healing failed and the adapter answered ``no_session``. Both
+# still spent the caller's budget, so filing them is defensible, but a sample
+# taken then measures STM rather than the LTM. Deriving the flag from an
+# explicit marker set immediately before the RPC would be the precise version
+# is tracked as #994 — this filter predates #874 and is unchanged by it.
 RETRIEVAL_SKIP_REASONS: frozenset[str] = frozenset(
     {
         "no_results_score",
@@ -255,7 +266,11 @@ class CallLedger:
 
     @property
     def retrieval_attempted(self) -> bool:
-        """Did this call reach a terminal decision that needed the LTM?"""
+        """Did this call reach the retrieval stage?
+
+        Not "did an RPC leave the process" — see ``RETRIEVAL_SKIP_REASONS``
+        for the two members that can be recorded without one.
+        """
         return any(reason in RETRIEVAL_SKIP_REASONS for reason in self.skip_reasons) or any(
             outcome in RETRIEVAL_OUTCOMES for outcome in self.outcomes
         )

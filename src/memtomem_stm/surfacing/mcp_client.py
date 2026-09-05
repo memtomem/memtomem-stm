@@ -1226,12 +1226,32 @@ class McpClientSearchAdapter:
     async def _rpc(
         self, session: ClientSession, generation: int, tool: str, args: dict[str, Any]
     ) -> Any:
-        """Run one RPC and dirty only the session cancelled mid-call."""
-        try:
-            return await session.call_tool(tool, args)
-        except asyncio.CancelledError:
-            self._mark_dirty(session, generation)
-            raise
+        """Run one RPC. An ordinary caller cancellation leaves the session usable.
+
+        This used to retire the session generation when a call was cancelled
+        mid-flight, on the assumption that an abandoned request leaves the
+        stdio stream in an unknown state. Under the ``mcp>=2.0`` floor that is
+        no longer true, and once callers overlap it is actively harmful.
+
+        The SDK's dispatcher owns request-id correlation: on caller
+        cancellation it sends the peer a courtesy ``cancelled`` notification
+        and pops **only this request's** waiter, so a late reply is dropped
+        rather than mistaken for someone else's. Nothing about the framing or
+        the other in-flight requests changes.
+
+        Retiring the generation, by contrast, makes the next caller reconnect
+        — which closes the transport out from under every sibling RPC still
+        using it. While the daemon serialized surfacing there was never a
+        sibling, so the cost was invisible; with
+        ``daemon.max_concurrent_ltm_ops`` above 1 (#874) one request's timeout
+        would fail unrelated requests with "Connection closed".
+
+        A session that really is broken still heals: every RPC call site marks
+        the generation dirty on a transport error and reconnects there. That is
+        the signal to act on — an error from the transport, not the caller
+        changing its mind.
+        """
+        return await session.call_tool(tool, args)
 
     async def _heal_if_needed(self) -> bool:
         """Ready the session for the next RPC.
@@ -1375,15 +1395,6 @@ class McpClientSearchAdapter:
                     "MCP mem_search failed after reconnect: %s", self._scrub_exc(retry_exc)
                 )
                 return [], [], "transport_error"
-        except asyncio.CancelledError:
-            # #290: the caller's timeout cancelled us mid-RPC. Mark for lazy
-            # reconnect on the next call (the session's read/write streams
-            # are now in a half-read state) and propagate the cancellation.
-            # The caller does not await this unwind (#720) — it books its
-            # timeout as soon as its own timer fires — so the marking must
-            # not depend on getting there first.
-            self._mark_dirty(session, generation)
-            raise
         except Exception as exc:
             logger.warning("MCP mem_search failed: %s", self._scrub_exc(exc))
             return [], [], "call_error"
@@ -1465,9 +1476,6 @@ class McpClientSearchAdapter:
             except self._TRANSPORT_ERRORS:
                 self._mark_dirty(retry_session, retry_generation)
                 raise
-        except asyncio.CancelledError:
-            self._mark_dirty(session, generation)
-            raise
 
     @staticmethod
     def _result_text(result: Any) -> str:
@@ -1680,11 +1688,6 @@ class McpClientSearchAdapter:
                     "MCP reconnect after increment_access failure failed: %s",
                     self._scrub_exc(reconnect_exc),
                 )
-        except asyncio.CancelledError:
-            # #290: see search() — mid-RPC cancellation marks the session
-            # for lazy reconnect; propagate per the cooperative model.
-            self._mark_dirty(session, generation)
-            raise
         except Exception as exc:
             logger.debug("MCP mem_do(increment_access) failed: %s", self._scrub_exc(exc))
 
@@ -1733,11 +1736,6 @@ class McpClientSearchAdapter:
                 return []
             except Exception:
                 return []
-        except asyncio.CancelledError:
-            # #290: see search() — mid-RPC cancellation marks the session
-            # for lazy reconnect; propagate per the cooperative model.
-            self._mark_dirty(session, generation)
-            raise
         except Exception as exc:
             logger.debug("MCP mem_do(scratch_get) failed: %s", self._scrub_exc(exc))
             return []

@@ -115,6 +115,16 @@ changes inline only. See the deprecation policy in
   operations through its owner task. The real bound is what the LTM child can
   serve in parallel.
 
+  Cancelling one LTM call no longer retires the shared MCP session. That rule
+  came from #290, when a cancelled request was assumed to leave the stdio
+  stream half-read; under the `mcp>=2.0` floor the dispatcher sends the peer a
+  courtesy `cancelled` notification and drops only that request's waiter. While
+  surfacing was serialized the rule was merely unnecessary — with concurrent
+  calls it is harmful, because the next arrival's reconnect closes the
+  transport under sibling RPCs and fails them with "Connection closed". A
+  session that really is broken still heals: every RPC call site marks the
+  generation dirty on a transport *error*, which is the signal that means it.
+
   **Behavior change**: set `daemon.max_concurrent_ltm_ops` to `1` for the
   older serialized daemon; that is the only value that restores it, since a
   core with no parallel capacity degrades the same way at `2` as at `4`.

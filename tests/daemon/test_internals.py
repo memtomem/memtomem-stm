@@ -254,6 +254,28 @@ def test_config_fingerprint_stable_and_broad(monkeypatch: pytest.MonkeyPatch):
     assert discovery.config_fingerprint(STMConfig()) != fp
 
 
+def test_config_fingerprint_separates_daemon_concurrency(monkeypatch: pytest.MonkeyPatch):
+    # Both admission bounds change what the daemon does, so both split identity.
+    # Without this a caller that configured the serialized daemon
+    # (`max_concurrent_ltm_ops=1`) keys to the same handshake as a running
+    # four-way one and silently reuses it (#874).
+    monkeypatch.delenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", raising=False)
+    fp = discovery.config_fingerprint(STMConfig())
+
+    serialized = STMConfig()
+    serialized.daemon.max_concurrent_ltm_ops = 1
+    assert discovery.config_fingerprint(serialized) != fp
+
+    wider = STMConfig()
+    wider.daemon.max_concurrent_ltm_ops = 8
+    assert discovery.config_fingerprint(wider) != fp
+    assert discovery.config_fingerprint(wider) != discovery.config_fingerprint(serialized)
+
+    admission = STMConfig()
+    admission.daemon.max_pending_requests = 8
+    assert discovery.config_fingerprint(admission) != fp
+
+
 def test_config_fingerprint_survives_a_hostile_surface_tools_env(
     monkeypatch: pytest.MonkeyPatch,
 ):

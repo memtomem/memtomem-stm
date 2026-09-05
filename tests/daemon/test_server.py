@@ -1173,9 +1173,9 @@ _BURST_PATH_WORDS = (
 _BURST_SIZE = len(_BURST_PATH_WORDS)
 
 
-async def _warm_and_burst(cfg: STMConfig) -> tuple[list[dict | None], float]:
+async def _warm_and_burst(cfg: STMConfig) -> tuple[DaemonServer, list[dict | None], float]:
     """Warm the LTM child, then fire a burst of distinct read hooks at once."""
-    _, task = await _start(cfg)  # real _build_engine
+    server, task = await _start(cfg)  # real _build_engine
     try:
         # The first call pays process start; the burst is what is being timed.
         assert await client.surface(cfg, _canonical(_READ_PAYLOAD), timeout=15.0) is not None
@@ -1192,7 +1192,7 @@ async def _warm_and_burst(cfg: STMConfig) -> tuple[list[dict | None], float]:
         outputs = await asyncio.gather(
             *(client.surface(cfg, call, timeout=2.5) for call in calls)
         )
-        return list(outputs), asyncio.get_running_loop().time() - started
+        return server, list(outputs), asyncio.get_running_loop().time() - started
     finally:
         await _stop(cfg, task)
 
@@ -1204,11 +1204,19 @@ async def test_a_burst_of_distinct_hook_calls_overlaps_on_the_warm_ltm(tmp_path:
     # with nothing left of its budget and books timeouts that open the breaker
     # for every tool. Overlapped, the whole burst costs about one search.
     cfg = _burst_config(tmp_path, concurrency=4)
-    outputs, elapsed = await _warm_and_burst(cfg)
+    server, outputs, elapsed = await _warm_and_burst(cfg)
 
-    assert all(out is not None for out in outputs), "the daemon dropped part of the burst"
+    # `{}` is the fail-open shape for an engine timeout, an adapter error, or
+    # nothing found, so "not None" would pass while every search failed.
+    for out in outputs:
+        assert out, "the daemon dropped part of the burst"
+        context = out["hookSpecificOutput"]["additionalContext"]
+        assert "<surfaced-memories>" in context, context[:200]
     # Two waves of four searches, not eight in a row.
     assert elapsed < _BURST_SEARCH_SECONDS * 4, f"burst took {elapsed:.2f}s"
+    # And no request paid for another's wait.
+    outcomes = server._engine.observability.snapshot()["outcomes"]["__total__"]
+    assert outcomes.get("error_timeout", 0) == 0, outcomes
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="stdio child + timing")
@@ -1220,7 +1228,7 @@ async def test_a_serialized_daemon_spends_the_whole_deadline_on_the_same_burst(
     # deadline. Asserted against the burst's own arithmetic rather than a wall
     # clock guess -- this is the arm the fix is measured against.
     cfg = _burst_config(tmp_path, concurrency=1)
-    outputs, elapsed = await _warm_and_burst(cfg)
+    _, outputs, elapsed = await _warm_and_burst(cfg)
 
     assert elapsed > _BURST_SEARCH_SECONDS * _BURST_SIZE * 0.5, f"burst took {elapsed:.2f}s"
     # And the tail pays for it: some of the burst gets nothing back.

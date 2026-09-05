@@ -687,20 +687,28 @@ class TestTextNoneTolerance:
 
 
 class TestOuterCancellationLazyReconnect:
-    """``SurfacingEngine`` wraps adapter calls in ``asyncio.wait_for``. When the
-    outer timeout fires, the inner ``call_tool`` is cancelled mid-RPC and the
-    MCP session is left in a half-read state. ``_TRANSPORT_ERRORS`` must NOT
-    catch ``CancelledError`` (cooperative cancellation must propagate), but
-    the next adapter call must heal the connection lazily before issuing a
-    fresh RPC — otherwise the next surfacing cycle hangs or sees out-of-order
-    responses on the same stream."""
+    """``SurfacingEngine`` wraps adapter calls in its own timeout. When that
+    fires, the inner ``call_tool`` is cancelled mid-RPC.
+
+    The session is **not** left in a half-read state by that, and this used to
+    assume otherwise (#290). Under the ``mcp>=2.0`` floor the dispatcher owns
+    request-id correlation: a caller cancellation sends the peer a courtesy
+    ``cancelled`` notification and pops only that request's waiter, so a late
+    reply is dropped rather than mistaken for another request's. Retiring the
+    session over it closes the transport out from under every sibling RPC —
+    harmless while the daemon ran one call at a time, a way to fail unrelated
+    requests once it does not (#874).
+
+    ``_TRANSPORT_ERRORS`` must still NOT catch ``CancelledError`` (cooperative
+    cancellation must propagate), and a session that really is broken still
+    heals lazily — on a transport *error*, which every RPC call site marks."""
 
     @pytest.mark.asyncio
-    async def test_mid_rpc_cancellation_marks_for_reconnect(self):
+    async def test_mid_rpc_cancellation_keeps_the_session(self):
         adapter = McpClientSearchAdapter(SurfacingConfig())
 
         async def hang(*_args, **_kwargs):
-            # Never returns on its own — outer wait_for must cancel us.
+            # Never returns on its own — the outer timeout must cancel us.
             await asyncio.sleep(10)
 
         mock_session = AsyncMock()
@@ -711,10 +719,10 @@ class TestOuterCancellationLazyReconnect:
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(adapter.search("q"), timeout=0.05)
 
-        # Flag set so the next caller heals the session before issuing an RPC.
-        assert adapter._needs_reconnect is True
-        # The cancellation alone does not synchronously trigger reconnect —
-        # heal is lazy on the next call.
+        # The caller changed its mind; the transport did not fail. Retiring the
+        # session here is what closed it under concurrent siblings (#874).
+        assert adapter._needs_reconnect is False
+        assert adapter._session is mock_session
         adapter._reconnect.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -765,7 +773,7 @@ class TestOuterCancellationLazyReconnect:
         mock_session.call_tool.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_increment_access_cancellation_marks_for_reconnect(self):
+    async def test_increment_access_cancellation_keeps_the_session(self):
         adapter = McpClientSearchAdapter(SurfacingConfig())
 
         async def hang(*_args, **_kwargs):
@@ -781,7 +789,8 @@ class TestOuterCancellationLazyReconnect:
                 timeout=0.05,
             )
 
-        assert adapter._needs_reconnect is True
+        assert adapter._needs_reconnect is False
+        assert adapter._session is mock_session
 
     @pytest.mark.asyncio
     async def test_increment_access_transport_failure_is_not_replayed(self):
@@ -797,7 +806,7 @@ class TestOuterCancellationLazyReconnect:
         adapter._shared_reconnect.assert_awaited_once_with(adapter._generation)
 
     @pytest.mark.asyncio
-    async def test_scratch_list_cancellation_marks_for_reconnect(self):
+    async def test_scratch_list_cancellation_keeps_the_session(self):
         adapter = McpClientSearchAdapter(SurfacingConfig())
 
         async def hang(*_args, **_kwargs):
@@ -810,7 +819,55 @@ class TestOuterCancellationLazyReconnect:
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(adapter.scratch_list(), timeout=0.05)
 
-        assert adapter._needs_reconnect is True
+        assert adapter._needs_reconnect is False
+        assert adapter._session is mock_session
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_call_does_not_close_a_sibling_rpc(self):
+        """The reason the rule changed, stated as a test.
+
+        Two calls share one session. Cancelling the first used to retire the
+        generation, so the next arrival reconnected — closing the transport
+        while the second call was still awaiting a reply on it, which surfaced
+        to an unrelated request as "Connection closed".
+        """
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
+        sibling_started = asyncio.Event()
+        sibling_may_finish = asyncio.Event()
+        closed = False
+
+        async def call(*_args, **kwargs):
+            if kwargs.get("arguments", {}).get("query") == "victim":
+                await asyncio.sleep(10)
+            sibling_started.set()
+            await sibling_may_finish.wait()
+            if closed:
+                raise ConnectionError("Connection closed")
+            return _result_with_text(_COMPACT_HIT)
+
+        session = AsyncMock()
+        session.call_tool = AsyncMock(side_effect=call)
+        adapter._session = session
+
+        async def close_the_session(expected_generation=None):
+            nonlocal closed
+            closed = True
+
+        adapter._reconnect = close_the_session  # type: ignore[method-assign]
+
+        sibling = asyncio.create_task(adapter.search("sibling"))
+        victim = asyncio.create_task(adapter.search("victim"))
+        await asyncio.wait_for(sibling_started.wait(), timeout=1.0)
+        victim.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await victim
+
+        # A newcomer must not find a session to retire.
+        assert adapter._needs_reconnect is False
+        sibling_may_finish.set()
+        results, _, outcome = await asyncio.wait_for(sibling, timeout=1.0)
+        assert outcome == "ok"
+        assert results
 
 
 # ── Lazy start paths ─────────────────────────────────────────────────────
@@ -1155,7 +1212,11 @@ class TestGenerationAwareReconnect:
         assert adapter._reconnect_flights == {}
 
     @pytest.mark.asyncio
-    async def test_post_reconnect_retry_cancellation_dirties_new_generation(self):
+    async def test_post_reconnect_retry_cancellation_keeps_the_new_generation(self):
+        # A transport error retires generation 1 and the retry runs on the
+        # fresh generation 2. Cancelling *that* retry is still just a caller
+        # changing its mind, so generation 2 stays published and clean and the
+        # next call reuses it rather than reconnecting again (#874).
         adapter = McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
         old_session = AsyncMock()
         old_session.call_tool = AsyncMock(side_effect=ConnectionError("old session failed"))
@@ -1163,15 +1224,18 @@ class TestGenerationAwareReconnect:
         adapter._generation = 1
 
         retry_started = asyncio.Event()
+        first_retry = True
 
-        async def hang_retry(*_args, **_kwargs):
-            retry_started.set()
-            await asyncio.Event().wait()
+        async def hang_then_answer(*_args, **_kwargs):
+            nonlocal first_retry
+            if first_retry:
+                first_retry = False
+                retry_started.set()
+                await asyncio.Event().wait()
+            return _result_with_text(_COMPACT_HIT)
 
         retry_session = AsyncMock()
-        retry_session.call_tool = AsyncMock(side_effect=hang_retry)
-        healthy_session = AsyncMock()
-        healthy_session.call_tool = AsyncMock(return_value=_result_with_text(_COMPACT_HIT))
+        retry_session.call_tool = AsyncMock(side_effect=hang_then_answer)
         reconnect_generations: list[int | None] = []
 
         async def replace_generation(expected_generation=None):
@@ -1179,11 +1243,8 @@ class TestGenerationAwareReconnect:
             if expected_generation == 1:
                 adapter._session = retry_session
                 adapter._generation = 2
-            elif expected_generation == 2:
-                adapter._session = healthy_session
-                adapter._generation = 3
-            else:  # pragma: no cover - test invariant guard
-                raise AssertionError(f"unexpected generation: {expected_generation}")
+            else:  # pragma: no cover - the point of the test is that this never runs
+                raise AssertionError(f"unexpected reconnect for generation: {expected_generation}")
 
         adapter._reconnect = replace_generation  # type: ignore[method-assign]
 
@@ -1195,16 +1256,17 @@ class TestGenerationAwareReconnect:
 
         assert adapter._session is retry_session
         assert adapter._generation == 2
-        assert adapter._dirty_generation == 2
-        assert adapter._needs_reconnect is True
+        assert adapter._dirty_generation is None
+        assert adapter._needs_reconnect is False
 
         results, _, outcome = await asyncio.wait_for(adapter.search("retry"), timeout=1.0)
 
         assert outcome == "ok"
         assert len(results) == 1
-        assert adapter._session is healthy_session
-        assert adapter._generation == 3
-        assert reconnect_generations == [1, 2]
+        # Still on generation 2: only the transport error caused a reconnect.
+        assert adapter._session is retry_session
+        assert adapter._generation == 2
+        assert reconnect_generations == [1]
 
     @pytest.mark.asyncio
     async def test_completed_reconnect_flights_are_evicted(self):
