@@ -120,25 +120,40 @@ changes inline only. See the deprecation policy in
   `gt=0` admits `+inf` (the gap #722 documented for the shutdown timeouts), and a
   config file can carry one without anything unusual having been typed, since
   `json.dumps` writes a bare `Infinity` and `json.loads` reads it back. Such a
-  config loaded successfully and then raised `OverflowError` inside the budget
-  resolution every proxied call runs through -- naming neither the field nor the
-  level it was written at. Rejecting non-finite input does not cover the whole
-  surface on its own, so the conversion is now total as well: two finite values
-  whose product overflows, and a `max_result_tokens` too wide to multiply as a
-  float at all (the field carries no upper bound), both saturate at the
-  signed-64-bit ceiling, which the callers still cap against their own configured
-  maximum. `ProxyConfig.effective_max_result_chars()` -- the budget every
+  config loaded successfully and then raised `OverflowError` in budget
+  resolution, on every call whose budget that ratio was selected to convert --
+  naming neither the field nor the level it was written at. Rejecting non-finite input does not close the surface
+  on its own, so the conversion is now total as well: two finite values whose
+  product overflows, and a token budget too wide to multiply as a float at all,
+  saturate at the signed-64-bit ceiling. `max_result_tokens` is bounded by that
+  same ceiling, and the bound rather than the saturation is what keeps an
+  enormous budget out of the system. The field had no upper bound, and a value
+  past the interpreter's 4300-digit integer-to-string limit previously died in
+  the conversion; making the conversion total would have moved that failure
+  downstream to the response-cache fingerprint, which serializes the resolved
+  budget on every call before the upstream is dispatched, and which would then
+  have failed the call without the conversion being implicated at all. `ProxyConfig.effective_max_result_chars()` -- the budget every
   default-budget call runs under -- did its own multiplication and so would have
   been left open by a guard in the conversion helper alone; it now goes through
-  that helper, leaving the chain with a single multiplication site.
-  **Behavior change**: a config with a non-finite `chars_per_token` at any of the
-  three levels now fails validation at load instead of loading and failing each
-  call; an overflowing conversion yields an effectively unbounded budget rather
-  than an error; and a token budget converting to less than one character
-  resolves to one char rather than zero, which under a disabled
-  `min_result_retention` had compressed the response to nothing. Nothing else
-  about retention changes -- `min_result_retention` still applies afterwards
-  exactly as before, and every in-range budget resolves to the same number.
+  that helper, passing the already-scaled token count so the operands associate
+  exactly as they did before (grouping them the other way moves some in-range
+  budgets by one character, in both directions).
+  **Behavior change**: a config with `+inf` as the `chars_per_token` at any of
+  the three levels, or a `max_result_tokens` above the signed-64-bit ceiling,
+  now fails validation at load instead of loading and then failing the calls
+  that used it. (`nan` and `-inf` were already refused by `gt=0`, since both
+  compare false against zero; `+inf` is the only value whose acceptance
+  changes.) And a token
+  budget converting to less than one character resolves to one char rather than
+  zero, which under a disabled `min_result_retention` had compressed the response
+  to nothing. The model-scaled budget keeps answering its own degenerate case by
+  falling back to `default_max_result_chars`, unchanged. For a config that
+  still validates, every budget that previously resolved to a number between
+  one character and the ceiling resolves to that same number, and
+  `min_result_retention` applies afterwards exactly as it did. The exception is
+  a config the new bound now rejects outright: a `max_result_tokens` above the
+  ceiling paired with a ratio below 1 could resolve into that range before, and
+  no longer loads at all.
 
 - **`mms prune` no longer deletes a host entry whose transport-relevant
   connection block is not a mapping** (#984) -- `env` for stdio, `headers` for

@@ -31,7 +31,6 @@ threshold decisions, not for billing.
 
 from __future__ import annotations
 
-import math
 from typing import Final
 
 # Tokens-per-character by Unicode block, calibrated 2026-04-29 against
@@ -49,8 +48,9 @@ MAX_CHAR_BUDGET: Final = 2**63 - 1
 A saturation ceiling, not a policy limit: it exists so an operator value
 that overflows the conversion resolves to "no effective limit" instead of
 failing the call. Fixed at the signed-64-bit maximum rather than derived
-from ``sys.maxsize`` so the value does not differ between platforms, and
-so it stays inside the SQLite INTEGER domain the budget is recorded in.
+from ``sys.maxsize``, so the value does not differ between platforms. It
+doubles as the upper bound on ``max_result_tokens``, which keeps the token
+budget and the char budget it converts to inside one domain.
 """
 
 
@@ -86,24 +86,34 @@ def approx_tokens(text: str) -> int:
     )
 
 
-def tokens_to_chars(tokens: int, chars_per_token: float) -> int:
+def tokens_to_chars(tokens: float, chars_per_token: float) -> int:
     """Convert a token budget to a char budget using the operator-supplied ratio.
 
     For Latin-script content, ``chars_per_token`` typically ranges 3.5-4.0.
     For Korean (Hangul-dominant) content, 1.8-2.0 is realistic.
     For Chinese (CJK-ideograph-dominant), 1.0-1.5.
 
+    ``tokens`` is typed ``float`` so a caller that has already scaled a token
+    count can hand the scaled value over rather than re-associating the
+    multiplication here; see ``ProxyConfig.effective_max_result_chars``.
+
     Total by contract: every input maps to an int, none raises (#977). This
     runs inside per-call budget resolution, where an exception fails the
     proxied tool call and names neither the offending field nor the level it
-    was written at. Saturation degrades to "no effective limit" instead, and
-    the callers cap the result against their own configured maximum.
+    was written at. Saturation degrades to "no effective limit" instead.
+    Whether that is then capped is the caller's decision, and they differ: the
+    model-aware budget caps against ``default_max_result_chars``, while an
+    explicit token budget outranks every char budget and so is returned as-is.
 
     - Non-positive ``tokens`` or ratio, and ``nan`` in either position (which
       compares false against 0), return ``0``.
     - A product that overflows to infinity, and a ``tokens`` value too wide to
       multiply as a float at all, return :data:`MAX_CHAR_BUDGET`. So does a
-      finite product beyond that ceiling.
+      finite product beyond that ceiling. The first and third are reachable
+      from a validated config -- ``chars_per_token`` is bounded only away from
+      zero and infinity, so a legal ``1e308`` saturates -- while the second
+      needs a ``tokens`` value wider than ``max_result_tokens`` now admits,
+      and is pinned because this helper is public.
     - A product below 1 truncates to ``0``, deliberately: the two callers read
       a degenerate budget differently. ``ProxyConfig.effective_max_result_chars``
       treats it as "model scaling off" and falls back to its static default,
@@ -115,10 +125,13 @@ def tokens_to_chars(tokens: int, chars_per_token: float) -> int:
     try:
         chars = tokens * chars_per_token
     except OverflowError:
-        # ``int * float`` raises when the int is wider than the float range
-        # (``max_result_tokens`` carries no upper bound), rather than
-        # producing an infinity to test for below.
+        # ``int * float`` raises when the int is wider than the float range,
+        # rather than producing an infinity to compare below.
         return MAX_CHAR_BUDGET
-    if math.isinf(chars):
+    # One comparison covers an infinite product, a finite one above the
+    # ceiling, and an integer product too wide to convert to a float at all.
+    # ``math.isinf`` would not: it raises on that last case, which is exactly
+    # what a caller passing two ints produces.
+    if chars >= MAX_CHAR_BUDGET:
         return MAX_CHAR_BUDGET
-    return min(int(chars), MAX_CHAR_BUDGET)
+    return int(chars)
