@@ -184,53 +184,6 @@ FAULT_OUTCOMES: frozenset[str] = frozenset(
     }
 )
 
-# Terminal decisions the daemon files a latency sample for (#874).
-#
-# The percentiles are advice about how long a *warm search* takes, so a call
-# that never got as far as the retrieval stage — an allowlist or gate skip, a
-# response too short, a breaker already open — must not be filed as a near-zero
-# sample. These two sets name that filter. They are the daemon's own inputs,
-# moved here verbatim from ``daemon/server.py``; the behavior they select is
-# unchanged.
-#
-# Deliberately narrower than ``SEARCH_COMPLETED_SKIP_REASONS`` +
-# ``SURFACED_OUTCOMES`` + ``FAULT_*``, which answer a different question (the
-# fault *ratio* in ``stm_surfacing_stats``):
-#
-# - ``surfaced_cache_hit`` / ``no_results_invalidated`` /
-#   ``no_results_empty_cache`` are decided from the result cache, so their
-#   duration is not a search measurement. (The daemon disables the cache
-#   outright, so on that path they cannot occur at all.)
-# - ``circuit_open`` and ``ltm_draining`` are refusals to attempt a round trip;
-#   they are faults for the ratio but non-samples for the percentiles.
-#
-# **These name a stage, not a proven round trip.** Two members are recorded on
-# paths where no RPC was issued: ``error_timeout`` when pre-timeout work
-# consumed the whole window (``engine.surface``, #720), and ``ltm_unavailable``
-# when session healing failed and the adapter answered ``no_session``. Both
-# still spent the caller's budget, so filing them is defensible, but a sample
-# taken then measures STM rather than the LTM. Deriving the flag from an
-# explicit marker set immediately before the RPC would be the precise version
-# is tracked as #994 — this filter predates #874 and is unchanged by it.
-RETRIEVAL_SKIP_REASONS: frozenset[str] = frozenset(
-    {
-        "no_results_score",
-        "no_results_dedup",
-        "no_results_demoted",
-        "ltm_unavailable",
-        "ltm_call_failed",
-        "ltm_parse_empty",
-    }
-)
-
-RETRIEVAL_OUTCOMES: frozenset[str] = frozenset(
-    {
-        "surfaced_cache_miss",
-        "error_timeout",
-        "error_other",
-    }
-)
-
 CacheBucket = Literal["hit", "miss"]
 
 # Sentinel string key for the "all tools" aggregate row in per-tool dicts.
@@ -258,22 +211,35 @@ class CallLedger:
 
     Cache buckets are not recorded here: no consumer asks a per-call question
     about them, and leaving them out keeps the ledger to the two mutually
-    exclusive per-call decisions (``record_skip`` OR ``record_outcome``).
+    exclusive per-call decisions (``record_skip`` OR ``record_outcome``) plus
+    the one fact neither of them can carry — whether a request actually left
+    for the LTM (#994).
     """
 
     skip_reasons: list[str] = field(default_factory=list)
     outcomes: list[str] = field(default_factory=list)
+    # Set by :func:`record_ltm_rpc` at the moment a request is handed to the
+    # LTM transport — the one place that knows a round trip was issued.
+    ltm_rpc_issued: bool = False
 
     @property
     def retrieval_attempted(self) -> bool:
-        """Did this call reach the retrieval stage?
+        """Did an LTM round trip leave the process for this call?
 
-        Not "did an RPC leave the process" — see ``RETRIEVAL_SKIP_REASONS``
-        for the two members that can be recorded without one.
+        Read from the explicit marker, not inferred from the terminal
+        decision. The skip reasons and outcomes name the *stage* a call
+        reached, and three of the ones a completed search records are also
+        recorded on paths that issued no RPC (#994): ``error_timeout`` when
+        pre-timeout work consumed the whole window (``engine.surface``, #720),
+        ``ltm_unavailable`` when session healing failed and the adapter
+        answered ``no_session``, and ``ltm_call_failed`` when the same failure
+        reached the engine through the compose path. Each still spent the
+        caller's budget, but a duration taken then measures STM, not the LTM,
+        and the percentiles this gates are advice about the LTM. A call that
+        never reached it is not an observation of it, so it files nothing —
+        not into the percentiles and not into the timeout count either.
         """
-        return any(reason in RETRIEVAL_SKIP_REASONS for reason in self.skip_reasons) or any(
-            outcome in RETRIEVAL_OUTCOMES for outcome in self.outcomes
-        )
+        return self.ltm_rpc_issued
 
     @property
     def timed_out(self) -> bool:
@@ -328,6 +294,20 @@ def attribute_call() -> Iterator[CallLedger]:
         yield ledger
     finally:
         _ACTIVE_LEDGER.reset(token)
+
+
+def record_ltm_rpc() -> None:
+    """Mark that the surfacing call in this context is issuing an LTM RPC.
+
+    Called by the transport adapter immediately before the request is sent,
+    after session healing has produced a live session — so a heal that fails
+    (``no_session``) leaves the mark unset, and a retry after a transport error
+    sets it again harmlessly. Outside any :func:`attribute_call` block (the
+    proxy path, a daemon operation that opens no ledger) this is a no-op.
+    """
+    ledger = _ACTIVE_LEDGER.get()
+    if ledger is not None:
+        ledger.ltm_rpc_issued = True
 
 
 class SurfacingObservability:

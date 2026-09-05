@@ -22,6 +22,7 @@ from mcp.shared.exceptions import MCPError
 from mcp.types import CONNECTION_CLOSED, TextContent
 
 from memtomem_stm.surfacing.config import SurfacingConfig
+from memtomem_stm.surfacing.observability import record_ltm_rpc
 from memtomem_stm.utils.mcp_transport import streamable_http_transport
 from memtomem_stm.utils.json_out import (
     escape_lone_surrogates,
@@ -1261,7 +1262,13 @@ class McpClientSearchAdapter:
         the generation dirty on a transport error and reconnects there. That is
         the signal to act on — an error from the transport, not the caller
         changing its mind.
+
+        This is also where a surfacing call is marked as having reached the
+        LTM (#994): the caller's per-request ledger, if one is open, learns
+        that a round trip was issued here and not at any earlier stage, so a
+        heal that failed before this point leaves no mark.
         """
+        record_ltm_rpc()
         try:
             return await session.call_tool(tool, args)
         except MCPError as exc:

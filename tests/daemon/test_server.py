@@ -47,7 +47,7 @@ from memtomem_stm.daemon.protocol import (
 from memtomem_stm.daemon.server import DaemonServer
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine
-from memtomem_stm.surfacing.observability import SurfacingObservability
+from memtomem_stm.surfacing.observability import SurfacingObservability, record_ltm_rpc
 
 
 @dataclass
@@ -328,9 +328,10 @@ async def test_engine_internal_timeout_is_not_a_success_latency_sample(tmp_path:
     obs = SurfacingObservability()
 
     async def surfaced_but_timed_out() -> dict[str, object]:
-        # Exactly what engine.surface() books on its own timeout, recorded
-        # through a real observability so the daemon reads it the way it does
-        # in production.
+        # Exactly what the adapter and engine.surface() book when a round trip
+        # is issued and then times out, recorded through a real observability
+        # so the daemon reads it the way it does in production.
+        record_ltm_rpc()
         obs.record_outcome("Read", "error_timeout")
         return surface_response({})
 
@@ -344,6 +345,68 @@ async def test_engine_internal_timeout_is_not_a_success_latency_sample(tmp_path:
     surface_latency = server._latency.snapshot()["surface"]
     assert surface_latency["timeout_samples"] == 1
     assert surface_latency["samples"] == 0
+
+
+async def test_pre_work_exhausted_timeout_is_not_a_latency_sample(tmp_path: Path) -> None:
+    # The engine books ``error_timeout`` without issuing an RPC when the gate,
+    # query extraction and privacy scan consumed the caller's whole window
+    # (#720). The daemon used to read that terminal as "a search was attempted"
+    # and file a timeout — a duration that measured STM pre-work and queue wait,
+    # in a series that is advice about the LTM (#994). No RPC, no sample: not
+    # in the percentiles and not in the timeout count either.
+    server = DaemonServer(_config(tmp_path))
+    server._ltm_warmth = lambda: "warm"  # type: ignore[method-assign]
+    obs = SurfacingObservability()
+
+    async def timed_out_before_the_rpc() -> dict[str, object]:
+        obs.record_outcome("Read", "error_timeout")
+        return surface_response({})
+
+    await server._run_admitted(
+        {"deadline_monotonic": asyncio.get_running_loop().time() + 1.0},
+        timed_out_before_the_rpc,
+        latency_kind="surface",
+        attribute=True,
+    )
+
+    surface_latency = server._latency.snapshot()["surface"]
+    assert surface_latency["samples"] == 0
+    assert surface_latency["timeout_samples"] == 0
+
+
+async def test_failed_session_healing_is_not_a_latency_sample(tmp_path: Path) -> None:
+    # ``ltm_unavailable`` is what the engine records when the adapter answered
+    # ``no_session`` — session healing failed before any request was sent. A
+    # stretch of failed healing used to land every one of those durations in
+    # the warm-search series (#994). The same terminal *after* a transport error
+    # mid-flight did issue a request, and that one stays a sample.
+    server = DaemonServer(_config(tmp_path))
+    server._ltm_warmth = lambda: "warm"  # type: ignore[method-assign]
+    obs = SurfacingObservability()
+
+    async def healing_failed() -> dict[str, object]:
+        obs.record_skip("Read", "ltm_unavailable")
+        return surface_response({})
+
+    async def connection_dropped_mid_flight() -> dict[str, object]:
+        record_ltm_rpc()
+        obs.record_skip("Read", "ltm_unavailable")
+        return surface_response({})
+
+    for operation in (healing_failed, connection_dropped_mid_flight):
+        await server._run_admitted(
+            {"deadline_monotonic": asyncio.get_running_loop().time() + 1.0},
+            operation,
+            latency_kind="surface",
+            attribute=True,
+        )
+
+    surface_latency = server._latency.snapshot()["surface"]
+    # ``ltm_unavailable`` is a skip, so the response is ``ok`` with no
+    # memories and the one sample that is filed is a success duration.
+    assert surface_latency["samples"] == 1
+    assert surface_latency["timeout_samples"] == 0
+    assert surface_latency["error_samples"] == 0
 
 
 async def test_gate_skip_is_not_a_latency_sample(tmp_path: Path) -> None:
@@ -395,10 +458,12 @@ async def test_overlapping_request_does_not_inherit_another_requests_timeout(
             await asyncio.wait_for(healthy_done.wait(), timeout=2.0)
         except asyncio.TimeoutError:
             raise AssertionError("the second request never overlapped the first") from None
+        record_ltm_rpc()
         obs.record_outcome("Read", "error_timeout")
         return surface_response({})
 
     async def healthy() -> dict[str, object]:
+        record_ltm_rpc()
         obs.record_outcome("Read", "surfaced_cache_miss")
         healthy_done.set()
         return surface_response({})

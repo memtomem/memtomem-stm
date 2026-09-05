@@ -219,6 +219,29 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **The daemon files a warm-search latency sample only for a request that
+  actually issued an LTM RPC** (#994). `_run_admitted` decided whether a
+  surfacing request was a sample from the terminal decision the engine
+  recorded (`RETRIEVAL_SKIP_REASONS` / `RETRIEVAL_OUTCOMES`, #874). Those sets
+  named a *stage*, not a round trip, and three of their members are also
+  recorded on paths where nothing was sent: `error_timeout` when the gate,
+  query extraction and privacy scan consumed the caller's whole window (#720),
+  `ltm_unavailable` when session healing failed and the adapter answered
+  `no_session`, and `ltm_call_failed` when that same failure reached the engine
+  through the compose path. Each still spent the caller's budget, but the
+  duration measures STM pre-work and queue wait, and it landed in the series
+  `hook.daemon_timeout_seconds` advice is derived from -- a stretch of failed
+  healing inflated the recommendation with numbers about the wrong component.
+  The adapter now marks the request's `CallLedger` at the point the RPC is
+  handed to the transport (`McpClientSearchAdapter._rpc`, after healing), and
+  `retrieval_attempted` reads that mark instead of inferring it; the two sets
+  are gone. A call that never reached the LTM files nothing -- not into the
+  percentiles and not into the timeout count either -- rather than into a
+  separate series, since no consumer asks for one and a non-RPC duration is not
+  a censored observation of the LTM. The pre-existing filter for allowlist,
+  gate and cache-decided terminals is unchanged in effect. Found by a Codex
+  review of #993.
+
 - **A non-finite `chars_per_token` is refused at load, and a char budget whose
   conversion overflows saturates instead of failing the call** (#977). Pydantic's
   `gt=0` admits `+inf` (the gap #722 documented for the shutdown timeouts), and a

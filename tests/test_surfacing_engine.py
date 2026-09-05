@@ -1359,6 +1359,146 @@ class TestSurfacingDeadline:
         assert engine._circuit_breaker.failure_count == 1
 
 
+class TestLedgerRpcMark:
+    """The per-call ledger learns about a round trip from the adapter (#994).
+
+    Real engine over the real ``McpClientSearchAdapter`` with only the session
+    faked, under the same ``attribute_call`` block the daemon opens: the
+    ``retrieval_attempted`` the daemon gates its latency sample on must be
+    ``True`` exactly when a request was handed to the transport.
+    """
+
+    _COMPACT_HIT = "[1] 0.90 | [default] note.md\nsurfaced through a real rpc"
+
+    def _adapter_with_session(self, call_tool: AsyncMock):
+        from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
+        session = AsyncMock()
+        session.call_tool = call_tool
+
+        async def fake_start():
+            adapter._session = session
+
+        adapter.start = AsyncMock(side_effect=fake_start)  # type: ignore[method-assign]
+        return adapter
+
+    def _hit(self):
+        content = MagicMock()
+        content.type = "text"
+        content.text = self._COMPACT_HIT
+        result = MagicMock()
+        result.content = [content]
+        return result
+
+    async def test_a_completed_search_is_marked(self):
+        from memtomem_stm.surfacing.observability import (
+            SurfacingObservability,
+            attribute_call,
+        )
+
+        call_tool = AsyncMock(return_value=self._hit())
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=self._adapter_with_session(call_tool),
+            observability=obs,
+        )
+        with attribute_call() as ledger:
+            output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+        assert "surfaced through a real rpc" in output
+        call_tool.assert_awaited_once()
+        assert ledger.outcomes == ["surfaced_cache_miss"]
+        assert ledger.retrieval_attempted is True
+        assert ledger.timed_out is False
+
+    async def test_pre_work_exhausting_the_window_is_not_marked(self):
+        # ``effective_timeout <= 0``: the engine books ``error_timeout`` itself
+        # and never calls the adapter (#720). The daemon used to infer a round
+        # trip from that terminal and file the duration as a timeout sample.
+        from memtomem_stm.surfacing.observability import (
+            SurfacingObservability,
+            attribute_call,
+        )
+
+        call_tool = AsyncMock(return_value=self._hit())
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=self._adapter_with_session(call_tool),
+            observability=obs,
+        )
+        with attribute_call() as ledger:
+            output = await engine.surface(
+                "gh",
+                "read_file",
+                VALID_ARGS,
+                LONG_RESPONSE,
+                deadline_monotonic=time.monotonic() - 1.0,
+            )
+
+        assert output == LONG_RESPONSE
+        call_tool.assert_not_awaited()
+        assert ledger.outcomes == ["error_timeout"]
+        assert ledger.timed_out is True
+        assert ledger.retrieval_attempted is False
+
+    async def test_failed_session_healing_is_not_marked(self):
+        # ``_heal_if_needed`` fails → the adapter answers ``no_session`` before
+        # ``_rpc`` → the engine records ``ltm_unavailable``. Nothing was sent.
+        from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+        from memtomem_stm.surfacing.observability import (
+            SurfacingObservability,
+            attribute_call,
+        )
+
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
+        adapter.start = AsyncMock(  # type: ignore[method-assign]
+            side_effect=ConnectionError("LTM unreachable"),
+        )
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+        with attribute_call() as ledger:
+            output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+        assert output == LONG_RESPONSE
+        assert ledger.skip_reasons == ["ltm_unavailable"]
+        assert ledger.retrieval_attempted is False
+
+    async def test_a_round_trip_that_times_out_is_still_marked(self):
+        # The positive control for the two negatives above: the same
+        # ``error_timeout`` terminal, but this time a request did go out and
+        # the duration is a real (censored) measurement of the LTM.
+        from memtomem_stm.surfacing.observability import (
+            SurfacingObservability,
+            attribute_call,
+        )
+
+        async def hangs(*_args, **_kwargs):
+            await asyncio.sleep(10)
+
+        call_tool = AsyncMock(side_effect=hangs)
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.05),
+            mcp_adapter=self._adapter_with_session(call_tool),
+            observability=obs,
+        )
+        with attribute_call() as ledger:
+            output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+        assert output == LONG_RESPONSE
+        call_tool.assert_awaited_once()
+        assert ledger.outcomes == ["error_timeout"]
+        assert ledger.timed_out is True
+        assert ledger.retrieval_attempted is True
+
+
 class TestSessionDedup:
     """Verify same memory isn't surfaced twice in one session."""
 

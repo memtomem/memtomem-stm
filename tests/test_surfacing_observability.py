@@ -20,14 +20,13 @@ from memtomem_stm.surfacing.observability import (
     FAULT_OUTCOMES,
     FAULT_SKIP_REASONS,
     HEALTHY_SKIP_REASONS,
-    RETRIEVAL_OUTCOMES,
-    RETRIEVAL_SKIP_REASONS,
     SEARCH_COMPLETED_SKIP_REASONS,
     SURFACED_OUTCOMES,
     Outcome,
     SkipReason,
     SurfacingObservability,
     attribute_call,
+    record_ltm_rpc,
 )
 
 
@@ -587,6 +586,14 @@ class TestCallLedger:
                 _record_later(obs, "surfaced_cache_miss"),
             )
         assert ledger.outcomes == ["surfaced_cache_miss"]
+
+    async def test_ledger_captures_the_rpc_mark_made_in_a_child_task(self):
+        # The adapter marks the RPC from inside the same ``_run_within`` task
+        # the search body runs in. Same carrier as the outcome above: a ledger
+        # that only saw the calling task would read every completed search as
+        # "never reached the LTM" and the daemon would file no sample at all.
+        with attribute_call() as ledger:
+            await asyncio.ensure_future(_mark_later())
         assert ledger.retrieval_attempted is True
 
     async def test_ledger_is_isolated_between_concurrent_tasks(self):
@@ -634,44 +641,72 @@ class TestCallLedger:
         assert next_ledger.outcomes == []
         assert abandoned_ledger.outcomes == ["error_timeout"]
 
-    def test_retrieval_attempted_reads_both_buckets(self):
+    def test_retrieval_attempted_is_the_rpc_mark_not_the_terminal_decision(self):
+        """The mark is set where the request is handed to the transport (#994).
+
+        Three terminals a completed search records are also recorded on paths
+        that issued no RPC: ``error_timeout`` when pre-work spent the whole
+        window, ``ltm_unavailable`` when session healing failed, and
+        ``ltm_call_failed`` when that same failure arrived through the compose
+        path. Inferring the round trip from any of them files an STM duration
+        into a series that is advice about the LTM.
+        """
         obs = SurfacingObservability()
+        with attribute_call() as pre_work_exhausted:
+            obs.record_outcome("Read", "error_timeout")
+        with attribute_call() as healing_failed:
+            obs.record_skip("Read", "ltm_unavailable")
+        with attribute_call() as compose_healing_failed:
+            obs.record_skip("Read", "ltm_call_failed")
+        with attribute_call() as rpc_timed_out:
+            record_ltm_rpc()
+            obs.record_outcome("Read", "error_timeout")
+        with attribute_call() as rpc_unavailable:
+            # A transport error mid-flight also lands on ``ltm_unavailable``;
+            # that one did issue a request and stays a sample.
+            record_ltm_rpc()
+            obs.record_skip("Read", "ltm_unavailable")
+        with attribute_call() as searched:
+            record_ltm_rpc()
+            obs.record_skip("Read", "no_results_score")
         with attribute_call() as gated:
             obs.record_skip("Read", "gate_cooldown")
-        with attribute_call() as searched:
-            obs.record_skip("Read", "no_results_score")
-        with attribute_call() as surfaced:
-            obs.record_outcome("Read", "surfaced_cache_miss")
         with attribute_call() as empty:
             pass
-        assert gated.retrieval_attempted is False
+
+        assert pre_work_exhausted.retrieval_attempted is False
+        assert pre_work_exhausted.timed_out is True
+        assert healing_failed.retrieval_attempted is False
+        assert compose_healing_failed.retrieval_attempted is False
+        assert rpc_timed_out.retrieval_attempted is True
+        assert rpc_timed_out.timed_out is True
+        assert rpc_unavailable.retrieval_attempted is True
         assert searched.retrieval_attempted is True
-        assert surfaced.retrieval_attempted is True
+        assert gated.retrieval_attempted is False
         assert empty.retrieval_attempted is False
         assert empty.timed_out is False
 
+    def test_marking_outside_any_ledger_is_fine(self):
+        # The proxy path and the daemon's raw LTM ops issue RPCs with no ledger
+        # open; the mark has nowhere to land and must not care.
+        record_ltm_rpc()
+        with attribute_call() as ledger:
+            pass
+        assert ledger.retrieval_attempted is False
 
-class TestRetrievalSets:
-    def test_retrieval_sets_are_subsets_of_the_enums(self):
-        assert RETRIEVAL_SKIP_REASONS <= set(get_args(SkipReason))
-        assert RETRIEVAL_OUTCOMES <= set(get_args(Outcome))
+    def test_the_mark_is_per_ledger(self):
+        # An RPC issued under one request's ledger says nothing about the next.
+        with attribute_call() as first:
+            record_ltm_rpc()
+        with attribute_call() as second:
+            pass
+        assert first.retrieval_attempted is True
+        assert second.retrieval_attempted is False
 
-    def test_cache_decided_terminals_are_excluded(self):
-        """A terminal the result cache decided is not a search measurement.
 
-        Counting one would file a cache read as a warm-LTM latency sample, and
-        the percentiles are advice about how long a round trip takes.
-        """
-        assert "surfaced_cache_hit" not in RETRIEVAL_OUTCOMES
-        assert "no_results_empty_cache" not in RETRIEVAL_SKIP_REASONS
-        assert "no_results_invalidated" not in RETRIEVAL_SKIP_REASONS
-
-    def test_refusals_to_attempt_are_excluded(self):
-        """``circuit_open`` and ``ltm_draining`` are faults for the stats
-        verdict but non-samples for the percentiles: no round trip was made."""
-        assert "circuit_open" not in RETRIEVAL_SKIP_REASONS
-        assert "ltm_draining" not in RETRIEVAL_SKIP_REASONS
-        assert {"circuit_open", "ltm_draining"} <= FAULT_SKIP_REASONS
+async def _mark_later() -> None:
+    await asyncio.sleep(0)
+    record_ltm_rpc()
 
 
 async def _record_later(obs: SurfacingObservability, outcome: Outcome) -> None:

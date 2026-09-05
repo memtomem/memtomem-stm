@@ -786,7 +786,9 @@ class DaemonServer:
           filed as a ``success`` sample of roughly the whole budget — censored
           data in the percentiles the timeout recommendation is derived from.
         - Whether the LTM was reached at all. Allowlist and gate skips must not
-          dilute warm-search percentiles with near-zero samples.
+          dilute warm-search percentiles with near-zero samples, and a call
+          that timed out or failed before issuing an RPC is not a measurement
+          of the LTM either (#994).
 
         Reading either from the engine's process-global counters would require
         that exactly one call be in flight, which is the constraint this is
@@ -826,12 +828,13 @@ class DaemonServer:
                         self._ltm_in_flight -= 1
             # Two different "nothing to read" cases, deliberately opposite.
             # Without a ledger (the raw LTM ops) the operation *is* the round
-            # trip, so every one of them is a sample. With a ledger, an empty
-            # one means the engine reached no terminal decision that needed the
-            # LTM — a call the hook allowlist or the gate turned away — and
-            # filing its near-zero duration would drag the percentiles the
-            # timeout recommendation comes from. A missing sample is invisible;
-            # a wrong one moves the advice.
+            # trip, so every one of them is a sample. With a ledger, a sample is
+            # filed only when the adapter marked an RPC as issued (#994): a call
+            # the hook allowlist or the gate turned away, one whose pre-work
+            # spent the whole window, or one whose session healing failed never
+            # reached the LTM, and filing its duration would move percentiles
+            # that are advice about the LTM with a measurement of STM. A
+            # missing sample is invisible; a wrong one moves the advice.
             activity_observed = ledger is None or ledger.retrieval_attempted
             if latency_kind is not None and activity_observed:
                 elapsed_ms = (time.monotonic() - started) * 1000.0
