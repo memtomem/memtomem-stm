@@ -17087,6 +17087,404 @@ class TestDoctor:
         assert "outer hook deadline truncates" in result.output
         assert "MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS=10" in result.output
 
+    def test_doctor_warns_when_every_surfacing_attempt_failed(
+        self, runner, config, monkeypatch
+    ):
+        # A failing dependency used to arrive as successful durations; it now
+        # lands in the failure counters instead (#994). Reading only
+        # ``samples`` therefore turned a daemon whose every search fails into
+        # "PASS -- collecting telemetry", which says the opposite of what is
+        # wrong. Cold samples stay out of the count: not-yet-warm IS still
+        # collecting.
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._healthy_config(config)
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(
+            proxy_mod,
+            "_surfacing_bootstrap_status",
+            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False, config_path=None: {
+                "enabled": True,
+                "feedback_enabled": False,
+                "feedback_db": None,
+                "timeouts": {"surfacing_seconds": 3.0, "hook_daemon_seconds": 2.5},
+                "ltm_server": {
+                    "route": "daemon",
+                    "connected": True,
+                    "display": "mms daemon",
+                    "latency": {
+                        "surface": {
+                            "samples": 0,
+                            "timeout_samples": 2,
+                            "error_samples": 6,
+                            "cold_samples": 3,
+                            "pre_rpc_faults": 4,
+                            "recommendation": {"status": "collecting", "seconds": None},
+                        },
+                        "retrieval": {
+                            "samples": 0,
+                            "recommendation": {"status": "collecting", "seconds": None},
+                        },
+                    },
+                    "measurement": None,
+                },
+            },
+        )
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        # WARN-only keeps doctor at exit 0 by its own contract.
+        assert result.exit_code == 0, result.output
+        outcomes_line = next(
+            line for line in result.output.splitlines() if "surfacing outcomes" in line
+        )
+        assert "WARN" in outcomes_line
+        # 2 timeouts + 6 errors + 4 pre-RPC faults; the 3 cold samples are not
+        # failures and must not be counted.
+        assert "12 surfacing request(s) since start" in result.output
+        assert "2 timed out, 6 faulted after issuing one, 4 never issued one" in result.output
+
+    def test_doctor_still_reports_collecting_for_an_unused_daemon(
+        self, runner, config, monkeypatch
+    ):
+        # The control: zero observations of any kind is genuinely "collecting",
+        # and widening the check must not turn every quiet daemon into a WARN.
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._healthy_config(config)
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(
+            proxy_mod,
+            "_surfacing_bootstrap_status",
+            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False, config_path=None: {
+                "enabled": True,
+                "feedback_enabled": False,
+                "feedback_db": None,
+                "timeouts": {"surfacing_seconds": 3.0, "hook_daemon_seconds": 2.5},
+                "ltm_server": {
+                    "route": "daemon",
+                    "connected": True,
+                    "display": "mms daemon",
+                    "latency": {
+                        "surface": {
+                            "samples": 0,
+                            "timeout_samples": 0,
+                            "error_samples": 0,
+                            "cold_samples": 3,
+                            "pre_rpc_faults": 0,
+                            "recommendation": {"status": "collecting", "seconds": None},
+                        },
+                        "retrieval": {
+                            "samples": 0,
+                            "recommendation": {"status": "collecting", "seconds": None},
+                        },
+                    },
+                    "measurement": None,
+                },
+            },
+        )
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert "collecting telemetry (0/5 successful warm samples)" in result.output
+        # No failures and no successes: the outcome check has nothing to say
+        # and stays off the report entirely rather than reporting a vacuous
+        # PASS an operator would read as "searches are working".
+        assert "surfacing outcomes" not in result.output
+
+    def test_doctor_reports_failures_even_once_a_recommendation_exists(
+        self, runner, config, monkeypatch
+    ):
+        # The hole in the first version of this check: it lived inside the
+        # timeout verdict's "not enough data yet" branch, so a daemon with
+        # enough old successes to have a recommendation never had its failures
+        # looked at, and one old success plus a thousand failures reported
+        # "collecting telemetry". Failure health is independent of whether
+        # there is enough data to size a timeout.
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._healthy_config(config)
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(
+            proxy_mod,
+            "_surfacing_bootstrap_status",
+            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False, config_path=None: {
+                "enabled": True,
+                "feedback_enabled": False,
+                "feedback_db": None,
+                "timeouts": {"surfacing_seconds": 30.0, "hook_daemon_seconds": 40.0},
+                "ltm_server": {
+                    "route": "daemon",
+                    "connected": True,
+                    "display": "mms daemon",
+                    "latency": {
+                        "surface": {
+                            "samples": 5,
+                            "timeout_samples": 0,
+                            "error_samples": 40,
+                            "cold_samples": 0,
+                            "pre_rpc_faults": 0,
+                            # A ready recommendation: the timeout check is
+                            # satisfied and says nothing about the 40 errors.
+                            "recommendation": {"status": "ready", "seconds": 2.0},
+                        },
+                        "retrieval": {
+                            "samples": 0,
+                            "recommendation": {"status": "collecting", "seconds": None},
+                        },
+                    },
+                    "measurement": None,
+                },
+            },
+        )
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        outcomes_line = next(
+            line for line in result.output.splitlines() if "surfacing outcomes" in line
+        )
+        assert "WARN" in outcomes_line
+        assert "40 surfacing request(s) since start" in result.output
+        # The timeout check is independently satisfied and must stay PASS --
+        # the point is that the two verdicts no longer gate each other.
+        timeout_line = next(
+            line for line in result.output.splitlines() if "surfacing timeout" in line
+        )
+        assert "PASS" in timeout_line
+
+    def test_doctor_passes_outcomes_when_every_search_succeeded(
+        self, runner, config, monkeypatch
+    ):
+        # The positive control for the WARN above: a daemon doing its job says
+        # so, which is also what makes the WARN readable as a change.
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._healthy_config(config)
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(
+            proxy_mod,
+            "_surfacing_bootstrap_status",
+            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False, config_path=None: {
+                "enabled": True,
+                "feedback_enabled": False,
+                "feedback_db": None,
+                "timeouts": {"surfacing_seconds": 30.0, "hook_daemon_seconds": 40.0},
+                "ltm_server": {
+                    "route": "daemon",
+                    "connected": True,
+                    "display": "mms daemon",
+                    "latency": {
+                        "surface": {
+                            "samples": 12,
+                            "timeout_samples": 0,
+                            "error_samples": 0,
+                            "cold_samples": 0,
+                            "pre_rpc_faults": 0,
+                            "recommendation": {"status": "ready", "seconds": 2.0},
+                        },
+                        "retrieval": {
+                            "samples": 0,
+                            "recommendation": {"status": "collecting", "seconds": None},
+                        },
+                    },
+                    "measurement": None,
+                },
+            },
+        )
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        outcomes_line = next(
+            line for line in result.output.splitlines() if "surfacing outcomes" in line
+        )
+        assert "PASS" in outcomes_line
+        assert "no failed surfacing requests since start" in result.output
+
+    def test_doctor_outcomes_never_puts_a_window_over_lifetime_counters(
+        self, runner, config, monkeypatch
+    ):
+        # ``samples`` is the length of a 256-wide duration window; the failure
+        # counters are cumulative since start. Reporting "N of M" over those
+        # two said "1 of 257" for a daemon that had served ten thousand
+        # successful searches and failed once. The check reports counts on one
+        # scope instead, so there is no denominator to get wrong.
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._healthy_config(config)
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(
+            proxy_mod,
+            "_surfacing_bootstrap_status",
+            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False, config_path=None: {
+                "enabled": True,
+                "feedback_enabled": False,
+                "feedback_db": None,
+                "timeouts": {"surfacing_seconds": 30.0, "hook_daemon_seconds": 40.0},
+                "ltm_server": {
+                    "route": "daemon",
+                    "connected": True,
+                    "display": "mms daemon",
+                    "latency": {
+                        "surface": {
+                            # A saturated window, which is all a long-running
+                            # healthy daemon ever reports.
+                            "samples": 256,
+                            "timeout_samples": 0,
+                            "error_samples": 1,
+                            "cold_samples": 0,
+                            "pre_rpc_faults": 0,
+                            "recommendation": {"status": "ready", "seconds": 2.0},
+                        },
+                        "retrieval": {
+                            "samples": 0,
+                            "recommendation": {"status": "collecting", "seconds": None},
+                        },
+                    },
+                    "measurement": None,
+                },
+            },
+        )
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert "1 surfacing request(s) since start" in result.output
+        # The window length must not appear as a denominator anywhere.
+        assert "of 257" not in result.output
+        assert "1 of 256" not in result.output
+
+    def test_doctor_outcomes_ignores_the_raw_retrieval_series(
+        self, runner, config, monkeypatch
+    ):
+        # ``retrieval`` is raw search/compose ops plus the synthetic searches
+        # ``--measure-ltm`` issues. Folding it in let a measurement run report
+        # on surfacing that never happened, and sent a retrieval-only failure
+        # to `mms daemon status`, which renders only the surface series and so
+        # could not explain it. ``ltm measurement`` is where measurement
+        # reports.
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._healthy_config(config)
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(
+            proxy_mod,
+            "_surfacing_bootstrap_status",
+            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False, config_path=None: {
+                "enabled": True,
+                "feedback_enabled": False,
+                "feedback_db": None,
+                "timeouts": {"surfacing_seconds": 30.0, "hook_daemon_seconds": 40.0},
+                "ltm_server": {
+                    "route": "daemon",
+                    "connected": True,
+                    "display": "mms daemon",
+                    "latency": {
+                        "surface": {
+                            "samples": 0,
+                            "timeout_samples": 0,
+                            "error_samples": 0,
+                            "cold_samples": 0,
+                            "pre_rpc_faults": 0,
+                            "recommendation": {"status": "collecting", "seconds": None},
+                        },
+                        "retrieval": {
+                            "samples": 2,
+                            "timeout_samples": 3,
+                            "error_samples": 5,
+                            "recommendation": {"status": "collecting", "seconds": None},
+                        },
+                    },
+                    "measurement": None,
+                },
+            },
+        )
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        # No surfacing traffic at all: the check says nothing, rather than
+        # attributing eight raw-op failures to surfacing.
+        assert "surfacing outcomes" not in result.output
+
+    def test_doctor_does_not_certify_a_daemon_that_predates_the_counters(
+        self, runner, config, monkeypatch
+    ):
+        # A daemon still running an older build sends no ``pre_rpc_faults``.
+        # Read as zero it produced "no failed surfacing requests since start" --
+        # a clean bill of health for the one daemon that cannot report its
+        # failures, and whose successes still include the failed round trips
+        # #994 stopped counting as successes.
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._healthy_config(config)
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(
+            proxy_mod,
+            "_surfacing_bootstrap_status",
+            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False, config_path=None: {
+                "enabled": True,
+                "feedback_enabled": False,
+                "feedback_db": None,
+                "timeouts": {"surfacing_seconds": 30.0, "hook_daemon_seconds": 40.0},
+                "ltm_server": {
+                    "route": "daemon",
+                    "connected": True,
+                    "display": "mms daemon",
+                    "latency": {
+                        # Exactly the pre-#994 shape: no ``pre_rpc_faults``.
+                        "surface": {
+                            "samples": 30,
+                            "timeout_samples": 0,
+                            "error_samples": 0,
+                            "cold_samples": 0,
+                            "recommendation": {"status": "ready", "seconds": 2.0},
+                        },
+                        "retrieval": {
+                            "samples": 0,
+                            "recommendation": {"status": "collecting", "seconds": None},
+                        },
+                    },
+                    "measurement": None,
+                },
+            },
+        )
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        outcomes_line = next(
+            line for line in result.output.splitlines() if "surfacing outcomes" in line
+        )
+        assert "WARN" in outcomes_line
+        assert "predates the surfacing outcome counters" in result.output
+        assert "mms daemon restart" in result.output
+        # The health claim it cannot support must not appear.
+        assert "no failed surfacing requests since start" not in result.output
+
     def test_score_scale_mismatch_diagnostic_fails_before_ceiling_heuristic(
         self, runner, config, monkeypatch
     ):

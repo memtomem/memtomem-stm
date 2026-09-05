@@ -1359,6 +1359,249 @@ class TestSurfacingDeadline:
         assert engine._circuit_breaker.failure_count == 1
 
 
+class TestLedgerRpcMark:
+    """The per-call ledger learns about a round trip from the adapter (#994).
+
+    Real engine over the real ``McpClientSearchAdapter`` with only the session
+    faked, under the same ``attribute_call`` block the daemon opens: the
+    ``retrieval_attempted`` the daemon gates its latency sample on must be
+    ``True`` exactly when a request was handed to the transport.
+    """
+
+    _COMPACT_HIT = "[1] 0.90 | [default] note.md\nsurfaced through a real rpc"
+
+    def _adapter_with_session(self, call_tool: AsyncMock):
+        from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
+        session = AsyncMock()
+        session.call_tool = call_tool
+
+        async def fake_start():
+            adapter._session = session
+
+        adapter.start = AsyncMock(side_effect=fake_start)  # type: ignore[method-assign]
+        return adapter
+
+    def _hit(self):
+        content = MagicMock()
+        content.type = "text"
+        content.text = self._COMPACT_HIT
+        result = MagicMock()
+        result.content = [content]
+        return result
+
+    async def test_a_completed_search_is_marked(self):
+        from memtomem_stm.surfacing.observability import (
+            SurfacingObservability,
+            attribute_call,
+        )
+
+        call_tool = AsyncMock(return_value=self._hit())
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=self._adapter_with_session(call_tool),
+            observability=obs,
+        )
+        with attribute_call() as ledger:
+            output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+        assert "surfaced through a real rpc" in output
+        call_tool.assert_awaited_once()
+        assert ledger.outcomes == ["surfaced_cache_miss"]
+        assert ledger.retrieval_attempted is True
+        assert ledger.timed_out is False
+
+    async def test_pre_work_exhausting_the_window_is_not_marked(self):
+        # ``effective_timeout <= 0``: the engine books ``error_timeout`` itself
+        # and never calls the adapter (#720). The daemon used to infer a round
+        # trip from that terminal and file the duration as a timeout sample.
+        from memtomem_stm.surfacing.observability import (
+            SurfacingObservability,
+            attribute_call,
+        )
+
+        call_tool = AsyncMock(return_value=self._hit())
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=self._adapter_with_session(call_tool),
+            observability=obs,
+        )
+        with attribute_call() as ledger:
+            output = await engine.surface(
+                "gh",
+                "read_file",
+                VALID_ARGS,
+                LONG_RESPONSE,
+                deadline_monotonic=time.monotonic() - 1.0,
+            )
+
+        assert output == LONG_RESPONSE
+        call_tool.assert_not_awaited()
+        assert ledger.outcomes == ["error_timeout"]
+        assert ledger.timed_out is True
+        assert ledger.retrieval_attempted is False
+
+    async def test_failed_session_healing_is_not_marked(self):
+        # ``_heal_if_needed`` fails → the adapter answers ``no_session`` before
+        # ``_rpc`` → the engine records ``ltm_unavailable``. Nothing was sent.
+        from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+        from memtomem_stm.surfacing.observability import (
+            SurfacingObservability,
+            attribute_call,
+        )
+
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
+        adapter.start = AsyncMock(  # type: ignore[method-assign]
+            side_effect=ConnectionError("LTM unreachable"),
+        )
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+        with attribute_call() as ledger:
+            output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+        assert output == LONG_RESPONSE
+        assert ledger.skip_reasons == ["ltm_unavailable"]
+        assert ledger.retrieval_attempted is False
+
+    async def test_the_real_lifecycle_exchanges_do_not_mark(self):
+        # The adapter's own lifecycle calls -- the ``mem_do action=version``
+        # probe in ``_negotiate_format`` and the ``list_tools`` rerank check in
+        # ``_probe_rerank_support`` -- go to the session directly, not through
+        # ``_rpc``, so they do not mark even when a request's lazy start ran
+        # them inside its ledger.
+        #
+        # Drives the REAL methods, not a hand-rolled imitation of what they do:
+        # an implementation that started routing either of them through ``_rpc``
+        # has to fail this, which is the whole point of pinning the boundary.
+        from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+        from memtomem_stm.surfacing.observability import attribute_call
+
+        adapter = McpClientSearchAdapter(
+            SurfacingConfig(result_format="structured", rerank=False)
+        )
+        session = AsyncMock()
+        version = MagicMock()
+        version_text = MagicMock()
+        version_text.type = "text"
+        version_text.text = '{"capabilities": {"search_formats": ["structured"]}}'
+        version.content = [version_text]
+        session.call_tool = AsyncMock(return_value=version)
+        listing = MagicMock()
+        listing.tools = []
+        session.list_tools = AsyncMock(return_value=listing)
+
+        with attribute_call() as ledger:
+            await adapter._negotiate_format(session)
+            await adapter._probe_rerank_support(session)
+
+        # Both really ran -- an inert session would make the assertion below
+        # true for the wrong reason.
+        session.call_tool.assert_awaited_once()
+        session.list_tools.assert_awaited_once()
+        assert ledger.retrieval_attempted is False
+
+        # And the search RPC through that same session does mark, so what is
+        # being pinned is the call path and not a session too quiet to mark.
+        adapter._session = session
+        session.call_tool = AsyncMock(return_value=self._hit())
+        with attribute_call() as searched:
+            await adapter.search("q")
+        assert searched.retrieval_attempted is True
+
+    async def test_a_bookkeeping_rpc_does_not_mark(self):
+        # ``_rpc`` also carries the scratch / proposal / access-boost mutations
+        # a surfacing call makes around its search. Marking one would make a
+        # request whose search never went out look like one that did, purely
+        # because some later bookkeeping call did -- and the only reason that
+        # is not already wrong is that today's call graph happens to search
+        # first. The marker names the two search actions instead of trusting
+        # the order.
+        from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+        from memtomem_stm.surfacing.observability import attribute_call
+
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
+        session = AsyncMock()
+        session.call_tool = AsyncMock(return_value=self._hit())
+
+        with attribute_call() as bookkeeping:
+            await adapter._rpc(
+                session, 1, "mem_do", {"action": "increment_access", "params": {}}
+            )
+        assert bookkeeping.retrieval_attempted is False
+
+        with attribute_call() as composed:
+            await adapter._rpc(session, 1, "mem_do", {"action": "context_compose", "params": {}})
+        assert composed.retrieval_attempted is True
+
+        with attribute_call() as searched:
+            await adapter._rpc(session, 1, "mem_search", {"query": "q"})
+        assert searched.retrieval_attempted is True
+
+    async def test_the_public_compose_path_marks(self):
+        # The predicate test above calls ``_rpc`` directly. This drives the
+        # path a capable core actually takes -- ``context_compose()`` ->
+        # ``_call_mem_do()`` -> ``_rpc()`` -- so a refactor that stopped
+        # routing compose through ``_rpc``, or that changed the action name the
+        # predicate matches on, fails here rather than silently dropping every
+        # compose-route request out of the percentiles.
+        from memtomem_stm.surfacing.mcp_client import LtmCapabilities, McpClientSearchAdapter
+        from memtomem_stm.surfacing.observability import attribute_call
+
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="structured"))
+        session = AsyncMock()
+        bundle = MagicMock()
+        bundle.type = "text"
+        bundle.text = '{"pinned": [], "retrieved": [], "warnings": []}'
+        result = MagicMock()
+        result.content = [bundle]
+        session.call_tool = AsyncMock(return_value=result)
+        adapter._session = session
+        adapter._capabilities = LtmCapabilities(context_compose_schema=2)
+
+        with attribute_call() as ledger:
+            await adapter.context_compose("q", max_chars=1000, top_k=4)
+
+        sent = session.call_tool.await_args.args
+        assert sent[0] == "mem_do"
+        assert sent[1]["action"] == "context_compose"
+        assert ledger.retrieval_attempted is True
+
+    async def test_a_round_trip_that_times_out_is_still_marked(self):
+        # The positive control for the two negatives above: the same
+        # ``error_timeout`` terminal, but this time a request did go out and
+        # the duration is a real (censored) measurement of the LTM.
+        from memtomem_stm.surfacing.observability import (
+            SurfacingObservability,
+            attribute_call,
+        )
+
+        async def hangs(*_args, **_kwargs):
+            await asyncio.sleep(10)
+
+        call_tool = AsyncMock(side_effect=hangs)
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.05),
+            mcp_adapter=self._adapter_with_session(call_tool),
+            observability=obs,
+        )
+        with attribute_call() as ledger:
+            output = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+
+        assert output == LONG_RESPONSE
+        call_tool.assert_awaited_once()
+        assert ledger.outcomes == ["error_timeout"]
+        assert ledger.timed_out is True
+        assert ledger.retrieval_attempted is True
+
+
 class TestSessionDedup:
     """Verify same memory isn't surfaced twice in one session."""
 

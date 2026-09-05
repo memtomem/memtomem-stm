@@ -9551,6 +9551,39 @@ def doctor(
                         value = summary.get("recommendation")
                         return value if isinstance(value, dict) else None
 
+                    def _predates_outcome_counters(summary: Any) -> bool:
+                        """Is this snapshot from a daemon built before #994?
+
+                        ``pre_rpc_faults`` is the key that change added, so its
+                        absence dates the running daemon rather than describing
+                        it. That matters twice over: the counter cannot be read
+                        as zero (absent means unmeasured, not none), and such a
+                        daemon files a failed round trip as a *successful*
+                        duration, so its ``samples`` and the recommendation
+                        derived from them are polluted by exactly what #994
+                        removed. Neither can be repaired from this side -- the
+                        daemon has to be restarted onto the new build.
+                        """
+                        return not (isinstance(summary, dict) and "pre_rpc_faults" in summary)
+
+                    def _failure_breakdown(summary: Any) -> dict[str, int]:
+                        """Per-counter observations that were not a completed warm search.
+
+                        Tolerant of a payload from an older daemon that carries
+                        only some of these keys. ``cold_samples`` is excluded:
+                        a cold start is the LTM not being warm yet, which is
+                        what "collecting telemetry" already describes.
+                        """
+                        counts = {
+                            key: 0 for key in ("timeout_samples", "error_samples", "pre_rpc_faults")
+                        }
+                        if isinstance(summary, dict):
+                            for key in counts:
+                                value = summary.get(key)
+                                if isinstance(value, int) and not isinstance(value, bool):
+                                    counts[key] = max(0, value)
+                        return counts
+
                     surface_rec = recommendation(surface_summary)
                     retrieval_rec = recommendation(retrieval_summary)
                     # Hook traffic populates ``surface``; explicit low-level
@@ -9615,6 +9648,73 @@ def doctor(
                             "PASS",
                             f"configured {surfacing_current:g}s >= observed recommendation "
                             f"{recommended:g}s",
+                        )
+
+                    # Its own check, not a branch of the timeout verdict above.
+                    # Nesting it there tied "is the dependency healthy" to "is
+                    # there enough data to size a timeout", and the two are
+                    # independent: a daemon with one old success and a thousand
+                    # later failures has a recommendation, or is "collecting",
+                    # and either way the timeout check has nothing to say about
+                    # the failures.
+                    #
+                    # Scoped to ``surface`` alone -- the daemon's own hook
+                    # traffic. The ``retrieval`` series is raw search/compose
+                    # ops plus the synthetic searches ``--measure-ltm`` issues,
+                    # so folding it in here would let a measurement run report
+                    # on surfacing that never happened, and would send a
+                    # retrieval-only failure to ``mms daemon status``, which
+                    # renders only the surface series and could not explain it.
+                    # ``ltm_measurement`` above is where measurement reports.
+                    #
+                    # Counts, not a ratio. The failure counters are cumulative
+                    # since start, but ``samples`` is the length of a 256-wide
+                    # duration window -- putting them over one denominator
+                    # reads as a rate and is simply wrong once a daemon has
+                    # served more than a window's worth ("1 of 257" after ten
+                    # thousand successes and one failure).
+                    breakdown = _failure_breakdown(surface_summary)
+                    failures = sum(breakdown.values())
+                    if _predates_outcome_counters(surface_summary):
+                        # Neither verdict below can be honest about this
+                        # snapshot: the failure counters are partly absent, and
+                        # the successes it does report include the failed round
+                        # trips #994 stopped counting as successes.
+                        check(
+                            "surfacing_outcomes",
+                            "surfacing outcomes",
+                            "WARN",
+                            "the running daemon predates the surfacing outcome counters; "
+                            "its failures are unreported and its timeout recommendation is "
+                            "derived from durations that include failed searches",
+                            "mms daemon restart",
+                        )
+                    elif failures:
+                        # Neutral about the cause on purpose: this population
+                        # mixes a dependency that erred or timed out with a
+                        # request the daemon shed before touching the LTM at
+                        # all (queue pressure, or a client deadline too short
+                        # to start a search under). The breakdown is what makes
+                        # it actionable without asserting which one it was.
+                        check(
+                            "surfacing_outcomes",
+                            "surfacing outcomes",
+                            "WARN",
+                            f"{failures} surfacing request(s) since start did not complete a "
+                            f"warm LTM search ({breakdown['timeout_samples']} timed out, "
+                            f"{breakdown['error_samples']} faulted after issuing one, "
+                            f"{breakdown['pre_rpc_faults']} never issued one)",
+                            "mms daemon status",
+                        )
+                    elif isinstance(surface_summary, dict) and surface_summary.get("samples"):
+                        # No count on this side: ``samples`` is windowed, so
+                        # naming it here would invite the same false arithmetic
+                        # the WARN branch avoids.
+                        check(
+                            "surfacing_outcomes",
+                            "surfacing outcomes",
+                            "PASS",
+                            "no failed surfacing requests since start",
                         )
 
                     from memtomem_stm.daemon.latency import hook_timeout_recommendation

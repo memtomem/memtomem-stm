@@ -485,6 +485,13 @@ class DaemonServer:
                 surface_deadline = self._surface_deadline(req)
                 if surface_deadline is None:
                     logger.debug("surface skipped: no budget left in the client deadline")
+                    # Shed before the engine is touched, so nothing records a
+                    # terminal and the ledger stays empty -- which the
+                    # classification below reads as "no observation" and drops.
+                    # Counted here instead: a daemon shedding every request at
+                    # this floor is saturated, and without this it looks
+                    # exactly like one nobody is calling (#994).
+                    self._latency.record_pre_rpc_fault("surface")
                     return surface_response({})
                 output = await run_surfacing_hook(
                     call, engine=self._engine, deadline_monotonic=surface_deadline
@@ -786,7 +793,9 @@ class DaemonServer:
           filed as a ``success`` sample of roughly the whole budget — censored
           data in the percentiles the timeout recommendation is derived from.
         - Whether the LTM was reached at all. Allowlist and gate skips must not
-          dilute warm-search percentiles with near-zero samples.
+          dilute warm-search percentiles with near-zero samples, and a call
+          that timed out or failed before issuing an RPC is not a measurement
+          of the LTM either (#994).
 
         Reading either from the engine's process-global counters would require
         that exactly one call be in flight, which is the constraint this is
@@ -826,40 +835,78 @@ class DaemonServer:
                         self._ltm_in_flight -= 1
             # Two different "nothing to read" cases, deliberately opposite.
             # Without a ledger (the raw LTM ops) the operation *is* the round
-            # trip, so every one of them is a sample. With a ledger, an empty
-            # one means the engine reached no terminal decision that needed the
-            # LTM — a call the hook allowlist or the gate turned away — and
-            # filing its near-zero duration would drag the percentiles the
-            # timeout recommendation comes from. A missing sample is invisible;
-            # a wrong one moves the advice.
+            # trip, so every one of them is a sample. With a ledger, a sample is
+            # filed only when the adapter marked an RPC as issued (#994): a call
+            # the hook allowlist or the gate turned away, one whose pre-work
+            # spent the whole window, or one whose session healing failed never
+            # reached the LTM, and filing its duration would move percentiles
+            # that are advice about the LTM with a measurement of STM. A
+            # missing sample is invisible; a wrong one moves the advice.
             activity_observed = ledger is None or ledger.retrieval_attempted
+            if latency_kind is not None and ledger is not None and not activity_observed:
+                # No duration to file, but not nothing to say. Healing that
+                # failed, pre-timeout work that spent the window, and a breaker
+                # refusing the attempt all leave every counter below reading
+                # exactly as they do for a daemon nobody used -- so an operator
+                # asking "did my requests die before the search went out?" had
+                # no way to tell (#994). This counter answers that one
+                # question and stays out of the percentiles.
+                if ledger.faulted:
+                    self._latency.record_pre_rpc_fault(latency_kind)
+                # A healthy pre-RPC skip -- the hook allowlist, a gate
+                # cooldown, a cache-decided terminal -- is deliberately not
+                # counted. Surfacing does more of those than everything else
+                # combined, so counting them would bury the signal this exists
+                # for under ordinary traffic.
             if latency_kind is not None and activity_observed:
                 elapsed_ms = (time.monotonic() - started) * 1000.0
                 self_timed_out = ledger is not None and ledger.timed_out
-                if not warm_at_start:
-                    outcome: LatencyOutcome = "cold"
-                elif self_timed_out:
-                    # Same precedence as the `asyncio.TimeoutError` branch below,
-                    # which this replaces for surfacing: cold first, then timeout.
-                    outcome = "timeout"
+                # How the call ended decides first; whether the LTM was warm
+                # only decides what to do with a call that ended *well*.
+                #
+                # ``cold`` used to come first, which merged three populations
+                # into one bucket -- cold successes, cold timeouts and cold
+                # faults -- and every consumer that reads ``cold_samples`` as
+                # "still warming up" then read a failing daemon as a starting
+                # one. Nothing is lost by demoting it: only a ``success``
+                # files a duration, so the whole reason ``cold`` exists (a
+                # cold-start duration must not reach percentiles that answer
+                # how long a *warm* search takes) is untouched by classifying
+                # a cold failure as the failure it is.
+                if self_timed_out:
+                    outcome: LatencyOutcome = "timeout"
+                elif ledger is not None and ledger.faulted:
+                    # A round trip that went out and then failed — the LTM
+                    # dropped the connection mid-flight, raised, or answered
+                    # something the parser could not read. Real LTM time, but
+                    # not a *successful* search, and the percentiles answer how
+                    # long one of those takes. The response cannot carry this:
+                    # the engine returns the caller's text unchanged on a
+                    # fault, so an ``ok`` surfacing reply is shape-identical to
+                    # a healthy one that surfaced nothing, and every such call
+                    # used to be filed as a success duration (#994).
+                    outcome = "error"
                 elif response.get("ok") is not True or (
                     latency_kind == "retrieval"
                     and response.get("outcome") not in (None, "ok", "empty_results")
                 ):
                     outcome = "error"
+                elif not warm_at_start:
+                    outcome = "cold"
                 else:
                     outcome = "success"
                 self._latency.record(latency_kind, elapsed_ms, outcome)
             return response
         except asyncio.TimeoutError:
             if latency_kind is not None:
-                outcome = "timeout" if warm_at_start else "cold"
-                self._latency.record(latency_kind, (time.monotonic() - started) * 1000.0, outcome)
+                # Same precedence as the branch above: a request that ran out
+                # of deadline did so whether or not the LTM was warm, and
+                # filing it as ``cold`` hid it from every failure reader.
+                self._latency.record(latency_kind, (time.monotonic() - started) * 1000.0, "timeout")
             return {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
         except Exception:
             if latency_kind is not None:
-                outcome = "error" if warm_at_start else "cold"
-                self._latency.record(latency_kind, (time.monotonic() - started) * 1000.0, outcome)
+                self._latency.record(latency_kind, (time.monotonic() - started) * 1000.0, "error")
             logger.debug("daemon LTM operation failed", exc_info=True)
             return {"v": PROTOCOL_VERSION, "ok": False, "status": "unavailable"}
         finally:

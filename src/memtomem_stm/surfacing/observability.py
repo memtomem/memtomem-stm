@@ -184,53 +184,6 @@ FAULT_OUTCOMES: frozenset[str] = frozenset(
     }
 )
 
-# Terminal decisions the daemon files a latency sample for (#874).
-#
-# The percentiles are advice about how long a *warm search* takes, so a call
-# that never got as far as the retrieval stage — an allowlist or gate skip, a
-# response too short, a breaker already open — must not be filed as a near-zero
-# sample. These two sets name that filter. They are the daemon's own inputs,
-# moved here verbatim from ``daemon/server.py``; the behavior they select is
-# unchanged.
-#
-# Deliberately narrower than ``SEARCH_COMPLETED_SKIP_REASONS`` +
-# ``SURFACED_OUTCOMES`` + ``FAULT_*``, which answer a different question (the
-# fault *ratio* in ``stm_surfacing_stats``):
-#
-# - ``surfaced_cache_hit`` / ``no_results_invalidated`` /
-#   ``no_results_empty_cache`` are decided from the result cache, so their
-#   duration is not a search measurement. (The daemon disables the cache
-#   outright, so on that path they cannot occur at all.)
-# - ``circuit_open`` and ``ltm_draining`` are refusals to attempt a round trip;
-#   they are faults for the ratio but non-samples for the percentiles.
-#
-# **These name a stage, not a proven round trip.** Two members are recorded on
-# paths where no RPC was issued: ``error_timeout`` when pre-timeout work
-# consumed the whole window (``engine.surface``, #720), and ``ltm_unavailable``
-# when session healing failed and the adapter answered ``no_session``. Both
-# still spent the caller's budget, so filing them is defensible, but a sample
-# taken then measures STM rather than the LTM. Deriving the flag from an
-# explicit marker set immediately before the RPC would be the precise version
-# is tracked as #994 — this filter predates #874 and is unchanged by it.
-RETRIEVAL_SKIP_REASONS: frozenset[str] = frozenset(
-    {
-        "no_results_score",
-        "no_results_dedup",
-        "no_results_demoted",
-        "ltm_unavailable",
-        "ltm_call_failed",
-        "ltm_parse_empty",
-    }
-)
-
-RETRIEVAL_OUTCOMES: frozenset[str] = frozenset(
-    {
-        "surfaced_cache_miss",
-        "error_timeout",
-        "error_other",
-    }
-)
-
 CacheBucket = Literal["hit", "miss"]
 
 # Sentinel string key for the "all tools" aggregate row in per-tool dicts.
@@ -258,21 +211,60 @@ class CallLedger:
 
     Cache buckets are not recorded here: no consumer asks a per-call question
     about them, and leaving them out keeps the ledger to the two mutually
-    exclusive per-call decisions (``record_skip`` OR ``record_outcome``).
+    exclusive per-call decisions (``record_skip`` OR ``record_outcome``) plus
+    the one fact neither of them can carry — whether a request actually left
+    for the LTM (#994).
     """
 
     skip_reasons: list[str] = field(default_factory=list)
     outcomes: list[str] = field(default_factory=list)
+    # Set by :func:`record_search_rpc` at the moment a search request is handed
+    # to the LTM transport — the one place that knows a round trip was issued.
+    search_rpc_issued: bool = False
 
     @property
     def retrieval_attempted(self) -> bool:
-        """Did this call reach the retrieval stage?
+        """Did a *search* RPC leave the process for this call?
 
-        Not "did an RPC leave the process" — see ``RETRIEVAL_SKIP_REASONS``
-        for the two members that can be recorded without one.
+        Read from the explicit mark :func:`record_search_rpc` sets in the
+        adapter, never inferred from the terminal decision: ``error_timeout``
+        and ``ltm_unavailable`` are both recorded on paths that sent nothing
+        (pre-work that spent the window, #720; healing that failed), and a
+        duration taken there measures STM, not the LTM (#994).
+
+        Scope is the two search actions, ``mem_search`` and ``context_compose``.
+        Lifecycle exchanges (version probe, ``list_tools``) and the bookkeeping
+        RPCs around a search do not mark -- a connect is not a search, and
+        marking one would put spawn and negotiation time into percentiles that
+        are advice about a warm search. An unmarked call files no duration at
+        all; when it ended badly the daemon counts it as ``pre_rpc_faults``.
+        The reasoning behind each boundary is in the CHANGELOG entry for #994.
         """
-        return any(reason in RETRIEVAL_SKIP_REASONS for reason in self.skip_reasons) or any(
-            outcome in RETRIEVAL_OUTCOMES for outcome in self.outcomes
+        return self.search_rpc_issued
+
+    @property
+    def faulted(self) -> bool:
+        """Did this call end on a fault rather than on a healthy terminal?
+
+        Mostly a degraded dependency, but not only: ``error_other`` is the
+        engine's catch-all for an unexpected internal exception, so a consumer
+        naming this population must not promise the LTM was at fault.
+
+        Read together with :attr:`retrieval_attempted` by a caller bucketing a
+        duration: an RPC that went out and then failed mid-flight is a real
+        measurement of the LTM, but not of a *successful* search, so it does
+        not belong in the percentiles that answer how long one takes. The
+        daemon cannot see this in the response — the engine returns the
+        caller's text unchanged on a fault, so a surfacing reply is shaped
+        exactly like a healthy one that surfaced nothing (#994).
+
+        Deliberately the same membership as the ``stm_surfacing_stats`` fault
+        ratio, so an operator comparing the two reads one definition of
+        "fault". ``timed_out`` overlaps by way of ``error_timeout`` and is kept
+        separate because its consumer buckets a timeout before an error.
+        """
+        return any(reason in FAULT_SKIP_REASONS for reason in self.skip_reasons) or any(
+            outcome in FAULT_OUTCOMES for outcome in self.outcomes
         )
 
     @property
@@ -328,6 +320,22 @@ def attribute_call() -> Iterator[CallLedger]:
         yield ledger
     finally:
         _ACTIVE_LEDGER.reset(token)
+
+
+def record_search_rpc() -> None:
+    """Mark that the surfacing call in this context is issuing a search RPC.
+
+    Called by the transport adapter immediately before a ``mem_search`` or
+    ``context_compose`` request is handed to the session -- after healing has
+    produced a live one, so a heal that fails (``no_session``) leaves the mark
+    unset, and a retry after a transport error sets it again harmlessly. Other
+    RPCs through the same adapter do not call this. Outside any
+    :func:`attribute_call` block (the proxy path, a daemon operation that opens
+    no ledger) this is a no-op.
+    """
+    ledger = _ACTIVE_LEDGER.get()
+    if ledger is not None:
+        ledger.search_rpc_issued = True
 
 
 class SurfacingObservability:

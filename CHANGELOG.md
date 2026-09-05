@@ -219,6 +219,129 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **The daemon files a warm-search latency sample only for a request that
+  actually issued a search RPC to the LTM** (#994). `_run_admitted` decided
+  whether a surfacing request was a sample from the terminal decision the
+  engine recorded (`RETRIEVAL_SKIP_REASONS` / `RETRIEVAL_OUTCOMES`, #874).
+  Those sets named a *stage*, not a round trip, and two of their members are
+  also recorded on paths where nothing was sent: `error_timeout` when the gate,
+  query extraction and privacy scan consumed the caller's whole window (#720),
+  and `ltm_unavailable` when session healing failed and the adapter answered
+  `no_session`. Each still spent the caller's budget, but none of that elapsed
+  time is a warm search: it is STM pre-work, queue wait, and -- when healing is
+  what failed -- adapter startup, reconnect and capability negotiation. It
+  landed in the series `hook.daemon_timeout_seconds` advice is derived from, so
+  a stretch of failed healing inflated the recommendation with numbers about
+  the wrong component.
+  The adapter now marks the request's `CallLedger` at the point the RPC is
+  handed to the transport (`McpClientSearchAdapter._rpc`, after healing), and
+  `retrieval_attempted` reads that mark instead of inferring it; the two sets
+  are gone. A surfacing call the engine handled to a terminal without reaching
+  the LTM files no *duration* -- not into the percentiles and not into the
+  timeout count either -- rather than into a separate duration series, since a
+  non-RPC elapsed time is not a censored observation of the LTM. One that ended
+  badly is still counted, without a duration, by `pre_rpc_faults` below. Two
+  boundaries are deliberate. The mark is scoped to the *search* round trip, so
+  the adapter's lifecycle exchanges (the version probe in `_negotiate_format`
+  and the `list_tools` rerank check in `_probe_rerank_support`, which go to the
+  session directly) do not mark: a connect is not a search, and marking one
+  would put child-spawn and negotiation time into the very series this change
+  exists to clean up. The consequence is that a request whose only LTM work was
+  a start or reconnect that then failed produces **no latency sample at all**,
+  not a `cold` one -- the warmth check sits inside the branch the mark gates.
+  Separately, a request that expires while waiting for an admission or LTM slot
+  is still filed as a timeout by the outer handler, which consults no ledger,
+  because that is currently the only telemetry of daemon saturation. The
+  pre-existing filter for allowlist, gate and cache-decided terminals is
+  unchanged in effect.
+
+  **The daemon counts what it no longer samples**, as `pre_rpc_faults` in the
+  latency snapshot: a request that ended badly without any search RPC leaving
+  the process. Two kinds, from two recorders. The engine records a fault --
+  healing failed, pre-timeout work spent the window, the breaker refused the
+  attempt -- and the daemon reads it off the ledger. The daemon also records
+  one itself, before the engine is involved at all, when the admission queue
+  and the LTM-slot wait have left too little of the client's deadline to start
+  a search under; there the LTM is never touched and the cause is queue
+  pressure or a client deadline too short for this daemon. Both are "the
+  request produced no search", which is the question the counter answers; `mms
+  daemon status` and the engine's own counters are where the two come apart. It
+  is a counter, not a duration, and never enters the percentiles. Without it,
+  dropping these calls would have made a daemon whose every request dies before
+  its search read exactly like an unused one *in the daemon's own status*: the
+  engine's fault counters live on the daemon's engine, and `stm_surfacing_stats`
+  renders the MCP server process's engine instead -- a different object in a
+  different process. The durable fault store is the one place the two routes
+  already met, and it stays that: `mms stats` reports the engine-recorded
+  faults when a feedback tracker is attached, on its own shared,
+  retention-windowed scope rather than this daemon's since-start one.
+
+  **A warm round trip that failed after the request went out is filed as an
+  error rather than a success duration**, in the same change. The engine
+  returns the caller's text unchanged on a dependency fault, so the daemon's
+  response is `ok` and shape-identical to a healthy call that surfaced nothing
+  -- and classifying from the response alone put every mid-flight connection
+  drop, call error and parse failure into the percentiles that answer how long
+  a *successful* search takes. `CallLedger.faulted` reads the same membership
+  as the `stm_surfacing_stats` fault ratio, so an operator comparing the two
+  reads one definition of "fault", and those durations now increment
+  `error_samples` instead. The two populations are still not identical, by
+  construction: cold-start precedence files a fault on a not-yet-warm daemon as
+  `cold`, and a refusal to attempt (`circuit_open`, `ltm_draining`) is never
+  marked, so neither reaches `error_samples` while both count toward the stats
+  ratio. A completed search whose candidates were all filtered out
+  (`no_results_score`, `no_results_dedup`, `no_results_demoted`) is healthy and
+  stays a success duration; the cache-decided members of that family
+  (`no_results_invalidated`, `no_results_empty_cache`) issue no RPC and were
+  never samples at all.
+
+  **Behavior change**: how the call ended now outranks whether the LTM was warm
+  when classifying a latency observation. `cold` used to be decided first, so a
+  request that connected, issued its search and then failed or timed out was
+  filed as `cold_samples` beside the cold *successes* -- and every consumer
+  reads that bucket as "still warming up", which turned a daemon failing on
+  every request into one that looked like it was starting. A failure is now
+  filed as the failure it was, warm or not; `cold` keeps only the calls that
+  ended well, which is all it was ever protecting. Nothing moves in the
+  percentiles either way: only a success files a duration.
+
+  `mms daemon status` renders the surface-latency line on any observation
+  rather than only on a successful one, and prints every counter that can turn
+  it on -- `timeouts`, `errors`, `cold` and `pre_rpc_faults` -- rather than a
+  line switched on by an observation it does not show. With no successful
+  durations it says so instead of printing percentiles over an empty window,
+  which render as `p50=0ms` and read as "instant". Gating the line on `samples`
+  meant a daemon whose every search was failing printed no line at all, which
+  reads exactly like a daemon nothing has used yet -- and after the
+  reclassification above that is the daemon an operator most needs the command
+  to describe. `--json` passes the daemon's snapshot through as before; its
+  latency schema gains `pre_rpc_faults` as an additive key on both series, and
+  a reader that does not know it is unaffected.
+
+  `mms doctor` gains a `surfacing outcomes` check reading the same counters,
+  independent of the timeout checks beside it. It WARNs when the surface series
+  records a request that timed out, faulted after issuing a search, or never
+  issued one, and reports that breakdown rather than a ratio: the failure
+  counters are cumulative while `samples` is the length of a 256-wide duration
+  window, so the two do not share a denominator. Requests the daemon turned
+  away before admitting them (`expired`, `busy`) are outside this population --
+  they are counted in the queue telemetry instead. A snapshot with no
+  `pre_rpc_faults` key comes from a daemon predating this change: the check
+  says so and asks for a restart rather than reading absent counters as zero,
+  since such a daemon cannot report its failures and its recommendation is
+  derived from durations that still include failed searches. Without it, a daemon whose LTM had died
+  reported "collecting telemetry" -- the timeout check answers "is there enough
+  data to size a timeout", which is a different question from "is the
+  dependency working", and after the reclassification above the failures no
+  longer reach the first one at all. Scoped to the daemon's own hook traffic:
+  the raw and synthetic `retrieval` operations report through `ltm measurement`
+  instead, and folding them in would attribute a measurement run's failures to
+  surfacing that never ran.
+
+  Found by a Codex review of #993; the fault classification, the status gap,
+  the `pre_rpc_faults` counter and the doctor verdict by Codex reviews of the
+  change itself.
+
 - **A non-finite `chars_per_token` is refused at load, and a char budget whose
   conversion overflows saturates instead of failing the call** (#977). Pydantic's
   `gt=0` admits `+inf` (the gap #722 documented for the shutdown timeouts), and a
