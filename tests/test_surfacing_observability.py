@@ -644,20 +644,24 @@ class TestCallLedger:
     def test_retrieval_attempted_is_the_rpc_mark_not_the_terminal_decision(self):
         """The mark is set where the request is handed to the transport (#994).
 
-        Three terminals a completed search records are also recorded on paths
+        Two terminals a completed search records are also recorded on paths
         that issued no RPC: ``error_timeout`` when pre-work spent the whole
-        window, ``ltm_unavailable`` when session healing failed, and
-        ``ltm_call_failed`` when that same failure arrived through the compose
-        path. Inferring the round trip from any of them files an STM duration
-        into a series that is advice about the LTM.
+        window, and ``ltm_unavailable`` when session healing failed. Inferring
+        the round trip from either files an STM duration into a series that is
+        advice about the LTM.
+
+        ``ltm_call_failed`` is deliberately not a third case here. It reads
+        like one -- healing can fail on the compose path too -- but it is not
+        reachable that way: ``context_compose`` returns ``None`` when its own
+        heal fails, the engine falls back to ``search``, and that records
+        ``ltm_unavailable``. Asserting it would pin a terminal production
+        cannot produce.
         """
         obs = SurfacingObservability()
         with attribute_call() as pre_work_exhausted:
             obs.record_outcome("Read", "error_timeout")
         with attribute_call() as healing_failed:
             obs.record_skip("Read", "ltm_unavailable")
-        with attribute_call() as compose_healing_failed:
-            obs.record_skip("Read", "ltm_call_failed")
         with attribute_call() as rpc_timed_out:
             record_ltm_rpc()
             obs.record_outcome("Read", "error_timeout")
@@ -677,7 +681,6 @@ class TestCallLedger:
         assert pre_work_exhausted.retrieval_attempted is False
         assert pre_work_exhausted.timed_out is True
         assert healing_failed.retrieval_attempted is False
-        assert compose_healing_failed.retrieval_attempted is False
         assert rpc_timed_out.retrieval_attempted is True
         assert rpc_timed_out.timed_out is True
         assert rpc_unavailable.retrieval_attempted is True

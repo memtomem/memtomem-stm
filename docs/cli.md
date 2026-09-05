@@ -580,6 +580,7 @@ Checks, in order:
 | `ltm retrieval mode` | Core configured/effective search mode | FAIL on disabled or unexpected dense-to-BM25 degradation; intentional BM25-only is WARN |
 | `ltm score scale` | feedback diagnostics | FAIL while a recent score-scale mismatch episode remains unrecovered |
 | `ltm measurement` / timeout checks | daemon latency telemetry | WARN when measurement cannot run or configured surfacing/hook deadlines are too small |
+| `surfacing outcomes` | daemon latency telemetry | WARN when any daemon surfacing request since start did not complete a warm LTM search; independent of whether there is enough data to size a timeout |
 
 `--json` emits a single document: `{"config_path", "status": "pass"|"warn"|"fail", "checks": [{"id", "label", "status", "detail", "next_action"}, ...]}` plus, once probing ran, the staged `servers` map (same shape as `health --json`) and the `surfacing` bootstrap payload. Active Ollama dependencies add one grouped `ollama_endpoint:<digest>` check per unique base URL (the digest covers the credential-stripped URL; a credentialed endpoint appends a digest of its own use sites, so credential-only twins stay distinct and IDs never depend on a secret); duplicate models and use sites share its single inventory request. Short-circuited runs contain only the checks that executed. Secrets never appear: probe errors are pre-sanitized, URL credentials are removed, and `env`/`headers` values are never printed.
 

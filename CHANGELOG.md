@@ -223,12 +223,11 @@ changes inline only. See the deprecation policy in
   actually issued a search RPC to the LTM** (#994). `_run_admitted` decided whether a
   surfacing request was a sample from the terminal decision the engine
   recorded (`RETRIEVAL_SKIP_REASONS` / `RETRIEVAL_OUTCOMES`, #874). Those sets
-  named a *stage*, not a round trip, and three of their members are also
+  named a *stage*, not a round trip, and two of their members are also
   recorded on paths where nothing was sent: `error_timeout` when the gate,
   query extraction and privacy scan consumed the caller's whole window (#720),
-  `ltm_unavailable` when session healing failed and the adapter answered
-  `no_session`, and `ltm_call_failed` when that same failure reached the engine
-  through the compose path. Each still spent the caller's budget, but the
+  and `ltm_unavailable` when session healing failed and the adapter answered
+  `no_session`. Each still spent the caller's budget, but the
   duration measures STM pre-work and queue wait, and it landed in the series
   `hook.daemon_timeout_seconds` advice is derived from -- a stretch of failed
   healing inflated the recommendation with numbers about the wrong component.
@@ -236,9 +235,10 @@ changes inline only. See the deprecation policy in
   handed to the transport (`McpClientSearchAdapter._rpc`, after healing), and
   `retrieval_attempted` reads that mark instead of inferring it; the two sets
   are gone. A surfacing call the engine handled to a terminal without reaching
-  the LTM files nothing -- not into the percentiles and not into the timeout
-  count either -- rather than into a separate series, since no consumer asks
-  for one and a non-RPC duration is not a censored observation of the LTM. Two
+  the LTM files no *duration* -- not into the percentiles and not into the
+  timeout count either -- rather than into a separate duration series, since a
+  non-RPC elapsed time is not a censored observation of the LTM. One that ended
+  badly is still counted, without a duration, by `pre_rpc_faults` below. Two
   boundaries are deliberate. The mark is scoped to the *search* round trip, so
   the adapter's lifecycle exchanges (the version probe in `_negotiate_format`
   and the `list_tools` rerank check in `_probe_rerank_support`, which go to the
@@ -254,16 +254,25 @@ changes inline only. See the deprecation policy in
   unchanged in effect.
 
   **The daemon counts what it no longer samples**, as `pre_rpc_faults` in the
-  latency snapshot: a request that reached a dependency fault -- healing
-  failed, pre-timeout work spent the window, the breaker refused the attempt --
-  without any search RPC leaving the process. It is a counter, not a duration,
-  and never enters the percentiles. Without it, dropping those calls would have
-  made a daemon whose every request dies during start or reconnect read exactly
-  like a daemon nobody has used: the engine records a fault for each one
-  (normally `ltm_unavailable`, or `error_timeout` when the deadline expired)
-  and charges the circuit breaker, but those counters live on the daemon's own
-  engine and `stm_surfacing_stats` renders the MCP server process's engine
-  instead -- a different object in a different process.
+  latency snapshot: a request that ended badly without any search RPC leaving
+  the process. Two kinds, from two recorders. The engine records a fault --
+  healing failed, pre-timeout work spent the window, the breaker refused the
+  attempt -- and the daemon reads it off the ledger. The daemon also records
+  one itself, before the engine is involved at all, when the admission queue
+  and the LTM-slot wait have left too little of the client's deadline to start
+  a search under; there the LTM is never touched and the cause is queue
+  pressure or a client deadline too short for this daemon. Both are "the
+  request produced no search", which is the question the counter answers; `mms
+  daemon status` and the engine's own counters are where the two come apart. It
+  is a counter, not a duration, and never enters the percentiles. Without it,
+  dropping these calls would have made a daemon whose every request dies before
+  its search read exactly like an unused one *in the daemon's own status*: the
+  engine's fault counters live on the daemon's engine, and `stm_surfacing_stats`
+  renders the MCP server process's engine instead -- a different object in a
+  different process. The durable fault store is the one place the two routes
+  already met, and it stays that: `mms stats` reports the engine-recorded
+  faults when a feedback tracker is attached, on its own shared,
+  retention-windowed scope rather than this daemon's since-start one.
 
   **A warm round trip that failed after the request went out is filed as an
   error rather than a success duration**, in the same change. The engine

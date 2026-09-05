@@ -17138,14 +17138,13 @@ class TestDoctor:
         result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
         # WARN-only keeps doctor at exit 0 by its own contract.
         assert result.exit_code == 0, result.output
-        timeout_line = next(
-            line for line in result.output.splitlines() if "surfacing timeout" in line
+        outcomes_line = next(
+            line for line in result.output.splitlines() if "surfacing outcomes" in line
         )
-        assert "WARN" in timeout_line
+        assert "WARN" in outcomes_line
         # 2 timeouts + 6 errors + 4 pre-RPC faults; the 3 cold samples are not
         # failures and must not be counted.
-        assert "12 failed surfacing attempts" in result.output
-        assert "collecting telemetry" not in result.output
+        assert "12 of 12 daemon surfacing requests" in result.output
 
     def test_doctor_still_reports_collecting_for_an_unused_daemon(
         self, runner, config, monkeypatch
@@ -17194,7 +17193,126 @@ class TestDoctor:
         result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
         assert result.exit_code == 0, result.output
         assert "collecting telemetry (0/5 successful warm samples)" in result.output
-        assert "failed surfacing attempts" not in result.output
+        # No failures and no successes: the outcome check has nothing to say
+        # and stays off the report entirely rather than reporting a vacuous
+        # PASS an operator would read as "searches are working".
+        assert "surfacing outcomes" not in result.output
+
+    def test_doctor_reports_failures_even_once_a_recommendation_exists(
+        self, runner, config, monkeypatch
+    ):
+        # The hole in the first version of this check: it lived inside the
+        # timeout verdict's "not enough data yet" branch, so a daemon with
+        # enough old successes to have a recommendation never had its failures
+        # looked at, and one old success plus a thousand failures reported
+        # "collecting telemetry". Failure health is independent of whether
+        # there is enough data to size a timeout.
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._healthy_config(config)
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(
+            proxy_mod,
+            "_surfacing_bootstrap_status",
+            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False, config_path=None: {
+                "enabled": True,
+                "feedback_enabled": False,
+                "feedback_db": None,
+                "timeouts": {"surfacing_seconds": 30.0, "hook_daemon_seconds": 40.0},
+                "ltm_server": {
+                    "route": "daemon",
+                    "connected": True,
+                    "display": "mms daemon",
+                    "latency": {
+                        "surface": {
+                            "samples": 5,
+                            "timeout_samples": 0,
+                            "error_samples": 40,
+                            "cold_samples": 0,
+                            "pre_rpc_faults": 0,
+                            # A ready recommendation: the timeout check is
+                            # satisfied and says nothing about the 40 errors.
+                            "recommendation": {"status": "ready", "seconds": 2.0},
+                        },
+                        "retrieval": {
+                            "samples": 0,
+                            "recommendation": {"status": "collecting", "seconds": None},
+                        },
+                    },
+                    "measurement": None,
+                },
+            },
+        )
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        outcomes_line = next(
+            line for line in result.output.splitlines() if "surfacing outcomes" in line
+        )
+        assert "WARN" in outcomes_line
+        assert "40 of 45 daemon surfacing requests" in result.output
+        # The timeout check is independently satisfied and must stay PASS --
+        # the point is that the two verdicts no longer gate each other.
+        timeout_line = next(
+            line for line in result.output.splitlines() if "surfacing timeout" in line
+        )
+        assert "PASS" in timeout_line
+
+    def test_doctor_passes_outcomes_when_every_search_succeeded(
+        self, runner, config, monkeypatch
+    ):
+        # The positive control for the WARN above: a daemon doing its job says
+        # so, which is also what makes the WARN readable as a change.
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._healthy_config(config)
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(
+            proxy_mod,
+            "_surfacing_bootstrap_status",
+            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False, config_path=None: {
+                "enabled": True,
+                "feedback_enabled": False,
+                "feedback_db": None,
+                "timeouts": {"surfacing_seconds": 30.0, "hook_daemon_seconds": 40.0},
+                "ltm_server": {
+                    "route": "daemon",
+                    "connected": True,
+                    "display": "mms daemon",
+                    "latency": {
+                        "surface": {
+                            "samples": 12,
+                            "timeout_samples": 0,
+                            "error_samples": 0,
+                            "cold_samples": 0,
+                            "pre_rpc_faults": 0,
+                            "recommendation": {"status": "ready", "seconds": 2.0},
+                        },
+                        "retrieval": {
+                            "samples": 0,
+                            "recommendation": {"status": "collecting", "seconds": None},
+                        },
+                    },
+                    "measurement": None,
+                },
+            },
+        )
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        outcomes_line = next(
+            line for line in result.output.splitlines() if "surfacing outcomes" in line
+        )
+        assert "PASS" in outcomes_line
+        assert "12 warm LTM search(es) since start, none failed" in result.output
 
     def test_score_scale_mismatch_diagnostic_fails_before_ceiling_heuristic(
         self, runner, config, monkeypatch

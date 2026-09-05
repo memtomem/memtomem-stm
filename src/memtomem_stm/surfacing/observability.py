@@ -228,16 +228,17 @@ class CallLedger:
 
         Read from the explicit marker, not inferred from the terminal
         decision. The skip reasons and outcomes name the *stage* a call
-        reached, and three of the ones a completed search records are also
+        reached, and two of the ones a completed search records are also
         recorded on paths that issued no RPC (#994): ``error_timeout`` when
         pre-timeout work consumed the whole window (``engine.surface``, #720),
-        ``ltm_unavailable`` when session healing failed and the adapter
-        answered ``no_session``, and ``ltm_call_failed`` when the same failure
-        reached the engine through the compose path. Each still spent the
-        caller's budget, but a duration taken then measures STM, not the LTM,
-        and the percentiles this gates are advice about the LTM. A call that
-        never reached it is not an observation of it, so it files nothing —
-        not into the percentiles and not into the timeout count either.
+        and ``ltm_unavailable`` when session healing failed and the adapter
+        answered ``no_session``. Each still spent the caller's budget, but a
+        duration taken then measures STM, not the LTM, and the percentiles this
+        gates are advice about the LTM. A call that never reached it is not an
+        observation of it, so it files no duration — not into the percentiles
+        and not into the timeout count either. It is still counted: the daemon
+        increments its non-duration ``pre_rpc_faults`` for one that ended
+        badly.
 
         Scoped to the *search* round trip — ``mem_search`` and the
         ``context_compose`` action, the two a ``surface()`` call makes on its

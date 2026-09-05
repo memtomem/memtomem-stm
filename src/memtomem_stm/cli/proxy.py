@@ -9609,34 +9609,13 @@ def doctor(
                             if isinstance(retrieval_summary, dict)
                             else 0,
                         )
-                        # "Collecting telemetry" is the right answer for a
-                        # daemon nothing has exercised yet. It is the wrong one
-                        # for a daemon whose every search fails: those used to
-                        # arrive as successful durations and now land in the
-                        # failure counters instead (#994), so reading only
-                        # ``samples`` turns a broken dependency into a PASS
-                        # that says it is still waiting for traffic.
-                        failures = _failure_observations(surface_summary) + (
-                            _failure_observations(retrieval_summary)
+                        check(
+                            "surfacing_timeout",
+                            "surfacing timeout",
+                            "PASS",
+                            f"collecting telemetry ({samples}/5 successful warm samples)",
+                            "mms doctor --measure-ltm" if samples < 5 else None,
                         )
-                        if samples == 0 and failures:
-                            check(
-                                "surfacing_timeout",
-                                "surfacing timeout",
-                                "WARN",
-                                f"{failures} failed surfacing attempts since this daemon "
-                                "started and no successful warm search to size a timeout "
-                                "from; the LTM is unreachable or erroring",
-                                "mms daemon status",
-                            )
-                        else:
-                            check(
-                                "surfacing_timeout",
-                                "surfacing timeout",
-                                "PASS",
-                                f"collecting telemetry ({samples}/5 successful warm samples)",
-                                "mms doctor --measure-ltm" if samples < 5 else None,
-                            )
                     elif surfacing_current < recommended:
                         check(
                             "surfacing_timeout",
@@ -9653,6 +9632,51 @@ def doctor(
                             "PASS",
                             f"configured {surfacing_current:g}s >= observed recommendation "
                             f"{recommended:g}s",
+                        )
+
+                    # Its own check, not a branch of the timeout verdict above.
+                    # Nesting it there tied "is the dependency healthy" to "is
+                    # there enough data to size a timeout", and the two are
+                    # independent: a daemon with one old success and a thousand
+                    # later failures has a recommendation, or is "collecting",
+                    # and either way the timeout check has nothing to say about
+                    # the failures. These counters are since-start and never
+                    # evicted, so the reading is cumulative -- the wording says
+                    # so rather than implying a current rate.
+                    surface_failures = _failure_observations(surface_summary)
+                    retrieval_failures = _failure_observations(retrieval_summary)
+                    failures = surface_failures + retrieval_failures
+                    successes = max(
+                        int((surface_summary or {}).get("samples", 0) or 0)
+                        if isinstance(surface_summary, dict)
+                        else 0,
+                        int((retrieval_summary or {}).get("samples", 0) or 0)
+                        if isinstance(retrieval_summary, dict)
+                        else 0,
+                    )
+                    if failures:
+                        # Neutral about the cause on purpose: this population
+                        # mixes a dependency that erred or timed out with a
+                        # request the daemon shed before touching the LTM at
+                        # all (queue pressure, or a client deadline too short
+                        # to start a search under). `mms daemon status` breaks
+                        # the counters apart; this check only says how much of
+                        # the traffic did not come back with a search.
+                        check(
+                            "surfacing_outcomes",
+                            "surfacing outcomes",
+                            "WARN",
+                            f"{failures} of {failures + successes} daemon surfacing requests "
+                            "since start did not complete a warm LTM search "
+                            f"({successes} did)",
+                            "mms daemon status",
+                        )
+                    elif successes:
+                        check(
+                            "surfacing_outcomes",
+                            "surfacing outcomes",
+                            "PASS",
+                            f"{successes} warm LTM search(es) since start, none failed",
                         )
 
                     from memtomem_stm.daemon.latency import hook_timeout_recommendation
