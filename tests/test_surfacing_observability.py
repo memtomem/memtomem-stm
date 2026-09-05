@@ -8,6 +8,7 @@ focused on the standalone counter contract and the stats formatter.
 
 from __future__ import annotations
 
+import asyncio
 from typing import get_args
 
 from memtomem_stm.server import (
@@ -19,11 +20,14 @@ from memtomem_stm.surfacing.observability import (
     FAULT_OUTCOMES,
     FAULT_SKIP_REASONS,
     HEALTHY_SKIP_REASONS,
+    RETRIEVAL_OUTCOMES,
+    RETRIEVAL_SKIP_REASONS,
     SEARCH_COMPLETED_SKIP_REASONS,
     SURFACED_OUTCOMES,
     Outcome,
     SkipReason,
     SurfacingObservability,
+    attribute_call,
 )
 
 
@@ -538,3 +542,132 @@ class TestSurfacingVerdict:
         about that tool rather than as its absence from this process."""
         snap = self._snap({"ltm_unavailable": 5}, {"surfaced_cache_miss": 20})
         assert _surfacing_verdict_line(snap, tool_filter="never_seen") is None
+
+
+class TestCallLedger:
+    """Per-call attribution (#874).
+
+    The daemon used to read *this* request's outcome as a before/after delta on
+    the process-global ``__total__`` counters, which is only correct while
+    exactly one surfacing call can be in flight. These pin the replacement.
+    """
+
+    def test_records_land_in_the_open_ledger_and_in_the_counters(self):
+        obs = SurfacingObservability()
+        with attribute_call() as ledger:
+            obs.record_skip("Read", "no_results_score")
+            obs.record_outcome("Read", "surfaced_cache_miss")
+        assert ledger.skip_reasons == ["no_results_score"]
+        assert ledger.outcomes == ["surfaced_cache_miss"]
+        # The global aggregate still moves — the ledger is additive, not a
+        # replacement for the counters ``stm_surfacing_stats`` renders.
+        snap = obs.snapshot()
+        assert snap["skip_reasons"]["__total__"] == {"no_results_score": 1}
+        assert snap["outcomes"]["__total__"] == {"surfaced_cache_miss": 1}
+
+    def test_recording_outside_any_ledger_is_fine(self):
+        # The proxy path records without ever opening a ledger.
+        obs = SurfacingObservability()
+        obs.record_skip("Read", "gate_cooldown")
+        assert obs.snapshot()["skip_reasons"]["__total__"] == {"gate_cooldown": 1}
+
+    async def test_ledger_captures_records_made_in_child_tasks(self):
+        # The engine decides its timeout outcome inside the task
+        # ``_run_within`` spawns, so a ledger that only saw the calling task
+        # would miss exactly the record the daemon opened it for.
+        obs = SurfacingObservability()
+        with attribute_call() as ledger:
+            await asyncio.ensure_future(
+                _record_later(obs, "error_timeout"),
+            )
+        assert ledger.outcomes == ["error_timeout"]
+        assert ledger.timed_out is True
+
+    async def test_ledger_is_isolated_between_concurrent_tasks(self):
+        # Two overlapping surfacing calls: neither may see the other's record.
+        obs = SurfacingObservability()
+        started = asyncio.Event()
+        may_finish = asyncio.Event()
+
+        async def slow_timeout() -> list[str]:
+            with attribute_call() as ledger:
+                started.set()
+                await may_finish.wait()
+                obs.record_outcome("Read", "error_timeout")
+            return ledger.outcomes
+
+        async def quick_success() -> list[str]:
+            with attribute_call() as ledger:
+                obs.record_outcome("Bash", "surfaced_cache_miss")
+            return ledger.outcomes
+
+        slow = asyncio.create_task(slow_timeout())
+        await started.wait()
+        quick = asyncio.create_task(quick_success())
+        assert await quick == ["surfaced_cache_miss"]
+        may_finish.set()
+        assert await slow == ["error_timeout"]
+
+    async def test_a_late_record_cannot_reach_another_requests_ledger(self):
+        # An operation abandoned at timeout keeps running with the ledger of a
+        # block that has already exited. Its late record must land nowhere a
+        # consumer reads — never in the request that came after it.
+        obs = SurfacingObservability()
+        may_record = asyncio.Event()
+
+        async def abandoned() -> None:
+            await may_record.wait()
+            obs.record_outcome("Read", "error_timeout")
+
+        with attribute_call() as abandoned_ledger:
+            straggler = asyncio.create_task(abandoned())
+        with attribute_call() as next_ledger:
+            may_record.set()
+            await straggler
+
+        assert next_ledger.outcomes == []
+        assert abandoned_ledger.outcomes == ["error_timeout"]
+
+    def test_retrieval_attempted_reads_both_buckets(self):
+        obs = SurfacingObservability()
+        with attribute_call() as gated:
+            obs.record_skip("Read", "gate_cooldown")
+        with attribute_call() as searched:
+            obs.record_skip("Read", "no_results_score")
+        with attribute_call() as surfaced:
+            obs.record_outcome("Read", "surfaced_cache_miss")
+        with attribute_call() as empty:
+            pass
+        assert gated.retrieval_attempted is False
+        assert searched.retrieval_attempted is True
+        assert surfaced.retrieval_attempted is True
+        assert empty.retrieval_attempted is False
+        assert empty.timed_out is False
+
+
+class TestRetrievalSets:
+    def test_retrieval_sets_are_subsets_of_the_enums(self):
+        assert RETRIEVAL_SKIP_REASONS <= set(get_args(SkipReason))
+        assert RETRIEVAL_OUTCOMES <= set(get_args(Outcome))
+
+    def test_cache_decided_terminals_are_excluded(self):
+        """A terminal the result cache decided is not a search measurement.
+
+        Counting one would file a cache read as a warm-LTM latency sample, and
+        the percentiles are advice about how long a round trip takes.
+        """
+        assert "surfaced_cache_hit" not in RETRIEVAL_OUTCOMES
+        assert "no_results_empty_cache" not in RETRIEVAL_SKIP_REASONS
+        assert "no_results_invalidated" not in RETRIEVAL_SKIP_REASONS
+
+    def test_refusals_to_attempt_are_excluded(self):
+        """``circuit_open`` and ``ltm_draining`` are faults for the stats
+        verdict but non-samples for the percentiles: no round trip was made."""
+        assert "circuit_open" not in RETRIEVAL_SKIP_REASONS
+        assert "ltm_draining" not in RETRIEVAL_SKIP_REASONS
+        assert {"circuit_open", "ltm_draining"} <= FAULT_SKIP_REASONS
+
+
+async def _record_later(obs: SurfacingObservability, outcome: Outcome) -> None:
+    await asyncio.sleep(0)
+    obs.record_outcome("Read", outcome)

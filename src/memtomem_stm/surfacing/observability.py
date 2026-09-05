@@ -20,6 +20,10 @@ from __future__ import annotations
 
 import threading
 from collections import defaultdict
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Literal
 
 # Per-call decision tree categories. The engine records exactly one
@@ -180,6 +184,42 @@ FAULT_OUTCOMES: frozenset[str] = frozenset(
     }
 )
 
+# Terminal decisions that required an LTM round trip to be attempted (#874).
+#
+# The daemon's latency percentiles are advice about how long a *warm search*
+# takes, so a call that never reached the LTM — an allowlist or gate skip, a
+# response too short, a breaker already open — must not be filed as a
+# near-zero sample. These two sets name that filter.
+#
+# Deliberately narrower than ``SEARCH_COMPLETED_SKIP_REASONS`` +
+# ``SURFACED_OUTCOMES`` + ``FAULT_*``, which answer a different question (the
+# fault *ratio* in ``stm_surfacing_stats``):
+#
+# - ``surfaced_cache_hit`` / ``no_results_invalidated`` /
+#   ``no_results_empty_cache`` are decided from the result cache, so their
+#   duration is not a search measurement. (The daemon disables the cache
+#   outright, so on that path they cannot occur at all.)
+# - ``circuit_open`` and ``ltm_draining`` are refusals to attempt a round trip;
+#   they are faults for the ratio but non-samples for the percentiles.
+RETRIEVAL_SKIP_REASONS: frozenset[str] = frozenset(
+    {
+        "no_results_score",
+        "no_results_dedup",
+        "no_results_demoted",
+        "ltm_unavailable",
+        "ltm_call_failed",
+        "ltm_parse_empty",
+    }
+)
+
+RETRIEVAL_OUTCOMES: frozenset[str] = frozenset(
+    {
+        "surfaced_cache_miss",
+        "error_timeout",
+        "error_other",
+    }
+)
+
 CacheBucket = Literal["hit", "miss"]
 
 # Sentinel string key for the "all tools" aggregate row in per-tool dicts.
@@ -193,6 +233,86 @@ CacheBucket = Literal["hit", "miss"]
 # ``__total__``-first ordering rather than relying on lexicographic sort
 # so even a tool name starting with ``__`` would not bury the aggregate.
 _TOTAL_KEY = "__total__"
+
+
+@dataclass
+class CallLedger:
+    """What one ``surface()`` call recorded, for the caller that opened it.
+
+    The counters this sits beside are process-global sums. A caller that needs
+    to know what *its own* call did — the daemon, which files a latency sample
+    per request — used to read those sums before and after and take the delta,
+    which is only correct while exactly one call can be in flight. This is the
+    same information without that requirement (#874).
+
+    Cache buckets are not recorded here: no consumer asks a per-call question
+    about them, and leaving them out keeps the ledger to the two mutually
+    exclusive per-call decisions (``record_skip`` OR ``record_outcome``).
+    """
+
+    skip_reasons: list[str] = field(default_factory=list)
+    outcomes: list[str] = field(default_factory=list)
+
+    @property
+    def retrieval_attempted(self) -> bool:
+        """Did this call reach a terminal decision that needed the LTM?"""
+        return any(reason in RETRIEVAL_SKIP_REASONS for reason in self.skip_reasons) or any(
+            outcome in RETRIEVAL_OUTCOMES for outcome in self.outcomes
+        )
+
+    @property
+    def timed_out(self) -> bool:
+        """Did this call abort on its own timeout?
+
+        The engine handles that abort itself and returns a well-formed empty
+        result, which is shape-identical to "nothing relevant" — so a caller
+        that wants to keep the two apart has to be told.
+        """
+        return "error_timeout" in self.outcomes
+
+
+_ACTIVE_LEDGER: ContextVar[CallLedger | None] = ContextVar(
+    "memtomem_stm_surfacing_call_ledger", default=None
+)
+
+
+@contextmanager
+def attribute_call() -> Iterator[CallLedger]:
+    """Collect what the surfacing call made inside this block recorded.
+
+    Opened per request by a caller that has to answer a per-call question the
+    global counters cannot answer once calls overlap (#874) — today the daemon,
+    deciding whether to file a latency sample and whether it is a timeout. A
+    block that runs no surfacing yields an empty ledger, which reads as
+    "nothing was attempted".
+
+    Two rules make this reliable, both satisfied by the daemon's
+    one-task-per-connection request handling:
+
+    - Set and reset happen in the same task. A ``ContextVar`` token is only
+      valid in the context that set it.
+    - Work the call spawns records into the *same* ledger, because a new task
+      copies the current context and the ledger is shared by reference. That is
+      what carries the engine's ``_run_within`` operation task, where the
+      timeout outcome is decided.
+
+    The converse is the safety property: an operation abandoned at timeout
+    keeps a reference to a ledger whose block has already exited, so a late
+    record lands in an object nobody reads — never in another request's.
+
+    Scoped to the *context*, not to one :class:`SurfacingObservability`: every
+    instance recording inside this block appends here. A process with two
+    engines surfacing under one block would therefore blend them, which is not
+    a shape the daemon has (one engine, one adapter) and not one this is for.
+    Nesting is likewise unsupported — an inner block would silently take the
+    outer block's records.
+    """
+    ledger = CallLedger()
+    token = _ACTIVE_LEDGER.set(ledger)
+    try:
+        yield ledger
+    finally:
+        _ACTIVE_LEDGER.reset(token)
 
 
 class SurfacingObservability:
@@ -215,18 +335,30 @@ class SurfacingObservability:
         self._any_call = False
 
     def record_skip(self, tool: str, reason: SkipReason) -> None:
-        """Record a per-tool reject. ``__total__`` aggregate is also updated."""
+        """Record a per-tool reject. ``__total__`` aggregate is also updated.
+
+        Also appended to the :class:`CallLedger` open in this context, if any.
+        """
         with self._lock:
             self._any_call = True
             self._skip_reasons[tool][reason] += 1
             self._skip_reasons[_TOTAL_KEY][reason] += 1
+        ledger = _ACTIVE_LEDGER.get()
+        if ledger is not None:
+            ledger.skip_reasons.append(reason)
 
     def record_outcome(self, tool: str, outcome: Outcome) -> None:
-        """Record a per-tool outcome. ``__total__`` aggregate is also updated."""
+        """Record a per-tool outcome. ``__total__`` aggregate is also updated.
+
+        Also appended to the :class:`CallLedger` open in this context, if any.
+        """
         with self._lock:
             self._any_call = True
             self._outcomes[tool][outcome] += 1
             self._outcomes[_TOTAL_KEY][outcome] += 1
+        ledger = _ACTIVE_LEDGER.get()
+        if ledger is not None:
+            ledger.outcomes.append(outcome)
 
     def record_cache(self, bucket: CacheBucket) -> None:
         """Record a single cache lookup (independent of outcome)."""
