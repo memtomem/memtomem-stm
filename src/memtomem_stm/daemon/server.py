@@ -47,6 +47,7 @@ from memtomem_stm.cli.hook_cmd import run_surfacing_hook
 from memtomem_stm.config import STMConfig, _is_loopback_host, log_stm_config_failure
 from memtomem_stm.daemon import discovery, locking
 from memtomem_stm.daemon.latency import DaemonLatencyTracker, LatencyKind, LatencyOutcome
+from memtomem_stm.surfacing.observability import CallLedger, attribute_call
 from memtomem_stm.utils import child_reaper
 from memtomem_stm.utils.anyio_shutdown import is_clean_cancel_scope_shutdown
 from memtomem_stm.daemon.protocol import (
@@ -484,8 +485,7 @@ class DaemonServer:
                 req,
                 surface_call,
                 latency_kind="surface",
-                activity_counter=self._surfacing_retrieval_count,
-                timeout_counter=self._surfacing_timeout_count,
+                attribute=True,
             )
         if op in {
             OP_LTM_SEARCH,
@@ -761,18 +761,28 @@ class DaemonServer:
         operation: Callable[[], Awaitable[dict[str, Any]]],
         *,
         latency_kind: LatencyKind | None = None,
-        activity_counter: Callable[[], int] | None = None,
-        timeout_counter: Callable[[], int] | None = None,
+        attribute: bool = False,
     ) -> dict[str, Any]:
         """Run one LTM operation under the shared queue, deadline, and lock.
 
-        ``timeout_counter`` reports an abort the *operation* handled itself, so
-        it never surfaces as an exception here. Surfacing does exactly that now
-        that it runs under a propagated budget: it returns a well-formed empty
-        result on timeout, which is otherwise indistinguishable from "nothing
-        relevant" and would be filed as a ``success`` sample of roughly the
-        whole budget — censored data in the percentiles the timeout
-        recommendation is derived from.
+        ``attribute`` opens a :func:`attribute_call` ledger around the
+        operation, which is how a surfacing request's own outcome is read back.
+        Two things about surfacing need it and neither surfaces as an exception
+        here:
+
+        - An abort the operation handled itself. Under a propagated budget the
+          engine returns a well-formed empty result on timeout, which is
+          otherwise indistinguishable from "nothing relevant" and would be
+          filed as a ``success`` sample of roughly the whole budget — censored
+          data in the percentiles the timeout recommendation is derived from.
+        - Whether the LTM was reached at all. Allowlist and gate skips must not
+          dilute warm-search percentiles with near-zero samples.
+
+        Reading either from the engine's process-global counters would require
+        that exactly one call be in flight, which is the constraint this is
+        replacing (#874). A caller that passes ``attribute=False`` keeps the
+        older "every admitted call is a sample" behavior — right for the raw
+        LTM ops, whose operation *is* the round trip.
         """
         deadline = _usable_deadline(req)
         if deadline is None or deadline <= time.monotonic():
@@ -784,34 +794,27 @@ class DaemonServer:
         # including admission-queue and serialization-lock wait time.
         started = time.monotonic()
         warm_at_start = self._ltm_warmth() == "warm"
-        activity_before: int | None = None
-        timeouts_before: int | None = None
+        ledger: CallLedger | None = None
         await self._pending_slots.acquire()
         self._last_request = time.monotonic()
         self._active_requests += 1
         try:
             async with asyncio.timeout_at(deadline):
                 async with self._surface_lock:
-                    # Read under the lock, not before the queue: admissions
-                    # overlap (`max_pending_requests` is 32), and the engine's
-                    # counters only move inside a serialized run. Captured
-                    # earlier, a request that merely *waited* while another one
-                    # timed out would see the delta and inherit its outcome.
-                    activity_before = activity_counter() if activity_counter is not None else None
-                    timeouts_before = timeout_counter() if timeout_counter is not None else None
-                    response = await operation()
-            activity_observed = (
-                activity_counter is None
-                or activity_before is None
-                or activity_counter() > activity_before
-            )
+                    if attribute:
+                        with attribute_call() as ledger:
+                            response = await operation()
+                    else:
+                        response = await operation()
+            # An operation that reported nothing is treated as having reached
+            # the LTM: that is what the raw LTM ops do (their operation is the
+            # round trip), and it is also the safe reading for a surfacing call
+            # whose engine records nothing — a missing sample is invisible,
+            # while a wrong one moves the recommendation.
+            activity_observed = ledger is None or ledger.retrieval_attempted
             if latency_kind is not None and activity_observed:
                 elapsed_ms = (time.monotonic() - started) * 1000.0
-                self_timed_out = (
-                    timeout_counter is not None
-                    and timeouts_before is not None
-                    and timeout_counter() > timeouts_before
-                )
+                self_timed_out = ledger is not None and ledger.timed_out
                 if not warm_at_start:
                     outcome: LatencyOutcome = "cold"
                 elif self_timed_out:
@@ -854,51 +857,6 @@ class DaemonServer:
             "available": max(0, self._max_pending_requests - self._active_requests),
             "busy_rejections": self._busy_rejections,
         }
-
-    def _surfacing_retrieval_count(self) -> int:
-        """Number of engine terminal decisions that require an LTM attempt.
-
-        Hook allowlist and engine gate skips must not dilute warm-search
-        percentiles with near-zero samples. The daemon wires a real
-        ``SurfacingObservability`` and serializes surface calls, so comparing
-        this aggregate before/after one admitted request is deterministic —
-        provided the "before" read happens under ``_surface_lock`` too, which
-        is why ``_run_admitted`` captures it there rather than at admission.
-        """
-        observability = getattr(self._engine, "observability", None)
-        if observability is None:
-            return 0
-        snapshot = observability.snapshot()
-        total_skips = snapshot.get("skip_reasons", {}).get("__total__", {})
-        total_outcomes = snapshot.get("outcomes", {}).get("__total__", {})
-        retrieval_skips = {
-            "no_results_score",
-            "no_results_dedup",
-            "no_results_demoted",
-            "ltm_unavailable",
-            "ltm_call_failed",
-            "ltm_parse_empty",
-        }
-        retrieval_outcomes = {"surfaced_cache_miss", "error_timeout", "error_other"}
-        return sum(int(total_skips.get(key, 0)) for key in retrieval_skips) + sum(
-            int(total_outcomes.get(key, 0)) for key in retrieval_outcomes
-        )
-
-    def _surfacing_timeout_count(self) -> int:
-        """Engine-internal surfacing timeouts recorded so far.
-
-        Sibling of :meth:`_surfacing_retrieval_count`, read the same way and
-        deterministic for the same reason: the daemon wires a real
-        ``SurfacingObservability``, and ``_run_admitted`` brackets the
-        before/after reads around ``operation()`` *inside* ``_surface_lock``,
-        so the window spans exactly one request even while others are queued.
-        """
-        observability = getattr(self._engine, "observability", None)
-        if observability is None:
-            return 0
-        snapshot = observability.snapshot()
-        total_outcomes = snapshot.get("outcomes", {}).get("__total__", {})
-        return int(total_outcomes.get("error_timeout", 0))
 
     @staticmethod
     def _parse_search_payload(payload: dict[str, Any]) -> dict[str, Any] | None:

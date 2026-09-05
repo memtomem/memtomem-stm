@@ -90,6 +90,24 @@ changes inline only. See the deprecation policy in
   carried none now carry their name there as well as in the ranker's heading
   field; the ranking is telemetry input only and gates nothing.
 
+- **The daemon reads a surfacing request's own outcome from a per-call ledger
+  instead of a global counter delta** (#874). `_run_admitted` decided whether
+  to file a latency sample, and whether that sample was a timeout, by
+  comparing the engine's process-global `__total__` counters before and after
+  the call. That is only correct while exactly one surfacing call can be in
+  flight -- which is what the daemon's single serialization lock guarantees
+  today, and what the lock exists to be relieved of. `attribute_call()` opens a
+  `CallLedger` for one request instead: `record_skip` / `record_outcome`
+  append to whichever ledger is open in the recording context, so the work a
+  call spawns (the engine's own timeout task) is attributed to it and a call
+  that merely overlapped is not. The retrieval-sample filter moves out of the
+  daemon into `RETRIEVAL_SKIP_REASONS` / `RETRIEVAL_OUTCOMES`, beside the sets
+  the stats verdict already uses; it stays narrower than those on purpose,
+  since a cache-decided terminal is not a measurement of a search and a refusal
+  to attempt one (`circuit_open`, `ltm_draining`) is not a sample at all.
+  **Behavior change**: none. The serialization lock is unchanged here; this is
+  the prerequisite for removing it.
+
 - **Client-config discovery returns a typed candidate record, and its readers
   consume the identity facts the scan established** (#987). The scan used to
   hand back bare dicts, so which of `raw`, the normalized entry and the

@@ -47,6 +47,7 @@ from memtomem_stm.daemon.protocol import (
 from memtomem_stm.daemon.server import DaemonServer
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine
+from memtomem_stm.surfacing.observability import SurfacingObservability
 
 
 @dataclass
@@ -323,23 +324,49 @@ async def test_engine_internal_timeout_is_not_a_success_latency_sample(tmp_path:
     # recommendation derives from with a sample the length of the whole budget.
     server = DaemonServer(_config(tmp_path))
     server._ltm_warmth = lambda: "warm"  # type: ignore[method-assign]
-    timeouts = 0
+    obs = SurfacingObservability()
 
     async def surfaced_but_timed_out() -> dict[str, object]:
-        nonlocal timeouts
-        timeouts += 1  # what engine.surface() records as an error_timeout outcome
+        # Exactly what engine.surface() books on its own timeout, recorded
+        # through a real observability so the daemon reads it the way it does
+        # in production.
+        obs.record_outcome("Read", "error_timeout")
         return surface_response({})
 
     await server._run_admitted(
         {"deadline_monotonic": asyncio.get_running_loop().time() + 1.0},
         surfaced_but_timed_out,
         latency_kind="surface",
-        timeout_counter=lambda: timeouts,
+        attribute=True,
     )
 
     surface_latency = server._latency.snapshot()["surface"]
     assert surface_latency["timeout_samples"] == 1
     assert surface_latency["samples"] == 0
+
+
+async def test_gate_skip_is_not_a_latency_sample(tmp_path: Path) -> None:
+    # A call the gate rejected never reached the LTM, so its near-zero duration
+    # is not a measurement of a warm search. Filed as a sample it would drag the
+    # percentiles the hook-timeout recommendation is derived from toward zero.
+    server = DaemonServer(_config(tmp_path))
+    server._ltm_warmth = lambda: "warm"  # type: ignore[method-assign]
+    obs = SurfacingObservability()
+
+    async def gated_out() -> dict[str, object]:
+        obs.record_skip("Read", "gate_cooldown")
+        return surface_response({})
+
+    await server._run_admitted(
+        {"deadline_monotonic": asyncio.get_running_loop().time() + 1.0},
+        gated_out,
+        latency_kind="surface",
+        attribute=True,
+    )
+
+    surface_latency = server._latency.snapshot()["surface"]
+    assert surface_latency["samples"] == 0
+    assert surface_latency["timeout_samples"] == 0
 
 
 async def test_queued_request_does_not_inherit_another_requests_timeout(tmp_path: Path) -> None:
@@ -350,18 +377,18 @@ async def test_queued_request_does_not_inherit_another_requests_timeout(tmp_path
     # (a slow LTM) where the recommendation matters most.
     server = DaemonServer(_config(tmp_path))
     server._ltm_warmth = lambda: "warm"  # type: ignore[method-assign]
-    timeouts = 0
+    obs = SurfacingObservability()
     slow_started = asyncio.Event()
     slow_may_finish = asyncio.Event()
 
     async def times_out_internally() -> dict[str, object]:
-        nonlocal timeouts
         slow_started.set()
         await slow_may_finish.wait()
-        timeouts += 1
+        obs.record_outcome("Read", "error_timeout")
         return surface_response({})
 
     async def healthy() -> dict[str, object]:
+        obs.record_outcome("Read", "surfaced_cache_miss")
         return surface_response({})
 
     deadline = asyncio.get_running_loop().time() + 5.0
@@ -370,7 +397,7 @@ async def test_queued_request_does_not_inherit_another_requests_timeout(tmp_path
             {"deadline_monotonic": deadline},
             times_out_internally,
             latency_kind="surface",
-            timeout_counter=lambda: timeouts,
+            attribute=True,
         )
     )
     await slow_started.wait()
@@ -379,7 +406,7 @@ async def test_queued_request_does_not_inherit_another_requests_timeout(tmp_path
             {"deadline_monotonic": deadline},
             healthy,
             latency_kind="surface",
-            timeout_counter=lambda: timeouts,
+            attribute=True,
         )
     )
     await asyncio.sleep(0.05)  # let the second request reach the lock and wait
