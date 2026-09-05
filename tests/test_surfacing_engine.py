@@ -15,7 +15,7 @@ import pytest
 
 from memtomem_stm.surfacing import engine as engine_module
 from memtomem_stm.surfacing.config import SurfacingConfig
-from memtomem_stm.surfacing.engine import SurfacingEngine
+from memtomem_stm.surfacing.engine import SurfacingEngine, _TimerScope
 from memtomem_stm.surfacing.feedback_store import DIAGNOSTIC_KINDS
 from memtomem_stm.utils.digest import framed_digest
 
@@ -810,7 +810,7 @@ class TestSurfacingDeadline:
         async def answers() -> str:
             return "answered in time"
 
-        task = asyncio.create_task(engine._run_within(answers(), 30.0))
+        task = asyncio.create_task(engine._run_within(answers(), 30.0, _TimerScope()))
         await asyncio.sleep(0)  # arm the timer, suspend on the shield
         await asyncio.sleep(0)  # the operation finishes; the wrapper is only queued to resolve
         fire["callback"]()  # the timer, landing in exactly that batch
@@ -1308,9 +1308,9 @@ class TestSurfacingDeadline:
         engine_cls = SurfacingEngine
         real_run_within = engine_cls._run_within
 
-        async def spy_run_within(self, coro, timeout):
+        async def spy_run_within(self, coro, timeout, scope):
             captured.append(timeout)
-            return await real_run_within(self, coro, timeout)
+            return await real_run_within(self, coro, timeout, scope)
 
         monkeypatch.setattr(engine_cls, "_run_within", spy_run_within)
 
@@ -3096,6 +3096,7 @@ class TestMaybeCleanupExpired:
         engine._last_cleanup = time.monotonic() - 7200
 
         await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        await engine.drain_store_writes()
         assert tracker.store.cleanup_expired.call_count == 1
 
         # Second call within interval — should NOT trigger cleanup again
@@ -3106,6 +3107,7 @@ class TestMaybeCleanupExpired:
             {"path": "/other", "_context_query": "different query for testing"},
             LONG_RESPONSE,
         )
+        await engine.drain_store_writes()
         assert tracker.store.cleanup_expired.call_count == 1
 
     async def test_cleanup_fires_again_after_interval(self):
@@ -3120,6 +3122,7 @@ class TestMaybeCleanupExpired:
         engine._last_cleanup = time.monotonic() - 7200
 
         await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        await engine.drain_store_writes()
         assert tracker.store.cleanup_expired.call_count == 1
 
         # Simulate clock advancing past the 1-hour interval
@@ -3131,6 +3134,7 @@ class TestMaybeCleanupExpired:
             {"path": "/z", "_context_query": "another query for clock test"},
             LONG_RESPONSE,
         )
+        await engine.drain_store_writes()
         assert tracker.store.cleanup_expired.call_count == 2
 
     async def test_cleanup_skipped_when_ttl_zero(self):
@@ -3145,6 +3149,7 @@ class TestMaybeCleanupExpired:
         engine._last_cleanup = time.monotonic() - 7200
 
         await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        await engine.drain_store_writes()
         tracker.store.cleanup_expired.assert_not_called()
 
     async def test_cleanup_skipped_when_no_tracker(self):
@@ -3175,6 +3180,7 @@ class TestMaybeCleanupExpired:
         output = await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
         # Should not crash — cleanup error is swallowed
         assert "mem" in output
+        await engine.drain_store_writes()
         tracker.store.cleanup_expired.assert_called_once()
 
     # ── #352 part 2: query retention branch ────────────────────────────
@@ -3192,6 +3198,7 @@ class TestMaybeCleanupExpired:
         engine._last_cleanup = time.monotonic() - 7200
 
         await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        await engine.drain_store_writes()
         tracker.store.cleanup_expired_queries.assert_called_once_with(30 * 86400.0)
 
     async def test_query_retention_skipped_when_zero(self):
@@ -3208,6 +3215,7 @@ class TestMaybeCleanupExpired:
         engine._last_cleanup = time.monotonic() - 7200
 
         await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        await engine.drain_store_writes()
         tracker.store.cleanup_expired_queries.assert_not_called()
 
     async def test_retention_runs_even_when_dedup_disabled(self):
@@ -3225,6 +3233,7 @@ class TestMaybeCleanupExpired:
         engine._last_cleanup = time.monotonic() - 7200
 
         await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        await engine.drain_store_writes()
         tracker.store.cleanup_expired.assert_not_called()
         tracker.store.cleanup_expired_queries.assert_called_once_with(7 * 86400.0)
 
@@ -3243,6 +3252,7 @@ class TestMaybeCleanupExpired:
 
         out = await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
         assert "mem" in out
+        await engine.drain_store_writes()
         tracker.store.cleanup_expired_queries.assert_called_once()
 
     # ── #584: row-deletion retention branch ────────────────────────────
@@ -3263,6 +3273,7 @@ class TestMaybeCleanupExpired:
         engine._last_cleanup = time.monotonic() - 7200
 
         await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        await engine.drain_store_writes()
         tracker.store.delete_events_older_than.assert_called_once_with(90 * 86400.0)
 
     async def test_stats_retention_skipped_when_zero(self):
@@ -3277,6 +3288,7 @@ class TestMaybeCleanupExpired:
         engine._last_cleanup = time.monotonic() - 7200
 
         await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        await engine.drain_store_writes()
         tracker.store.delete_events_older_than.assert_not_called()
 
     async def test_stats_retention_exception_is_swallowed(self):
@@ -3297,13 +3309,17 @@ class TestMaybeCleanupExpired:
 
         out = await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
         assert "mem" in out
+        await engine.drain_store_writes()
         tracker.store.delete_events_older_than.assert_called_once()
 
-    def test_stats_retention_runs_at_startup(self):
+    async def test_stats_retention_runs_at_startup(self):
         """#584: retention runs once at engine construction, so a
         ``stm_surfacing_stats`` read before the first ``surface()`` fires after
         a restart still sees a bounded table."""
         tracker = self._make_tracker()
+        # Still inline, deliberately: the startup sweep runs while the engine
+        # is being constructed, before any request can be served, so there is
+        # no loop to protect and nothing to drain (#996).
         SurfacingEngine(
             config=_make_config(dedup_ttl_seconds=0, stats_retention_days=90),
             mcp_adapter=_make_mcp_adapter([]),
@@ -3321,7 +3337,7 @@ class TestMaybeCleanupExpired:
         )
         tracker.store.delete_events_older_than.assert_not_called()
 
-    def test_startup_retention_failure_does_not_break_construction(self):
+    async def test_startup_retention_failure_does_not_break_construction(self):
         """A raising ``delete_events_older_than`` at startup is swallowed so the
         engine still constructs."""
         tracker = self._make_tracker()
@@ -3332,6 +3348,7 @@ class TestMaybeCleanupExpired:
             feedback_tracker=tracker,
         )
         assert engine is not None
+        await engine.drain_store_writes()
         tracker.store.delete_events_older_than.assert_called_once()
 
 
@@ -3777,11 +3794,12 @@ class TestScoreScaleDiagnostic:
         # Searches 5 and 6 are both saturated, and each writes: the durable
         # row is shared with peer processes, so persistence cannot be latched
         # to the once-per-episode WARNING (#944).
+        await engine.drain_store_writes()
         assert tracker.record_diagnostic.call_args_list == [
-            call("gh", "read_file", "score_ceiling_below_min")
+            call("gh", "read_file", "score_ceiling_below_min", at=ANY)
         ] * 2
 
-    def test_empty_recovery_and_threshold_change_reset_episode(self, caplog):
+    async def test_empty_recovery_and_threshold_change_reset_episode(self, caplog):
         tracker = MagicMock()
         engine = self._engine(tracker=tracker)
         low = [FakeSearchResult(chunk=FakeChunk(), score=0.016)]
@@ -3799,11 +3817,12 @@ class TestScoreScaleDiagnostic:
             engine._observe_score_scale("gh", "read_file", low, 0.04)
 
         assert not [r for r in caplog.records if "score-scale mismatch" in r.message]
+        await engine.drain_store_writes()
         tracker.record_diagnostic.assert_not_called()
         assert engine._score_scale_streaks[("gh", "read_file")].count == 1
         assert engine._score_scale_streaks[("gh", "read_file")].threshold == 0.04
 
-    def test_streak_isolated_by_server_and_tool_and_rearms(self):
+    async def test_streak_isolated_by_server_and_tool_and_rearms(self):
         tracker = MagicMock()
         engine = self._engine(tracker=tracker)
         low = [FakeSearchResult(chunk=FakeChunk(), score=0.016)]
@@ -3818,11 +3837,12 @@ class TestScoreScaleDiagnostic:
         for _ in range(5):
             engine._observe_score_scale("gh", "read_file", low, 0.03)
 
+        await engine.drain_store_writes()
         assert tracker.record_diagnostic.call_count == 2
         assert engine._score_scale_streaks[("gitlab", "read_file")].count == 4
         assert engine._score_scale_streaks[("gh", "search")].count == 4
 
-    def test_every_healthy_observation_closes_both_kinds(self):
+    async def test_every_healthy_observation_closes_both_kinds(self):
         """Unlatched by design (#944): a peer process can reopen the episode
         between two healthy observations, so this process must keep writing.
         The store's WHERE guard makes the repeat inert."""
@@ -3833,6 +3853,7 @@ class TestScoreScaleDiagnostic:
 
         engine._observe_score_scale("gh", "read_file", healthy, 0.03)
         engine._observe_score_scale("gh", "read_file", healthy, 0.03)
+        await engine.drain_store_writes()
         assert tracker.record_diagnostic_recoveries.call_count == 2
         assert tracker.record_diagnostic_recoveries.call_args == call(
             "gh", "read_file", DIAGNOSTIC_KINDS, recovered_at=ANY
@@ -3840,9 +3861,10 @@ class TestScoreScaleDiagnostic:
 
         engine._observe_score_scale("gh", "read_file", low, 0.03)
         engine._observe_score_scale("gh", "read_file", healthy, 0.03)
+        await engine.drain_store_writes()
         assert tracker.record_diagnostic_recoveries.call_count == 3
 
-    def test_non_finite_score_resets_without_warning(self):
+    async def test_non_finite_score_resets_without_warning(self):
         tracker = MagicMock()
         engine = self._engine(tracker=tracker)
         low = [FakeSearchResult(chunk=FakeChunk(), score=0.016)]
@@ -3853,6 +3875,7 @@ class TestScoreScaleDiagnostic:
         engine._observe_score_scale("gh", "read_file", invalid, 0.03)
 
         assert ("gh", "read_file") not in engine._score_scale_streaks
+        await engine.drain_store_writes()
         tracker.record_diagnostic.assert_not_called()
 
     async def test_cache_hit_does_not_advance_streak(self):
@@ -3882,8 +3905,9 @@ class TestScoreScaleDiagnostic:
                 LONG_RESPONSE,
             )
 
+        await engine.drain_store_writes()
         tracker.record_diagnostic.assert_called_once_with(
-            "gh", "read_file", "score_ceiling_below_min"
+            "gh", "read_file", "score_ceiling_below_min", at=ANY
         )
 
     async def test_without_tracker_still_logs_safely(self, caplog):
@@ -3915,6 +3939,7 @@ class TestScoreScaleDiagnostic:
             )
 
         assert outputs == [LONG_RESPONSE] * 5
+        await engine.drain_store_writes()
         tracker.record_diagnostic.assert_called_once()
 
 
@@ -3941,7 +3966,7 @@ class TestReportedScoreScale:
             feedback_tracker=tracker,
         )
 
-    def test_known_non_rrf_scale_fires_mismatch_immediately(self, caplog):
+    async def test_known_non_rrf_scale_fires_mismatch_immediately(self, caplog):
         tracker = MagicMock()
         engine = self._engine(tracker=tracker)
         low = self._low("rerank", reranker="BAAI/bge-reranker-v2-m3")
@@ -3956,22 +3981,24 @@ class TestReportedScoreScale:
         assert "reranker=BAAI/bge-reranker-v2-m3" in warnings[0]
         # WARNS once, PERSISTS twice: the durable row is shared, so each
         # mismatched observation must reopen it (#944).
+        await engine.drain_store_writes()
         assert tracker.record_diagnostic.call_args_list == [
-            call("gh", "read_file", "score_scale_mismatch")
+            call("gh", "read_file", "score_scale_mismatch", at=ANY)
         ] * 2
         # The named scale supersedes streak evidence entirely.
         assert ("gh", "read_file") not in engine._score_scale_streaks
 
-    def test_all_non_rrf_labels_fire_definitively(self):
+    async def test_all_non_rrf_labels_fire_definitively(self):
         for scale in ("rerank", "bm25", "dense", "none"):
             tracker = MagicMock()
             engine = self._engine(tracker=tracker)
             engine._observe_score_scale("gh", "read_file", self._low(scale), 0.03)
+            await engine.drain_store_writes()
             tracker.record_diagnostic.assert_called_once_with(
-                "gh", "read_file", "score_scale_mismatch"
+                "gh", "read_file", "score_scale_mismatch", at=ANY
             )
 
-    def test_rrf_confirmed_scale_keeps_streak_of_five(self, caplog):
+    async def test_rrf_confirmed_scale_keeps_streak_of_five(self, caplog):
         tracker = MagicMock()
         engine = self._engine(tracker=tracker)
         low = self._low("rrf", score=0.016)
@@ -3979,16 +4006,18 @@ class TestReportedScoreScale:
         with caplog.at_level(logging.WARNING):
             for _ in range(4):
                 engine._observe_score_scale("gh", "read_file", low, 0.03)
+            await engine.drain_store_writes()
             tracker.record_diagnostic.assert_not_called()
             engine._observe_score_scale("gh", "read_file", low, 0.03)
 
+        await engine.drain_store_writes()
         tracker.record_diagnostic.assert_called_once_with(
-            "gh", "read_file", "score_ceiling_below_min"
+            "gh", "read_file", "score_ceiling_below_min", at=ANY
         )
         warnings = [r.message for r in caplog.records if "score-scale mismatch" in r.message]
         assert "Core confirms score_scale=rrf" in warnings[0]
 
-    def test_unrecognized_label_stays_on_heuristic_tier(self, caplog):
+    async def test_unrecognized_label_stays_on_heuristic_tier(self, caplog):
         """A renamed core label must not fire the definitive diagnostic."""
         tracker = MagicMock()
         engine = self._engine(tracker=tracker)
@@ -3998,13 +4027,14 @@ class TestReportedScoreScale:
             for _ in range(5):
                 engine._observe_score_scale("gh", "read_file", low, 0.03)
 
+        await engine.drain_store_writes()
         tracker.record_diagnostic.assert_called_once_with(
-            "gh", "read_file", "score_ceiling_below_min"
+            "gh", "read_file", "score_ceiling_below_min", at=ANY
         )
         warnings = [r.message for r in caplog.records if "score-scale mismatch" in r.message]
         assert "may be running single-leg/BM25-only" in warnings[0]
 
-    def test_mismatch_recovers_on_healthy_observation_and_rearms(self):
+    async def test_mismatch_recovers_on_healthy_observation_and_rearms(self):
         tracker = MagicMock()
         engine = self._engine(tracker=tracker)
         low = self._low("rerank")
@@ -4013,14 +4043,16 @@ class TestReportedScoreScale:
         engine._observe_score_scale("gh", "read_file", low, 0.03)
         engine._observe_score_scale("gh", "read_file", healthy, 0.03)
         # One batched call closes both kinds for the key.
+        await engine.drain_store_writes()
         tracker.record_diagnostic_recoveries.assert_called_once_with(
             "gh", "read_file", DIAGNOSTIC_KINDS, recovered_at=ANY
         )
         # Re-arm: a fresh below-threshold observation opens a new episode.
         engine._observe_score_scale("gh", "read_file", low, 0.03)
+        await engine.drain_store_writes()
         assert tracker.record_diagnostic.call_count == 2
 
-    def test_recovery_write_failure_does_not_block_the_next_write(self, caplog):
+    async def test_recovery_write_failure_does_not_block_the_next_write(self, caplog):
         """A transient store failure must not poison the path (#944).
 
         The old design retried through a pending map; unlatched, the retry is
@@ -4040,10 +4072,11 @@ class TestReportedScoreScale:
             assert ("gh", "read_file") not in engine._score_scale_mismatch_active
             engine._observe_score_scale("gh", "read_file", healthy, 0.03)
 
+        await engine.drain_store_writes()
         assert tracker.record_diagnostic_recoveries.call_count == 2
         assert len([r for r in caplog.records if "score-scale mismatch" in r.message]) == 1
 
-    def test_diagnostic_write_failure_does_not_break_later_observations(self, caplog):
+    async def test_diagnostic_write_failure_does_not_break_later_observations(self, caplog):
         tracker = MagicMock()
         tracker.record_diagnostic.side_effect = [RuntimeError("sqlite down"), None]
         engine = self._engine(tracker=tracker)
@@ -4053,6 +4086,7 @@ class TestReportedScoreScale:
             engine._observe_score_scale("gh", "read_file", low, 0.03)
             engine._observe_score_scale("gh", "read_file", low, 0.03)
 
+        await engine.drain_store_writes()
         assert tracker.record_diagnostic.call_count == 2
         assert len([r for r in caplog.records if "score-scale mismatch" in r.message]) == 1
 
@@ -4123,7 +4157,7 @@ class TestReportedScoreScale:
         assert "adjust or remove the pin" in warnings[0]
         assert "scale_gated_min_score=true" not in warnings[0]
 
-    def test_mismatch_latch_survives_empty_results(self, caplog):
+    async def test_mismatch_latch_survives_empty_results(self, caplog):
         """Alternating empty/below-threshold searches must not re-WARN."""
         tracker = MagicMock()
         engine = self._engine(tracker=tracker)
@@ -4137,6 +4171,7 @@ class TestReportedScoreScale:
         # The LOG latch is what survives the empty batch; the durable counter
         # tracks observations, so it advances on both low batches (#944).
         assert len([r for r in caplog.records if "score-scale mismatch" in r.message]) == 1
+        await engine.drain_store_writes()
         assert tracker.record_diagnostic.call_count == 2
 
     async def test_record_surfacing_carries_score_scale_on_miss_and_cache_hit(self):
@@ -4351,7 +4386,10 @@ class TestScaleGatedMinScore:
         )
         out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
         assert out == LONG_RESPONSE
-        tracker.record_diagnostic.assert_called_once_with("gh", "read_file", "score_scale_mismatch")
+        await engine.drain_store_writes()
+        tracker.record_diagnostic.assert_called_once_with(
+            "gh", "read_file", "score_scale_mismatch", at=ANY
+        )
 
     async def test_escape_hatch_off_restores_filtering(self):
         tracker = MagicMock()
@@ -4365,7 +4403,10 @@ class TestScaleGatedMinScore:
         )
         out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
         assert out == LONG_RESPONSE
-        tracker.record_diagnostic.assert_called_once_with("gh", "read_file", "score_scale_mismatch")
+        await engine.drain_store_writes()
+        tracker.record_diagnostic.assert_called_once_with(
+            "gh", "read_file", "score_scale_mismatch", at=ANY
+        )
 
     async def test_absent_scale_behavior_unchanged(self):
         results = [FakeSearchResult(chunk=FakeChunk(content="unstamped"), score=0.001)]
@@ -4398,8 +4439,9 @@ class TestScaleGatedMinScore:
                 "gh", "read_file", {"_context_query": f"unrecognized scale query {i}"}, LONG_RESPONSE
             )
             assert out == LONG_RESPONSE
+        await engine.drain_store_writes()
         tracker.record_diagnostic.assert_called_once_with(
-            "gh", "read_file", "score_ceiling_below_min"
+            "gh", "read_file", "score_ceiling_below_min", at=ANY
         )
 
     async def test_auto_tune_learning_skipped_on_suspended_batch(self):
@@ -4434,26 +4476,28 @@ class TestScaleGatedMinScore:
         )
         tuner.maybe_adjust.assert_called_once_with("read_file")
 
-    def test_suspended_batch_resets_streak_and_closes_both_kinds(self):
+    async def test_suspended_batch_resets_streak_and_closes_both_kinds(self):
         tracker = MagicMock()
         engine = self._engine([], tracker=tracker, min_score=0.03)
         low = [FakeSearchResult(chunk=FakeChunk(), score=-0.17, score_scale="rerank")]
 
         # Open an episode via the filter-applies path (gate off / pin).
         engine._observe_score_scale("gh", "read_file", low, 0.03)
+        await engine.drain_store_writes()
         tracker.record_diagnostic.assert_called_once()
 
         # Every suspended batch closes both kinds — unlatched, because a peer
         # process can reopen the episode between two of them (#944).
         engine._observe_score_scale("gh", "read_file", low, 0.03, filter_suspended=True)
         engine._observe_score_scale("gh", "read_file", low, 0.03, filter_suspended=True)
+        await engine.drain_store_writes()
         assert tracker.record_diagnostic_recoveries.call_args_list == [
             call("gh", "read_file", DIAGNOSTIC_KINDS, recovered_at=ANY)
         ] * 2
         assert ("gh", "read_file") not in engine._score_scale_mismatch_active
         assert ("gh", "read_file") not in engine._score_scale_streaks
 
-    def test_suspend_recovers_an_episode_reopened_after_an_earlier_suspend(self):
+    async def test_suspend_recovers_an_episode_reopened_after_an_earlier_suspend(self):
         """A tool alternating rerank (suspend) and rrf/unstamped low-score
         (streak) batches must not leave the re-opened episode stuck FAILing in
         mms doctor. Previously guarded by re-arming a once-per-key latch;
@@ -4464,19 +4508,22 @@ class TestScaleGatedMinScore:
         unstamped_low = [FakeSearchResult(chunk=FakeChunk(), score=0.001)]
 
         engine._observe_score_scale("gh", "read_file", rerank_low, 0.03, filter_suspended=True)
+        await engine.drain_store_writes()
         assert tracker.record_diagnostic_recoveries.call_count == 1
 
         # Five unstamped below-floor batches open a fresh
         # score_ceiling_below_min episode.
         for _ in range(5):
             engine._observe_score_scale("gh", "read_file", unstamped_low, 0.03)
+        await engine.drain_store_writes()
         tracker.record_diagnostic.assert_called_once_with(
-            "gh", "read_file", "score_ceiling_below_min"
+            "gh", "read_file", "score_ceiling_below_min", at=ANY
         )
 
         # A later suspended batch closes the re-opened episode.
         tracker.record_diagnostic_recoveries.reset_mock()
         engine._observe_score_scale("gh", "read_file", rerank_low, 0.03, filter_suspended=True)
+        await engine.drain_store_writes()
         tracker.record_diagnostic_recoveries.assert_called_once_with(
             "gh", "read_file", DIAGNOSTIC_KINDS, recovered_at=ANY
         )
@@ -4603,7 +4650,10 @@ class TestScaleGateComposePath:
         # A per-tool pin keeps the filter active, so the below-pin compose
         # result is dropped and the definitive mismatch diagnostic fires.
         assert out == LONG_RESPONSE
-        tracker.record_diagnostic.assert_called_once_with("gh", "read_file", "score_scale_mismatch")
+        await engine.drain_store_writes()
+        tracker.record_diagnostic.assert_called_once_with(
+            "gh", "read_file", "score_scale_mismatch", at=ANY
+        )
 
     async def test_compose_absent_scale_behavior_unchanged(self):
         retrieved = [_remote_result("unstamped compose", 0.001)]

@@ -49,7 +49,8 @@ from memtomem_stm.surfacing.observability import (
     SurfacingObservability,
 )
 from memtomem_stm.observability.tracing import traced
-from memtomem_stm.surfacing.feedback import FeedbackTracker
+from memtomem_stm.surfacing.feedback import FeedbackTracker, record_feedback_batch
+from memtomem_stm.surfacing.store_io import run_off_loop
 from memtomem_stm.utils.anyio_shutdown import await_or_warn, is_clean_cancel_scope_shutdown
 from memtomem_stm.utils import child_reaper
 from memtomem_stm.utils.parent_liveness import ParentLivenessWatcher
@@ -1753,13 +1754,18 @@ async def stm_surfacing_feedback(
         if app.feedback_tracker is None:
             return "Feedback tracking is not enabled."
         if ratings is not None:
-            return _record_batched_via_tracker(app.feedback_tracker, surfacing_id, ratings)
+            return await _record_batched_via_tracker(app.feedback_tracker, surfacing_id, ratings)
         if rating is None:
             return "Error: `rating` is required for single-memory feedback."
-        return app.feedback_tracker.record_feedback(surfacing_id, rating, memory_id)
+        # Off-loop like every other feedback-store write (#996): this DB is
+        # shared with the proxy's own stores and other processes, so an insert
+        # that has to wait one of them out must not stall the server.
+        return await run_off_loop(
+            app.feedback_tracker.record_feedback, surfacing_id, rating, memory_id
+        )
 
 
-def _record_batched_via_tracker(
+async def _record_batched_via_tracker(
     tracker: Any,
     surfacing_id: str,
     ratings: list[dict],
@@ -1792,10 +1798,11 @@ def _record_batched_via_tracker(
             return f"Error: ratings[{i}] missing string `rating`."
         parsed.append((mid, rat))
 
+    results = await run_off_loop(record_feedback_batch, tracker, surfacing_id, parsed)
     recorded = 0
     errors: list[str] = []
     for i, (mid, rat) in enumerate(parsed):
-        result = tracker.record_feedback(surfacing_id, rat, mid)
+        result = results[i]
         if isinstance(result, str) and result.startswith("Error"):
             errors.append(f"ratings[{i}]: {result}")
         else:

@@ -701,6 +701,7 @@ class TestEngineFaultPersistence:
             feedback_tracker=FeedbackTracker(config),
         )
         await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        await engine.drain_store_writes()
         assert _fault_rows(config.feedback_db_path) == [("gh", "read_file", "error_timeout", 1)]
 
     async def test_circuit_open_persists_fault(self, tmp_path):
@@ -720,6 +721,7 @@ class TestEngineFaultPersistence:
         )
         await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)  # opens breaker
         await engine.surface("gh", "read_file", {"path": "y"}, LONG_RESPONSE)  # skipped
+        await engine.drain_store_writes()
         rows = dict(
             ((server, tool, kind), count)
             for server, tool, kind, count in _fault_rows(config.feedback_db_path)
@@ -737,6 +739,7 @@ class TestEngineFaultPersistence:
             feedback_tracker=FeedbackTracker(config),
         )
         await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        await engine.drain_store_writes()
         assert _fault_rows(config.feedback_db_path) == [("gh", "read_file", "ltm_unavailable", 1)]
 
     async def test_scale_gate_recovers_stale_mismatch_episode(self, tmp_path):
@@ -768,6 +771,7 @@ class TestEngineFaultPersistence:
         engine = SurfacingEngine(config=config, mcp_adapter=adapter, feedback_tracker=tracker)
         await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
 
+        await engine.drain_store_writes()
         assert read_surfacing_summary(config.feedback_db_path)["active_diagnostics"] == {}
 
     @dataclass
@@ -895,6 +899,7 @@ class TestEngineFaultPersistence:
         engine._observe_score_scale(
             "gh", "read_file", [self._ScaleResult(FakeChunk(), 0.9)], 0.03
         )
+        await engine.drain_store_writes()
         assert read_surfacing_summary(config.feedback_db_path)["active_diagnostics"] == {}
 
     async def test_suspended_batch_closes_an_episode_only_a_peer_recorded(self, tmp_path):
@@ -913,6 +918,7 @@ class TestEngineFaultPersistence:
             0.03,
             filter_suspended=True,
         )
+        await engine.drain_store_writes()
         assert read_surfacing_summary(config.feedback_db_path)["active_diagnostics"] == {}
 
     async def test_mismatch_path_persists_every_observation(self, tmp_path, caplog):
@@ -930,6 +936,7 @@ class TestEngineFaultPersistence:
             for _ in range(6):
                 engine._observe_score_scale("gh", "other_tool", unstamped_low, 0.03)
 
+        await engine.drain_store_writes()
         rows = {(r[1], r[2]): r[3] for r in _fault_rows(config.feedback_db_path)}
         assert rows[("read_file", "score_scale_mismatch")] == 3
         # Six observations, saturating at five: writes on the 5th and 6th.
@@ -951,6 +958,7 @@ class TestEngineFaultPersistence:
         for _ in range(5):
             engine._observe_score_scale("gh", "read_file", healthy, 0.03)
 
+        await engine.drain_store_writes()
         assert probe.attempts == 5, "one batched UPDATE covering both kinds per observation"
         tracker.store._db = probe._db
         assert read_surfacing_summary(config.feedback_db_path)["active_diagnostics"] == {}
@@ -966,13 +974,16 @@ class TestEngineFaultPersistence:
         engine = SurfacingEngine(config=config, mcp_adapter=adapter, feedback_tracker=tracker)
 
         await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        await engine.drain_store_writes()
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {}
 
         engine._persist_fault("gh", "read_file", "error_timeout")
+        await engine.drain_store_writes()
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {
             "error_timeout": 2
         }
         await engine.surface("gh", "read_file", _other_args("third"), LONG_RESPONSE)
+        await engine.drain_store_writes()
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {}
 
     async def test_a_different_key_closing_the_breaker_closes_the_blocked_key(self, tmp_path):
@@ -1004,6 +1015,7 @@ class TestEngineFaultPersistence:
         await engine.surface("gh", "search_code", _other_args("boom"), LONG_RESPONSE)
         assert engine._circuit_breaker.is_open
         await engine.surface("gh", "read_file", _other_args("blocked"), LONG_RESPONSE)
+        await engine.drain_store_writes()
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {
             "error_other": 1,
             "circuit_open": 1,
@@ -1014,6 +1026,7 @@ class TestEngineFaultPersistence:
         engine._circuit_breaker._opened_at = time.monotonic() - 3600.0
         await engine.surface("gh", "list_docs", _other_args("probe"), LONG_RESPONSE)
         assert engine._circuit_breaker.state == "closed"
+        await engine.drain_store_writes()
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {
             # read_file's circuit_open is closed by the probe; search_code's
             # own error_other is NOT — a probe on another key is no evidence
@@ -1042,6 +1055,7 @@ class TestEngineFaultPersistence:
         tracker.store._db = failing  # type: ignore[assignment]
         await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
         tracker.store._db = real_db  # type: ignore[assignment]
+        await engine.drain_store_writes()
         assert failing.attempts == 2  # the batch really did reach the second key
 
         # Neither key recovered — not the one whose UPDATE had already run.
@@ -1052,6 +1066,7 @@ class TestEngineFaultPersistence:
         # The blocked key is still owed a recovery, so the next success pays it.
         assert engine._breaker_blocked_keys == {("gh", "blocked_tool")}
         await engine.surface("gh", "read_file", _other_args("retry"), LONG_RESPONSE)
+        await engine.drain_store_writes()
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {}
 
     async def test_a_failed_fault_write_keeps_the_breaker_claim(self, tmp_path):
@@ -1078,12 +1093,14 @@ class TestEngineFaultPersistence:
         # The abandoned INSERT rides out on an unrelated later write — count 2
         # from one durable fault plus the one that was left pending.
         tracker.record_fault("gh", "blocked_tool", "circuit_open")
+        await engine.drain_store_writes()
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {
             "circuit_open": 2
         }
 
         # A different key's probe still closes it, because the claim survived.
         await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        await engine.drain_store_writes()
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {}
 
     async def test_trackerless_engine_does_not_accumulate_blocked_keys(self, tmp_path):
@@ -1108,12 +1125,14 @@ class TestEngineFaultPersistence:
         peer = FeedbackTracker(config)
         peer.record_fault("gh", "read_file", "error_timeout")
         peer.close()
+        await engine.drain_store_writes()
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {
             "error_timeout": 1
         }
 
         await engine.surface("gh", "read_file", _other_args("second"), LONG_RESPONSE)
         assert calls() == 1
+        await engine.drain_store_writes()
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {}
 
     async def test_first_success_closes_a_previous_process_episode(self, tmp_path):
@@ -1131,6 +1150,7 @@ class TestEngineFaultPersistence:
             config=config, mcp_adapter=adapter, feedback_tracker=FeedbackTracker(config)
         )
         await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        await engine.drain_store_writes()
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {}
 
     async def test_cache_hit_does_not_close_the_episode(self, tmp_path):
@@ -1148,6 +1168,7 @@ class TestEngineFaultPersistence:
         calls = _recovery_call_counter(tracker)
         await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)  # cache hit
         assert calls() == 0
+        await engine.drain_store_writes()
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {
             "error_timeout": 1
         }
@@ -1155,6 +1176,7 @@ class TestEngineFaultPersistence:
         # Positive control: a miss on the same key does close it.
         await engine.surface("gh", "read_file", _other_args("miss"), LONG_RESPONSE)
         assert calls() == 1
+        await engine.drain_store_writes()
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {}
 
     async def test_recovery_write_failure_retries_on_the_next_success(self, tmp_path):
@@ -1176,11 +1198,13 @@ class TestEngineFaultPersistence:
 
         tracker.record_fault_recoveries = flaky  # type: ignore[method-assign]
         await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        await engine.drain_store_writes()
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {
             "error_timeout": 1
         }
 
         await engine.surface("gh", "read_file", _other_args("retry"), LONG_RESPONSE)
+        await engine.drain_store_writes()
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {}
 
     async def test_no_tracker_does_not_raise(self, tmp_path):
@@ -1209,6 +1233,7 @@ class TestEngineFaultPersistence:
         )
         tracker.store._db.commit()
         engine._run_stats_retention(tracker.store)
+        await engine.drain_store_writes()
         assert _fault_rows(config.feedback_db_path) == []
 
 

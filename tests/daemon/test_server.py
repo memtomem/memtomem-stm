@@ -681,6 +681,110 @@ async def test_request_expiring_while_waiting_for_a_slot_never_touches_the_engin
     assert server._queue_snapshot()["in_flight"] == 0
 
 
+async def test_a_locked_feedback_db_does_not_stall_the_admitted_burst(tmp_path: Path) -> None:
+    """A peer holding ``stm_feedback.db`` must cost rows, not the whole daemon.
+
+    Every admitted surfacing writes an event row and its dedup rows, and that
+    file is shared with the proxy's stores, ``mms tune``, and any second STM
+    process. While those writes ran on the loop, one of them waiting out a
+    peer froze the other admitted calls AND the ``timeout_at`` timers meant to
+    shed requests whose clients had given up — the burst came back as a wave
+    of late ``expired`` replies (#996). Now the wait happens on a worker
+    thread: the loop keeps running, the calls keep finishing, and the rows
+    land once the peer lets go.
+    """
+    import sqlite3
+
+    from memtomem_stm.surfacing.feedback import FeedbackTracker
+
+    cfg = _config(tmp_path)
+    cfg.surfacing.cache_ttl_seconds = 0.0
+    tracker = FeedbackTracker(cfg.surfacing)
+    adapter = AsyncMock()
+
+    async def distinct_memory(**_kwargs: object):
+        # A fresh chunk id per call: one shared id would be filtered by
+        # cross-session dedup after the first hit, and the burst would write
+        # one row no matter how well the offload works.
+        return ([_Result(_Chunk(), 0.5)], [], "ok")
+
+    adapter.search = AsyncMock(side_effect=distinct_memory)
+    engine = SurfacingEngine(
+        cfg.surfacing,
+        mcp_adapter=adapter,
+        feedback_tracker=tracker,
+        observability=SurfacingObservability(),
+    )
+    server = DaemonServer(cfg)
+    server._engine = engine
+
+    holder = sqlite3.connect(str(cfg.surfacing.feedback_db_path))
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute(
+        "INSERT INTO seen_memories (memory_id, first_seen_at, last_seen_at, seen_count)"
+        " VALUES ('mem-peer', 1.0, 1.0, 1)"
+    )
+    released = False
+
+    loop = asyncio.get_running_loop()
+    gaps: list[float] = []
+
+    async def heartbeat() -> None:
+        last = loop.time()
+        while True:
+            await asyncio.sleep(0.01)
+            now = loop.time()
+            gaps.append(now - last)
+            last = now
+
+    beat = asyncio.create_task(heartbeat())
+    try:
+        requests = [
+            {
+                "v": PROTOCOL_VERSION,
+                "op": OP_SURFACE,
+                "payload": _canonical(
+                    {
+                        **_READ_PAYLOAD,
+                        "tool_input": {"file_path": f"/src/{word}/handler.py"},
+                    }
+                ).to_wire(),
+                # Generous on purpose: a deadline short enough to be shed at
+                # ``_surface_deadline`` would pass this test without ever
+                # reaching the LTM or the store.
+                "deadline_monotonic": loop.time() + 3.0,
+            }
+            for word in ("auth", "billing", "search", "reporting")
+        ]
+        dispatched = asyncio.gather(*(server._dispatch(req) for req in requests))
+        await asyncio.sleep(0.5)  # the whole burst is parked on the locked DB
+        stall = max(gaps)
+        holder.rollback()
+        holder.close()
+        released = True
+        responses = await asyncio.wait_for(dispatched, timeout=15.0)
+
+        assert stall < 0.15, f"the loop stalled {stall:.2f}s while the DB was held"
+        assert adapter.search.await_count == 4, "every call must have reached the LTM"
+        assert all(r.get("ok") is True for r in responses), responses
+        assert engine._circuit_breaker.is_open is False
+        assert server._queue_snapshot()["in_flight"] == 0
+
+        await engine.drain_store_writes()
+        rows = sqlite3.connect(str(cfg.surfacing.feedback_db_path))
+        try:
+            assert rows.execute("SELECT COUNT(*) FROM surfacing_events").fetchone()[0] == 4
+        finally:
+            rows.close()
+    finally:
+        beat.cancel()
+        if not released:
+            holder.rollback()
+            holder.close()
+        await engine.stop()
+        tracker.close()
+
+
 async def test_queue_snapshot_counts_every_in_flight_operation(tmp_path: Path) -> None:
     # `in_flight` used to be a lock's own state and could only read 0 or 1, so
     # an operator watching a saturated daemon saw the same number as an idle

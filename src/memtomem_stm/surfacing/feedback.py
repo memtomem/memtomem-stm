@@ -32,6 +32,21 @@ VALID_RATINGS: tuple[str, ...] = (
 )
 
 
+def record_feedback_batch(
+    tracker: FeedbackTracker, surfacing_id: str, parsed: list[tuple[str, str]]
+) -> list[str]:
+    """Record a whole feedback batch in one call.
+
+    Exists so a caller on an event loop can hand the batch to the
+    feedback-I/O worker as a single unit (#996): one queue wait instead of
+    one per entry, and a cancellation cannot land a prefix of the rows.
+    Returns one result string per entry, in order.
+    """
+    return [
+        tracker.record_feedback(surfacing_id, rating, memory_id) for memory_id, rating in parsed
+    ]
+
+
 class FeedbackTracker:
     """Track surfacing feedback and optionally auto-tune min_score."""
 
@@ -78,8 +93,8 @@ class FeedbackTracker:
             score_scale=score_scale,
         )
 
-    def record_fault(self, server: str, tool: str, kind: str) -> None:
-        self._store.record_fault(server, tool, kind)
+    def record_fault(self, server: str, tool: str, kind: str, *, at: float | None = None) -> None:
+        self._store.record_fault(server, tool, kind, at=at)
 
     def record_fault_recoveries(
         self,
@@ -89,8 +104,10 @@ class FeedbackTracker:
     ) -> None:
         self._store.record_fault_recoveries(entries, recovered_at=recovered_at)
 
-    def record_diagnostic(self, server: str, tool: str, kind: str) -> None:
-        self._store.record_diagnostic(server, tool, kind)
+    def record_diagnostic(
+        self, server: str, tool: str, kind: str, *, at: float | None = None
+    ) -> None:
+        self._store.record_diagnostic(server, tool, kind, at=at)
 
     def record_diagnostic_recovery(self, server: str, tool: str, kind: str) -> None:
         self._store.record_diagnostic_recovery(server, tool, kind)

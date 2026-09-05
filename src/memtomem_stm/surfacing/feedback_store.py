@@ -483,26 +483,51 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
 class FeedbackStore:
     """SQLite store for surfacing events and feedback ratings.
 
-    The write paths (``record_surfacing`` / ``record_feedback`` /
-    ``mark_surfaced`` / ``save_adjustment`` / the ``cleanup_*`` sweeps)
-    do synchronous sqlite I/O on the asyncio event loop (proxy and
-    daemon paths alike): while one runs, every runnable coroutine
-    stalls — other in-flight calls included, not just the one being
-    served. Accepted for the current local single-MCP-client
-    deployment, where call volume is low and the writes are cheap local
-    inserts. Multi-client serving (or materially higher concurrency) is
-    the reopen trigger: move the writes off-loop (e.g.
-    ``asyncio.to_thread``) — and note ``self._lock`` serializes the
-    write paths only; the read/stat methods share the connection
-    unlocked, so a thread move also needs every connection access
-    locked (the ``MetricsStore.__init__`` reader/writer convention) or
-    per-thread connections.
+    **Thread-safe, and the writes are meant to run off the event loop.**
+    Every method is synchronous, but a caller living on an asyncio loop must
+    hand the write paths (``record_surfacing`` / ``record_feedback`` /
+    ``mark_surfaced`` / ``save_adjustment`` / the fault counters / the
+    ``cleanup_*`` sweeps) to the shared worker in
+    ``memtomem_stm.surfacing.store_io``. They used to run inline, which was
+    accepted while one MCP client served one call at a time; #874 made the
+    daemon run several surfacing calls at once, and the write lock here is
+    file-wide across every process pointing at this DB (the proxy's own store,
+    ``mms tune``'s retention purge). A write that waits out a peer inside
+    ``busy_timeout`` froze the whole loop — including the ``asyncio.timeout_at``
+    timers meant to shed the requests that were piling up behind it (#996).
+
+    Two connections make that split safe:
+
+    - ``_db`` is the writer, serialized by ``_lock``. Schema and migrations run
+      on it during :meth:`initialize`, before anything else can reach it.
+    - ``_read_db`` is a second connection for the read/stat methods, serialized
+      by ``_read_lock``. Under WAL a reader never waits on a writer, so a read
+      left on the loop cannot block behind a worker write that is waiting out a
+      peer. It opens with a deliberately short lock budget: the only thing it
+      can still wait for is WAL recovery, and a loop-side read must not spend
+      the writer's multi-second budget on that.
+
+    Both connections are ``check_same_thread=False`` and are re-read *inside*
+    the lock by every method, so a :meth:`close` racing an in-flight write on
+    the worker degrades to this class's documented no-op instead of raising
+    from a half-closed connection.
+
+    Four writes still run on the caller's thread, all of them outside request
+    service and named here so the exception list stays honest:
+    :meth:`initialize` (schema and migrations), the engine constructor's
+    startup retention sweep, and ``AutoTuner``'s re-clamp of persisted
+    adjustments — those three run while the server is being built, before it
+    can accept a call — plus :meth:`close` at teardown.
     """
+
+    _READ_BUSY_TIMEOUT_MS = 250
 
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
         self._db: sqlite3.Connection | None = None
+        self._read_db: sqlite3.Connection | None = None
         self._lock = threading.Lock()
+        self._read_lock = threading.Lock()
 
     @property
     def db_path(self) -> Path:
@@ -511,6 +536,7 @@ class FeedbackStore:
     def initialize(self) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         db = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        read_db: sqlite3.Connection | None = None
         try:
             ensure_private_db_files(self._db_path)
             tune_connection(db)
@@ -519,15 +545,34 @@ class FeedbackStore:
             _add_fault_recovery_column(db)
             # Must stay after the relax migration — see its docstring.
             _add_events_score_scale_column(db)
+            # Opened only once the schema is final: the reader runs no DDL of
+            # its own, so it must never observe a half-migrated table.
+            read_db = sqlite3.connect(str(self._db_path), check_same_thread=False)
+            tune_connection(read_db, busy_timeout_ms=self._READ_BUSY_TIMEOUT_MS)
         except Exception:
+            if read_db is not None:
+                read_db.close()
             db.close()
             raise
         self._db = db
+        self._read_db = read_db
 
     def close(self) -> None:
-        if self._db:
-            self._db.close()
-            self._db = None
+        """Close both connections, waiting out an in-flight write.
+
+        Taking ``_lock`` is what makes the wait: a write already running on the
+        worker finishes and commits rather than having the connection closed
+        from under it. That wait is bounded by the writer's lock budget and is
+        paid at teardown, when this process has no requests left to serve.
+        """
+        with self._lock:
+            if self._db is not None:
+                self._db.close()
+                self._db = None
+        with self._read_lock:
+            if self._read_db is not None:
+                self._read_db.close()
+                self._read_db = None
 
     def record_surfacing(
         self,
@@ -549,7 +594,10 @@ class FeedbackStore:
         safe_query = escape_lone_surrogates(query)
         safe_score_scale = escape_lone_surrogates(score_scale) if score_scale is not None else None
         with self._lock:
-            self._db.execute(
+            db = self._db
+            if db is None:
+                return
+            db.execute(
                 "INSERT OR IGNORE INTO surfacing_events "
                 "(id, server, tool, query, memory_ids, scores, created_at, score_scale) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -564,9 +612,9 @@ class FeedbackStore:
                     safe_score_scale,
                 ),
             )
-            self._db.commit()
+            db.commit()
 
-    def record_fault(self, server: str, tool: str, kind: str) -> None:
+    def record_fault(self, server: str, tool: str, kind: str, *, at: float | None = None) -> None:
         """Increment the durable per-day fault counter for (server, tool, kind).
 
         Unknown *kind* values are dropped (defensively, not raised): the
@@ -579,14 +627,25 @@ class FeedbackStore:
         (``reset_recovery``), mirroring :meth:`record_diagnostic`: readers
         treat a kind as active while its newest occurrence postdates its
         newest recovery, so a re-break must not read as still-recovered.
-        """
-        self._record_signal(server, tool, kind, FAULT_KINDS, reset_recovery=True)
 
-    def record_diagnostic(self, server: str, tool: str, kind: str) -> None:
+        *at* is when the fault was observed, defaulting to now. A caller that
+        queues this write on a worker must pass the observation time: the
+        recovery guard compares ``last_at <= recovered_at``, so a fault that
+        executes late — after the caller took the timestamp for a later
+        recovery — would otherwise stamp a row the recovery can no longer
+        close, leaving a disproved episode open for the retention window.
+        """
+        self._record_signal(server, tool, kind, FAULT_KINDS, reset_recovery=True, at=at)
+
+    def record_diagnostic(
+        self, server: str, tool: str, kind: str, *, at: float | None = None
+    ) -> None:
         """Increment a durable advisory diagnostic counter.
 
         Diagnostics share the day-aggregated fault table for bounded storage,
         but readers partition them so operator guidance remains accurate.
+        *at* carries the observation time for a queued write, exactly as in
+        :meth:`record_fault`.
         """
         self._record_signal(
             server,
@@ -594,6 +653,7 @@ class FeedbackStore:
             kind,
             DIAGNOSTIC_KINDS,
             reset_recovery=True,
+            at=at,
         )
 
     def record_diagnostic_recovery(self, server: str, tool: str, kind: str) -> None:
@@ -722,15 +782,18 @@ class FeedbackStore:
         if not statements:
             return
         with self._lock:
+            db = self._db
+            if db is None:
+                return
             try:
                 for sql, params in statements:
-                    self._db.execute(sql, params)
-                self._db.commit()
+                    db.execute(sql, params)
+                db.commit()
             except Exception:
-                self._abandon_transaction(what)
+                self._abandon_transaction(db, what)
                 raise
 
-    def _abandon_transaction(self, what: str) -> None:
+    def _abandon_transaction(self, db: sqlite3.Connection, what: str) -> None:
         """Leave no pending transaction behind after a failed write.
 
         A failing ``execute`` or ``commit`` leaves the transaction OPEN, and
@@ -739,20 +802,20 @@ class FeedbackStore:
         half-applied recovery, say. Rolling back is what prevents that.
 
         A rollback that ITSELF fails is only logged. Dropping the connection
-        looks safer but is not: ``self._db is None`` makes every write a SILENT
+        looks safer but is not: a ``None`` connection makes every write a SILENT
         no-op, and ``record_surfacing`` returning without writing leaves the
         agent holding an advertised feedback ID that resolves to nothing —
         whereas a raising write makes the engine re-render without the dead
         handle. A connection whose rollback fails is broken anyway, so its next
         write raises and degrades through the paths that already exist.
 
-        Called from inside ``self._lock``; never raises, so the caller's
-        original exception is what propagates.
+        Called from inside ``self._lock`` with the connection the failed write
+        used, so a concurrent :meth:`close` cannot swap it for ``None`` between
+        the failure and the rollback; never raises, so the caller's original
+        exception is what propagates.
         """
-        if self._db is None:
-            return
         try:
-            self._db.rollback()
+            db.rollback()
         except Exception:
             logger.warning(
                 "Rollback after a failed %s write failed; the surfacing feedback "
@@ -769,30 +832,34 @@ class FeedbackStore:
         allowed_kinds: frozenset[str],
         *,
         reset_recovery: bool = False,
+        at: float | None = None,
     ) -> None:
         if self._db is None or kind not in allowed_kinds:
             return
         if has_lone_surrogate(server) or has_lone_surrogate(tool):
             return
-        now = time.time()
+        now = time.time() if at is None else at
         day = time.strftime("%Y-%m-%d", time.gmtime(now))
         recovery_update = ", last_recovered_at = NULL" if reset_recovery else ""
         with self._lock:
+            db = self._db
+            if db is None:
+                return
             try:
-                self._db.execute(
+                db.execute(
                     "INSERT INTO surfacing_faults (day, server, tool, kind, count, last_at) "
                     "VALUES (?, ?, ?, ?, 1, ?) "
                     "ON CONFLICT(day, server, tool, kind) "
                     "DO UPDATE SET count = count + 1, last_at = excluded.last_at" + recovery_update,
                     (day, server, tool, kind, now),
                 )
-                self._db.commit()
+                db.commit()
             except Exception:
                 # Same guarantee the recovery batch gets: a failed counter
                 # write must not leave a row pending for someone else's commit
                 # to publish. The engine's breaker bookkeeping reads a raised
                 # exception as "nothing landed", so that has to be true.
-                self._abandon_transaction("fault counter")
+                self._abandon_transaction(db, "fault counter")
                 raise
 
     def delete_faults_older_than(self, retention_seconds: float) -> int:
@@ -806,8 +873,11 @@ class FeedbackStore:
             return 0
         cutoff = time.time() - retention_seconds
         with self._lock:
-            cur = self._db.execute("DELETE FROM surfacing_faults WHERE last_at < ?", (cutoff,))
-            self._db.commit()
+            db = self._db
+            if db is None:
+                return 0
+            cur = db.execute("DELETE FROM surfacing_faults WHERE last_at < ?", (cutoff,))
+            db.commit()
         return cur.rowcount if cur.rowcount is not None and cur.rowcount > 0 else 0
 
     def record_feedback(
@@ -823,8 +893,11 @@ class FeedbackStore:
         if memory_id is not None and has_lone_surrogate(memory_id):
             return False
         with self._lock:
+            db = self._db
+            if db is None:
+                return False
             # Verify surfacing event exists
-            event = self._db.execute(
+            event = db.execute(
                 "SELECT memory_ids FROM surfacing_events WHERE id = ?", (surfacing_id,)
             ).fetchone()
             if not event:
@@ -836,40 +909,44 @@ class FeedbackStore:
                     return False
                 if memory_id not in event_memory_ids:
                     return False
-            self._db.execute(
+            db.execute(
                 "INSERT INTO surfacing_feedback (surfacing_id, memory_id, rating, created_at) "
                 "VALUES (?, ?, ?, ?)",
                 (surfacing_id, memory_id, rating, time.time()),
             )
-            self._db.commit()
+            db.commit()
         return True
 
     def get_memory_ids_for_surfacing(self, surfacing_id: str) -> list[str]:
         """Return memory_ids from a surfacing event."""
-        if self._db is None or has_lone_surrogate(surfacing_id):
-            return []
-        row = self._db.execute(
-            "SELECT memory_ids FROM surfacing_events WHERE id = ?", (surfacing_id,)
-        ).fetchone()
-        if not row:
-            return []
-        return _load_safe_memory_ids(row[0])
+        with self._read_lock:
+            db = self._read_db
+            if db is None or has_lone_surrogate(surfacing_id):
+                return []
+            row = db.execute(
+                "SELECT memory_ids FROM surfacing_events WHERE id = ?", (surfacing_id,)
+            ).fetchone()
+            if not row:
+                return []
+            return _load_safe_memory_ids(row[0])
 
     def get_feedback_count(self, tool: str | None = None) -> int:
         """Return the durable feedback watermark for auto-tuning."""
-        if self._db is None:
-            return 0
-        if tool is None:
-            row = self._db.execute("SELECT COUNT(*) FROM surfacing_feedback").fetchone()
-        else:
-            if has_lone_surrogate(tool):
+        with self._read_lock:
+            db = self._read_db
+            if db is None:
                 return 0
-            row = self._db.execute(
-                "SELECT COUNT(*) FROM surfacing_feedback f "
-                "JOIN surfacing_events e ON e.id = f.surfacing_id WHERE e.tool = ?",
-                (tool,),
-            ).fetchone()
-        return int(row[0]) if row else 0
+            if tool is None:
+                row = db.execute("SELECT COUNT(*) FROM surfacing_feedback").fetchone()
+            else:
+                if has_lone_surrogate(tool):
+                    return 0
+                row = db.execute(
+                    "SELECT COUNT(*) FROM surfacing_feedback f "
+                    "JOIN surfacing_events e ON e.id = f.surfacing_id WHERE e.tool = ?",
+                    (tool,),
+                ).fetchone()
+            return int(row[0]) if row else 0
 
     def get_negative_feedback_counts(self, memory_ids: list[str]) -> dict[str, int]:
         """Return durable negative-feedback event counts for memory IDs.
@@ -881,59 +958,61 @@ class FeedbackStore:
         negatives (``memory_id IS NULL``) are expanded from the parent
         event's ``memory_ids`` JSON without relying on SQLite JSON1.
         """
-        if self._db is None or not memory_ids:
-            return {}
+        with self._read_lock:
+            db = self._read_db
+            if db is None or not memory_ids:
+                return {}
 
-        # Drop the unencodable ids, not the batch. They cannot be bound as
-        # SQLite parameters, but they also cannot match a stored row — the
-        # write paths refuse them — so their count is known to be 0 without
-        # asking. Failing the whole call instead would answer 0 for every
-        # *valid* id too, and the caller reads that as "nothing has enough
-        # negatives": a memory the agent rated ``not_relevant`` past the
-        # threshold would resurface for as long as one bad id rode along in
-        # the same candidate set. Same leaf-filtering shape as
-        # ``_load_safe_memory_ids``.
-        target_ids = [
-            mid
-            for mid in dict.fromkeys(str(mid) for mid in memory_ids)
-            if not has_lone_surrogate(mid)
-        ]
-        if not target_ids:
-            return {}
-        event_ids_by_memory: dict[str, set[str]] = {mid: set() for mid in target_ids}
-        target_set = set(target_ids)
+            # Drop the unencodable ids, not the batch. They cannot be bound as
+            # SQLite parameters, but they also cannot match a stored row — the
+            # write paths refuse them — so their count is known to be 0 without
+            # asking. Failing the whole call instead would answer 0 for every
+            # *valid* id too, and the caller reads that as "nothing has enough
+            # negatives": a memory the agent rated ``not_relevant`` past the
+            # threshold would resurface for as long as one bad id rode along in
+            # the same candidate set. Same leaf-filtering shape as
+            # ``_load_safe_memory_ids``.
+            target_ids = [
+                mid
+                for mid in dict.fromkeys(str(mid) for mid in memory_ids)
+                if not has_lone_surrogate(mid)
+            ]
+            if not target_ids:
+                return {}
+            event_ids_by_memory: dict[str, set[str]] = {mid: set() for mid in target_ids}
+            target_set = set(target_ids)
 
-        placeholders = ", ".join("?" for _ in target_ids)
-        rating_placeholders = ", ".join("?" for _ in _NEGATIVE_FEEDBACK_RATINGS)
-        explicit_rows = self._db.execute(
-            "SELECT DISTINCT memory_id, surfacing_id FROM surfacing_feedback "
-            f"WHERE memory_id IN ({placeholders}) "
-            f"AND rating IN ({rating_placeholders})",
-            (*target_ids, *_NEGATIVE_FEEDBACK_RATINGS),
-        ).fetchall()
-        for memory_id, surfacing_id in explicit_rows:
-            event_ids_by_memory[str(memory_id)].add(str(surfacing_id))
+            placeholders = ", ".join("?" for _ in target_ids)
+            rating_placeholders = ", ".join("?" for _ in _NEGATIVE_FEEDBACK_RATINGS)
+            explicit_rows = db.execute(
+                "SELECT DISTINCT memory_id, surfacing_id FROM surfacing_feedback "
+                f"WHERE memory_id IN ({placeholders}) "
+                f"AND rating IN ({rating_placeholders})",
+                (*target_ids, *_NEGATIVE_FEEDBACK_RATINGS),
+            ).fetchall()
+            for memory_id, surfacing_id in explicit_rows:
+                event_ids_by_memory[str(memory_id)].add(str(surfacing_id))
 
-        blanket_rows = self._db.execute(
-            "SELECT DISTINCT f.surfacing_id, e.memory_ids FROM surfacing_feedback f "
-            "JOIN surfacing_events e ON f.surfacing_id = e.id "
-            "WHERE f.memory_id IS NULL "
-            f"AND f.rating IN ({rating_placeholders})",
-            _NEGATIVE_FEEDBACK_RATINGS,
-        ).fetchall()
-        for surfacing_id, event_memory_ids_json in blanket_rows:
-            try:
-                event_memory_ids = json.loads(event_memory_ids_json)
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if not isinstance(event_memory_ids, list):
-                continue
-            for memory_id in event_memory_ids:
-                mid = str(memory_id)
-                if mid in target_set:
-                    event_ids_by_memory[mid].add(str(surfacing_id))
+            blanket_rows = db.execute(
+                "SELECT DISTINCT f.surfacing_id, e.memory_ids FROM surfacing_feedback f "
+                "JOIN surfacing_events e ON f.surfacing_id = e.id "
+                "WHERE f.memory_id IS NULL "
+                f"AND f.rating IN ({rating_placeholders})",
+                _NEGATIVE_FEEDBACK_RATINGS,
+            ).fetchall()
+            for surfacing_id, event_memory_ids_json in blanket_rows:
+                try:
+                    event_memory_ids = json.loads(event_memory_ids_json)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(event_memory_ids, list):
+                    continue
+                for memory_id in event_memory_ids:
+                    mid = str(memory_id)
+                    if mid in target_set:
+                        event_ids_by_memory[mid].add(str(surfacing_id))
 
-        return {mid: len(event_ids) for mid, event_ids in event_ids_by_memory.items()}
+            return {mid: len(event_ids) for mid, event_ids in event_ids_by_memory.items()}
 
     def get_surfacing_event(self, surfacing_id: str) -> dict | None:
         """Return ``{server, tool, memory_ids}`` for a surfacing event.
@@ -943,53 +1022,55 @@ class FeedbackStore:
         in-memory invalidation set against ``SurfacingCache`` entries.
         Returns ``None`` if the event does not exist.
         """
-        if self._db is None or has_lone_surrogate(surfacing_id):
-            return None
-        row = self._db.execute(
-            "SELECT server, tool, memory_ids FROM surfacing_events WHERE id = ?",
-            (surfacing_id,),
-        ).fetchone()
-        if not row:
-            return None
-        try:
-            memory_ids = json.loads(row[2])
-        except (json.JSONDecodeError, TypeError):
-            memory_ids = []
-        return {"server": row[0], "tool": row[1], "memory_ids": memory_ids}
+        with self._read_lock:
+            db = self._read_db
+            if db is None or has_lone_surrogate(surfacing_id):
+                return None
+            row = db.execute(
+                "SELECT server, tool, memory_ids FROM surfacing_events WHERE id = ?",
+                (surfacing_id,),
+            ).fetchone()
+            if not row:
+                return None
+            try:
+                memory_ids = json.loads(row[2])
+            except (json.JSONDecodeError, TypeError):
+                memory_ids = []
+            return {"server": row[0], "tool": row[1], "memory_ids": memory_ids}
 
     def get_tool_feedback_summary(self, tool: str | None = None) -> dict:
         """Get feedback summary, optionally filtered by tool."""
-        if self._db is None:
-            return {"total_surfacings": 0, "total_feedback": 0, "by_rating": {}}
-        if tool is not None and has_lone_surrogate(tool):
-            return {"total_surfacings": 0, "total_feedback": 0, "by_rating": {}}
+        with self._read_lock:
+            db = self._read_db
+            if db is None:
+                return {"total_surfacings": 0, "total_feedback": 0, "by_rating": {}}
+            if tool is not None and has_lone_surrogate(tool):
+                return {"total_surfacings": 0, "total_feedback": 0, "by_rating": {}}
 
-        if tool:
-            total_surfacings = self._db.execute(
-                "SELECT COUNT(*) FROM surfacing_events WHERE tool = ?", (tool,)
-            ).fetchone()[0]
-            rows = self._db.execute(
-                "SELECT f.rating, COUNT(*) FROM surfacing_feedback f "
-                "JOIN surfacing_events e ON f.surfacing_id = e.id "
-                "WHERE e.tool = ? GROUP BY f.rating",
-                (tool,),
-            ).fetchall()
-        else:
-            total_surfacings = self._db.execute("SELECT COUNT(*) FROM surfacing_events").fetchone()[
-                0
-            ]
-            rows = self._db.execute(
-                "SELECT rating, COUNT(*) FROM surfacing_feedback GROUP BY rating"
-            ).fetchall()
+            if tool:
+                total_surfacings = db.execute(
+                    "SELECT COUNT(*) FROM surfacing_events WHERE tool = ?", (tool,)
+                ).fetchone()[0]
+                rows = db.execute(
+                    "SELECT f.rating, COUNT(*) FROM surfacing_feedback f "
+                    "JOIN surfacing_events e ON f.surfacing_id = e.id "
+                    "WHERE e.tool = ? GROUP BY f.rating",
+                    (tool,),
+                ).fetchall()
+            else:
+                total_surfacings = db.execute("SELECT COUNT(*) FROM surfacing_events").fetchone()[0]
+                rows = db.execute(
+                    "SELECT rating, COUNT(*) FROM surfacing_feedback GROUP BY rating"
+                ).fetchall()
 
-        by_rating = {r[0]: r[1] for r in rows}
-        total_feedback = sum(by_rating.values())
+            by_rating = {r[0]: r[1] for r in rows}
+            total_feedback = sum(by_rating.values())
 
-        return {
-            "total_surfacings": total_surfacings,
-            "total_feedback": total_feedback,
-            "by_rating": by_rating,
-        }
+            return {
+                "total_surfacings": total_surfacings,
+                "total_feedback": total_feedback,
+                "by_rating": by_rating,
+            }
 
     def get_stats(
         self,
@@ -1010,198 +1091,200 @@ class FeedbackStore:
             since: Unix timestamp lower bound for ``created_at``.
             limit: Max rows in the ``recent`` tail (``<=0`` disables).
         """
-        empty = {
-            "events_total": 0,
-            "distinct_tools": 0,
-            "date_range": {"first": None, "last": None},
-            "per_tool_breakdown": [],
-            "rating_distribution": {},
-            "total_feedback": 0,
-            "recent": [],
-            "score_distribution": {"count": 0, "min": None, "max": None},
-            "score_scale_distribution": {},
-        }
-        if self._db is None:
-            return empty
-        if tool is not None and has_lone_surrogate(tool):
-            return empty
-
-        event_filters: list[str] = []
-        event_params: list[object] = []
-        if tool is not None:
-            event_filters.append("tool = ?")
-            event_params.append(tool)
-        if since is not None:
-            event_filters.append("created_at >= ?")
-            event_params.append(since)
-        where_sql = (" WHERE " + " AND ".join(event_filters)) if event_filters else ""
-
-        events_total = self._db.execute(
-            f"SELECT COUNT(*) FROM surfacing_events{where_sql}", event_params
-        ).fetchone()[0]
-
-        if events_total == 0:
-            # Still surface feedback with zero events? No — feedback rows
-            # without their parent event in the filter range aren't
-            # meaningful here. Return empty shape.
-            return empty
-
-        distinct_tools = self._db.execute(
-            f"SELECT COUNT(DISTINCT tool) FROM surfacing_events{where_sql}", event_params
-        ).fetchone()[0]
-
-        first, last = self._db.execute(
-            f"SELECT MIN(created_at), MAX(created_at) FROM surfacing_events{where_sql}",
-            event_params,
-        ).fetchone()
-
-        # Per-tool: events + average memory_ids length. Average is computed
-        # in Python because memory_ids is JSON-encoded and SQLite's JSON1
-        # extension isn't universally guaranteed on the shipping wheels.
-        # The same pass aggregates the score distribution (count/min/max)
-        # for the flat-score tripwire (#560): min == max over a large
-        # enough sample means the upstream score channel carries no
-        # ranking information. min/max is O(1) memory and is exactly the
-        # "all scores equal" predicate — no need to hold the value set.
-        rows = self._db.execute(
-            f"SELECT tool, memory_ids, scores, score_scale FROM surfacing_events{where_sql}",
-            event_params,
-        ).fetchall()
-        per_tool: dict[str, dict[str, float]] = {}
-        score_count = 0
-        score_min: float | None = None
-        score_max: float | None = None
-        # Per-event count of the core-reported scale label (#1781). NULL rows
-        # (pre-#1781 cores, compose bundles, legacy events) bucket under
-        # "unknown" so the distribution always sums to events_total.
-        score_scale_distribution: dict[str, int] = {}
-        for tool_name, memory_ids_json, scores_json, score_scale in rows:
-            scale_key = (
-                escape_lone_surrogates(score_scale)
-                if isinstance(score_scale, str) and score_scale
-                else "unknown"
-            )
-            score_scale_distribution[scale_key] = score_scale_distribution.get(scale_key, 0) + 1
-            n = len(_load_safe_memory_ids(memory_ids_json))
-            bucket = per_tool.setdefault(tool_name, {"events": 0, "sum_memory_count": 0})
-            bucket["events"] += 1
-            bucket["sum_memory_count"] += n
-            for score in _load_numeric_scores(scores_json):
-                score_count += 1
-                score_min = score if score_min is None else min(score_min, score)
-                score_max = score if score_max is None else max(score_max, score)
-
-        # Per-tool feedback counts (total + negative) within the same
-        # event filter. Powers the AutoTuner readiness signal: with these
-        # the formatter can render "feedback N (negative R%)" and decide
-        # whether the tool has hit auto_tune_min_samples.
-        per_tool_feedback_filter = " AND ".join(f"e.{f}" for f in event_filters)
-        per_tool_feedback_where = (
-            (" WHERE " + per_tool_feedback_filter) if per_tool_feedback_filter else ""
-        )
-        feedback_rows = self._db.execute(
-            "SELECT e.tool, f.rating, COUNT(*) FROM surfacing_feedback f "
-            "JOIN surfacing_events e ON f.surfacing_id = e.id"
-            f"{per_tool_feedback_where} GROUP BY e.tool, f.rating",
-            event_params,
-        ).fetchall()
-        per_tool_feedback: dict[str, dict[str, int]] = {}
-        for tool_name, rating, count in feedback_rows:
-            bucket_fb = per_tool_feedback.setdefault(
-                tool_name,
-                {"total": 0, "not_relevant": 0, "negative": 0},
-            )
-            bucket_fb["total"] += count
-            if rating == "not_relevant":
-                bucket_fb["not_relevant"] += count
-            if rating in _NEGATIVE_FEEDBACK_RATINGS:
-                bucket_fb["negative"] += count
-
-        per_tool_breakdown: list[dict] = [
-            {
-                "tool": t,
-                "events": int(b["events"]),
-                "avg_memory_count": round(b["sum_memory_count"] / b["events"], 2)
-                if b["events"]
-                else 0.0,
-                "feedback_count": per_tool_feedback.get(t, {}).get("total", 0),
-                "not_relevant_count": per_tool_feedback.get(t, {}).get("not_relevant", 0),
-                "negative_count": per_tool_feedback.get(t, {}).get("negative", 0),
+        with self._read_lock:
+            db = self._read_db
+            empty = {
+                "events_total": 0,
+                "distinct_tools": 0,
+                "date_range": {"first": None, "last": None},
+                "per_tool_breakdown": [],
+                "rating_distribution": {},
+                "total_feedback": 0,
+                "recent": [],
+                "score_distribution": {"count": 0, "min": None, "max": None},
+                "score_scale_distribution": {},
             }
-            for t, b in sorted(per_tool.items(), key=lambda kv: kv[1]["events"], reverse=True)
-        ]
+            if db is None:
+                return empty
+            if tool is not None and has_lone_surrogate(tool):
+                return empty
 
-        # Feedback ratings JOINed against the same event filter.
-        rating_join_filter = " AND ".join(f"e.{f}" for f in event_filters)
-        rating_where = (" WHERE " + rating_join_filter) if rating_join_filter else ""
-        rating_rows = self._db.execute(
-            "SELECT f.rating, COUNT(*) FROM surfacing_feedback f "
-            "JOIN surfacing_events e ON f.surfacing_id = e.id"
-            f"{rating_where} GROUP BY f.rating",
-            event_params,
-        ).fetchall()
-        rating_distribution = {r[0]: r[1] for r in rating_rows}
-        total_feedback = sum(rating_distribution.values())
+            event_filters: list[str] = []
+            event_params: list[object] = []
+            if tool is not None:
+                event_filters.append("tool = ?")
+                event_params.append(tool)
+            if since is not None:
+                event_filters.append("created_at >= ?")
+                event_params.append(since)
+            where_sql = (" WHERE " + " AND ".join(event_filters)) if event_filters else ""
 
-        recent: list[dict] = []
-        if limit > 0:
-            recent_rows = self._db.execute(
-                f"SELECT created_at, tool, query, memory_ids, scores, score_scale "
-                f"FROM surfacing_events{where_sql} "
-                "ORDER BY created_at DESC, rowid DESC LIMIT ?",
-                [*event_params, limit],
+            events_total = db.execute(
+                f"SELECT COUNT(*) FROM surfacing_events{where_sql}", event_params
+            ).fetchone()[0]
+
+            if events_total == 0:
+                # Still surface feedback with zero events? No — feedback rows
+                # without their parent event in the filter range aren't
+                # meaningful here. Return empty shape.
+                return empty
+
+            distinct_tools = db.execute(
+                f"SELECT COUNT(DISTINCT tool) FROM surfacing_events{where_sql}", event_params
+            ).fetchone()[0]
+
+            first, last = db.execute(
+                f"SELECT MIN(created_at), MAX(created_at) FROM surfacing_events{where_sql}",
+                event_params,
+            ).fetchone()
+
+            # Per-tool: events + average memory_ids length. Average is computed
+            # in Python because memory_ids is JSON-encoded and SQLite's JSON1
+            # extension isn't universally guaranteed on the shipping wheels.
+            # The same pass aggregates the score distribution (count/min/max)
+            # for the flat-score tripwire (#560): min == max over a large
+            # enough sample means the upstream score channel carries no
+            # ranking information. min/max is O(1) memory and is exactly the
+            # "all scores equal" predicate — no need to hold the value set.
+            rows = db.execute(
+                f"SELECT tool, memory_ids, scores, score_scale FROM surfacing_events{where_sql}",
+                event_params,
             ).fetchall()
-            for ts, tool_name, query, memory_ids_json, scores_json, score_scale in recent_rows:
-                memory_ids = _load_safe_memory_ids(memory_ids_json)
-                scores = _load_numeric_scores(scores_json)
-                # #352 part 2: ``query`` is now nullable.
-                # ``cleanup_expired_queries`` clears the column on rows
-                # older than ``query_retention_days`` while preserving
-                # the row itself for stats aggregates, so a SELECT can
-                # legitimately yield ``None`` here. ``len(None)`` would
-                # crash ``stm_surfacing_stats`` once retention has
-                # actually swept anything — render a stable placeholder.
-                # #352 part 3: only the exact ``sha256:<16-hex>`` shape
-                # written by the engine under ``persist_query_text=False``
-                # bypasses the 80-char clip. Prefix-only matching would
-                # misclassify legitimate raw queries that happen to
-                # start with ``sha256:`` (e.g. a user-typed checksum
-                # search) and leak unbounded text under the default
-                # config. Raw text — including any ``sha256:``-prefixed
-                # user query — keeps the legacy 80-char clip.
-                if query is None:
-                    preview = "<expired>"
-                elif _HASHED_QUERY_RE.fullmatch(query):
-                    preview = query
-                else:
-                    safe_query = escape_lone_surrogates(query)
-                    preview = safe_query if len(safe_query) <= 80 else safe_query[:77] + "..."
-                recent.append(
-                    {
-                        "ts": ts,
-                        "tool": tool_name,
-                        "query_preview": preview,
-                        "memory_ids": memory_ids,
-                        "scores": scores,
-                        "score_scale": (
-                            escape_lone_surrogates(score_scale)
-                            if isinstance(score_scale, str)
-                            else score_scale
-                        ),
-                    }
+            per_tool: dict[str, dict[str, float]] = {}
+            score_count = 0
+            score_min: float | None = None
+            score_max: float | None = None
+            # Per-event count of the core-reported scale label (#1781). NULL rows
+            # (pre-#1781 cores, compose bundles, legacy events) bucket under
+            # "unknown" so the distribution always sums to events_total.
+            score_scale_distribution: dict[str, int] = {}
+            for tool_name, memory_ids_json, scores_json, score_scale in rows:
+                scale_key = (
+                    escape_lone_surrogates(score_scale)
+                    if isinstance(score_scale, str) and score_scale
+                    else "unknown"
                 )
+                score_scale_distribution[scale_key] = score_scale_distribution.get(scale_key, 0) + 1
+                n = len(_load_safe_memory_ids(memory_ids_json))
+                bucket = per_tool.setdefault(tool_name, {"events": 0, "sum_memory_count": 0})
+                bucket["events"] += 1
+                bucket["sum_memory_count"] += n
+                for score in _load_numeric_scores(scores_json):
+                    score_count += 1
+                    score_min = score if score_min is None else min(score_min, score)
+                    score_max = score if score_max is None else max(score_max, score)
 
-        return {
-            "events_total": events_total,
-            "distinct_tools": distinct_tools,
-            "date_range": {"first": first, "last": last},
-            "per_tool_breakdown": per_tool_breakdown,
-            "rating_distribution": rating_distribution,
-            "total_feedback": total_feedback,
-            "recent": recent,
-            "score_distribution": {"count": score_count, "min": score_min, "max": score_max},
-            "score_scale_distribution": score_scale_distribution,
-        }
+            # Per-tool feedback counts (total + negative) within the same
+            # event filter. Powers the AutoTuner readiness signal: with these
+            # the formatter can render "feedback N (negative R%)" and decide
+            # whether the tool has hit auto_tune_min_samples.
+            per_tool_feedback_filter = " AND ".join(f"e.{f}" for f in event_filters)
+            per_tool_feedback_where = (
+                (" WHERE " + per_tool_feedback_filter) if per_tool_feedback_filter else ""
+            )
+            feedback_rows = db.execute(
+                "SELECT e.tool, f.rating, COUNT(*) FROM surfacing_feedback f "
+                "JOIN surfacing_events e ON f.surfacing_id = e.id"
+                f"{per_tool_feedback_where} GROUP BY e.tool, f.rating",
+                event_params,
+            ).fetchall()
+            per_tool_feedback: dict[str, dict[str, int]] = {}
+            for tool_name, rating, count in feedback_rows:
+                bucket_fb = per_tool_feedback.setdefault(
+                    tool_name,
+                    {"total": 0, "not_relevant": 0, "negative": 0},
+                )
+                bucket_fb["total"] += count
+                if rating == "not_relevant":
+                    bucket_fb["not_relevant"] += count
+                if rating in _NEGATIVE_FEEDBACK_RATINGS:
+                    bucket_fb["negative"] += count
+
+            per_tool_breakdown: list[dict] = [
+                {
+                    "tool": t,
+                    "events": int(b["events"]),
+                    "avg_memory_count": round(b["sum_memory_count"] / b["events"], 2)
+                    if b["events"]
+                    else 0.0,
+                    "feedback_count": per_tool_feedback.get(t, {}).get("total", 0),
+                    "not_relevant_count": per_tool_feedback.get(t, {}).get("not_relevant", 0),
+                    "negative_count": per_tool_feedback.get(t, {}).get("negative", 0),
+                }
+                for t, b in sorted(per_tool.items(), key=lambda kv: kv[1]["events"], reverse=True)
+            ]
+
+            # Feedback ratings JOINed against the same event filter.
+            rating_join_filter = " AND ".join(f"e.{f}" for f in event_filters)
+            rating_where = (" WHERE " + rating_join_filter) if rating_join_filter else ""
+            rating_rows = db.execute(
+                "SELECT f.rating, COUNT(*) FROM surfacing_feedback f "
+                "JOIN surfacing_events e ON f.surfacing_id = e.id"
+                f"{rating_where} GROUP BY f.rating",
+                event_params,
+            ).fetchall()
+            rating_distribution = {r[0]: r[1] for r in rating_rows}
+            total_feedback = sum(rating_distribution.values())
+
+            recent: list[dict] = []
+            if limit > 0:
+                recent_rows = db.execute(
+                    f"SELECT created_at, tool, query, memory_ids, scores, score_scale "
+                    f"FROM surfacing_events{where_sql} "
+                    "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                    [*event_params, limit],
+                ).fetchall()
+                for ts, tool_name, query, memory_ids_json, scores_json, score_scale in recent_rows:
+                    memory_ids = _load_safe_memory_ids(memory_ids_json)
+                    scores = _load_numeric_scores(scores_json)
+                    # #352 part 2: ``query`` is now nullable.
+                    # ``cleanup_expired_queries`` clears the column on rows
+                    # older than ``query_retention_days`` while preserving
+                    # the row itself for stats aggregates, so a SELECT can
+                    # legitimately yield ``None`` here. ``len(None)`` would
+                    # crash ``stm_surfacing_stats`` once retention has
+                    # actually swept anything — render a stable placeholder.
+                    # #352 part 3: only the exact ``sha256:<16-hex>`` shape
+                    # written by the engine under ``persist_query_text=False``
+                    # bypasses the 80-char clip. Prefix-only matching would
+                    # misclassify legitimate raw queries that happen to
+                    # start with ``sha256:`` (e.g. a user-typed checksum
+                    # search) and leak unbounded text under the default
+                    # config. Raw text — including any ``sha256:``-prefixed
+                    # user query — keeps the legacy 80-char clip.
+                    if query is None:
+                        preview = "<expired>"
+                    elif _HASHED_QUERY_RE.fullmatch(query):
+                        preview = query
+                    else:
+                        safe_query = escape_lone_surrogates(query)
+                        preview = safe_query if len(safe_query) <= 80 else safe_query[:77] + "..."
+                    recent.append(
+                        {
+                            "ts": ts,
+                            "tool": tool_name,
+                            "query_preview": preview,
+                            "memory_ids": memory_ids,
+                            "scores": scores,
+                            "score_scale": (
+                                escape_lone_surrogates(score_scale)
+                                if isinstance(score_scale, str)
+                                else score_scale
+                            ),
+                        }
+                    )
+
+            return {
+                "events_total": events_total,
+                "distinct_tools": distinct_tools,
+                "date_range": {"first": first, "last": last},
+                "per_tool_breakdown": per_tool_breakdown,
+                "rating_distribution": rating_distribution,
+                "total_feedback": total_feedback,
+                "recent": recent,
+                "score_distribution": {"count": score_count, "min": score_min, "max": score_max},
+                "score_scale_distribution": score_scale_distribution,
+            }
 
     # ── Cross-session dedup ────────────────────────────────────────────
 
@@ -1213,8 +1296,11 @@ class FeedbackStore:
             require_utf8_identifier(memory_id, f"memory_ids[{index}]")
         now = time.time()
         with self._lock:
+            db = self._db
+            if db is None:
+                return
             for mid in memory_ids:
-                self._db.execute(
+                db.execute(
                     "INSERT INTO seen_memories (memory_id, first_seen_at, last_seen_at, seen_count) "
                     "VALUES (?, ?, ?, 1) "
                     "ON CONFLICT(memory_id) DO UPDATE SET "
@@ -1222,17 +1308,19 @@ class FeedbackStore:
                     "seen_count = seen_count + 1",
                     (mid, now, now),
                 )
-            self._db.commit()
+            db.commit()
 
     def get_seen_ids(self, ttl_seconds: float) -> set[str]:
         """Return memory IDs surfaced within the TTL window."""
-        if self._db is None:
-            return set()
-        cutoff = time.time() - ttl_seconds
-        rows = self._db.execute(
-            "SELECT memory_id FROM seen_memories WHERE last_seen_at >= ?", (cutoff,)
-        ).fetchall()
-        return {r[0] for r in rows}
+        with self._read_lock:
+            db = self._read_db
+            if db is None:
+                return set()
+            cutoff = time.time() - ttl_seconds
+            rows = db.execute(
+                "SELECT memory_id FROM seen_memories WHERE last_seen_at >= ?", (cutoff,)
+            ).fetchall()
+            return {r[0] for r in rows}
 
     def cleanup_expired(self, ttl_seconds: float) -> int:
         """Delete seen_memories entries older than TTL. Returns count deleted."""
@@ -1240,8 +1328,11 @@ class FeedbackStore:
             return 0
         cutoff = time.time() - ttl_seconds
         with self._lock:
-            cursor = self._db.execute("DELETE FROM seen_memories WHERE last_seen_at < ?", (cutoff,))
-            self._db.commit()
+            db = self._db
+            if db is None:
+                return 0
+            cursor = db.execute("DELETE FROM seen_memories WHERE last_seen_at < ?", (cutoff,))
+            db.commit()
             return cursor.rowcount
 
     def cleanup_expired_queries(self, retention_seconds: float) -> int:
@@ -1255,12 +1346,15 @@ class FeedbackStore:
             return 0
         cutoff = time.time() - retention_seconds
         with self._lock:
-            cursor = self._db.execute(
+            db = self._db
+            if db is None:
+                return 0
+            cursor = db.execute(
                 "UPDATE surfacing_events SET query = NULL "
                 "WHERE created_at < ? AND query IS NOT NULL",
                 (cutoff,),
             )
-            self._db.commit()
+            db.commit()
             return cursor.rowcount
 
     def delete_events_older_than(self, retention_seconds: float) -> int:
@@ -1278,15 +1372,16 @@ class FeedbackStore:
             return 0
         cutoff = time.time() - retention_seconds
         with self._lock:
-            self._db.execute(
+            db = self._db
+            if db is None:
+                return 0
+            db.execute(
                 "DELETE FROM surfacing_feedback WHERE surfacing_id IN "
                 "(SELECT id FROM surfacing_events WHERE created_at < ?)",
                 (cutoff,),
             )
-            cursor = self._db.execute(
-                "DELETE FROM surfacing_events WHERE created_at < ?", (cutoff,)
-            )
-            self._db.commit()
+            cursor = db.execute("DELETE FROM surfacing_events WHERE created_at < ?", (cutoff,))
+            db.commit()
             return cursor.rowcount
 
     def _get_tool_rating_ratio(
@@ -1302,43 +1397,45 @@ class FeedbackStore:
         # IS NULL keeps two row classes counting as before: events rows with
         # no reported scale, and orphaned feedback whose events row was aged
         # out by retention.
-        scale_pred = "(e.score_scale IS NULL OR e.score_scale = 'rrf')"
-        if self._db is None:
-            return None
-        if tool is not None and has_lone_surrogate(tool):
-            return None
+        with self._read_lock:
+            db = self._read_db
+            scale_pred = "(e.score_scale IS NULL OR e.score_scale = 'rrf')"
+            if db is None:
+                return None
+            if tool is not None and has_lone_surrogate(tool):
+                return None
 
-        placeholders = ", ".join("?" for _ in ratings)
-        if tool is not None:
-            total = self._db.execute(
-                "SELECT COUNT(*) FROM surfacing_feedback f "
-                "JOIN surfacing_events e ON f.surfacing_id = e.id "
-                f"WHERE e.tool = ? AND {scale_pred}",
-                (tool,),
-            ).fetchone()[0]
-            if total < min_samples:
-                return None
-            matching = self._db.execute(
-                "SELECT COUNT(*) FROM surfacing_feedback f "
-                "JOIN surfacing_events e ON f.surfacing_id = e.id "
-                f"WHERE e.tool = ? AND {scale_pred} AND f.rating IN ({placeholders})",
-                (tool, *ratings),
-            ).fetchone()[0]
-        else:
-            total = self._db.execute(
-                "SELECT COUNT(*) FROM surfacing_feedback f "
-                "LEFT JOIN surfacing_events e ON f.surfacing_id = e.id "
-                f"WHERE {scale_pred}",
-            ).fetchone()[0]
-            if total < min_samples:
-                return None
-            matching = self._db.execute(
-                "SELECT COUNT(*) FROM surfacing_feedback f "
-                "LEFT JOIN surfacing_events e ON f.surfacing_id = e.id "
-                f"WHERE {scale_pred} AND f.rating IN ({placeholders})",
-                ratings,
-            ).fetchone()[0]
-        return matching / total if total > 0 else 0.0
+            placeholders = ", ".join("?" for _ in ratings)
+            if tool is not None:
+                total = db.execute(
+                    "SELECT COUNT(*) FROM surfacing_feedback f "
+                    "JOIN surfacing_events e ON f.surfacing_id = e.id "
+                    f"WHERE e.tool = ? AND {scale_pred}",
+                    (tool,),
+                ).fetchone()[0]
+                if total < min_samples:
+                    return None
+                matching = db.execute(
+                    "SELECT COUNT(*) FROM surfacing_feedback f "
+                    "JOIN surfacing_events e ON f.surfacing_id = e.id "
+                    f"WHERE e.tool = ? AND {scale_pred} AND f.rating IN ({placeholders})",
+                    (tool, *ratings),
+                ).fetchone()[0]
+            else:
+                total = db.execute(
+                    "SELECT COUNT(*) FROM surfacing_feedback f "
+                    "LEFT JOIN surfacing_events e ON f.surfacing_id = e.id "
+                    f"WHERE {scale_pred}",
+                ).fetchone()[0]
+                if total < min_samples:
+                    return None
+                matching = db.execute(
+                    "SELECT COUNT(*) FROM surfacing_feedback f "
+                    "LEFT JOIN surfacing_events e ON f.surfacing_id = e.id "
+                    f"WHERE {scale_pred} AND f.rating IN ({placeholders})",
+                    ratings,
+                ).fetchone()[0]
+            return matching / total if total > 0 else 0.0
 
     def get_tool_negative_ratio(self, tool: str | None, min_samples: int = 20) -> float | None:
         """Return ratio of negative feedback. None if insufficient samples.
@@ -1377,10 +1474,12 @@ class FeedbackStore:
         losing every tuning decision the moment the server bounces.
         Returns ``{}`` when the store is closed or empty.
         """
-        if self._db is None:
-            return {}
-        rows = self._db.execute("SELECT tool, min_score FROM auto_tune_adjustments").fetchall()
-        return {tool: score for tool, score in rows}
+        with self._read_lock:
+            db = self._read_db
+            if db is None:
+                return {}
+            rows = db.execute("SELECT tool, min_score FROM auto_tune_adjustments").fetchall()
+            return {tool: score for tool, score in rows}
 
     def save_adjustment(self, tool: str, min_score: float) -> None:
         """Upsert one per-tool min_score adjustment."""
@@ -1388,7 +1487,10 @@ class FeedbackStore:
             return
         require_utf8_identifier(tool, "tool")
         with self._lock:
-            self._db.execute(
+            db = self._db
+            if db is None:
+                return
+            db.execute(
                 "INSERT INTO auto_tune_adjustments (tool, min_score, updated_at) "
                 "VALUES (?, ?, ?) "
                 "ON CONFLICT(tool) DO UPDATE SET "
@@ -1396,7 +1498,7 @@ class FeedbackStore:
                 "updated_at = excluded.updated_at",
                 (tool, min_score, time.time()),
             )
-            self._db.commit()
+            db.commit()
 
     def get_per_tool_feedback_counts(self) -> dict[str, int]:
         """Return total feedback rows per tool, ignoring any time window.
@@ -1410,11 +1512,13 @@ class FeedbackStore:
 
         Returns ``{}`` when the store is closed.
         """
-        if self._db is None:
-            return {}
-        rows = self._db.execute(
-            "SELECT e.tool, COUNT(*) FROM surfacing_feedback f "
-            "JOIN surfacing_events e ON f.surfacing_id = e.id "
-            "GROUP BY e.tool"
-        ).fetchall()
-        return {tool: count for tool, count in rows}
+        with self._read_lock:
+            db = self._read_db
+            if db is None:
+                return {}
+            rows = db.execute(
+                "SELECT e.tool, COUNT(*) FROM surfacing_feedback f "
+                "JOIN surfacing_events e ON f.surfacing_id = e.id "
+                "GROUP BY e.tool"
+            ).fetchall()
+            return {tool: count for tool, count in rows}

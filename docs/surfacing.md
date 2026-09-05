@@ -493,6 +493,8 @@ Surfacing tracks which memory IDs have already been shown so the same content do
 
 The in-memory set is **seeded from `seen_memories`** on startup so dedup survives restarts within the TTL, and every new surfacing writes to both layers via `FeedbackStore.mark_surfaced(ids)`.
 
+That write, like every other write to `stm_feedback.db`, runs on a dedicated worker thread rather than the event loop (#996). The file is shared with the proxy's own stores, `mms tune`, and any second STM process, and SQLite's write lock covers the whole file — so a write that meets one of those peers waits inside a blocking call for up to three seconds. Keeping it off the loop is what lets the other in-flight surfacing calls, and the daemon's request deadlines, keep running while it waits. Reads use a separate WAL connection and never queue behind a write. The visible consequence is ordering: fault counters, score-scale diagnostics and the hourly retention sweeps are queued when their branch runs and land shortly after the response, not before it.
+
 Negative-feedback demotion is local to STM. It filters only the current candidate
 set after LTM returns results and does not decrement access counts or mutate LTM
 rank. Counts are based on distinct surfacing events, so repeated feedback rows for

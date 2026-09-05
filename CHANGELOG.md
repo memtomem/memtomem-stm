@@ -219,6 +219,37 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **Feedback-store writes run on a worker thread instead of the event loop**
+  (#996). Every surfacing call writes a `surfacing_events` row and its
+  `seen_memories` dedup rows, and `stm_feedback.db` is shared with the proxy's
+  own stores, `mms tune`'s retention purge, and any second STM process. The
+  write lock is file-wide, so a write that met one of those peers spent up to
+  `busy_timeout` (3 s) inside a blocking call. On the loop that froze
+  everything: the other surfacing calls the daemon now admits concurrently
+  (#874), and the `asyncio.timeout_at` timers that exist to shed requests
+  whose clients have already given up — a latency spike came back as a wave of
+  late `expired` replies. `FeedbackStore` is now thread-safe (a writer
+  connection under the existing lock, a second WAL reader connection under its
+  own, both re-read inside the lock so a `close` cannot race a write), and the
+  engine hands its writes to a single dedicated worker: the event row, the
+  dedup rows and the feedback rows are awaited there, while fault counters,
+  score-scale diagnostics and the hourly retention sweeps are queued
+  fire-and-forget. In a burst of four concurrent surfacings against a held
+  database, the loop's longest stall drops from tens of seconds to under
+  150 ms.
+
+  **Behavior change**: durable telemetry now lands shortly *after* the
+  response rather than before it — a fault counter, diagnostic or retention
+  sweep is queued when the branch runs and written a moment later. A request
+  cancelled by its deadline mid-write still lands its event row, so a shed
+  request can leave a row for a manifest its client never received. The
+  surfacing timeout no longer covers the work after the LTM round trip
+  returns: a contended store write holds that one call (as it always did)
+  instead of being booked as an LTM timeout that charges the circuit breaker.
+  `FeedbackStore.close()` waits for an in-flight write, and
+  `record_fault` / `record_diagnostic` take the observation time from the
+  caller so a queued write cannot outrun the recovery that disproves it.
+
 - **The daemon files a warm-search latency sample only for a request that
   actually issued a search RPC to the LTM** (#994). `_run_admitted` decided
   whether a surfacing request was a sample from the terminal decision the

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import logging
 import math
 import time
 import uuid
+from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,6 +18,7 @@ from memtomem_stm.proxy.privacy import contains_sensitive_content
 from memtomem_stm.surfacing.cache import SurfacingCache
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.context_extractor import ContextExtractor
+from memtomem_stm.surfacing.feedback import record_feedback_batch
 from memtomem_stm.surfacing.feedback_store import DIAGNOSTIC_KINDS, FAULT_KINDS
 from memtomem_stm.surfacing.formatter import SurfacingFormatter
 from memtomem_stm.surfacing.mcp_client import (
@@ -26,6 +29,7 @@ from memtomem_stm.surfacing.mcp_client import (
 )
 from memtomem_stm.surfacing.observability import _NOOP_OBSERVABILITY, SurfacingObservability
 from memtomem_stm.surfacing.relevance import RateClaim, RelevanceGate
+from memtomem_stm.surfacing.store_io import run_off_loop, submit_store_write
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 from memtomem_stm.utils.digest import framed_digest
 from memtomem_stm.utils.keyed_locks import KeyedLocks
@@ -123,6 +127,50 @@ class _ScoreScaleStreak:
 
 class _DependencyFault(RuntimeError):
     """Internal signal: return passthrough but count the dependency failure."""
+
+
+def _noop_store_write() -> None:
+    """FIFO marker for :meth:`SurfacingEngine.drain_store_writes`."""
+
+
+def _persist_surfacing(tracker: Any, record_event: Any, delivered_ids: list[str]) -> None:
+    """Write both of a delivered surfacing's rows in one worker hop.
+
+    The event row first, then the cross-session dedup rows — and the dedup
+    write runs even when the event row raised, as it did when these were two
+    inline calls. The caller withdraws the feedback handle on that failure,
+    but the memories were still delivered and must still be deduped against
+    later sessions. A dedup failure stays a warning here: the caller's error
+    path is about the event ID it advertised, not about dedup.
+
+    One hop rather than two so the pair costs one queue wait, and so a
+    cancellation cannot land the event row without the dedup rows that keep
+    those memories from being surfaced again.
+    """
+    try:
+        record_event()
+    finally:
+        try:
+            tracker.store.mark_surfaced(delivered_ids)
+        except Exception:
+            logger.warning("Failed to persist seen memory IDs", exc_info=True)
+
+
+@dataclass
+class _TimerScope:
+    """Whether a surfacing call has passed the point its own timer guards.
+
+    :meth:`SurfacingEngine._run_within`'s timer exists to abort a hung LTM
+    round trip and book it against the breaker. Everything after the round
+    trip — rendering, and the feedback-store writes that now wait on a worker
+    thread — is not the LTM, and a contended store write must never be
+    reported as an LTM timeout that opens the breaker on a healthy core
+    (#996). The call flips ``past_ltm`` once it is out of that territory and
+    the timer stops firing; the caller's own backstop (the daemon deadline)
+    still bounds what is left.
+    """
+
+    past_ltm: bool = False
 
 
 class _OperationalSkip(RuntimeError):
@@ -374,6 +422,89 @@ class SurfacingEngine:
         result cache is empty (it only filters cache hits)."""
         return self._cache.clear()
 
+    def _submit_store_write(
+        self,
+        fn: Any,
+        *,
+        what: str,
+        on_success: Any = None,
+    ) -> None:
+        """Queue a best-effort feedback-store write on the shared worker.
+
+        For the durable telemetry no caller reads back: fault counters, the
+        score-scale diagnostics, the retention sweeps. Queued rather than
+        awaited, for two reasons. The response does not depend on the row, so
+        making an agent wait out a locked DB for a counter would spend the
+        thing that matters on the thing that does not. And an await is a
+        cancellation point that lands exactly on these failure branches, where
+        the in-memory bookkeeping beside the write (breaker, latches, claims)
+        has already run — a cancelled write there would lose its row while the
+        rest of the branch stands.
+
+        A failure that escapes the queued call logs at debug, matching what
+        these callers' own ``except`` blocks did inline; the sweeps that
+        logged a warning per failed statement still do so from inside the
+        call. *on_success* runs after a write that landed, on the worker
+        thread: the only place a caller may retire in-memory state the row has
+        taken ownership of. Keep it to atomic container operations.
+        """
+        try:
+            future = submit_store_write(fn)
+        except RuntimeError:
+            # Executor already shut down (interpreter teardown). Nothing
+            # durable to do, and this is best-effort telemetry.
+            logger.debug("Could not queue %s write", what, exc_info=True)
+            return
+
+        def _done(f: Future[Any]) -> None:
+            if f.cancelled():
+                return
+            exc = f.exception()
+            if exc is not None:
+                logger.debug("Failed to persist %s", what, exc_info=exc)
+                return
+            if on_success is not None:
+                on_success()
+
+        future.add_done_callback(_done)
+
+    async def _await_store_write(self, fn: Any, *args: Any) -> Any:
+        """Run a store write on the worker, keeping it once it is queued.
+
+        For the writes a caller acts on — the surfacing event row whose ID it
+        may have to withdraw, the feedback row whose result it returns. The
+        shield is load-bearing: by the time these run, in-memory state already
+        assumes the row exists (``_claim_surfaced_ids`` and the gate cooldown
+        for the event row), so letting a deadline cancel a queued write would
+        leave this process suppressing memories the client never received.
+        A cancellation still reaches the caller — only the write survives it.
+        """
+        future = asyncio.ensure_future(run_off_loop(fn, *args))
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            # Consume whatever it ends up doing so asyncio does not report an
+            # orphaned exception from a write nobody is waiting for any more.
+            future.add_done_callback(self._consume_abandoned_write)
+            raise
+
+    @staticmethod
+    def _consume_abandoned_write(future: asyncio.Future) -> None:
+        if future.cancelled():
+            return
+        exc = future.exception()
+        if exc is not None:
+            logger.debug("Abandoned feedback-store write failed: %s", exc)
+
+    async def drain_store_writes(self) -> None:
+        """Wait for every feedback-store write queued so far to finish.
+
+        The worker is a single FIFO thread, so a call that returns after this
+        one was queued proves its predecessors are done. Exists for tests and
+        for :meth:`stop`, which needs the rows on disk before the store closes.
+        """
+        await run_off_loop(_noop_store_write)
+
     def _persist_fault(self, server: str, tool: str, kind: str) -> None:
         """Best-effort durable counterpart to the in-memory fault counters.
 
@@ -399,17 +530,23 @@ class SurfacingEngine:
         # never landed is harmless — its recovery UPDATE matches nothing.
         if kind == "circuit_open":
             self._breaker_blocked_keys.add((server, tool))
-        try:
-            self._feedback_tracker.record_fault(server, tool, kind)
-        except Exception:
-            # The claim is kept even though the write failed. The two mistakes
-            # are not symmetric: a claim whose row never landed is inert — its
-            # recovery UPDATE matches nothing — while dropping a claim whose
-            # row DID land (a failed commit whose rollback also failed, then
-            # published by an unrelated later write) leaves that key's episode
-            # open until it happens to surface on its own. So this must not
-            # depend on the store's rollback succeeding.
-            logger.debug("Failed to persist surfacing fault counter", exc_info=True)
+        # The claim is kept whatever the write does. The two mistakes are not
+        # symmetric: a claim whose row never landed is inert — its recovery
+        # UPDATE matches nothing — while dropping a claim whose row DID land
+        # leaves that key's episode open until it happens to surface on its
+        # own. So this must not depend on the write succeeding, which is also
+        # why the queued write's failure is only logged.
+        #
+        # The observation time is taken HERE, not when the write runs: a
+        # recovery queued behind this one carries the timestamp of the round
+        # trip that disproved it, and a fault stamped later than that could no
+        # longer be closed by it (``record_fault``).
+        self._submit_store_write(
+            functools.partial(
+                self._feedback_tracker.record_fault, server, tool, kind, at=time.time()
+            ),
+            what="surfacing fault counter",
+        )
 
     def _persist_diagnostic(self, server: str, tool: str, kind: str) -> None:
         """Best-effort durable counter for advisory pipeline diagnostics.
@@ -422,10 +559,12 @@ class SurfacingEngine:
         """
         if self._feedback_tracker is None:
             return
-        try:
-            self._feedback_tracker.record_diagnostic(server, tool, kind)
-        except Exception:
-            logger.debug("Failed to persist surfacing diagnostic counter", exc_info=True)
+        self._submit_store_write(
+            functools.partial(
+                self._feedback_tracker.record_diagnostic, server, tool, kind, at=time.time()
+            ),
+            what="surfacing diagnostic counter",
+        )
 
     def _persist_diagnostic_recovery(self, server: str, tool: str, recovered_at: float) -> None:
         """Close both score-scale episodes for one key.
@@ -457,12 +596,16 @@ class SurfacingEngine:
         """
         if self._feedback_tracker is None:
             return
-        try:
-            self._feedback_tracker.record_diagnostic_recoveries(
-                server, tool, DIAGNOSTIC_KINDS, recovered_at=recovered_at
-            )
-        except Exception:
-            logger.debug("Failed to persist surfacing diagnostic recovery", exc_info=True)
+        self._submit_store_write(
+            functools.partial(
+                self._feedback_tracker.record_diagnostic_recoveries,
+                server,
+                tool,
+                DIAGNOSTIC_KINDS,
+                recovered_at=recovered_at,
+            ),
+            what="surfacing diagnostic recovery",
+        )
 
     def _persist_fault_recovery(self, server: str, tool: str, succeeded_at: float) -> None:
         """Close the durable fault episodes a successful round trip disproved.
@@ -494,6 +637,11 @@ class SurfacingEngine:
         UPDATE that matches nothing once the episode is closed, on a path that
         just paid a full LTM round trip, and a transient failure simply retries
         on the next success.
+
+        The claims are released against the SNAPSHOT this write carries, not
+        by clearing the set: the write lands on a worker thread while other
+        surfacing calls keep running, and a key blocked after it was queued
+        has no recovery row of its own yet.
         """
         if self._feedback_tracker is None:
             return
@@ -503,12 +651,14 @@ class SurfacingEngine:
             (blocked_server, blocked_tool, _CIRCUIT_OPEN_KIND)
             for blocked_server, blocked_tool in sorted(blocked)
         )
-        try:
-            self._feedback_tracker.record_fault_recoveries(entries, recovered_at=succeeded_at)
-        except Exception:
-            logger.debug("Failed to persist surfacing fault recovery", exc_info=True)
-            return
-        self._breaker_blocked_keys.clear()
+        released = frozenset(blocked | {(server, tool)})
+        self._submit_store_write(
+            functools.partial(
+                self._feedback_tracker.record_fault_recoveries, entries, recovered_at=succeeded_at
+            ),
+            what="surfacing fault recovery",
+            on_success=functools.partial(self._breaker_blocked_keys.difference_update, released),
+        )
 
     def _reset_score_scale_streak(self, server: str, tool: str) -> None:
         self._score_scale_streaks.pop((server, tool), None)
@@ -536,7 +686,7 @@ class SurfacingEngine:
             )
         return None, None
 
-    async def _run_within(self, coro: Any, timeout: float) -> Any:
+    async def _run_within(self, coro: Any, timeout: float, scope: _TimerScope) -> Any:
         """Run *coro* under *timeout*, turning an abort *this* call's timer
         started into :class:`asyncio.TimeoutError` (#720).
 
@@ -556,6 +706,12 @@ class SurfacingEngine:
         backstop, so it cannot be preempted even when a stall makes both come
         due on the same iteration — which is exactly how the backstop used to
         cancel :meth:`surface` from outside and skip the bookkeeping entirely.
+
+        *scope* is how the call says the timer's job is over: once the LTM
+        round trip has returned, an abort here would be booking STM's own
+        work — rendering, or a feedback-store write waiting out a peer
+        process — as an LTM timeout, and three of those open the breaker on a
+        core that answered every time (#996).
 
         The ``shield`` is what keeps that prompt: cancelling it wakes us
         immediately instead of after the cancelled LTM adapter has finished
@@ -577,8 +733,9 @@ class SurfacingEngine:
             # callback, so there is one loop batch where the operation has
             # finished but ``shielded`` has not caught up. Firing on the
             # wrapper alone would charge an LTM that answered inside its
-            # window.
-            if op.done() or shielded.done():
+            # window. ``past_ltm`` is the same judgment for work that comes
+            # after the round trip rather than after the whole call.
+            if scope.past_ltm or op.done() or shielded.done():
                 return
             timed_out = True
             # Only the wrapper: ``op`` keeps unwinding on its own time.
@@ -916,16 +1073,43 @@ class SurfacingEngine:
         digest = hashlib.sha256(query.encode("utf-8", errors="surrogatepass")).hexdigest()[:16]
         return f"{_QUERY_HASH_PREFIX}{digest}"
 
-    def _active_min_score(self, tool: str, *, adjust_auto_tuner: bool) -> float:
-        """Return the score floor currently used for surfacing decisions."""
+    def _active_min_score(self, tool: str) -> float:
+        """Return the score floor currently used for surfacing decisions.
+
+        Pure read. Moving the threshold is :meth:`_maybe_auto_tune`'s job,
+        which has to await a worker thread — the tuner reads four feedback
+        aggregates and may write one row, and that is not work to do on the
+        event loop while other calls are in flight (#996).
+        """
         tool_cfg = self._config.context_tools.get(tool)
         if tool_cfg is not None and tool_cfg.min_score is not None:
             return tool_cfg.min_score
         if self._auto_tuner is not None:
-            if adjust_auto_tuner:
-                self._auto_tuner.maybe_adjust(tool)
             return self._auto_tuner.get_effective_min_score(tool)
         return self._config.min_score
+
+    async def _maybe_auto_tune(self, tool: str) -> None:
+        """Let the AutoTuner re-read feedback and move ``min_score``, off-loop.
+
+        Skipped for a pinned tool: :meth:`_active_min_score` returns the pin
+        before consulting the tuner, so learning for that tool would move a
+        threshold nothing reads — the pre-existing "pinned tools don't learn"
+        behavior, kept explicit now that the call is no longer nested inside
+        the score lookup.
+
+        A failure here is not the caller's problem: the tuner reads feedback
+        aggregates on a database a peer process may hold, and a locked read
+        must leave surfacing on the current threshold, not fault the call.
+        """
+        if self._auto_tuner is None:
+            return
+        tool_cfg = self._config.context_tools.get(tool)
+        if tool_cfg is not None and tool_cfg.min_score is not None:
+            return
+        try:
+            await run_off_loop(self._auto_tuner.maybe_adjust, tool)
+        except Exception:
+            logger.debug("AutoTuner adjustment failed for %s", tool, exc_info=True)
 
     def _scale_gate_suspends(self, tool: str, score_scale: str | None) -> bool:
         """Return True when this batch's core-reported scale suspends the
@@ -1092,6 +1276,7 @@ class SurfacingEngine:
             return response_text
 
         effective_timeout = self._effective_timeout(deadline_monotonic)
+        scope = _TimerScope()
         try:
             if effective_timeout <= 0:
                 # Pre-timeout work (gate, query extraction, privacy scan)
@@ -1114,8 +1299,10 @@ class SurfacingEngine:
                     query,
                     rate_claim=rate_claim,
                     trace_id=trace_id,
+                    scope=scope,
                 ),
                 effective_timeout,
+                scope,
             )
             return result
         except asyncio.TimeoutError:
@@ -1170,7 +1357,9 @@ class SurfacingEngine:
         if self._feedback_tracker is None:
             return "Feedback tracking is not enabled."
 
-        result = self._feedback_tracker.record_feedback(surfacing_id, rating, memory_id)
+        result = await self._await_store_write(
+            self._feedback_tracker.record_feedback, surfacing_id, rating, memory_id
+        )
 
         if isinstance(result, str) and result.startswith("Error"):
             return result
@@ -1248,12 +1437,19 @@ class SurfacingEngine:
                 return f"Error: ratings[{i}] missing string `rating`."
             parsed.append((mid, rat))
 
+        # Every row in one worker hop, then the in-memory side effects on the
+        # loop. Recording moved off-loop wholesale (#996); doing it per entry
+        # would pay the queue wait N times and let a cancellation land a
+        # partial batch.
+        results = await self._await_store_write(
+            record_feedback_batch, self._feedback_tracker, surfacing_id, parsed
+        )
         recorded = 0
         errors: list[str] = []
         helpful_ids: list[str] = []
         seen_helpful: set[str] = set()
         for i, (mid, rat) in enumerate(parsed):
-            result = self._feedback_tracker.record_feedback(surfacing_id, rat, mid)
+            result = results[i]
             if isinstance(result, str) and result.startswith("Error"):
                 errors.append(f"ratings[{i}]: {result}")
                 continue
@@ -1365,7 +1561,7 @@ class SurfacingEngine:
             self._surfaced_ids[mid] = None
         _fifo_prune(self._surfaced_ids, self._surfaced_ids_max)
 
-    def _render_cached(
+    async def _render_cached(
         self,
         cached: list[Any],
         response_text: str,
@@ -1472,7 +1668,7 @@ class SurfacingEngine:
             cached,
             query,
             surfacing_id=advertised_id,
-            score_floor=self._active_min_score(tool, adjust_auto_tuner=False),
+            score_floor=self._active_min_score(tool),
         )
         delivered_ids = list(manifest.delivered_ids)
         delivered_set = set(delivered_ids)
@@ -1485,20 +1681,23 @@ class SurfacingEngine:
         if surfacing_id is not None:
             assert self._feedback_tracker is not None
             try:
-                self._feedback_tracker.record_surfacing(
-                    surfacing_id=surfacing_id,
-                    server=server,
-                    tool=tool,
-                    query=self._persistable_query(query),
-                    memory_ids=delivered_ids,
-                    scores=[
-                        r.score
-                        for r in cached
-                        if not getattr(r, "pinned", False) and str(r.chunk.id) in delivered_set
-                    ],
-                    # Cached entries keep the scale they were stamped with at
-                    # miss time, so the hit-path row carries it too.
-                    score_scale=self._result_score_scale(cached)[0],
+                await self._await_store_write(
+                    functools.partial(
+                        self._feedback_tracker.record_surfacing,
+                        surfacing_id=surfacing_id,
+                        server=server,
+                        tool=tool,
+                        query=self._persistable_query(query),
+                        memory_ids=delivered_ids,
+                        scores=[
+                            r.score
+                            for r in cached
+                            if not getattr(r, "pinned", False) and str(r.chunk.id) in delivered_set
+                        ],
+                        # Cached entries keep the scale they were stamped with
+                        # at miss time, so the hit-path row carries it too.
+                        score_scale=self._result_score_scale(cached)[0],
+                    )
                 )
             except Exception:
                 logger.warning("Failed to record cached surfacing event", exc_info=True)
@@ -1514,7 +1713,7 @@ class SurfacingEngine:
                         response_text,
                         cached,
                         query,
-                        score_floor=self._active_min_score(tool, adjust_auto_tuner=False),
+                        score_floor=self._active_min_score(tool),
                     )
         return manifest.text
 
@@ -1528,6 +1727,7 @@ class SurfacingEngine:
         *,
         rate_claim: RateClaim,
         trace_id: str | None = None,
+        scope: _TimerScope,
     ) -> str:
         # Check surfacing cache (keyed by server+tool+query). The full miss
         # path lives in ``_do_surface_miss``; this shell handles the
@@ -1540,8 +1740,11 @@ class SurfacingEngine:
         cached = self._cache.get(cache_key)
         if cached is not None:
             self._observability.record_cache("hit")
+            # A hit does no LTM work at all, so nothing from here on is the
+            # timer's business — including the event-row write it may await.
+            scope.past_ltm = True
             try:
-                return self._render_cached(cached, response_text, query, server, tool)
+                return await self._render_cached(cached, response_text, query, server, tool)
             finally:
                 # This caller claimed a rate slot before it knew the cache
                 # could answer. A hit starts no LTM work, so it is not an
@@ -1554,8 +1757,9 @@ class SurfacingEngine:
             cached = self._cache.get(cache_key)
             if cached is not None:
                 self._observability.record_cache("hit")
+                scope.past_ltm = True
                 try:
-                    return self._render_cached(cached, response_text, query, server, tool)
+                    return await self._render_cached(cached, response_text, query, server, tool)
                 finally:
                     self._gate.release_claim(rate_claim)
             self._observability.record_cache("miss")
@@ -1568,6 +1772,7 @@ class SurfacingEngine:
                 cache_key,
                 rate_claim=rate_claim,
                 trace_id=trace_id,
+                scope=scope,
             )
 
     async def _do_surface_miss(
@@ -1581,6 +1786,7 @@ class SurfacingEngine:
         *,
         rate_claim: RateClaim,
         trace_id: str | None = None,
+        scope: _TimerScope,
     ) -> str:
         """Admission for the one path that starts LTM work, then the work.
 
@@ -1629,6 +1835,7 @@ class SurfacingEngine:
             query,
             cache_key,
             trace_id=trace_id,
+            scope=scope,
         )
 
     async def _do_surface_miss_admitted(
@@ -1641,6 +1848,7 @@ class SurfacingEngine:
         cache_key: str,
         *,
         trace_id: str | None = None,
+        scope: _TimerScope,
     ) -> str:
         tool_cfg = self._config.context_tools.get(tool)
         max_results = (
@@ -1736,6 +1944,12 @@ class SurfacingEngine:
             self._reset_score_scale_streak(server, tool)
             raise
 
+        # The LTM has answered — well or badly, but it answered. Everything
+        # below is STM's own work, and the surfacing timer must stop being
+        # able to call it an LTM timeout (#996). What remains is still bounded
+        # by whatever backstop the caller brought.
+        scope.past_ltm = True
+
         # #295: branch on the adapter outcome before doing any further work
         # so the operator-facing skip label distinguishes "LTM unavailable"
         # (``no_session``/``transport_error``) from "LTM call raised"
@@ -1807,7 +2021,9 @@ class SurfacingEngine:
         # tool ``_active_min_score`` returns the pin before the tuner runs,
         # so the pre-existing "pinned tools don't learn" behavior holds.
         filter_suspended = self._scale_gate_suspends(tool, score_scale)
-        min_score = self._active_min_score(tool, adjust_auto_tuner=not filter_suspended)
+        if not filter_suspended:
+            await self._maybe_auto_tune(tool)
+        min_score = self._active_min_score(tool)
         self._observe_score_scale(
             server,
             tool,
@@ -2008,15 +2224,19 @@ class SurfacingEngine:
                 for r in relevant
                 if not getattr(r, "pinned", False) and str(r.chunk.id) in delivered_set
             ]
+            record_event = functools.partial(
+                self._feedback_tracker.record_surfacing,
+                surfacing_id=surfacing_id,
+                server=server,
+                tool=tool,
+                query=self._persistable_query(query),
+                memory_ids=delivered_ids,
+                scores=[r.score for r in delivered_results],
+                score_scale=score_scale,
+            )
             try:
-                self._feedback_tracker.record_surfacing(
-                    surfacing_id=surfacing_id,
-                    server=server,
-                    tool=tool,
-                    query=self._persistable_query(query),
-                    memory_ids=delivered_ids,
-                    scores=[r.score for r in delivered_results],
-                    score_scale=score_scale,
+                await self._await_store_write(
+                    _persist_surfacing, self._feedback_tracker, record_event, delivered_ids
                 )
             except Exception:
                 logger.warning("Failed to record surfacing event", exc_info=True)
@@ -2036,11 +2256,6 @@ class SurfacingEngine:
                         scratch_items=scratch_items,
                         score_floor=min_score,
                     )
-        if self._feedback_tracker is not None:
-            try:
-                self._feedback_tracker.store.mark_surfaced(delivered_ids)
-            except Exception:
-                logger.warning("Failed to persist seen memory IDs", exc_info=True)
 
         self._observability.record_outcome(tool, "surfaced_cache_miss")
 
@@ -2098,6 +2313,16 @@ class SurfacingEngine:
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
         self._background_tasks.clear()
+
+        try:
+            # Bounded, and bounded by the same budget as the abandoned ops: the
+            # queued rows should land before the tracker closes the store, but
+            # a peer process holding the DB must not hold shutdown open. What
+            # is still queued after this runs against a closing store and
+            # degrades to the store's documented no-op.
+            await asyncio.wait_for(self.drain_store_writes(), timeout=_ABANDONED_DRAIN_SECONDS)
+        except (asyncio.TimeoutError, RuntimeError):
+            logger.debug("Feedback-store writes still draining at stop", exc_info=True)
 
         stragglers = {task for task in self._abandoned_ops if not task.done()}
         if stragglers:
@@ -2170,7 +2395,24 @@ class SurfacingEngine:
         if now - self._last_cleanup < self._cleanup_interval:
             return
         self._last_cleanup = now
-        store = self._feedback_tracker.store
+        self._submit_store_write(
+            functools.partial(
+                self._run_store_maintenance,
+                self._feedback_tracker.store,
+                dedup_ttl,
+                retention_days,
+            ),
+            what="surfacing store maintenance",
+        )
+
+    def _run_store_maintenance(self, store: Any, dedup_ttl: float, retention_days: float) -> None:
+        """The periodic sweeps themselves, run on the feedback-I/O worker.
+
+        Queued rather than run inline: these are the store's widest writes
+        (two DELETEs and an UPDATE over aged rows), they fire from
+        :meth:`surface` before the call's own budget is even computed, and
+        nothing in the response depends on them.
+        """
         if dedup_ttl > 0:
             try:
                 deleted = store.cleanup_expired(dedup_ttl)
