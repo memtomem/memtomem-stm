@@ -13,6 +13,35 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- **The advertisement forwards an upstream tool's top-level `title` and its
+  `icons`** (#895). MCP models a tool's display name in two places — the
+  top-level `Tool.title` (`BaseMetadata`, revision 2025-06-18) and
+  `annotations.title` — and its icon list in `Tool.icons` (SEP-973, revision
+  2025-11-25). The proxy carried only `annotations.title`, so a picker showing
+  an upstream that populates the top-level field rendered the bare prefixed
+  name (`playwright__browser_close`) and no icon. Both now reach the client.
+  The `[{server}]` attribution tag applies to the top-level title too, not
+  only to `annotations.title`: MCP ranks the top-level field ABOVE the
+  annotation for display, so tagging one and not the other would have put the
+  unattributed picker label back for every tool that sets both. Icons are
+  forwarded verbatim — they carry no prose to budget, and their `src` is a URL
+  the client resolves itself. A tool whose upstream sets neither produces
+  exactly the previous registration call. Both fields join the advertisement
+  credential scan in the same change (#894/#930): a credential in a title
+  reaches the client's context on every `tools/list` exactly as one in a
+  description does, and an icon `src` can carry one in a query string or a
+  `data:` payload. The title is scanned in the tagged form registration sends,
+  so a tool that set no title is still not rejected for a credential-shaped
+  server name. `Tool.execution` remains deliberately unforwarded (#892) — the
+  proxy's call path is synchronous-only.
+
+  **Behavior change**: a proxied tool whose upstream sets a top-level `title`
+  now displays as `[{server}] {title}` in MCP pickers instead of its prefixed
+  name, and its icons appear where a client renders them. Under the `strict`
+  exposure profile, a tool with a credential-shaped title or icon URL is now
+  withheld (`sensitive_metadata`) rather than advertised; under `review` it is
+  demoted.
+
 - **The embedding relevance scorer now holds a bounded cache of the embeddings
   it has already fetched** (#873), sized by the new
   `relevance_scorer.embedding_cache_size` (default `256`, `0` disables it).

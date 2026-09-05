@@ -160,7 +160,7 @@ from memtomem_stm.proxy.config import (
 )
 from memtomem_stm.proxy.metrics import ErrorCategory
 from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS, contains_sensitive_content
-from memtomem_stm.proxy.tool_metadata import tag_annotations_title
+from memtomem_stm.proxy.tool_metadata import tag_annotations_title, tag_title
 from memtomem_stm.proxy.toolgraph_provider import ToolgraphProtocolError
 from memtomem_stm.utils.numeric import finite_number
 
@@ -464,18 +464,22 @@ def _flags_sensitive_metadata(candidate: ExposureCandidate) -> bool:
     - the raw input schema — distillation only ever *removes* content;
     - ``output_schema`` and ``meta`` (advertised as ``_meta``), forwarded
       with no truncation or distillation at all;
-    - ``annotations`` as REGISTRATION WILL SEND THEM, i.e. through
-      :func:`tag_annotations_title`, the same function the registration
-      path calls. That tagging prepends ``info.server`` to a non-empty
-      ``title``, so the untagged value plus an unconditional server scan is
-      not equivalent: it rejects a clean, annotation-less tool whose server
-      name merely looks credential-shaped, since nothing would have carried
-      that name to the client (codex R2). Calling the shared function is
-      also the only form that cannot drift from what registration does.
+    - ``annotations`` and the top-level ``title`` as REGISTRATION WILL SEND
+      THEM, i.e. through :func:`tag_annotations_title` / :func:`tag_title`,
+      the same functions the registration path calls. That tagging prepends
+      ``info.server`` to a non-empty title, so the untagged value plus an
+      unconditional server scan is not equivalent: it rejects a clean,
+      title-less tool whose server name merely looks credential-shaped,
+      since nothing would have carried that name to the client (codex R2).
+      Calling the shared functions is also the only form that cannot drift
+      from what registration does;
+    - ``icons``, forwarded verbatim (#895) — an ``Icon`` is mostly a ``src``
+      URL, and a query string or a ``data:`` payload is as much a place to
+      park a credential as any description.
 
-    ``title``, ``icons`` and ``execution`` are deliberately absent: the
-    proxy forwards none of them today (#892, #895). Add them here in the
-    same breath as any change that starts forwarding them.
+    ``execution`` is deliberately absent: the proxy does not forward it
+    (#892). Add it here in the same breath as any change that starts
+    forwarding it.
 
     Every text is scanned SEPARATELY. Scanning one joined blob let a
     pattern bridge a field boundary: the credential labels admit whitespace
@@ -503,13 +507,35 @@ def _flags_sensitive_metadata(candidate: ExposureCandidate) -> bool:
     texts = [candidate.raw_description, info.description, info.prefixed_name]
     try:
         tagged_annotations = tag_annotations_title(info.annotations, info.server)
+        # Only when the upstream supplied one: registration passes no
+        # ``title`` otherwise, so an absent title carries no server name to
+        # the client and scanning one here would reject on text nobody sees.
+        raw_title = info.title
+        tagged_title = tag_title(raw_title, info.server) if isinstance(raw_title, str) else None
     except Exception:
         return True
+    if tagged_title:
+        texts.append(tagged_title)
+    raw_icons = info.icons
+    if raw_icons is None:
+        icon_values: tuple[Any, ...] = ()
+    elif isinstance(raw_icons, (list, tuple)):
+        # Element-wise, because :func:`_scan_texts` refuses to serialize a
+        # pydantic model NESTED in a container on purpose (codex R4) and an
+        # ``Icon`` list is exactly that shape — handed over whole, every
+        # icon-bearing tool would fail closed and be withheld under strict.
+        # Each icon is a field-level value :func:`_plain` renders through
+        # ``model_dump``, so the fail-closed rule still covers anything
+        # nested INSIDE one icon.
+        icon_values = tuple(raw_icons)
+    else:
+        icon_values = (raw_icons,)
     for value in (
         candidate.raw_schema or {},
         tagged_annotations,
         info.output_schema,
         info.meta,
+        *icon_values,
     ):
         rendered = _scan_texts(value)
         if rendered is None:

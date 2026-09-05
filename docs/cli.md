@@ -1176,7 +1176,7 @@ Eight observability/admin tools are hidden unless
 
 Plus all proxied tools named `{prefix}__{original_tool_name}` (e.g. `fs__read_file`, `gh__search_repositories`).
 
-Proxied tool **titles** — the `annotations.title` field rendered by MCP tool-pickers (e.g. Claude Code's `/mcp`) — are automatically prefixed with `[{server}]` for attribution: a `filesystem` server's `Read file` tool appears as `[filesystem] Read file`. This is separate from the `{prefix}__{tool}` name used when calling the tool, and it kicks in only when the upstream tool already provides an `annotations.title`; tools without one are unaffected.
+Proxied tool **titles** — the fields MCP tool-pickers (e.g. Claude Code's `/mcp`) render in place of the name, namely the top-level `title` and `annotations.title` — are automatically prefixed with `[{server}]` for attribution: a `filesystem` server's `Read file` tool appears as `[filesystem] Read file`. Both are tagged, because a client that has both displays the top-level one first. This is separate from the `{prefix}__{tool}` name used when calling the tool, and it kicks in only where the upstream tool already provides a title; tools without one are unaffected and fall back to the prefixed name. Tool `icons` are forwarded exactly as the upstream sent them.
 
 A typical agent session uses a mix of proxied tools and STM-specific control tools:
 

@@ -89,6 +89,8 @@ def _cand(
     annotations: Any = None,
     output_schema: Any = None,
     meta: Any = None,
+    title: Any = None,
+    icons: Any = None,
 ) -> ExposureCandidate:
     schema = schema if schema is not None else {"type": "object"}
     return ExposureCandidate(
@@ -101,6 +103,8 @@ def _cand(
             annotations=annotations,
             output_schema=output_schema,
             meta=meta,
+            title=title,
+            icons=icons,
         ),
         raw_description=raw_desc if raw_desc is not None else desc,
         raw_schema=schema,
@@ -351,6 +355,61 @@ class TestSensitiveEnvelopeMetadata:
         result = filter_tools(
             [_cand("a", _server_cfg(), meta={"build": {"deploy_key": self.CRED}})], STRICT
         )
+        assert result.eligible == []
+        assert result.reject_reasons == {"test__a": REASON_SENSITIVE_METADATA}
+
+    def test_credential_in_the_top_level_title_rejected_under_strict(self):
+        # MCP ranks ``Tool.title`` above ``annotations.title`` for display,
+        # so it is the string most pickers actually render (#895).
+        cand = _cand("a", _server_cfg(), title=f"Deploy {self.CRED}")
+        result = filter_tools([cand], STRICT)
+        assert result.eligible == []
+        assert result.reject_reasons == {"test__a": REASON_SENSITIVE_METADATA}
+
+    def test_credential_in_an_icon_src_rejected_under_strict(self):
+        from mcp.types import Icon
+
+        cand = _cand(
+            "a",
+            _server_cfg(),
+            icons=[Icon(src=f"https://cdn.example.test/i.svg?token={self.CRED}")],
+        )
+        result = filter_tools([cand], STRICT)
+        assert result.eligible == []
+        assert result.reject_reasons == {"test__a": REASON_SENSITIVE_METADATA}
+
+    def test_a_clean_icon_list_does_not_fail_closed(self):
+        # An ``Icon`` list is pydantic models inside a container, the one
+        # shape the scan's serializer refuses on purpose. Scanned whole it
+        # would flag EVERY icon-bearing tool, withholding clean tools under
+        # strict — a false reject the operator would read as a compromised
+        # upstream.
+        from mcp.types import Icon
+
+        cand = _cand(
+            "a",
+            _server_cfg(),
+            icons=[Icon(src="https://cdn.example.test/icon.svg", mime_type="image/svg+xml")],
+        )
+        result = filter_tools([cand], STRICT)
+        assert _names(result) == ["test__a"]
+        assert result.reject_reasons == {}
+
+    def test_a_title_less_tool_is_not_rejected_for_its_server_name(self):
+        # The server name reaches the client only through a title the
+        # upstream actually set. Scanning it unconditionally would reject a
+        # clean tool for text nobody would have seen (codex R2, #930).
+        cand = _cand("a", _server_cfg(), server=f"srv-{self.CRED}", title=None)
+        result = filter_tools([cand], STRICT)
+        assert _names(result) == ["test__a"]
+        assert result.reject_reasons == {}
+
+    def test_credential_in_the_server_name_of_a_titled_tool_is_rejected(self):
+        # The mirror of the case above: once the upstream sets a title, the
+        # tag carries the server name into the advertisement, so it is in
+        # scope exactly as it is for a titled ``annotations`` block.
+        cand = _cand("a", _server_cfg(), server=f"srv-{self.CRED}", title="Deploy")
+        result = filter_tools([cand], STRICT)
         assert result.eligible == []
         assert result.reject_reasons == {"test__a": REASON_SENSITIVE_METADATA}
 

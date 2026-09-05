@@ -1,7 +1,8 @@
 """Unit tests for the MCPServer compatibility layer.
 
-Focused on the ``tag_annotations_title`` helper that prepends a ``[server]``
-scope tag to ``ToolAnnotations.title`` for ``/mcp`` picker disambiguation.
+Focused on the ``[server]`` scope tag the proxy puts on the titles an MCP
+picker renders — ``ToolAnnotations.title`` and the top-level ``Tool.title``
+— and on the display metadata registration forwards alongside them.
 """
 
 from __future__ import annotations
@@ -9,9 +10,9 @@ from __future__ import annotations
 # CallToolResult is module-level so the ``-> CallToolResult`` string
 # annotation on test handlers resolves in this module's globals when
 # the SDK's func_metadata eval's it.
-from mcp.types import CallToolResult, TextContent, ToolAnnotations
+from mcp.types import CallToolResult, Icon, TextContent, ToolAnnotations
 
-from memtomem_stm.proxy.tool_metadata import tag_annotations_title
+from memtomem_stm.proxy.tool_metadata import tag_annotations_title, tag_title
 
 
 def test_tag_title_prepends_server_when_title_present() -> None:
@@ -71,6 +72,18 @@ def test_tag_title_falls_back_to_original_when_model_copy_raises() -> None:
     broken = _BrokenCopy()
     tagged = tag_annotations_title(broken, "playwright")
     assert tagged is broken
+
+
+def test_tag_title_tags_a_top_level_title() -> None:
+    assert tag_title("Close browser", "playwright") == "[playwright] Close browser"
+
+
+def test_tag_title_passes_an_absent_or_empty_title_through() -> None:
+    # A client with no title falls back to the already-prefixed name, so
+    # there is nothing to attribute — and inventing one would put a display
+    # string in front of the user that the upstream never supplied.
+    assert tag_title(None, "playwright") is None
+    assert tag_title("", "playwright") == ""
 
 
 def test_register_proxy_tool_degrades_when_schema_fields_renamed(caplog) -> None:
@@ -235,6 +248,63 @@ def test_register_passes_meta_kwarg_only_when_set() -> None:
     assert "meta" not in server.add_tool.call_args.kwargs  # pre-envelope exact call
 
 
+def test_register_passes_title_and_icons_only_when_set() -> None:
+    from types import SimpleNamespace
+
+    base = dict(
+        prefixed_name="srv_tool",
+        description="desc",
+        annotations=None,
+        server="srv",
+        input_schema={"type": "object"},
+        output_schema=None,
+        meta=None,
+    )
+    icons = [Icon(src="https://example.test/tool.svg")]
+    server, _ = _register(SimpleNamespace(**base, title="Close browser", icons=icons))
+    kwargs = server.add_tool.call_args.kwargs
+    # Tagged here, not upstream: MCP ranks the top-level title ABOVE
+    # ``annotations.title`` for display, so an untagged one would put the
+    # unattributed picker label back for tools that set both.
+    assert kwargs["title"] == "[srv] Close browser"
+    assert kwargs["icons"] == icons
+
+    server, _ = _register(SimpleNamespace(**base, title=None, icons=None))
+    assert "title" not in server.add_tool.call_args.kwargs  # pre-#895 exact call
+    assert "icons" not in server.add_tool.call_args.kwargs
+
+    # An upstream that sets an empty title or an empty icon list has supplied
+    # no display metadata; forwarding ``[srv] `` or ``[]`` would advertise a
+    # value where the client should fall back to the prefixed name.
+    server, _ = _register(SimpleNamespace(**base, title="", icons=[]))
+    assert "title" not in server.add_tool.call_args.kwargs
+    assert "icons" not in server.add_tool.call_args.kwargs
+
+
+def test_register_ignores_display_metadata_of_the_wrong_type() -> None:
+    # The stand-ins this shim must survive answer every attribute (MagicMock
+    # infos in the degradation tests), so a non-str title / non-list icons
+    # must not become an ``add_tool`` value the SDK would reject.
+    from unittest.mock import MagicMock
+
+    from types import SimpleNamespace
+
+    info = SimpleNamespace(
+        prefixed_name="srv_tool",
+        description="desc",
+        annotations=None,
+        server="srv",
+        input_schema={"type": "object"},
+        output_schema=None,
+        meta=None,
+        title=MagicMock(),
+        icons=MagicMock(),
+    )
+    server, _ = _register(info)
+    assert "title" not in server.add_tool.call_args.kwargs
+    assert "icons" not in server.add_tool.call_args.kwargs
+
+
 def test_register_carries_output_schema_on_fn_metadata() -> None:
     from types import SimpleNamespace
 
@@ -280,6 +350,8 @@ async def test_real_fastmcp_advertises_output_schema_and_meta() -> None:
     async def handler(**kwargs: object) -> CallToolResult:
         raise NotImplementedError
 
+    icons = [Icon(src="https://example.test/tool.svg", mime_type="image/svg+xml")]
+
     server = MCPServer("test")
     register_proxy_tool(
         server,
@@ -292,12 +364,16 @@ async def test_real_fastmcp_advertises_output_schema_and_meta() -> None:
             original_name="tool",
             output_schema=schema,
             meta=meta,
+            title="Close browser",
+            icons=icons,
         ),
     )
     tools = await server.list_tools()
     (tool,) = [t for t in tools if t.name == "srv__tool"]
     assert tool.output_schema == schema
     assert tool.meta == meta
+    assert tool.title == "[srv] Close browser"
+    assert tool.icons == icons
 
 
 def test_proxy_tool_info_has_no_execution_field() -> None:
@@ -372,6 +448,8 @@ async def test_proxy_tool_round_trips_over_the_wire() -> None:
             original_name="tool",
             output_schema=output_schema,
             meta={"origin": "upstream"},
+            title="Search docs",
+            icons=[Icon(src="https://example.test/search.png")],
         ),
     )
 
@@ -382,6 +460,10 @@ async def test_proxy_tool_round_trips_over_the_wire() -> None:
             (tool,) = [t for t in listed.tools if t.name == "srv__tool"]
             assert tool.input_schema == input_schema
             assert tool.output_schema == output_schema
+            # Display metadata survives a real client's own model validation
+            # (#895) — an attribute-level assertion cannot show that.
+            assert tool.title == "[srv] Search docs"
+            assert [icon.src for icon in tool.icons or []] == ["https://example.test/search.png"]
 
             result = await session.call_tool(
                 "srv__tool", {"query": "hello", "opts": {"nested": [1, 2]}}
