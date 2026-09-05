@@ -244,7 +244,11 @@ class CallLedger:
 
     @property
     def faulted(self) -> bool:
-        """Did this call end on a degraded-dependency terminal?
+        """Did this call end on a fault rather than on a healthy terminal?
+
+        Mostly a degraded dependency, but not only: ``error_other`` is the
+        engine's catch-all for an unexpected internal exception, so a consumer
+        naming this population must not promise the LTM was at fault.
 
         Read together with :attr:`retrieval_attempted` by a caller bucketing a
         duration: an RPC that went out and then failed mid-flight is a real

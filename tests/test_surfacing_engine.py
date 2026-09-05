@@ -1544,6 +1544,35 @@ class TestLedgerRpcMark:
             await adapter._rpc(session, 1, "mem_search", {"query": "q"})
         assert searched.retrieval_attempted is True
 
+    async def test_the_public_compose_path_marks(self):
+        # The predicate test above calls ``_rpc`` directly. This drives the
+        # path a capable core actually takes -- ``context_compose()`` ->
+        # ``_call_mem_do()`` -> ``_rpc()`` -- so a refactor that stopped
+        # routing compose through ``_rpc``, or that changed the action name the
+        # predicate matches on, fails here rather than silently dropping every
+        # compose-route request out of the percentiles.
+        from memtomem_stm.surfacing.mcp_client import LtmCapabilities, McpClientSearchAdapter
+        from memtomem_stm.surfacing.observability import attribute_call
+
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="structured"))
+        session = AsyncMock()
+        bundle = MagicMock()
+        bundle.type = "text"
+        bundle.text = '{"pinned": [], "retrieved": [], "warnings": []}'
+        result = MagicMock()
+        result.content = [bundle]
+        session.call_tool = AsyncMock(return_value=result)
+        adapter._session = session
+        adapter._capabilities = LtmCapabilities(context_compose_schema=2)
+
+        with attribute_call() as ledger:
+            await adapter.context_compose("q", max_chars=1000, top_k=4)
+
+        sent = session.call_tool.await_args.args
+        assert sent[0] == "mem_do"
+        assert sent[1]["action"] == "context_compose"
+        assert ledger.retrieval_attempted is True
+
     async def test_a_round_trip_that_times_out_is_still_marked(self):
         # The positive control for the two negatives above: the same
         # ``error_timeout`` terminal, but this time a request did go out and

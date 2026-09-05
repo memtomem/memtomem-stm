@@ -614,8 +614,13 @@ def status_cmd(as_json: bool) -> None:
             # line on is also printed on it -- a line switched on by an
             # observation it does not show is worse than no line, since it
             # reads as a positive report that nothing happened.
+            # A counter the snapshot does not carry is unmeasured, not zero:
+            # a daemon built before #994 has no ``pre_rpc_faults`` at all, and
+            # printing 0 there would report an absence as a clean bill of
+            # health.
             summary = "surface latency: " + " ".join(
-                f"{label}={surface.get(key, 0)}" for key, label in _SURFACE_COUNTERS
+                f"{label}={surface[key]}" if key in surface else f"{label}=?"
+                for key, label in _SURFACE_COUNTERS
             )
             if surface.get("samples"):
                 summary += (

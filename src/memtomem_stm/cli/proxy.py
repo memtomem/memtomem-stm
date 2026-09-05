@@ -9551,6 +9551,21 @@ def doctor(
                         value = summary.get("recommendation")
                         return value if isinstance(value, dict) else None
 
+                    def _predates_outcome_counters(summary: Any) -> bool:
+                        """Is this snapshot from a daemon built before #994?
+
+                        ``pre_rpc_faults`` is the key that change added, so its
+                        absence dates the running daemon rather than describing
+                        it. That matters twice over: the counter cannot be read
+                        as zero (absent means unmeasured, not none), and such a
+                        daemon files a failed round trip as a *successful*
+                        duration, so its ``samples`` and the recommendation
+                        derived from them are polluted by exactly what #994
+                        removed. Neither can be repaired from this side -- the
+                        daemon has to be restarted onto the new build.
+                        """
+                        return not (isinstance(summary, dict) and "pre_rpc_faults" in summary)
+
                     def _failure_breakdown(summary: Any) -> dict[str, int]:
                         """Per-counter observations that were not a completed warm search.
 
@@ -9660,7 +9675,21 @@ def doctor(
                     # thousand successes and one failure).
                     breakdown = _failure_breakdown(surface_summary)
                     failures = sum(breakdown.values())
-                    if failures:
+                    if _predates_outcome_counters(surface_summary):
+                        # Neither verdict below can be honest about this
+                        # snapshot: the failure counters are partly absent, and
+                        # the successes it does report include the failed round
+                        # trips #994 stopped counting as successes.
+                        check(
+                            "surfacing_outcomes",
+                            "surfacing outcomes",
+                            "WARN",
+                            "the running daemon predates the surfacing outcome counters; "
+                            "its failures are unreported and its timeout recommendation is "
+                            "derived from durations that include failed searches",
+                            "mms daemon restart",
+                        )
+                    elif failures:
                         # Neutral about the cause on purpose: this population
                         # mixes a dependency that erred or timed out with a
                         # request the daemon shed before touching the LTM at
@@ -9673,7 +9702,7 @@ def doctor(
                             "WARN",
                             f"{failures} surfacing request(s) since start did not complete a "
                             f"warm LTM search ({breakdown['timeout_samples']} timed out, "
-                            f"{breakdown['error_samples']} failed mid-search, "
+                            f"{breakdown['error_samples']} faulted after issuing one, "
                             f"{breakdown['pre_rpc_faults']} never issued one)",
                             "mms daemon status",
                         )

@@ -501,6 +501,57 @@ async def test_a_pre_rpc_fault_is_counted_even_though_it_is_not_sampled(
     assert after_gate["pre_rpc_faults"] == 1  # unchanged by the healthy skip
 
 
+async def test_a_cold_failure_is_filed_as_a_failure_not_as_cold(tmp_path: Path) -> None:
+    # ``cold`` used to win over every other classification, so a request that
+    # connected, issued its search and then failed landed in ``cold_samples``
+    # beside the cold *successes*. Every reader treats that bucket as "still
+    # warming up", so a daemon failing on every request read as one starting
+    # up -- and `mms doctor` discards the bucket outright, so it reported no
+    # failures at all. Nothing is lost by demoting cold: only a success files
+    # a duration, which is the whole reason the bucket exists.
+    server = DaemonServer(_config(tmp_path))
+    server._ltm_warmth = lambda: "cold"  # type: ignore[method-assign]
+    obs = SurfacingObservability()
+
+    async def cold_and_faulted() -> dict[str, object]:
+        record_search_rpc()
+        obs.record_skip("Read", "ltm_unavailable")
+        return surface_response({})
+
+    async def cold_and_timed_out() -> dict[str, object]:
+        record_search_rpc()
+        obs.record_outcome("Read", "error_timeout")
+        return surface_response({})
+
+    async def cold_and_fine() -> dict[str, object]:
+        # The control: a cold call that worked is still ``cold``. Its duration
+        # includes the cold start, so it must stay out of the percentiles.
+        record_search_rpc()
+        obs.record_outcome("Read", "surfaced_cache_miss")
+        return surface_response({})
+
+    async def run(operation) -> dict[str, object]:
+        await server._run_admitted(
+            {"deadline_monotonic": asyncio.get_running_loop().time() + 1.0},
+            operation,
+            latency_kind="surface",
+            attribute=True,
+        )
+        return server._latency.snapshot()["surface"]
+
+    after_fault = await run(cold_and_faulted)
+    assert after_fault["error_samples"] == 1
+    assert after_fault["cold_samples"] == 0
+
+    after_timeout = await run(cold_and_timed_out)
+    assert after_timeout["timeout_samples"] == 1
+    assert after_timeout["cold_samples"] == 0
+
+    after_success = await run(cold_and_fine)
+    assert after_success["cold_samples"] == 1
+    assert after_success["samples"] == 0  # not a warm duration
+
+
 async def test_gate_skip_is_not_a_latency_sample(tmp_path: Path) -> None:
     # A call the gate rejected never reached the LTM, so its near-zero duration
     # is not a measurement of a warm search. Filed as a sample it would drag the

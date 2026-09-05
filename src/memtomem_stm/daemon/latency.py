@@ -108,10 +108,13 @@ class _Series:
     # for the two. Healthy pre-RPC skips (allowlist, gate, cache) are not
     # counted; they are the overwhelming majority and would bury the signal.
     #
-    # Only the ``surface`` series can move: the raw LTM ops run without a
-    # ledger (``attribute=False``) and their operation *is* the round trip, so
-    # they have no pre-RPC stage to report. The key is present on both series
-    # so the snapshot shape stays uniform for a JSON consumer.
+    # Only the ``surface`` series can move today: the raw LTM ops are admitted
+    # with ``attribute=False`` and so open no ledger for the daemon to read a
+    # fault from. They are not immune to the stage -- a raw search whose
+    # healing fails returns ``no_session`` before any RPC too -- they are
+    # simply not attributed, and wiring that up is the change that would make
+    # this field move for ``retrieval``. The key is emitted on both series
+    # regardless, so the snapshot shape stays uniform for a JSON consumer.
     pre_rpc_faults: int = 0
 
     def record_pre_rpc_fault(self) -> None:

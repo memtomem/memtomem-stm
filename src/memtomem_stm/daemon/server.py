@@ -861,12 +861,20 @@ class DaemonServer:
             if latency_kind is not None and activity_observed:
                 elapsed_ms = (time.monotonic() - started) * 1000.0
                 self_timed_out = ledger is not None and ledger.timed_out
-                if not warm_at_start:
-                    outcome: LatencyOutcome = "cold"
-                elif self_timed_out:
-                    # Same precedence as the `asyncio.TimeoutError` branch below,
-                    # which this replaces for surfacing: cold first, then timeout.
-                    outcome = "timeout"
+                # How the call ended decides first; whether the LTM was warm
+                # only decides what to do with a call that ended *well*.
+                #
+                # ``cold`` used to come first, which merged three populations
+                # into one bucket -- cold successes, cold timeouts and cold
+                # faults -- and every consumer that reads ``cold_samples`` as
+                # "still warming up" then read a failing daemon as a starting
+                # one. Nothing is lost by demoting it: only a ``success``
+                # files a duration, so the whole reason ``cold`` exists (a
+                # cold-start duration must not reach percentiles that answer
+                # how long a *warm* search takes) is untouched by classifying
+                # a cold failure as the failure it is.
+                if self_timed_out:
+                    outcome: LatencyOutcome = "timeout"
                 elif ledger is not None and ledger.faulted:
                     # A round trip that went out and then failed — the LTM
                     # dropped the connection mid-flight, raised, or answered
@@ -883,19 +891,22 @@ class DaemonServer:
                     and response.get("outcome") not in (None, "ok", "empty_results")
                 ):
                     outcome = "error"
+                elif not warm_at_start:
+                    outcome = "cold"
                 else:
                     outcome = "success"
                 self._latency.record(latency_kind, elapsed_ms, outcome)
             return response
         except asyncio.TimeoutError:
             if latency_kind is not None:
-                outcome = "timeout" if warm_at_start else "cold"
-                self._latency.record(latency_kind, (time.monotonic() - started) * 1000.0, outcome)
+                # Same precedence as the branch above: a request that ran out
+                # of deadline did so whether or not the LTM was warm, and
+                # filing it as ``cold`` hid it from every failure reader.
+                self._latency.record(latency_kind, (time.monotonic() - started) * 1000.0, "timeout")
             return {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
         except Exception:
             if latency_kind is not None:
-                outcome = "error" if warm_at_start else "cold"
-                self._latency.record(latency_kind, (time.monotonic() - started) * 1000.0, outcome)
+                self._latency.record(latency_kind, (time.monotonic() - started) * 1000.0, "error")
             logger.debug("daemon LTM operation failed", exc_info=True)
             return {"v": PROTOCOL_VERSION, "ok": False, "status": "unavailable"}
         finally:

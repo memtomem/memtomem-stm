@@ -1367,8 +1367,10 @@ class TestDaemonStatusCli:
 
         assert text.exit_code == 0, text.output
         assert "samples=3" in text.output
-        assert "errors=0" in text.output
-        assert "pre_rpc_faults=0" in text.output
+        # Absent is not zero: this daemon does not report those counters at
+        # all, and printing 0 would read as "measured, and there were none".
+        assert "errors=?" in text.output
+        assert "pre_rpc_faults=?" in text.output
         assert "p50=300ms" in text.output
 
     def test_unreadable_handshake_is_stale_not_stopped(

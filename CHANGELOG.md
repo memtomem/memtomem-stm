@@ -227,10 +227,12 @@ changes inline only. See the deprecation policy in
   also recorded on paths where nothing was sent: `error_timeout` when the gate,
   query extraction and privacy scan consumed the caller's whole window (#720),
   and `ltm_unavailable` when session healing failed and the adapter answered
-  `no_session`. Each still spent the caller's budget, but the duration measures
-  STM pre-work and queue wait, and it landed in the series
-  `hook.daemon_timeout_seconds` advice is derived from -- a stretch of failed
-  healing inflated the recommendation with numbers about the wrong component.
+  `no_session`. Each still spent the caller's budget, but none of that elapsed
+  time is a warm search: it is STM pre-work, queue wait, and -- when healing is
+  what failed -- adapter startup, reconnect and capability negotiation. It
+  landed in the series `hook.daemon_timeout_seconds` advice is derived from, so
+  a stretch of failed healing inflated the recommendation with numbers about
+  the wrong component.
   The adapter now marks the request's `CallLedger` at the point the RPC is
   handed to the transport (`McpClientSearchAdapter._rpc`, after healing), and
   `retrieval_attempted` reads that mark instead of inferring it; the two sets
@@ -293,6 +295,16 @@ changes inline only. See the deprecation policy in
   (`no_results_invalidated`, `no_results_empty_cache`) issue no RPC and were
   never samples at all.
 
+  **Behavior change**: how the call ended now outranks whether the LTM was warm
+  when classifying a latency observation. `cold` used to be decided first, so a
+  request that connected, issued its search and then failed or timed out was
+  filed as `cold_samples` beside the cold *successes* -- and every consumer
+  reads that bucket as "still warming up", which turned a daemon failing on
+  every request into one that looked like it was starting. A failure is now
+  filed as the failure it was, warm or not; `cold` keeps only the calls that
+  ended well, which is all it was ever protecting. Nothing moves in the
+  percentiles either way: only a success files a duration.
+
   `mms daemon status` renders the surface-latency line on any observation
   rather than only on a successful one, and prints every counter that can turn
   it on -- `timeouts`, `errors`, `cold` and `pre_rpc_faults` -- rather than a
@@ -307,11 +319,17 @@ changes inline only. See the deprecation policy in
   a reader that does not know it is unaffected.
 
   `mms doctor` gains a `surfacing outcomes` check reading the same counters,
-  independent of the timeout checks beside it. It WARNs when any hook surfacing
-  request since daemon start timed out, failed mid-search, or never issued one,
-  and reports that breakdown rather than a ratio: the failure counters are
-  cumulative while `samples` is the length of a 256-wide duration window, so
-  the two do not share a denominator. Without it, a daemon whose LTM had died
+  independent of the timeout checks beside it. It WARNs when the surface series
+  records a request that timed out, faulted after issuing a search, or never
+  issued one, and reports that breakdown rather than a ratio: the failure
+  counters are cumulative while `samples` is the length of a 256-wide duration
+  window, so the two do not share a denominator. Requests the daemon turned
+  away before admitting them (`expired`, `busy`) are outside this population --
+  they are counted in the queue telemetry instead. A snapshot with no
+  `pre_rpc_faults` key comes from a daemon predating this change: the check
+  says so and asks for a restart rather than reading absent counters as zero,
+  since such a daemon cannot report its failures and its recommendation is
+  derived from durations that still include failed searches. Without it, a daemon whose LTM had died
   reported "collecting telemetry" -- the timeout check answers "is there enough
   data to size a timeout", which is a different question from "is the
   dependency working", and after the reclassification above the failures no

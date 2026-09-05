@@ -17145,7 +17145,7 @@ class TestDoctor:
         # 2 timeouts + 6 errors + 4 pre-RPC faults; the 3 cold samples are not
         # failures and must not be counted.
         assert "12 surfacing request(s) since start" in result.output
-        assert "2 timed out, 6 failed mid-search, 4 never issued one" in result.output
+        assert "2 timed out, 6 faulted after issuing one, 4 never issued one" in result.output
 
     def test_doctor_still_reports_collecting_for_an_unused_daemon(
         self, runner, config, monkeypatch
@@ -17426,6 +17426,64 @@ class TestDoctor:
         # No surfacing traffic at all: the check says nothing, rather than
         # attributing eight raw-op failures to surfacing.
         assert "surfacing outcomes" not in result.output
+
+    def test_doctor_does_not_certify_a_daemon_that_predates_the_counters(
+        self, runner, config, monkeypatch
+    ):
+        # A daemon still running an older build sends no ``pre_rpc_faults``.
+        # Read as zero it produced "no failed surfacing requests since start" --
+        # a clean bill of health for the one daemon that cannot report its
+        # failures, and whose successes still include the failed round trips
+        # #994 stopped counting as successes.
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._healthy_config(config)
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(
+            proxy_mod,
+            "_surfacing_bootstrap_status",
+            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False, config_path=None: {
+                "enabled": True,
+                "feedback_enabled": False,
+                "feedback_db": None,
+                "timeouts": {"surfacing_seconds": 30.0, "hook_daemon_seconds": 40.0},
+                "ltm_server": {
+                    "route": "daemon",
+                    "connected": True,
+                    "display": "mms daemon",
+                    "latency": {
+                        # Exactly the pre-#994 shape: no ``pre_rpc_faults``.
+                        "surface": {
+                            "samples": 30,
+                            "timeout_samples": 0,
+                            "error_samples": 0,
+                            "cold_samples": 0,
+                            "recommendation": {"status": "ready", "seconds": 2.0},
+                        },
+                        "retrieval": {
+                            "samples": 0,
+                            "recommendation": {"status": "collecting", "seconds": None},
+                        },
+                    },
+                    "measurement": None,
+                },
+            },
+        )
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        outcomes_line = next(
+            line for line in result.output.splitlines() if "surfacing outcomes" in line
+        )
+        assert "WARN" in outcomes_line
+        assert "predates the surfacing outcome counters" in result.output
+        assert "mms daemon restart" in result.output
+        # The health claim it cannot support must not appear.
+        assert "no failed surfacing requests since start" not in result.output
 
     def test_score_scale_mismatch_diagnostic_fails_before_ceiling_heuristic(
         self, runner, config, monkeypatch
