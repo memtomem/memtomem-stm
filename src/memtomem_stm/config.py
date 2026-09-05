@@ -470,10 +470,10 @@ class DaemonConfig(BaseModel):
     Set to ``1`` to restore that serialized daemon. That is the only value
     that restores it: measured against a stand-in core that serves searches
     serially, ``2`` degrades exactly like ``4`` -- the queue moves into the
-    child, the tail overruns anyway, and an overrun there is worse than a
-    wait, because it cancels an RPC mid-flight and the session has to be
-    rebuilt. So this is a choice between ``1`` and a value the LTM can
-    actually serve in parallel, not a dial to tune down.
+    child and the tail overruns anyway, except that an overrun there is worse
+    than a wait, because the RPC is cancelled mid-flight and the LTM's time is
+    spent on an answer nobody reads. So this is a choice between ``1`` and a
+    value the LTM can actually serve in parallel, not a dial to tune down.
 
     The default assumes a core that serves searches concurrently; it is not a
     measurement of any particular one. ``memtomem`` awaits its searches and

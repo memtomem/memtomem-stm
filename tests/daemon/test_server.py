@@ -512,6 +512,41 @@ async def test_queue_snapshot_counts_every_in_flight_operation(tmp_path: Path) -
     assert server._queue_snapshot()["in_flight"] == 0
 
 
+class _GateSkippingEngine:
+    """Engine stub that records a gate skip, as a rejected call really does."""
+
+    injection_mode = "append"
+
+    def __init__(self) -> None:
+        self.observability = SurfacingObservability()
+
+    async def surface(self, *args, **kwargs) -> str:
+        self.observability.record_skip("Read", "gate_cooldown")
+        return args[3] if len(args) > 3 else ""
+
+
+async def test_surface_dispatch_asks_for_attribution(tmp_path: Path) -> None:
+    # Every other attribution test calls `_run_admitted` directly and passes
+    # `attribute=True` itself, so all of them stay green if the production
+    # dispatch stops asking for it — and then a gate skip silently becomes a
+    # warm-search latency sample. This drives the real OP_SURFACE path.
+    server = DaemonServer(_config(tmp_path))
+    server._ltm_warmth = lambda: "warm"  # type: ignore[method-assign]
+    server._engine = _GateSkippingEngine()
+
+    response = await server._dispatch(
+        {
+            "v": PROTOCOL_VERSION,
+            "op": OP_SURFACE,
+            "payload": _canonical(_READ_PAYLOAD).to_wire(),
+            "deadline_monotonic": asyncio.get_running_loop().time() + 5.0,
+        }
+    )
+
+    assert response["ok"] is True
+    assert server._latency.snapshot()["surface"]["samples"] == 0
+
+
 async def test_surface_skips_ltm_when_deadline_leaves_no_budget(tmp_path: Path) -> None:
     # Admitted (deadline not yet expired) but too little left for a round trip.
     # Starting one would only cancel the adapter mid-RPC and force a stdio child

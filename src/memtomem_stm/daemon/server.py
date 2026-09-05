@@ -132,8 +132,10 @@ async def _terminate_leaked_children(pids: set[int]) -> None:
 _DEADLINE_RESPONSE_MARGIN_SECONDS = 0.15
 
 # Below this, an LTM round trip cannot plausibly complete, so starting one only
-# cancels the adapter mid-RPC — which forces a stdio child respawn on the next
-# call (#290/#296) and buys nothing. Skip instead.
+# has it cancelled mid-RPC and buys nothing. Skip instead. (A cancellation no
+# longer costs a session rebuild — see ``McpClientSearchAdapter._rpc``, #874 —
+# but the work sent to the LTM, and the deadline spent waiting on it, are
+# wasted either way.)
 _MIN_SURFACE_BUDGET_SECONDS = 0.25
 
 
@@ -822,11 +824,14 @@ class DaemonServer:
                             response = await operation()
                     finally:
                         self._ltm_in_flight -= 1
-            # An operation that reported nothing is treated as having reached
-            # the LTM: that is what the raw LTM ops do (their operation is the
-            # round trip), and it is also the safe reading for a surfacing call
-            # whose engine records nothing — a missing sample is invisible,
-            # while a wrong one moves the recommendation.
+            # Two different "nothing to read" cases, deliberately opposite.
+            # Without a ledger (the raw LTM ops) the operation *is* the round
+            # trip, so every one of them is a sample. With a ledger, an empty
+            # one means the engine reached no terminal decision that needed the
+            # LTM — a call the hook allowlist or the gate turned away — and
+            # filing its near-zero duration would drag the percentiles the
+            # timeout recommendation comes from. A missing sample is invisible;
+            # a wrong one moves the advice.
             activity_observed = ledger is None or ledger.retrieval_attempted
             if latency_kind is not None and activity_observed:
                 elapsed_ms = (time.monotonic() - started) * 1000.0

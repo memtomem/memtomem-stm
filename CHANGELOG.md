@@ -115,6 +115,21 @@ changes inline only. See the deprecation policy in
   operations through its owner task. The real bound is what the LTM child can
   serve in parallel.
 
+  A closed connection is now recognized as one. The SDK reports a dead peer as
+  `MCPError(CONNECTION_CLOSED)`, which inherits from `Exception` rather than
+  `OSError`, so the adapter's transport classification never matched it: every
+  call site fell through to its generic handler, returned `call_error`, and
+  left the dead session in place. A daemon whose LTM child died served
+  `call_error` until it was restarted -- verified against `main`, so this is
+  older than #874, but the concurrency work depends on the error path being the
+  one that heals. `_rpc` now translates that one code, and only that code:
+  every other `MCPError` is the peer answering.
+
+  The negotiated result format and the compose schema are read once per RPC
+  rather than after it. A reconnect renegotiates both, and reconnects can now
+  overlap an in-flight call, so a reply requested as structured could be parsed
+  as compact -- a parse error on a good answer.
+
   Cancelling one LTM call no longer retires the shared MCP session. That rule
   came from #290, when a cancelled request was assumed to leave the stdio
   stream half-read; under the `mcp>=2.0` floor the dispatcher sends the peer a

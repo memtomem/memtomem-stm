@@ -234,7 +234,8 @@ export MEMTOMEM_STM_DAEMON__ALLOW_NON_LOOPBACK=false     # escape hatch, see bel
 at once. Requests beyond it wait while their client deadline runs, so a low
 value makes a burst charge each arrival the wait ahead of it; a value above the
 LTM's own parallel capacity only moves that queue into the LTM process, where an
-overrun cancels an RPC mid-flight and costs a session rebuild. Watch
+overrun has the RPC cancelled mid-flight, spending the LTM's time on an answer
+nobody reads. Watch
 `queue.in_flight` against `queue.concurrency` in `mms daemon status` before
 changing it.
 
