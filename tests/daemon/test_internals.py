@@ -1241,11 +1241,57 @@ class TestDaemonStatusCli:
 
         assert text.exit_code == 0, text.output
         assert "errors=7" in text.output
-        assert "no completed searches yet" in text.output
+        assert "no successful warm searches yet" in text.output
         # Percentiles over an empty window render as 0ms, which reads as
         # "instant" — the opposite of what this daemon is doing.
         assert "p50=" not in text.output
         assert "suggested_timeout=" not in text.output
+
+    def test_status_prints_every_counter_that_turns_the_line_on(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # A cold-only or pre-RPC-fault-only daemon switches the line on. If the
+        # line then shows only samples/timeouts/errors it reads as a positive
+        # report that nothing has happened -- worse than printing no line,
+        # because the operator stops looking. Every counter in the gate is on
+        # the line.
+        import time as _time
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+
+        async def fake_ping(config, *, timeout=2.0):
+            return {
+                "pid": 11,
+                "host": "127.0.0.1",
+                "port": 4567,
+                "ltm": "cold",
+                "created_at": _time.time(),
+                "queue": {"active": 0, "in_flight": 0, "concurrency": 4},
+                "latency": {
+                    "surface": {
+                        "samples": 0,
+                        "timeout_samples": 0,
+                        "error_samples": 0,
+                        "cold_samples": 9,
+                        "pre_rpc_faults": 4,
+                        "p50_ms": None,
+                        "p95_ms": None,
+                    }
+                },
+            }
+
+        monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
+        text = CliRunner().invoke(_cli(), ["daemon", "status"])
+
+        assert text.exit_code == 0, text.output
+        assert "cold=9" in text.output
+        assert "pre_rpc_faults=4" in text.output
+        # "warm" is load-bearing: a cold-only daemon may have completed
+        # searches, just none the percentiles accept.
+        assert "no successful warm searches yet" in text.output
+        assert "p50=" not in text.output
 
     def test_status_omits_the_latency_line_when_nothing_was_observed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1273,6 +1319,7 @@ class TestDaemonStatusCli:
                         "timeout_samples": 0,
                         "error_samples": 0,
                         "cold_samples": 0,
+                        "pre_rpc_faults": 0,
                     }
                 },
             }
@@ -1282,6 +1329,47 @@ class TestDaemonStatusCli:
 
         assert text.exit_code == 0, text.output
         assert "surface latency" not in text.output
+
+    def test_status_tolerates_a_snapshot_without_the_newer_counters(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # The ping payload crosses a version boundary: an older daemon still
+        # running on this machine answers without ``error_samples`` or
+        # ``pre_rpc_faults``. The line must render those as zero rather than
+        # raising, and the counters it does have must still be right.
+        import time as _time
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+
+        async def fake_ping(config, *, timeout=2.0):
+            return {
+                "pid": 11,
+                "host": "127.0.0.1",
+                "port": 4567,
+                "ltm": "warm",
+                "created_at": _time.time(),
+                "queue": {"active": 0, "in_flight": 0, "concurrency": 4},
+                "latency": {
+                    "surface": {
+                        "samples": 3,
+                        "timeout_samples": 1,
+                        "p50_ms": 300.0,
+                        "p95_ms": 400.0,
+                        "recommendation": {"status": "collecting", "seconds": None},
+                    }
+                },
+            }
+
+        monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
+        text = CliRunner().invoke(_cli(), ["daemon", "status"])
+
+        assert text.exit_code == 0, text.output
+        assert "samples=3" in text.output
+        assert "errors=0" in text.output
+        assert "pre_rpc_faults=0" in text.output
+        assert "p50=300ms" in text.output
 
     def test_unreadable_handshake_is_stale_not_stopped(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

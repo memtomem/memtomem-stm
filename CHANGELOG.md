@@ -240,19 +240,30 @@ changes inline only. See the deprecation policy in
   count either -- rather than into a separate series, since no consumer asks
   for one and a non-RPC duration is not a censored observation of the LTM. Two
   boundaries are deliberate. The mark is scoped to the *search* round trip, so
-  the adapter's lifecycle exchanges (the version probe and the `list_tools`
-  rerank check, which go to the session directly) do not mark: a connect is not
-  a search, and marking one would put child-spawn and negotiation time into the
-  very series this change exists to clean up. The consequence is that a request
-  whose only LTM work was a start or reconnect that then failed produces **no
-  latency sample at all**, not a `cold` one -- the warmth check sits inside the
-  branch the mark gates. That signal is not lost: such a call still records
-  `ltm_unavailable`, which raises the `stm_surfacing_stats` fault ratio and
-  charges the circuit breaker. Separately, a request that expires while waiting
-  for an admission or LTM slot is still filed as a timeout by the outer
-  handler, which consults no ledger, because that is currently the only
-  telemetry of daemon saturation. The pre-existing filter for allowlist, gate
-  and cache-decided terminals is unchanged in effect.
+  the adapter's lifecycle exchanges (the version probe in `_negotiate_format`
+  and the `list_tools` rerank check in `_probe_rerank_support`, which go to the
+  session directly) do not mark: a connect is not a search, and marking one
+  would put child-spawn and negotiation time into the very series this change
+  exists to clean up. The consequence is that a request whose only LTM work was
+  a start or reconnect that then failed produces **no latency sample at all**,
+  not a `cold` one -- the warmth check sits inside the branch the mark gates.
+  Separately, a request that expires while waiting for an admission or LTM slot
+  is still filed as a timeout by the outer handler, which consults no ledger,
+  because that is currently the only telemetry of daemon saturation. The
+  pre-existing filter for allowlist, gate and cache-decided terminals is
+  unchanged in effect.
+
+  **The daemon counts what it no longer samples**, as `pre_rpc_faults` in the
+  latency snapshot: a request that reached a dependency fault -- healing
+  failed, pre-timeout work spent the window, the breaker refused the attempt --
+  without any search RPC leaving the process. It is a counter, not a duration,
+  and never enters the percentiles. Without it, dropping those calls would have
+  made a daemon whose every request dies during start or reconnect read exactly
+  like a daemon nobody has used: the engine records a fault for each one
+  (normally `ltm_unavailable`, or `error_timeout` when the deadline expired)
+  and charges the circuit breaker, but those counters live on the daemon's own
+  engine and `stm_surfacing_stats` renders the MCP server process's engine
+  instead -- a different object in a different process.
 
   **A warm round trip that failed after the request went out is filed as an
   error rather than a success duration**, in the same change. The engine
@@ -271,14 +282,17 @@ changes inline only. See the deprecation policy in
   (`no_results_*`) is healthy and stays a success duration.
 
   `mms daemon status` renders the surface-latency line on any observation
-  rather than only on a successful one, printing `errors=` beside `timeouts=`
-  and saying so plainly when there are no completed searches to take
-  percentiles over. Gating the line on `samples` meant a daemon whose every
-  search was failing printed no line at all, which reads exactly like a daemon
-  nothing has used yet -- and after the reclassification above that is the
-  daemon an operator most needs the command to describe. Found by a Codex
-  review of #993; the fault classification and this status gap by Codex reviews
-  of the change itself.
+  rather than only on a successful one, and prints every counter that can turn
+  it on -- `timeouts`, `errors`, `cold` and `pre_rpc_faults` -- rather than a
+  line switched on by an observation it does not show. With no successful
+  durations it says so instead of printing percentiles over an empty window,
+  which render as `p50=0ms` and read as "instant". Gating the line on `samples`
+  meant a daemon whose every search was failing printed no line at all, which
+  reads exactly like a daemon nothing has used yet -- and after the
+  reclassification above that is the daemon an operator most needs the command
+  to describe. `--json` is unchanged; it always carried the full counter set.
+  Found by a Codex review of #993; the fault classification, this status gap
+  and the `pre_rpc_faults` counter by Codex reviews of the change itself.
 
 - **A non-finite `chars_per_token` is refused at load, and a char budget whose
   conversion overflows saturates instead of failing the call** (#977). Pydantic's

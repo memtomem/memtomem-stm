@@ -98,6 +98,17 @@ class _Series:
     timeout_samples: int = 0
     error_samples: int = 0
     cold_samples: int = 0
+    # Requests that reached a dependency fault without ever issuing a search
+    # RPC: session healing failed, pre-timeout work spent the window, or the
+    # breaker refused the attempt. Deliberately not a duration -- the time is
+    # not a measurement of the LTM (#994) -- but the operator still has to be
+    # able to tell "requests died before the search went out" from "nobody
+    # used this daemon", and every other counter here reads identically for
+    # the two.
+    pre_rpc_faults: int = 0
+
+    def record_pre_rpc_fault(self) -> None:
+        self.pre_rpc_faults += 1
 
     def record(self, duration_ms: float, outcome: LatencyOutcome) -> None:
         if outcome == "success":
@@ -117,6 +128,7 @@ class _Series:
             "timeout_samples": self.timeout_samples,
             "error_samples": self.error_samples,
             "cold_samples": self.cold_samples,
+            "pre_rpc_faults": self.pre_rpc_faults,
             "p50_ms": round(_percentile(values, 50), 2) if values else None,
             "p95_ms": round(_percentile(values, 95), 2) if values else None,
             "p99_ms": round(_percentile(values, 99), 2) if values else None,
@@ -137,6 +149,14 @@ class DaemonLatencyTracker:
 
     def record(self, kind: LatencyKind, duration_ms: float, outcome: LatencyOutcome) -> None:
         self._series[kind].record(duration_ms, outcome)
+
+    def record_pre_rpc_fault(self, kind: LatencyKind) -> None:
+        """Count a request that faulted before any search RPC left the process.
+
+        Separate from :meth:`record` because there is no duration to file: the
+        elapsed time measured STM pre-work and queue wait, not the dependency.
+        """
+        self._series[kind].record_pre_rpc_fault()
 
     def snapshot(self) -> dict[str, Any]:
         return {kind: series.snapshot() for kind, series in self._series.items()}

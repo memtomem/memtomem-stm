@@ -459,6 +459,48 @@ async def test_a_faulted_round_trip_is_not_a_success_duration(tmp_path: Path) ->
     assert after_healthy["error_samples"] == 1  # unchanged by the healthy call
 
 
+async def test_a_pre_rpc_fault_is_counted_even_though_it_is_not_sampled(
+    tmp_path: Path,
+) -> None:
+    # Dropping these durations is right -- they measure STM, not the LTM -- but
+    # dropping them silently made a daemon whose every request dies during
+    # healing read exactly like a daemon nobody used: same zeros in every
+    # counter (#994). The engine's own fault counters cannot answer it either,
+    # since ``stm_surfacing_stats`` renders the MCP server process's engine and
+    # this one lives in the daemon.
+    server = DaemonServer(_config(tmp_path))
+    server._ltm_warmth = lambda: "warm"  # type: ignore[method-assign]
+    obs = SurfacingObservability()
+
+    async def healing_failed() -> dict[str, object]:
+        obs.record_skip("Read", "ltm_unavailable")
+        return surface_response({})
+
+    async def gated_out() -> dict[str, object]:
+        # The control that keeps this counter meaningful: a cooldown skip is
+        # not a fault, and surfacing does far more of those than anything else.
+        # Counting them would bury the signal under healthy traffic.
+        obs.record_skip("Read", "gate_cooldown")
+        return surface_response({})
+
+    async def run(operation) -> dict[str, object]:
+        await server._run_admitted(
+            {"deadline_monotonic": asyncio.get_running_loop().time() + 1.0},
+            operation,
+            latency_kind="surface",
+            attribute=True,
+        )
+        return server._latency.snapshot()["surface"]
+
+    after_fault = await run(healing_failed)
+    assert after_fault["pre_rpc_faults"] == 1
+    assert after_fault["samples"] == 0
+    assert after_fault["error_samples"] == 0  # not a duration, not an error sample
+
+    after_gate = await run(gated_out)
+    assert after_gate["pre_rpc_faults"] == 1  # unchanged by the healthy skip
+
+
 async def test_gate_skip_is_not_a_latency_sample(tmp_path: Path) -> None:
     # A call the gate rejected never reached the LTM, so its near-zero duration
     # is not a measurement of a warm search. Filed as a sample it would drag the

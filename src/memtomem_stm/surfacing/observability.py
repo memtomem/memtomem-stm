@@ -240,23 +240,30 @@ class CallLedger:
         not into the percentiles and not into the timeout count either.
 
         Scoped to the *search* round trip — ``mem_search`` and the
-        ``context_compose`` action, the two an ``surface()`` call makes on its
+        ``context_compose`` action, the two a ``surface()`` call makes on its
         own behalf. The adapter's lifecycle RPCs (the ``mem_do action=version``
-        probe and the ``list_tools`` rerank check inside ``_negotiate_format``)
-        call the session directly rather than through ``_rpc`` and so do not
-        mark, even when a request's own lazy start ran them. The percentiles
-        answer "how long does a warm search take", and a connect is not a
-        search — marking one would put child-spawn and negotiation time into
-        the series, which is the defect this exists to remove.
+        probe in ``_negotiate_format`` and the ``list_tools`` rerank check in
+        ``_probe_rerank_support``) call the session directly rather than
+        through ``_rpc`` and so do not mark, even when a request's own lazy
+        start ran them. The percentiles answer "how long does a warm search
+        take", and a connect is not a search — marking one would put
+        child-spawn and negotiation time into the series, which is the defect
+        this exists to remove.
 
         The consequence is exact and worth stating: a request whose *only* LTM
         work was a start or reconnect that then failed produces **no latency
         sample at all**. Not ``cold`` either — the daemon's warmth check sits
         inside the branch this flag gates, so an unmarked call is dropped
-        before it is reached. That signal lives elsewhere rather than being
-        lost: such a call still records ``ltm_unavailable``, which is in
-        :data:`FAULT_SKIP_REASONS` and so raises the ``stm_surfacing_stats``
-        fault ratio, and it still charges the circuit breaker.
+        before it is reached. Such a call does record a fault (normally
+        ``ltm_unavailable``; ``error_timeout`` when it was the deadline that
+        expired) and charges the circuit breaker, but those counters live on
+        the *daemon's* engine, which no ``stm_surfacing_stats`` reader can see
+        — that tool renders the MCP server process's own engine, a different
+        object in a different process. So the daemon counts these separately
+        as ``pre_rpc_faults`` in its latency snapshot, which is not a duration
+        and never enters the percentiles: it exists only so an operator can
+        tell "requests died before the search went out" from "nobody used this
+        daemon", which every other counter reports identically.
         """
         return self.ltm_rpc_issued
 

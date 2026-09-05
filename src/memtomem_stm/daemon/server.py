@@ -836,6 +836,16 @@ class DaemonServer:
             # that are advice about the LTM with a measurement of STM. A
             # missing sample is invisible; a wrong one moves the advice.
             activity_observed = ledger is None or ledger.retrieval_attempted
+            if latency_kind is not None and ledger is not None and not activity_observed:
+                # No duration to file, but not nothing to say. Healing that
+                # failed, pre-timeout work that spent the window, and a breaker
+                # refusing the attempt all leave every counter below reading
+                # exactly as they do for a daemon nobody used -- so an operator
+                # asking "did my requests die before the search went out?" had
+                # no way to tell (#994). This counter answers that one
+                # question and stays out of the percentiles.
+                if ledger.faulted:
+                    self._latency.record_pre_rpc_fault(latency_kind)
             if latency_kind is not None and activity_observed:
                 elapsed_ms = (time.monotonic() - started) * 1000.0
                 self_timed_out = ledger is not None and ledger.timed_out
