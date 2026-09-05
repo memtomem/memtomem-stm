@@ -115,6 +115,31 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **A non-finite `chars_per_token` is refused at load, and a char budget whose
+  conversion overflows saturates instead of failing the call** (#977). Pydantic's
+  `gt=0` admits `+inf` (the gap #722 documented for the shutdown timeouts), and a
+  config file can carry one without anything unusual having been typed, since
+  `json.dumps` writes a bare `Infinity` and `json.loads` reads it back. Such a
+  config loaded successfully and then raised `OverflowError` inside the budget
+  resolution every proxied call runs through -- naming neither the field nor the
+  level it was written at. Rejecting non-finite input does not cover the whole
+  surface on its own, so the conversion is now total as well: two finite values
+  whose product overflows, and a `max_result_tokens` too wide to multiply as a
+  float at all (the field carries no upper bound), both saturate at the
+  signed-64-bit ceiling, which the callers still cap against their own configured
+  maximum. `ProxyConfig.effective_max_result_chars()` -- the budget every
+  default-budget call runs under -- did its own multiplication and so would have
+  been left open by a guard in the conversion helper alone; it now goes through
+  that helper, leaving the chain with a single multiplication site.
+  **Behavior change**: a config with a non-finite `chars_per_token` at any of the
+  three levels now fails validation at load instead of loading and failing each
+  call; an overflowing conversion yields an effectively unbounded budget rather
+  than an error; and a token budget converting to less than one character
+  resolves to one char rather than zero, which under a disabled
+  `min_result_retention` had compressed the response to nothing. Nothing else
+  about retention changes -- `min_result_retention` still applies afterwards
+  exactly as before, and every in-range budget resolves to the same number.
+
 - **`mms prune` no longer deletes a host entry whose transport-relevant
   connection block is not a mapping** (#984) -- `env` for stdio, `headers` for
   HTTP. Those blocks joined server identity in #983 and a registered entry

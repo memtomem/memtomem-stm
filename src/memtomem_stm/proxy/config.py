@@ -1360,11 +1360,14 @@ class ToolOverrideConfig(BaseModel):
     ``max_result_chars`` and is converted to a char budget via the resolved
     ``chars_per_token`` ratio. Useful for non-Latin-script content where a
     fixed char budget under-triggers compression. See ``token_estimate.py``."""
-    chars_per_token: float | None = Field(default=None, gt=0.0)
+    chars_per_token: float | None = Field(default=None, gt=0.0, allow_inf_nan=False)
     """Per-tool override for the chars-per-token ratio used to convert a token
-    budget to a char budget. Falls back to the upstream server's ratio, then
-    ``ProxyConfig.chars_per_token``. The budget it converts may be this tool's
-    ``max_result_tokens`` or the one inherited from the server — the ratio
+    budget to a char budget. Must be finite: ``gt=0`` alone admits ``+inf``
+    (#722/#977), which a config file can carry because ``json.loads`` reads
+    back the bare ``Infinity`` that ``json.dumps`` writes. Falls back to the
+    upstream server's ratio, then ``ProxyConfig.chars_per_token``. The budget
+    it converts may be this tool's ``max_result_tokens`` or the one
+    inherited from the server — the ratio
     describes what this tool returns, not where its budget is written (#929).
     Inert when the tool sets ``max_result_chars`` and no token budget of its
     own: a char budget is absolute and nothing converts into it."""
@@ -1485,10 +1488,11 @@ class UpstreamServerConfig(BaseModel):
     over ``max_result_chars`` and is converted to a char budget via the
     resolved ``chars_per_token`` ratio. See ``token_estimate.py`` for the
     estimator used at gate time."""
-    chars_per_token: float | None = Field(default=None, gt=0.0)
+    chars_per_token: float | None = Field(default=None, gt=0.0, allow_inf_nan=False)
     """Per-server override for the chars-per-token ratio. Falls back to
     ``ProxyConfig.chars_per_token`` (default 3.5, English-biased). Set to
-    ~2.0 for Korean-dominant content, ~1.3 for Chinese-dominant."""
+    ~2.0 for Korean-dominant content, ~1.3 for Chinese-dominant. Must be
+    finite, for the reason given on the per-tool field (#977)."""
     token_estimation_mode: TokenEstimationMode | None = None
     """Per-server token gate mode. ``None`` inherits the proxy default."""
     retention_floor: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -2211,10 +2215,12 @@ class ProxyConfig(BaseModel):
     lock_timeout_seconds: float = Field(default=30.0, gt=0.0)
     consumer_model: str = ""
     context_budget_ratio: float = Field(default=0.05, ge=0.0, le=1.0)
-    chars_per_token: float = Field(default=3.5, gt=0.0)
+    chars_per_token: float = Field(default=3.5, gt=0.0, allow_inf_nan=False)
     """Default chars-per-token ratio used to convert token budgets into char
-    budgets. The default ``3.5`` is English-biased (ASCII text averages
-    ~4.0 chars/token for cl100k_base). Set to ~2.0 for Korean-dominant
+    budgets. Must be finite (#977): a non-finite ratio here reaches every
+    budget the proxy resolves, including the model-aware one below. The
+    default ``3.5`` is English-biased (ASCII text averages ~4.0 chars/token
+    for cl100k_base). Set to ~2.0 for Korean-dominant
     workloads, ~1.3 for Chinese-dominant. Per-server / per-tool overrides
     are available on ``UpstreamServerConfig`` and ``ToolOverrideConfig``.
     Also used inside ``effective_max_result_chars()`` to convert the
@@ -2286,7 +2292,13 @@ class ProxyConfig(BaseModel):
                 break
         if ctx_tokens is None:
             return self.default_max_result_chars
-        model_budget = int(ctx_tokens * self.context_budget_ratio * self.chars_per_token)
+        # Through the shared helper so the whole chain has exactly one
+        # multiplication site (#977): this branch used to do its own, and a
+        # guard placed only in the helper would have left the budget every
+        # default-budget call runs under still able to raise. The ratio is
+        # ``le=1.0`` and ``chars_per_token`` is finite, so the inner product
+        # is finite and the helper sees an ordinary ratio.
+        model_budget = tokens_to_chars(ctx_tokens, self.context_budget_ratio * self.chars_per_token)
         if model_budget <= 0:
             # context_budget_ratio is validated ge=0.0, so 0 is a legal value —
             # but a 0-char budget would flow into every per-server max_chars
@@ -2576,7 +2588,13 @@ def effective_max_result_chars(
             cpt = override.chars_per_token
 
     if token_budget is not None:
-        return tokens_to_chars(token_budget, cpt), token_budget
+        # Floored at one char (#977). Both operands are validated positive, so
+        # a product below 1 is a small budget, not "no output" — and a 0 here
+        # would flow into the compressors as an empty budget whenever
+        # ``min_result_retention`` is disabled. A budget that saturated at
+        # ``MAX_CHAR_BUDGET`` instead means the conversion overflowed and the
+        # call effectively runs unbounded; ``mms tune`` reads this same value.
+        return max(1, tokens_to_chars(token_budget, cpt)), token_budget
     if cfg.max_result_chars == default_server_max:
         return proxy_cfg.effective_max_result_chars(), None
     return cfg.max_result_chars, None

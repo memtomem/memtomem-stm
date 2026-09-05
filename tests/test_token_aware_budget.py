@@ -11,6 +11,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 
 import pytest
+from pydantic import ValidationError
 
 from memtomem_stm.proxy.config import (
     CompressionStrategy,
@@ -19,10 +20,11 @@ from memtomem_stm.proxy.config import (
     TokenEstimationMode,
     ToolOverrideConfig,
     UpstreamServerConfig,
+    effective_max_result_chars,
 )
 from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
 from memtomem_stm.proxy.metrics import TokenTracker
-from memtomem_stm.proxy.token_estimate import approx_tokens, tokens_to_chars
+from memtomem_stm.proxy.token_estimate import MAX_CHAR_BUDGET, approx_tokens, tokens_to_chars
 
 
 # ── token_estimate primitives ───────────────────────────────────────────
@@ -86,6 +88,50 @@ class TestTokensToChars:
         assert tokens_to_chars(1500, 1.85) == 2775
 
 
+class TestTokensToCharsSaturation:
+    """The conversion is total: no input reaches the caller as an exception (#977).
+
+    Every route below used to raise ``OverflowError`` inside the per-call
+    budget resolution, which fails the proxied tool call and names neither
+    the field nor the level it was written at.
+    """
+
+    def test_non_finite_ratio_saturates(self):
+        # ``gt=0`` admits ``+inf`` at the field level (#722), and a config
+        # file can carry one: ``json.dumps`` writes a bare ``Infinity`` and
+        # ``json.loads`` reads it back. The field now refuses it, but the
+        # helper is public and stays total on its own.
+        assert tokens_to_chars(400, float("inf")) == MAX_CHAR_BUDGET
+
+    def test_finite_operands_whose_product_overflows_saturate(self):
+        # Rejecting non-finite input does not cover this: both operands are
+        # finite and individually legal.
+        assert tokens_to_chars(2, 1e308) == MAX_CHAR_BUDGET
+
+    def test_token_budget_beyond_float_range_saturates(self):
+        # ``max_result_tokens`` has no upper bound, and an int past the float
+        # range raises in the multiplication itself rather than producing inf.
+        assert tokens_to_chars(10**400, 3.5) == MAX_CHAR_BUDGET
+
+    def test_finite_product_beyond_int64_saturates(self):
+        # No overflow and no inf — just a value wider than the budget's
+        # int64 domain, which SQLite-backed telemetry also stores.
+        assert tokens_to_chars(10**30, 3.5) == MAX_CHAR_BUDGET
+
+    def test_nan_ratio_yields_zero(self):
+        # ``nan`` compares false against 0, so it takes the non-positive
+        # branch rather than reaching the multiplication.
+        assert tokens_to_chars(1000, float("nan")) == 0
+
+    def test_sub_one_product_truncates_to_zero(self):
+        # The helper truncates and does NOT floor: the two callers want
+        # different things from a degenerate product, so the floor is a
+        # per-site policy. ``ProxyConfig.effective_max_result_chars`` reads
+        # this ``0`` as "model scaling off" and falls back to its static
+        # default; the token path floors at 1 instead.
+        assert tokens_to_chars(1, 0.5) == 0
+
+
 # ── ProxyConfig.chars_per_token + effective_max_result_chars ─────────────
 
 
@@ -135,6 +181,134 @@ class TestProxyConfigCharsPerToken:
         """Without ``consumer_model`` the chars_per_token field has no effect."""
         cfg = ProxyConfig(chars_per_token=1.0, default_max_result_chars=12345)
         assert cfg.effective_max_result_chars() == 12345
+
+
+class TestCharsPerTokenRejectsNonFinite:
+    """A non-finite ratio is refused at load, at all three levels (#977).
+
+    ``gt=0`` alone admits ``+inf`` — the same gap #722 documented for the
+    shutdown timeouts — and a config file can legitimately carry one, since
+    ``json.loads`` reads back the bare ``Infinity`` that ``json.dumps``
+    writes. Loading it used to succeed and then raise ``OverflowError``
+    inside every proxied call's budget resolution.
+    """
+
+    @pytest.mark.parametrize(
+        "build",
+        [
+            pytest.param(lambda v: ProxyConfig(chars_per_token=v), id="proxy"),
+            pytest.param(
+                lambda v: UpstreamServerConfig(prefix="p", command="c", chars_per_token=v),
+                id="server",
+            ),
+            pytest.param(lambda v: ToolOverrideConfig(chars_per_token=v), id="tool"),
+        ],
+    )
+    def test_positive_infinity_is_refused(self, build):
+        with pytest.raises(ValidationError):
+            build(float("inf"))
+
+    @pytest.mark.parametrize(
+        "build",
+        [
+            pytest.param(lambda v: ProxyConfig(chars_per_token=v), id="proxy"),
+            pytest.param(
+                lambda v: UpstreamServerConfig(prefix="p", command="c", chars_per_token=v),
+                id="server",
+            ),
+            pytest.param(lambda v: ToolOverrideConfig(chars_per_token=v), id="tool"),
+        ],
+    )
+    def test_a_finite_ratio_still_loads(self, build):
+        """Positive control: the new constraint refuses only the non-finite value."""
+        assert build(1.85).chars_per_token == 1.85
+
+    @pytest.mark.parametrize(
+        "build",
+        [
+            pytest.param(lambda v: ProxyConfig(chars_per_token=v), id="proxy"),
+            pytest.param(
+                lambda v: UpstreamServerConfig(prefix="p", command="c", chars_per_token=v),
+                id="server",
+            ),
+            pytest.param(lambda v: ToolOverrideConfig(chars_per_token=v), id="tool"),
+        ],
+    )
+    @pytest.mark.parametrize("value", [float("nan"), float("-inf")])
+    def test_nan_and_negative_infinity_were_already_refused(self, build, value):
+        """Pin what ``gt=0`` already covered, so ``+inf`` is the only new case.
+
+        Both compare false against 0, so they never reached the conversion.
+        Without this pin a later reader cannot tell which constraint is
+        carrying which value.
+        """
+        with pytest.raises(ValidationError):
+            build(value)
+
+
+class TestModelBudgetOverflow:
+    """``ProxyConfig.effective_max_result_chars`` does its own multiplication.
+
+    A guard placed only in ``tokens_to_chars`` would leave this route open,
+    and this is the budget every default-budget call runs under (#977).
+    """
+
+    def test_huge_ratio_saturates_instead_of_raising(self):
+        # (200000 * 0.05) * 1e308 overflows to inf and the int conversion
+        # raised. Both operands are finite, so field validation cannot cover
+        # it. The budget is capped at ``default_max_result_chars`` anyway, so
+        # saturating lands on the number the operator configured.
+        cfg = ProxyConfig(
+            consumer_model="claude-sonnet-4",
+            chars_per_token=1e308,
+            default_max_result_chars=12345,
+        )
+        assert cfg.effective_max_result_chars() == 12345
+
+    def test_degenerate_product_still_falls_back_rather_than_flooring(self):
+        # A tiny ratio makes the product < 1. The existing branch reads that
+        # as "model scaling effectively off" and returns the static default;
+        # the token path's floor of 1 must not leak in here.
+        cfg = ProxyConfig(
+            consumer_model="claude-sonnet-4",
+            context_budget_ratio=1e-12,
+            default_max_result_chars=12345,
+        )
+        assert cfg.effective_max_result_chars() == 12345
+
+
+class TestResolvedBudgetSaturationAndFloor:
+    """The shared resolver saturates and floors, so no call fails or starves."""
+
+    def test_server_ratio_overflow_saturates(self):
+        srv = UpstreamServerConfig(
+            prefix="p", command="c", max_result_tokens=2, chars_per_token=1e308
+        )
+        assert effective_max_result_chars(srv, None, ProxyConfig()) == (MAX_CHAR_BUDGET, 2)
+
+    def test_tool_ratio_overflow_saturates(self):
+        """The #929 route: a tool ratio applied to an inherited token budget."""
+        srv = UpstreamServerConfig(prefix="p", command="c", max_result_tokens=2)
+        override = ToolOverrideConfig(chars_per_token=1e308)
+        assert effective_max_result_chars(srv, override, ProxyConfig()) == (MAX_CHAR_BUDGET, 2)
+
+    def test_sub_one_product_floors_at_one_char(self):
+        """Two legal positive values must not resolve to a zero-char budget.
+
+        With ``min_result_retention`` disabled a 0 would compress the
+        response to nothing — "no output" from input that only said "small".
+        """
+        srv = UpstreamServerConfig(
+            prefix="p", command="c", max_result_tokens=1, chars_per_token=0.5
+        )
+        assert effective_max_result_chars(srv, None, ProxyConfig()) == (1, 1)
+
+    def test_an_ordinary_budget_is_untouched(self):
+        """Positive control: the floor and the cap are both inert in normal range."""
+        srv = UpstreamServerConfig(
+            prefix="p", command="c", max_result_tokens=1500, chars_per_token=1.85
+        )
+        assert effective_max_result_chars(srv, None, ProxyConfig()) == (2775, 1500)
 
 
 # ── _resolve_tool_config token-aware paths ───────────────────────────────

@@ -31,6 +31,9 @@ threshold decisions, not for billing.
 
 from __future__ import annotations
 
+import math
+from typing import Final
+
 # Tokens-per-character by Unicode block, calibrated 2026-04-29 against
 # cl100k_base on a 13-pair EN/KO doc corpus. See module docstring for
 # methodology.
@@ -39,6 +42,16 @@ TOK_PER_CHAR_HANGUL = 1.25
 TOK_PER_CHAR_CJK_IDEOGRAPH = 1.40
 TOK_PER_CHAR_KANA = 1.00
 TOK_PER_CHAR_OTHER = 0.45
+
+MAX_CHAR_BUDGET: Final = 2**63 - 1
+"""Largest char budget :func:`tokens_to_chars` will return.
+
+A saturation ceiling, not a policy limit: it exists so an operator value
+that overflows the conversion resolves to "no effective limit" instead of
+failing the call. Fixed at the signed-64-bit maximum rather than derived
+from ``sys.maxsize`` so the value does not differ between platforms, and
+so it stays inside the SQLite INTEGER domain the budget is recorded in.
+"""
 
 
 def approx_tokens(text: str) -> int:
@@ -80,8 +93,32 @@ def tokens_to_chars(tokens: int, chars_per_token: float) -> int:
     For Korean (Hangul-dominant) content, 1.8-2.0 is realistic.
     For Chinese (CJK-ideograph-dominant), 1.0-1.5.
 
-    Returns ``0`` for non-positive inputs.
+    Total by contract: every input maps to an int, none raises (#977). This
+    runs inside per-call budget resolution, where an exception fails the
+    proxied tool call and names neither the offending field nor the level it
+    was written at. Saturation degrades to "no effective limit" instead, and
+    the callers cap the result against their own configured maximum.
+
+    - Non-positive ``tokens`` or ratio, and ``nan`` in either position (which
+      compares false against 0), return ``0``.
+    - A product that overflows to infinity, and a ``tokens`` value too wide to
+      multiply as a float at all, return :data:`MAX_CHAR_BUDGET`. So does a
+      finite product beyond that ceiling.
+    - A product below 1 truncates to ``0``, deliberately: the two callers read
+      a degenerate budget differently. ``ProxyConfig.effective_max_result_chars``
+      treats it as "model scaling off" and falls back to its static default,
+      while the per-server/per-tool resolver floors it at one char. Flooring
+      here would defeat the first.
     """
-    if tokens <= 0 or chars_per_token <= 0:
+    if not (tokens > 0 and chars_per_token > 0):
         return 0
-    return int(tokens * chars_per_token)
+    try:
+        chars = tokens * chars_per_token
+    except OverflowError:
+        # ``int * float`` raises when the int is wider than the float range
+        # (``max_result_tokens`` carries no upper bound), rather than
+        # producing an infinity to test for below.
+        return MAX_CHAR_BUDGET
+    if math.isinf(chars):
+        return MAX_CHAR_BUDGET
+    return min(int(chars), MAX_CHAR_BUDGET)
