@@ -23,11 +23,15 @@ via the forced ``persist_query_text=False``), but
 ``record_feedback_events=False`` means no rating prompt is emitted (the
 pure-hook path has no in-band feedback channel) and no demotion read runs.
 
-Concurrency: LTM RPCs share one MCP ``ClientSession`` whose stdio framing is not
-safe under interleaved calls, so ``surface`` requests are serialized on a single
-lock. A warm search is sub-second and the engine's result cache absorbs repeats,
-so this is acceptable for the MVP; narrowing the lock to just the adapter RPC is
-a later optimization.
+Concurrency: up to ``daemon.max_concurrent_ltm_ops`` LTM operations run at once
+(#874). Requests beyond that wait for a slot under their own client deadline and
+are shed if it passes, so a burst no longer charges each arrival the queue wait
+ahead of it. One MCP ``ClientSession`` serves them all: the SDK correlates
+concurrent requests by JSON-RPC id behind a single writer task, and the adapter
+marshals only lifecycle ops (start / reconnect / close) through its owner task
+precisely because ``call_tool`` is task-agnostic. The bound exists for the LTM
+child's own parallel capacity, not for framing — set it to ``1`` for the older
+serialized behavior.
 """
 
 from __future__ import annotations
@@ -182,7 +186,11 @@ class DaemonServer:
         self._started_at = time.time()
         self._last_request = time.monotonic()
         self._shutdown_event = asyncio.Event()
-        self._surface_lock = asyncio.Lock()
+        self._max_concurrent_ltm_ops = config.daemon.max_concurrent_ltm_ops
+        self._ltm_slots = asyncio.Semaphore(self._max_concurrent_ltm_ops)
+        # Counted here rather than read off the semaphore: its remaining
+        # permits are private, and `_queue_snapshot` reports this to operators.
+        self._ltm_in_flight = 0
         self._max_pending_requests = config.daemon.max_pending_requests
         self._pending_slots = asyncio.Semaphore(self._max_pending_requests)
         self._active_requests = 0
@@ -303,10 +311,10 @@ class DaemonServer:
             # the in-session ``_surfaced_ids`` dedup (documented engine
             # behavior), which in a long-lived warm daemon would re-inject an
             # already-seen memory for a repeated identical query within the TTL
-            # window. The daemon serializes requests against a warm LTM
-            # connection, so the cache's stampede/latency benefit is redundant
-            # here — turning it off makes dedup (``_surfaced_ids`` +
-            # ``seen_memories``) authoritative.
+            # window. Turning it off makes dedup (``_surfaced_ids`` +
+            # ``seen_memories``) authoritative. The stampede protection the
+            # cache would add is not what pays for that: identical concurrent
+            # queries still serialize on the engine's per-key lock.
             "cache_ttl_seconds": 0.0,
         }
         if not record_events:
@@ -470,7 +478,7 @@ class DaemonServer:
 
             async def surface_call() -> dict[str, Any]:
                 # Computed here, not at admission: the admission queue and the
-                # serialization lock have already eaten part of the client's
+                # wait for an LTM slot have already eaten part of the client's
                 # deadline by the time we run.
                 surface_deadline = self._surface_deadline(req)
                 if surface_deadline is None:
@@ -763,7 +771,7 @@ class DaemonServer:
         latency_kind: LatencyKind | None = None,
         attribute: bool = False,
     ) -> dict[str, Any]:
-        """Run one LTM operation under the shared queue, deadline, and lock.
+        """Run one LTM operation under the shared queue, deadline, and slots.
 
         ``attribute`` opens a :func:`attribute_call` ledger around the
         operation, which is how a surfacing request's own outcome is read back.
@@ -791,7 +799,7 @@ class DaemonServer:
             self._busy_rejections += 1
             return {"v": PROTOCOL_VERSION, "ok": False, "status": "busy"}
         # Advice is based on user-observed end-to-end latency, intentionally
-        # including admission-queue and serialization-lock wait time.
+        # including admission-queue and LTM-slot wait time.
         started = time.monotonic()
         warm_at_start = self._ltm_warmth() == "warm"
         ledger: CallLedger | None = None
@@ -800,12 +808,20 @@ class DaemonServer:
         self._active_requests += 1
         try:
             async with asyncio.timeout_at(deadline):
-                async with self._surface_lock:
-                    if attribute:
-                        with attribute_call() as ledger:
+                # The deadline covers the wait for a slot, not just the work:
+                # a request whose client has already given up must not start an
+                # LTM round trip nobody will read, and it costs the engine
+                # nothing to shed here.
+                async with self._ltm_slots:
+                    self._ltm_in_flight += 1
+                    try:
+                        if attribute:
+                            with attribute_call() as ledger:
+                                response = await operation()
+                        else:
                             response = await operation()
-                    else:
-                        response = await operation()
+                    finally:
+                        self._ltm_in_flight -= 1
             # An operation that reported nothing is treated as having reached
             # the LTM: that is what the raw LTM ops do (their operation is the
             # round trip), and it is also the safe reading for a surfacing call
@@ -847,13 +863,21 @@ class DaemonServer:
             self._last_request = time.monotonic()
 
     def _queue_snapshot(self) -> dict[str, int]:
-        """Bounded numeric admission/serialization telemetry for operators."""
-        in_flight = 1 if self._surface_lock.locked() else 0
+        """Bounded numeric admission/concurrency telemetry for operators.
+
+        ``in_flight`` used to be the serialization lock's own state, so it
+        could only ever read 0 or 1. It is now the real count, and
+        ``concurrency`` names the bound it is measured against — the pair an
+        operator needs to tell "the LTM is saturated" from "requests are
+        arriving faster than they are admitted" (#874).
+        """
+        in_flight = self._ltm_in_flight
         return {
             "active": self._active_requests,
             "in_flight": in_flight,
             "queued": max(0, self._active_requests - in_flight),
             "capacity": self._max_pending_requests,
+            "concurrency": self._max_concurrent_ltm_ops,
             "available": max(0, self._max_pending_requests - self._active_requests),
             "busy_rejections": self._busy_rejections,
         }

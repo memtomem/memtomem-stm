@@ -182,6 +182,7 @@ async def test_ping_reports_ready_and_cold_ltm(tmp_path: Path) -> None:
             "in_flight": 0,
             "queued": 0,
             "capacity": cfg.daemon.max_pending_requests,
+            "concurrency": cfg.daemon.max_concurrent_ltm_ops,
             "available": cfg.daemon.max_pending_requests,
             "busy_rejections": 0,
         }
@@ -369,26 +370,37 @@ async def test_gate_skip_is_not_a_latency_sample(tmp_path: Path) -> None:
     assert surface_latency["timeout_samples"] == 0
 
 
-async def test_queued_request_does_not_inherit_another_requests_timeout(tmp_path: Path) -> None:
-    # Admissions overlap (max_pending_requests=32) even though execution is
-    # serialized. A "before" counter read at admission time would let a request
-    # that only *waited* through someone else's timeout be filed as a timeout —
-    # dropping its real duration from the percentiles, in exactly the scenario
-    # (a slow LTM) where the recommendation matters most.
+async def test_overlapping_request_does_not_inherit_another_requests_timeout(
+    tmp_path: Path,
+) -> None:
+    # Now that surfacing calls really do overlap (#874), the two of them run at
+    # the same time rather than one waiting for the other. A per-request outcome
+    # read from the engine's process-global counters would let the healthy call
+    # see the slow one's timeout and be filed as a timeout itself — dropping its
+    # real duration from the percentiles in exactly the scenario (a slow LTM)
+    # where the recommendation matters most.
     server = DaemonServer(_config(tmp_path))
     server._ltm_warmth = lambda: "warm"  # type: ignore[method-assign]
     obs = SurfacingObservability()
     slow_started = asyncio.Event()
-    slow_may_finish = asyncio.Event()
+    healthy_done = asyncio.Event()
 
     async def times_out_internally() -> dict[str, object]:
         slow_started.set()
-        await slow_may_finish.wait()
+        # Still running while the healthy call records and returns: this is the
+        # interleaving, not a queue behind a lock. A daemon that serializes the
+        # two deadlocks here instead, so the wait is bounded and the failure is
+        # reported as this operation not completing rather than as a hang.
+        try:
+            await asyncio.wait_for(healthy_done.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            raise AssertionError("the second request never overlapped the first") from None
         obs.record_outcome("Read", "error_timeout")
         return surface_response({})
 
     async def healthy() -> dict[str, object]:
         obs.record_outcome("Read", "surfaced_cache_miss")
+        healthy_done.set()
         return surface_response({})
 
     deadline = asyncio.get_running_loop().time() + 5.0
@@ -409,13 +421,95 @@ async def test_queued_request_does_not_inherit_another_requests_timeout(tmp_path
             attribute=True,
         )
     )
-    await asyncio.sleep(0.05)  # let the second request reach the lock and wait
-    slow_may_finish.set()
-    await asyncio.gather(first, second)
+    slow_response, healthy_response = await asyncio.gather(first, second)
 
+    # Both completed on their own terms — the overlap is what the rest of the
+    # assertions are about, so it must not be the thing that failed.
+    assert slow_response["ok"] is True
+    assert healthy_response["ok"] is True
     surface_latency = server._latency.snapshot()["surface"]
     assert surface_latency["timeout_samples"] == 1  # only the call that timed out
     assert surface_latency["samples"] == 1  # the healthy call kept its duration
+
+
+async def test_request_expiring_while_waiting_for_a_slot_never_touches_the_engine(
+    tmp_path: Path,
+) -> None:
+    # Shedding at the slot is what makes the wait cheap: a client that has
+    # already given up must not start an LTM round trip nobody will read, and
+    # cancelling one mid-RPC forces a stdio child respawn on the next call.
+    cfg = _config(tmp_path)
+    cfg.daemon.max_concurrent_ltm_ops = 1
+    server = DaemonServer(cfg)
+    engine = _DeadlineSpyEngine()
+    server._engine = engine
+    holder_may_finish = asyncio.Event()
+
+    async def holds_the_slot() -> dict[str, object]:
+        await holder_may_finish.wait()
+        return surface_response({})
+
+    holder = asyncio.create_task(
+        server._run_admitted(
+            {"deadline_monotonic": asyncio.get_running_loop().time() + 5.0},
+            holds_the_slot,
+        )
+    )
+    await asyncio.sleep(0)  # let the holder take the only slot
+
+    response = await server._dispatch(
+        {
+            "v": PROTOCOL_VERSION,
+            "op": OP_SURFACE,
+            "payload": _canonical(_READ_PAYLOAD).to_wire(),
+            "deadline_monotonic": asyncio.get_running_loop().time() + 0.05,
+        }
+    )
+    assert response == {"v": PROTOCOL_VERSION, "ok": False, "status": "expired"}
+    assert engine.calls == []
+
+    holder_may_finish.set()
+    await holder
+    assert server._queue_snapshot()["in_flight"] == 0
+
+
+async def test_queue_snapshot_counts_every_in_flight_operation(tmp_path: Path) -> None:
+    # `in_flight` used to be a lock's own state and could only read 0 or 1, so
+    # an operator watching a saturated daemon saw the same number as an idle
+    # one. It is the real count now, reported against the bound it is measured
+    # against.
+    cfg = _config(tmp_path)
+    cfg.daemon.max_concurrent_ltm_ops = 2
+    server = DaemonServer(cfg)
+    both_running = asyncio.Event()
+    may_finish = asyncio.Event()
+    running = 0
+
+    async def parks() -> dict[str, object]:
+        nonlocal running
+        running += 1
+        if running == 2:
+            both_running.set()
+        await may_finish.wait()
+        return surface_response({})
+
+    deadline = asyncio.get_running_loop().time() + 5.0
+    parked = [
+        asyncio.create_task(server._run_admitted({"deadline_monotonic": deadline}, parks))
+        for _ in range(2)
+    ]
+    # Bounded: without real overlap the second operation never starts, and an
+    # unbounded wait here would hang the suite instead of reporting the defect.
+    await asyncio.wait_for(both_running.wait(), timeout=2.0)
+
+    snapshot = server._queue_snapshot()
+    assert snapshot["in_flight"] == 2
+    assert snapshot["queued"] == 0
+    assert snapshot["concurrency"] == 2
+
+    may_finish.set()
+    await asyncio.gather(*parked)
+    assert server._queue_snapshot()["in_flight"] == 0
 
 
 async def test_surface_skips_ltm_when_deadline_leaves_no_budget(tmp_path: Path) -> None:
@@ -1043,6 +1137,94 @@ async def test_real_teardown_reaps_warm_ltm_child(tmp_path: Path) -> None:
         if asyncio.get_running_loop().time() >= deadline:
             raise AssertionError(f"leaked LTM child process(es) after teardown: {ltm_children}")
         await asyncio.sleep(0.1)
+
+
+# ── burst concurrency against a real warm LTM (#874) ──────────────────────────
+
+
+def _burst_config(tmp_path: Path, concurrency: int) -> STMConfig:
+    """A daemon wired to a real stdio LTM child that takes 0.3s per search."""
+    cfg = _config(tmp_path)
+    cfg.daemon.max_concurrent_ltm_ops = concurrency
+    cfg.surfacing.timeout_seconds = 15.0
+    cfg.surfacing.ltm_mcp_command = sys.executable
+    cfg.surfacing.ltm_mcp_args = [str(_FAKE_LTM_SERVER), "--search-delay", str(_BURST_SEARCH_SECONDS)]
+    return cfg
+
+
+_BURST_SEARCH_SECONDS = 0.3
+
+# Distinct *queries*, not just distinct paths. Identical queries serialize on
+# the engine's per-key stampede lock however much concurrency the daemon
+# allows, so a burst of those would prove nothing about #874 -- and a numeric
+# suffix does not make them distinct, because `_tokenize_path` drops purely
+# numeric segments (`jwt_handler_1.py` and `jwt_handler_2.py` both extract to
+# "src auth jwt handler py").
+_BURST_PATH_WORDS = (
+    "auth",
+    "billing",
+    "catalog",
+    "delivery",
+    "events",
+    "fulfilment",
+    "gateway",
+    "inventory",
+)
+_BURST_SIZE = len(_BURST_PATH_WORDS)
+
+
+async def _warm_and_burst(cfg: STMConfig) -> tuple[list[dict | None], float]:
+    """Warm the LTM child, then fire a burst of distinct read hooks at once."""
+    _, task = await _start(cfg)  # real _build_engine
+    try:
+        # The first call pays process start; the burst is what is being timed.
+        assert await client.surface(cfg, _canonical(_READ_PAYLOAD), timeout=15.0) is not None
+        calls = [
+            _canonical(
+                {
+                    **_READ_PAYLOAD,
+                    "tool_input": {"file_path": f"/src/{word}/handler.py"},
+                }
+            )
+            for word in _BURST_PATH_WORDS
+        ]
+        started = asyncio.get_running_loop().time()
+        outputs = await asyncio.gather(
+            *(client.surface(cfg, call, timeout=2.5) for call in calls)
+        )
+        return list(outputs), asyncio.get_running_loop().time() - started
+    finally:
+        await _stop(cfg, task)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="stdio child + timing")
+async def test_a_burst_of_distinct_hook_calls_overlaps_on_the_warm_ltm(tmp_path: Path) -> None:
+    # The shape from the live fault data: a tool burst arrives inside one
+    # client deadline. Serialized, the tail of the burst reaches the engine
+    # with nothing left of its budget and books timeouts that open the breaker
+    # for every tool. Overlapped, the whole burst costs about one search.
+    cfg = _burst_config(tmp_path, concurrency=4)
+    outputs, elapsed = await _warm_and_burst(cfg)
+
+    assert all(out is not None for out in outputs), "the daemon dropped part of the burst"
+    # Two waves of four searches, not eight in a row.
+    assert elapsed < _BURST_SEARCH_SECONDS * 4, f"burst took {elapsed:.2f}s"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="stdio child + timing")
+async def test_a_serialized_daemon_spends_the_whole_deadline_on_the_same_burst(
+    tmp_path: Path,
+) -> None:
+    # The bug, pinned: with the escape-hatch value the same burst costs the sum
+    # of its searches, which is what pushed the tail past the 2.5s client
+    # deadline. Asserted against the burst's own arithmetic rather than a wall
+    # clock guess -- this is the arm the fix is measured against.
+    cfg = _burst_config(tmp_path, concurrency=1)
+    outputs, elapsed = await _warm_and_burst(cfg)
+
+    assert elapsed > _BURST_SEARCH_SECONDS * _BURST_SIZE * 0.5, f"burst took {elapsed:.2f}s"
+    # And the tail pays for it: some of the burst gets nothing back.
+    assert any(out is None or out == {} for out in outputs)
 
 
 # ── startup warm-up (#664 PR 2) ───────────────────────────────────────────────

@@ -80,8 +80,10 @@ Small on purpose: past one or two, the LTM is not answering anyway.
 Counts only *abandoned* operations, not every one in flight. Reserving on every
 attempt would give a hard instantaneous cap, but nothing at admission time
 knows which attempts will get stuck, so it would equally cap healthy
-concurrency (the daemon serializes surfacing; ``ProxyManager`` does not) and
-report ordinary saturation as this dependency fault. The cost is that a burst
+concurrency (neither caller serializes surfacing: ``ProxyManager`` never did,
+and the daemon admits ``daemon.max_concurrent_ltm_ops`` at once since #874 —
+so one wedged LTM can fill this cap in a single burst rather than over four
+sequential timeouts, which is the intended reading and not a new failure). The cost is that a burst
 already in flight when the LTM wedges can overshoot — each of those read the
 count before any of them had timed out. That is bounded, since everything after
 they land is refused, and it errs toward letting a healthy LTM work.

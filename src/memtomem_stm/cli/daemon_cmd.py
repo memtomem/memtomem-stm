@@ -579,7 +579,9 @@ def status_cmd(as_json: bool) -> None:
         if isinstance(queue, dict):
             click.echo(
                 "queue: "
-                f"active={queue.get('active', 0)} queued={queue.get('queued', 0)} "
+                f"active={queue.get('active', 0)} "
+                f"in_flight={queue.get('in_flight', 0)}/{queue.get('concurrency', 1)} "
+                f"queued={queue.get('queued', 0)} "
                 f"capacity={queue.get('capacity', 0)} "
                 f"busy_rejections={queue.get('busy_rejections', 0)}"
             )

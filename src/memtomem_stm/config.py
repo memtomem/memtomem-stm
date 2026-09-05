@@ -456,7 +456,33 @@ class DaemonConfig(BaseModel):
     max_pending_requests: int = Field(default=32, ge=1, le=1024)
     """Maximum number of hook or standalone surfacing requests admitted
     concurrently. Requests beyond this bound fail open immediately instead of
-    building an unbounded queue behind the daemon's single LTM session."""
+    building an unbounded queue behind the daemon's LTM session."""
+    max_concurrent_ltm_ops: int = Field(default=4, ge=1, le=16)
+    """How many admitted requests may hold the LTM session at once (#874).
+
+    Admitted requests beyond this wait, and their client deadline keeps
+    running while they do — which is the whole cost being bounded here. The
+    daemon used to run exactly one at a time, so a burst charged each request
+    the queue wait ahead of it: with a 2.5s client deadline, the fifth arrival
+    behind four ~0.5s searches reached the engine with too little left, booked
+    a timeout, and a few of those opened the circuit breaker for every tool.
+
+    Set to ``1`` to restore that serialized daemon. That is the only value
+    that restores it: measured against a stand-in core that serves searches
+    serially, ``2`` degrades exactly like ``4`` -- the queue moves into the
+    child, the tail overruns anyway, and an overrun there is worse than a
+    wait, because it cancels an RPC mid-flight and the session has to be
+    rebuilt. So this is a choice between ``1`` and a value the LTM can
+    actually serve in parallel, not a dial to tune down. The default suits
+    a core that awaits its searches and offloads the heavy work, which is
+    what ``memtomem`` does.
+
+    Values above ``max_pending_requests`` are equivalent to admission --
+    nothing ever queues.
+
+    Overlap only helps a burst of *distinct* queries. Identical concurrent
+    ones still serialize on the engine's per-key stampede lock, which is what
+    keeps them from running the same search several times over."""
 
     @model_validator(mode="after")
     def _reject_non_loopback_host(self) -> "DaemonConfig":

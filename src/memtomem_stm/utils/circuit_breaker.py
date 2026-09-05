@@ -22,8 +22,12 @@ class CircuitBreaker:
     never mutates the breaker, so an observer (e.g. ``stm_proxy_health``)
     cannot perturb or misreport its state. The commit happens on the probe's
     outcome via ``record_success`` / ``record_failure``. (Half-open is not
-    single-probe-gated: a failing dependency behind a serialized single MCP
-    client is probed once per elapsed window in practice; concurrent
+    single-probe-gated: a failing dependency is probed by as many callers as
+    reach it before one of them commits an outcome — up to
+    ``daemon.max_concurrent_ltm_ops`` on the daemon path since #874, and
+    unbounded on the proxy path, which never serialized. The first failure
+    re-opens with a fresh window and the rest only increment an already-open
+    breaker, so the cost is wasted probes, not a double trip; concurrent
     single-probe enforcement is out of scope — see #600.)
     """
 

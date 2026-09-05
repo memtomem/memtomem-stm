@@ -37,6 +37,7 @@ Run with: ``python <path-to-this-file>`` (default canned hits) or
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import time
 import uuid
@@ -62,6 +63,17 @@ _RERANKER_ID: str | None = None
 # score-scale keys are added to the bundle envelope only at schema 4 (core
 # #1796), mirroring the additive envelope contract.
 _COMPOSE_SCHEMA: int | None = None
+
+_SEARCH_DELAY: float = 0.0
+"""Seconds each ``mem_search`` takes, standing in for a real core's latency.
+
+``await``ed, not slept: the SDK runs each inbound request in its own task, so a
+core with parallel capacity is what a caller sees. ``--search-delay-blocking``
+picks the other shape — a handler that holds the event loop — which is how a
+serial core makes concurrent callers queue inside the child instead.
+"""
+
+_SEARCH_DELAY_BLOCKS: bool = False
 
 # Deterministic retrieved leg for ``context_compose`` when no ``--seeds`` file
 # is given — fixed content (no per-call UUID) so a single compose round-trip
@@ -190,6 +202,16 @@ def _emit_compose(items: list[dict], schema: int) -> str:
     return json.dumps(payload)
 
 
+async def _search_delay() -> None:
+    """Spend ``--search-delay`` seconds the way the chosen core shape would."""
+    if _SEARCH_DELAY <= 0:
+        return
+    if _SEARCH_DELAY_BLOCKS:
+        time.sleep(_SEARCH_DELAY)
+    else:
+        await asyncio.sleep(_SEARCH_DELAY)
+
+
 async def mem_search(
     query: str,
     top_k: int | None = None,
@@ -213,6 +235,7 @@ async def mem_search(
     older than #1766 so integration tests prove the adapter withholds the
     key — while ``--rerank-capable`` swaps in the variant below.
     """
+    await _search_delay()
     if _SEEDS is not None:
         if output_format == "structured":
             return _emit_structured(_SEEDS)
@@ -360,12 +383,29 @@ if __name__ == "__main__":
             "advertises no compose capability, standing in for older cores."
         ),
     )
+    parser.add_argument(
+        "--search-delay",
+        type=float,
+        metavar="SECONDS",
+        default=0.0,
+        help="Make every mem_search take this long, standing in for core latency.",
+    )
+    parser.add_argument(
+        "--search-delay-blocking",
+        action="store_true",
+        help=(
+            "Spend --search-delay blocking the event loop instead of awaiting "
+            "it, standing in for a core that serves searches serially."
+        ),
+    )
     args = parser.parse_args()
     if args.seeds is not None:
         _SEEDS = _load_seeds(args.seeds)
     _SCORE_SCALE = args.score_scale
     _RERANKER_ID = args.reranker_id
     _COMPOSE_SCHEMA = args.compose_schema
+    _SEARCH_DELAY = args.search_delay
+    _SEARCH_DELAY_BLOCKS = args.search_delay_blocking
     if args.rerank_capable:
         mcp.tool(name="mem_search")(mem_search_rerank_capable)
     else:
