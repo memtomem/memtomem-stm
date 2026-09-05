@@ -234,19 +234,23 @@ changes inline only. See the deprecation policy in
   engine hands its writes to a single dedicated worker: the event row, the
   dedup rows and the feedback rows are awaited there, while fault counters,
   score-scale diagnostics and the hourly retention sweeps are queued
-  fire-and-forget. In a burst of four concurrent surfacings against a held
-  database, the loop's longest stall drops from tens of seconds to under
-  150 ms.
+  fire-and-forget. Measured on the new daemon test — four concurrent
+  surfacings against a database an external writer holds — the loop's longest
+  stall goes from 50.4 s with every write inline to under 0.15 s.
 
-  **Behavior change**: durable telemetry now lands shortly *after* the
-  response rather than before it — a fault counter, diagnostic or retention
-  sweep is queued when the branch runs and written a moment later. A request
-  cancelled by its deadline mid-write still lands its event row, so a shed
-  request can leave a row for a manifest its client never received. The
-  surfacing timeout no longer covers the work after the LTM round trip
-  returns: a contended store write holds that one call (as it always did)
-  instead of being booked as an LTM timeout that charges the circuit breaker.
-  `FeedbackStore.close()` waits for an in-flight write, and
+  **Behavior change**: durable telemetry now lands *after* the response rather
+  than before it — a fault counter, diagnostic or retention sweep is queued
+  when its branch runs and written a moment later. A request cancelled by its
+  deadline mid-write still lands its event row, so a shed request can leave a
+  row for a manifest its client never received. The worker is one FIFO thread,
+  so an awaited write can wait behind another call's queued sweep; that wait
+  is capped at `timeout_seconds`, past which the call delivers its memories
+  without a feedback prompt and the row lands on its own. The surfacing
+  timeout no longer covers the work after the LTM round trip returns: a
+  contended store write holds that one call (as it always did) instead of
+  being booked as an LTM timeout that charges the circuit breaker.
+  `FeedbackStore.close()` waits for an in-flight write, multi-query reads
+  (`get_stats` and the tuner's ratios) now answer from one snapshot, and
   `record_fault` / `record_diagnostic` take the observation time from the
   caller so a queued write cannot outrun the recovery that disproves it.
 

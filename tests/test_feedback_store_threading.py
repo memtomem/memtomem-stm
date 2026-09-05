@@ -102,11 +102,12 @@ class TestConcurrentReadersAndWriters:
     """The ``MetricsStore.__init__`` reader/writer convention, applied here.
 
     ``test_readers_and_writer_concurrent`` is the sibling of the same test in
-    ``tests/test_metrics_store.py``. Honest about what it proves: with the GIL
-    serializing each ``sqlite3`` call, dropping ``_read_lock`` does not by
-    itself make this fail — what the lock actually rules out is a ``close``
-    landing between the connection lookup and the ``execute`` that uses it,
-    which ``TestCloseRacingAWrite`` covers directly.
+    ``tests/test_metrics_store.py``. Honest about what each guard earns: the
+    cross-query assertions below fail without the ``_reading`` snapshot, while
+    ``_read_lock`` itself is not what they prove — with the GIL serializing
+    each ``sqlite3`` call, dropping it does not by itself tear a read. What
+    that lock rules out is a ``close`` landing between the connection lookup
+    and the ``execute`` that uses it, which ``TestCloseRacingAWrite`` covers.
     """
 
     def test_readers_and_writer_concurrent(self, tmp_path: Path) -> None:
@@ -130,8 +131,14 @@ class TestConcurrentReadersAndWriters:
         def read_stats() -> None:
             for _ in range(reads_per_worker):
                 stats = store.get_stats(limit=5)
-                # A torn read would show an event count without the rows that
-                # explain it, or a per-tool bucket with no events.
+                # The real tear test: ``events_total`` and the per-tool
+                # breakdown come from different queries, so a writer landing
+                # between them hands back a total that its own breakdown
+                # contradicts. Only a snapshot read makes these agree.
+                assert sum(r["events"] for r in stats["per_tool_breakdown"]) == (
+                    stats["events_total"]
+                )
+                assert sum(stats["score_scale_distribution"].values()) == stats["events_total"]
                 for row in stats["per_tool_breakdown"]:
                     assert row["events"] >= 1
                     assert isinstance(row["tool"], str)
@@ -223,8 +230,13 @@ class TestQueuedWriteTimestamps:
         # ``last_at <= recovered_at`` guard would leave a disproved episode
         # open for the whole retention window.
         store = _store(tmp_path)
-        observed_at = time.time()
-        recovered_at = observed_at + 0.001
+        # Both timestamps sit well in the past, so the fault's stamp is the
+        # one the caller passed rather than "whenever the worker got to it":
+        # a write stamped at execution time would land after ``recovered_at``
+        # and the recovery's ``last_at <= recovered_at`` guard would miss it.
+        now = time.time()
+        observed_at = now - 5.0
+        recovered_at = now - 2.0
         try:
             # Executed in that order, but the fault carries the earlier time.
             store.record_fault("gh", "read_file", "error_timeout", at=observed_at)

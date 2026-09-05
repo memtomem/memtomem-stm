@@ -1048,7 +1048,7 @@ class TestEngineFaultPersistence:
         tracker.record_fault("gh", "read_file", "error_timeout")
         tracker.record_fault("gh", "blocked_tool", "circuit_open")
         engine = SurfacingEngine(config=config, mcp_adapter=adapter, feedback_tracker=tracker)
-        engine._breaker_blocked_keys.add(("gh", "blocked_tool"))
+        engine._breaker_blocked_keys[("gh", "blocked_tool")] = 1
 
         real_db = tracker.store._db
         failing = _FailNthRecoveryUpdate(real_db, fail_on=2)
@@ -1064,7 +1064,7 @@ class TestEngineFaultPersistence:
             "circuit_open": 1,
         }
         # The blocked key is still owed a recovery, so the next success pays it.
-        assert engine._breaker_blocked_keys == {("gh", "blocked_tool")}
+        assert set(engine._breaker_blocked_keys) == {("gh", "blocked_tool")}
         await engine.surface("gh", "read_file", _other_args("retry"), LONG_RESPONSE)
         await engine.drain_store_writes()
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {}
@@ -1088,7 +1088,7 @@ class TestEngineFaultPersistence:
         tracker.store._db = _FailingCommit(real_db, fail_rollback=True)  # type: ignore[assignment]
         engine._persist_fault("gh", "blocked_tool", "circuit_open")
         tracker.store._db = real_db  # type: ignore[assignment]
-        assert engine._breaker_blocked_keys == {("gh", "blocked_tool")}
+        assert set(engine._breaker_blocked_keys) == {("gh", "blocked_tool")}
 
         # The abandoned INSERT rides out on an unrelated later write — count 2
         # from one durable fault plus the one that was left pending.
@@ -1108,7 +1108,7 @@ class TestEngineFaultPersistence:
         # before the set is spent — so it must never fill up.
         engine = SurfacingEngine(config=_make_config(tmp_path), mcp_adapter=AsyncMock())
         engine._persist_fault("gh", "read_file", "circuit_open")
-        assert engine._breaker_blocked_keys == set()
+        assert set(engine._breaker_blocked_keys) == set()
 
     async def test_recovery_is_reattempted_on_every_miss_path_success(self, tmp_path):
         """No once-per-process latch: another process can open an episode on

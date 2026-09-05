@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import re
 import sqlite3
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import TypedDict
 
@@ -505,7 +506,13 @@ class FeedbackStore:
       left on the loop cannot block behind a worker write that is waiting out a
       peer. It opens with a deliberately short lock budget: the only thing it
       can still wait for is WAL recovery, and a loop-side read must not spend
-      the writer's multi-second budget on that.
+      the writer's multi-second budget on that. Two readers do still exclude
+      each other — the loop's demotion lookup can wait for the tuner's counts
+      on the worker — but the lock is taken per method, and the methods that
+      run there are indexed aggregates over a retention-bounded table, so the
+      wait is one query rather than a lock budget. Methods issuing several
+      queries take :meth:`_reading` instead, which pins one snapshot for the
+      answer.
 
     Both connections are ``check_same_thread=False`` and are re-read *inside*
     the lock by every method, so a :meth:`close` racing an in-flight write on
@@ -557,13 +564,51 @@ class FeedbackStore:
         self._db = db
         self._read_db = read_db
 
+    @contextlib.contextmanager
+    def _reading(self) -> Iterator[sqlite3.Connection | None]:
+        """Read under one snapshot, for the methods that issue several queries.
+
+        Writes now land on a worker thread, so a peer statement can commit
+        between two of a reader's queries and hand back an answer that
+        contradicts itself — an event total that predates the per-tool
+        breakdown counted beside it. An explicit read transaction pins one
+        version of the database for the whole method; under WAL it blocks no
+        writer, it only stops this reader from seeing that writer land
+        mid-answer. Yields ``None`` when the store is closed, which is every
+        caller's existing empty-result path.
+        """
+        with self._read_lock:
+            db = self._read_db
+            if db is None:
+                yield None
+                return
+            db.execute("BEGIN")
+            try:
+                yield db
+            finally:
+                # Read-only: rollback is how the snapshot is released.
+                db.rollback()
+
     def close(self) -> None:
         """Close both connections, waiting out an in-flight write.
 
         Taking ``_lock`` is what makes the wait: a write already running on the
         worker finishes and commits rather than having the connection closed
-        from under it. That wait is bounded by the writer's lock budget and is
-        paid at teardown, when this process has no requests left to serve.
+        from under it. How long that takes is the statement's own business —
+        ``busy_timeout`` caps waiting for the file's lock, not the runtime of a
+        wide ``DELETE`` that already holds it — so this is not a bounded wait.
+        It is paid at teardown, when this process has no requests left to
+        serve, and the engine's ``stop()`` has already given the queue a
+        bounded chance to drain before anyone calls this.
+
+        A write queued but not started is a different case: it runs after this
+        returns, finds a closed store, and takes the no-op path every method
+        documents. The engine's two-statement delivery write (the event row
+        then the dedup rows) can therefore be split by a ``close`` that lands
+        between them, leaving an event row whose memories were never marked
+        seen. The cost is one memory that may surface again in the next
+        session; the alternative — holding one lock across both — would make a
+        teardown wait on the wider write rather than the narrower one.
         """
         with self._lock:
             if self._db is not None:
@@ -633,7 +678,17 @@ class FeedbackStore:
         recovery guard compares ``last_at <= recovered_at``, so a fault that
         executes late — after the caller took the timestamp for a later
         recovery — would otherwise stamp a row the recovery can no longer
-        close, leaving a disproved episode open for the retention window.
+        close, and the episode would read active on evidence that disproved it.
+
+        This orders a queue against itself, not against a peer process. A
+        recovery a PEER wrote while this fault sat in the queue updates rows
+        that exist at that moment, so it cannot match a row this write has yet
+        to insert, and the insert then opens an episode the peer's success had
+        already answered. Nothing in a shared day-aggregated row can close that
+        window — the peer would have to leave a recovery watermark for a key
+        with no row yet. It stays open only until the next healthy round trip
+        on that key, in either process, because the recovery write is
+        deliberately unlatched and re-runs on every success.
         """
         self._record_signal(server, tool, kind, FAULT_KINDS, reset_recovery=True, at=at)
 
@@ -958,8 +1013,7 @@ class FeedbackStore:
         negatives (``memory_id IS NULL``) are expanded from the parent
         event's ``memory_ids`` JSON without relying on SQLite JSON1.
         """
-        with self._read_lock:
-            db = self._read_db
+        with self._reading() as db:
             if db is None or not memory_ids:
                 return {}
 
@@ -1040,8 +1094,7 @@ class FeedbackStore:
 
     def get_tool_feedback_summary(self, tool: str | None = None) -> dict:
         """Get feedback summary, optionally filtered by tool."""
-        with self._read_lock:
-            db = self._read_db
+        with self._reading() as db:
             if db is None:
                 return {"total_surfacings": 0, "total_feedback": 0, "by_rating": {}}
             if tool is not None and has_lone_surrogate(tool):
@@ -1091,8 +1144,7 @@ class FeedbackStore:
             since: Unix timestamp lower bound for ``created_at``.
             limit: Max rows in the ``recent`` tail (``<=0`` disables).
         """
-        with self._read_lock:
-            db = self._read_db
+        with self._reading() as db:
             empty = {
                 "events_total": 0,
                 "distinct_tools": 0,
@@ -1397,8 +1449,7 @@ class FeedbackStore:
         # IS NULL keeps two row classes counting as before: events rows with
         # no reported scale, and orphaned feedback whose events row was aged
         # out by retention.
-        with self._read_lock:
-            db = self._read_db
+        with self._reading() as db:
             scale_pred = "(e.score_scale IS NULL OR e.score_scale = 'rrf')"
             if db is None:
                 return None

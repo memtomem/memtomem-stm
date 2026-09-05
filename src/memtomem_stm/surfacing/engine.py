@@ -129,6 +129,12 @@ class _DependencyFault(RuntimeError):
     """Internal signal: return passthrough but count the dependency failure."""
 
 
+_FEEDBACK_STORE_BUSY = (
+    "Error: the feedback store is busy; this rating was not confirmed. "
+    "It may still be recorded — do not re-submit."
+)
+
+
 def _noop_store_write() -> None:
     """FIFO marker for :meth:`SurfacingEngine.drain_store_writes`."""
 
@@ -375,7 +381,13 @@ class SurfacingEngine:
         # SAME key closes with them; that is the granularity the table has, and
         # the peer's next fault reopens it. Bounded by the upstream tool set
         # and emptied on the next success.
-        self._breaker_blocked_keys: set[tuple[str, str]] = set()
+        self._breaker_blocked_keys: dict[tuple[str, str], int] = {}
+        # Monotonic claim number, so the recovery write that lands on a worker
+        # thread releases the claim it was queued for and not a newer one for
+        # the same key. Without it a key blocked again while the recovery is in
+        # flight loses its claim, and the ``circuit_open`` row it just queued
+        # is left for its own next success to close.
+        self._breaker_claim_seq = 0
 
     @property
     def observability(self) -> SurfacingObservability | None:
@@ -478,11 +490,23 @@ class SurfacingEngine:
         for the event row), so letting a deadline cancel a queued write would
         leave this process suppressing memories the client never received.
         A cancellation still reaches the caller — only the write survives it.
+
+        Bounded by ``timeout_seconds``, the same ceiling the LTM round trip
+        gets, because the worker is a single FIFO thread: this write waits for
+        whatever was queued ahead of it, which can include another call's
+        retention sweep. Once :class:`_TimerScope` has disarmed the surfacing
+        timer, and on the proxy path where no caller deadline exists at all,
+        nothing else would bound that wait. A write that outlives the ceiling
+        still lands — the caller stops waiting for it and degrades as it does
+        for a failed write, which for the event row means withdrawing the
+        advertised feedback ID.
         """
         future = asyncio.ensure_future(run_off_loop(fn, *args))
         try:
-            return await asyncio.shield(future)
-        except asyncio.CancelledError:
+            return await asyncio.wait_for(
+                asyncio.shield(future), timeout=self._config.timeout_seconds
+            )
+        except (asyncio.CancelledError, asyncio.TimeoutError):
             # Consume whatever it ends up doing so asyncio does not report an
             # orphaned exception from a write nobody is waiting for any more.
             future.add_done_callback(self._consume_abandoned_write)
@@ -529,7 +553,8 @@ class SurfacingEngine:
         # succeed on its own before the episode can close. A claim whose row
         # never landed is harmless — its recovery UPDATE matches nothing.
         if kind == "circuit_open":
-            self._breaker_blocked_keys.add((server, tool))
+            self._breaker_claim_seq += 1
+            self._breaker_blocked_keys[(server, tool)] = self._breaker_claim_seq
         # The claim is kept whatever the write does. The two mistakes are not
         # symmetric: a claim whose row never landed is inert — its recovery
         # UPDATE matches nothing — while dropping a claim whose row DID land
@@ -645,20 +670,32 @@ class SurfacingEngine:
         """
         if self._feedback_tracker is None:
             return
-        blocked = self._breaker_blocked_keys - {(server, tool)}
+        blocked = set(self._breaker_blocked_keys) - {(server, tool)}
         entries = [(server, tool, FAULT_KINDS)]
         entries.extend(
             (blocked_server, blocked_tool, _CIRCUIT_OPEN_KIND)
             for blocked_server, blocked_tool in sorted(blocked)
         )
-        released = frozenset(blocked | {(server, tool)})
+        released = {key: self._breaker_blocked_keys.get(key) for key in blocked | {(server, tool)}}
         self._submit_store_write(
             functools.partial(
                 self._feedback_tracker.record_fault_recoveries, entries, recovered_at=succeeded_at
             ),
             what="surfacing fault recovery",
-            on_success=functools.partial(self._breaker_blocked_keys.difference_update, released),
+            on_success=functools.partial(self._release_breaker_claims, released),
         )
+
+    def _release_breaker_claims(self, released: dict[tuple[str, str], int | None]) -> None:
+        """Drop the claims this recovery closed, and only those.
+
+        Runs on the worker thread once the UPDATE landed. Each key is checked
+        against the claim number it carried when the write was queued: a key
+        blocked again in the meantime holds a newer claim, whose own
+        ``circuit_open`` row this recovery did not close, so it stays.
+        """
+        for key, generation in released.items():
+            if self._breaker_blocked_keys.get(key) == generation:
+                self._breaker_blocked_keys.pop(key, None)
 
     def _reset_score_scale_streak(self, server: str, tool: str) -> None:
         self._score_scale_streaks.pop((server, tool), None)
@@ -1357,9 +1394,16 @@ class SurfacingEngine:
         if self._feedback_tracker is None:
             return "Feedback tracking is not enabled."
 
-        result = await self._await_store_write(
-            self._feedback_tracker.record_feedback, surfacing_id, rating, memory_id
-        )
+        try:
+            result = await self._await_store_write(
+                self._feedback_tracker.record_feedback, surfacing_id, rating, memory_id
+            )
+        except asyncio.TimeoutError:
+            # The write is queued behind a busy store and still shielded, so it
+            # will land; what this call cannot do is confirm it, and the side
+            # effects below (cache invalidation, the access boost) are only
+            # correct for a rating known to be recorded.
+            return _FEEDBACK_STORE_BUSY
 
         if isinstance(result, str) and result.startswith("Error"):
             return result
@@ -1441,9 +1485,12 @@ class SurfacingEngine:
         # loop. Recording moved off-loop wholesale (#996); doing it per entry
         # would pay the queue wait N times and let a cancellation land a
         # partial batch.
-        results = await self._await_store_write(
-            record_feedback_batch, self._feedback_tracker, surfacing_id, parsed
-        )
+        try:
+            results = await self._await_store_write(
+                record_feedback_batch, self._feedback_tracker, surfacing_id, parsed
+            )
+        except asyncio.TimeoutError:
+            return _FEEDBACK_STORE_BUSY
         recorded = 0
         errors: list[str] = []
         helpful_ids: list[str] = []

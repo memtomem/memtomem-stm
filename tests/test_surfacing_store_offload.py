@@ -296,7 +296,7 @@ async def test_a_claim_made_during_a_recovery_write_is_not_released_by_it(
     engine = _engine(config, gated)
     try:
         engine._persist_fault("gh", "early_tool", "circuit_open")
-        assert engine._breaker_blocked_keys == {("gh", "early_tool")}
+        assert set(engine._breaker_blocked_keys) == {("gh", "early_tool")}
 
         engine._persist_fault_recovery("gh", "read_file", time.time())
         await asyncio.wait_for(gated.entered.wait(), timeout=10.0)
@@ -304,9 +304,111 @@ async def test_a_claim_made_during_a_recovery_write_is_not_released_by_it(
 
         gated.release.set()
         await engine.drain_store_writes()
-        assert engine._breaker_blocked_keys == {("gh", "late_tool")}
+        assert set(engine._breaker_blocked_keys) == {("gh", "late_tool")}
     finally:
         gated.release.set()
+        await engine.stop()
+        tracker.close()
+
+
+async def test_a_key_reblocked_during_the_recovery_keeps_its_new_claim(
+    tmp_path: Path,
+) -> None:
+    # The same key, not a different one: the recovery was queued to close the
+    # episode of claim N, and while it sat there the breaker blocked that key
+    # again under claim N+1. Releasing by key alone would drop N+1, whose own
+    # ``circuit_open`` row this recovery never closed — leaving a fault row
+    # active that no later probe knows to recover.
+    config = _config(tmp_path)
+    tracker = FeedbackTracker(config)
+    gated = _GatedTracker(tracker, "record_fault_recoveries")
+    engine = _engine(config, gated)
+    try:
+        engine._persist_fault("gh", "read_file", "circuit_open")
+        first_claim = engine._breaker_blocked_keys[("gh", "read_file")]
+
+        engine._persist_fault_recovery("gh", "other_tool", time.time())
+        await asyncio.wait_for(gated.entered.wait(), timeout=10.0)
+        engine._persist_fault("gh", "read_file", "circuit_open")
+        assert engine._breaker_blocked_keys[("gh", "read_file")] != first_claim
+
+        gated.release.set()
+        await engine.drain_store_writes()
+        assert set(engine._breaker_blocked_keys) == {("gh", "read_file")}
+    finally:
+        gated.release.set()
+        await engine.stop()
+        tracker.close()
+
+
+async def test_a_write_stuck_behind_the_queue_stops_holding_the_response(
+    tmp_path: Path,
+) -> None:
+    # The worker is one FIFO thread, so an awaited write waits for whatever was
+    # queued ahead of it — another call's retention sweep, a burst of fault
+    # counters. With the surfacing timer disarmed past the LTM round trip, and
+    # with no caller deadline at all on the proxy path, nothing else would
+    # bound that wait. The call gives up on the row and degrades the way it
+    # does for a failed write.
+    config = _config(tmp_path, timeout_seconds=0.3)
+    tracker = FeedbackTracker(config)
+    engine = _engine(config, tracker)
+    blocker = threading.Event()
+    submit_store_write(lambda: blocker.wait(timeout=10.0))
+    try:
+        started = asyncio.get_running_loop().time()
+        output = await asyncio.wait_for(
+            engine.surface("gh", "read_file", _args("stuck"), LONG_RESPONSE), timeout=5.0
+        )
+        elapsed = asyncio.get_running_loop().time() - started
+
+        assert elapsed < 2.0, f"the response waited {elapsed:.2f}s on a queued write"
+        # Content still delivered; only the feedback handle is withdrawn,
+        # because this process cannot say whether the row will land.
+        assert output != LONG_RESPONSE
+        assert "stm_surfacing_feedback" not in output
+
+        blocker.set()
+        await engine.drain_store_writes()
+        assert _event_count(config.feedback_db_path) == 1, "the write still lands"
+    finally:
+        blocker.set()
+        await engine.stop()
+        tracker.close()
+
+
+async def test_a_busy_store_declines_the_rating_instead_of_raising(tmp_path: Path) -> None:
+    # The rating write is bounded like the event row's. Past the ceiling the
+    # agent gets a sentence it can act on — and specifically one telling it not
+    # to re-submit, because the shielded write is still on its way.
+    config = _config(tmp_path, timeout_seconds=0.3)
+    tracker = FeedbackTracker(config)
+    engine = _engine(config, tracker)
+    blocker = threading.Event()
+    try:
+        await engine.surface("gh", "read_file", _args("rate me"), LONG_RESPONSE)
+        await engine.drain_store_writes()
+        db = sqlite3.connect(str(config.feedback_db_path))
+        try:
+            surfacing_id = db.execute("SELECT id FROM surfacing_events").fetchone()[0]
+        finally:
+            db.close()
+
+        submit_store_write(lambda: blocker.wait(timeout=10.0))
+        result = await asyncio.wait_for(
+            engine.handle_feedback(surfacing_id, "helpful"), timeout=5.0
+        )
+        assert result.startswith("Error: the feedback store is busy")
+
+        blocker.set()
+        await engine.drain_store_writes()
+        db = sqlite3.connect(str(config.feedback_db_path))
+        try:
+            assert db.execute("SELECT COUNT(*) FROM surfacing_feedback").fetchone()[0] == 1
+        finally:
+            db.close()
+    finally:
+        blocker.set()
         await engine.stop()
         tracker.close()
 
@@ -331,7 +433,7 @@ async def test_a_failed_best_effort_write_does_not_change_the_response(
 
         assert any("surfacing fault counter" in r.getMessage() for r in caplog.records)
         # The claim bookkeeping ran on the loop and is unaffected by the write.
-        assert engine._breaker_blocked_keys == set()
+        assert set(engine._breaker_blocked_keys) == set()
     finally:
         await engine.stop()
         tracker.close()
