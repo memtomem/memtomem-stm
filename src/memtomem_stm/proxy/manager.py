@@ -292,8 +292,9 @@ class ProxyToolInfo:
     # tagged with the source server at REGISTRATION, not here, so this field
     # and ``annotations`` reach ``tag_title`` by the same route and the
     # credential scan can ask for the tagged form without re-deriving it.
-    # ``icons`` are forwarded with no rewrite at all: they are a list of MCP
-    # ``Icon`` models whose only text is a URL the client fetches itself.
+    # ``icons`` are forwarded with no rewrite at all: an MCP ``Icon`` is a
+    # ``src`` URL the client fetches itself plus mime type, sizes and theme —
+    # nothing the proxy could budget or shorten without breaking it.
     title: str | None = None  # top-level ``Tool.title`` (MCP ``BaseMetadata``)
     icons: list[Any] | None = None  # MCP ``Icon`` list (SEP-973)
     # Deliberately NOT carried: ``execution`` (MCP 2025-11-25 task support).

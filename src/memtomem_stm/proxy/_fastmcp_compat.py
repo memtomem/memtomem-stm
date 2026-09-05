@@ -174,8 +174,10 @@ def register_proxy_tool(
         add_tool_kwargs["title"] = tool_title
     if tool_icons is not None:
         # Forwarded verbatim. Icons carry no prose the proxy could budget or
-        # rewrite, and their ``src`` is a URL the client resolves itself; the
-        # eligibility scan reads them before this point.
+        # rewrite, and their ``src`` is a URL the client resolves itself.
+        # Whatever text they do hold has been through the eligibility scan by
+        # the time production reaches here — under every profile that runs it,
+        # which is every one but ``explore``.
         add_tool_kwargs["icons"] = tool_icons
     # The SDK treats a duplicate ``add_tool`` as a successful no-op: it returns
     # the tool already under that name without inserting the new handler, and
