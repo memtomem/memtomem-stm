@@ -845,6 +845,17 @@ class DaemonServer:
                     # Same precedence as the `asyncio.TimeoutError` branch below,
                     # which this replaces for surfacing: cold first, then timeout.
                     outcome = "timeout"
+                elif ledger is not None and ledger.faulted:
+                    # A round trip that went out and then failed — the LTM
+                    # dropped the connection mid-flight, raised, or answered
+                    # something the parser could not read. Real LTM time, but
+                    # not a *successful* search, and the percentiles answer how
+                    # long one of those takes. The response cannot carry this:
+                    # the engine returns the caller's text unchanged on a
+                    # fault, so an ``ok`` surfacing reply is shape-identical to
+                    # a healthy one that surfaced nothing, and every such call
+                    # used to be filed as a success duration (#994).
+                    outcome = "error"
                 elif response.get("ok") is not True or (
                     latency_kind == "retrieval"
                     and response.get("outcome") not in (None, "ok", "empty_results")

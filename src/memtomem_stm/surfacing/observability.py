@@ -238,8 +238,40 @@ class CallLedger:
         and the percentiles this gates are advice about the LTM. A call that
         never reached it is not an observation of it, so it files nothing —
         not into the percentiles and not into the timeout count either.
+
+        Scoped to the *search* round trip — ``mem_search`` and the
+        ``context_compose`` action, the two an ``surface()`` call makes on its
+        own behalf. The adapter's lifecycle RPCs (the ``mem_do action=version``
+        probe and the ``list_tools`` rerank check inside ``_negotiate_format``)
+        call the session directly rather than through ``_rpc`` and so do not
+        mark, even when a request's own lazy start ran them. That is the
+        intended scope, not an oversight: the percentiles answer "how long does
+        a warm search take", and a request whose only LTM work was connecting
+        is a cold start, which ``_run_admitted`` already files as ``cold`` on
+        the warmth check that precedes this one.
         """
         return self.ltm_rpc_issued
+
+    @property
+    def faulted(self) -> bool:
+        """Did this call end on a degraded-dependency terminal?
+
+        Read together with :attr:`retrieval_attempted` by a caller bucketing a
+        duration: an RPC that went out and then failed mid-flight is a real
+        measurement of the LTM, but not of a *successful* search, so it does
+        not belong in the percentiles that answer how long one takes. The
+        daemon cannot see this in the response — the engine returns the
+        caller's text unchanged on a fault, so a surfacing reply is shaped
+        exactly like a healthy one that surfaced nothing (#994).
+
+        Deliberately the same membership as the ``stm_surfacing_stats`` fault
+        ratio, so an operator comparing the two reads one definition of
+        "fault". ``timed_out`` overlaps by way of ``error_timeout`` and is kept
+        separate because its consumer buckets a timeout before an error.
+        """
+        return any(reason in FAULT_SKIP_REASONS for reason in self.skip_reasons) or any(
+            outcome in FAULT_OUTCOMES for outcome in self.outcomes
+        )
 
     @property
     def timed_out(self) -> bool:

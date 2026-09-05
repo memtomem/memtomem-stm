@@ -235,12 +235,32 @@ changes inline only. See the deprecation policy in
   The adapter now marks the request's `CallLedger` at the point the RPC is
   handed to the transport (`McpClientSearchAdapter._rpc`, after healing), and
   `retrieval_attempted` reads that mark instead of inferring it; the two sets
-  are gone. A call that never reached the LTM files nothing -- not into the
-  percentiles and not into the timeout count either -- rather than into a
-  separate series, since no consumer asks for one and a non-RPC duration is not
-  a censored observation of the LTM. The pre-existing filter for allowlist,
-  gate and cache-decided terminals is unchanged in effect. Found by a Codex
-  review of #993.
+  are gone. A surfacing call the engine handled to a terminal without reaching
+  the LTM files nothing -- not into the percentiles and not into the timeout
+  count either -- rather than into a separate series, since no consumer asks
+  for one and a non-RPC duration is not a censored observation of the LTM. Two
+  boundaries are deliberate and unchanged: the mark is scoped to the *search*
+  round trip, so the adapter's lifecycle calls (the version probe and the
+  `list_tools` rerank check, which go to the session directly) do not mark, and
+  a request whose only LTM work was connecting is a cold start the warmth check
+  already files as `cold`; and a request that expires while waiting for an
+  admission or LTM slot is still filed as a timeout by the outer handler, which
+  consults no ledger, because that is currently the only telemetry of daemon
+  saturation. The pre-existing filter for allowlist, gate and cache-decided
+  terminals is unchanged in effect.
+
+  **A round trip that failed after the request went out is filed as an error
+  rather than a success duration**, in the same change. The engine returns the
+  caller's text unchanged on a dependency fault, so the daemon's response is
+  `ok` and shape-identical to a healthy call that surfaced nothing -- and
+  classifying from the response alone put every mid-flight connection drop,
+  call error and parse failure into the percentiles that answer how long a
+  *successful* search takes. `CallLedger.faulted` reads the same membership as
+  the `stm_surfacing_stats` fault ratio, so an operator comparing the two reads
+  one definition of "fault", and those durations now increment `error_samples`
+  instead. A completed search whose candidates were all filtered out
+  (`no_results_*`) is healthy and stays a success duration. Found by a Codex
+  review of #993, and the fault classification by a Codex review of this change.
 
 - **A non-finite `chars_per_token` is refused at load, and a char budget whose
   conversion overflows saturates instead of failing the call** (#977). Pydantic's

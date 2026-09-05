@@ -393,20 +393,70 @@ async def test_failed_session_healing_is_not_a_latency_sample(tmp_path: Path) ->
         obs.record_skip("Read", "ltm_unavailable")
         return surface_response({})
 
-    for operation in (healing_failed, connection_dropped_mid_flight):
+    async def run(operation) -> dict[str, object]:
         await server._run_admitted(
             {"deadline_monotonic": asyncio.get_running_loop().time() + 1.0},
             operation,
             latency_kind="surface",
             attribute=True,
         )
+        return server._latency.snapshot()["surface"]
 
-    surface_latency = server._latency.snapshot()["surface"]
-    # ``ltm_unavailable`` is a skip, so the response is ``ok`` with no
-    # memories and the one sample that is filed is a success duration.
-    assert surface_latency["samples"] == 1
-    assert surface_latency["timeout_samples"] == 0
-    assert surface_latency["error_samples"] == 0
+    # Asserted after each call, not once at the end: a totals-only check on a
+    # shared tracker passes just as well for the reversed implementation, which
+    # files the unmarked call and drops the marked one.
+    after_healing_failed = await run(healing_failed)
+    assert after_healing_failed["samples"] == 0
+    assert after_healing_failed["timeout_samples"] == 0
+    assert after_healing_failed["error_samples"] == 0
+
+    after_mid_flight = await run(connection_dropped_mid_flight)
+    # The positive control did issue a request, so it is filed -- as an error,
+    # not a success duration: the round trip is real LTM time but not a
+    # measurement of a search that completed.
+    assert after_mid_flight["error_samples"] == 1
+    assert after_mid_flight["samples"] == 0
+    assert after_mid_flight["timeout_samples"] == 0
+
+
+async def test_a_faulted_round_trip_is_not_a_success_duration(tmp_path: Path) -> None:
+    # The engine returns the caller's text unchanged on a dependency fault, so
+    # the daemon's response is ``ok`` and shape-identical to a healthy call that
+    # surfaced nothing. Classified from the response alone, every fault whose
+    # RPC went out landed in the percentiles that answer how long a *successful*
+    # search takes (#994). The ledger is what tells the two apart.
+    server = DaemonServer(_config(tmp_path))
+    server._ltm_warmth = lambda: "warm"  # type: ignore[method-assign]
+    obs = SurfacingObservability()
+
+    async def parse_failed() -> dict[str, object]:
+        record_ltm_rpc()
+        obs.record_skip("Read", "ltm_parse_empty")
+        return surface_response({})
+
+    async def searched_and_filtered_everything_out() -> dict[str, object]:
+        # The healthy control: a completed round trip whose candidates were all
+        # filtered out is a search that worked, and stays a success duration.
+        record_ltm_rpc()
+        obs.record_skip("Read", "no_results_score")
+        return surface_response({})
+
+    async def run(operation) -> dict[str, object]:
+        await server._run_admitted(
+            {"deadline_monotonic": asyncio.get_running_loop().time() + 1.0},
+            operation,
+            latency_kind="surface",
+            attribute=True,
+        )
+        return server._latency.snapshot()["surface"]
+
+    after_fault = await run(parse_failed)
+    assert after_fault["error_samples"] == 1
+    assert after_fault["samples"] == 0
+
+    after_healthy = await run(searched_and_filtered_everything_out)
+    assert after_healthy["samples"] == 1
+    assert after_healthy["error_samples"] == 1  # unchanged by the healthy call
 
 
 async def test_gate_skip_is_not_a_latency_sample(tmp_path: Path) -> None:

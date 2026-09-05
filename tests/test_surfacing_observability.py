@@ -694,6 +694,54 @@ class TestCallLedger:
             pass
         assert ledger.retrieval_attempted is False
 
+    async def test_a_late_mark_cannot_reach_another_requests_ledger(self):
+        # Same safety property the outcomes have, asserted for the new mutable
+        # flag: an operation abandoned at timeout keeps a reference to a ledger
+        # whose block has exited. Its late mark must land there, never in the
+        # request that came after it -- which would file a latency sample for a
+        # call that issued nothing.
+        may_mark = asyncio.Event()
+
+        async def abandoned() -> None:
+            await may_mark.wait()
+            record_ltm_rpc()
+
+        with attribute_call() as abandoned_ledger:
+            straggler = asyncio.create_task(abandoned())
+        with attribute_call() as next_ledger:
+            may_mark.set()
+            await straggler
+
+        assert next_ledger.retrieval_attempted is False
+        assert abandoned_ledger.retrieval_attempted is True
+
+    def test_faulted_reads_both_buckets_and_is_independent_of_the_mark(self):
+        # ``faulted`` buckets a duration that ``retrieval_attempted`` already
+        # admitted; the two answer different questions and a consumer reads
+        # both. A fault with no RPC behind it is not a sample at all.
+        obs = SurfacingObservability()
+        with attribute_call() as rpc_then_dropped:
+            record_ltm_rpc()
+            obs.record_skip("Read", "ltm_unavailable")
+        with attribute_call() as rpc_then_raised:
+            record_ltm_rpc()
+            obs.record_outcome("Read", "error_other")
+        with attribute_call() as searched_and_filtered:
+            record_ltm_rpc()
+            obs.record_skip("Read", "no_results_score")
+        with attribute_call() as healing_failed:
+            obs.record_skip("Read", "ltm_unavailable")
+
+        assert rpc_then_dropped.faulted is True
+        assert rpc_then_dropped.retrieval_attempted is True
+        assert rpc_then_raised.faulted is True
+        # A completed search that filtered everything out is healthy, not a
+        # fault -- the same call the percentiles exist to measure.
+        assert searched_and_filtered.faulted is False
+        assert searched_and_filtered.retrieval_attempted is True
+        assert healing_failed.faulted is True
+        assert healing_failed.retrieval_attempted is False
+
     def test_the_mark_is_per_ledger(self):
         # An RPC issued under one request's ledger says nothing about the next.
         with attribute_call() as first:

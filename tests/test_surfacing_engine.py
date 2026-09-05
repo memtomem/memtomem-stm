@@ -1470,6 +1470,35 @@ class TestLedgerRpcMark:
         assert ledger.skip_reasons == ["ltm_unavailable"]
         assert ledger.retrieval_attempted is False
 
+    async def test_a_lifecycle_rpc_alone_does_not_mark(self):
+        # The adapter's own lifecycle calls -- the ``mem_do action=version``
+        # probe and the ``list_tools`` rerank check in ``_negotiate_format`` --
+        # go to the session directly, not through ``_rpc``, so they do not mark
+        # even when a request's lazy start ran them inside its ledger. That is
+        # the scope: the percentiles measure a search, and a request whose only
+        # LTM work was connecting is a cold start the daemon files as ``cold``
+        # on the warmth check that precedes the mark.
+        from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+        from memtomem_stm.surfacing.observability import attribute_call
+
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
+        session = AsyncMock()
+        session.call_tool = AsyncMock(return_value=self._hit())
+
+        with attribute_call() as ledger:
+            # Exactly what negotiation does: the session, not ``_rpc``.
+            await session.call_tool("mem_do", {"action": "version"})
+            await session.list_tools()
+        assert ledger.retrieval_attempted is False
+
+        # And the search RPC through the same session does mark -- so the
+        # assertion above is about the call path, not about a session too inert
+        # to mark anything.
+        adapter._session = session
+        with attribute_call() as searched:
+            await adapter.search("q")
+        assert searched.retrieval_attempted is True
+
     async def test_a_round_trip_that_times_out_is_still_marked(self):
         # The positive control for the two negatives above: the same
         # ``error_timeout`` terminal, but this time a request did go out and
