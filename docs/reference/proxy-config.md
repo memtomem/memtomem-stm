@@ -126,10 +126,17 @@ leaves room for the prefix and some surviving text.
 
 When the budget is tight the convention suffix wins over upstream text, because
 it names the follow-up tool the response requires. If even the suffix alone
-cannot fit, it is dropped whole rather than cut short. When the selected source
-text is empty — an upstream that supplies no description and no override to
-stand in for it — nothing survives to be truncated, so what is advertised is the
-prefix plus whatever suffix fits.
+cannot fit, it is dropped whole rather than cut short. If no body survives
+beside a suffix, the space the suffix opens with is dropped: the prefix already
+ends in one.
+
+Source text is stripped before it is budgeted, so whitespace-only text counts as
+none. When the selected source text is empty — an upstream that supplies no
+description, and no override to stand in for it — the prefixed tool name is
+advertised in its place (`[proxied] fs__read_file`). It is the only text the
+proxy can supply without inventing a claim about what the tool does, and it is
+budgeted like any other source text: truncated to what the cap leaves after the
+prefix and the suffix, never exempt from the cap.
 
 The cap is applied where a tool is advertised, so it describes what
 registration produces rather than what the config file currently says. The

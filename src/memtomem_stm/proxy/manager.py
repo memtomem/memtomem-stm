@@ -3242,12 +3242,29 @@ class ProxyManager:
                 # not name its tool at all — and otherwise wins over upstream
                 # text, since it is what tells the client which follow-up tool
                 # to call (#893).
-                desc = t.description or ""
+                #
+                # Source text is stripped, so whitespace-only text counts as
+                # none, and an upstream (or override) that supplies none falls
+                # back to the prefixed name (#922). The name is the only text
+                # the proxy holds that says something true about the tool
+                # without inventing a claim, and it is budgeted like any other
+                # text — the cap is on what the client sees, and nothing here
+                # is exempt from it. What this replaces is a bare ``[proxied] ``
+                # advertisement carrying no statement at all.
+                prefixed_name = f"{cfg.prefix}__{t.name}"
+                desc = (t.description or "").strip()
                 if advert_override is not None and advert_override.description_override is not None:
-                    desc = advert_override.description_override
+                    desc = advert_override.description_override.strip()
+                if not desc:
+                    desc = prefixed_name
                 budget = min(max_desc, global_max_desc) - len(PROXIED_PREFIX)
                 if suffix and len(suffix) <= budget:
-                    desc = self._truncate_description(desc, budget - len(suffix)) + suffix
+                    body = self._truncate_description(desc, budget - len(suffix))
+                    # The suffix opens with a space and the prefix closes with
+                    # one. With a body between them both separate something;
+                    # with no body left they would meet, which is where the
+                    # doubled space in ``[proxied]  | …`` came from (#922).
+                    desc = body + suffix if body else suffix.lstrip()
                 else:
                     desc = self._truncate_description(desc, budget)
 
@@ -3267,7 +3284,7 @@ class ProxyManager:
                 candidates.append(
                     ExposureCandidate(
                         info=ProxyToolInfo(
-                            prefixed_name=f"{cfg.prefix}__{t.name}",
+                            prefixed_name=prefixed_name,
                             description=desc,
                             input_schema=schema,
                             server=conn.name,

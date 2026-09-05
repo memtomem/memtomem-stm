@@ -47,11 +47,11 @@ _MISSING = object()
 #: 32 is a usability choice, not the arithmetic minimum. That minimum is 10:
 #: registration prepends the prefix unconditionally, so a cap below its length
 #: cannot be met at all, while every cap of 10 or more is met exactly. The
-#: floor is set where a surviving description can still say something, and it
-#: does NOT guarantee one — an upstream that supplies no description
-#: contributes no text at any cap, leaving only the prefix and, where it fits,
-#: the convention suffix (#896). Not imported from ``tool_metadata``, which
-#: imports this module.
+#: floor is set where a surviving description can still say something. An
+#: upstream that supplies no description contributes no text at any cap, and
+#: what is advertised then is the prefixed tool name, budgeted like any other
+#: source text (#922) — where once it was the bare prefix (#896). Not imported
+#: from ``tool_metadata``, which imports this module.
 MIN_DESCRIPTION_CHARS = 32
 
 

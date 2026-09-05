@@ -35,6 +35,32 @@ changes inline only. See the deprecation policy in
 
 ### Changed
 
+- **An upstream tool that supplies no description now advertises its own
+  prefixed name** (#922, issue #896). The description a client receives is
+  assembled, not copied, and the assembly had no floor of meaning: an upstream
+  that set no description contributed no text at any cap, so what arrived was
+  the bare `[proxied] ` prefix, or — where a convention suffix fitted —
+  `[proxied]  | TOC response: use stm_proxy_select_chunks`, with a doubled
+  space and no statement of what the tool does. The `32` floor on
+  `max_description_chars` bounds that string from above and could never
+  establish one from below. The prefixed name (`[proxied] fs__read_file`) is
+  the only text the proxy holds that says something true about the tool without
+  inventing a claim, and it is the name the client would have to call anyway.
+  It is budgeted like any other source text: the convention suffix still takes
+  its share of the cap first, and what is left of the name is truncated on the
+  same path upstream text takes.
+
+  **Behavior change**: three client-visible shapes change. A tool with no
+  description (or an explicitly blank `description_override`) is advertised
+  with its prefixed name instead of nothing. Whitespace-only source text now
+  counts as empty and takes that fallback, and surrounding whitespace is
+  stripped from source text that survives. Where a suffix is advertised with no
+  body beside it, the suffix's leading space is dropped, since the prefix
+  already ends in one — the doubled-space shape is gone. The tool-relevance
+  ranker (#466) scores the advertised description, so tools that previously
+  carried none now carry their name there as well as in the ranker's heading
+  field; the ranking is telemetry input only and gates nothing.
+
 - **Client-config discovery returns a typed candidate record, and its readers
   consume the identity facts the scan established** (#987). The scan used to
   hand back bare dicts, so which of `raw`, the normalized entry and the
