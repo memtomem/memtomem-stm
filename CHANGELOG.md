@@ -90,6 +90,63 @@ changes inline only. See the deprecation policy in
   carried none now carry their name there as well as in the ranker's heading
   field; the ranking is telemetry input only and gates nothing.
 
+- **The daemon runs several LTM operations at once instead of one** (#874).
+  Every surfacing and raw-LTM request used to pass through a single
+  serialization lock, so a burst of tool calls -- the ordinary shape of a
+  coding session -- queued behind each other while each one's client deadline
+  kept running. The daemon re-reads the remaining budget after the wait, and
+  the floor for starting a round trip is only 0.25s, so a request that waited
+  most of its 2.5s still called the engine, timed out, and counted toward the
+  circuit breaker; once that opened, every following call was refused before
+  the relevance gate. That is the shape of this repo's own fault data, where
+  `circuit_open` outnumbers `error_timeout` roughly 3:2 across the burst days.
+  Up to `daemon.max_concurrent_ltm_ops` (default 4) requests now hold the LTM
+  session at once, and the deadline still covers the wait for a slot, so a
+  request whose client has already given up is shed without starting a round
+  trip nobody will read. Measured against a stand-in LTM taking 0.3s per
+  search, a burst of eight distinct reads goes from 2.1s with one timed-out
+  tail call to 0.61s with none, and the daemon's own timeout recommendation
+  drops from 3.5s to 1.5s.
+
+  The lock's stated reason -- that stdio framing is unsafe under interleaved
+  calls -- was not true. The MCP SDK correlates concurrent requests by
+  JSON-RPC id behind a single writer task, and STM's own LTM adapter already
+  documents that `call_tool` is task-agnostic and marshals only lifecycle
+  operations through its owner task. The real bound is what the LTM child can
+  serve in parallel.
+
+  A closed connection is now recognized as one. The SDK reports a dead peer as
+  `MCPError(CONNECTION_CLOSED)`, which inherits from `Exception` rather than
+  `OSError`, so the adapter's transport classification never matched it: every
+  call site fell through to its generic handler, returned `call_error`, and
+  left the dead session in place. A daemon whose LTM child died served
+  `call_error` until it was restarted -- verified against `main`, so this is
+  older than #874, but the concurrency work depends on the error path being the
+  one that heals. `_rpc` now translates that one code, and only that code:
+  every other `MCPError` is the peer answering.
+
+  The negotiated result format and the compose schema are read once per RPC
+  rather than after it. A reconnect renegotiates both, and reconnects can now
+  overlap an in-flight call, so a reply requested as structured could be parsed
+  as compact -- a parse error on a good answer.
+
+  Cancelling one LTM call no longer retires the shared MCP session. That rule
+  came from #290, when a cancelled request was assumed to leave the stdio
+  stream half-read; under the `mcp>=2.0` floor the dispatcher sends the peer a
+  courtesy `cancelled` notification and drops only that request's waiter. While
+  surfacing was serialized the rule was merely unnecessary — with concurrent
+  calls it is harmful, because the next arrival's reconnect closes the
+  transport under sibling RPCs and fails them with "Connection closed". A
+  session that really is broken still heals: every RPC call site marks the
+  generation dirty on a transport *error*, which is the signal that means it.
+
+  **Behavior change**: set `daemon.max_concurrent_ltm_ops` to `1` for the
+  older serialized daemon; that is the only value that restores it, since a
+  core with no parallel capacity degrades the same way at `2` as at `4`.
+  `mms daemon status` reports `queue.in_flight` above 1 now that it counts
+  operations rather than a lock's state, and gains `queue.concurrency`
+  alongside it.
+
 - **The daemon reads a surfacing request's own outcome from a per-call ledger
   instead of a global counter delta** (#874). `_run_admitted` decided whether
   to file a latency sample, and whether that sample was a timeout, by

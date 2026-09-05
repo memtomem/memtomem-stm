@@ -572,16 +572,22 @@ class TestCallLedger:
         assert obs.snapshot()["skip_reasons"]["__total__"] == {"gate_cooldown": 1}
 
     async def test_ledger_captures_records_made_in_child_tasks(self):
-        # The engine decides its timeout outcome inside the task
-        # ``_run_within`` spawns, so a ledger that only saw the calling task
-        # would miss exactly the record the daemon opened it for.
+        # The engine runs the surfacing body in a task ``_run_within`` spawns
+        # (`asyncio.ensure_future`), and the terminal outcome of a completed
+        # search — ``surfaced_cache_miss`` — is recorded in there. A ledger
+        # that only saw the calling task would miss it and the daemon would
+        # file no latency sample for a request that did the work.
+        #
+        # (``error_timeout`` is NOT that case: it is raised out of the child
+        # and caught by ``surface()`` in the caller's own task. It is covered
+        # by the daemon tests instead.)
         obs = SurfacingObservability()
         with attribute_call() as ledger:
             await asyncio.ensure_future(
-                _record_later(obs, "error_timeout"),
+                _record_later(obs, "surfaced_cache_miss"),
             )
-        assert ledger.outcomes == ["error_timeout"]
-        assert ledger.timed_out is True
+        assert ledger.outcomes == ["surfaced_cache_miss"]
+        assert ledger.retrieval_attempted is True
 
     async def test_ledger_is_isolated_between_concurrent_tasks(self):
         # Two overlapping surfacing calls: neither may see the other's record.

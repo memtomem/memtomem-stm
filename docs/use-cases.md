@@ -61,11 +61,13 @@ The daemon shares the LTM connection. Response caches, feedback, rate limits,
 and tuning remain local to each proxy; this is not remote HA or multi-tenant
 infrastructure.
 
-Use `mms daemon status --json` to record `queue.active`, `queue.queued`, queue
-capacity, and cumulative busy rejections beside latency percentiles. The
-current daemon serializes access to one warm MCP session; queue telemetry is
-the evidence needed before increasing concurrency or introducing a session
-pool.
+Use `mms daemon status --json` to record `queue.active`, `queue.queued`,
+`queue.in_flight`, `queue.concurrency`, queue capacity, and cumulative busy
+rejections beside latency percentiles. The daemon runs up to
+`daemon.max_concurrent_ltm_ops` LTM operations at once against one warm MCP
+session; `in_flight` sitting at `concurrency` while `queued` grows is the
+evidence that raising the bound — or introducing a session pool — is the next
+step rather than a guess.
 
 ## Common evidence rules
 

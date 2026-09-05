@@ -657,6 +657,29 @@ class TestDaemonHostConstraint:
         assert STMConfig().daemon.host == "0.0.0.0"
 
 
+class TestDaemonConcurrencyConstraint:
+    """``max_concurrent_ltm_ops`` bounds how many admitted requests hold the
+    LTM session at once (#874). Both ends of the range are load-bearing: ``1``
+    is the documented escape hatch back to the serialized daemon, and the upper
+    bound keeps a burst from fanning out past what the LTM child can serve."""
+
+    def test_default_allows_a_burst_to_overlap(self) -> None:
+        assert DaemonConfig().max_concurrent_ltm_ops == 4
+
+    def test_one_is_accepted_as_the_serialized_escape_hatch(self) -> None:
+        assert DaemonConfig(max_concurrent_ltm_ops=1).max_concurrent_ltm_ops == 1
+
+    @pytest.mark.parametrize("value", [0, -1, 17])
+    def test_out_of_range_rejected(self, value: int) -> None:
+        # Zero would admit requests into a queue nothing ever drains.
+        with pytest.raises(ValidationError):
+            DaemonConfig(max_concurrent_ltm_ops=value)
+
+    def test_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MEMTOMEM_STM_DAEMON__MAX_CONCURRENT_LTM_OPS", "2")
+        assert STMConfig().daemon.max_concurrent_ltm_ops == 2
+
+
 class TestHookDeadlineBudgetConstraint:
     """``daemon_timeout_seconds`` becomes the client deadline
     (``now + budget``), so a non-finite value is not a big budget — it is a

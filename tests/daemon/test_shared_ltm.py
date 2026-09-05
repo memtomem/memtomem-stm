@@ -6,6 +6,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -999,9 +1000,8 @@ async def test_adapter_stop_does_not_shutdown_shared_daemon(tmp_path: Path) -> N
     await DaemonLtmAdapter(_config(tmp_path)).stop()
 
 
-@pytest.mark.asyncio
-async def test_mixed_ltm_operations_are_serialized(tmp_path: Path) -> None:
-    server = DaemonServer(_config(tmp_path))
+def _peak_counting_adapter() -> tuple[SimpleNamespace, Callable[[], int]]:
+    """An LTM adapter that reports the most searches it ever ran at once."""
     active = 0
     peak = 0
 
@@ -1013,11 +1013,40 @@ async def test_mixed_ltm_operations_are_serialized(tmp_path: Path) -> None:
         active -= 1
         return [], [], "empty_results"
 
-    server._adapter = SimpleNamespace(search=search)
+    return SimpleNamespace(search=search), lambda: peak
+
+
+@pytest.mark.asyncio
+async def test_mixed_ltm_operations_overlap_up_to_the_configured_bound(tmp_path: Path) -> None:
+    # The daemon used to run exactly one LTM operation at a time, so a burst
+    # charged every arrival the wait ahead of it against its own client
+    # deadline (#874). Overlap is the fix; the bound is what keeps it from
+    # becoming an unbounded fan-out into the LTM child.
+    config = _config(tmp_path)
+    config.daemon.max_concurrent_ltm_ops = 4
+    server = DaemonServer(config)
+    server._adapter, peak = _peak_counting_adapter()
+
+    requests = [_request(OP_LTM_SEARCH, {"query": f"q-{i}"}) for i in range(8)]
+    await asyncio.gather(*(server._dispatch(request) for request in requests))
+
+    assert peak() == 4
+
+
+@pytest.mark.asyncio
+async def test_max_concurrent_ltm_ops_one_restores_the_serialized_daemon(tmp_path: Path) -> None:
+    # The escape hatch for an LTM with no parallel capacity of its own, where
+    # overlap would only move the queue into the child and get RPCs cancelled
+    # mid-flight. It must reproduce the old behavior exactly, not approximately.
+    config = _config(tmp_path)
+    config.daemon.max_concurrent_ltm_ops = 1
+    server = DaemonServer(config)
+    server._adapter, peak = _peak_counting_adapter()
+
     requests = [_request(OP_LTM_SEARCH, {"query": f"q-{i}"}) for i in range(4)]
     await asyncio.gather(*(server._dispatch(request) for request in requests))
 
-    assert peak == 1
+    assert peak() == 1
 
 
 @pytest.mark.asyncio

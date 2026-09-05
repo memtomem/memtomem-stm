@@ -254,6 +254,28 @@ def test_config_fingerprint_stable_and_broad(monkeypatch: pytest.MonkeyPatch):
     assert discovery.config_fingerprint(STMConfig()) != fp
 
 
+def test_config_fingerprint_separates_daemon_concurrency(monkeypatch: pytest.MonkeyPatch):
+    # Both admission bounds change what the daemon does, so both split identity.
+    # Without this a caller that configured the serialized daemon
+    # (`max_concurrent_ltm_ops=1`) keys to the same handshake as a running
+    # four-way one and silently reuses it (#874).
+    monkeypatch.delenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", raising=False)
+    fp = discovery.config_fingerprint(STMConfig())
+
+    serialized = STMConfig()
+    serialized.daemon.max_concurrent_ltm_ops = 1
+    assert discovery.config_fingerprint(serialized) != fp
+
+    wider = STMConfig()
+    wider.daemon.max_concurrent_ltm_ops = 8
+    assert discovery.config_fingerprint(wider) != fp
+    assert discovery.config_fingerprint(wider) != discovery.config_fingerprint(serialized)
+
+    admission = STMConfig()
+    admission.daemon.max_pending_requests = 8
+    assert discovery.config_fingerprint(admission) != fp
+
+
 def test_config_fingerprint_survives_a_hostile_surface_tools_env(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -1135,6 +1157,50 @@ class TestDaemonStatusCli:
         assert info["uptime_seconds"] >= 0.0
         assert "hook_will_use_daemon" in info
         assert "standalone_will_use_daemon" in info
+
+    def test_status_json_carries_the_latency_the_guidance_names(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # The concurrency and hook-timeout guidance both tell operators to read
+        # these numbers from `mms daemon status`. The daemon has always sent
+        # them; the status command dropped them on the floor (#874).
+        import json
+        import time as _time
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        latency = {
+            "surface": {
+                "samples": 12,
+                "timeout_samples": 1,
+                "p50_ms": 455.4,
+                "p95_ms": 607.2,
+                "recommendation": {"status": "provisional", "seconds": 1.5},
+            }
+        }
+
+        async def fake_ping(config, *, timeout=2.0):
+            return {
+                "pid": 11,
+                "host": "127.0.0.1",
+                "port": 4567,
+                "ltm": "warm",
+                "created_at": _time.time(),
+                "queue": {"active": 0, "in_flight": 0, "concurrency": 4},
+                "latency": latency,
+            }
+
+        monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
+        result = CliRunner().invoke(_cli(), ["daemon", "status", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output)["latency"] == latency
+
+        text = CliRunner().invoke(_cli(), ["daemon", "status"])
+        assert text.exit_code == 0, text.output
+        assert "in_flight=0/4" in text.output
+        assert "p50=455ms" in text.output
+        assert "suggested_timeout=1.5s" in text.output
 
     def test_unreadable_handshake_is_stale_not_stopped(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

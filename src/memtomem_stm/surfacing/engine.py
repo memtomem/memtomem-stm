@@ -80,8 +80,10 @@ Small on purpose: past one or two, the LTM is not answering anyway.
 Counts only *abandoned* operations, not every one in flight. Reserving on every
 attempt would give a hard instantaneous cap, but nothing at admission time
 knows which attempts will get stuck, so it would equally cap healthy
-concurrency (the daemon serializes surfacing; ``ProxyManager`` does not) and
-report ordinary saturation as this dependency fault. The cost is that a burst
+concurrency (neither caller serializes surfacing: ``ProxyManager`` never did,
+and the daemon admits ``daemon.max_concurrent_ltm_ops`` at once since #874 —
+so one wedged LTM can fill this cap in a single burst rather than over four
+sequential timeouts, which is the intended reading and not a new failure). The cost is that a burst
 already in flight when the LTM wedges can overshoot — each of those read the
 count before any of them had timed out. That is bounded, since everything after
 they land is refused, and it errs toward letting a healthy LTM work.
@@ -1037,7 +1039,7 @@ class SurfacingEngine:
         :class:`asyncio.TimeoutError` path below records the fault, logs, and
         counts the failure toward the breaker (#579), and an outside
         cancellation skips all three, so the breaker never opens and every
-        subsequent call pays the full timeout and respawns the LTM child again.
+        subsequent call pays the full timeout again.
         :meth:`_run_within` is what makes that abort reliably ours to raise
         rather than a race against the caller's backstop (#720). A cancellation
         that reaches here is therefore one this call did not start — a
@@ -1095,8 +1097,8 @@ class SurfacingEngine:
                 # Pre-timeout work (gate, query extraction, privacy scan)
                 # consumed the caller's whole window (#720). Book the abort
                 # through the branch below without starting an LTM round trip
-                # that would be cancelled mid-RPC and force a stdio child
-                # respawn on the next call (#290/#296). No LTM work started
+                # that would only be cancelled mid-RPC, spending the LTM's
+                # time on an answer nobody reads. No LTM work started
                 # also means no rate-limit attempt was made (the cap counts
                 # attempts because an attempt spent LTM resources — see
                 # ``release_claim``); the timeout/breaker booking still
@@ -1128,10 +1130,9 @@ class SurfacingEngine:
                 max(effective_timeout, 0.0),
             )
             # A hung LTM must open the breaker like an erroring one (#579): a
-            # timeout is a degraded dependency, and it also cancels the adapter
-            # mid-RPC, forcing a stdio child respawn on the next call (#290/#296).
-            # Without counting it, every eligible call pays the full timeout
-            # indefinitely and the breaker never opens.
+            # timeout is a degraded dependency. Without counting it, every
+            # eligible call pays the full timeout indefinitely and the breaker
+            # never opens.
             self._circuit_breaker.record_failure()
             return response_text
         except _DependencyFault:

@@ -120,6 +120,10 @@ def config_fingerprint(config: STMConfig) -> str:
         "host": config.daemon.host,
         "idle_timeout_seconds": config.daemon.idle_timeout_seconds,
         "max_pending_requests": config.daemon.max_pending_requests,
+        # Sibling of the line above and required for the same reason: a caller
+        # that asked for the serialized daemon must not silently reuse a
+        # running four-way one, and vice versa (#874).
+        "max_concurrent_ltm_ops": config.daemon.max_concurrent_ltm_ops,
         "surface_tools_env": os.environ.get("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", ""),
         "protocol_version": PROTOCOL_VERSION,
     }

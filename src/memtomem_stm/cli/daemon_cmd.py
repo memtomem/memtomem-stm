@@ -522,6 +522,11 @@ def status_cmd(as_json: bool) -> None:
             "port": hs.get("port"),
             "ltm": hs.get("ltm"),
             "queue": hs.get("queue"),
+            # The percentiles and the derived hook-timeout recommendation. The
+            # daemon has always reported them on the wire; dropping them here
+            # left `--json` without the numbers the concurrency and timeout
+            # guidance tells operators to tune from (#874).
+            "latency": hs.get("latency"),
             "uptime_seconds": round(uptime, 1),
             "hook_will_use_daemon": use_daemon,
             "standalone_will_use_daemon": standalone_use_daemon,
@@ -579,9 +584,22 @@ def status_cmd(as_json: bool) -> None:
         if isinstance(queue, dict):
             click.echo(
                 "queue: "
-                f"active={queue.get('active', 0)} queued={queue.get('queued', 0)} "
+                f"active={queue.get('active', 0)} "
+                f"in_flight={queue.get('in_flight', 0)}/{queue.get('concurrency', 1)} "
+                f"queued={queue.get('queued', 0)} "
                 f"capacity={queue.get('capacity', 0)} "
                 f"busy_rejections={queue.get('busy_rejections', 0)}"
+            )
+        surface = (info.get("latency") or {}).get("surface")
+        if isinstance(surface, dict) and surface.get("samples"):
+            recommendation = surface.get("recommendation") or {}
+            click.echo(
+                "surface latency: "
+                f"samples={surface.get('samples', 0)} "
+                f"timeouts={surface.get('timeout_samples', 0)} "
+                f"p50={_as_float(surface.get('p50_ms'), 0.0):.0f}ms "
+                f"p95={_as_float(surface.get('p95_ms'), 0.0):.0f}ms "
+                f"suggested_timeout={recommendation.get('seconds', '?')}s"
             )
     elif state == "stale" and info.get("handshake_unreadable"):
         # No pid line: reading the record is what failed.

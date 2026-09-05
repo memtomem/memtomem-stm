@@ -226,8 +226,18 @@ never falls back to a private LTM child.
 ```bash
 export MEMTOMEM_STM_DAEMON__HOST=127.0.0.1
 export MEMTOMEM_STM_DAEMON__IDLE_TIMEOUT_SECONDS=900
+export MEMTOMEM_STM_DAEMON__MAX_CONCURRENT_LTM_OPS=4     # 1 = serialized daemon
 export MEMTOMEM_STM_DAEMON__ALLOW_NON_LOOPBACK=false     # escape hatch, see below
 ```
+
+`max_concurrent_ltm_ops` is how many admitted requests may hold the LTM session
+at once. Requests beyond it wait while their client deadline runs, so a low
+value makes a burst charge each arrival the wait ahead of it; a value above the
+LTM's own parallel capacity only moves that queue into the LTM process, where an
+overrun has the RPC cancelled mid-flight, spending the LTM's time on an answer
+nobody reads. Watch
+`queue.in_flight` against `queue.concurrency` in `mms daemon status` before
+changing it.
 
 The daemon binds loopback and authenticates requests with a per-start token,
 not network ACLs. A non-loopback `host` (including `0.0.0.0` and `""`, which
