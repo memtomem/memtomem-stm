@@ -244,11 +244,19 @@ class CallLedger:
         own behalf. The adapter's lifecycle RPCs (the ``mem_do action=version``
         probe and the ``list_tools`` rerank check inside ``_negotiate_format``)
         call the session directly rather than through ``_rpc`` and so do not
-        mark, even when a request's own lazy start ran them. That is the
-        intended scope, not an oversight: the percentiles answer "how long does
-        a warm search take", and a request whose only LTM work was connecting
-        is a cold start, which ``_run_admitted`` already files as ``cold`` on
-        the warmth check that precedes this one.
+        mark, even when a request's own lazy start ran them. The percentiles
+        answer "how long does a warm search take", and a connect is not a
+        search — marking one would put child-spawn and negotiation time into
+        the series, which is the defect this exists to remove.
+
+        The consequence is exact and worth stating: a request whose *only* LTM
+        work was a start or reconnect that then failed produces **no latency
+        sample at all**. Not ``cold`` either — the daemon's warmth check sits
+        inside the branch this flag gates, so an unmarked call is dropped
+        before it is reached. That signal lives elsewhere rather than being
+        lost: such a call still records ``ltm_unavailable``, which is in
+        :data:`FAULT_SKIP_REASONS` and so raises the ``stm_surfacing_stats``
+        fault ratio, and it still charges the circuit breaker.
         """
         return self.ltm_rpc_issued
 

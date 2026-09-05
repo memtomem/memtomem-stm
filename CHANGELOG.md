@@ -220,7 +220,7 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - **The daemon files a warm-search latency sample only for a request that
-  actually issued an LTM RPC** (#994). `_run_admitted` decided whether a
+  actually issued a search RPC to the LTM** (#994). `_run_admitted` decided whether a
   surfacing request was a sample from the terminal decision the engine
   recorded (`RETRIEVAL_SKIP_REASONS` / `RETRIEVAL_OUTCOMES`, #874). Those sets
   named a *stage*, not a round trip, and three of their members are also
@@ -239,28 +239,46 @@ changes inline only. See the deprecation policy in
   the LTM files nothing -- not into the percentiles and not into the timeout
   count either -- rather than into a separate series, since no consumer asks
   for one and a non-RPC duration is not a censored observation of the LTM. Two
-  boundaries are deliberate and unchanged: the mark is scoped to the *search*
-  round trip, so the adapter's lifecycle calls (the version probe and the
-  `list_tools` rerank check, which go to the session directly) do not mark, and
-  a request whose only LTM work was connecting is a cold start the warmth check
-  already files as `cold`; and a request that expires while waiting for an
-  admission or LTM slot is still filed as a timeout by the outer handler, which
-  consults no ledger, because that is currently the only telemetry of daemon
-  saturation. The pre-existing filter for allowlist, gate and cache-decided
-  terminals is unchanged in effect.
+  boundaries are deliberate. The mark is scoped to the *search* round trip, so
+  the adapter's lifecycle exchanges (the version probe and the `list_tools`
+  rerank check, which go to the session directly) do not mark: a connect is not
+  a search, and marking one would put child-spawn and negotiation time into the
+  very series this change exists to clean up. The consequence is that a request
+  whose only LTM work was a start or reconnect that then failed produces **no
+  latency sample at all**, not a `cold` one -- the warmth check sits inside the
+  branch the mark gates. That signal is not lost: such a call still records
+  `ltm_unavailable`, which raises the `stm_surfacing_stats` fault ratio and
+  charges the circuit breaker. Separately, a request that expires while waiting
+  for an admission or LTM slot is still filed as a timeout by the outer
+  handler, which consults no ledger, because that is currently the only
+  telemetry of daemon saturation. The pre-existing filter for allowlist, gate
+  and cache-decided terminals is unchanged in effect.
 
-  **A round trip that failed after the request went out is filed as an error
-  rather than a success duration**, in the same change. The engine returns the
-  caller's text unchanged on a dependency fault, so the daemon's response is
-  `ok` and shape-identical to a healthy call that surfaced nothing -- and
-  classifying from the response alone put every mid-flight connection drop,
-  call error and parse failure into the percentiles that answer how long a
-  *successful* search takes. `CallLedger.faulted` reads the same membership as
-  the `stm_surfacing_stats` fault ratio, so an operator comparing the two reads
-  one definition of "fault", and those durations now increment `error_samples`
-  instead. A completed search whose candidates were all filtered out
-  (`no_results_*`) is healthy and stays a success duration. Found by a Codex
-  review of #993, and the fault classification by a Codex review of this change.
+  **A warm round trip that failed after the request went out is filed as an
+  error rather than a success duration**, in the same change. The engine
+  returns the caller's text unchanged on a dependency fault, so the daemon's
+  response is `ok` and shape-identical to a healthy call that surfaced nothing
+  -- and classifying from the response alone put every mid-flight connection
+  drop, call error and parse failure into the percentiles that answer how long
+  a *successful* search takes. `CallLedger.faulted` reads the same membership
+  as the `stm_surfacing_stats` fault ratio, so an operator comparing the two
+  reads one definition of "fault", and those durations now increment
+  `error_samples` instead. The two populations are still not identical, by
+  construction: cold-start precedence files a fault on a not-yet-warm daemon as
+  `cold`, and a refusal to attempt (`circuit_open`, `ltm_draining`) is never
+  marked, so neither reaches `error_samples` while both count toward the stats
+  ratio. A completed search whose candidates were all filtered out
+  (`no_results_*`) is healthy and stays a success duration.
+
+  `mms daemon status` renders the surface-latency line on any observation
+  rather than only on a successful one, printing `errors=` beside `timeouts=`
+  and saying so plainly when there are no completed searches to take
+  percentiles over. Gating the line on `samples` meant a daemon whose every
+  search was failing printed no line at all, which reads exactly like a daemon
+  nothing has used yet -- and after the reclassification above that is the
+  daemon an operator most needs the command to describe. Found by a Codex
+  review of #993; the fault classification and this status gap by Codex reviews
+  of the change itself.
 
 - **A non-finite `chars_per_token` is refused at load, and a char budget whose
   conversion overflows saturates instead of failing the call** (#977). Pydantic's

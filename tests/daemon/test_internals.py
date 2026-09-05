@@ -1202,6 +1202,87 @@ class TestDaemonStatusCli:
         assert "p50=455ms" in text.output
         assert "suggested_timeout=1.5s" in text.output
 
+    def test_status_shows_a_failing_daemon_that_has_no_successful_samples(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # A round trip that failed mid-flight is filed as an error rather than
+        # a success duration (#994). Gating the whole latency line on
+        # ``samples`` therefore hid exactly the daemon an operator runs this
+        # command to diagnose: every search failing reads as no line at all,
+        # which is indistinguishable from a daemon nothing has used yet.
+        import time as _time
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+
+        async def fake_ping(config, *, timeout=2.0):
+            return {
+                "pid": 11,
+                "host": "127.0.0.1",
+                "port": 4567,
+                "ltm": "warm",
+                "created_at": _time.time(),
+                "queue": {"active": 0, "in_flight": 0, "concurrency": 4},
+                "latency": {
+                    "surface": {
+                        "samples": 0,
+                        "timeout_samples": 0,
+                        "error_samples": 7,
+                        "p50_ms": None,
+                        "p95_ms": None,
+                        "recommendation": {"status": "collecting", "seconds": None},
+                    }
+                },
+            }
+
+        monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
+        text = CliRunner().invoke(_cli(), ["daemon", "status"])
+
+        assert text.exit_code == 0, text.output
+        assert "errors=7" in text.output
+        assert "no completed searches yet" in text.output
+        # Percentiles over an empty window render as 0ms, which reads as
+        # "instant" — the opposite of what this daemon is doing.
+        assert "p50=" not in text.output
+        assert "suggested_timeout=" not in text.output
+
+    def test_status_omits_the_latency_line_when_nothing_was_observed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # The control for the test above: a daemon with no observations at all
+        # still prints no latency line, so widening the condition did not turn
+        # it into a permanent fixture that says nothing.
+        import time as _time
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+
+        async def fake_ping(config, *, timeout=2.0):
+            return {
+                "pid": 11,
+                "host": "127.0.0.1",
+                "port": 4567,
+                "ltm": "warm",
+                "created_at": _time.time(),
+                "queue": {"active": 0, "in_flight": 0, "concurrency": 4},
+                "latency": {
+                    "surface": {
+                        "samples": 0,
+                        "timeout_samples": 0,
+                        "error_samples": 0,
+                        "cold_samples": 0,
+                    }
+                },
+            }
+
+        monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
+        text = CliRunner().invoke(_cli(), ["daemon", "status"])
+
+        assert text.exit_code == 0, text.output
+        assert "surface latency" not in text.output
+
     def test_unreadable_handshake_is_stale_not_stopped(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):

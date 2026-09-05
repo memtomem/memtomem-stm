@@ -1470,31 +1470,47 @@ class TestLedgerRpcMark:
         assert ledger.skip_reasons == ["ltm_unavailable"]
         assert ledger.retrieval_attempted is False
 
-    async def test_a_lifecycle_rpc_alone_does_not_mark(self):
+    async def test_the_real_lifecycle_exchanges_do_not_mark(self):
         # The adapter's own lifecycle calls -- the ``mem_do action=version``
-        # probe and the ``list_tools`` rerank check in ``_negotiate_format`` --
-        # go to the session directly, not through ``_rpc``, so they do not mark
-        # even when a request's lazy start ran them inside its ledger. That is
-        # the scope: the percentiles measure a search, and a request whose only
-        # LTM work was connecting is a cold start the daemon files as ``cold``
-        # on the warmth check that precedes the mark.
+        # probe in ``_negotiate_format`` and the ``list_tools`` rerank check in
+        # ``_probe_rerank_support`` -- go to the session directly, not through
+        # ``_rpc``, so they do not mark even when a request's lazy start ran
+        # them inside its ledger.
+        #
+        # Drives the REAL methods, not a hand-rolled imitation of what they do:
+        # an implementation that started routing either of them through ``_rpc``
+        # has to fail this, which is the whole point of pinning the boundary.
         from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
         from memtomem_stm.surfacing.observability import attribute_call
 
-        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
+        adapter = McpClientSearchAdapter(
+            SurfacingConfig(result_format="structured", rerank=False)
+        )
         session = AsyncMock()
-        session.call_tool = AsyncMock(return_value=self._hit())
+        version = MagicMock()
+        version_text = MagicMock()
+        version_text.type = "text"
+        version_text.text = '{"capabilities": {"search_formats": ["structured"]}}'
+        version.content = [version_text]
+        session.call_tool = AsyncMock(return_value=version)
+        listing = MagicMock()
+        listing.tools = []
+        session.list_tools = AsyncMock(return_value=listing)
 
         with attribute_call() as ledger:
-            # Exactly what negotiation does: the session, not ``_rpc``.
-            await session.call_tool("mem_do", {"action": "version"})
-            await session.list_tools()
+            await adapter._negotiate_format(session)
+            await adapter._probe_rerank_support(session)
+
+        # Both really ran -- an inert session would make the assertion below
+        # true for the wrong reason.
+        session.call_tool.assert_awaited_once()
+        session.list_tools.assert_awaited_once()
         assert ledger.retrieval_attempted is False
 
-        # And the search RPC through the same session does mark -- so the
-        # assertion above is about the call path, not about a session too inert
-        # to mark anything.
+        # And the search RPC through that same session does mark, so what is
+        # being pinned is the call path and not a session too quiet to mark.
         adapter._session = session
+        session.call_tool = AsyncMock(return_value=self._hit())
         with attribute_call() as searched:
             await adapter.search("q")
         assert searched.retrieval_attempted is True

@@ -591,16 +591,34 @@ def status_cmd(as_json: bool) -> None:
                 f"busy_rejections={queue.get('busy_rejections', 0)}"
             )
         surface = (info.get("latency") or {}).get("surface")
-        if isinstance(surface, dict) and surface.get("samples"):
+        if isinstance(surface, dict) and any(
+            surface.get(counter)
+            for counter in ("samples", "timeout_samples", "error_samples", "cold_samples")
+        ):
             recommendation = surface.get("recommendation") or {}
-            click.echo(
+            # Rendered on any observation, not only on a successful one. A
+            # round trip that failed mid-flight is filed as an error rather
+            # than a success duration (#994), so gating the whole line on
+            # ``samples`` hid the operator's only status-line view of a daemon
+            # whose every search is failing. ``errors`` is printed beside
+            # ``timeouts`` for the same reason; neither feeds the percentiles.
+            summary = (
                 "surface latency: "
                 f"samples={surface.get('samples', 0)} "
                 f"timeouts={surface.get('timeout_samples', 0)} "
-                f"p50={_as_float(surface.get('p50_ms'), 0.0):.0f}ms "
-                f"p95={_as_float(surface.get('p95_ms'), 0.0):.0f}ms "
-                f"suggested_timeout={recommendation.get('seconds', '?')}s"
+                f"errors={surface.get('error_samples', 0)} "
             )
+            if surface.get("samples"):
+                summary += (
+                    f"p50={_as_float(surface.get('p50_ms'), 0.0):.0f}ms "
+                    f"p95={_as_float(surface.get('p95_ms'), 0.0):.0f}ms "
+                    f"suggested_timeout={recommendation.get('seconds', '?')}s"
+                )
+            else:
+                # No successful durations: percentiles would print as 0ms and
+                # read as "instant", the opposite of what this daemon is doing.
+                summary += "no completed searches yet"
+            click.echo(summary.rstrip())
     elif state == "stale" and info.get("handshake_unreadable"):
         # No pid line: reading the record is what failed.
         click.echo(_warn("handshake present but unreadable — daemon state unknown"))
