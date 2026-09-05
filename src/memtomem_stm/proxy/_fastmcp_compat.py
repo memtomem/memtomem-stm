@@ -20,7 +20,11 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase, FuncMetadata
 from mcp.types import CallToolResult, TextContent
 
-from memtomem_stm.proxy.tool_metadata import PROXIED_PREFIX, tag_annotations_title
+from memtomem_stm.proxy.tool_metadata import (
+    PROXIED_PREFIX,
+    tag_annotations_title,
+    tag_title,
+)
 
 
 def to_call_tool_result(result: str | list | CallToolResult) -> CallToolResult:
@@ -106,7 +110,7 @@ def register_proxy_tool(
     handler: Any,
     info: Any,  # ProxyToolInfo
 ) -> bool:
-    """Register a proxy tool with the upstream's actual schema and annotations.
+    """Register a proxy tool with the upstream's schema, annotations and display metadata.
 
     Returns whether this call took ownership of the name; the caller removes
     exactly the names that returned True at teardown (#891). False when
@@ -128,8 +132,16 @@ def register_proxy_tool(
     # before ``add_tool`` or feeding a non-dict into Tool validation.
     raw_output_schema = getattr(info, "output_schema", None)
     raw_meta = getattr(info, "meta", None)
+    raw_title = getattr(info, "title", None)
+    raw_icons = getattr(info, "icons", None)
     output_schema = raw_output_schema if isinstance(raw_output_schema, dict) else None
     tool_meta = raw_meta if isinstance(raw_meta, dict) else None
+    # Tagged here rather than upstream so this call and the credential scan
+    # send the client the same string (#895). ``isinstance`` before tagging:
+    # the stand-ins above answer every attribute, and an untyped one must not
+    # become an ``add_tool`` value the SDK would reject or advertise.
+    tool_title = tag_title(raw_title, info.server) if isinstance(raw_title, str) else None
+    tool_icons = raw_icons if isinstance(raw_icons, list) and raw_icons else None
     # No ``execution`` kwarg, deliberately: the proxy serves every tool
     # synchronously, so the advertised tool declares no task support (#892).
     # Upstream tools that *require* it are withheld one layer up, in
@@ -152,6 +164,19 @@ def register_proxy_tool(
         # that drops the kwarg fails only meta-bearing tools into the
         # version-drift warning below instead of all of them.
         add_tool_kwargs["meta"] = tool_meta
+    if tool_title:
+        # Same conditional shape as ``meta``: a tool whose upstream set no
+        # title produces exactly the pre-#895 call, and an SDK that drops the
+        # kwarg fails only title-bearing tools into the version-drift warning.
+        # The tag matches ``annotations.title`` because MCP ranks this field
+        # ABOVE it for display — tagging one and not the other would put the
+        # unattributed label back in the picker for tools that set both.
+        add_tool_kwargs["title"] = tool_title
+    if tool_icons is not None:
+        # Forwarded verbatim. Icons carry no prose the proxy could budget or
+        # rewrite, and their ``src`` is a URL the client resolves itself; the
+        # eligibility scan reads them before this point.
+        add_tool_kwargs["icons"] = tool_icons
     # The SDK treats a duplicate ``add_tool`` as a successful no-op: it returns
     # the tool already under that name without inserting the new handler, and
     # ``MCPServer.add_tool`` discards that return value, so a collision is

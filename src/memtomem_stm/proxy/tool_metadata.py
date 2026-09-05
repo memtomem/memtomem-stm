@@ -82,6 +82,25 @@ def convention_suffix(
     return ""
 
 
+def tag_title(title: str | None, server_name: str) -> str | None:
+    """Prepend ``[server_name]`` to one display title, or pass it through.
+
+    The shared rule behind both title surfaces a client may render: the
+    top-level ``Tool.title`` (MCP ``BaseMetadata``, forwarded since #895) and
+    ``annotations.title``. A falsy title is returned unchanged, because a
+    client with no title falls back to the already-prefixed ``name`` and
+    manufacturing one here would invent a display string the upstream never
+    supplied.
+
+    Kept as one function so the two surfaces cannot drift apart, and so the
+    credential scan can ask for exactly the text registration will send
+    (:func:`memtomem_stm.proxy.tool_eligibility._flags_sensitive_metadata`).
+    """
+    if not title:
+        return title
+    return f"[{server_name}] {title}"
+
+
 def tag_annotations_title(annotations: Any, server_name: str) -> Any:
     """Prepend ``[server_name]`` to ``annotations.title`` for picker disambiguation.
 
@@ -103,7 +122,7 @@ def tag_annotations_title(annotations: Any, server_name: str) -> Any:
     title = getattr(annotations, "title", None)
     if not title:
         return annotations
-    new_title = f"[{server_name}] {title}"
+    new_title = tag_title(title, server_name)
     model_copy = getattr(annotations, "model_copy", None)
     if callable(model_copy):
         try:

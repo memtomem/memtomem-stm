@@ -341,6 +341,34 @@ class TestGetProxyToolsSchema:
         assert proxy_tools[0].input_schema["properties"]["q"]["description"] == "Query"
 
 
+class TestGetProxyToolsDisplayMetadata:
+    """Top-level ``Tool.title`` and ``Tool.icons`` reach the advertisement
+    record UNTAGGED (#895).
+
+    Registration applies the ``[server]`` tag, and the credential scan reads
+    it back through the same function, so storing a pre-tagged value here
+    would tag it twice on one path or leave the two paths disagreeing.
+    """
+
+    def test_title_and_icons_are_carried_from_the_upstream_tool(self):
+        from mcp.types import Icon
+
+        icons = [Icon(src="https://example.test/icon.svg")]
+        tool = _fake_tool("tool")
+        tool.title = "Close browser"
+        tool.icons = icons
+        info = _make_manager_with_tools([tool]).get_proxy_tools()[0]
+        assert info.title == "Close browser"
+        assert info.icons == icons
+
+    def test_an_upstream_without_them_carries_none(self):
+        # ``_fake_tool`` has neither attribute, which is also the shape of a
+        # pre-2025-11-25 SDK's Tool model.
+        info = _make_manager_with_tools([_fake_tool("tool")]).get_proxy_tools()[0]
+        assert info.title is None
+        assert info.icons is None
+
+
 class TestTokenSavings:
     def test_50_tools_description_savings(self):
         """50 tools with 500-char descriptions → truncated to 200 saves >50%."""

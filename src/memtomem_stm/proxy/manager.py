@@ -288,6 +288,14 @@ class ProxyToolInfo:
     # budgeting and schema distillation apply to the INPUT side only).
     output_schema: dict[str, Any] | None = None
     meta: dict[str, Any] | None = None  # tool-level ``_meta``
+    # Display metadata (#895), stored as the upstream sent it. ``title`` is
+    # tagged with the source server at REGISTRATION, not here, so this field
+    # and ``annotations`` reach ``tag_title`` by the same route and the
+    # credential scan can ask for the tagged form without re-deriving it.
+    # ``icons`` are forwarded with no rewrite at all: they are a list of MCP
+    # ``Icon`` models whose only text is a URL the client fetches itself.
+    title: str | None = None  # top-level ``Tool.title`` (MCP ``BaseMetadata``)
+    icons: list[Any] | None = None  # MCP ``Icon`` list (SEP-973)
     # Deliberately NOT carried: ``execution`` (MCP 2025-11-25 task support).
     # The proxy's call path is synchronous-only, so forwarding it would
     # advertise task support nothing here can bridge. ``taskSupport:
@@ -3292,6 +3300,11 @@ class ProxyManager:
                             annotations=getattr(t, "annotations", None),
                             output_schema=getattr(t, "output_schema", None),
                             meta=getattr(t, "meta", None),
+                            # Untagged: registration applies the ``[server]``
+                            # tag, and the scan reads it back through the same
+                            # function, so neither can drift from the other.
+                            title=getattr(t, "title", None),
+                            icons=getattr(t, "icons", None),
                         ),
                         raw_description=t.description or "",
                         raw_schema=t.input_schema,
