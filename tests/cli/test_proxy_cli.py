@@ -17144,7 +17144,8 @@ class TestDoctor:
         assert "WARN" in outcomes_line
         # 2 timeouts + 6 errors + 4 pre-RPC faults; the 3 cold samples are not
         # failures and must not be counted.
-        assert "12 of 12 daemon surfacing requests" in result.output
+        assert "12 surfacing request(s) since start" in result.output
+        assert "2 timed out, 6 failed mid-search, 4 never issued one" in result.output
 
     def test_doctor_still_reports_collecting_for_an_unused_daemon(
         self, runner, config, monkeypatch
@@ -17254,7 +17255,7 @@ class TestDoctor:
             line for line in result.output.splitlines() if "surfacing outcomes" in line
         )
         assert "WARN" in outcomes_line
-        assert "40 of 45 daemon surfacing requests" in result.output
+        assert "40 surfacing request(s) since start" in result.output
         # The timeout check is independently satisfied and must stay PASS --
         # the point is that the two verdicts no longer gate each other.
         timeout_line = next(
@@ -17312,7 +17313,119 @@ class TestDoctor:
             line for line in result.output.splitlines() if "surfacing outcomes" in line
         )
         assert "PASS" in outcomes_line
-        assert "12 warm LTM search(es) since start, none failed" in result.output
+        assert "no failed surfacing requests since start" in result.output
+
+    def test_doctor_outcomes_never_puts_a_window_over_lifetime_counters(
+        self, runner, config, monkeypatch
+    ):
+        # ``samples`` is the length of a 256-wide duration window; the failure
+        # counters are cumulative since start. Reporting "N of M" over those
+        # two said "1 of 257" for a daemon that had served ten thousand
+        # successful searches and failed once. The check reports counts on one
+        # scope instead, so there is no denominator to get wrong.
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._healthy_config(config)
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(
+            proxy_mod,
+            "_surfacing_bootstrap_status",
+            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False, config_path=None: {
+                "enabled": True,
+                "feedback_enabled": False,
+                "feedback_db": None,
+                "timeouts": {"surfacing_seconds": 30.0, "hook_daemon_seconds": 40.0},
+                "ltm_server": {
+                    "route": "daemon",
+                    "connected": True,
+                    "display": "mms daemon",
+                    "latency": {
+                        "surface": {
+                            # A saturated window, which is all a long-running
+                            # healthy daemon ever reports.
+                            "samples": 256,
+                            "timeout_samples": 0,
+                            "error_samples": 1,
+                            "cold_samples": 0,
+                            "pre_rpc_faults": 0,
+                            "recommendation": {"status": "ready", "seconds": 2.0},
+                        },
+                        "retrieval": {
+                            "samples": 0,
+                            "recommendation": {"status": "collecting", "seconds": None},
+                        },
+                    },
+                    "measurement": None,
+                },
+            },
+        )
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert "1 surfacing request(s) since start" in result.output
+        # The window length must not appear as a denominator anywhere.
+        assert "of 257" not in result.output
+        assert "1 of 256" not in result.output
+
+    def test_doctor_outcomes_ignores_the_raw_retrieval_series(
+        self, runner, config, monkeypatch
+    ):
+        # ``retrieval`` is raw search/compose ops plus the synthetic searches
+        # ``--measure-ltm`` issues. Folding it in let a measurement run report
+        # on surfacing that never happened, and sent a retrieval-only failure
+        # to `mms daemon status`, which renders only the surface series and so
+        # could not explain it. ``ltm measurement`` is where measurement
+        # reports.
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._healthy_config(config)
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(
+            proxy_mod,
+            "_surfacing_bootstrap_status",
+            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False, config_path=None: {
+                "enabled": True,
+                "feedback_enabled": False,
+                "feedback_db": None,
+                "timeouts": {"surfacing_seconds": 30.0, "hook_daemon_seconds": 40.0},
+                "ltm_server": {
+                    "route": "daemon",
+                    "connected": True,
+                    "display": "mms daemon",
+                    "latency": {
+                        "surface": {
+                            "samples": 0,
+                            "timeout_samples": 0,
+                            "error_samples": 0,
+                            "cold_samples": 0,
+                            "pre_rpc_faults": 0,
+                            "recommendation": {"status": "collecting", "seconds": None},
+                        },
+                        "retrieval": {
+                            "samples": 2,
+                            "timeout_samples": 3,
+                            "error_samples": 5,
+                            "recommendation": {"status": "collecting", "seconds": None},
+                        },
+                    },
+                    "measurement": None,
+                },
+            },
+        )
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        # No surfacing traffic at all: the check says nothing, rather than
+        # attributing eight raw-op failures to surfacing.
+        assert "surfacing outcomes" not in result.output
 
     def test_score_scale_mismatch_diagnostic_fails_before_ceiling_heuristic(
         self, runner, config, monkeypatch

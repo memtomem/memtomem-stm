@@ -218,59 +218,29 @@ class CallLedger:
 
     skip_reasons: list[str] = field(default_factory=list)
     outcomes: list[str] = field(default_factory=list)
-    # Set by :func:`record_ltm_rpc` at the moment a request is handed to the
-    # LTM transport — the one place that knows a round trip was issued.
-    ltm_rpc_issued: bool = False
+    # Set by :func:`record_search_rpc` at the moment a search request is handed
+    # to the LTM transport — the one place that knows a round trip was issued.
+    search_rpc_issued: bool = False
 
     @property
     def retrieval_attempted(self) -> bool:
-        """Did an LTM round trip leave the process for this call?
+        """Did a *search* RPC leave the process for this call?
 
-        Read from the explicit marker, not inferred from the terminal
-        decision. The skip reasons and outcomes name the *stage* a call
-        reached, and two of the ones a completed search records are also
-        recorded on paths that issued no RPC (#994): ``error_timeout`` when
-        pre-timeout work consumed the whole window (``engine.surface``, #720),
-        and ``ltm_unavailable`` when session healing failed and the adapter
-        answered ``no_session``. Each still spent the caller's budget, but a
-        duration taken then measures STM, not the LTM, and the percentiles this
-        gates are advice about the LTM. A call that never reached it is not an
-        observation of it, so it files no duration — not into the percentiles
-        and not into the timeout count either. It is still counted: the daemon
-        increments its non-duration ``pre_rpc_faults`` for one that ended
-        badly.
+        Read from the explicit mark :func:`record_search_rpc` sets in the
+        adapter, never inferred from the terminal decision: ``error_timeout``
+        and ``ltm_unavailable`` are both recorded on paths that sent nothing
+        (pre-work that spent the window, #720; healing that failed), and a
+        duration taken there measures STM, not the LTM (#994).
 
-        Scoped to the *search* round trip — ``mem_search`` and the
-        ``context_compose`` action, the two a ``surface()`` call makes on its
-        own behalf. The adapter's lifecycle RPCs (the ``mem_do action=version``
-        probe in ``_negotiate_format`` and the ``list_tools`` rerank check in
-        ``_probe_rerank_support``) call the session directly rather than
-        through ``_rpc`` and so do not mark, even when a request's own lazy
-        start ran them. The percentiles answer "how long does a warm search
-        take", and a connect is not a search — marking one would put
-        child-spawn and negotiation time into the series, which is the defect
-        this exists to remove.
-
-        The consequence is exact and worth stating: a request whose *only* LTM
-        work was a start or reconnect that then failed produces **no latency
-        sample at all**. Not ``cold`` either — the daemon's warmth check sits
-        inside the branch this flag gates, so an unmarked call is dropped
-        before it is reached. Such a call does record a fault (normally
-        ``ltm_unavailable``; ``error_timeout`` when it was the deadline that
-        expired) and charges the circuit breaker, but those counters live on
-        the *daemon's* engine, which no ``stm_surfacing_stats`` reader can see
-        — that tool renders the MCP server process's own engine, a different
-        object in a different process. (The durable fault store does
-        span both, so ``mms stats`` reports these when a feedback tracker is
-        attached; its scope is shared and retention-windowed rather than this
-        daemon's since-start one.) So the daemon counts them separately as
-        ``pre_rpc_faults`` in its latency snapshot, which is not a duration and
-        never enters the percentiles: it exists only so an operator reading
-        that snapshot can tell "requests died before the search went out" from
-        "nobody used this daemon", which every other counter there reports
-        identically.
+        Scope is the two search actions, ``mem_search`` and ``context_compose``.
+        Lifecycle exchanges (version probe, ``list_tools``) and the bookkeeping
+        RPCs around a search do not mark -- a connect is not a search, and
+        marking one would put spawn and negotiation time into percentiles that
+        are advice about a warm search. An unmarked call files no duration at
+        all; when it ended badly the daemon counts it as ``pre_rpc_faults``.
+        The reasoning behind each boundary is in the CHANGELOG entry for #994.
         """
-        return self.ltm_rpc_issued
+        return self.search_rpc_issued
 
     @property
     def faulted(self) -> bool:
@@ -348,18 +318,20 @@ def attribute_call() -> Iterator[CallLedger]:
         _ACTIVE_LEDGER.reset(token)
 
 
-def record_ltm_rpc() -> None:
-    """Mark that the surfacing call in this context is issuing an LTM RPC.
+def record_search_rpc() -> None:
+    """Mark that the surfacing call in this context is issuing a search RPC.
 
-    Called by the transport adapter immediately before the request is sent,
-    after session healing has produced a live session — so a heal that fails
-    (``no_session``) leaves the mark unset, and a retry after a transport error
-    sets it again harmlessly. Outside any :func:`attribute_call` block (the
-    proxy path, a daemon operation that opens no ledger) this is a no-op.
+    Called by the transport adapter immediately before a ``mem_search`` or
+    ``context_compose`` request is handed to the session -- after healing has
+    produced a live one, so a heal that fails (``no_session``) leaves the mark
+    unset, and a retry after a transport error sets it again harmlessly. Other
+    RPCs through the same adapter do not call this. Outside any
+    :func:`attribute_call` block (the proxy path, a daemon operation that opens
+    no ledger) this is a no-op.
     """
     ledger = _ACTIVE_LEDGER.get()
     if ledger is not None:
-        ledger.ltm_rpc_issued = True
+        ledger.search_rpc_issued = True
 
 
 class SurfacingObservability:

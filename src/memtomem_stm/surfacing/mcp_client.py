@@ -22,7 +22,7 @@ from mcp.shared.exceptions import MCPError
 from mcp.types import CONNECTION_CLOSED, TextContent
 
 from memtomem_stm.surfacing.config import SurfacingConfig
-from memtomem_stm.surfacing.observability import record_ltm_rpc
+from memtomem_stm.surfacing.observability import record_search_rpc
 from memtomem_stm.utils.mcp_transport import streamable_http_transport
 from memtomem_stm.utils.json_out import (
     escape_lone_surrogates,
@@ -1278,7 +1278,7 @@ class McpClientSearchAdapter:
         right when the order changes.
         """
         if tool == "mem_search" or (tool == "mem_do" and args.get("action") == "context_compose"):
-            record_ltm_rpc()
+            record_search_rpc()
         try:
             return await session.call_tool(tool, args)
         except MCPError as exc:

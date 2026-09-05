@@ -47,7 +47,7 @@ from memtomem_stm.daemon.protocol import (
 from memtomem_stm.daemon.server import DaemonServer
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine
-from memtomem_stm.surfacing.observability import SurfacingObservability, record_ltm_rpc
+from memtomem_stm.surfacing.observability import SurfacingObservability, record_search_rpc
 
 
 @dataclass
@@ -331,7 +331,7 @@ async def test_engine_internal_timeout_is_not_a_success_latency_sample(tmp_path:
         # Exactly what the adapter and engine.surface() book when a round trip
         # is issued and then times out, recorded through a real observability
         # so the daemon reads it the way it does in production.
-        record_ltm_rpc()
+        record_search_rpc()
         obs.record_outcome("Read", "error_timeout")
         return surface_response({})
 
@@ -389,7 +389,7 @@ async def test_failed_session_healing_is_not_a_latency_sample(tmp_path: Path) ->
         return surface_response({})
 
     async def connection_dropped_mid_flight() -> dict[str, object]:
-        record_ltm_rpc()
+        record_search_rpc()
         obs.record_skip("Read", "ltm_unavailable")
         return surface_response({})
 
@@ -430,14 +430,14 @@ async def test_a_faulted_round_trip_is_not_a_success_duration(tmp_path: Path) ->
     obs = SurfacingObservability()
 
     async def parse_failed() -> dict[str, object]:
-        record_ltm_rpc()
+        record_search_rpc()
         obs.record_skip("Read", "ltm_parse_empty")
         return surface_response({})
 
     async def searched_and_filtered_everything_out() -> dict[str, object]:
         # The healthy control: a completed round trip whose candidates were all
         # filtered out is a search that worked, and stays a success duration.
-        record_ltm_rpc()
+        record_search_rpc()
         obs.record_skip("Read", "no_results_score")
         return surface_response({})
 
@@ -550,12 +550,12 @@ async def test_overlapping_request_does_not_inherit_another_requests_timeout(
             await asyncio.wait_for(healthy_done.wait(), timeout=2.0)
         except asyncio.TimeoutError:
             raise AssertionError("the second request never overlapped the first") from None
-        record_ltm_rpc()
+        record_search_rpc()
         obs.record_outcome("Read", "error_timeout")
         return surface_response({})
 
     async def healthy() -> dict[str, object]:
-        record_ltm_rpc()
+        record_search_rpc()
         obs.record_outcome("Read", "surfaced_cache_miss")
         healthy_done.set()
         return surface_response({})

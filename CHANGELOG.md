@@ -220,15 +220,15 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - **The daemon files a warm-search latency sample only for a request that
-  actually issued a search RPC to the LTM** (#994). `_run_admitted` decided whether a
-  surfacing request was a sample from the terminal decision the engine
-  recorded (`RETRIEVAL_SKIP_REASONS` / `RETRIEVAL_OUTCOMES`, #874). Those sets
-  named a *stage*, not a round trip, and two of their members are also
-  recorded on paths where nothing was sent: `error_timeout` when the gate,
+  actually issued a search RPC to the LTM** (#994). `_run_admitted` decided
+  whether a surfacing request was a sample from the terminal decision the
+  engine recorded (`RETRIEVAL_SKIP_REASONS` / `RETRIEVAL_OUTCOMES`, #874).
+  Those sets named a *stage*, not a round trip, and two of their members are
+  also recorded on paths where nothing was sent: `error_timeout` when the gate,
   query extraction and privacy scan consumed the caller's whole window (#720),
   and `ltm_unavailable` when session healing failed and the adapter answered
-  `no_session`. Each still spent the caller's budget, but the
-  duration measures STM pre-work and queue wait, and it landed in the series
+  `no_session`. Each still spent the caller's budget, but the duration measures
+  STM pre-work and queue wait, and it landed in the series
   `hook.daemon_timeout_seconds` advice is derived from -- a stretch of failed
   healing inflated the recommendation with numbers about the wrong component.
   The adapter now marks the request's `CallLedger` at the point the RPC is
@@ -304,11 +304,21 @@ changes inline only. See the deprecation policy in
   reclassification above that is the daemon an operator most needs the command
   to describe. `--json` passes the daemon's snapshot through as before; its
   latency schema gains `pre_rpc_faults` as an additive key on both series, and
-  a reader that does not know it is unaffected. `mms doctor` reads the same
-  counters: with no successful warm search but failures recorded it now WARNs
-  instead of reporting "collecting telemetry", which after the reclassification
-  above would have described a daemon with a dead LTM as one still waiting for
-  traffic.
+  a reader that does not know it is unaffected.
+
+  `mms doctor` gains a `surfacing outcomes` check reading the same counters,
+  independent of the timeout checks beside it. It WARNs when any hook surfacing
+  request since daemon start timed out, failed mid-search, or never issued one,
+  and reports that breakdown rather than a ratio: the failure counters are
+  cumulative while `samples` is the length of a 256-wide duration window, so
+  the two do not share a denominator. Without it, a daemon whose LTM had died
+  reported "collecting telemetry" -- the timeout check answers "is there enough
+  data to size a timeout", which is a different question from "is the
+  dependency working", and after the reclassification above the failures no
+  longer reach the first one at all. Scoped to the daemon's own hook traffic:
+  the raw and synthetic `retrieval` operations report through `ltm measurement`
+  instead, and folding them in would attribute a measurement run's failures to
+  surfacing that never ran.
 
   Found by a Codex review of #993; the fault classification, the status gap,
   the `pre_rpc_faults` counter and the doctor verdict by Codex reviews of the

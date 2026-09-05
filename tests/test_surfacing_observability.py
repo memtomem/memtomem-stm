@@ -26,7 +26,7 @@ from memtomem_stm.surfacing.observability import (
     SkipReason,
     SurfacingObservability,
     attribute_call,
-    record_ltm_rpc,
+    record_search_rpc,
 )
 
 
@@ -663,15 +663,15 @@ class TestCallLedger:
         with attribute_call() as healing_failed:
             obs.record_skip("Read", "ltm_unavailable")
         with attribute_call() as rpc_timed_out:
-            record_ltm_rpc()
+            record_search_rpc()
             obs.record_outcome("Read", "error_timeout")
         with attribute_call() as rpc_unavailable:
             # A transport error mid-flight also lands on ``ltm_unavailable``;
             # that one did issue a request and stays a sample.
-            record_ltm_rpc()
+            record_search_rpc()
             obs.record_skip("Read", "ltm_unavailable")
         with attribute_call() as searched:
-            record_ltm_rpc()
+            record_search_rpc()
             obs.record_skip("Read", "no_results_score")
         with attribute_call() as gated:
             obs.record_skip("Read", "gate_cooldown")
@@ -692,7 +692,7 @@ class TestCallLedger:
     def test_marking_outside_any_ledger_is_fine(self):
         # The proxy path and the daemon's raw LTM ops issue RPCs with no ledger
         # open; the mark has nowhere to land and must not care.
-        record_ltm_rpc()
+        record_search_rpc()
         with attribute_call() as ledger:
             pass
         assert ledger.retrieval_attempted is False
@@ -707,7 +707,7 @@ class TestCallLedger:
 
         async def abandoned() -> None:
             await may_mark.wait()
-            record_ltm_rpc()
+            record_search_rpc()
 
         with attribute_call() as abandoned_ledger:
             straggler = asyncio.create_task(abandoned())
@@ -724,13 +724,13 @@ class TestCallLedger:
         # both. A fault with no RPC behind it is not a sample at all.
         obs = SurfacingObservability()
         with attribute_call() as rpc_then_dropped:
-            record_ltm_rpc()
+            record_search_rpc()
             obs.record_skip("Read", "ltm_unavailable")
         with attribute_call() as rpc_then_raised:
-            record_ltm_rpc()
+            record_search_rpc()
             obs.record_outcome("Read", "error_other")
         with attribute_call() as searched_and_filtered:
-            record_ltm_rpc()
+            record_search_rpc()
             obs.record_skip("Read", "no_results_score")
         with attribute_call() as healing_failed:
             obs.record_skip("Read", "ltm_unavailable")
@@ -748,7 +748,7 @@ class TestCallLedger:
     def test_the_mark_is_per_ledger(self):
         # An RPC issued under one request's ledger says nothing about the next.
         with attribute_call() as first:
-            record_ltm_rpc()
+            record_search_rpc()
         with attribute_call() as second:
             pass
         assert first.retrieval_attempted is True
@@ -757,7 +757,7 @@ class TestCallLedger:
 
 async def _mark_later() -> None:
     await asyncio.sleep(0)
-    record_ltm_rpc()
+    record_search_rpc()
 
 
 async def _record_later(obs: SurfacingObservability, outcome: Outcome) -> None:

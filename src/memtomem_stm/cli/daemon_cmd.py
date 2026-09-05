@@ -494,6 +494,19 @@ def _stop_foreign_daemons(config: STMConfig) -> None:
             click.echo(_warn(f"could not signal daemon pid={pid} (fp={d['fingerprint']})"))
 
 
+# (snapshot key, status-line label) for every surface-series counter. The
+# status line switches on when any of these is nonzero and prints all of them:
+# a line switched on by an observation it does not show reads as a positive
+# report that nothing happened (#994).
+_SURFACE_COUNTERS = (
+    ("samples", "samples"),
+    ("timeout_samples", "timeouts"),
+    ("error_samples", "errors"),
+    ("cold_samples", "cold"),
+    ("pre_rpc_faults", "pre_rpc_faults"),
+)
+
+
 @daemon_group.command(name="status")
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON for scripting.")
 def status_cmd(as_json: bool) -> None:
@@ -591,13 +604,6 @@ def status_cmd(as_json: bool) -> None:
                 f"busy_rejections={queue.get('busy_rejections', 0)}"
             )
         surface = (info.get("latency") or {}).get("surface")
-        _SURFACE_COUNTERS = (
-            ("samples", "samples"),
-            ("timeout_samples", "timeouts"),
-            ("error_samples", "errors"),
-            ("cold_samples", "cold"),
-            ("pre_rpc_faults", "pre_rpc_faults"),
-        )
         if isinstance(surface, dict) and any(surface.get(key) for key, _ in _SURFACE_COUNTERS):
             recommendation = surface.get("recommendation") or {}
             # Rendered on any observation, not only on a successful one. A

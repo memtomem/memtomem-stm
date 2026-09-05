@@ -9551,22 +9551,23 @@ def doctor(
                         value = summary.get("recommendation")
                         return value if isinstance(value, dict) else None
 
-                    def _failure_observations(summary: Any) -> int:
-                        """Observations that were not a completed warm search.
+                    def _failure_breakdown(summary: Any) -> dict[str, int]:
+                        """Per-counter observations that were not a completed warm search.
 
                         Tolerant of a payload from an older daemon that carries
                         only some of these keys. ``cold_samples`` is excluded:
                         a cold start is the LTM not being warm yet, which is
                         what "collecting telemetry" already describes.
                         """
-                        if not isinstance(summary, dict):
-                            return 0
-                        total = 0
-                        for key in ("timeout_samples", "error_samples", "pre_rpc_faults"):
-                            value = summary.get(key)
-                            if isinstance(value, int) and not isinstance(value, bool):
-                                total += max(0, value)
-                        return total
+                        counts = {
+                            key: 0 for key in ("timeout_samples", "error_samples", "pre_rpc_faults")
+                        }
+                        if isinstance(summary, dict):
+                            for key in counts:
+                                value = summary.get(key)
+                                if isinstance(value, int) and not isinstance(value, bool):
+                                    counts[key] = max(0, value)
+                        return counts
 
                     surface_rec = recommendation(surface_summary)
                     retrieval_rec = recommendation(retrieval_summary)
@@ -9640,43 +9641,51 @@ def doctor(
                     # independent: a daemon with one old success and a thousand
                     # later failures has a recommendation, or is "collecting",
                     # and either way the timeout check has nothing to say about
-                    # the failures. These counters are since-start and never
-                    # evicted, so the reading is cumulative -- the wording says
-                    # so rather than implying a current rate.
-                    surface_failures = _failure_observations(surface_summary)
-                    retrieval_failures = _failure_observations(retrieval_summary)
-                    failures = surface_failures + retrieval_failures
-                    successes = max(
-                        int((surface_summary or {}).get("samples", 0) or 0)
-                        if isinstance(surface_summary, dict)
-                        else 0,
-                        int((retrieval_summary or {}).get("samples", 0) or 0)
-                        if isinstance(retrieval_summary, dict)
-                        else 0,
-                    )
+                    # the failures.
+                    #
+                    # Scoped to ``surface`` alone -- the daemon's own hook
+                    # traffic. The ``retrieval`` series is raw search/compose
+                    # ops plus the synthetic searches ``--measure-ltm`` issues,
+                    # so folding it in here would let a measurement run report
+                    # on surfacing that never happened, and would send a
+                    # retrieval-only failure to ``mms daemon status``, which
+                    # renders only the surface series and could not explain it.
+                    # ``ltm_measurement`` above is where measurement reports.
+                    #
+                    # Counts, not a ratio. The failure counters are cumulative
+                    # since start, but ``samples`` is the length of a 256-wide
+                    # duration window -- putting them over one denominator
+                    # reads as a rate and is simply wrong once a daemon has
+                    # served more than a window's worth ("1 of 257" after ten
+                    # thousand successes and one failure).
+                    breakdown = _failure_breakdown(surface_summary)
+                    failures = sum(breakdown.values())
                     if failures:
                         # Neutral about the cause on purpose: this population
                         # mixes a dependency that erred or timed out with a
                         # request the daemon shed before touching the LTM at
                         # all (queue pressure, or a client deadline too short
-                        # to start a search under). `mms daemon status` breaks
-                        # the counters apart; this check only says how much of
-                        # the traffic did not come back with a search.
+                        # to start a search under). The breakdown is what makes
+                        # it actionable without asserting which one it was.
                         check(
                             "surfacing_outcomes",
                             "surfacing outcomes",
                             "WARN",
-                            f"{failures} of {failures + successes} daemon surfacing requests "
-                            "since start did not complete a warm LTM search "
-                            f"({successes} did)",
+                            f"{failures} surfacing request(s) since start did not complete a "
+                            f"warm LTM search ({breakdown['timeout_samples']} timed out, "
+                            f"{breakdown['error_samples']} failed mid-search, "
+                            f"{breakdown['pre_rpc_faults']} never issued one)",
                             "mms daemon status",
                         )
-                    elif successes:
+                    elif isinstance(surface_summary, dict) and surface_summary.get("samples"):
+                        # No count on this side: ``samples`` is windowed, so
+                        # naming it here would invite the same false arithmetic
+                        # the WARN branch avoids.
                         check(
                             "surfacing_outcomes",
                             "surfacing outcomes",
                             "PASS",
-                            f"{successes} warm LTM search(es) since start, none failed",
+                            "no failed surfacing requests since start",
                         )
 
                     from memtomem_stm.daemon.latency import hook_timeout_recommendation
