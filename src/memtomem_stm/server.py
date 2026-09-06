@@ -51,10 +51,11 @@ from memtomem_stm.surfacing.observability import (
 from memtomem_stm.observability.tracing import traced
 from memtomem_stm.surfacing.feedback import (
     FEEDBACK_STORE_BUSY,
+    FEEDBACK_STORE_UNAVAILABLE,
     FeedbackTracker,
     record_feedback_batch,
 )
-from memtomem_stm.surfacing.store_io import await_store_write
+from memtomem_stm.surfacing.store_io import StoreWriteQueueFull, await_store_write
 from memtomem_stm.utils.anyio_shutdown import await_or_warn, is_clean_cancel_scope_shutdown
 from memtomem_stm.utils import child_reaper
 from memtomem_stm.utils.parent_liveness import ParentLivenessWatcher
@@ -1777,6 +1778,8 @@ async def stm_surfacing_feedback(
                 memory_id,
                 timeout=timeout,
             )
+        except StoreWriteQueueFull:
+            return FEEDBACK_STORE_UNAVAILABLE
         except asyncio.TimeoutError:
             return FEEDBACK_STORE_BUSY
 
@@ -1820,6 +1823,8 @@ async def _record_batched_via_tracker(
         results = await await_store_write(
             record_feedback_batch, tracker, surfacing_id, parsed, timeout=timeout
         )
+    except StoreWriteQueueFull:
+        return FEEDBACK_STORE_UNAVAILABLE
     except asyncio.TimeoutError:
         return FEEDBACK_STORE_BUSY
     recorded = 0

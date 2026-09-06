@@ -260,7 +260,11 @@ changes inline only. See the deprecation policy in
   multi-query reads (`get_stats` and the tuner's ratios) now answer from one
   snapshot, and
   `record_fault` / `record_diagnostic` take the observation time from the
-  caller so a queued write cannot outrun the recovery that disproves it.
+  caller, and the fault row keeps the newer of the two timestamps rather than
+  whichever wrote last, so a queued write cannot outrun the recovery that
+  disproves it or drag a peer's newer observation backward. A rating refused
+  before it was queued says so and asks for a retry, unlike one already in
+  flight.
 
 - **The daemon files a warm-search latency sample only for a request that
   actually issued a search RPC to the LTM** (#994). `_run_admitted` decided

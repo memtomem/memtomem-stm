@@ -128,9 +128,12 @@ class TestConcurrentReadersAndWriters:
                 store.mark_surfaced([f"mem-{i}"])
                 store.record_fault("gh", f"tool{i % 3}", "error_timeout")
 
+        totals_seen: set[int] = set()
+
         def read_stats() -> None:
             for _ in range(reads_per_worker):
                 stats = store.get_stats(limit=5)
+                totals_seen.add(stats["events_total"])
                 # The real tear test: ``events_total`` and the per-tool
                 # breakdown come from different queries, so a writer landing
                 # between them hands back a total that its own breakdown
@@ -165,6 +168,11 @@ class TestConcurrentReadersAndWriters:
 
             assert store.get_stats(limit=1)["events_total"] == total_writes
             assert len(store.get_seen_ids(10_000_000.0)) == total_writes
+            # Positive control for the assertions above: several different
+            # totals means the reads really did land while the table was
+            # growing. One total would mean the writer finished first and the
+            # snapshot was never under test.
+            assert len(totals_seen) > 1, f"reads never overlapped the writer: {totals_seen}"
         finally:
             store.close()
 
@@ -260,6 +268,47 @@ class TestQueuedWriteTimestamps:
             )
             store.record_fault("gh", "read_file", "error_timeout", at=recovered_at + 1.0)
             assert read_surfacing_summary(store.db_path)["active_faults"] == {"error_timeout": 1}
+        finally:
+            store.close()
+
+
+    def test_a_stale_fault_does_not_drag_the_row_back_in_time(self, tmp_path: Path) -> None:
+        # A peer commits a newer fault for the same key while this process's
+        # write is still queued. Assigning ``last_at`` unconditionally would
+        # move the row backward, and a recovery taken between the two would
+        # then satisfy ``last_at <= recovered_at`` and close an episode the
+        # peer's fault should hold open.
+        store = _store(tmp_path)
+        now = time.time()
+        try:
+            store.record_fault("gh", "read_file", "error_timeout", at=now)
+            store.record_fault("gh", "read_file", "error_timeout", at=now - 10.0)
+            store.record_fault_recoveries(
+                [("gh", "read_file", FAULT_KINDS)], recovered_at=now - 5.0
+            )
+
+            summary = read_surfacing_summary(store.db_path)
+            assert summary["faults"] == {"error_timeout": 2}, "both observations are counted"
+            assert summary["active_faults"] == {"error_timeout": 2}, (
+                "the newer fault postdates the recovery, so the episode stays open"
+            )
+        finally:
+            store.close()
+
+    def test_a_stale_fault_does_not_reopen_an_episode_it_predates(self, tmp_path: Path) -> None:
+        store = _store(tmp_path)
+        now = time.time()
+        try:
+            store.record_fault("gh", "read_file", "error_timeout", at=now - 10.0)
+            store.record_fault_recoveries([("gh", "read_file", FAULT_KINDS)], recovered_at=now)
+            assert read_surfacing_summary(store.db_path)["active_faults"] == {}
+
+            # Queued behind the recovery but observed before it: already
+            # answered, so it counts without reopening.
+            store.record_fault("gh", "read_file", "error_timeout", at=now - 8.0)
+            summary = read_surfacing_summary(store.db_path)
+            assert summary["faults"] == {"error_timeout": 2}
+            assert summary["active_faults"] == {}
         finally:
             store.close()
 

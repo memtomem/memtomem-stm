@@ -903,7 +903,23 @@ class FeedbackStore:
             return
         now = time.time() if at is None else at
         day = time.strftime("%Y-%m-%d", time.gmtime(now))
-        recovery_update = ", last_recovered_at = NULL" if reset_recovery else ""
+        # A queued write can execute after a peer already recorded a NEWER
+        # observation for the same row, so neither field may be assigned
+        # unconditionally. ``last_at`` keeps the newest of the two — moving it
+        # backward would let a recovery taken between them satisfy
+        # ``last_at <= recovered_at`` and close an episode the peer's fault
+        # should hold open. The recovery stamp clears only for a fault that is
+        # not OLDER than it: ties still reopen, which is the documented rule on
+        # a clock too coarse to separate two adjacent writes (see
+        # ``record_fault_recovery``), while a fault that recovery already
+        # answered no longer reopens the episode after the fact.
+        recovery_update = (
+            ", last_recovered_at = CASE"
+            " WHEN excluded.last_at >= COALESCE(surfacing_faults.last_recovered_at, 0)"
+            " THEN NULL ELSE surfacing_faults.last_recovered_at END"
+            if reset_recovery
+            else ""
+        )
         with self._lock:
             db = self._db
             if db is None:
@@ -913,7 +929,8 @@ class FeedbackStore:
                     "INSERT INTO surfacing_faults (day, server, tool, kind, count, last_at) "
                     "VALUES (?, ?, ?, ?, 1, ?) "
                     "ON CONFLICT(day, server, tool, kind) "
-                    "DO UPDATE SET count = count + 1, last_at = excluded.last_at" + recovery_update,
+                    "DO UPDATE SET count = count + 1, "
+                    "last_at = MAX(surfacing_faults.last_at, excluded.last_at)" + recovery_update,
                     (day, server, tool, kind, now),
                 )
                 db.commit()

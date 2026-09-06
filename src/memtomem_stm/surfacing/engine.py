@@ -10,6 +10,7 @@ import math
 import time
 import uuid
 from concurrent.futures import Future
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,7 +19,11 @@ from memtomem_stm.proxy.privacy import contains_sensitive_content
 from memtomem_stm.surfacing.cache import SurfacingCache
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.context_extractor import ContextExtractor
-from memtomem_stm.surfacing.feedback import FEEDBACK_STORE_BUSY, record_feedback_batch
+from memtomem_stm.surfacing.feedback import (
+    FEEDBACK_STORE_BUSY,
+    FEEDBACK_STORE_UNAVAILABLE,
+    record_feedback_batch,
+)
 from memtomem_stm.surfacing.feedback_store import DIAGNOSTIC_KINDS, FAULT_KINDS
 from memtomem_stm.surfacing.formatter import SurfacingFormatter
 from memtomem_stm.surfacing.mcp_client import (
@@ -684,7 +689,9 @@ class SurfacingEngine:
     def _release_breaker_claims(self, released: dict[tuple[str, str], int | None]) -> None:
         """Drop the claims this recovery closed, and only those.
 
-        Runs on the worker thread once the UPDATE landed. Each key is checked
+        Scheduled back onto the event loop once the UPDATE landed, so the
+        check below cannot straddle a claim the loop records. Each key is
+        checked
         against the claim number it carried when the write was queued: a key
         blocked again in the meantime holds a newer claim, whose own
         ``circuit_open`` row this recovery did not close, so it stays.
@@ -1396,6 +1403,17 @@ class SurfacingEngine:
             result = await self._await_store_write(
                 self._feedback_tracker.record_feedback, surfacing_id, rating, memory_id
             )
+        except StoreWriteQueueFull:
+            # Refused before it was queued, so nothing is on its way and the
+            # rating has no in-memory consequence either.
+            logger.debug("Feedback store queue full; rating refused", exc_info=True)
+            return FEEDBACK_STORE_UNAVAILABLE
+        except asyncio.CancelledError:
+            # The write is queued and shielded, so the rejection is durable
+            # even though this call is going away. Apply its filter for the
+            # same reason the timeout path does.
+            self._invalidate_negative_ratings(surfacing_id, [(memory_id, rating)])
+            raise
         except asyncio.TimeoutError:
             # The write is queued behind a busy store and still shielded, so it
             # will land — this call just cannot confirm it. The negative
@@ -1405,8 +1423,7 @@ class SurfacingEngine:
             # that somehow never landed costs one memory not resurfacing this
             # session. The access boost is not: that writes to the LTM, and an
             # unconfirmed rating is no basis for it.
-            if rating in ("not_relevant", "already_known"):
-                self._invalidate_cache_for_feedback(surfacing_id, memory_id)
+            self._invalidate_negative_ratings(surfacing_id, [(memory_id, rating)])
             return FEEDBACK_STORE_BUSY
 
         if isinstance(result, str) and result.startswith("Error"):
@@ -1493,12 +1510,16 @@ class SurfacingEngine:
             results = await self._await_store_write(
                 record_feedback_batch, self._feedback_tracker, surfacing_id, parsed
             )
+        except StoreWriteQueueFull:
+            logger.debug("Feedback store queue full; batch refused", exc_info=True)
+            return FEEDBACK_STORE_UNAVAILABLE
+        except asyncio.CancelledError:
+            self._invalidate_negative_ratings(surfacing_id, parsed)
+            raise
         except asyncio.TimeoutError:
             # Same rule as the single-rating path: apply the in-memory filter
             # for every negative in the batch, skip the LTM-facing boost.
-            for memory_id, rating in parsed:
-                if rating in ("not_relevant", "already_known"):
-                    self._invalidate_cache_for_feedback(surfacing_id, memory_id)
+            self._invalidate_negative_ratings(surfacing_id, parsed)
             return FEEDBACK_STORE_BUSY
         recorded = 0
         errors: list[str] = []
@@ -1555,6 +1576,22 @@ class SurfacingEngine:
             self._mcp_adapter.increment_access(chunk_ids),
             timeout=self._config.timeout_seconds,
         )
+
+    def _invalidate_negative_ratings(
+        self, surfacing_id: str, ratings: Sequence[tuple[str | None, str]]
+    ) -> None:
+        """Apply the cache filter for every negative rating in *ratings*.
+
+        Used where a rating's write is durable but this call cannot see its
+        result — it timed out, or the caller was cancelled while the shielded
+        write was still on its way. The filter is in-memory and conservative:
+        applying it for a rating that somehow never landed costs one memory
+        not resurfacing this session, while skipping it lets the memory the
+        agent just rejected come straight back out of a warm entry.
+        """
+        for memory_id, rating in ratings:
+            if rating in ("not_relevant", "already_known"):
+                self._invalidate_cache_for_feedback(surfacing_id, memory_id)
 
     def _invalidate_cache_for_feedback(self, surfacing_id: str, memory_id: str | None) -> None:
         """Populate ``_invalidated_ids`` from a surfacing event.

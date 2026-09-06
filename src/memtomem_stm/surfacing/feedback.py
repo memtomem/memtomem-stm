@@ -44,6 +44,17 @@ would land a second row for the same rating.
 """
 
 
+FEEDBACK_STORE_UNAVAILABLE = (
+    "Error: the feedback store is overloaded; this rating was NOT recorded. Retry it later."
+)
+"""Answer for a rating refused before it was ever queued (#996).
+
+Distinct from :data:`FEEDBACK_STORE_BUSY` on the one point the agent acts on:
+nothing was written and nothing is on its way, so retrying later is right —
+where a busy write is already in flight and a retry would double it.
+"""
+
+
 def record_feedback_batch(
     tracker: FeedbackTracker, surfacing_id: str, parsed: list[tuple[str, str]]
 ) -> list[str]:

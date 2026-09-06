@@ -1054,8 +1054,11 @@ class TestEngineFaultPersistence:
         failing = _FailNthRecoveryUpdate(real_db, fail_on=2)
         tracker.store._db = failing  # type: ignore[assignment]
         await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
-        tracker.store._db = real_db  # type: ignore[assignment]
+        # Drain BEFORE restoring: the recovery write is queued on the worker,
+        # so putting the real connection back first would let it run against
+        # that one and the probe would never see the batch.
         await engine.drain_store_writes()
+        tracker.store._db = real_db  # type: ignore[assignment]
         assert failing.attempts == 2  # the batch really did reach the second key
 
         # Neither key recovered — not the one whose UPDATE had already run.
@@ -1087,6 +1090,9 @@ class TestEngineFaultPersistence:
         real_db = tracker.store._db
         tracker.store._db = _FailingCommit(real_db, fail_rollback=True)  # type: ignore[assignment]
         engine._persist_fault("gh", "blocked_tool", "circuit_open")
+        # The fault write is queued; it has to run against the failing
+        # connection, so drain before putting the real one back.
+        await engine.drain_store_writes()
         tracker.store._db = real_db  # type: ignore[assignment]
         assert set(engine._breaker_blocked_keys) == {("gh", "blocked_tool")}
 
