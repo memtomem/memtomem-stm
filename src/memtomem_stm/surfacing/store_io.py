@@ -44,6 +44,52 @@ _executor_lock = threading.Lock()
 
 T = TypeVar("T")
 
+MAX_QUEUED_WRITES = 64
+"""Ceiling on writes waiting on the worker, awaited and queued alike.
+
+A store nobody can write to — a peer holding it for minutes, a dead disk —
+would otherwise let this queue grow at call rate: every caller stops waiting
+after its own ceiling, but what it queued stays. Same shape and reason as the
+background-task ceiling in ``ProxyManager`` (#868). Refusing is the honest
+answer at that point: a best-effort write is dropped, and a write a caller
+awaits raises, which is the same degradation those callers already handle for
+a store that failed.
+"""
+
+_queued = 0
+_queued_lock = threading.Lock()
+
+
+class StoreWriteQueueFull(RuntimeError):
+    """Raised instead of queueing past :data:`MAX_QUEUED_WRITES`."""
+
+
+def queued_writes() -> int:
+    """How many writes are queued or running on the worker."""
+    with _queued_lock:
+        return _queued
+
+
+def _enqueue(fn: Callable[..., T], args: tuple[Any, ...]) -> Future[T]:
+    global _queued
+    with _queued_lock:
+        if _queued >= MAX_QUEUED_WRITES:
+            raise StoreWriteQueueFull(f"{_queued} feedback-store writes already queued")
+        _queued += 1
+    try:
+        future = feedback_io_executor().submit(fn, *args)
+    except BaseException:
+        _release_slot()
+        raise
+    future.add_done_callback(lambda _f: _release_slot())
+    return future
+
+
+def _release_slot(*_args: Any) -> None:
+    global _queued
+    with _queued_lock:
+        _queued -= 1
+
 
 def feedback_io_executor() -> ThreadPoolExecutor:
     """Return the shared single-thread executor for feedback-store I/O."""
@@ -63,8 +109,10 @@ def submit_store_write(fn: Callable[..., T], /, *args: Any) -> Future[T]:
     diagnostics, the retention sweeps). The caller owns the returned future:
     it must consume the exception — asyncio never sees it — and should keep a
     reference until it completes so shutdown can wait on what is outstanding.
+
+    Raises :class:`StoreWriteQueueFull` once the worker is that far behind.
     """
-    return feedback_io_executor().submit(fn, *args)
+    return _enqueue(fn, args)
 
 
 async def run_off_loop(fn: Callable[..., T], /, *args: Any) -> T:
@@ -93,8 +141,11 @@ async def await_store_write(fn: Callable[..., T], /, *args: Any, timeout: float)
     including another caller's retention sweep. A write that outlives
     *timeout* still lands; the caller stops waiting and degrades as it would
     for a failed write.
+
+    Raises :class:`StoreWriteQueueFull` rather than joining a queue already at
+    its ceiling — the caller degrades as it would for a write that failed.
     """
-    future = asyncio.ensure_future(run_off_loop(fn, *args))
+    future = asyncio.wrap_future(_enqueue(fn, args))
     try:
         return await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
     except (asyncio.CancelledError, asyncio.TimeoutError):

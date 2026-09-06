@@ -28,9 +28,13 @@ from uuid import uuid4
 import pytest
 
 from memtomem_stm.surfacing.config import SurfacingConfig
-from memtomem_stm.surfacing.engine import _MAX_QUEUED_STORE_WRITES, SurfacingEngine
+from memtomem_stm.surfacing.engine import SurfacingEngine
 from memtomem_stm.surfacing.feedback import FeedbackTracker
-from memtomem_stm.surfacing.store_io import submit_store_write
+from memtomem_stm.surfacing.store_io import (
+    MAX_QUEUED_WRITES,
+    queued_writes,
+    submit_store_write,
+)
 
 LONG_RESPONSE = "x" * 500
 
@@ -480,9 +484,9 @@ async def test_the_best_effort_queue_stops_growing_at_its_ceiling(tmp_path: Path
     blocker = threading.Event()
     submit_store_write(lambda: blocker.wait(timeout=10.0))
     try:
-        for index in range(_MAX_QUEUED_STORE_WRITES + 10):
+        for index in range(MAX_QUEUED_WRITES + 10):
             engine._persist_fault("gh", f"tool{index}", "error_timeout")
-        assert engine._queued_store_writes == _MAX_QUEUED_STORE_WRITES
+        assert queued_writes() == MAX_QUEUED_WRITES
 
         blocker.set()
         await engine.drain_store_writes()
@@ -492,7 +496,61 @@ async def test_the_best_effort_queue_stops_growing_at_its_ceiling(tmp_path: Path
             rows = db.execute("SELECT COUNT(*) FROM surfacing_faults").fetchone()[0]
         finally:
             db.close()
-        assert rows == _MAX_QUEUED_STORE_WRITES
+        # One slot went to the blocker itself, so the ceiling covers it too.
+        assert rows == MAX_QUEUED_WRITES - 1
+    finally:
+        blocker.set()
+        await engine.stop()
+        tracker.close()
+
+
+async def test_a_cancelled_call_gives_back_the_ids_it_reserved(tmp_path: Path) -> None:
+    # The reservation is made before the event write so a concurrent call
+    # cannot surface the same memories. A cancellation there means nothing
+    # reaches the client — not the manifest, not the feedback ID — so holding
+    # the reservation would suppress memories nobody saw for the rest of the
+    # session.
+    config = _config(tmp_path)
+    tracker = FeedbackTracker(config)
+    engine = _engine(config, tracker)
+    blocker = threading.Event()
+    submit_store_write(lambda: blocker.wait(timeout=10.0))
+    try:
+        surfacing = asyncio.create_task(
+            engine.surface("gh", "read_file", _args("reserved"), LONG_RESPONSE)
+        )
+        await asyncio.sleep(0.1)
+        assert engine._surfaced_ids, "the call must have reserved its IDs by now"
+
+        surfacing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await surfacing
+        assert engine._surfaced_ids == {}, "an undelivered call keeps no reservation"
+    finally:
+        blocker.set()
+        await engine.stop()
+        tracker.close()
+
+
+async def test_an_awaited_write_also_refuses_to_join_a_full_queue(tmp_path: Path) -> None:
+    # The ceiling covers awaited writes too, or a wedged store would let event
+    # rows pile up at call rate: every caller stops waiting after its own
+    # timeout, but what it queued stays. Refusing routes the call through the
+    # same degradation a failed write gets — content delivered, no prompt.
+    config = _config(tmp_path)
+    tracker = FeedbackTracker(config)
+    engine = _engine(config, tracker)
+    blocker = threading.Event()
+    for _ in range(MAX_QUEUED_WRITES):
+        submit_store_write(lambda: blocker.wait(timeout=10.0))
+    try:
+        assert queued_writes() == MAX_QUEUED_WRITES
+        output = await asyncio.wait_for(
+            engine.surface("gh", "read_file", _args("refused"), LONG_RESPONSE), timeout=5.0
+        )
+
+        assert output != LONG_RESPONSE, "the memories are still delivered"
+        assert "stm_surfacing_feedback" not in output
     finally:
         blocker.set()
         await engine.stop()

@@ -267,8 +267,23 @@ class TestQueuedWriteTimestamps:
 def test_initialize_failure_leaves_no_connection_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Both connections, not just the writer (the reader opens last)."""
+    """Both connections are closed, not just nulled out.
+
+    The attributes are ``None`` whether or not the failure path closes
+    anything — the reader is assigned last — so this follows the connection
+    objects themselves and asks each one whether it still works. A leaked
+    handle keeps a file descriptor and, for the writer, a stale lock across
+    repeated failed starts.
+    """
     import memtomem_stm.surfacing.feedback_store as module
+
+    opened: list[sqlite3.Connection] = []
+    real_connect = sqlite3.connect
+
+    def tracking_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        conn = real_connect(*args, **kwargs)  # type: ignore[arg-type]
+        opened.append(conn)
+        return conn
 
     calls = {"n": 0}
     real_tune = module.tune_connection
@@ -279,6 +294,7 @@ def test_initialize_failure_leaves_no_connection_open(
             raise RuntimeError("simulated reader tuning failure")
         real_tune(conn, **kwargs)  # type: ignore[arg-type]
 
+    monkeypatch.setattr(module.sqlite3, "connect", tracking_connect)
     monkeypatch.setattr(module, "tune_connection", fail_on_the_reader)
     store = FeedbackStore(tmp_path / "feedback.db")
     with pytest.raises(RuntimeError, match="simulated reader tuning failure"):
@@ -286,3 +302,8 @@ def test_initialize_failure_leaves_no_connection_open(
 
     assert store._db is None
     assert store._read_db is None
+    assert len(opened) == 2, "the writer opened, then the reader that failed tuning"
+    for index, conn in enumerate(opened):
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+        assert index in (0, 1)

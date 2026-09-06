@@ -30,6 +30,7 @@ from memtomem_stm.surfacing.mcp_client import (
 from memtomem_stm.surfacing.observability import _NOOP_OBSERVABILITY, SurfacingObservability
 from memtomem_stm.surfacing.relevance import RateClaim, RelevanceGate
 from memtomem_stm.surfacing.store_io import (
+    StoreWriteQueueFull,
     await_store_write,
     run_off_loop,
     submit_store_write,
@@ -131,10 +132,6 @@ class _ScoreScaleStreak:
 
 class _DependencyFault(RuntimeError):
     """Internal signal: return passthrough but count the dependency failure."""
-
-
-_MAX_QUEUED_STORE_WRITES = 64
-"""Ceiling on best-effort feedback-store writes waiting on the shared worker."""
 
 
 def _noop_store_write() -> None:
@@ -395,10 +392,6 @@ class SurfacingEngine:
         # flight loses its claim, and the ``circuit_open`` row it just queued
         # is left for its own next success to close.
         self._breaker_claim_seq = 0
-        # Outstanding best-effort writes, bounded so a store nobody can write
-        # to cannot grow this queue without limit. Same shape and reason as
-        # the background-task ceiling in ``ProxyManager`` (#868).
-        self._queued_store_writes = 0
 
     @property
     def observability(self) -> SurfacingObservability | None:
@@ -471,28 +464,21 @@ class SurfacingEngine:
         the event loop so it can retire in-memory state without racing the
         loop's own writes to it.
         """
-        if self._queued_store_writes >= _MAX_QUEUED_STORE_WRITES:
-            # A store nothing can write to (a peer holding it for minutes, a
-            # dead disk) would otherwise let this queue grow at call rate.
-            # Telemetry is the right thing to drop: the response never
-            # depended on it, and the counters it feeds are advisory.
-            logger.debug("Dropped %s write: %d already queued", what, self._queued_store_writes)
-            return
         try:
             loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
         try:
             future = submit_store_write(fn)
-        except RuntimeError:
-            # Executor already shut down (interpreter teardown). Nothing
-            # durable to do, and this is best-effort telemetry.
+        except (StoreWriteQueueFull, RuntimeError):
+            # The worker is that far behind, or the executor is already shut
+            # down at interpreter teardown. Telemetry is the right thing to
+            # drop either way: the response never depended on it, and the
+            # counters it feeds are advisory.
             logger.debug("Could not queue %s write", what, exc_info=True)
             return
-        self._queued_store_writes += 1
 
         def _done(f: Future[Any]) -> None:
-            self._queued_store_writes -= 1
             if f.cancelled():
                 return
             exc = f.exception()
@@ -1631,6 +1617,11 @@ class SurfacingEngine:
             self._surfaced_ids[mid] = None
         _fifo_prune(self._surfaced_ids, self._surfaced_ids_max)
 
+    def _release_surfaced_ids(self, ids: list[str]) -> None:
+        """Give back session-dedup reservations a cancelled call never used."""
+        for mid in ids:
+            self._surfaced_ids.pop(mid, None)
+
     async def _render_cached(
         self,
         cached: list[Any],
@@ -1773,6 +1764,10 @@ class SurfacingEngine:
                     # The store closed under this call; the row does not
                     # exist, so the ID must not stay advertised.
                     raise RuntimeError("feedback store closed before the event was written")
+            except asyncio.CancelledError:
+                # Same as the miss path: an undelivered render keeps no claim.
+                self._release_surfaced_ids(delivered_ids)
+                raise
             except Exception:
                 logger.warning("Failed to record cached surfacing event", exc_info=True)
                 # Kept symmetric with the miss path; the cached path fires no
@@ -2312,6 +2307,17 @@ class SurfacingEngine:
                 await self._await_store_write(
                     _persist_surfacing, self._feedback_tracker, record_event, delivered_ids
                 )
+            except asyncio.CancelledError:
+                # Nothing about this call reaches the client — not the
+                # manifest, not the feedback ID — so the IDs it reserved must
+                # go back, or this session suppresses memories nobody saw.
+                # The durable rows still land (the write is shielded), which
+                # keeps the event row and its dedup rows consistent with each
+                # other; a later session may therefore skip these once inside
+                # ``dedup_ttl_seconds``, the same window a client that hangs
+                # up mid-write already costs.
+                self._release_surfaced_ids(delivered_ids)
+                raise
             except Exception:
                 logger.warning("Failed to record surfacing event", exc_info=True)
                 # No row was written, so the webhook payload must carry None.

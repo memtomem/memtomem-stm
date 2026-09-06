@@ -249,8 +249,10 @@ changes inline only. See the deprecation policy in
   is capped at `timeout_seconds`, past which the call delivers its memories
   without a feedback prompt and the row lands on its own. The surfacing
   timeout no longer covers the work after the LTM round trip returns: a
-  contended store write holds that one call (as it always did) instead of
-  being booked as an LTM timeout that charges the circuit breaker.
+  contended store write holds the call that is making it, as it always did,
+  instead of being booked as an LTM timeout that charges the circuit breaker.
+  A call queued behind it on the same query key still carries an armed timer
+  and can still book that wait as a timeout, exactly as on `main` — #998.
   A rating whose write outruns the ceiling comes back as "not confirmed — do
   not re-submit" instead of a silent success, and a store closed under an
   in-flight call withdraws that call's feedback prompt rather than advertising
