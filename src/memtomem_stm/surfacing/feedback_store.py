@@ -596,19 +596,15 @@ class FeedbackStore:
         worker finishes and commits rather than having the connection closed
         from under it. How long that takes is the statement's own business —
         ``busy_timeout`` caps waiting for the file's lock, not the runtime of a
-        wide ``DELETE`` that already holds it — so this is not a bounded wait.
-        It is paid at teardown, when this process has no requests left to
-        serve, and the engine's ``stop()`` has already given the queue a
-        bounded chance to drain before anyone calls this.
+        wide ``DELETE`` that already holds it — so a caller on the event loop
+        must not call this directly. ``store_io.close_store_on_worker`` is how
+        both teardown paths reach it: queued on the same FIFO worker, the
+        close runs *after* the writes rather than competing with them, so it
+        never waits on this lock at all and cannot land between the two
+        statements of a delivery write.
 
-        A write queued but not started is a different case: it runs after this
-        returns, finds a closed store, and takes the no-op path every method
-        documents. The engine's two-statement delivery write (the event row
-        then the dedup rows) can therefore be split by a ``close`` that lands
-        between them, leaving an event row whose memories were never marked
-        seen. The cost is one memory that may surface again in the next
-        session; the alternative — holding one lock across both — would make a
-        teardown wait on the wider write rather than the narrower one.
+        A write queued after the close runs, finds a closed store, and takes
+        the no-op path every method documents.
         """
         with self._lock:
             if self._db is not None:

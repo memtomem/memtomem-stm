@@ -39,6 +39,7 @@ from memtomem_stm.surfacing.store_io import (
     await_store_write,
     run_off_loop,
     submit_store_write,
+    worker_started,
 )
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 from memtomem_stm.utils.digest import framed_digest
@@ -527,7 +528,11 @@ class SurfacingEngine:
         The worker is a single FIFO thread, so a call that returns after this
         one was queued proves its predecessors are done. Exists for tests and
         for :meth:`stop`, which needs the rows on disk before the store closes.
+        No-op when nothing was ever queued, so a process that never surfaced
+        does not start a thread just to watch it exit.
         """
+        if not worker_started():
+            return
         await run_off_loop(_noop_store_write)
 
     def _persist_fault(self, server: str, tool: str, kind: str) -> None:
@@ -2495,8 +2500,9 @@ class SurfacingEngine:
         """Run periodic store maintenance at most once per cleanup interval.
 
         Called opportunistically from surface() — no separate timer thread
-        needed. Each sub-task is synchronous (SQLite DELETE / UPDATE) and
-        fast enough to run inline. Sub-tasks are independent: an operator
+        needed. The sweeps themselves are queued on the feedback-I/O worker
+        (see :meth:`_run_store_maintenance`); what stays here is the interval
+        bookkeeping. Sub-tasks are independent: an operator
         can disable cross-session dedup (``dedup_ttl_seconds=0``) while
         keeping query retention on, and vice versa. The interval check
         is shared so the loop fires once and visits both.

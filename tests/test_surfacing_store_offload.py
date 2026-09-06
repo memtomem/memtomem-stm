@@ -32,7 +32,9 @@ from memtomem_stm.surfacing.engine import SurfacingEngine
 from memtomem_stm.surfacing.feedback import FeedbackTracker
 from memtomem_stm.surfacing.store_io import (
     MAX_QUEUED_WRITES,
+    close_store_on_worker,
     queued_writes,
+    run_off_loop,
     submit_store_write,
 )
 
@@ -555,6 +557,36 @@ async def test_an_awaited_write_also_refuses_to_join_a_full_queue(tmp_path: Path
         blocker.set()
         await engine.stop()
         tracker.close()
+
+
+async def test_teardown_is_not_held_open_by_a_blocked_write(tmp_path: Path) -> None:
+    # Closing from the event loop takes the store's writer lock, which an
+    # in-flight write holds for as long as its statement runs — a peer holding
+    # the database, a wide retention DELETE. Queueing the close on the same
+    # worker makes it the last operation instead of a competing one, and the
+    # wait for it is bounded.
+    config = _config(tmp_path)
+    tracker = FeedbackTracker(config)
+    blocker = threading.Event()
+    submit_store_write(lambda: blocker.wait(timeout=10.0))
+    try:
+        started = asyncio.get_running_loop().time()
+        await close_store_on_worker(tracker.close, timeout=0.3)
+        elapsed = asyncio.get_running_loop().time() - started
+
+        assert elapsed < 1.5, f"teardown waited {elapsed:.2f}s on a blocked write"
+        assert tracker.store._db is not None, "the close is queued, not skipped"
+
+        blocker.set()
+        await run_off_loop(_noop)
+        assert tracker.store._db is None, "and it runs once the worker is free"
+    finally:
+        blocker.set()
+        tracker.close()
+
+
+def _noop() -> None:
+    """FIFO marker: a call that returns proves its predecessors finished."""
 
 
 async def test_a_failed_best_effort_write_does_not_change_the_response(

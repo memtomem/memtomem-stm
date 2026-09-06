@@ -247,7 +247,8 @@ changes inline only. See the deprecation policy in
   row for a manifest its client never received. The worker is one FIFO thread,
   so an awaited write can wait behind another call's queued sweep; that wait
   is capped at `timeout_seconds`, past which the call delivers its memories
-  without a feedback prompt and the row lands on its own. The surfacing
+  without a feedback prompt while the write stays queued and lands on its own
+  (unless the process is shutting down, which closes the store first). The surfacing
   timeout no longer covers the work after the LTM round trip returns: a
   contended store write holds the call that is making it, as it always did,
   instead of being booked as an LTM timeout that charges the circuit breaker.
@@ -256,7 +257,8 @@ changes inline only. See the deprecation policy in
   A rating whose write outruns the ceiling comes back as "not confirmed — do
   not re-submit" instead of a silent success, and a store closed under an
   in-flight call withdraws that call's feedback prompt rather than advertising
-  an ID with no row. `FeedbackStore.close()` waits for an in-flight write,
+  an ID with no row. `FeedbackStore.close()` is queued on the same worker so a teardown waits
+  behind the writes rather than on the lock one of them holds,
   multi-query reads (`get_stats` and the tuner's ratios) now answer from one
   snapshot, and
   `record_fault` / `record_diagnostic` take the observation time from the

@@ -102,6 +102,42 @@ def feedback_io_executor() -> ThreadPoolExecutor:
         return _executor
 
 
+def worker_started() -> bool:
+    """Whether any write has been queued in this process yet.
+
+    Lets a teardown skip the drain instead of starting a thread purely to
+    watch it exit — the common case for a process that never surfaced.
+    """
+    with _executor_lock:
+        return _executor is not None
+
+
+STORE_CLOSE_BUDGET_SECONDS = 2.0
+"""How long a teardown waits for the store close it queued on the worker."""
+
+
+async def close_store_on_worker(
+    close: Callable[[], None], *, timeout: float = STORE_CLOSE_BUDGET_SECONDS
+) -> None:
+    """Close a store on the worker, after the writes already queued for it.
+
+    Closing from the event loop takes the store's writer lock, which an
+    in-flight write holds for as long as its statement runs — a peer process
+    holding the database, or a wide retention ``DELETE``. That wait is not
+    bounded by anything, and it lands at exactly the moment a shutdown is
+    trying to finish. Sending the close down the same FIFO worker makes it the
+    last operation rather than a competing one, and the wait here is bounded:
+    past *timeout* the close still happens, just not before this returns.
+    """
+    if not worker_started():
+        close()
+        return
+    try:
+        await asyncio.wait_for(asyncio.shield(run_off_loop(close)), timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.debug("Feedback store close still queued behind an in-flight write")
+
+
 def submit_store_write(fn: Callable[..., T], /, *args: Any) -> Future[T]:
     """Queue *fn* on the worker without waiting for it.
 

@@ -55,7 +55,11 @@ from memtomem_stm.surfacing.feedback import (
     FeedbackTracker,
     record_feedback_batch,
 )
-from memtomem_stm.surfacing.store_io import StoreWriteQueueFull, await_store_write
+from memtomem_stm.surfacing.store_io import (
+    StoreWriteQueueFull,
+    await_store_write,
+    close_store_on_worker,
+)
 from memtomem_stm.utils.anyio_shutdown import await_or_warn, is_clean_cancel_scope_shutdown
 from memtomem_stm.utils import child_reaper
 from memtomem_stm.utils.parent_liveness import ParentLivenessWatcher
@@ -733,10 +737,18 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                     )
                 except Exception:
                     logger.warning("Failed to stop surfacing engine", exc_info=True)
+            if feedback_tracker is not None:
+                try:
+                    # Queued on the feedback-I/O worker rather than called
+                    # here: closing from the loop takes the store's writer
+                    # lock, which an in-flight write holds for as long as its
+                    # statement runs (#996).
+                    await close_store_on_worker(feedback_tracker.close)
+                except Exception:
+                    logger.warning("Failed to close feedback_tracker", exc_info=True)
             for resource, name in [
                 (proxy_cache, "proxy_cache"),
                 (metrics_store, "metrics_store"),
-                (feedback_tracker, "feedback_tracker"),
                 (compression_feedback_tracker, "compression_feedback_tracker"),
                 (progressive_reads_tracker, "progressive_reads_tracker"),
                 (selection_log, "selection_log"),
