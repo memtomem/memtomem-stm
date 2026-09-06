@@ -239,7 +239,46 @@ changes inline only. See the deprecation policy in
   await added later in that same stretch. The marker is entry to that path
   rather than a request seen on the wire: the adapter heals its session before
   the RPC, and a call cancelled in there has already spent the LTM/MCP
-  resources the cap counts. Pre-existing on `main`; unrelated to #998.
+  resources the cap counts. Pre-existing on `main`; unrelated to the #998
+  change below, which the probe for this one gave the same answer on.
+
+- **A surfacing call queued on the per-key stampede lock no longer books its
+  wait as an LTM timeout** (#998). `SurfacingEngine._do_surface` serializes
+  identical concurrent queries on `_key_locks`, and that `await` used to sit
+  inside the window `_run_within`'s timer covers. A follower therefore kept an
+  armed timer for time it spent queued behind another call's work, and could
+  raise `asyncio.TimeoutError` without ever having called the LTM — which
+  `surface()` books as the dependency's fault: `error_timeout` on the
+  observability counter, a durable `surfacing_faults` row, and
+  `circuit_breaker.record_failure()`. Three of those open the breaker on a
+  core that answered every request it was given, after which every eligible
+  call is skipped for the reset window.
+  The cache lookup, the key lock, and the post-lock double-check now sit
+  outside the timed scope, and `_effective_timeout` is derived once the lock
+  is held — the same reasoning #720 used to derive the window after the gate,
+  query extraction and privacy scan, applied to the last piece of pre-work
+  that was still inside it. The timer again bounds exactly what it exists to
+  bound: one LTM operation — the adapter's search call, including any
+  reconnect and retry it makes inside it. A follower released by the lock
+  re-checks the
+  cache first — a hit needs no LTM at all, and now renders even for a caller
+  whose `deadline_monotonic` expired while it was queued — and otherwise gets
+  a window derived at that moment: the configured ceiling for a caller that
+  passed no deadline, so a search that was never sent can no longer be
+  reported as one that timed out.
+  Two boundaries are unchanged on purpose. A caller that *did* pass a deadline
+  and whose post-lock re-check misses still books the timeout without sending
+  anything: that is #720's standing decision that pre-work timeouts are booked,
+  and reversing it is a separate change (#998 records the argument). And an LTM
+  operation abandoned at timeout *or cancellation* no longer holds the key lock
+  while it unwinds — the caller releases it as the abort propagates — so the
+  next holder of that key can search while the abandoned request is still
+  unwinding upstream. That is the trade this change makes deliberately: the
+  alternative is the one it removes, a caller waiting out an unwind nothing
+  bounds. `_MAX_ABANDONED_OPS` still bounds how many may pile up, and what
+  keeps an abandoned call from writing the cache behind the new holder is that
+  it stays cancelled — #290's cooperative cancellation contract, which the
+  bundled adapter honours on every caller-facing path.
 
 - **Feedback-store writes run on a worker thread instead of the event loop**
   (#996). A surfacing call that delivers memories writes a `surfacing_events`
@@ -280,8 +319,9 @@ changes inline only. See the deprecation policy in
   timeout no longer covers the work after the LTM round trip returns: a
   contended store write holds the call that is making it, as it always did,
   instead of being booked as an LTM timeout that charges the circuit breaker.
-  A call queued behind it on the same query key still carries an armed timer
-  and can still book that wait as a timeout, exactly as on `main` — #998.
+  A call queued behind it on the same query key carried an armed timer and
+  could book that wait as a timeout; the entry above (#998) takes the key lock
+  outside the timed scope, so it no longer does.
   A rating whose write outruns the ceiling comes back as "not confirmed — do
   not re-submit" instead of a silent success, and a store closed under an
   in-flight call withdraws that call's feedback prompt rather than advertising

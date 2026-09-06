@@ -810,7 +810,7 @@ class TestSurfacingDeadline:
         async def answers() -> str:
             return "answered in time"
 
-        task = asyncio.create_task(engine._run_within(answers(), 30.0, _TimerScope()))
+        task = asyncio.create_task(engine._run_within(answers(), 30.0, _TimerScope(seconds=30.0)))
         await asyncio.sleep(0)  # arm the timer, suspend on the shield
         await asyncio.sleep(0)  # the operation finishes; the wrapper is only queued to resolve
         fire["callback"]()  # the timer, landing in exactly that batch
@@ -1967,6 +1967,170 @@ class TestSurfacingCacheStampede:
                 "Cache entry missing or poisoned — the second searcher's empty "
                 "result overwrote the populated one"
             )
+
+
+class TestKeyLockWaitIsNotAnLtmTimeout:
+    """#998: the timer bounds one LTM round trip, not a queue for the key lock.
+
+    ``_do_surface`` serializes identical concurrent queries on ``_key_locks``.
+    A caller that spends the window queued behind another has issued no LTM
+    request of its own, so an abort while it waits is not the LTM's fault:
+    booking it as ``error_timeout`` plus a breaker failure opens the breaker
+    on a core that answered every request it was given.
+
+    Both tests hold the key lock from the test body rather than from a second
+    ``surface()`` call. A second caller would arm its own timer within
+    microseconds of the follower's, and the assertions would then turn on
+    which of two equal timers the loop happened to run first; here the hold is
+    three windows long, so the queued caller is unambiguously past its old
+    deadline when it acquires the lock.
+    """
+
+    @staticmethod
+    def _count_breaker_charges(engine) -> list[int]:
+        """Count charges rather than read ``failure_count``: a later success
+        resets the counter, which would hide a spurious charge."""
+        charges = [0]
+        real_record_failure = engine._circuit_breaker.record_failure
+
+        def counting_record_failure():
+            charges[0] += 1
+            real_record_failure()
+
+        engine._circuit_breaker.record_failure = counting_record_failure
+        return charges
+
+    async def test_queued_caller_gets_its_own_window_for_its_own_search(self):
+        """Released by the lock onto a cache MISS, the caller runs its own LTM
+        search under a fresh window instead of inheriting an expired one."""
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        chunk = FakeChunk(id="mem-shared", content="shared result")
+        results = [FakeSearchResult(chunk=chunk, score=0.5)]
+        adapter = _make_mcp_adapter(results)
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.1),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+        charges = self._count_breaker_charges(engine)
+        cache_key = framed_digest(("gh", "read_file", VALID_ARGS["_context_query"]))
+
+        async def hold_the_key(hold_for: float) -> None:
+            async with engine._key_locks.hold(cache_key):
+                await asyncio.sleep(hold_for)
+
+        # Three windows: whatever the scheduler does, the queued call is well
+        # past ``timeout_seconds`` by the time it acquires the lock.
+        holder = asyncio.create_task(hold_the_key(0.3))
+        while engine._key_locks.total_refs() != 1:
+            await asyncio.sleep(0)
+
+        out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        await holder
+
+        assert "shared result" in out, (
+            "the queued call was aborted before it ever reached the LTM"
+        )
+        assert adapter.search.call_count == 1
+        outcomes = obs.snapshot()["outcomes"].get("read_file", {})
+        assert "error_timeout" not in outcomes, (
+            f"the wait on the key lock was booked as an LTM timeout ({outcomes})"
+        )
+        assert charges[0] == 0, "the breaker was charged for time spent queued, not for the LTM"
+
+    async def test_queued_caller_released_onto_a_populated_cache_renders_it(self):
+        """Released onto a cache HIT the caller needs no LTM at all, so an
+        expired ``deadline_monotonic`` must not turn the hit into a timeout."""
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        chunk = FakeChunk(id="mem-shared", content="shared result")
+        results = [FakeSearchResult(chunk=chunk, score=0.5)]
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(
+            side_effect=AssertionError("a cache hit must not reach the LTM")
+        )
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=5.0),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+        charges = self._count_breaker_charges(engine)
+        cache_key = framed_digest(("gh", "read_file", VALID_ARGS["_context_query"]))
+
+        async def hold_then_populate() -> None:
+            async with engine._key_locks.hold(cache_key):
+                await asyncio.sleep(0.3)
+                engine._cache.set(cache_key, results)
+
+        holder = asyncio.create_task(hold_then_populate())
+        while engine._key_locks.total_refs() != 1:
+            await asyncio.sleep(0)
+
+        # A daemon-style caller whose own deadline expires while it is queued.
+        out = await engine.surface(
+            "gh",
+            "read_file",
+            VALID_ARGS,
+            LONG_RESPONSE,
+            deadline_monotonic=time.monotonic() + 0.1,
+        )
+        await holder
+
+        assert "shared result" in out, "the post-lock cache hit was not rendered"
+        outcomes = obs.snapshot()["outcomes"].get("read_file", {})
+        assert "error_timeout" not in outcomes, (
+            f"a cache hit that needed no LTM was booked as an LTM timeout ({outcomes})"
+        )
+        assert charges[0] == 0
+
+    async def test_expired_deadline_on_a_post_lock_miss_still_books(self):
+        """The boundary this change deliberately does NOT move (#720).
+
+        A caller that supplied a ``deadline_monotonic`` the wait consumed, and
+        whose post-lock re-check then misses, is still booked as a timeout —
+        real time did pass, and reversing that is #720's decision to revisit,
+        not this one's to contradict. Pinned so a later change cannot flip it
+        by accident: the cheap alternative in #998 is exactly this branch."""
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(
+            side_effect=AssertionError("a spent window must start no LTM work")
+        )
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=5.0),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+        charges = self._count_breaker_charges(engine)
+        cache_key = framed_digest(("gh", "read_file", VALID_ARGS["_context_query"]))
+
+        async def hold_the_key() -> None:
+            # Released without populating the cache, so the re-check misses.
+            async with engine._key_locks.hold(cache_key):
+                await asyncio.sleep(0.3)
+
+        holder = asyncio.create_task(hold_the_key())
+        while engine._key_locks.total_refs() != 1:
+            await asyncio.sleep(0)
+
+        out = await engine.surface(
+            "gh",
+            "read_file",
+            VALID_ARGS,
+            LONG_RESPONSE,
+            deadline_monotonic=time.monotonic() + 0.1,
+        )
+        await holder
+
+        assert out == LONG_RESPONSE
+        assert obs.snapshot()["outcomes"]["read_file"] == {"error_timeout": 1}
+        assert charges[0] == 1
+
 
 
 class TestRelevanceGateConcurrency:
