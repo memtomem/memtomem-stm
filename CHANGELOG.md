@@ -219,6 +219,30 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **A surfacing call queued on the per-key stampede lock no longer books its
+  wait as an LTM timeout** (#998). `SurfacingEngine._do_surface` serializes
+  identical concurrent queries on `_key_locks`, and that `await` used to sit
+  inside the window `_run_within`'s timer covers. A follower therefore kept an
+  armed timer for time it spent queued behind another call's work, and could
+  raise `asyncio.TimeoutError` without ever having called the LTM — which
+  `surface()` books as the dependency's fault: `error_timeout` on the
+  observability counter, a durable `surfacing_faults` row, and
+  `circuit_breaker.record_failure()`. Three of those open the breaker on a
+  core that answered every request it was given, after which every eligible
+  call is skipped for the reset window.
+  The cache lookup, the key lock, and the post-lock double-check now sit
+  outside the timed scope, and `_effective_timeout` is derived once the lock
+  is held — the same reasoning #720 used to derive the window after the gate,
+  query extraction and privacy scan, applied to the last piece of pre-work
+  that was still inside it. The timer again bounds exactly what it exists to
+  bound: one LTM round trip. A follower released by the lock re-checks the
+  cache first (a hit needs no LTM at all) and otherwise gets its own full
+  window for its own search. Two smaller consequences: a caller whose
+  `deadline_monotonic` expired while it was queued now renders a cached answer
+  instead of booking a timeout it would have charged the LTM for, and an LTM
+  operation abandoned at timeout no longer holds the key lock while it
+  unwinds, since the caller releases it as the timeout propagates.
+
 - **The daemon files a warm-search latency sample only for a request that
   actually issued a search RPC to the LTM** (#994). `_run_admitted` decided
   whether a surfacing request was a sample from the terminal decision the

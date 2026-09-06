@@ -1884,6 +1884,90 @@ class TestSurfacingCacheStampede:
             )
 
 
+class TestKeyLockWaitIsNotAnLtmTimeout:
+    """#998: the timer bounds one LTM round trip, not a queue for the key lock.
+
+    ``_do_surface`` serializes identical concurrent queries on
+    ``_key_locks``. A follower that spends the window queued behind another
+    call has issued no LTM request of its own, so an abort while it waits is
+    not the LTM's fault: booking it as ``error_timeout`` plus a breaker
+    failure opens the breaker on a core that answered every request it was
+    given.
+    """
+
+    async def test_follower_queued_behind_a_timing_out_owner_is_not_charged(self):
+        """The owner's LTM never answers, so its own timeout books one
+        failure — that part is legitimate. The follower is queued on the key
+        lock for that whole window; once the owner lets go it must get its own
+        window for its own LTM call, not inherit an already-expired one."""
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        chunk = FakeChunk(id="mem-shared", content="shared result")
+        results = [FakeSearchResult(chunk=chunk, score=0.5)]
+        entered = asyncio.Event()
+        searches = 0
+
+        async def search(**_kwargs):
+            nonlocal searches
+            searches += 1
+            if searches == 1:
+                entered.set()
+                await asyncio.Event().wait()  # hung LTM: only cancellation ends it
+            return (results, [], "ok")
+
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(side_effect=search)
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=0.1),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+
+        # Count breaker charges rather than read ``failure_count``: the
+        # follower's success resets the counter, which would hide a second
+        # charge instead of reporting it.
+        charges = 0
+        real_record_failure = engine._circuit_breaker.record_failure
+
+        def counting_record_failure():
+            nonlocal charges
+            charges += 1
+            real_record_failure()
+
+        engine._circuit_breaker.record_failure = counting_record_failure
+
+        owner = asyncio.create_task(engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE))
+        await entered.wait()
+        follower = asyncio.create_task(
+            engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        )
+        # The follower must be QUEUED on the owner's key lock before either
+        # timer comes due — the whole scenario rests on that precondition.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 2.0
+        while engine._key_locks.total_refs() != 2:
+            assert loop.time() < deadline, "timed out waiting for the follower to queue"
+            await asyncio.sleep(0)
+
+        out_owner, out_follower = await asyncio.gather(owner, follower)
+
+        assert out_owner == LONG_RESPONSE, "the owner's hung LTM cannot have surfaced anything"
+        assert "shared result" in out_follower, (
+            "the follower never ran its own LTM call — it was aborted while queued"
+        )
+        assert adapter.search.call_count == 2
+        outcomes = obs.snapshot()["outcomes"]["read_file"]
+        assert outcomes.get("error_timeout") == 1, (
+            f"only the owner's hung LTM may book a timeout (got {outcomes})"
+        )
+        assert charges == 1, (
+            "the follower charged the breaker for time it spent waiting on the key lock "
+            f"(breaker charged {charges} times, expected only the owner's)"
+        )
+        assert not engine._circuit_breaker.is_open
+
+
 class TestRelevanceGateConcurrency:
     """``RelevanceGate.should_surface`` is called at ``surface()`` entry and
     ``record_surfacing`` is called later inside ``_do_surface_miss`` (after

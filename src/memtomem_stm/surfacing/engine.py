@@ -70,9 +70,10 @@ stops starting new ones.
 
 ``_run_within`` abandons an operation rather than waiting out an unwind it
 cannot bound, so an LTM that never lets go leaves one behind per attempt, each
-still holding whatever it held (its session, the per-key lock). The circuit
-breaker throttles but does not stop that: every reset lets another probe
-through. Rather than evict the references — the point of keeping them is that
+still holding whatever it held (its session; not the per-key lock, which the
+caller took outside the timed scope and releases as the timeout propagates —
+#998). The circuit breaker throttles but does not stop that: every reset lets
+another probe through. Rather than evict the references — the point of keeping them is that
 the operation is still running — refuse the *next* attempt while this many are
 stuck, which is also the honest reading of a dependency that will not let go.
 Small on purpose: past one or two, the LTM is not answering anyway.
@@ -119,6 +120,22 @@ class _ScoreScaleStreak:
     threshold: float
     count: int
     observed_max: float
+
+
+@dataclass
+class _TimerWindow:
+    """The LTM window a call actually armed, reported back to :meth:`surface`.
+
+    The window is derived deep inside :meth:`_do_surface` — after the per-key
+    lock is held (#998) — but it is :meth:`surface` that logs it on the
+    timeout path, and a call can also reach that path without deriving one at
+    all (a :class:`asyncio.TimeoutError` raised by the operation itself, or a
+    cache hit that never armed a timer). So it starts at the configured
+    ceiling, which is the honest reading of "the limit" for a call that never
+    narrowed it, and the derivation overwrites it.
+    """
+
+    seconds: float
 
 
 class _DependencyFault(RuntimeError):
@@ -621,11 +638,13 @@ class SurfacingEngine:
         """This call's LTM window: the configured ceiling, lowered to what is
         left of a deadline-bounded caller's absolute deadline.
 
-        Reading the clock *here* — after the gate, query extraction, and
-        privacy scan — makes the engine's own pre-timeout work debit its own
-        window instead of the caller's response margin (#720); a relative
-        budget captured before that work silently spent the margin. The
-        deadline only ever shrinks the window — an operator's
+        Read after the gate, query extraction, privacy scan, the cache
+        lookup, and the wait for the per-key lock (#720/#998), so the
+        engine's own pre-timeout work debits its own window instead of the
+        caller's response margin — and so a call queued behind an identical
+        one arms its timer for its own LTM round trip rather than for the
+        queue; a relative budget captured before that work silently spent the
+        margin. The deadline only ever shrinks the window — an operator's
         ``timeout_seconds`` stays the upper bound. ``None``, non-finite, or
         non-positive values (a ``time.monotonic()`` reading is always
         positive, so those are caller bugs, not elapsed time) are ignored
@@ -1041,10 +1060,13 @@ class SurfacingEngine:
         cancellation skips all three, so the breaker never opens and every
         subsequent call pays the full timeout again.
         :meth:`_run_within` is what makes that abort reliably ours to raise
-        rather than a race against the caller's backstop (#720). A cancellation
-        that reaches here is therefore one this call did not start — a
-        shutdown, a client hanging up — and propagates unbooked rather than
-        charging a healthy LTM.
+        rather than a race against the caller's backstop (#720). What it
+        covers is one LTM round trip: the cache lookup and the per-key
+        stampede lock sit outside it, so a call queued behind an identical one
+        is never charged for the wait (#998). A cancellation that reaches here
+        is therefore one this call did not start — a shutdown, a client
+        hanging up — and propagates unbooked rather than charging a healthy
+        LTM.
         """
         if not self._config.enabled:
             self._observability.record_skip(tool, "disabled")
@@ -1091,33 +1113,22 @@ class SurfacingEngine:
             )
             return response_text
 
-        effective_timeout = self._effective_timeout(deadline_monotonic)
+        # The window is armed inside ``_do_surface``, once the cache lookup
+        # and the per-key lock are behind us (#998); this holder carries back
+        # what it armed so the log below reports the real limit.
+        window = _TimerWindow(self._config.timeout_seconds)
         try:
-            if effective_timeout <= 0:
-                # Pre-timeout work (gate, query extraction, privacy scan)
-                # consumed the caller's whole window (#720). Book the abort
-                # through the branch below without starting an LTM round trip
-                # that would only be cancelled mid-RPC, spending the LTM's
-                # time on an answer nobody reads. No LTM work started
-                # also means no rate-limit attempt was made (the cap counts
-                # attempts because an attempt spent LTM resources — see
-                # ``release_claim``); the timeout/breaker booking still
-                # stands, since real time did pass.
-                self._gate.release_claim(rate_claim)
-                raise asyncio.TimeoutError
-            result = await self._run_within(
-                self._do_surface(
-                    server,
-                    tool,
-                    arguments,
-                    response_text,
-                    query,
-                    rate_claim=rate_claim,
-                    trace_id=trace_id,
-                ),
-                effective_timeout,
+            return await self._do_surface(
+                server,
+                tool,
+                arguments,
+                response_text,
+                query,
+                rate_claim=rate_claim,
+                trace_id=trace_id,
+                deadline_monotonic=deadline_monotonic,
+                window=window,
             )
-            return result
         except asyncio.TimeoutError:
             self._observability.record_outcome(tool, "error_timeout")
             self._persist_fault(server, tool, "error_timeout")
@@ -1125,9 +1136,10 @@ class SurfacingEngine:
                 "Surfacing timed out for %s/%s (%.1fs limit)",
                 server,
                 tool,
-                # Clamped: the pre-work branch above reaches here with a
-                # window already spent, and a negative "limit" reads as a bug.
-                max(effective_timeout, 0.0),
+                # Clamped: the pre-work branch in ``_do_surface`` reaches
+                # here with a window already spent, and a negative "limit"
+                # reads as a bug.
+                max(window.seconds, 0.0),
             )
             # A hung LTM must open the breaker like an erroring one (#579): a
             # timeout is a degraded dependency. Without counting it, every
@@ -1528,14 +1540,30 @@ class SurfacingEngine:
         *,
         rate_claim: RateClaim,
         trace_id: str | None = None,
+        deadline_monotonic: float | None = None,
+        window: _TimerWindow,
     ) -> str:
-        # Check surfacing cache (keyed by server+tool+query). The full miss
-        # path lives in ``_do_surface_miss``; this shell handles the
-        # cache-check fast path, per-key stampede lock, and post-lock
-        # double-check, so identical concurrent queries do not run
-        # overlapping LTM searches and the losing coroutine cannot poison the
-        # cache with an empty result. Collapse is cache-mediated, not
-        # coalescing (see ``_key_locks`` init docstring).
+        """Cache lookup, per-key stampede lock, then the timed LTM window.
+
+        The full miss path lives in ``_do_surface_miss``; this shell handles
+        the cache-check fast path, per-key stampede lock, and post-lock
+        double-check, so identical concurrent queries do not run overlapping
+        LTM searches and the losing coroutine cannot poison the cache with an
+        empty result. Collapse is cache-mediated, not coalescing (see
+        ``_key_locks`` init docstring).
+
+        None of that is timed, and that is the point (#998). The timer bounds
+        one LTM round trip and makes its abort bookable as the dependency's
+        fault (#579/#720); a wait for the key lock is neither. Timing it made
+        a follower raise :class:`asyncio.TimeoutError` without ever having
+        called the LTM, and :meth:`surface` charged the core —
+        ``error_timeout``, a fault row, a breaker failure — for time the
+        follower spent queued behind another call's work. Three of those open the breaker on a core
+        that answered every request it was given. So the window is derived
+        here, under the lock, by the same reasoning #720 used to derive it
+        after the gate and query extraction: whatever pre-work the engine does
+        on its own account debits its own time, not the LTM's record.
+        """
         cache_key = framed_digest((server, tool, query))
         cached = self._cache.get(cache_key)
         if cached is not None:
@@ -1559,15 +1587,38 @@ class SurfacingEngine:
                 finally:
                     self._gate.release_claim(rate_claim)
             self._observability.record_cache("miss")
-            return await self._do_surface_miss(
-                server,
-                tool,
-                arguments,
-                response_text,
-                query,
-                cache_key,
-                rate_claim=rate_claim,
-                trace_id=trace_id,
+            # Recorded before the window check below: the lookup happened and
+            # missed, whatever the clock then says. (A miss already does not
+            # imply an LTM attempt — admission can still refuse one.)
+            window.seconds = effective_timeout = self._effective_timeout(deadline_monotonic)
+            if effective_timeout <= 0:
+                # Pre-timeout work — gate, query extraction, privacy scan, and
+                # now the cache lookup and the queue for the key lock —
+                # consumed a deadline-bounded caller's whole window (#720).
+                # Book the abort through :meth:`surface`'s timeout branch
+                # without starting an LTM round trip that would only be
+                # cancelled mid-RPC, spending the LTM's time on an answer
+                # nobody reads. No LTM work started also means no rate-limit
+                # attempt was made (the cap counts attempts because an attempt
+                # spent LTM resources — see ``release_claim``); the
+                # timeout/breaker booking still stands, since real time did
+                # pass. Only a caller that supplied a deadline can land here:
+                # without one the window is the configured ceiling, so a
+                # follower released by the lock always gets a full one.
+                self._gate.release_claim(rate_claim)
+                raise asyncio.TimeoutError
+            return await self._run_within(
+                self._do_surface_miss(
+                    server,
+                    tool,
+                    arguments,
+                    response_text,
+                    query,
+                    cache_key,
+                    rate_claim=rate_claim,
+                    trace_id=trace_id,
+                ),
+                effective_timeout,
             )
 
     async def _do_surface_miss(
