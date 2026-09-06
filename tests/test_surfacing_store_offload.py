@@ -30,11 +30,11 @@ import pytest
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine
 from memtomem_stm.surfacing.feedback import FeedbackTracker
+from memtomem_stm.surfacing import store_io
 from memtomem_stm.surfacing.store_io import (
     MAX_QUEUED_WRITES,
     close_store_on_worker,
     queued_writes,
-    run_off_loop,
     submit_store_write,
 )
 
@@ -105,6 +105,18 @@ def _adapter() -> AsyncMock:
 
 def _engine(config: SurfacingConfig, tracker: Any) -> SurfacingEngine:
     return SurfacingEngine(config, mcp_adapter=_adapter(), feedback_tracker=tracker)
+
+
+@pytest.fixture
+def short_store_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shrink the store-write ceiling so a blocked worker trips it quickly.
+
+    The real budget comes from SQLite's lock timeout, not from
+    ``timeout_seconds`` — an operator tightening the LTM budget must not start
+    seeing "store busy" answers — so a test that wants to observe the ceiling
+    has to move the ceiling.
+    """
+    monkeypatch.setattr(store_io, "STORE_WRITE_BUDGET_SECONDS", 0.3)
 
 
 def _hold_write_lock(db_path: Path) -> sqlite3.Connection:
@@ -349,7 +361,7 @@ async def test_a_key_reblocked_during_the_recovery_keeps_its_new_claim(
 
 
 async def test_a_write_stuck_behind_the_queue_stops_holding_the_response(
-    tmp_path: Path,
+    tmp_path: Path, short_store_budget: None
 ) -> None:
     # The worker is one FIFO thread, so an awaited write waits for whatever was
     # queued ahead of it — another call's retention sweep, a burst of fault
@@ -357,7 +369,7 @@ async def test_a_write_stuck_behind_the_queue_stops_holding_the_response(
     # with no caller deadline at all on the proxy path, nothing else would
     # bound that wait. The call gives up on the row and degrades the way it
     # does for a failed write.
-    config = _config(tmp_path, timeout_seconds=0.3)
+    config = _config(tmp_path)
     tracker = FeedbackTracker(config)
     engine = _engine(config, tracker)
     blocker = threading.Event()
@@ -384,11 +396,13 @@ async def test_a_write_stuck_behind_the_queue_stops_holding_the_response(
         tracker.close()
 
 
-async def test_a_busy_store_declines_the_rating_instead_of_raising(tmp_path: Path) -> None:
+async def test_a_busy_store_declines_the_rating_instead_of_raising(
+    tmp_path: Path, short_store_budget: None
+) -> None:
     # The rating write is bounded like the event row's. Past the ceiling the
     # agent gets a sentence it can act on — and specifically one telling it not
     # to re-submit, because the shielded write is still on its way.
-    config = _config(tmp_path, timeout_seconds=0.3)
+    config = _config(tmp_path)
     tracker = FeedbackTracker(config)
     engine = _engine(config, tracker)
     blocker = threading.Event()
@@ -441,13 +455,13 @@ async def test_a_store_closed_under_the_call_withdraws_the_feedback_id(
 
 
 async def test_a_negative_rating_still_filters_the_cache_when_the_write_times_out(
-    tmp_path: Path,
+    tmp_path: Path, short_store_budget: None
 ) -> None:
     # The rating is shielded and lands later, so the agent's rejection is
     # real. Skipping the in-memory filter because this call could not confirm
     # the row would let the memory it just rejected come straight back out of
     # a warm cache entry.
-    config = _config(tmp_path, timeout_seconds=0.3, cache_ttl_seconds=60.0)
+    config = _config(tmp_path, cache_ttl_seconds=60.0)
     tracker = FeedbackTracker(config)
     engine = _engine(config, tracker)
     blocker = threading.Event()
@@ -534,6 +548,63 @@ async def test_a_cancelled_call_gives_back_the_ids_it_reserved(tmp_path: Path) -
         tracker.close()
 
 
+async def test_a_cancelled_cache_hit_keeps_the_miss_s_reservation(tmp_path: Path) -> None:
+    # A cache hit re-claims the IDs the miss that filled the entry already
+    # holds — it deliberately does not filter against the session set, or a
+    # repeated query would render nothing. So releasing every delivered ID on
+    # cancellation drops the miss's claim, and a later miss surfaces a memory
+    # this session already delivered.
+    config = _config(tmp_path, cache_ttl_seconds=60.0)
+    tracker = FeedbackTracker(config)
+    engine = _engine(config, tracker)
+    blocker = threading.Event()
+    try:
+        args = _args("cached twice")
+        await engine.surface("gh", "read_file", args, LONG_RESPONSE)
+        await engine.drain_store_writes()
+        claimed_by_the_miss = dict(engine._surfaced_ids)
+        assert claimed_by_the_miss, "the miss claimed what it delivered"
+
+        submit_store_write(lambda: blocker.wait(timeout=10.0))
+        cached = asyncio.create_task(engine.surface("gh", "read_file", args, LONG_RESPONSE))
+        await asyncio.sleep(0.1)
+        cached.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cached
+
+        assert engine._surfaced_ids == claimed_by_the_miss, (
+            "the cancelled hit introduced nothing, so it gives nothing back"
+        )
+    finally:
+        blocker.set()
+        await engine.stop()
+        tracker.close()
+
+
+async def test_a_rating_for_a_foreign_memory_filters_nothing(tmp_path: Path) -> None:
+    # The store refuses a rating whose memory the event never carried. The
+    # cache filter runs before that verdict is known on the timeout and
+    # cancellation paths, so it has to refuse the same thing itself — or a
+    # bogus ID suppresses unrelated cached results for that server and tool.
+    config = _config(tmp_path, cache_ttl_seconds=60.0)
+    tracker = FeedbackTracker(config)
+    engine = _engine(config, tracker)
+    try:
+        await engine.surface("gh", "read_file", _args("foreign rating"), LONG_RESPONSE)
+        await engine.drain_store_writes()
+        db = sqlite3.connect(str(config.feedback_db_path))
+        try:
+            surfacing_id = db.execute("SELECT id FROM surfacing_events").fetchone()[0]
+        finally:
+            db.close()
+
+        engine._invalidate_cache_for_feedback(surfacing_id, "mem-not-in-this-event")
+        assert engine._invalidated_ids == {}
+    finally:
+        await engine.stop()
+        tracker.close()
+
+
 async def test_an_awaited_write_also_refuses_to_join_a_full_queue(tmp_path: Path) -> None:
     # The ceiling covers awaited writes too, or a wedged store would let event
     # rows pile up at call rate: every caller stops waiting after its own
@@ -578,15 +649,16 @@ async def test_teardown_is_not_held_open_by_a_blocked_write(tmp_path: Path) -> N
         assert tracker.store._db is not None, "the close is queued, not skipped"
 
         blocker.set()
-        await run_off_loop(_noop)
+        # The close was handed to a daemon thread when its turn did not come,
+        # so it lands once the blocked write releases the lock — without the
+        # process having waited for it.
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while tracker.store._db is not None and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.02)
         assert tracker.store._db is None, "and it runs once the worker is free"
     finally:
         blocker.set()
         tracker.close()
-
-
-def _noop() -> None:
-    """FIFO marker: a call that returns proves its predecessors finished."""
 
 
 async def test_a_failed_best_effort_write_does_not_change_the_response(

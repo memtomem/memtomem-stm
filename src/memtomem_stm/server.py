@@ -1770,11 +1770,8 @@ async def stm_surfacing_feedback(
             return await app.surfacing_engine.handle_feedback(surfacing_id, rating, memory_id)
         if app.feedback_tracker is None:
             return "Feedback tracking is not enabled."
-        timeout = app.config.surfacing.timeout_seconds
         if ratings is not None:
-            return await _record_batched_via_tracker(
-                app.feedback_tracker, surfacing_id, ratings, timeout=timeout
-            )
+            return await _record_batched_via_tracker(app.feedback_tracker, surfacing_id, ratings)
         if rating is None:
             return "Error: `rating` is required for single-memory feedback."
         # Off-loop like every other feedback-store write (#996): this DB is
@@ -1784,11 +1781,7 @@ async def stm_surfacing_feedback(
         # hangs up must not drop a rating already on its way to the store.
         try:
             return await await_store_write(
-                app.feedback_tracker.record_feedback,
-                surfacing_id,
-                rating,
-                memory_id,
-                timeout=timeout,
+                app.feedback_tracker.record_feedback, surfacing_id, rating, memory_id
             )
         except StoreWriteQueueFull:
             return FEEDBACK_STORE_UNAVAILABLE
@@ -1800,8 +1793,6 @@ async def _record_batched_via_tracker(
     tracker: Any,
     surfacing_id: str,
     ratings: list[dict],
-    *,
-    timeout: float,
 ) -> str:
     """Fallback fan-out when the engine is unavailable but the tracker is.
 
@@ -1832,9 +1823,7 @@ async def _record_batched_via_tracker(
         parsed.append((mid, rat))
 
     try:
-        results = await await_store_write(
-            record_feedback_batch, tracker, surfacing_id, parsed, timeout=timeout
-        )
+        results = await await_store_write(record_feedback_batch, tracker, surfacing_id, parsed)
     except StoreWriteQueueFull:
         return FEEDBACK_STORE_UNAVAILABLE
     except asyncio.TimeoutError:

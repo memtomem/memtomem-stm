@@ -1137,6 +1137,7 @@ class TestEngineFaultPersistence:
         }
 
         await engine.surface("gh", "read_file", _other_args("second"), LONG_RESPONSE)
+        await engine.drain_store_writes()
         assert calls() == 1
         await engine.drain_store_writes()
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {}
@@ -1173,6 +1174,7 @@ class TestEngineFaultPersistence:
 
         calls = _recovery_call_counter(tracker)
         await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)  # cache hit
+        await engine.drain_store_writes()
         assert calls() == 0
         await engine.drain_store_writes()
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {
@@ -1181,6 +1183,7 @@ class TestEngineFaultPersistence:
 
         # Positive control: a miss on the same key does close it.
         await engine.surface("gh", "read_file", _other_args("miss"), LONG_RESPONSE)
+        await engine.drain_store_writes()
         assert calls() == 1
         await engine.drain_store_writes()
         assert read_surfacing_summary(config.feedback_db_path)["active_faults"] == {}

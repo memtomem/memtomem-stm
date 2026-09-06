@@ -35,6 +35,8 @@ from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, TypeVar
 
+from memtomem_stm.utils.sqlite_tuning import BUSY_TIMEOUT_MS
+
 logger = logging.getLogger(__name__)
 
 _EXECUTOR_THREAD_PREFIX = "stm-feedback-io"
@@ -112,6 +114,18 @@ def worker_started() -> bool:
         return _executor is not None
 
 
+STORE_WRITE_BUDGET_SECONDS = BUSY_TIMEOUT_MS / 1000.0 + 2.0
+"""How long a caller waits for its own store write before giving up on it.
+
+Derived from the store's own lock budget, not from the LTM timeout the rest of
+a surfacing call is measured against: what this bounds is waiting out another
+writer of ``stm_feedback.db``, which is what ``busy_timeout`` covers, plus
+slack for a couple of those queued ahead on the single worker. Tying it to
+``surfacing.timeout_seconds`` would make an operator who tightens the LTM
+budget start seeing "store busy" answers from a database that is merely being
+written by its neighbour.
+"""
+
 STORE_CLOSE_BUDGET_SECONDS = 2.0
 """How long a teardown waits for the store close it queued on the worker."""
 
@@ -135,7 +149,36 @@ async def close_store_on_worker(
     try:
         await asyncio.wait_for(asyncio.shield(run_off_loop(close)), timeout=timeout)
     except asyncio.TimeoutError:
+        # Its turn has not come. Retire the worker anyway — executor threads
+        # are not daemons, so leaving one queued behind a long write would
+        # hand that wait to interpreter exit — and finish the close on a
+        # daemon thread, which releases the connection when the lock frees
+        # without holding the process open for it.
         logger.debug("Feedback store close still queued behind an in-flight write")
+        shutdown_worker()
+        threading.Thread(target=close, name=f"{_EXECUTOR_THREAD_PREFIX}-close", daemon=True).start()
+    else:
+        shutdown_worker()
+
+
+def shutdown_worker(*, wait: bool = False) -> None:
+    """Retire the worker, dropping writes that have not started.
+
+    Executor threads are not daemons, so the interpreter's own exit handler
+    joins them — a teardown that gave up waiting for a close would still hand
+    that wait to process exit, and everything queued behind it would run
+    against a store that is already closed. Cancelling the queue and letting
+    go is the honest end: what had not started was going to be a no-op anyway.
+
+    The module goes back to its initial state, so a later write (a fresh
+    server in the same process, the next test) starts a new worker rather than
+    finding a dead one.
+    """
+    global _executor
+    with _executor_lock:
+        executor, _executor = _executor, None
+    if executor is not None:
+        executor.shutdown(wait=wait, cancel_futures=True)
 
 
 def submit_store_write(fn: Callable[..., T], /, *args: Any) -> Future[T]:
@@ -163,7 +206,7 @@ async def run_off_loop(fn: Callable[..., T], /, *args: Any) -> T:
     return await asyncio.get_running_loop().run_in_executor(feedback_io_executor(), fn, *args)
 
 
-async def await_store_write(fn: Callable[..., T], /, *args: Any, timeout: float) -> T:
+async def await_store_write(fn: Callable[..., T], /, *args: Any, timeout: float | None = None) -> T:
     """Run *fn* on the worker, keeping it once queued and bounding the wait.
 
     The shield is what keeps the write: by the time these run the caller's
@@ -180,10 +223,14 @@ async def await_store_write(fn: Callable[..., T], /, *args: Any, timeout: float)
 
     Raises :class:`StoreWriteQueueFull` rather than joining a queue already at
     its ceiling — the caller degrades as it would for a write that failed.
+    *timeout* defaults to :data:`STORE_WRITE_BUDGET_SECONDS`.
     """
+    # Read at call time, not bound as a default, so a test can shrink the
+    # budget without every caller having to pass one.
+    budget = STORE_WRITE_BUDGET_SECONDS if timeout is None else timeout
     future = asyncio.wrap_future(_enqueue(fn, args))
     try:
-        return await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+        return await asyncio.wait_for(asyncio.shield(future), timeout=budget)
     except (asyncio.CancelledError, asyncio.TimeoutError):
         # Consume whatever it ends up doing so asyncio does not report an
         # orphaned exception from a write nobody is waiting for any more.

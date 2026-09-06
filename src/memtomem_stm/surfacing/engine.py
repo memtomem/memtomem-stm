@@ -510,17 +510,20 @@ class SurfacingEngine:
         future.add_done_callback(_done)
 
     async def _await_store_write(self, fn: Any, *args: Any) -> Any:
-        """Await one store write on the worker under this engine's ceiling.
+        """Await one store write on the worker under the store's own ceiling.
 
         Every such write — the surfacing event row whose ID the caller may
         have to withdraw, the feedback row whose result it returns, the
-        tuner's pass — gets ``timeout_seconds``, the same budget the LTM round
-        trip gets, because a single FIFO worker makes the wait depend on what
-        other calls queued. Once :class:`_TimerScope` has disarmed the
-        surfacing timer, and on the proxy path where no caller deadline exists
-        at all, this is the only thing bounding it.
+        tuner's pass — is bounded by ``STORE_WRITE_BUDGET_SECONDS``, because a
+        single FIFO worker makes the wait depend on what other calls queued.
+        Once :class:`_TimerScope` has disarmed the surfacing timer, and on the
+        proxy path where no caller deadline exists at all, this is the only
+        thing bounding it. Deliberately not ``timeout_seconds``: that is the
+        budget for an LTM round trip, and an operator tightening it should not
+        start seeing "store busy" answers from a healthy database a neighbour
+        happens to be writing.
         """
-        return await await_store_write(fn, *args, timeout=self._config.timeout_seconds)
+        return await await_store_write(fn, *args)
 
     async def drain_store_writes(self) -> None:
         """Wait for every feedback-store write queued so far to finish.
@@ -1621,6 +1624,12 @@ class SurfacingEngine:
             return
         server = event["server"]
         tool = event["tool"]
+        if memory_id is not None and memory_id not in event["memory_ids"]:
+            # The store refuses a rating for a memory this event never
+            # carried, and the filter must refuse it for the same reason: the
+            # paths that call this before knowing the write's result would
+            # otherwise let a foreign ID suppress unrelated cached results.
+            return
         target_ids = [memory_id] if memory_id else event["memory_ids"]
         for mid in target_ids:
             self._invalidated_ids[(server, tool, mid)] = None
@@ -1650,17 +1659,30 @@ class SurfacingEngine:
         threshold = self._config.feedback_demotion_negative_threshold
         return {mid for mid, count in counts.items() if count >= threshold}
 
-    def _claim_surfaced_ids(self, ids: list[str]) -> None:
+    def _claim_surfaced_ids(self, ids: list[str]) -> list[str]:
         """Record memory IDs as surfaced this session, FIFO-pruning to
         ``_surfaced_ids_max``. Shared by the miss path and the cache-hit path so
         a memory injected either way is deduped against later misses (evicting
-        the oldest half once the cap is exceeded)."""
+        the oldest half once the cap is exceeded).
+
+        Returns the IDs this call actually introduced. A cache hit deliberately
+        re-claims IDs the miss that filled the entry already holds, so only
+        that subset is this call's to give back if it ends up delivering
+        nothing.
+        """
+        introduced = [mid for mid in ids if mid not in self._surfaced_ids]
         for mid in ids:
             self._surfaced_ids[mid] = None
         _fifo_prune(self._surfaced_ids, self._surfaced_ids_max)
+        return introduced
 
     def _release_surfaced_ids(self, ids: list[str]) -> None:
-        """Give back session-dedup reservations a cancelled call never used."""
+        """Give back session-dedup reservations a cancelled call never used.
+
+        Only the ones it introduced: another call may be delivering the same
+        memory right now, and dropping its claim would let a later miss
+        surface that memory a second time.
+        """
         for mid in ids:
             self._surfaced_ids.pop(mid, None)
 
@@ -1780,7 +1802,7 @@ class SurfacingEngine:
         # drop the whole injection (the id-less degradation contract).
         if manifest.rendered_bullets == 0:
             return response_text
-        self._claim_surfaced_ids(delivered_ids)
+        claimed = self._claim_surfaced_ids(delivered_ids)
         if surfacing_id is not None:
             assert self._feedback_tracker is not None
             try:
@@ -1808,7 +1830,7 @@ class SurfacingEngine:
                     raise RuntimeError("feedback store closed before the event was written")
             except asyncio.CancelledError:
                 # Same as the miss path: an undelivered render keeps no claim.
-                self._release_surfaced_ids(delivered_ids)
+                self._release_surfaced_ids(claimed)
                 raise
             except Exception:
                 logger.warning("Failed to record cached surfacing event", exc_info=True)
@@ -2268,7 +2290,7 @@ class SurfacingEngine:
         # coroutines build ``relevant`` including the same memory and
         # violate the documented session-dedup invariant.
         new_ids = [str(r.chunk.id) for r in relevant if not getattr(r, "pinned", False)]
-        self._claim_surfaced_ids(new_ids)
+        claimed = self._claim_surfaced_ids(new_ids)
 
         logger.info("Surfacing %d memories for %s/%s", len(relevant), server, tool)
         logger.debug(
@@ -2358,11 +2380,15 @@ class SurfacingEngine:
                 # other; a later session may therefore skip these once inside
                 # ``dedup_ttl_seconds``, the same window a client that hangs
                 # up mid-write already costs.
-                self._release_surfaced_ids(delivered_ids)
+                self._release_surfaced_ids([mid for mid in claimed if mid in delivered_set])
                 raise
             except Exception:
                 logger.warning("Failed to record surfacing event", exc_info=True)
-                # No row was written, so the webhook payload must carry None.
+                # This call cannot resolve the ID it advertised — the write
+                # failed outright, or outran its ceiling and is still queued —
+                # so the webhook payload carries None and the prompt is
+                # withdrawn. A write that lands later leaves a row nobody was
+                # told about, which is the same orphan a cancelled call makes.
                 surfacing_id = None
                 if advertised_id is not None:
                     # The rendered prompt references an unresolvable event ID.

@@ -246,9 +246,14 @@ changes inline only. See the deprecation policy in
   deadline mid-write still lands its event row, so a shed request can leave a
   row for a manifest its client never received. The worker is one FIFO thread,
   so an awaited write can wait behind another call's queued sweep; that wait
-  is capped at `timeout_seconds`, past which the call delivers its memories
-  without a feedback prompt while the write stays queued and lands on its own
-  (unless the process is shutting down, which closes the store first). The surfacing
+  has its own cap — derived from the store's SQLite lock timeout, deliberately
+  not from `timeout_seconds`, so tightening the LTM budget does not turn a
+  neighbour writing the database into a surfacing failure — past which the
+  call delivers its memories without a feedback prompt while the write stays
+  queued and lands on its own — leaving a row nobody was told about, the same
+  orphan a cancelled request makes. A teardown queues the store close behind
+  the writes already waiting, so those still land; anything queued after it
+  does not. The surfacing
   timeout no longer covers the work after the LTM round trip returns: a
   contended store write holds the call that is making it, as it always did,
   instead of being booked as an LTM timeout that charges the circuit breaker.
