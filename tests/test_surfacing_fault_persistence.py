@@ -1134,6 +1134,7 @@ class TestEngineFaultPersistence:
         engine = SurfacingEngine(config=config, mcp_adapter=adapter, feedback_tracker=tracker)
 
         await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        await engine.drain_store_writes()  # same ordering hazard as the cache-hit test
         calls = _recovery_call_counter(tracker)
         # A peer process opens an episode this engine never saw.
         peer = FeedbackTracker(config)
@@ -1178,6 +1179,13 @@ class TestEngineFaultPersistence:
         engine = SurfacingEngine(config=config, mcp_adapter=adapter, feedback_tracker=tracker)
 
         await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)  # populates cache
+        # Land the recovery that miss queued BEFORE recording the fault. Both
+        # timestamps come from the same clock, so a recovery running afterwards
+        # still satisfies ``last_at <= recovered_at`` wherever that clock is too
+        # coarse to separate them — 15.6 ms on Windows — and closes the episode
+        # this test asserts is open. Production cannot invert the two: its fault
+        # write rides the same FIFO worker and carries its own ``at=``.
+        await engine.drain_store_writes()
         tracker.record_fault("gh", "read_file", "error_timeout")
 
         calls = _recovery_call_counter(tracker)
