@@ -2712,3 +2712,76 @@ def test_release_publish_steps_scope_skip_existing_to_the_dry_run_lane() -> None
     assert "          skip-existing: true" in dry_run, (
         "the TestPyPI dry-run lane must skip existing files so a test-v* tag can be re-pushed"
     )
+
+
+def test_release_creates_the_github_release_in_a_least_privilege_job() -> None:
+    """The Release job exists, is gated, and does not share the publisher's token.
+
+    The Release object was forgotten three times (v0.1.3, v0.2.0, v0.4.0) while
+    the tag and the PyPI upload went out fine, so ``gh release list`` kept
+    showing an older release as Latest — for ten days after v0.2.0.
+    ``release.yml`` now creates it, and these pin the parts whose loss is silent:
+
+    * ``needs: publish`` — without it the Release is created even when the build,
+      the audits or the upload failed, announcing a version that is not on PyPI.
+    * the permission split — job-level ``permissions`` REPLACE the workflow-level
+      block outright, so moving this work into ``publish`` (or copying
+      ``id-token`` here) hands the OIDC-bearing job write access to the
+      repository. Two jobs, one capability each, is the whole reason this is a
+      job and not a step (#609).
+    * ``--verify-tag`` — ``gh release create`` INVENTS a tag that does not exist,
+      so dropping the flag turns a bad ref into a ghost tag instead of an error.
+    * the existence check — a re-run must not overwrite notes a human enriched.
+
+    Comments are dropped before every check: a commented-out ``id-token`` line
+    still spells the string, and reading it as live would let the split this
+    test exists to protect be dismantled while the test stayed green.
+    """
+    workflow = _read(".github/workflows/release.yml")
+
+    def _active(block: str) -> str:
+        return "\n".join(
+            line.rstrip()
+            for line in block.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+
+    assert "\n  github_release:\n" in workflow, (
+        "release.yml must carry the github_release job — the tag alone has "
+        "shipped without a Release three times"
+    )
+    publish_job = _active(workflow.split("\n  publish:\n", 1)[1].split("\n  github_release:", 1)[0])
+    release_job = _active(workflow.split("\n  github_release:\n", 1)[1])
+
+    assert "\n    needs: publish" in "\n" + release_job, (
+        "the Release must be created only after publish succeeds, or it "
+        "announces a version that never reached PyPI"
+    )
+    assert "if: ${{ !startsWith(github.ref_name, 'test-') }}" in release_job, (
+        "test-v* tags are TestPyPI dry runs and must not produce a Release"
+    )
+
+    # The split is the security property: each job carries exactly the one
+    # capability it needs, and neither carries the other's.
+    assert "contents: write" in release_job, (
+        "the Release job needs contents: write to create the release"
+    )
+    assert "id-token" not in release_job, (
+        "the Release job must not hold the OIDC token — that is why it is a "
+        "separate job from publish"
+    )
+    assert "id-token: write" in publish_job, (
+        "publish still needs the OIDC token for trusted publishing"
+    )
+    assert "contents: write" not in publish_job, (
+        "publish must not gain repository write access; the Release job holds it"
+    )
+
+    assert "--verify-tag" in release_job, (
+        "gh release create invents a missing tag without --verify-tag, turning "
+        "a bad ref into a ghost tag"
+    )
+    assert "gh release view" in release_job, (
+        "the job must skip an existing Release rather than overwrite notes a "
+        "human enriched after the fact"
+    )

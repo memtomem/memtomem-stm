@@ -110,3 +110,62 @@ jobs:
           # verification steps above check the local tag, sources and built
           # metadata, never the index.
           skip-existing: true
+
+  # The Release object was forgotten three times (v0.1.3, v0.2.0, v0.4.0) while
+  # the tag and the PyPI upload went out fine, leaving `gh release list` showing
+  # an older release as Latest — for ten days after v0.2.0. Writing the step down
+  # somewhere did not stop the third one, so the workflow does it.
+  #
+  # Its own job rather than a step in `publish`: job-level `permissions` fully
+  # replace the workflow-level block, so folding this in would hand
+  # `contents: write` to the job that also holds the OIDC token. Kept apart,
+  # `publish` keeps `id-token` only and this one takes `contents` only (#609).
+  #
+  # The body is deliberately minimal — install line plus a CHANGELOG link pinned
+  # at the tag. What makes a good release note (why this is a minor, what to read
+  # first) is a judgement no template makes well, so a human enriches it after the
+  # fact with `gh release edit --notes-file`. This guarantees the object EXISTS
+  # and points at the notes, never that it carries the final prose.
+  github_release:
+    name: Create the GitHub Release
+    needs: publish
+    # Production tags only. `test-v*` are TestPyPI dry runs and have never had a
+    # Release; creating one would put a dry run at the top of the releases page.
+    if: ${{ !startsWith(github.ref_name, 'test-') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create the Release if one does not already exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — leaving its notes alone."
+            exit 0
+          fi
+          # Built in a variable, not inline: a quoted multi-line argument would
+          # carry this file's YAML indentation into the body, and four leading
+          # spaces turn the fenced block into an indented one.
+          notes=$(printf '%s\n' \
+            "memtomem-stm ${TAG#v}" \
+            "" \
+            '```bash' \
+            "uv tool install --force memtomem-stm     # or: pip install -U memtomem-stm" \
+            '```' \
+            "" \
+            "Release notes: [CHANGELOG.md](https://github.com/$REPO/blob/$TAG/CHANGELOG.md)")
+          # --verify-tag: without it `gh release create` INVENTS a tag that does
+          # not exist, so a bad ref becomes a ghost tag instead of an error.
+          #
+          # --latest matches every release so far, which have gone out in
+          # increasing order. A backport (a v0.3.1 cut after v0.4.0) would take
+          # the Latest badge it should not have; fix that one with
+          # `gh release edit <tag> --latest=false` rather than teaching this
+          # step to compare versions.
+          gh release create "$TAG" --repo "$REPO" \
+            --title "$TAG" --latest --verify-tag --notes "$notes"
