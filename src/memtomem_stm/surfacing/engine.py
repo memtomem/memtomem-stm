@@ -190,7 +190,11 @@ class _TimerScope:
     did this call actually spend LTM resources? ``max_surfacings_per_minute``
     counts attempts, so every exit that made none — a cache hit, an admission
     refusal, a window already spent, or a cancellation that unwound before the
-    request went out — must give its eagerly claimed slot back (#1000). It is
+    call reached the path that issues the request — must give its eagerly
+    claimed slot back (#1000). What it marks is entry to that path, not a
+    request observed on the wire: past the marker the adapter still heals its
+    session before the RPC, and a call cancelled in there has spent LTM/MCP
+    resources under the same definition the cap is written in. It is
     a field on the scope rather than a local so the single ``finally`` in
     :meth:`SurfacingEngine.surface` can read it no matter how deep the call
     left from, including on a path that never returns a value.
@@ -1291,7 +1295,7 @@ class SurfacingEngine:
         shutdown, a client hanging up — and propagates unbooked rather than
         charging a healthy LTM. Unbooked on the breaker, that is: it still
         gives back the rate-limit slot the gate claimed for it, because a call
-        cancelled before its LTM request went out spent nothing (#1000).
+        cancelled before it reached the LTM path spent nothing (#1000).
         """
         if not self._config.enabled:
             self._observability.record_skip(tool, "disabled")
@@ -1398,12 +1402,14 @@ class SurfacingEngine:
         finally:
             # One place decides whether the eager claim was spent, because a
             # cancellation is not one of the exits that can decide for itself:
-            # it can arrive at any await between the claim and the request —
+            # it can arrive at any await between the claim and the LTM path —
             # today the queue for the per-key stampede lock — and by then the
             # unwinding code no longer knows which side of the line it is on
             # (#1000). Releasing on ``not ltm_attempted`` covers those exits
-            # and every future await added in that stretch, instead of leaving
-            # the next one to leak a slot silently.
+            # and any await added later in that same stretch, instead of
+            # leaving the next one to leak a slot silently. An await added
+            # *past* the marker is on the spent side by construction — which is
+            # why the marker sits where the spending starts.
             if not scope.ltm_attempted:
                 self._gate.release_claim(rate_claim)
 
@@ -2011,11 +2017,14 @@ class SurfacingEngine:
         trace_id: str | None = None,
         scope: _TimerScope,
     ) -> str:
-        # Past admission, this call issues an LTM request on every branch
-        # below — compose or legacy search — so its rate-limit slot is spent
-        # whatever the request answers, or fails to (#1000). Set before the
-        # first await so a cancellation inside the round trip still counts as
-        # the attempt it was.
+        # Past admission, this call takes the LTM path on every branch below
+        # — compose or legacy search — so its rate-limit slot is spent whatever
+        # the request answers, or fails to (#1000). Marked here rather than
+        # around the request itself: the adapter heals its session before the
+        # RPC, and a call cancelled in there has already spent LTM/MCP
+        # resources, which is exactly what the cap counts. This is the line
+        # where spending starts; everything after it, the round trip included,
+        # keeps its slot when cancelled.
         scope.ltm_attempted = True
         tool_cfg = self._config.context_tools.get(tool)
         max_results = (

@@ -233,10 +233,13 @@ changes inline only. See the deprecation policy in
   whose clients have already given up, and with a low
   `max_surfacings_per_minute` a burst of shed requests could hold the whole
   cap for a minute while no search was ever issued. The per-call timer scope
-  now records whether an LTM request actually went out, and one `finally` in
-  `surface()` releases the claim when the call leaves without one — covering
-  the cancellation, the existing bail-outs, and any future await added between
-  the claim and the request. Pre-existing on `main`; unrelated to #998.
+  now records whether the call reached the path that issues the LTM request,
+  and one `finally` in `surface()` releases the claim when it leaves without
+  having done so — covering the cancellation, the existing bail-outs, and any
+  await added later in that same stretch. The marker is entry to that path
+  rather than a request seen on the wire: the adapter heals its session before
+  the RPC, and a call cancelled in there has already spent the LTM/MCP
+  resources the cap counts. Pre-existing on `main`; unrelated to #998.
 
 - **Feedback-store writes run on a worker thread instead of the event loop**
   (#996). A surfacing call that delivers memories writes a `surfacing_events`
