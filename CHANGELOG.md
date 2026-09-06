@@ -219,6 +219,25 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **A cancelled surfacing gives back the rate-limit slot it never spent**
+  (#1000). `RelevanceGate.should_surface` claims a slot eagerly so concurrent
+  callers see the budget consumption immediately, and hands back a token that
+  every exit starting no LTM work returns — a cache hit, an `ltm_draining`
+  refusal, a window already consumed by pre-work. A cancellation returned
+  nothing: it propagates deliberately unbooked (charging the breaker for a
+  call this engine did not start would open it on a healthy LTM, #720), and
+  nothing covered the claim on the way out. A call cancelled after the gate
+  passed and before its first LTM request — reachable today while queued on
+  the per-key stampede lock — therefore held a slot for the rest of the
+  60-second window. The daemon is where it bit: it cancels surfacing requests
+  whose clients have already given up, and with a low
+  `max_surfacings_per_minute` a burst of shed requests could hold the whole
+  cap for a minute while no search was ever issued. The per-call timer scope
+  now records whether an LTM request actually went out, and one `finally` in
+  `surface()` releases the claim when the call leaves without one — covering
+  the cancellation, the existing bail-outs, and any future await added between
+  the claim and the request. Pre-existing on `main`; unrelated to #998.
+
 - **Feedback-store writes run on a worker thread instead of the event loop**
   (#996). A surfacing call that delivers memories writes a `surfacing_events`
   row and its `seen_memories` dedup rows (a cache hit writes the row only),
