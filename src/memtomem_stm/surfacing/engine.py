@@ -34,7 +34,7 @@ from memtomem_stm.surfacing.mcp_client import (
     SearchOutcome,
 )
 from memtomem_stm.surfacing.observability import _NOOP_OBSERVABILITY, SurfacingObservability
-from memtomem_stm.surfacing.relevance import RateClaim, RelevanceGate
+from memtomem_stm.surfacing.relevance import RelevanceGate
 from memtomem_stm.surfacing.store_io import (
     StoreWriteQueueFull,
     await_store_write,
@@ -188,6 +188,19 @@ class _TimerScope:
     the timer stops firing; the caller's own backstop (the daemon deadline)
     still bounds what is left. What comes *before* the round trip is kept out
     the other way, by arming nothing until the call is past it (#998).
+
+    ``ltm_attempted`` answers the neighbouring question for the rate limiter:
+    did this call actually spend LTM resources? ``max_surfacings_per_minute``
+    counts attempts, so every exit that made none — a cache hit, an admission
+    refusal, a window already spent, or a cancellation that unwound before the
+    call reached the path that issues the request — must give its eagerly
+    claimed slot back (#1000). What it marks is entry to that path, not a
+    request observed on the wire: past the marker the adapter still heals its
+    session before the RPC, and a call cancelled in there has spent LTM/MCP
+    resources under the same definition the cap is written in. It is
+    a field on the scope rather than a local so the single ``finally`` in
+    :meth:`SurfacingEngine.surface` can read it no matter how deep the call
+    left from, including on a path that never returns a value.
     """
 
     seconds: float
@@ -202,6 +215,7 @@ class _TimerScope:
     the derivation overwrites it."""
 
     past_ltm: bool = False
+    ltm_attempted: bool = False
 
 
 class _OperationalSkip(RuntimeError):
@@ -1305,7 +1319,9 @@ class SurfacingEngine:
         change. A cancellation that reaches here
         is therefore one this call did not start — a shutdown, a client
         hanging up — and propagates unbooked rather than charging a healthy
-        LTM.
+        LTM. Unbooked on the breaker, that is: it still gives back the
+        rate-limit slot the gate claimed for it, because a call cancelled
+        before it reached the LTM path spent nothing (#1000).
         """
         if not self._config.enabled:
             self._observability.record_skip(tool, "disabled")
@@ -1363,7 +1379,6 @@ class SurfacingEngine:
                 arguments,
                 response_text,
                 query,
-                rate_claim=rate_claim,
                 trace_id=trace_id,
                 deadline_monotonic=deadline_monotonic,
                 scope=scope,
@@ -1397,6 +1412,19 @@ class SurfacingEngine:
             logger.warning("Surfacing failed for %s/%s", server, tool, exc_info=True)
             self._circuit_breaker.record_failure()
             return response_text
+        finally:
+            # One place decides whether the eager claim was spent, because a
+            # cancellation is not one of the exits that can decide for itself:
+            # it can arrive at any await between the claim and the LTM path —
+            # today the queue for the per-key stampede lock — and by then the
+            # unwinding code no longer knows which side of the line it is on
+            # (#1000). Releasing on ``not ltm_attempted`` covers those exits
+            # and any await added later in that same stretch, instead of
+            # leaving the next one to leak a slot silently. An await added
+            # *past* the marker is on the spent side by construction — which is
+            # why the marker sits where the spending starts.
+            if not scope.ltm_attempted:
+                self._gate.release_claim(rate_claim)
 
     async def handle_feedback(
         self,
@@ -1886,7 +1914,6 @@ class SurfacingEngine:
         response_text: str,
         query: str,
         *,
-        rate_claim: RateClaim,
         trace_id: str | None = None,
         deadline_monotonic: float | None = None,
         scope: _TimerScope,
@@ -1937,14 +1964,11 @@ class SurfacingEngine:
             self._observability.record_cache("hit")
             # A hit does no LTM work at all, and since #998 nothing here is
             # inside a timed scope to begin with — no timer is armed until the
-            # miss branch below derives one.
-            try:
-                return await self._render_cached(cached, response_text, query, server, tool)
-            finally:
-                # This caller claimed a rate slot before it knew the cache
-                # could answer. A hit starts no LTM work, so it is not an
-                # attempt under RelevanceGate's documented accounting.
-                self._gate.release_claim(rate_claim)
+            # miss branch below derives one. This caller claimed a rate slot
+            # before it knew the cache could answer; a hit starts no LTM work,
+            # so ``ltm_attempted`` stays false and ``surface()`` gives the slot
+            # back (#1000).
+            return await self._render_cached(cached, response_text, query, server, tool)
 
         async with self._key_locks.hold(cache_key):
             # Double-check inside the lock: a coroutine that held the
@@ -1952,10 +1976,7 @@ class SurfacingEngine:
             cached = self._cache.get(cache_key)
             if cached is not None:
                 self._observability.record_cache("hit")
-                try:
-                    return await self._render_cached(cached, response_text, query, server, tool)
-                finally:
-                    self._gate.release_claim(rate_claim)
+                return await self._render_cached(cached, response_text, query, server, tool)
             self._observability.record_cache("miss")
             # Recorded before the window check below: the lookup happened
             # and missed, whatever the clock then says. (A miss already does
@@ -1970,15 +1991,15 @@ class SurfacingEngine:
                 # cancelled mid-RPC, spending the LTM's time on an answer
                 # nobody reads. No LTM work started also means no rate-limit
                 # attempt was made (the cap counts attempts because an attempt
-                # spent LTM resources — see ``release_claim``); the
-                # timeout/breaker booking still stands, since real time did
+                # spent LTM resources — see ``release_claim``), so
+                # :meth:`surface`'s ``finally`` hands the slot back (#1000);
+                # the timeout/breaker booking still stands, since real time did
                 # pass. Only a caller that supplied a deadline can land
                 # here: without one the window is the configured ceiling, so a
                 # call released by the lock always gets a full one. With one,
                 # this is the one remaining way to book a timeout having sent
                 # nothing — kept, rather than quietly reversed, because it is
                 # #720's decision and not this change's to make.
-                self._gate.release_claim(rate_claim)
                 raise asyncio.TimeoutError
             return await self._run_within(
                 self._do_surface_miss(
@@ -1988,7 +2009,6 @@ class SurfacingEngine:
                     response_text,
                     query,
                     cache_key,
-                    rate_claim=rate_claim,
                     trace_id=trace_id,
                     scope=scope,
                 ),
@@ -2005,7 +2025,6 @@ class SurfacingEngine:
         query: str,
         cache_key: str,
         *,
-        rate_claim: RateClaim,
         trace_id: str | None = None,
         scope: _TimerScope,
     ) -> str:
@@ -2017,9 +2036,9 @@ class SurfacingEngine:
         """
         if len(self._abandoned_ops) >= _MAX_ABANDONED_OPS:
             # No LTM work started, so this is not an "attempt" by the rate
-            # limiter's own definition — give the slot back rather than let a
-            # run of refusals spend the throttle on nothing.
-            self._gate.release_claim(rate_claim)
+            # limiter's own definition — ``ltm_attempted`` stays false and
+            # ``surface()`` gives the slot back rather than let a run of
+            # refusals spend the throttle on nothing.
             self._observability.record_skip(tool, "ltm_draining")
             self._persist_fault(server, tool, "ltm_draining")
             # Warn once per draining episode (see the latch's init comment):
@@ -2071,6 +2090,15 @@ class SurfacingEngine:
         trace_id: str | None = None,
         scope: _TimerScope,
     ) -> str:
+        # Past admission, this call takes the LTM path on every branch below
+        # — compose or legacy search — so its rate-limit slot is spent whatever
+        # the request answers, or fails to (#1000). Marked here rather than
+        # around the request itself: the adapter heals its session before the
+        # RPC, and a call cancelled in there has already spent LTM/MCP
+        # resources, which is exactly what the cap counts. This is the line
+        # where spending starts; everything after it, the round trip included,
+        # keeps its slot when cancelled.
+        scope.ltm_attempted = True
         tool_cfg = self._config.context_tools.get(tool)
         max_results = (
             tool_cfg.max_results

@@ -1710,6 +1710,91 @@ class TestSurfacingCache:
         assert engine._circuit_breaker.failure_count == 1
 
 
+class TestCancelledCallReleasesRateSlot:
+    """``RelevanceGate.should_surface`` claims a rate slot eagerly and hands
+    back a token so a caller that starts no LTM work can give exactly its own
+    slot back. Every exit that bails without an attempt does — except a
+    cancellation, which propagates deliberately unbooked and used to carry the
+    slot out with it, holding a slot in the 60-second window for a call that
+    spent nothing (#1000). The daemon is where it bites: it cancels surfacing
+    requests whose clients already gave up, and those are the calls most
+    likely to be queued behind another.
+    """
+
+    QUERY = "distinct Flask routing architecture"
+
+    @staticmethod
+    async def _wait_until_queued(engine) -> None:
+        """Block until a second holder is waiting on the key lock.
+
+        A real deadline, not a fixed number of ``sleep(0)`` yields: how many
+        loop iterations ``surface()`` needs to reach the lock is a guess, and
+        a guess that comes up short would silently cancel a call that had not
+        claimed anything yet.
+        """
+        deadline = time.monotonic() + 5.0
+        while engine._key_locks.total_refs() < 2:
+            if time.monotonic() > deadline:
+                raise AssertionError("surface() never queued behind the key lock")
+            await asyncio.sleep(0.01)
+
+    async def test_cancelled_while_queued_gives_the_rate_slot_back(self):
+        adapter = _make_mcp_adapter(
+            [FakeSearchResult(chunk=FakeChunk(content="memory"), score=0.5)]
+        )
+        engine = SurfacingEngine(
+            config=_make_config(max_surfacings_per_minute=1),
+            mcp_adapter=adapter,
+        )
+        cache_key = framed_digest(("gh", "read_file", self.QUERY))
+
+        async with engine._key_locks.hold(cache_key):
+            task = asyncio.create_task(
+                engine.surface(
+                    "gh", "read_file", VALID_ARGS, LONG_RESPONSE, context_query=self.QUERY
+                )
+            )
+            await self._wait_until_queued(engine)
+            assert len(engine._gate._surfacing_timestamps) == 1, (
+                "Positive control: the gate must have claimed a slot before the "
+                "cancellation, or an always-empty deque would pass this test"
+            )
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert list(engine._gate._surfacing_timestamps) == [], (
+            "Cancelled before any LTM request went out, so the call made no "
+            "attempt — its rate slot must not stay claimed for the window"
+        )
+        adapter.search.assert_not_awaited()
+
+    async def test_completed_call_keeps_the_rate_slot_it_spent(self):
+        """The other half of the control: releasing on the way out must be the
+        cancellation's doing, not something the engine does to every call that
+        queues behind the lock."""
+        adapter = _make_mcp_adapter(
+            [FakeSearchResult(chunk=FakeChunk(content="memory"), score=0.5)]
+        )
+        engine = SurfacingEngine(
+            config=_make_config(max_surfacings_per_minute=1),
+            mcp_adapter=adapter,
+        )
+        cache_key = framed_digest(("gh", "read_file", self.QUERY))
+
+        async with engine._key_locks.hold(cache_key):
+            task = asyncio.create_task(
+                engine.surface(
+                    "gh", "read_file", VALID_ARGS, LONG_RESPONSE, context_query=self.QUERY
+                )
+            )
+            await self._wait_until_queued(engine)
+
+        assert "memory" in await task
+        assert adapter.search.await_count == 1
+        assert len(engine._gate._surfacing_timestamps) == 1
+
+
 class TestSurfacingCacheStampede:
     """Two concurrent ``surface()`` calls for the same ``{server}/{tool}/{query}``
     cache key should trigger a single LTM search, not one per caller. The
