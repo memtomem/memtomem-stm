@@ -49,7 +49,17 @@ from memtomem_stm.surfacing.observability import (
     SurfacingObservability,
 )
 from memtomem_stm.observability.tracing import traced
-from memtomem_stm.surfacing.feedback import FeedbackTracker
+from memtomem_stm.surfacing.feedback import (
+    FEEDBACK_STORE_BUSY,
+    FEEDBACK_STORE_UNAVAILABLE,
+    FeedbackTracker,
+    record_feedback_batch,
+)
+from memtomem_stm.surfacing.store_io import (
+    StoreWriteQueueFull,
+    await_store_write,
+    close_store_on_worker,
+)
 from memtomem_stm.utils.anyio_shutdown import await_or_warn, is_clean_cancel_scope_shutdown
 from memtomem_stm.utils import child_reaper
 from memtomem_stm.utils.parent_liveness import ParentLivenessWatcher
@@ -727,10 +737,18 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                     )
                 except Exception:
                     logger.warning("Failed to stop surfacing engine", exc_info=True)
+            if feedback_tracker is not None:
+                try:
+                    # Queued on the feedback-I/O worker rather than called
+                    # here: closing from the loop takes the store's writer
+                    # lock, which an in-flight write holds for as long as its
+                    # statement runs (#996).
+                    await close_store_on_worker(feedback_tracker.close)
+                except Exception:
+                    logger.warning("Failed to close feedback_tracker", exc_info=True)
             for resource, name in [
                 (proxy_cache, "proxy_cache"),
                 (metrics_store, "metrics_store"),
-                (feedback_tracker, "feedback_tracker"),
                 (compression_feedback_tracker, "compression_feedback_tracker"),
                 (progressive_reads_tracker, "progressive_reads_tracker"),
                 (selection_log, "selection_log"),
@@ -1753,13 +1771,25 @@ async def stm_surfacing_feedback(
         if app.feedback_tracker is None:
             return "Feedback tracking is not enabled."
         if ratings is not None:
-            return _record_batched_via_tracker(app.feedback_tracker, surfacing_id, ratings)
+            return await _record_batched_via_tracker(app.feedback_tracker, surfacing_id, ratings)
         if rating is None:
             return "Error: `rating` is required for single-memory feedback."
-        return app.feedback_tracker.record_feedback(surfacing_id, rating, memory_id)
+        # Off-loop like every other feedback-store write (#996): this DB is
+        # shared with the proxy's own stores and other processes, so an insert
+        # that has to wait one of them out must not stall the server. Shielded
+        # and bounded for the same reasons the engine path is — a client that
+        # hangs up must not drop a rating already on its way to the store.
+        try:
+            return await await_store_write(
+                app.feedback_tracker.record_feedback, surfacing_id, rating, memory_id
+            )
+        except StoreWriteQueueFull:
+            return FEEDBACK_STORE_UNAVAILABLE
+        except asyncio.TimeoutError:
+            return FEEDBACK_STORE_BUSY
 
 
-def _record_batched_via_tracker(
+async def _record_batched_via_tracker(
     tracker: Any,
     surfacing_id: str,
     ratings: list[dict],
@@ -1792,10 +1822,16 @@ def _record_batched_via_tracker(
             return f"Error: ratings[{i}] missing string `rating`."
         parsed.append((mid, rat))
 
+    try:
+        results = await await_store_write(record_feedback_batch, tracker, surfacing_id, parsed)
+    except StoreWriteQueueFull:
+        return FEEDBACK_STORE_UNAVAILABLE
+    except asyncio.TimeoutError:
+        return FEEDBACK_STORE_BUSY
     recorded = 0
     errors: list[str] = []
     for i, (mid, rat) in enumerate(parsed):
-        result = tracker.record_feedback(surfacing_id, rat, mid)
+        result = results[i]
         if isinstance(result, str) and result.startswith("Error"):
             errors.append(f"ratings[{i}]: {result}")
         else:

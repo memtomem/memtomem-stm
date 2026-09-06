@@ -50,7 +50,11 @@ def test_initialize_releases_connection_on_tune_failure(
 ) -> None:
     mod = importlib.import_module(module_path)
 
-    def boom(_db: Any) -> None:
+    # ``**_kwargs`` mirrors the real signature: ``tune_connection`` takes a
+    # keyword lock budget, and a store that passes one (``MetricsStore``'s
+    # fast-fail, ``FeedbackStore``'s reader connection) must fail here on the
+    # simulated tuning error, not on a stub that cannot be called.
+    def boom(_db: Any, **_kwargs: Any) -> None:
         raise RuntimeError("simulated tune_connection failure")
 
     monkeypatch.setattr(mod, "tune_connection", boom)
@@ -61,7 +65,7 @@ def test_initialize_releases_connection_on_tune_failure(
 
     assert store._db is None
 
-    monkeypatch.setattr(mod, "tune_connection", lambda _db: None)
+    monkeypatch.setattr(mod, "tune_connection", lambda _db, **_kwargs: None)
     store.initialize()
     assert store._db is not None
     store.close()

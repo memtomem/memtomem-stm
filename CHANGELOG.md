@@ -219,6 +219,61 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **Feedback-store writes run on a worker thread instead of the event loop**
+  (#996). A surfacing call that delivers memories writes a `surfacing_events`
+  row and its `seen_memories` dedup rows (a cache hit writes the row only),
+  and `stm_feedback.db` is shared with the proxy's
+  own stores, `mms tune`'s retention purge, and any second STM process. The
+  write lock is file-wide, so a write that met one of those peers spent up to
+  `busy_timeout` (3 s) inside a blocking call. On the loop that froze
+  everything: the other surfacing calls the daemon now admits concurrently
+  (#874), and the `asyncio.timeout_at` timers that exist to shed requests
+  whose clients have already given up — a latency spike came back as a wave of
+  late `expired` replies. `FeedbackStore` is now thread-safe (a writer
+  connection under the existing lock, a second WAL reader connection under its
+  own, both re-read inside the lock so a `close` cannot race a write), and the
+  engine hands its writes to a single dedicated worker: the event row, the
+  dedup rows and the feedback rows are awaited there, while fault counters,
+  score-scale diagnostics and the hourly retention sweeps are queued
+  fire-and-forget. Measured on the new daemon test — four concurrent
+  surfacings against a database an external writer holds — the loop's longest
+  stall goes from 50.4 s with every write inline to under 0.15 s.
+
+  **Behavior change**: durable telemetry is no longer guaranteed to land
+  before the response — a fault counter, diagnostic or retention sweep is
+  queued when its branch runs, and lands whenever the worker gets to it, which
+  on an idle worker can still be before the loop returns. A request cancelled by its
+  deadline mid-write still lands its event row, so a shed request can leave a
+  row for a manifest its client never received. The worker is one FIFO thread,
+  so an awaited write can wait behind another call's queued sweep; that wait
+  has its own cap — derived from the store's SQLite lock timeout, deliberately
+  not from `timeout_seconds`, so tightening the LTM budget does not turn a
+  neighbour writing the database into a surfacing failure — past which the
+  call delivers its memories without a feedback prompt while the write stays
+  queued and lands on its own — leaving a row nobody was told about, the same
+  orphan a cancelled request makes. A teardown queues the store close behind
+  the writes already waiting, so those land in the ordinary case; a teardown
+  that gives up waiting for its turn drops whatever is still queued rather
+  than handing that wait to process exit. The surfacing
+  timeout no longer covers the work after the LTM round trip returns: a
+  contended store write holds the call that is making it, as it always did,
+  instead of being booked as an LTM timeout that charges the circuit breaker.
+  A call queued behind it on the same query key still carries an armed timer
+  and can still book that wait as a timeout, exactly as on `main` — #998.
+  A rating whose write outruns the ceiling comes back as "not confirmed — do
+  not re-submit" instead of a silent success, and a store closed under an
+  in-flight call withdraws that call's feedback prompt rather than advertising
+  an ID with no row. `FeedbackStore.close()` is queued on the same worker so a teardown waits
+  behind the writes rather than on the lock one of them holds,
+  multi-query reads (`get_stats` and the tuner's ratios) now answer from one
+  snapshot, and
+  `record_fault` / `record_diagnostic` take the observation time from the
+  caller, and the fault row keeps the newer of the two timestamps rather than
+  whichever wrote last, so a queued write cannot outrun the recovery that
+  disproves it or drag a peer's newer observation backward. A rating refused
+  before it was queued says so and asks for a retry, unlike one already in
+  flight.
+
 - **The daemon files a warm-search latency sample only for a request that
   actually issued a search RPC to the LTM** (#994). `_run_admitted` decided
   whether a surfacing request was a sample from the terminal decision the
