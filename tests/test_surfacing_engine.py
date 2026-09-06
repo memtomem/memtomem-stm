@@ -2001,6 +2001,52 @@ class TestKeyLockWaitIsNotAnLtmTimeout:
         )
         assert charges[0] == 0
 
+    async def test_expired_deadline_on_a_post_lock_miss_still_books(self):
+        """The boundary this change deliberately does NOT move (#720).
+
+        A caller that supplied a ``deadline_monotonic`` the wait consumed, and
+        whose post-lock re-check then misses, is still booked as a timeout —
+        real time did pass, and reversing that is #720's decision to revisit,
+        not this one's to contradict. Pinned so a later change cannot flip it
+        by accident: the cheap alternative in #998 is exactly this branch."""
+        from memtomem_stm.surfacing.observability import SurfacingObservability
+
+        adapter = _make_mcp_adapter()
+        adapter.search = AsyncMock(
+            side_effect=AssertionError("a spent window must start no LTM work")
+        )
+        obs = SurfacingObservability()
+        engine = SurfacingEngine(
+            config=_make_config(timeout_seconds=5.0),
+            mcp_adapter=adapter,
+            observability=obs,
+        )
+        charges = self._count_breaker_charges(engine)
+        cache_key = framed_digest(("gh", "read_file", VALID_ARGS["_context_query"]))
+
+        async def hold_the_key() -> None:
+            # Released without populating the cache, so the re-check misses.
+            async with engine._key_locks.hold(cache_key):
+                await asyncio.sleep(0.3)
+
+        holder = asyncio.create_task(hold_the_key())
+        while engine._key_locks.total_refs() != 1:
+            await asyncio.sleep(0)
+
+        out = await engine.surface(
+            "gh",
+            "read_file",
+            VALID_ARGS,
+            LONG_RESPONSE,
+            deadline_monotonic=time.monotonic() + 0.1,
+        )
+        await holder
+
+        assert out == LONG_RESPONSE
+        assert obs.snapshot()["outcomes"]["read_file"] == {"error_timeout": 1}
+        assert charges[0] == 1
+
+
 
 class TestRelevanceGateConcurrency:
     """``RelevanceGate.should_surface`` is called at ``surface()`` entry and

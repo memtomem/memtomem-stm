@@ -235,7 +235,9 @@ changes inline only. See the deprecation policy in
   is held — the same reasoning #720 used to derive the window after the gate,
   query extraction and privacy scan, applied to the last piece of pre-work
   that was still inside it. The timer again bounds exactly what it exists to
-  bound: one LTM round trip. A follower released by the lock re-checks the
+  bound: one LTM operation — the adapter's search call, including any
+  reconnect and retry it makes inside it. A follower released by the lock
+  re-checks the
   cache first — a hit needs no LTM at all, and now renders even for a caller
   whose `deadline_monotonic` expired while it was queued — and otherwise gets
   a window derived at that moment: the configured ceiling for a caller that
@@ -245,13 +247,15 @@ changes inline only. See the deprecation policy in
   and whose post-lock re-check misses still books the timeout without sending
   anything: that is #720's standing decision that pre-work timeouts are booked,
   and reversing it is a separate change (#998 records the argument). And an LTM
-  operation abandoned at timeout no longer holds the key lock while it unwinds
-  — the caller releases it as the timeout propagates — so the next holder of
-  that key can search while the abandoned request is still unwinding upstream.
-  That is the trade this change makes deliberately: the alternative is the one
-  it removes, a caller waiting out an unwind nothing bounds. The abandoned task
-  is cancelled at its next await, so it cannot write the cache behind the new
-  holder, and `_MAX_ABANDONED_OPS` still bounds how many may pile up.
+  operation abandoned at timeout *or cancellation* no longer holds the key lock
+  while it unwinds — the caller releases it as the abort propagates — so the
+  next holder of that key can search while the abandoned request is still
+  unwinding upstream. That is the trade this change makes deliberately: the
+  alternative is the one it removes, a caller waiting out an unwind nothing
+  bounds. `_MAX_ABANDONED_OPS` still bounds how many may pile up, and what
+  keeps an abandoned call from writing the cache behind the new holder is that
+  it stays cancelled — #290's cooperative cancellation contract, which the
+  bundled adapter honours on every caller-facing path.
 
 - **Feedback-store writes run on a worker thread instead of the event loop**
   (#996). A surfacing call that delivers memories writes a `surfacing_events`

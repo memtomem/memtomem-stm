@@ -1293,7 +1293,9 @@ class SurfacingEngine:
         subsequent call pays the full timeout again.
         :meth:`_run_within` is what makes that abort reliably ours to raise
         rather than a race against the caller's backstop (#720). What it
-        covers is one LTM round trip: the cache lookup and the per-key
+        covers is one LTM operation — the adapter's ``search``/compose call,
+        including any reconnect and retry it makes inside it: the cache
+        lookup and the per-key
         stampede lock sit outside it, so no timer of this call's is armed
         while it waits for an identical one (#998). One case still books
         without an LTM request — a caller that supplied a ``deadline_monotonic``
@@ -1899,17 +1901,26 @@ class SurfacingEngine:
         ``_key_locks`` init docstring).
 
         One boundary on "do not overlap", and it is deliberate: a call
-        abandoned at timeout is cancelled but not awaited, and the adapter
-        shields its own in-flight request (#664), so the next holder of the
-        key can start a search while the abandoned one is still unwinding
-        upstream. The alternative is what this change exists to remove —
-        making the next caller wait out an unwind nobody bounds — and the
-        abandoned task itself is cancelled at its next await, so it cannot
-        come back and write the cache behind the new holder. The pile of
-        those is what ``_MAX_ABANDONED_OPS`` bounds.
+        abandoned at timeout *or cancellation* is cancelled but not awaited,
+        and the adapter shields its own in-flight request (#664), so the next
+        holder of the key can start a search while the abandoned one is still
+        unwinding upstream. The alternative is what this change exists to
+        remove — making the next caller wait out an unwind nobody bounds —
+        and the pile of abandoned ops is what ``_MAX_ABANDONED_OPS`` bounds.
+
+        What keeps the abandoned call from coming back and writing the cache
+        behind the new holder is that it stays cancelled: the cache write and
+        the session-dedup claim live past its next ``await``, which raises
+        :class:`asyncio.CancelledError` instead of returning. That is #290's
+        cooperative cancellation contract, which the bundled adapter honours
+        on every caller-facing path. An adapter that swallowed a cancellation
+        and returned normally would break this guarantee — it would resume
+        outside the lock and could overwrite a populated entry with its own
+        (empty, by session dedup) result. It would equally break the timeout
+        accounting, since its caller has already been told the call aborted.
 
         None of that is timed, and that is the point (#998). The timer bounds
-        one LTM round trip and makes its abort bookable as the dependency's
+        one LTM operation and makes its abort bookable as the dependency's
         fault (#579/#720); a wait for the key lock is neither. Timing it made
         a follower raise :class:`asyncio.TimeoutError` without ever having
         called the LTM, and :meth:`surface` charged the core —
