@@ -11,6 +11,62 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-06
+
+### Upgrade notes
+
+- **Proxied tools can look different in your client's picker, and `strict` can
+  withhold more of them** (#895, #922). A tool whose upstream sets a top-level
+  `title` now displays as `[{server}] {title}` instead of its prefixed name, and
+  its `icons` reach the client. A tool that supplies no description now
+  advertises its own prefixed name rather than a bare `[proxied] ` prefix. Under
+  the `strict` exposure profile, a tool whose title or icon URL is
+  credential-shaped is withheld (`sensitive_metadata`); under `review` it is
+  demoted. If a tool disappears from your picker after upgrading, check its
+  upstream metadata against the credential scan before assuming a regression.
+
+- **Two config values that used to load now fail validation at load** (#977,
+  #929). `+inf` as `chars_per_token` at any of the three levels, and a
+  `max_result_tokens` above the signed-64-bit ceiling, are refused at load
+  instead of loading and then failing the calls that used them. Separately, a
+  per-tool `chars_per_token` now applies to a token budget inherited from the
+  server, so a deployment that sets both sees that tool's resolved char budget
+  re-scaled (a server at 400 tokens x 2.5 with a tool ratio of 4.0 moves from
+  1000 to 1600 chars).
+
+- **`mms prune` and `mms add --from-clients` now compare identity, not just
+  name** (#981, #983, #984, #955). A prune no longer removes a source
+  entry whose `env` or `headers` diverge from the STM upstream — divergence in a
+  second client is reported as a conflict, in the first by name. A prune that
+  previously removed a same-name entry from a second client now removes only the
+  sources that hold the same server and says which ones it left. Cursor's MCP
+  configs are now scanned, so `--all` adopts more servers than before on a
+  machine that has them; Cursor entries are reported but never written.
+
+- **The daemon runs several LTM operations at once, and its telemetry says so**
+  (#874, #994). Set `daemon.max_concurrent_ltm_ops` to `1` to restore the older
+  serialized daemon — that is the only value that does, since a core with no
+  parallel capacity degrades the same way at `2` as at `4`. `mms daemon status`
+  reports `queue.in_flight` above 1 and gains `queue.concurrency`. Latency
+  classification changed with it: how a call ended now outranks whether the LTM
+  was warm, so a request that connected, searched and then failed is filed as
+  the failure it was rather than in `cold_samples`.
+
+- **Durable surfacing telemetry no longer lands before the response** (#996).
+  Fault counters, diagnostics and retention sweeps are queued when their branch
+  runs and land whenever the FIFO worker gets to them. A request cancelled by
+  its deadline mid-write still lands its event row, so a shed request can leave
+  a row for a manifest its client never received. Reads of `stm_surfacing_stats`
+  immediately after a call may not see the row yet.
+
+- **`max_upstream_bytes` is enforced on the inbound envelope, and the embedding
+  scorer falls back further** (issue #957, #873). The cap measures the decoded
+  message's compact serialization, which is what `docs/configuration.md` has
+  always described; a result that serializes larger than the envelope that
+  carried it is no longer rejected on that parsed size. And an embedding
+  provider that returns a different number of vectors than it was given inputs
+  now falls back to BM25 for that call.
+
 ### Added
 
 - **The advertisement forwards an upstream tool's top-level `title` and its
