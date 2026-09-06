@@ -32,6 +32,57 @@ VALID_RATINGS: tuple[str, ...] = (
 )
 
 
+def rating_error(rating: str) -> str | None:
+    """The refusal for an unusable rating value, or ``None`` if it is usable.
+
+    Shared so a caller can refuse one without a store round trip. Recording
+    now happens on a worker thread, and a rating the store was always going to
+    reject must not come back as "busy, it may still be recorded" just because
+    the queue was long — that answer would be false twice over.
+    """
+    if rating not in VALID_RATINGS:
+        return f"Error: rating must be one of {list(VALID_RATINGS)}"
+    return None
+
+
+FEEDBACK_STORE_BUSY = (
+    "Error: the feedback store is busy; this rating was not confirmed. "
+    "It may still be recorded — do not re-submit."
+)
+"""Answer for a rating whose write outran its ceiling (#996).
+
+The write is shielded, so it is still on its way to the store; what the caller
+cannot do is confirm it. Says so, and says not to re-submit, because a retry
+would land a second row for the same rating.
+"""
+
+
+FEEDBACK_STORE_UNAVAILABLE = (
+    "Error: the feedback store is overloaded; this rating was NOT recorded. Retry it later."
+)
+"""Answer for a rating refused before it was ever queued (#996).
+
+Distinct from :data:`FEEDBACK_STORE_BUSY` on the one point the agent acts on:
+nothing was written and nothing is on its way, so retrying later is right —
+where a busy write is already in flight and a retry would double it.
+"""
+
+
+def record_feedback_batch(
+    tracker: FeedbackTracker, surfacing_id: str, parsed: list[tuple[str, str]]
+) -> list[str]:
+    """Record a whole feedback batch in one call.
+
+    Exists so a caller on an event loop can hand the batch to the
+    feedback-I/O worker as a single unit (#996): one queue wait instead of
+    one per entry, and a cancellation cannot land a prefix of the rows.
+    Returns one result string per entry, in order.
+    """
+    return [
+        tracker.record_feedback(surfacing_id, rating, memory_id) for memory_id, rating in parsed
+    ]
+
+
 class FeedbackTracker:
     """Track surfacing feedback and optionally auto-tune min_score."""
 
@@ -67,8 +118,8 @@ class FeedbackTracker:
         memory_ids: list[str],
         scores: list[float],
         score_scale: str | None = None,
-    ) -> None:
-        self._store.record_surfacing(
+    ) -> bool:
+        return self._store.record_surfacing(
             surfacing_id,
             server,
             tool,
@@ -78,8 +129,8 @@ class FeedbackTracker:
             score_scale=score_scale,
         )
 
-    def record_fault(self, server: str, tool: str, kind: str) -> None:
-        self._store.record_fault(server, tool, kind)
+    def record_fault(self, server: str, tool: str, kind: str, *, at: float | None = None) -> None:
+        self._store.record_fault(server, tool, kind, at=at)
 
     def record_fault_recoveries(
         self,
@@ -89,8 +140,10 @@ class FeedbackTracker:
     ) -> None:
         self._store.record_fault_recoveries(entries, recovered_at=recovered_at)
 
-    def record_diagnostic(self, server: str, tool: str, kind: str) -> None:
-        self._store.record_diagnostic(server, tool, kind)
+    def record_diagnostic(
+        self, server: str, tool: str, kind: str, *, at: float | None = None
+    ) -> None:
+        self._store.record_diagnostic(server, tool, kind, at=at)
 
     def record_diagnostic_recovery(self, server: str, tool: str, kind: str) -> None:
         self._store.record_diagnostic_recovery(server, tool, kind)
@@ -111,8 +164,9 @@ class FeedbackTracker:
         rating: str,
         memory_id: str | None = None,
     ) -> str:
-        if rating not in VALID_RATINGS:
-            return f"Error: rating must be one of {list(VALID_RATINGS)}"
+        invalid = rating_error(rating)
+        if invalid is not None:
+            return invalid
         for field, value in (
             ("surfacing_id", surfacing_id),
             ("memory_id", memory_id),

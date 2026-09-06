@@ -52,6 +52,7 @@ from memtomem_stm.config import STMConfig, _is_loopback_host, log_stm_config_fai
 from memtomem_stm.daemon import discovery, locking
 from memtomem_stm.daemon.latency import DaemonLatencyTracker, LatencyKind, LatencyOutcome
 from memtomem_stm.surfacing.observability import CallLedger, attribute_call
+from memtomem_stm.surfacing.store_io import close_store_on_worker
 from memtomem_stm.utils import child_reaper
 from memtomem_stm.utils.anyio_shutdown import is_clean_cancel_scope_shutdown
 from memtomem_stm.daemon.protocol import (
@@ -362,7 +363,9 @@ class DaemonServer:
             await _quiet(self._engine.stop(), "engine stop")
         if self._tracker is not None:
             try:
-                self._tracker.close()
+                # Down the same worker the writes went to, so it runs after
+                # them instead of waiting on the lock one of them holds (#996).
+                await close_store_on_worker(self._tracker.close)
             except Exception:
                 logger.debug("tracker close failed", exc_info=True)
         if self._adapter is not None:
