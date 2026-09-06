@@ -628,9 +628,16 @@ class FeedbackStore:
         memory_ids: list[str],
         scores: list[float],
         score_scale: str | None = None,
-    ) -> None:
+    ) -> bool:
+        """Write one surfacing event row. ``False`` when the store is closed.
+
+        The caller advertises this row's ID to the agent, so "closed" cannot
+        be a silent success: a teardown that closes the store while a call is
+        still in flight would otherwise leave the agent holding a feedback
+        handle that resolves to nothing.
+        """
         if self._db is None:
-            return
+            return False
         require_utf8_identifier(surfacing_id, "surfacing_id")
         require_utf8_identifier(server, "server")
         require_utf8_identifier(tool, "tool")
@@ -641,7 +648,7 @@ class FeedbackStore:
         with self._lock:
             db = self._db
             if db is None:
-                return
+                return False
             db.execute(
                 "INSERT OR IGNORE INTO surfacing_events "
                 "(id, server, tool, query, memory_ids, scores, created_at, score_scale) "
@@ -658,6 +665,7 @@ class FeedbackStore:
                 ),
             )
             db.commit()
+        return True
 
     def record_fault(self, server: str, tool: str, kind: str, *, at: float | None = None) -> None:
         """Increment the durable per-day fault counter for (server, tool, kind).

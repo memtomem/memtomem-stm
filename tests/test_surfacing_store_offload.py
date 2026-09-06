@@ -14,6 +14,7 @@ mistake used to cause.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sqlite3
 import threading
@@ -27,7 +28,7 @@ from uuid import uuid4
 import pytest
 
 from memtomem_stm.surfacing.config import SurfacingConfig
-from memtomem_stm.surfacing.engine import SurfacingEngine
+from memtomem_stm.surfacing.engine import _MAX_QUEUED_STORE_WRITES, SurfacingEngine
 from memtomem_stm.surfacing.feedback import FeedbackTracker
 from memtomem_stm.surfacing.store_io import submit_store_write
 
@@ -407,6 +408,91 @@ async def test_a_busy_store_declines_the_rating_instead_of_raising(tmp_path: Pat
             assert db.execute("SELECT COUNT(*) FROM surfacing_feedback").fetchone()[0] == 1
         finally:
             db.close()
+    finally:
+        blocker.set()
+        await engine.stop()
+        tracker.close()
+
+
+async def test_a_store_closed_under_the_call_withdraws_the_feedback_id(
+    tmp_path: Path,
+) -> None:
+    # Teardown can close the store while a call is still in flight: its
+    # queued write then runs against a closed store and takes the documented
+    # no-op path. A no-op that reads as success would leave the agent holding
+    # a rating prompt for an event row that was never written.
+    config = _config(tmp_path)
+    tracker = FeedbackTracker(config)
+    engine = _engine(config, tracker)
+    try:
+        tracker.close()
+        output = await engine.surface("gh", "read_file", _args("closed store"), LONG_RESPONSE)
+
+        assert output != LONG_RESPONSE, "the memories are still delivered"
+        assert "stm_surfacing_feedback" not in output, "no handle for a row that does not exist"
+    finally:
+        await engine.stop()
+
+
+async def test_a_negative_rating_still_filters_the_cache_when_the_write_times_out(
+    tmp_path: Path,
+) -> None:
+    # The rating is shielded and lands later, so the agent's rejection is
+    # real. Skipping the in-memory filter because this call could not confirm
+    # the row would let the memory it just rejected come straight back out of
+    # a warm cache entry.
+    config = _config(tmp_path, timeout_seconds=0.3, cache_ttl_seconds=60.0)
+    tracker = FeedbackTracker(config)
+    engine = _engine(config, tracker)
+    blocker = threading.Event()
+    try:
+        await engine.surface("gh", "read_file", _args("rate me down"), LONG_RESPONSE)
+        await engine.drain_store_writes()
+        db = sqlite3.connect(str(config.feedback_db_path))
+        try:
+            surfacing_id, memory_ids = db.execute(
+                "SELECT id, memory_ids FROM surfacing_events"
+            ).fetchone()
+        finally:
+            db.close()
+        memory_id = json.loads(memory_ids)[0]
+
+        submit_store_write(lambda: blocker.wait(timeout=10.0))
+        result = await asyncio.wait_for(
+            engine.handle_feedback(surfacing_id, "not_relevant", memory_id), timeout=5.0
+        )
+
+        assert result.startswith("Error: the feedback store is busy")
+        assert ("gh", "read_file", memory_id) in engine._invalidated_ids
+    finally:
+        blocker.set()
+        await engine.stop()
+        tracker.close()
+
+
+async def test_the_best_effort_queue_stops_growing_at_its_ceiling(tmp_path: Path) -> None:
+    # A store nobody can write to — a peer holding it for minutes, a dead
+    # disk — would otherwise let this queue grow at call rate, since every
+    # failure branch adds to it and nothing waits for the result.
+    config = _config(tmp_path)
+    tracker = FeedbackTracker(config)
+    engine = _engine(config, tracker)
+    blocker = threading.Event()
+    submit_store_write(lambda: blocker.wait(timeout=10.0))
+    try:
+        for index in range(_MAX_QUEUED_STORE_WRITES + 10):
+            engine._persist_fault("gh", f"tool{index}", "error_timeout")
+        assert engine._queued_store_writes == _MAX_QUEUED_STORE_WRITES
+
+        blocker.set()
+        await engine.drain_store_writes()
+        # Everything that was queued still landed; only the excess was dropped.
+        db = sqlite3.connect(str(config.feedback_db_path))
+        try:
+            rows = db.execute("SELECT COUNT(*) FROM surfacing_faults").fetchone()[0]
+        finally:
+            db.close()
+        assert rows == _MAX_QUEUED_STORE_WRITES
     finally:
         blocker.set()
         await engine.stop()

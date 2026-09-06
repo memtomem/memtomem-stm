@@ -29,10 +29,13 @@ process that never surfaces never starts it.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, TypeVar
+
+logger = logging.getLogger(__name__)
 
 _EXECUTOR_THREAD_PREFIX = "stm-feedback-io"
 
@@ -65,12 +68,45 @@ def submit_store_write(fn: Callable[..., T], /, *args: Any) -> Future[T]:
 
 
 async def run_off_loop(fn: Callable[..., T], /, *args: Any) -> T:
-    """Run *fn* on the worker and await its result.
+    """Run *fn* on the worker and await its result, unshielded.
 
-    For writes whose outcome the caller acts on. Cancelling the awaiting task
-    cancels a still-queued call outright — it never runs — while one already
-    executing runs to completion with its result discarded. A caller whose
-    in-memory state already assumes the write happened must therefore
-    ``asyncio.shield`` this.
+    Cancelling the awaiting task cancels a still-queued call outright — it
+    never runs — while one already executing runs to completion with its
+    result discarded. Only for work a caller may freely abandon; anything
+    whose in-memory consequences have already happened wants
+    :func:`await_store_write`.
     """
     return await asyncio.get_running_loop().run_in_executor(feedback_io_executor(), fn, *args)
+
+
+async def await_store_write(fn: Callable[..., T], /, *args: Any, timeout: float) -> T:
+    """Run *fn* on the worker, keeping it once queued and bounding the wait.
+
+    The shield is what keeps the write: by the time these run the caller's
+    in-memory state already assumes the row exists, so letting a cancellation
+    drop a still-queued write would leave the process acting on a row that
+    never landed. A cancellation still reaches the caller — only the write
+    survives it.
+
+    The bound is for the queue, not the statement (``busy_timeout`` covers
+    that): one FIFO worker means this call waits for everything ahead of it,
+    including another caller's retention sweep. A write that outlives
+    *timeout* still lands; the caller stops waiting and degrades as it would
+    for a failed write.
+    """
+    future = asyncio.ensure_future(run_off_loop(fn, *args))
+    try:
+        return await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+        # Consume whatever it ends up doing so asyncio does not report an
+        # orphaned exception from a write nobody is waiting for any more.
+        future.add_done_callback(_consume_abandoned_write)
+        raise
+
+
+def _consume_abandoned_write(future: "asyncio.Future[Any]") -> None:
+    if future.cancelled():
+        return
+    exc = future.exception()
+    if exc is not None:
+        logger.debug("Abandoned feedback-store write failed: %s", exc)

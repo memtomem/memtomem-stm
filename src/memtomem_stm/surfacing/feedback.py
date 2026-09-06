@@ -32,6 +32,18 @@ VALID_RATINGS: tuple[str, ...] = (
 )
 
 
+FEEDBACK_STORE_BUSY = (
+    "Error: the feedback store is busy; this rating was not confirmed. "
+    "It may still be recorded — do not re-submit."
+)
+"""Answer for a rating whose write outran its ceiling (#996).
+
+The write is shielded, so it is still on its way to the store; what the caller
+cannot do is confirm it. Says so, and says not to re-submit, because a retry
+would land a second row for the same rating.
+"""
+
+
 def record_feedback_batch(
     tracker: FeedbackTracker, surfacing_id: str, parsed: list[tuple[str, str]]
 ) -> list[str]:
@@ -82,8 +94,8 @@ class FeedbackTracker:
         memory_ids: list[str],
         scores: list[float],
         score_scale: str | None = None,
-    ) -> None:
-        self._store.record_surfacing(
+    ) -> bool:
+        return self._store.record_surfacing(
             surfacing_id,
             server,
             tool,

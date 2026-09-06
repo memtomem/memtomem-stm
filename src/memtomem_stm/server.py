@@ -49,8 +49,12 @@ from memtomem_stm.surfacing.observability import (
     SurfacingObservability,
 )
 from memtomem_stm.observability.tracing import traced
-from memtomem_stm.surfacing.feedback import FeedbackTracker, record_feedback_batch
-from memtomem_stm.surfacing.store_io import run_off_loop
+from memtomem_stm.surfacing.feedback import (
+    FEEDBACK_STORE_BUSY,
+    FeedbackTracker,
+    record_feedback_batch,
+)
+from memtomem_stm.surfacing.store_io import await_store_write
 from memtomem_stm.utils.anyio_shutdown import await_or_warn, is_clean_cancel_scope_shutdown
 from memtomem_stm.utils import child_reaper
 from memtomem_stm.utils.parent_liveness import ParentLivenessWatcher
@@ -1753,22 +1757,36 @@ async def stm_surfacing_feedback(
             return await app.surfacing_engine.handle_feedback(surfacing_id, rating, memory_id)
         if app.feedback_tracker is None:
             return "Feedback tracking is not enabled."
+        timeout = app.config.surfacing.timeout_seconds
         if ratings is not None:
-            return await _record_batched_via_tracker(app.feedback_tracker, surfacing_id, ratings)
+            return await _record_batched_via_tracker(
+                app.feedback_tracker, surfacing_id, ratings, timeout=timeout
+            )
         if rating is None:
             return "Error: `rating` is required for single-memory feedback."
         # Off-loop like every other feedback-store write (#996): this DB is
         # shared with the proxy's own stores and other processes, so an insert
-        # that has to wait one of them out must not stall the server.
-        return await run_off_loop(
-            app.feedback_tracker.record_feedback, surfacing_id, rating, memory_id
-        )
+        # that has to wait one of them out must not stall the server. Shielded
+        # and bounded for the same reasons the engine path is — a client that
+        # hangs up must not drop a rating already on its way to the store.
+        try:
+            return await await_store_write(
+                app.feedback_tracker.record_feedback,
+                surfacing_id,
+                rating,
+                memory_id,
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            return FEEDBACK_STORE_BUSY
 
 
 async def _record_batched_via_tracker(
     tracker: Any,
     surfacing_id: str,
     ratings: list[dict],
+    *,
+    timeout: float,
 ) -> str:
     """Fallback fan-out when the engine is unavailable but the tracker is.
 
@@ -1798,7 +1816,12 @@ async def _record_batched_via_tracker(
             return f"Error: ratings[{i}] missing string `rating`."
         parsed.append((mid, rat))
 
-    results = await run_off_loop(record_feedback_batch, tracker, surfacing_id, parsed)
+    try:
+        results = await await_store_write(
+            record_feedback_batch, tracker, surfacing_id, parsed, timeout=timeout
+        )
+    except asyncio.TimeoutError:
+        return FEEDBACK_STORE_BUSY
     recorded = 0
     errors: list[str] = []
     for i, (mid, rat) in enumerate(parsed):

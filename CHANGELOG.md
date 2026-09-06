@@ -220,8 +220,9 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - **Feedback-store writes run on a worker thread instead of the event loop**
-  (#996). Every surfacing call writes a `surfacing_events` row and its
-  `seen_memories` dedup rows, and `stm_feedback.db` is shared with the proxy's
+  (#996). A surfacing call that delivers memories writes a `surfacing_events`
+  row and its `seen_memories` dedup rows (a cache hit writes the row only),
+  and `stm_feedback.db` is shared with the proxy's
   own stores, `mms tune`'s retention purge, and any second STM process. The
   write lock is file-wide, so a write that met one of those peers spent up to
   `busy_timeout` (3 s) inside a blocking call. On the loop that froze
@@ -238,9 +239,10 @@ changes inline only. See the deprecation policy in
   surfacings against a database an external writer holds — the loop's longest
   stall goes from 50.4 s with every write inline to under 0.15 s.
 
-  **Behavior change**: durable telemetry now lands *after* the response rather
-  than before it — a fault counter, diagnostic or retention sweep is queued
-  when its branch runs and written a moment later. A request cancelled by its
+  **Behavior change**: durable telemetry is no longer guaranteed to land
+  before the response — a fault counter, diagnostic or retention sweep is
+  queued when its branch runs, and lands whenever the worker gets to it, which
+  on an idle worker can still be before the loop returns. A request cancelled by its
   deadline mid-write still lands its event row, so a shed request can leave a
   row for a manifest its client never received. The worker is one FIFO thread,
   so an awaited write can wait behind another call's queued sweep; that wait
@@ -249,8 +251,12 @@ changes inline only. See the deprecation policy in
   timeout no longer covers the work after the LTM round trip returns: a
   contended store write holds that one call (as it always did) instead of
   being booked as an LTM timeout that charges the circuit breaker.
-  `FeedbackStore.close()` waits for an in-flight write, multi-query reads
-  (`get_stats` and the tuner's ratios) now answer from one snapshot, and
+  A rating whose write outruns the ceiling comes back as "not confirmed — do
+  not re-submit" instead of a silent success, and a store closed under an
+  in-flight call withdraws that call's feedback prompt rather than advertising
+  an ID with no row. `FeedbackStore.close()` waits for an in-flight write,
+  multi-query reads (`get_stats` and the tuner's ratios) now answer from one
+  snapshot, and
   `record_fault` / `record_diagnostic` take the observation time from the
   caller so a queued write cannot outrun the recovery that disproves it.
 
