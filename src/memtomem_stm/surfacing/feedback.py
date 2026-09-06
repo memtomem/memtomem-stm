@@ -32,6 +32,19 @@ VALID_RATINGS: tuple[str, ...] = (
 )
 
 
+def rating_error(rating: str) -> str | None:
+    """The refusal for an unusable rating value, or ``None`` if it is usable.
+
+    Shared so a caller can refuse one without a store round trip. Recording
+    now happens on a worker thread, and a rating the store was always going to
+    reject must not come back as "busy, it may still be recorded" just because
+    the queue was long — that answer would be false twice over.
+    """
+    if rating not in VALID_RATINGS:
+        return f"Error: rating must be one of {list(VALID_RATINGS)}"
+    return None
+
+
 FEEDBACK_STORE_BUSY = (
     "Error: the feedback store is busy; this rating was not confirmed. "
     "It may still be recorded — do not re-submit."
@@ -151,8 +164,9 @@ class FeedbackTracker:
         rating: str,
         memory_id: str | None = None,
     ) -> str:
-        if rating not in VALID_RATINGS:
-            return f"Error: rating must be one of {list(VALID_RATINGS)}"
+        invalid = rating_error(rating)
+        if invalid is not None:
+            return invalid
         for field, value in (
             ("surfacing_id", surfacing_id),
             ("memory_id", memory_id),

@@ -36,6 +36,7 @@ from memtomem_stm.surfacing.store_io import (
     close_store_on_worker,
     queued_writes,
     submit_store_write,
+    worker_started,
 )
 
 LONG_RESPONSE = "x" * 500
@@ -444,13 +445,22 @@ async def test_a_store_closed_under_the_call_withdraws_the_feedback_id(
     config = _config(tmp_path)
     tracker = FeedbackTracker(config)
     engine = _engine(config, tracker)
+    blocker = threading.Event()
+    submit_store_write(lambda: blocker.wait(timeout=10.0))
     try:
-        tracker.close()
-        output = await engine.surface("gh", "read_file", _args("closed store"), LONG_RESPONSE)
+        surfacing = asyncio.create_task(
+            engine.surface("gh", "read_file", _args("closed store"), LONG_RESPONSE)
+        )
+        await asyncio.sleep(0.1)  # the call is at its write, queued behind the blocker
+        tracker.close()  # teardown lands while that write waits its turn
+        blocker.set()
+        output = await asyncio.wait_for(surfacing, timeout=5.0)
 
         assert output != LONG_RESPONSE, "the memories are still delivered"
         assert "stm_surfacing_feedback" not in output, "no handle for a row that does not exist"
+        assert _event_count(config.feedback_db_path) == 0, "and no row was written"
     finally:
+        blocker.set()
         await engine.stop()
 
 
@@ -646,12 +656,12 @@ async def test_teardown_is_not_held_open_by_a_blocked_write(tmp_path: Path) -> N
         elapsed = asyncio.get_running_loop().time() - started
 
         assert elapsed < 1.5, f"teardown waited {elapsed:.2f}s on a blocked write"
-        assert tracker.store._db is not None, "the close is queued, not skipped"
+        assert not worker_started(), "the worker was retired rather than left queued"
 
         blocker.set()
         # The close was handed to a daemon thread when its turn did not come,
-        # so it lands once the blocked write releases the lock — without the
-        # process having waited for it.
+        # so it lands on its own schedule — without the teardown, or process
+        # exit, having waited for it.
         deadline = asyncio.get_running_loop().time() + 5.0
         while tracker.store._db is not None and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.02)

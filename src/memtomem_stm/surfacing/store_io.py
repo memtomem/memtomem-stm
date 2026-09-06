@@ -149,11 +149,11 @@ async def close_store_on_worker(
     try:
         await asyncio.wait_for(asyncio.shield(run_off_loop(close)), timeout=timeout)
     except asyncio.TimeoutError:
-        # Its turn has not come. Retire the worker anyway — executor threads
-        # are not daemons, so leaving one queued behind a long write would
-        # hand that wait to interpreter exit — and finish the close on a
-        # daemon thread, which releases the connection when the lock frees
-        # without holding the process open for it.
+        # Its turn has not come, and waiting longer is what this budget exists
+        # to refuse. Retiring the worker drops the queue the close was behind,
+        # so the close has to go somewhere: a daemon thread takes it, which
+        # releases the connection once the lock frees without process exit
+        # having to wait for it.
         logger.debug("Feedback store close still queued behind an in-flight write")
         shutdown_worker()
         threading.Thread(target=close, name=f"{_EXECUTOR_THREAD_PREFIX}-close", daemon=True).start()
@@ -162,16 +162,24 @@ async def close_store_on_worker(
 
 
 def shutdown_worker(*, wait: bool = False) -> None:
-    """Retire the worker, dropping writes that have not started.
+    """Stop accepting writes and drop the ones that have not started.
 
-    Executor threads are not daemons, so the interpreter's own exit handler
-    joins them — a teardown that gave up waiting for a close would still hand
-    that wait to process exit, and everything queued behind it would run
-    against a store that is already closed. Cancelling the queue and letting
-    go is the honest end: what had not started was going to be a no-op anyway.
+    Called only from a teardown, and the dropping is the point. Executor
+    threads are not daemons, so the interpreter's exit handler joins this one;
+    leaving a queue in front of it would hand a wait to process exit that
+    grows with the queue — up to a lock budget per write against a database a
+    peer is holding. What is dropped is telemetry and rows for calls that have
+    already answered, and the store they were headed for is closing.
 
-    The module goes back to its initial state, so a later write (a fresh
-    server in the same process, the next test) starts a new worker rather than
+    What this cannot do is stop the write already executing. Exit still joins
+    the worker for that one, bounded by the statement itself: ``busy_timeout``
+    caps a lock wait, and a sweep is bounded by its rows.
+
+    A caller awaiting a dropped write sees ``CancelledError``, which its
+    cancellation path already handles; at teardown there is no such caller.
+
+    The module returns to its initial state, so a later write — a fresh server
+    in the same process, the next test — starts a new worker rather than
     finding a dead one.
     """
     global _executor

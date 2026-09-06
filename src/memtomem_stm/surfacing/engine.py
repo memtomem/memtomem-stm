@@ -22,6 +22,7 @@ from memtomem_stm.surfacing.context_extractor import ContextExtractor
 from memtomem_stm.surfacing.feedback import (
     FEEDBACK_STORE_BUSY,
     FEEDBACK_STORE_UNAVAILABLE,
+    rating_error,
     record_feedback_batch,
 )
 from memtomem_stm.surfacing.feedback_store import DIAGNOSTIC_KINDS, FAULT_KINDS
@@ -1406,6 +1407,12 @@ class SurfacingEngine:
         """
         if self._feedback_tracker is None:
             return "Feedback tracking is not enabled."
+        # Checked here, not only inside the write: an unusable rating has no
+        # store answer to wait for, and a queue would otherwise turn a plain
+        # refusal into "busy, it may still be recorded".
+        invalid = rating_error(rating)
+        if invalid is not None:
+            return invalid
 
         try:
             result = await self._await_store_write(
@@ -1508,6 +1515,10 @@ class SurfacingEngine:
                 return f"Error: ratings[{i}] missing string `memory_id`."
             if not isinstance(rat, str):
                 return f"Error: ratings[{i}] missing string `rating`."
+            # Deliberately NOT pre-checked against ``VALID_RATINGS`` the way
+            # the single-rating path is: a batch fails only the entry whose
+            # value is unusable and records the rest, so the verdict has to
+            # come back per entry from the write itself.
             parsed.append((mid, rat))
 
         # Every row in one worker hop, then the in-memory side effects on the
@@ -1769,7 +1780,6 @@ class SurfacingEngine:
                 self._observability.record_skip(tool, "no_results_invalidated")
             logger.debug("Surfacing cache hit (empty) for %s/%s", server, tool)
             return response_text
-        self._observability.record_outcome(tool, "surfaced_cache_hit")
         logger.debug("Surfacing cache hit (%d results) for %s/%s", len(cached), server, tool)
         # Reclaim the injected IDs into the session-dedup set, symmetric with
         # the miss path, so a memory re-shown from cache is deduped against
@@ -1848,6 +1858,11 @@ class SurfacingEngine:
                         query,
                         score_floor=self._active_min_score(tool),
                     )
+        # Counted once the call is past the point it can be cancelled at: a
+        # hit whose event write was still queued when the client hung up
+        # delivered nothing, and counting it there would report a surfacing
+        # that never reached anyone.
+        self._observability.record_outcome(tool, "surfaced_cache_hit")
         return manifest.text
 
     async def _do_surface(

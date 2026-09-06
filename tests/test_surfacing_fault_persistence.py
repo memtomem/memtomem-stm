@@ -803,17 +803,20 @@ class TestEngineFaultPersistence:
 
         with caplog.at_level(logging.WARNING):
             engine_b._observe_score_scale("gh", "read_file", named_low, 0.03)
+            await engine_b.drain_store_writes()
             assert _episode_is_open(
                 config.feedback_db_path, "gh", "read_file", "score_scale_mismatch"
             )
 
             engine_a._observe_score_scale("gh", "read_file", healthy, 0.03)
+            await engine_a.drain_store_writes()
             assert not _episode_is_open(
                 config.feedback_db_path, "gh", "read_file", "score_scale_mismatch"
             )
 
             # B is still mismatched: its next observation must reopen the row.
             engine_b._observe_score_scale("gh", "read_file", named_low, 0.03)
+            await engine_b.drain_store_writes()
 
         assert _episode_is_open(
             config.feedback_db_path, "gh", "read_file", "score_scale_mismatch"
@@ -872,15 +875,20 @@ class TestEngineFaultPersistence:
             return {"_context_query": f"distinct mixed config query {i}"}
 
         await engine_b.surface("gh", "read_file", q(1), LONG_RESPONSE)
+        await engine_b.drain_store_writes()
         assert open_now(), "the pinned process sees a real mismatch"
         await engine_a.surface("gh", "read_file", q(2), LONG_RESPONSE)
+        await engine_a.drain_store_writes()
         assert not open_now(), "the gated process closes it: its filter is suspended"
         await engine_b.surface("gh", "read_file", q(3), LONG_RESPONSE)
+        await engine_b.drain_store_writes()
         assert open_now(), "B must reopen — this is the #944 fix"
         await engine_a.surface("gh", "read_file", q(4), LONG_RESPONSE)
+        await engine_a.drain_store_writes()
         assert not open_now(), "last writer wins; the row has no per-process column"
         # B is never permanently silenced: it reopens again, indefinitely.
         await engine_b.surface("gh", "read_file", q(5), LONG_RESPONSE)
+        await engine_b.drain_store_writes()
         assert open_now()
 
     async def test_healthy_observation_closes_an_episode_only_a_peer_recorded(self, tmp_path):

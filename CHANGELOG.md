@@ -252,8 +252,9 @@ changes inline only. See the deprecation policy in
   call delivers its memories without a feedback prompt while the write stays
   queued and lands on its own — leaving a row nobody was told about, the same
   orphan a cancelled request makes. A teardown queues the store close behind
-  the writes already waiting, so those still land; anything queued after it
-  does not. The surfacing
+  the writes already waiting, so those land in the ordinary case; a teardown
+  that gives up waiting for its turn drops whatever is still queued rather
+  than handing that wait to process exit. The surfacing
   timeout no longer covers the work after the LTM round trip returns: a
   contended store write holds the call that is making it, as it always did,
   instead of being booked as an LTM timeout that charges the circuit breaker.
