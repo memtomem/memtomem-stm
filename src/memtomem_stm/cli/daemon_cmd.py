@@ -281,10 +281,12 @@ def start_cmd() -> None:
                 launched_any = launched_any or launched
                 spawns += int(launched)
         time.sleep(0.3)
-    # A child that got as far as exec can write the log, whichever attempt it
-    # was: report the fork failure only when *no* attempt ever launched one.
-    # Either mix reported the other way sends the operator somewhere the answer
-    # is not — to a log that was never written, or past the one that was.
+    # A child that got as far as exec is the one that can have logged, whichever
+    # attempt it was, so report the fork failure only when *no* attempt ever
+    # launched one. Reported the other way round, either mix sends the operator
+    # somewhere the answer is not — to a log nothing could have written, or past
+    # a child that ran. The log is where to *look*, not a promise: a child that
+    # dies before ``run_cmd`` configures logging leaves nothing in it.
     detail = (
         f"could not spawn it: {spawn_error}"
         if spawn_error is not None and not launched_any
