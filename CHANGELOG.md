@@ -13,7 +13,7 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
-- Reap exited surfacing daemon children while their MCP host remains alive.
+- Reap exited surfacing daemon children while their MCP host remains alive (#1008).
   **Behavior change**: exited detached children no longer linger as zombies;
   running shared daemons still outlive their launching host.
 
