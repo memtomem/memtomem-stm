@@ -11,6 +11,16 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Fixed
+
+- Reap exited surfacing daemon children while their MCP host remains alive (#1008).
+  **Behavior change**: exited detached children no longer linger as zombies;
+  running shared daemons still outlive their launching host, and the pid stops
+  being spared by the leaked-child sweep once it has been reaped. `mms daemon
+  start` now reports a spawn that failed outright (no thread, no fork) with its
+  cause, instead of retrying it for the whole readiness window and then pointing
+  at a daemon log that was never written.
+
 ## [0.4.0] — 2026-09-06
 
 ### Upgrade notes

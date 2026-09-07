@@ -380,7 +380,7 @@ def test_start_retries_spawn_until_lock_frees(tmp_path: Path, monkeypatch: pytes
 
     state = {"spawns": 0, "lock_free_seen": []}
 
-    def fake_request_spawn(config):
+    def fake_request_spawn(config, *, propagate_errors=False):
         # The real request_spawn probes the (per-config) lock; if start_cmd held
         # it this would see it taken. Assert it's free → start holds nothing.
         lp = lock_path(config.data_dir, discovery.config_fingerprint(config))
@@ -420,7 +420,7 @@ def test_start_caps_spawn_attempts_for_crash_looping_child(
 
     spawns = {"n": 0}
 
-    def crash_looping_spawn(config):
+    def crash_looping_spawn(config, *, propagate_errors=False):
         spawns["n"] += 1
         return True  # lock free every time — the spawned child died instantly
 
@@ -445,6 +445,137 @@ def test_start_caps_spawn_attempts_for_crash_looping_child(
     from memtomem_stm.cli.daemon_cmd import _START_MAX_SPAWNS
 
     assert spawns["n"] == _START_MAX_SPAWNS  # capped, not ~33
+
+
+def test_start_reports_a_failing_spawn_instead_of_retrying_it_forever(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # A spawn that cannot even fork (no thread, EAGAIN) leaves the lock free, so
+    # it looks exactly like a deferral to a caller reading only the bool: the
+    # retry budget is never spent, the window fills with ~33 identical failures,
+    # and the timeout message sends the operator to a daemon log the child never
+    # got to write. `start` asks for the error and charges the attempt.
+    from types import SimpleNamespace
+
+    from click.testing import CliRunner
+
+    from memtomem_stm.cli.proxy import cli
+
+    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+
+    attempts = {"n": 0}
+
+    def failing_spawn(config, *, propagate_errors=False):
+        attempts["n"] += 1
+        assert propagate_errors  # start must not read this failure as a deferral
+        raise OSError("Resource temporarily unavailable")
+
+    async def never_ready(config, *, timeout=2.0):
+        return None
+
+    monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", failing_spawn)
+    monkeypatch.setattr("memtomem_stm.daemon.client.ping", never_ready)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(
+        "memtomem_stm.cli.daemon_cmd.time",
+        SimpleNamespace(
+            time=lambda: clock["t"],
+            sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
+        ),
+    )
+
+    result = CliRunner().invoke(cli, ["daemon", "start"])
+    assert result.exit_code == 1
+    from memtomem_stm.cli.daemon_cmd import _START_MAX_SPAWNS
+
+    assert attempts["n"] == _START_MAX_SPAWNS  # a failed spawn spends the budget
+    assert "Resource temporarily unavailable" in result.output  # names the cause
+    assert "stm-daemon.log" not in result.output  # and not a log that cannot exist
+
+
+def test_start_points_at_the_daemon_log_once_a_child_actually_launched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # A fork that failed and then succeeded is a different story from one that
+    # never succeeded: the child that launched can write the log, so reporting
+    # the earlier OSError would send the operator somewhere the answer is not
+    # and drop the only pointer they have.
+    from types import SimpleNamespace
+
+    from click.testing import CliRunner
+
+    from memtomem_stm.cli.proxy import cli
+
+    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+
+    attempts = {"n": 0}
+
+    def failing_then_launching(config, *, propagate_errors=False):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise OSError("Resource temporarily unavailable")
+        return True  # a child got as far as exec, then crashed on startup
+
+    async def never_ready(config, *, timeout=2.0):
+        return None
+
+    monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", failing_then_launching)
+    monkeypatch.setattr("memtomem_stm.daemon.client.ping", never_ready)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(
+        "memtomem_stm.cli.daemon_cmd.time",
+        SimpleNamespace(
+            time=lambda: clock["t"],
+            sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
+        ),
+    )
+
+    result = CliRunner().invoke(cli, ["daemon", "start"])
+    assert result.exit_code == 1
+    assert "stm-daemon.log" in result.output  # the launched child's log
+    assert "Resource temporarily unavailable" not in result.output  # stale cause
+
+
+def test_start_keeps_the_log_pointer_when_the_failure_comes_last(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # The mirror of the case above. A child launched, then a later fork failed:
+    # the log the first child wrote is still the place to look, so a message
+    # that reports only the fork failure walks the operator past the answer.
+    from types import SimpleNamespace
+
+    from click.testing import CliRunner
+
+    from memtomem_stm.cli.proxy import cli
+
+    monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+
+    attempts = {"n": 0}
+
+    def launching_then_failing(config, *, propagate_errors=False):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return True  # launched, and the child crashed on startup
+        raise OSError("Resource temporarily unavailable")
+
+    async def never_ready(config, *, timeout=2.0):
+        return None
+
+    monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", launching_then_failing)
+    monkeypatch.setattr("memtomem_stm.daemon.client.ping", never_ready)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(
+        "memtomem_stm.cli.daemon_cmd.time",
+        SimpleNamespace(
+            time=lambda: clock["t"],
+            sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
+        ),
+    )
+
+    result = CliRunner().invoke(cli, ["daemon", "start"])
+    assert result.exit_code == 1
+    assert "stm-daemon.log" in result.output
+    assert "Resource temporarily unavailable" not in result.output
 
 
 def test_start_coexists_with_different_config_daemon(
@@ -472,7 +603,7 @@ def test_start_coexists_with_different_config_daemon(
 
     state = {"spawns": 0}
 
-    def fake_request_spawn(config):
+    def fake_request_spawn(config, *, propagate_errors=False):
         state["spawns"] += 1
         return True  # our config's lock is free → spawn proceeds
 
@@ -515,13 +646,42 @@ def test_spawn_detached_registers_the_child_as_meant_to_outlive_us(
     A caller's teardown leaked-child sweep must be told, or it reads the shared
     daemon as a leak and kills it (with the LTM it holds for everyone) on exit
     (#906)."""
+    import threading
+
     from memtomem_stm.daemon import spawn
     from memtomem_stm.utils import child_reaper
 
-    monkeypatch.setattr(child_reaper, "_detached_pids", set())
-    monkeypatch.setattr(spawn.subprocess, "Popen", lambda *_a, **_kw: SimpleNamespace(pid=31337))
-    spawn._spawn_detached()
-    assert 31337 in child_reaper._detached_pids
+    monkeypatch.setattr(child_reaper, "_detached_claims", {})
+    # Hold the child open for the assertion. A wait() that returns at once lets
+    # the reaper retire the claim first, so the test would be asserting on a
+    # race — and the reaper could outlive the monkeypatch and touch the restored
+    # process-global claims.
+    running = threading.Event()
+    reaped = threading.Event()
+
+    def _wait() -> int:
+        running.wait(5)
+        reaped.set()
+        return 0
+
+    monkeypatch.setattr(
+        spawn.subprocess, "Popen", lambda *_a, **_kw: SimpleNamespace(pid=31337, wait=_wait)
+    )
+    reaper: list[threading.Thread] = []
+    try:
+        spawn._spawn_detached()
+        reaper += [t for t in threading.enumerate() if t.name == "stm-daemon-reaper"]
+        claim = child_reaper._detached_claims[31337]
+        assert claim.retired_at is None  # claimed for as long as the child lives
+    finally:
+        # Release the child and join even when the assertion above fails: an
+        # abandoned reaper would sit here until its own timeout and then retire
+        # its claim against the globals this test is about to restore.
+        running.set()
+        for thread in reaper:
+            thread.join(timeout=5)
+    assert reaped.wait(5)
+    assert 31337 not in child_reaper._detached_claims  # retired once reaped
 
 
 def test_request_spawn_spawns_when_lock_free(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -574,6 +734,10 @@ def test_request_spawn_swallows_oserror(tmp_path: Path, monkeypatch: pytest.Monk
 
     monkeypatch.setattr(locking, "single_owner_lock", _boom)
     assert spawn.request_spawn(cfg) is False  # never raises into the hot path
+    # propagate_errors is about the *spawn*, not the probe: an unopenable lock
+    # file says nothing about whether a daemon is coming up, so `start` keeps
+    # retrying it rather than reporting it as the reason it never became ready.
+    assert spawn.request_spawn(cfg, propagate_errors=True) is False
     assert calls == []
 
 
@@ -1849,7 +2013,7 @@ class TestDaemonRestartCli:
         async def fake_ping(config, *, timeout=2.0):
             return {"pid": 7, "port": 9} if calls["spawns"] else None
 
-        def fake_request_spawn(config):
+        def fake_request_spawn(config, *, propagate_errors=False):
             calls["spawns"] += 1
             return True
 

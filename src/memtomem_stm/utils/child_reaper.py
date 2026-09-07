@@ -30,6 +30,7 @@ machinery and must not import the daemon server to get it.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 import signal
@@ -38,6 +39,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -47,14 +49,45 @@ LEAK_KILL_ESCALATE_SECONDS = 2.0
 
 _ESCALATION_POLL_SECONDS = 0.05
 
-# Pids of children deliberately spawned to outlive us — see
+
+@dataclass
+class _Claim:
+    """One detached spawn's hold on a pid.
+
+    *serial* names this claim, not the pid: pids are recycled, so a waiter that
+    releases by pid alone can retire the claim of a *newer* spawn that happens
+    to have been given the same number. *retired_at* is when the waiter proved
+    the child was reaped — the claim is dropped later, by the sweep, once no
+    in-flight enumeration can still be holding a stale view of that pid.
+    """
+
+    serial: int
+    retired_at: float | None = None
+
+
+# Claims on pids of children deliberately spawned to outlive us — see
 # :func:`spawn_claimed`. The lock spans the spawn itself, not just the
 # bookkeeping, so a sweep can never observe a child that exists but is not yet
-# claimed. Claims are never expired: a pid could be recycled onto a child we
-# later leak, but chasing that would trade the cheap mistake (a missed leak) for
-# the expensive one (killing the live daemon whose pid we misjudged).
-_detached_pids: set[int] = set()
+# claimed. Exactly one thing retires a claim: :func:`release_claim`, called by
+# the waiter that consumed the child's exit status. Never a timer and never a
+# liveness guess — only the reaping waiter proves the pid stopped naming our
+# process, and guessing would trade the cheap mistake (a missed leak) for the
+# expensive one (killing the live daemon whose pid we misjudged).
+_detached_claims: dict[int, _Claim] = {}
 _detached_lock = threading.Lock()
+_claim_serials = itertools.count(1)
+
+# Enumerations in flight, by probe id → the moment that probe started. A sweep
+# registers before it enumerates and stays registered until it has read the
+# claims, so a retirement is dropped only once every sweep that could have seen
+# the child alive has finished with it. Sweeps do overlap: the teardown watchdog
+# fires one from its own thread while the lifespan teardown is still running
+# another (``server.py``), and without this the newer sweep would drop the
+# retirement out from under the older one — which would then answer with a pid
+# that was reaped after it looked.
+_active_probes: dict[int, float] = {}
+_probe_lock = threading.Lock()
+_probe_ids = itertools.count(1)
 
 # Ceiling on waiting for a detached spawn to finish claiming. Long enough that a
 # healthy Popen never trips it, short enough that a wedged one cannot park a
@@ -251,8 +284,10 @@ def terminate_leaked_children(
         signal_pid(pid, signal.SIGKILL)
 
 
-def spawn_claimed(spawn: Callable[[], int]) -> None:
+def spawn_claimed(spawn: Callable[[], int]) -> int:
     """Run *spawn* and claim its pid as meant to outlive us, atomically.
+
+    Returns the claim's serial, which :func:`release_claim` requires.
 
     The shared surfacing daemon is spawned detached but is still a direct child
     of whoever launched it (:mod:`memtomem_stm.daemon.spawn` does not
@@ -269,7 +304,71 @@ def spawn_claimed(spawn: Callable[[], int]) -> None:
     is bounded — see :func:`leaked_child_pids`.
     """
     with _detached_lock:
-        _detached_pids.add(spawn())
+        pid = spawn()
+        claim = _Claim(serial=next(_claim_serials))
+        _detached_claims[pid] = claim
+        return claim.serial
+
+
+def release_claim(pid: int, serial: int) -> None:
+    """Retire the claim *serial* holds on *pid*, once its child was reaped.
+
+    Only the waiter that consumed the exit status may call this. Until the child
+    is reaped its zombie pins the pid; after the reap the number is free for the
+    OS to hand to somebody else, so a claim kept past that point spares a pid
+    that is no longer ours — and the child that inherits it (a leaked stdio
+    server still holding an LTM, #906) is exactly what the sweep exists to
+    catch.
+
+    Two things this deliberately does *not* do, because each would turn a missed
+    leak into a killed live process:
+
+    *It does not release by pid.* A waiter can be descheduled between reaping
+    its child and taking the lock, and a new detached spawn can be given the
+    same number in that gap. A mismatched serial means exactly that: the claim
+    now belongs to somebody else's live child, and this waiter has nothing left
+    to retire.
+
+    *It does not drop the entry while a sweep could still be holding it.* A
+    sweep enumerates before it reads the claims, so a reap landing between those
+    two steps would let it signal a pid its probe saw as a zombie and that
+    nobody owns any more. Retiring records the time instead, and the entry goes
+    when no enumeration that started before it is still in flight — right here
+    when none is, which is the usual case.
+    """
+    with _detached_lock:
+        claim = _detached_claims.get(pid)
+        if claim is not None and claim.serial == serial and claim.retired_at is None:
+            claim.retired_at = time.monotonic()
+        _drop_settled_retirements()
+
+
+def _open_probe_window() -> tuple[int, float]:
+    """Register an enumeration about to start; returns its id and start time."""
+    with _probe_lock:
+        probe_id = next(_probe_ids)
+        started = time.monotonic()
+        _active_probes[probe_id] = started
+        return probe_id, started
+
+
+def _close_probe_window(probe_id: int) -> None:
+    with _probe_lock:
+        _active_probes.pop(probe_id, None)
+
+
+def _drop_settled_retirements() -> None:
+    """Forget claims retired before every in-flight enumeration began.
+
+    Caller must hold ``_detached_lock``. With no enumeration in flight there is
+    nobody to protect, so every retired claim goes — which is what keeps the
+    table from growing across a long-lived host's spawns.
+    """
+    with _probe_lock:
+        horizon = min(_active_probes.values(), default=None)
+    for pid, claim in list(_detached_claims.items()):
+        if claim.retired_at is not None and (horizon is None or claim.retired_at < horizon):
+            del _detached_claims[pid]
 
 
 def leaked_child_pids(baseline: set[int]) -> set[int] | None:
@@ -295,25 +394,48 @@ def leaked_child_pids(baseline: set[int]) -> set[int] | None:
     *leader* still pins its pid, so its pgid cannot have been recycled, and the
     live grandchild in that group is reachable only by signalling it. Skipping
     the corpse would skip the leak.
+
+    That reasoning is what makes the claim bookkeeping this function's job. A
+    claimed child *is* reaped, by its waiter, and the pid is recyclable the
+    moment that happens — so a retired claim must stop sparing its pid, or the
+    next child to inherit the number inherits the exemption too. But this
+    function has already enumerated by then: honouring a retirement that landed
+    during its own probe would let it signal a pid it saw as a zombie and that
+    nobody owns now. So a claim retired at or after *probe_started* still
+    spares here, and the entry is forgotten only once no enumeration that could
+    have seen the child alive is still in flight — which is why the window is
+    registered rather than merely timed.
     """
-    seen = probe_child_pids()
-    if seen is None:
-        logger.warning("Leaked-child sweep skipped: could not enumerate this process's children")
-        return None
-    seen -= baseline
-    if not _detached_lock.acquire(timeout=_CLAIM_LOCK_WAIT_SECONDS):
-        # A spawn is wedged mid-Popen. This is the one wait on the shutdown path
-        # that has no other ceiling, and the sweep must never be the reason the
-        # process fails to exit.
-        logger.warning(
-            "Leaked-child sweep skipped: a detached spawn held the claim lock for over %.1fs",
-            _CLAIM_LOCK_WAIT_SECONDS,
-        )
-        return None
+    probe_id, probe_started = _open_probe_window()
     try:
-        return seen - _detached_pids
+        seen = probe_child_pids()
+        if seen is None:
+            logger.warning(
+                "Leaked-child sweep skipped: could not enumerate this process's children"
+            )
+            return None
+        seen -= baseline
+        if not _detached_lock.acquire(timeout=_CLAIM_LOCK_WAIT_SECONDS):
+            # A spawn is wedged mid-Popen. This is the one wait on the shutdown
+            # path that has no other ceiling, and the sweep must never be the
+            # reason the process fails to exit.
+            logger.warning(
+                "Leaked-child sweep skipped: a detached spawn held the claim lock for over %.1fs",
+                _CLAIM_LOCK_WAIT_SECONDS,
+            )
+            return None
+        try:
+            spared = {
+                pid
+                for pid, claim in _detached_claims.items()
+                if claim.retired_at is None or claim.retired_at >= probe_started
+            }
+            _drop_settled_retirements()
+            return seen - spared
+        finally:
+            _detached_lock.release()
     finally:
-        _detached_lock.release()
+        _close_probe_window(probe_id)
 
 
 def sweep_leaked_children(*, baseline: set[int] | None) -> None:
