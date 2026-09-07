@@ -277,6 +277,11 @@ def start_cmd() -> None:
                 spawn_error = exc
                 spawns += 1
             else:
+                if launched:
+                    # A child that got as far as exec can write the log the
+                    # message below points at, so an earlier failure to fork
+                    # stops being the thing to report.
+                    spawn_error = None
                 spawns += int(launched)
         time.sleep(0.3)
     detail = (

@@ -19,14 +19,24 @@ from memtomem_stm.utils import child_reaper
 
 @pytest.fixture(autouse=True)
 def isolated_claims(monkeypatch):
-    """Claim the pids into a per-test set.
+    """Claim the pids into a per-test table, and outlive no reaper.
 
-    ``_detached_pids`` is process-global and no timer expires it, so a test that
-    leaves a real (immediately recyclable) pid behind spares whatever inherits
-    that number — including a genuine leak in a later ``real_child_sweep`` test,
-    which would then pass vacuously on the sweep's central contract.
+    ``_detached_claims`` is process-global and no timer expires it, so a test
+    that leaves a real (immediately recyclable) pid behind spares whatever
+    inherits that number — including a genuine leak in a later
+    ``real_child_sweep`` test, which would then pass vacuously on the sweep's
+    central contract.
+
+    Joining the reaper threads before the monkeypatch unwinds is the other half:
+    a reaper still waiting on a fake child would retire its claim against the
+    *restored* globals, at whatever point in a later test that lands.
     """
-    monkeypatch.setattr(child_reaper, "_detached_pids", set())
+    monkeypatch.setattr(child_reaper, "_detached_claims", {})
+    yield
+    for thread in threading.enumerate():
+        if thread.name == "stm-daemon-reaper":
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "a reaper thread outlived its test"
 
 
 def wait_until(predicate):
@@ -103,9 +113,11 @@ def test_exited_child_disappears_without_another_popen(monkeypatch, code):
             wait_until(lambda: not exists(child.pid) and child.returncode is not None)
             assert child.returncode == code
             # The claim is what spares this pid from a teardown sweep. Reaping
-            # frees the number, so a claim kept past it would spare whatever
-            # child inherits it (#906).
-            assert child.pid not in child_reaper._detached_pids
+            # frees the number, so the claim has to be retired, or it would
+            # spare whatever child inherits it (#906). Retirement happens after
+            # the wait returns, so poll for it rather than racing the reaper.
+            claim = child_reaper._detached_claims[child.pid]
+            wait_until(lambda: claim.retired_at is not None)
     finally:
         for child in children:
             with contextlib.suppress(ProcessLookupError):
@@ -122,7 +134,8 @@ def test_wait_runs_after_claim_outside_lock(monkeypatch):
 
         def wait(self):
             acquired = child_reaper._detached_lock.acquire(timeout=1)
-            observed.append((self.pid in child_reaper._detached_pids, acquired))
+            claimed = child_reaper._detached_claims.get(self.pid)
+            observed.append((claimed is not None and claimed.retired_at is None, acquired))
             if acquired:
                 child_reaper._detached_lock.release()
             done.set()
@@ -134,7 +147,8 @@ def test_wait_runs_after_claim_outside_lock(monkeypatch):
     assert observed == [(True, True)]
     # Claimed for the whole life of the child, and retired by the one thing that
     # proves the pid stopped naming it: the wait that consumed its exit status.
-    wait_until(lambda: 31337 not in child_reaper._detached_pids)
+    claim = child_reaper._detached_claims[31337]
+    wait_until(lambda: claim.retired_at is not None)
 
 
 @pytest.mark.parametrize("failure", ["thread", "popen"])
@@ -147,7 +161,7 @@ def test_spawn_failure_does_not_leave_waiter_or_child(monkeypatch, tmp_path, fai
     for thread in threads:
         thread.join(timeout=5)
         assert not thread.is_alive()
-    assert not child_reaper._detached_pids  # nothing spawned, nothing claimed
+    assert not child_reaper._detached_claims  # nothing spawned, nothing claimed
 
 
 @pytest.mark.parametrize("failure", ["thread", "popen"])

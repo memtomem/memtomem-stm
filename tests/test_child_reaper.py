@@ -221,7 +221,7 @@ def test_sweep_spares_a_child_meant_to_outlive_us(
     # The shared surfacing daemon is spawned detached but is still a direct
     # child (nothing double-forks), and it is meant to outlive us. Sweeping it
     # would take down the daemon and the LTM it holds for every other consumer.
-    monkeypatch.setattr(child_reaper, "_detached_pids", set())
+    monkeypatch.setattr(child_reaper, "_detached_claims", {})
     monkeypatch.setattr(child_reaper, "probe_child_pids", lambda: {111, 222})
     killed: list[set[int]] = []
     monkeypatch.setattr(child_reaper, "terminate_leaked_children", killed.append)
@@ -267,7 +267,7 @@ def test_a_sweep_cannot_run_between_the_spawn_and_its_claim(
     but is not yet claimed. ``spawn_claimed`` holds the lock across the spawn —
     and the sweep probes *before* taking that lock, so a spawn completing
     between the two reads still lands on the sparing side."""
-    monkeypatch.setattr(child_reaper, "_detached_pids", set())
+    monkeypatch.setattr(child_reaper, "_detached_claims", {})
     spawn_started = threading.Event()
     probed = threading.Event()
 
@@ -301,15 +301,67 @@ def test_a_released_claim_stops_sparing_the_recycled_pid(
     a timer. The one event that ends it is the waiter reaping the child: until
     then the zombie pins the number, and after it the OS may hand the same
     number to a child we *do* leak — which the sweep exists to catch (#906)."""
-    monkeypatch.setattr(child_reaper, "_detached_pids", set())
+    monkeypatch.setattr(child_reaper, "_detached_claims", {})
     monkeypatch.setattr(child_reaper, "probe_child_pids", lambda: {4242})
-    child_reaper.spawn_claimed(lambda: 4242)
+    serial = child_reaper.spawn_claimed(lambda: 4242)
     assert child_reaper.leaked_child_pids(set()) == set()  # ours, spared
 
-    child_reaper.release_claim(4242)  # the waiter consumed its exit status
+    child_reaper.release_claim(4242, serial)  # the waiter consumed its exit status
     # Same pid, different process: a leaked stdio child that inherited it.
     assert child_reaper.leaked_child_pids(set()) == {4242}
-    child_reaper.release_claim(4242)  # idempotent — a second waiter is not an error
+    child_reaper.release_claim(4242, serial)  # idempotent — a late waiter is not an error
+    assert child_reaper.leaked_child_pids(set()) == {4242}
+
+
+def test_a_reap_inside_the_probe_still_spares_that_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sweep enumerates before it reads the claims, so a reap can land in
+    between. That pid was a zombie when the probe saw it and is unowned by the
+    time we would signal it — dropping the claim right there would point the
+    sweep at a number that can already belong to somebody else."""
+    monkeypatch.setattr(child_reaper, "_detached_claims", {})
+    serial = child_reaper.spawn_claimed(lambda: 4242)
+
+    def _probe() -> set[int]:
+        child_reaper.release_claim(4242, serial)  # reaped mid-enumeration
+        return {4242}
+
+    monkeypatch.setattr(child_reaper, "probe_child_pids", _probe)
+    assert child_reaper.leaked_child_pids(set()) == set()
+
+    # ...and the retirement is not forgotten: the next sweep, whose probe ran
+    # after it, stops sparing the number.
+    monkeypatch.setattr(child_reaper, "probe_child_pids", lambda: {4242})
+    assert child_reaper.leaked_child_pids(set()) == {4242}
+
+
+def test_a_late_waiter_cannot_retire_the_next_spawns_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A waiter can be descheduled between reaping its child and taking the
+    lock, and a new detached spawn can be handed the same pid in that gap.
+    Releasing by pid alone would un-spare a live shared daemon — the expensive
+    mistake this module is built to avoid."""
+    monkeypatch.setattr(child_reaper, "_detached_claims", {})
+    monkeypatch.setattr(child_reaper, "probe_child_pids", lambda: {4242})
+    first = child_reaper.spawn_claimed(lambda: 4242)
+
+    # The old child was reaped, but no sweep has run, so its entry is still the
+    # one in the table when the number comes back around.
+    child_reaper.release_claim(4242, first)
+    second = child_reaper.spawn_claimed(lambda: 4242)
+    assert second != first
+    child_reaper.release_claim(4242, first)  # the old waiter, finally scheduled
+    assert child_reaper.leaked_child_pids(set()) == set()  # the live child is spared
+
+    # Same again with the retired entry already swept away.
+    child_reaper.release_claim(4242, second)
+    assert child_reaper.leaked_child_pids(set()) == {4242}
+    third = child_reaper.spawn_claimed(lambda: 4242)
+    child_reaper.release_claim(4242, second)
+    assert child_reaper.leaked_child_pids(set()) == set()
+    child_reaper.release_claim(4242, third)
 
 
 def test_a_wedged_spawn_cannot_park_the_shutdown(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -317,7 +369,7 @@ def test_a_wedged_spawn_cannot_park_the_shutdown(monkeypatch: pytest.MonkeyPatch
     process fails to exit; waiting on the claim lock is the one that has no
     other ceiling. A spawn stuck inside Popen must yield "unknown", not a hang
     — so the assertion is on the wait completing, not just on its answer."""
-    monkeypatch.setattr(child_reaper, "_detached_pids", set())
+    monkeypatch.setattr(child_reaper, "_detached_claims", {})
     monkeypatch.setattr(child_reaper, "probe_child_pids", lambda: {888})
     monkeypatch.setattr(child_reaper, "_CLAIM_LOCK_WAIT_SECONDS", 0.1)
     wedged = threading.Event()
@@ -365,7 +417,7 @@ def test_a_claim_is_never_expired(monkeypatch: pytest.MonkeyPatch) -> None:
     that leak trades the cheap mistake for the expensive one: the check would
     also mis-sentence the live daemon whose Popen something else already
     reaped. The sweep is biased toward sparing, so the claim stands."""
-    monkeypatch.setattr(child_reaper, "_detached_pids", set())
+    monkeypatch.setattr(child_reaper, "_detached_claims", {})
     monkeypatch.setattr(child_reaper, "probe_child_pids", lambda: {555})
     child_reaper.spawn_claimed(lambda: 555)
     assert child_reaper.leaked_child_pids(set()) == set()
@@ -377,7 +429,7 @@ def test_a_zombie_leader_is_still_swept(monkeypatch: pytest.MonkeyPatch) -> None
     server it wrapped still in its process group. The zombie pins its pid, so
     the pgid cannot have been recycled, and signalling the group is the only
     way to reach the grandchild. Skipping the corpse would skip the leak."""
-    monkeypatch.setattr(child_reaper, "_detached_pids", set())
+    monkeypatch.setattr(child_reaper, "_detached_claims", {})
     monkeypatch.setattr(child_reaper, "probe_child_pids", lambda: {666})
     monkeypatch.setattr(child_reaper, "_has_exited", lambda _pid: True)
     assert child_reaper.leaked_child_pids(set()) == {666}
@@ -405,7 +457,7 @@ def test_signal_pid_reaches_the_group_of_a_zombie_leader(
 def test_children_that_predate_us_are_not_ours_to_kill(monkeypatch: pytest.MonkeyPatch) -> None:
     # app_lifespan does not always own the process it runs in; a host's own
     # subprocesses must survive our teardown.
-    monkeypatch.setattr(child_reaper, "_detached_pids", set())
+    monkeypatch.setattr(child_reaper, "_detached_claims", {})
     monkeypatch.setattr(child_reaper, "probe_child_pids", lambda: {10, 20})
     killed: list[set[int]] = []
     monkeypatch.setattr(child_reaper, "terminate_leaked_children", killed.append)

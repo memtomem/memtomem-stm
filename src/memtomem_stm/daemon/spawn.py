@@ -53,15 +53,17 @@ def _spawn_detached() -> None:
     # which only reaps on a later Popen and can leave a long-lived host zombies.
     ready = threading.Event()
     child: subprocess.Popen[bytes] | None = None
+    serial: int | None = None
 
     def reap() -> None:
         ready.wait()
-        if child is not None:
+        if child is not None and serial is not None:
             child.wait()
             # The claim outranks the child only while the child pins the pid.
             # Reaping frees that number for reuse, so keeping the claim would
-            # spare whichever later child inherits it (#906).
-            release_claim(child.pid)
+            # spare whichever later child inherits it (#906). The serial is what
+            # keeps this from retiring a *newer* spawn's claim on the same pid.
+            release_claim(child.pid, serial)
 
     def launch() -> int:
         nonlocal child
@@ -70,7 +72,7 @@ def _spawn_detached() -> None:
 
     threading.Thread(target=reap, name="stm-daemon-reaper", daemon=True).start()
     try:
-        spawn_claimed(launch)
+        serial = spawn_claimed(launch)
     finally:
         # Also release the waiter if Popen fails. Waiting never holds the claim
         # lock and never joins the shared daemon during host shutdown.

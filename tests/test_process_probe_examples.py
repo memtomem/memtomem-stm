@@ -12,6 +12,25 @@ import pytest
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX documentation examples")
 
 
+def stopped(pid):
+    """True once *pid* is no longer a *running* process.
+
+    An orphaned worker cannot control whether its new parent reaps it: PID 1
+    does on a normal system, but a container whose PID 1 is an ordinary process
+    does not, and the exited worker then stays visible to ``kill(0)`` as a
+    zombie. The example promises the workers stop themselves, not that somebody
+    reaps them, so a zombie counts as stopped.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    state = subprocess.run(
+        ["ps", "-o", "state=", "-p", str(pid)], capture_output=True, text=True
+    ).stdout.strip()
+    return state.startswith("Z")
+
+
 def example(name):
     text = (Path(__file__).parents[1] / "CONTRIBUTING.md").read_text()
     section = text.split(f"<!-- process-probe: {name} -->", 1)[1]
@@ -98,11 +117,7 @@ def test_load_workers_have_their_own_deadline(tmp_path):
         host.wait(timeout=5)
         deadline = time.monotonic() + 5
         while pids and time.monotonic() < deadline:
-            for pid in pids[:]:
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
-                    pids.remove(pid)
+            pids = [pid for pid in pids if not stopped(pid)]
             time.sleep(0.02)
         assert not pids
     finally:
