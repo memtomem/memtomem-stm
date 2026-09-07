@@ -294,6 +294,24 @@ def test_a_sweep_cannot_run_between_the_spawn_and_its_claim(
         worker.join(timeout=5.0)
 
 
+def test_a_released_claim_stops_sparing_the_recycled_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A claim spares its pid from every later sweep, and nothing expires it on
+    a timer. The one event that ends it is the waiter reaping the child: until
+    then the zombie pins the number, and after it the OS may hand the same
+    number to a child we *do* leak — which the sweep exists to catch (#906)."""
+    monkeypatch.setattr(child_reaper, "_detached_pids", set())
+    monkeypatch.setattr(child_reaper, "probe_child_pids", lambda: {4242})
+    child_reaper.spawn_claimed(lambda: 4242)
+    assert child_reaper.leaked_child_pids(set()) == set()  # ours, spared
+
+    child_reaper.release_claim(4242)  # the waiter consumed its exit status
+    # Same pid, different process: a leaked stdio child that inherited it.
+    assert child_reaper.leaked_child_pids(set()) == {4242}
+    child_reaper.release_claim(4242)  # idempotent — a second waiter is not an error
+
+
 def test_a_wedged_spawn_cannot_park_the_shutdown(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every other step of the sweep is capped so it can never be the reason a
     process fails to exit; waiting on the claim lock is the one that has no

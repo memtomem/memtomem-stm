@@ -50,9 +50,11 @@ _ESCALATION_POLL_SECONDS = 0.05
 # Pids of children deliberately spawned to outlive us — see
 # :func:`spawn_claimed`. The lock spans the spawn itself, not just the
 # bookkeeping, so a sweep can never observe a child that exists but is not yet
-# claimed. Claims are never expired: a pid could be recycled onto a child we
-# later leak, but chasing that would trade the cheap mistake (a missed leak) for
-# the expensive one (killing the live daemon whose pid we misjudged).
+# claimed. Exactly one thing retires a claim: :func:`release_claim`, called by
+# the waiter that consumed the child's exit status. Never a timer and never a
+# liveness guess — only the reaping waiter proves the pid stopped naming our
+# process, and guessing would trade the cheap mistake (a missed leak) for the
+# expensive one (killing the live daemon whose pid we misjudged).
 _detached_pids: set[int] = set()
 _detached_lock = threading.Lock()
 
@@ -272,6 +274,25 @@ def spawn_claimed(spawn: Callable[[], int]) -> None:
         _detached_pids.add(spawn())
 
 
+def release_claim(pid: int) -> None:
+    """Retire *pid*'s claim, once its child has been reaped by the waiter.
+
+    Only that waiter may call this. Until the child is reaped its zombie pins
+    the pid; after the reap the number is free for the OS to hand to somebody
+    else, so a claim kept past that point spares a pid that is no longer ours —
+    and the child that inherits it (a leaked stdio server still holding an LTM,
+    #906) is exactly what the sweep exists to catch.
+
+    The counterpart window is narrow and taken deliberately: a sweep that
+    enumerated the child while it was still a zombie, and reads the claims after
+    this call, names a pid we no longer own. That is the microseconds between
+    one sweep's ``pgrep`` and its signal, weighed against a stale claim that
+    otherwise lasts the host's whole life.
+    """
+    with _detached_lock:
+        _detached_pids.discard(pid)
+
+
 def leaked_child_pids(baseline: set[int]) -> set[int] | None:
     """Direct children that are ours and were not meant to outlive us.
 
@@ -294,7 +315,10 @@ def leaked_child_pids(baseline: set[int]) -> set[int] | None:
     A pid that has already exited stays in the answer. An unreaped zombie
     *leader* still pins its pid, so its pgid cannot have been recycled, and the
     live grandchild in that group is reachable only by signalling it. Skipping
-    the corpse would skip the leak.
+    the corpse would skip the leak. That reasoning covers the *unreaped* only:
+    a claimed child whose waiter reaped it between this probe and this read has
+    already released its claim (:func:`release_claim`), so the answer can name a
+    pid nothing owns any more — see that function for why the trade is right.
     """
     seen = probe_child_pids()
     if seen is None:

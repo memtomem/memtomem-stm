@@ -2,17 +2,31 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
 from memtomem_stm.config import STMConfig
 from memtomem_stm.daemon import spawn
 from memtomem_stm.utils import child_reaper
+
+
+@pytest.fixture(autouse=True)
+def isolated_claims(monkeypatch):
+    """Claim the pids into a per-test set.
+
+    ``_detached_pids`` is process-global and no timer expires it, so a test that
+    leaves a real (immediately recyclable) pid behind spares whatever inherits
+    that number — including a genuine leak in a later ``real_child_sweep`` test,
+    which would then pass vacuously on the sweep's central contract.
+    """
+    monkeypatch.setattr(child_reaper, "_detached_pids", set())
 
 
 def wait_until(predicate):
@@ -30,6 +44,41 @@ def exists(pid):
     return True
 
 
+def break_spawn(monkeypatch, failure, launched):
+    """Make the reaper thread or the ``Popen`` fail, without breaking the world.
+
+    ``spawn.threading`` *is* the stdlib module, so patching ``Thread`` on it
+    fails every thread creation in the interpreter for the duration of the test
+    (an ``asyncio`` executor growing a worker, a plugin's background thread).
+    Rebinding the name inside ``spawn`` reaches only the code under test.
+    """
+
+    def fail_thread(*_a, **_kw):
+        raise RuntimeError("cannot start thread")
+
+    def fail_popen(*_a, **_kw):
+        launched.append(True)
+        raise OSError("cannot spawn")
+
+    threads: list[threading.Thread] = []
+
+    def make_thread(*args, **kwargs):
+        thread = threading.Thread(*args, **kwargs)
+        threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(
+        spawn,
+        "threading",
+        SimpleNamespace(
+            Event=threading.Event,
+            Thread=fail_thread if failure == "thread" else make_thread,
+        ),
+    )
+    monkeypatch.setattr(spawn.subprocess, "Popen", fail_popen)
+    return threads
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX zombie observation")
 @pytest.mark.parametrize("code", [0, 3])
 def test_exited_child_disappears_without_another_popen(monkeypatch, code):
@@ -45,14 +94,22 @@ def test_exited_child_disappears_without_another_popen(monkeypatch, code):
     try:
         for _ in range(3):
             spawn._spawn_detached()
+            child = children[-1]
             # kill(0) observes existence, including zombies, without reaping.
             # No Popen/poll/wait on this path can accidentally fix the defect.
-            wait_until(lambda: not exists(children[-1].pid))
-            assert children[-1].returncode == code
+            # The pid disappears the moment the reaper's waitpid returns, a few
+            # statements before Popen records the status, so wait for both —
+            # asserting on the pid alone races the reaper thread.
+            wait_until(lambda: not exists(child.pid) and child.returncode is not None)
+            assert child.returncode == code
+            # The claim is what spares this pid from a teardown sweep. Reaping
+            # frees the number, so a claim kept past it would spare whatever
+            # child inherits it (#906).
+            assert child.pid not in child_reaper._detached_pids
     finally:
         for child in children:
-            if child.poll() is None:
-                child.kill()
+            with contextlib.suppress(ProcessLookupError):
+                child.kill()  # a no-op once the reaper recorded the exit
             child.wait(timeout=5)
 
 
@@ -75,36 +132,35 @@ def test_wait_runs_after_claim_outside_lock(monkeypatch):
     spawn._spawn_detached()
     assert done.wait(5)
     assert observed == [(True, True)]
+    # Claimed for the whole life of the child, and retired by the one thing that
+    # proves the pid stopped naming it: the wait that consumed its exit status.
+    wait_until(lambda: 31337 not in child_reaper._detached_pids)
 
 
 @pytest.mark.parametrize("failure", ["thread", "popen"])
 def test_spawn_failure_does_not_leave_waiter_or_child(monkeypatch, tmp_path, failure):
-    started = []
-    real_thread = threading.Thread
-    launched = []
-
-    def make_thread(**kwargs):
-        thread = real_thread(**kwargs)
-        started.append(thread)
-        return thread
-
-    def fail_thread(**kwargs):
-        raise RuntimeError("cannot start thread")
-
-    def fail_popen(*args, **kwargs):
-        launched.append(True)
-        raise OSError("cannot spawn")
-
-    monkeypatch.setattr(
-        spawn.threading, "Thread", fail_thread if failure == "thread" else make_thread
-    )
-    monkeypatch.setattr(spawn.subprocess, "Popen", fail_popen)
+    launched: list[bool] = []
+    threads = break_spawn(monkeypatch, failure, launched)
     cfg = STMConfig(data_dir=tmp_path)
     assert spawn.request_spawn(cfg) is False
     assert bool(launched) == (failure == "popen")
-    for thread in started:
+    for thread in threads:
         thread.join(timeout=5)
         assert not thread.is_alive()
+    assert not child_reaper._detached_pids  # nothing spawned, nothing claimed
+
+
+@pytest.mark.parametrize("failure", ["thread", "popen"])
+def test_spawn_error_reaches_the_caller_that_asks_for_it(monkeypatch, tmp_path, failure):
+    # Degrading to False is right for the hot path, which only ever falls back
+    # to cold surfacing. `mms daemon start` retries on a budget and reports at
+    # the end, so a swallowed failure there costs it both: the budget is never
+    # spent (a failed spawn is indistinguishable from a deferral) and the
+    # timeout message blames a daemon log the child never got to write.
+    cfg = STMConfig(data_dir=tmp_path)
+    break_spawn(monkeypatch, failure, [])
+    with pytest.raises(RuntimeError if failure == "thread" else OSError):
+        spawn.request_spawn(cfg, propagate_errors=True)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process cleanup")

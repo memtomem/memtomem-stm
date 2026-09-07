@@ -251,31 +251,40 @@ def start_cmd() -> None:
 
     deadline = time.time() + 10.0
     spawns = 0
+    spawn_error: Exception | None = None
     while time.time() < deadline:
         hs = asyncio.run(client.ping(config, timeout=1.0))
         if hs is not None:
             click.echo(_ok(f"daemon started (pid={hs.get('pid')} port={hs.get('port')})"))
             return
         # request_spawn launches a detached child iff our config's lock is free;
-        # it returns False only when a same-config daemon already holds it
-        # (mid-startup → ping succeeds soon, or mid-shutdown → the lock frees and
-        # the next attempt wins). We never hold the lock, so the spawned child
-        # can take ownership. BUT a free lock can also mean the child we just
-        # spawned crashed on startup (bad config) — without a cap, a
-        # crash-looping config would fire a detached child every 0.3s for the
-        # whole window (~33 processes). Cap actual spawns and keep only
-        # ping-polling afterwards; the mid-shutdown handoff needs at most one
-        # respawn after the old daemon releases.
-        if spawns < _START_MAX_SPAWNS and request_spawn(config):
-            spawns += 1
+        # it declines when a same-config daemon already holds it (mid-startup →
+        # ping succeeds soon, or mid-shutdown → the lock frees and the next
+        # attempt wins). We never hold the lock, so the spawned child can take
+        # ownership. BUT a free lock can also mean the child we just spawned
+        # crashed on startup (bad config) — without a cap, a crash-looping
+        # config would fire a detached child every 0.3s for the whole window
+        # (~33 processes). Cap actual spawns and keep only ping-polling
+        # afterwards; the mid-shutdown handoff needs at most one respawn after
+        # the old daemon releases. A spawn that *raised* (no thread, no fork)
+        # spends the same budget: a fork that cannot fork will not start
+        # forking, and unbudgeted retries would bury the cause under a
+        # ~33-deep stack of the same traceback.
+        if spawns < _START_MAX_SPAWNS:
+            try:
+                launched = request_spawn(config, propagate_errors=True)
+            except (OSError, RuntimeError) as exc:
+                spawn_error = exc
+                spawns += 1
+            else:
+                spawns += int(launched)
         time.sleep(0.3)
-    click.echo(
-        _warn(
-            "daemon did not become ready in time — "
-            "check the daemon log under data_dir (stm-daemon.log)"
-        ),
-        err=True,
+    detail = (
+        f"could not spawn it: {spawn_error}"
+        if spawn_error is not None
+        else "check the daemon log under data_dir (stm-daemon.log)"
     )
+    click.echo(_warn(f"daemon did not become ready in time — {detail}"), err=True)
     raise SystemExit(1)
 
 

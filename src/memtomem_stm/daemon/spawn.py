@@ -20,7 +20,7 @@ import sys
 import threading
 from typing import TYPE_CHECKING, Any
 
-from memtomem_stm.utils.child_reaper import spawn_claimed
+from memtomem_stm.utils.child_reaper import release_claim, spawn_claimed
 
 if TYPE_CHECKING:
     from memtomem_stm.config import STMConfig
@@ -58,6 +58,10 @@ def _spawn_detached() -> None:
         ready.wait()
         if child is not None:
             child.wait()
+            # The claim outranks the child only while the child pins the pid.
+            # Reaping frees that number for reuse, so keeping the claim would
+            # spare whichever later child inherits it (#906).
+            release_claim(child.pid)
 
     def launch() -> int:
         nonlocal child
@@ -73,15 +77,23 @@ def _spawn_detached() -> None:
         ready.set()
 
 
-def request_spawn(config: STMConfig) -> bool:
+def request_spawn(config: STMConfig, *, propagate_errors: bool = False) -> bool:
     """Fire-and-forget spawn a detached daemon iff none owns *this config's* lock.
 
     The lock is keyed by ``config``'s fingerprint, so a daemon running under a
     *different* config holds a different lock and never blocks this spawn — the
-    new daemon coexists with it. Returns ``True`` if a child was launched,
-    ``False`` if a same-config daemon already owns the lifetime lock (alive or
-    mid-startup) so we deferred, or if the lock file couldn't be opened. Never
-    blocks on readiness and never raises.
+    new daemon coexists with it. Returns ``True`` if a child was launched.
+    ``False`` covers three different things, and no caller can tell them apart:
+    a same-config daemon already owns the lifetime lock (alive or mid-startup)
+    so we deferred, the lock file couldn't be opened, or the spawn itself failed
+    (no thread, no fork). Never blocks on readiness, and never raises — the hot
+    path (``mms hook``, the daemon LTM adapter) only ever degrades to cold
+    surfacing, so an exception there buys nothing.
+
+    *propagate_errors* re-raises that third case for callers that do more than
+    degrade: ``mms daemon start`` retries on a schedule and reports at the end,
+    so it needs to charge a failed spawn against its retry budget and name the
+    cause instead of blaming a daemon log that was never written.
 
     The lock is a probe only (acquire + release); the spawned child re-acquires
     it for its lifetime as the single owner.
@@ -100,6 +112,8 @@ def request_spawn(config: STMConfig) -> bool:
     try:
         _spawn_detached()  # spawn OUTSIDE the lock (already released above)
     except (OSError, RuntimeError):
+        if propagate_errors:
+            raise
         logger.warning("Could not spawn surfacing daemon", exc_info=True)
         return False
     return True

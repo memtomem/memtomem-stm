@@ -98,7 +98,8 @@ For a short CPU load probe, use Bash explicitly (`bash load_probe.sh`). These
 workers stop themselves after two seconds even if the launcher is killed.
 Record `$!` immediately; shell job numbers such as `%1` are not stable process
 identities. Replace the foreground `sleep` with a bounded test command when
-needed, and adjust the worker deadline deliberately.
+needed, and adjust the worker deadline deliberately — the cleanup trap is
+installed before the first worker, so it has to survive an empty `pids`.
 
 <!-- process-probe: load -->
 ```bash
@@ -106,8 +107,11 @@ needed, and adjust the worker deadline deliberately.
 set -eu
 pids=()
 cleanup() {
-  for pid in "${pids[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
-  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+  # ${pids[@]+...} because `set -u` + an empty array is an *error* in bash 3.2
+  # (macOS /bin/bash): the EXIT trap would then abort before cleaning anything,
+  # which is exactly the run where it is installed but no worker started yet.
+  for pid in ${pids[@]+"${pids[@]}"}; do kill -TERM "$pid" 2>/dev/null || true; done
+  for pid in ${pids[@]+"${pids[@]}"}; do wait "$pid" 2>/dev/null || true; done
 }
 trap cleanup EXIT
 trap 'exit 130' INT

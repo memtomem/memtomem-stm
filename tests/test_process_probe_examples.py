@@ -67,6 +67,26 @@ def test_load_example_reaps_workers(tmp_path, interrupt):
             host.wait(timeout=6)
 
 
+def test_load_example_cleanup_survives_an_empty_worker_list(tmp_path):
+    # The EXIT trap is installed before the first worker starts, so it has to run
+    # with `pids` still empty — and under `set -u` an empty array expansion is an
+    # *error* in bash 3.2, the /bin/bash macOS ships. The trap would then abort
+    # on its first line, in exactly the run where an early failure (or an edit
+    # the section invites) makes cleanup matter.
+    text = example("load")
+    # bash >= 4.4 accepts the unguarded form, so CI's bash cannot show the bug by
+    # running it: pin the guard itself as well as the behaviour.
+    assert '${pids[@]+"${pids[@]}"}' in text
+    assert 'in "${pids[@]}"' not in text
+    marker = "trap 'exit 143' TERM\n"
+    assert marker in text
+    path = tmp_path / "load_probe.sh"
+    path.write_text(text.replace(marker, marker + "exit 7\n", 1))
+    result = subprocess.run(["bash", str(path)], capture_output=True, text=True, timeout=8)
+    assert result.returncode == 7, result.stderr  # the trap ran and changed nothing
+    assert "unbound variable" not in result.stderr
+
+
 def test_load_workers_have_their_own_deadline(tmp_path):
     path = tmp_path / "load_probe.sh"
     path.write_text(example("load"))
