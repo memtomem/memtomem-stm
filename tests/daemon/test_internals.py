@@ -519,7 +519,9 @@ def test_spawn_detached_registers_the_child_as_meant_to_outlive_us(
     from memtomem_stm.utils import child_reaper
 
     monkeypatch.setattr(child_reaper, "_detached_pids", set())
-    monkeypatch.setattr(spawn.subprocess, "Popen", lambda *_a, **_kw: SimpleNamespace(pid=31337))
+    monkeypatch.setattr(
+        spawn.subprocess, "Popen", lambda *_a, **_kw: SimpleNamespace(pid=31337, wait=lambda: 0)
+    )
     spawn._spawn_detached()
     assert 31337 in child_reaper._detached_pids
 

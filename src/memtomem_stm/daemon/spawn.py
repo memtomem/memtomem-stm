@@ -17,6 +17,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 from typing import TYPE_CHECKING, Any
 
 from memtomem_stm.utils.child_reaper import spawn_claimed
@@ -47,7 +48,29 @@ def _spawn_detached() -> None:
     # under the sweep's lock, or a caller's teardown leaked-child sweep reads the
     # shared daemon as a leak and kills it (with the LTM it holds for everyone
     # else) on exit (#906).
-    spawn_claimed(lambda: subprocess.Popen(cmd, **kwargs).pid)
+    # Start the waiter first: thread exhaustion must not leave an unowned child.
+    # Keep the Popen object alive rather than relying on subprocess._active,
+    # which only reaps on a later Popen and can leave a long-lived host zombies.
+    ready = threading.Event()
+    child: subprocess.Popen[bytes] | None = None
+
+    def reap() -> None:
+        ready.wait()
+        if child is not None:
+            child.wait()
+
+    def launch() -> int:
+        nonlocal child
+        child = subprocess.Popen(cmd, **kwargs)
+        return child.pid
+
+    threading.Thread(target=reap, name="stm-daemon-reaper", daemon=True).start()
+    try:
+        spawn_claimed(launch)
+    finally:
+        # Also release the waiter if Popen fails. Waiting never holds the claim
+        # lock and never joins the shared daemon during host shutdown.
+        ready.set()
 
 
 def request_spawn(config: STMConfig) -> bool:
@@ -74,5 +97,9 @@ def request_spawn(config: STMConfig) -> bool:
         return False
     if alive:
         return False
-    _spawn_detached()  # spawn OUTSIDE the lock (already released above)
+    try:
+        _spawn_detached()  # spawn OUTSIDE the lock (already released above)
+    except (OSError, RuntimeError):
+        logger.warning("Could not spawn surfacing daemon", exc_info=True)
+        return False
     return True

@@ -11,6 +11,12 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Fixed
+
+- Reap exited surfacing daemon children while their MCP host remains alive.
+  **Behavior change**: exited detached children no longer linger as zombies;
+  running shared daemons still outlive their launching host.
+
 ## [0.4.0] — 2026-09-06
 
 ### Upgrade notes

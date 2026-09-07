@@ -26,6 +26,107 @@ uv run ruff format src
 uv run mypy src
 ```
 
+## Temporary process probes (macOS / Linux)
+
+A detached process is still its launcher's child. Keep its process handle and
+reap it when it exits; do not install a global SIGCHLD handler or reap another
+library's children. A timeout that merely backgrounds a command is not cleanup.
+
+For a PTY probe, save this as `pty_probe.py` and run `python3 pty_probe.py`
+(or append the command and arguments to inspect). EOF is readable forever on
+some systems: break on an empty read as well as PTY EIO, and bound the drain.
+
+<!-- process-probe: pty -->
+```python
+import errno
+import os
+import pty
+import select
+import signal
+import sys
+import time
+
+command = sys.argv[1:] or [sys.executable, "-c", "print('probe complete')"]
+pid, fd = pty.fork()
+if pid == 0:
+    try:
+        os.execvp(command[0], command)
+    except OSError:
+        os._exit(127)
+
+reaped = False
+try:
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if not select.select([fd], [], [], 0.05)[0]:
+            continue
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError as exc:
+            if exc.errno == errno.EIO:
+                break
+            raise
+        if not chunk:
+            break
+        sys.stdout.buffer.write(chunk)
+        sys.stdout.buffer.flush()
+finally:
+    # This example supervises a single child; commands that launch descendants
+    # need ownership and cleanup of their process group as well.
+    os.close(fd)
+    reaped = bool(os.waitpid(pid, os.WNOHANG)[0])
+    if not reaped:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            if os.waitpid(pid, os.WNOHANG)[0]:
+                reaped = True
+                break
+            time.sleep(0.02)
+        if not reaped:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            os.waitpid(pid, 0)
+```
+
+For a short CPU load probe, use Bash explicitly (`bash load_probe.sh`). These
+workers stop themselves after two seconds even if the launcher is killed.
+Record `$!` immediately; shell job numbers such as `%1` are not stable process
+identities. Replace the foreground `sleep` with a bounded test command when
+needed, and adjust the worker deadline deliberately.
+
+<!-- process-probe: load -->
+```bash
+#!/usr/bin/env bash
+set -eu
+pids=()
+cleanup() {
+  for pid in "${pids[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
+  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+for i in 1 2; do
+  python3 -c 'import time; end=time.monotonic()+2
+while time.monotonic()<end: pass' </dev/null >/dev/null 2>&1 &
+  pids+=("$!")
+done
+printf 'workers: %s\n' "${pids[*]}"
+sleep 1
+```
+
+After normal completion or interruption, check the recorded PIDs and their
+parents with `ps`. Sleeping, parent PID 1, or high memory alone does not prove a
+process is unnecessary. A zombie cannot be fixed by signalling its already
+exited PID: its parent must reap it, or exit. These examples are preventive
+patterns, not automatic cleanup for unrelated sessions.
+
 ## Project Structure
 
 - `src/memtomem_stm/` — Core: MCP server, proxy pipeline, compression, surfacing, caching, observability
