@@ -336,6 +336,43 @@ def test_a_reap_inside_the_probe_still_spares_that_sweep(
     assert child_reaper.leaked_child_pids(set()) == {4242}
 
 
+def test_an_older_sweep_keeps_sparing_what_a_newer_sweep_settled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sweeps overlap: the teardown watchdog fires one from its own thread while
+    the lifespan teardown is still running another (``server.py``). The older
+    sweep enumerated the child while it was alive, so a newer sweep must not
+    forget the retirement out from under it — that would hand the older one a
+    pid that was reaped after it looked, and the signal would land on whatever
+    holds that number now."""
+    monkeypatch.setattr(child_reaper, "_detached_claims", {})
+    monkeypatch.setattr(child_reaper, "_active_probes", {})
+    serial = child_reaper.spawn_claimed(lambda: 4242)
+
+    older_probed = threading.Event()
+    resume_older = threading.Event()
+    answers: list[set[int] | None] = []
+
+    def _probe() -> set[int]:
+        if threading.current_thread() is older:
+            older_probed.set()
+            assert resume_older.wait(5.0)
+        return {4242}
+
+    monkeypatch.setattr(child_reaper, "probe_child_pids", _probe)
+    older = threading.Thread(target=lambda: answers.append(child_reaper.leaked_child_pids(set())))
+    older.start()
+    try:
+        assert older_probed.wait(5.0)  # enumerated, not yet reading the claims
+        child_reaper.release_claim(4242, serial)  # its waiter reaps it now
+        # A whole newer sweep runs to completion in that gap.
+        assert child_reaper.leaked_child_pids(set()) == {4242}
+    finally:
+        resume_older.set()
+        older.join(timeout=5.0)
+    assert answers == [set()]  # the older sweep still spares the pid it saw
+
+
 def test_a_late_waiter_cannot_retire_the_next_spawns_claim(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

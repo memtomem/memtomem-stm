@@ -17,33 +17,23 @@ from memtomem_stm.daemon import spawn
 from memtomem_stm.utils import child_reaper
 
 
-@pytest.fixture(autouse=True)
-def isolated_claims(monkeypatch):
-    """Claim the pids into a per-test table, and outlive no reaper.
-
-    ``_detached_claims`` is process-global and no timer expires it, so a test
-    that leaves a real (immediately recyclable) pid behind spares whatever
-    inherits that number — including a genuine leak in a later
-    ``real_child_sweep`` test, which would then pass vacuously on the sweep's
-    central contract.
-
-    Joining the reaper threads before the monkeypatch unwinds is the other half:
-    a reaper still waiting on a fake child would retire its claim against the
-    *restored* globals, at whatever point in a later test that lands.
-    """
-    monkeypatch.setattr(child_reaper, "_detached_claims", {})
-    yield
-    for thread in threading.enumerate():
-        if thread.name == "stm-daemon-reaper":
-            thread.join(timeout=5)
-            assert not thread.is_alive(), "a reaper thread outlived its test"
-
-
 def wait_until(predicate):
     deadline = time.monotonic() + 5
     while not predicate():
         assert time.monotonic() < deadline, "child was not reaped"
         time.sleep(0.01)
+
+
+def spares_a_new_sweep(pid):
+    """Whether a sweep enumerating *now* would still leave *pid* alone.
+
+    A retirement with no sweep in flight settles at once (the entry goes), and
+    a retirement recorded during one lingers until that sweep finishes — either
+    shape stops sparing a sweep that starts afterwards, which is the property
+    reaping has to buy.
+    """
+    claim = child_reaper._detached_claims.get(pid)
+    return claim is not None and claim.retired_at is None
 
 
 def exists(pid):
@@ -113,11 +103,10 @@ def test_exited_child_disappears_without_another_popen(monkeypatch, code):
             wait_until(lambda: not exists(child.pid) and child.returncode is not None)
             assert child.returncode == code
             # The claim is what spares this pid from a teardown sweep. Reaping
-            # frees the number, so the claim has to be retired, or it would
-            # spare whatever child inherits it (#906). Retirement happens after
-            # the wait returns, so poll for it rather than racing the reaper.
-            claim = child_reaper._detached_claims[child.pid]
-            wait_until(lambda: claim.retired_at is not None)
+            # frees the number, so the claim has to stop sparing it, or whatever
+            # child inherits it inherits the exemption too (#906). Retirement
+            # lands after the wait returns — poll, do not race the reaper.
+            wait_until(lambda: not spares_a_new_sweep(child.pid))
     finally:
         for child in children:
             with contextlib.suppress(ProcessLookupError):
@@ -147,8 +136,7 @@ def test_wait_runs_after_claim_outside_lock(monkeypatch):
     assert observed == [(True, True)]
     # Claimed for the whole life of the child, and retired by the one thing that
     # proves the pid stopped naming it: the wait that consumed its exit status.
-    claim = child_reaper._detached_claims[31337]
-    wait_until(lambda: claim.retired_at is not None)
+    wait_until(lambda: not spares_a_new_sweep(31337))
 
 
 @pytest.mark.parametrize("failure", ["thread", "popen"])

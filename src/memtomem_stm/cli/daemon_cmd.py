@@ -252,6 +252,7 @@ def start_cmd() -> None:
     deadline = time.time() + 10.0
     spawns = 0
     spawn_error: Exception | None = None
+    launched_any = False
     while time.time() < deadline:
         hs = asyncio.run(client.ping(config, timeout=1.0))
         if hs is not None:
@@ -277,16 +278,16 @@ def start_cmd() -> None:
                 spawn_error = exc
                 spawns += 1
             else:
-                if launched:
-                    # A child that got as far as exec can write the log the
-                    # message below points at, so an earlier failure to fork
-                    # stops being the thing to report.
-                    spawn_error = None
+                launched_any = launched_any or launched
                 spawns += int(launched)
         time.sleep(0.3)
+    # A child that got as far as exec can write the log, whichever attempt it
+    # was: report the fork failure only when *no* attempt ever launched one.
+    # Either mix reported the other way sends the operator somewhere the answer
+    # is not — to a log that was never written, or past the one that was.
     detail = (
         f"could not spawn it: {spawn_error}"
-        if spawn_error is not None
+        if spawn_error is not None and not launched_any
         else "check the daemon log under data_dir (stm-daemon.log)"
     )
     click.echo(_warn(f"daemon did not become ready in time — {detail}"), err=True)
