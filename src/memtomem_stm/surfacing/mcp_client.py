@@ -931,6 +931,11 @@ class McpClientSearchAdapter:
     def runtime_profile(self) -> dict[str, Any] | None:
         return self._runtime_profile
 
+    @property
+    def effective_result_format(self) -> str:
+        """The parser actually used by this adapter, including downgrades."""
+        return "structured" if isinstance(self._parser, StructuredResultParser) else "compact"
+
     # Bounded join for the owner task at ``stop()``. Generous: a healthy
     # owner only has to finish (or roll back) the current lifecycle op and
     # aclose the exit stack.

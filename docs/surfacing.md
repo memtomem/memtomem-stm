@@ -287,6 +287,10 @@ The snapshot must report Core reranking disabled before doctor recommends a
 pin. `surfacing.rerank=false` alone is insufficient: the adapter may withhold
 that argument if tool-schema negotiation fails, and the diagnostic snapshot
 does not confirm a negotiated bypass.
+Doctor also requires confirmed structured output. Direct probes check Core's
+advertised formats; daemon probes use the adapter's actual parser, including
+compact downgrades after negotiation failures. Older daemons without format
+metadata produce WARN without a numeric pin; restart after upgrading.
 
 ### Scoping surfacing per upstream
 

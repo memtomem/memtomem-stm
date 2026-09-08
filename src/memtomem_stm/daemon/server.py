@@ -467,7 +467,12 @@ class DaemonServer:
                 "ltm": self._ltm_warmth(),
                 "latency": self._latency.snapshot(),
                 "queue": self._queue_snapshot(),
-                "core": {"runtime_profile": getattr(self._adapter, "runtime_profile", None)},
+                "core": {
+                    "runtime_profile": getattr(self._adapter, "runtime_profile", None),
+                    "effective_result_format": getattr(
+                        self._adapter, "effective_result_format", None
+                    ),
+                },
             }
         if op == OP_SHUTDOWN:
             logger.info("daemon received shutdown request")

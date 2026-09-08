@@ -57,12 +57,16 @@ def _recommendation(low: float, high: float) -> float | None:
         first += 1
     while last / 10_000 > upper:
         last -= 1
+    while (last + 1) / 10_000 <= upper:
+        last += 1
     if first > last:
         return None
     return ((first + last + 1) // 2) / 10_000
 
 
-def rrf_boundary_doctor_checks(profile: Any, config: SurfacingConfig) -> list[DoctorCheck]:
+def rrf_boundary_doctor_checks(
+    profile: Any, config: SurfacingConfig, *, effective_format: str | None = None
+) -> list[DoctorCheck]:
     """Assess configured floors, preserving the existing WARN-only exit contract."""
     if not config.enabled:
         return []
@@ -100,10 +104,12 @@ def rrf_boundary_doctor_checks(profile: Any, config: SurfacingConfig) -> list[Do
         or search.get("enable_dense") is not True
     ):
         return unavailable("Two positive-weight, enabled retrieval legs are not reported")
-    if config.result_format != "structured":
+    if config.result_format != "structured" or effective_format != "structured":
         return unavailable(
-            "Compact scores cannot support this four-decimal boundary check",
-            "set MEMTOMEM_STM_SURFACING__RESULT_FORMAT=structured, then rerun mms doctor",
+            "Structured output is not confirmed; compact or unknown scores cannot support "
+            "this four-decimal boundary check",
+            "set MEMTOMEM_STM_SURFACING__RESULT_FORMAT=structured, restart the LTM/daemon, "
+            "then rerun mms doctor to confirm format negotiation",
         )
     rerank = profile.get("rerank")
     # A configured bypass is only sent after successful tool-schema negotiation.
