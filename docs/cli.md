@@ -649,7 +649,8 @@ whose best candidate remains below its active `min_score`, the proxy records a
 `score_ceiling_below_min` diagnostic — and one on every further such search, so
 the count reflects observations rather than episodes, like the fault counts
 above it. This can indicate a single-leg/BM25-only
-LTM (for example, missing embedding extras) or an intentionally high threshold.
+LTM (for example, missing embedding extras), two legs returning disjoint
+candidates, or an intentionally high threshold.
 The warning is advisory: inspect the LTM logs/search backend before lowering a
 pinned threshold. STM never changes `min_score` in response to this diagnostic.
 `--json` exposes the same signal under the additive `surfacing.diagnostics`,

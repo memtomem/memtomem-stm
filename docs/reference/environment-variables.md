@@ -3,7 +3,7 @@
 This is the authoritative inventory of memtomem-stm environment settings.
 Root settings use `MEMTOMEM_STM_<FIELD>`; nested settings use Pydantic's
 double-underscore convention, for example
-`MEMTOMEM_STM_SURFACING__MIN_SCORE=0.03`. Complex lists and mappings are JSON.
+`MEMTOMEM_STM_SURFACING__MIN_SCORE=0.017`. Complex lists and mappings are JSON.
 The table below lists one row per leaf setting. A whole nested block can also be
 supplied as one JSON object at its parent name — `MEMTOMEM_STM_PROXY__CACHE` for
 every `MEMTOMEM_STM_PROXY__CACHE__*` leaf — including optional blocks such as
@@ -148,7 +148,7 @@ Status meanings:
 | `MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS` | JSON string array | `[]` | LTM stdio arguments. | Startup |
 | `MEMTOMEM_STM_SURFACING__LTM_MCP_URL` | URL | empty | LTM SSE/HTTP endpoint. | Startup |
 | `MEMTOMEM_STM_SURFACING__LTM_MCP_HEADERS` | JSON object or `null` | — | LTM network headers; values may be secret. | Startup |
-| `MEMTOMEM_STM_SURFACING__MIN_SCORE` | float `0..1` | `0.03` | Global result-score floor when scale gating permits it. | Bundled |
+| `MEMTOMEM_STM_SURFACING__MIN_SCORE` | float `0..1` | `0.017` | Global result-score floor when scale gating permits it. On the baseline RRF scale this is the "found by both retrieval legs" boundary. | Bundled |
 | `MEMTOMEM_STM_SURFACING__MAX_RESULTS` | positive integer | `3` | Maximum injected retrieval results. | Bundled |
 | `MEMTOMEM_STM_SURFACING__MIN_QUERY_TOKENS` | positive integer | `3` | Minimum extracted query size. | Bundled |
 | `MEMTOMEM_STM_SURFACING__COOLDOWN_SECONDS` | non-negative float | `5.0` | Per-query cooldown. | Bundled |

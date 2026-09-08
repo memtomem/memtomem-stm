@@ -191,7 +191,7 @@ memories must still be treated as reference data rather than instructions.
 
 Each result line shows a relevance bucket (`[weak]`, `[related]`, or `[strong]`) instead of the raw search score. Buckets are computed across the active `[min_score, 1.0]` range, so changing `min_score` also shifts the bucket boundaries. The tag is suppressed for results the core stamped with a known non-RRF `score_scale` (`bm25` / `dense` / `none` / `rerank`) — the `[min_score, 1.0]` band math only holds on the RRF scale, and e.g. rerank logits can be negative. Suppression keys on each result's own stamp, so cache hits render the same way the original miss did; unstamped results and unrecognized labels keep the bucket. Exact raw-score distributions remain available through `stm_surfacing_stats`.
 
-Each bullet also carries its memory's id as a backticked token (e.g. `` `a1b2c3d4e5f6a7b8` ``). Pass it as a `memory_id` in the batched `stm_surfacing_feedback(ratings=[...])` call to rate individual memories — `not_relevant` / `already_known` then invalidate exactly those memories on the next cache hit. Under the default `result_format="structured"` this id is the real LTM `chunk_id`, carried end to end, so `helpful` boosts reach the underlying chunk. Under `result_format="compact"` (legacy fallback, auto-selected when the core doesn't advertise structured support) the id is a content-derived surrogate (`sha256(content)[:16]`): it drives STM-side cache invalidation but not the LTM `increment_access` boost, and two memories with identical content collide on one id. Compact also renders scores rounded to two decimals, which collapses the RRF score distribution to a single value above `min_score` — the reason structured is the default (#560).
+Each bullet also carries its memory's id as a backticked token (e.g. `` `a1b2c3d4e5f6a7b8` ``). Pass it as a `memory_id` in the batched `stm_surfacing_feedback(ratings=[...])` call to rate individual memories — `not_relevant` / `already_known` then invalidate exactly those memories on the next cache hit. Under the default `result_format="structured"` this id is the real LTM `chunk_id`, carried end to end, so `helpful` boosts reach the underlying chunk. Under `result_format="compact"` (legacy fallback, auto-selected when the core doesn't advertise structured support) the id is a content-derived surrogate (`sha256(content)[:16]`): it drives STM-side cache invalidation but not the LTM `increment_access` boost, and two memories with identical content collide on one id. Compact also renders scores rounded to two decimals, which collapses the RRF score distribution onto the two values above `min_score` (`0.02` and `0.03`) — the reason structured is the default (#560). It also erases the single-leg/two-leg distinction the default `min_score` is drawn on: a single-leg `0.0164` arrives as `0.02` and passes (#875).
 
 The injection mode is configurable: `append` (default), `prepend`, or `section`. `prepend` is skipped on the progressive-delivery path because it would shift character offsets and break `stm_proxy_read_more` — the skip is counted as `progressive_mode_conflict` in `stm_surfacing_stats`.
 
@@ -202,7 +202,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `enabled` | `true` | Global on/off switch |
 | `use_daemon` | `false` | Opt-in standalone route through the shared local daemon. Keeps feedback/cache/tuning local while sharing one LTM connection per matching config. Never falls back to a private child. |
 | `warmup_enabled` | `true` | Kick a background LTM warm-up right after server/daemon startup, pre-paying the ~9s cold start so the first surfacing call is warm **if** warm-up has finished by then (a call arriving mid-warm-up still times out, then the abandoned start finishes for the next one — see `timeout_seconds`) (#664). Runs in a host-owned task and never blocks the proxy's own MCP initialize handshake. Best-effort: on failure, the lazy start on first use is the retry. Disable when eagerly spawning an LTM child per proxy process is undesirable (e.g. many short-lived proxies). |
-| `min_score` | `0.03` | Minimum search score to include a result |
+| `min_score` | `0.017` | Minimum search score to include a result. On the baseline RRF scale (`rrf_k=60`, two equally weighted legs of ≤50 candidates) this is the "found by both legs" boundary: single-leg hits top out at `1/61 ≈ 0.0164`, the worst two-leg hit still scores `2/110 ≈ 0.0182`. Pin per tool when running off that baseline. |
 | `max_results` | `3` | Maximum memories surfaced per tool call (model-scaled) |
 | `max_injection_chars` | `3000` | Maximum total chars injected, truncated if exceeded (model-scaled) |
 | `min_response_chars` | `5000` | Skip surfacing when a tool response is shorter than this (logged as `response_too_short`). Measured on the cleaned upstream response *before* compression; an explicit agent query (`_context_query`) bypasses the gate. Precision/cost gate — distinct from the library-only extraction threshold described below. |
@@ -225,9 +225,9 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `result_content_max_chars` | `500` | Max chars retained per LTM result before the formatter sees it |
 | `preview_max_chars` | `300` | Max chars per result preview in the injected memory block |
 | `consumer_model` | `""` | Model name for auto-scaling `max_results` and `max_injection_chars` |
-| `result_format` | `structured` | Legacy `mem_search` output format. `structured` carries full-precision scores and real chunk ids; auto-downgrades to `compact` when the core doesn't advertise structured support. Schema 2+ compose uses its own structured contract. Pin `compact` only for cores that predate the structured search format (its 2-decimal score rendering collapses the score distribution, #560). |
-| `rerank` | `false` | Per-call rerank decision forwarded to the core's `mem_search`/`context_compose` (core #1766). `false` (default) skips the core's cross-encoder rerank stage for surfacing retrievals — that stage is ~99% of retrieval latency on a rerank-enabled core (compose p50 4.2s vs 42ms) and blows the surfacing budget on every call, while survival past the default `min_score` is measured identical either way. `true` forces the server-configured rerank; `none` omits the parameter (server config decides). Core 0.3.12+ advertises this parameter; on older cores the key is silently withheld, same pattern as the `result_format` downgrade. Bypassed scores come back on the RRF scale (`(0, ~0.033]`), the scale `min_score` and the auto-tuner were calibrated against. |
-| `scale_gated_min_score` | `true` | Suspend the RRF-calibrated `min_score` filter (and pause auto-tune learning) for batches whose core-reported `score_scale` is a known non-RRF label (`bm25` / `dense` / `none` / `rerank`, core #1781) — no fixed constant is meaningful on a foreign scale, so results pass through bounded by `max_results`. Per-tool `context_tools.<name>.min_score` pins always keep the filter active. Both structured `mem_search` (core #1781) and a compose schema-4 core (core #1796) report the scale, so the gate covers both retrieval paths. Batches with no reported scale (`compact` format, pre-#1781 cores, compose on a pre-#1796 core) or an unrecognized label keep unconditional filtering. Set `false` to restore unconditional filtering on every scale. |
+| `result_format` | `structured` | Legacy `mem_search` output format. `structured` carries four-decimal scores and real chunk ids; auto-downgrades to `compact` when the core doesn't advertise structured support. Schema 2+ compose uses its own structured contract. Pin `compact` only for cores that predate the structured search format (its 2-decimal score rendering collapses the score distribution, #560). |
+| `rerank` | `false` | Per-call rerank decision forwarded to the core's `mem_search`/`context_compose` (core #1766). `false` (default) skips the core's cross-encoder rerank stage for surfacing retrievals — that stage is ~99% of retrieval latency on a rerank-enabled core (compose p50 4.2s vs 42ms) and blows the surfacing budget on every call, while survival past the then-default `min_score` of `0.03` was measured identical either way (#727; the `0.017` default of #875 postdates that measurement and was not re-measured against it). `true` forces the server-configured rerank; `none` omits the parameter (server config decides). Core 0.3.12+ advertises this parameter; on older cores the key is silently withheld, same pattern as the `result_format` downgrade. Bypassed scores come back on the RRF scale (baseline `(0, ~0.033]`), the scale `min_score` and the auto-tuner operate on. |
+| `scale_gated_min_score` | `true` | Suspend the RRF-scale `min_score` filter (and pause auto-tune learning) for batches whose core-reported `score_scale` is a known non-RRF label (`bm25` / `dense` / `none` / `rerank`, core #1781) — no fixed constant is meaningful on a foreign scale, so results pass through bounded by `max_results`. Per-tool `context_tools.<name>.min_score` pins always keep the filter active. Both structured `mem_search` (core #1781) and a compose schema-4 core (core #1796) report the scale, so the gate covers both retrieval paths. Batches with no reported scale (`compact` format, pre-#1781 cores, compose on a pre-#1796 core) or an unrecognized label keep unconditional filtering. Set `false` to restore unconditional filtering on every scale. |
 | `feedback_db_path` | `~/.memtomem/stm_feedback.db` | SQLite store for events, feedback, and cross-session dedup |
 | `ltm_mcp_transport` | `stdio` | LTM MCP transport: `stdio`, `sse`, or `streamable_http` |
 | `ltm_mcp_command` | `memtomem-server` | Command used when `ltm_mcp_transport=stdio` |
@@ -600,7 +600,7 @@ Requires `auto_tune_min_samples` (default 20) feedback entries before adjusting.
 
 **Per-tool override wins:** if `context_tools.<name>.min_score` is set, auto-tune is skipped for that tool entirely — the tuner is not consulted and does not learn from its feedback (see [`min_score` precedence](#per-tool-templates)).
 
-**Scale-gated batches don't tune:** the tuner moves an RRF-calibrated threshold, so on a batch suspended by `scale_gated_min_score` (core-named non-RRF `score_scale`) `maybe_adjust` is skipped, and the rating ratios above are computed only from feedback earned on RRF-stamped or unstamped surfacings — ratings earned under pass-all filtering measure a different policy on a different scale and are excluded from the tuner's evidence.
+**Scale-gated batches don't tune:** the tuner moves a threshold drawn on the RRF scale, so on a batch suspended by `scale_gated_min_score` (core-named non-RRF `score_scale`) `maybe_adjust` is skipped, and the rating ratios above are computed only from feedback earned on RRF-stamped or unstamped surfacings — ratings earned under pass-all filtering measure a different policy on a different scale and are excluded from the tuner's evidence.
 
 **Search boost from feedback**: when you rate memories as "helpful", their `access_count` is incremented in the core search index (once per surfacing event, capped at `max_boost=1.5`). This creates a positive feedback loop where useful memories rank higher in future searches.
 
@@ -715,11 +715,14 @@ hit:
   upstream tool remain below the active floor, STM logs a one-shot
   score-scale warning and, from that search on, records a
   `score_ceiling_below_min` diagnostic for `mms stats` on every such
-  search — the counter tracks observations, the warning stays one-shot. Check the LTM embedding/search backend first: a
-  single-leg/BM25-only search has a lower score ceiling than the default
-  hybrid scale. If the backend is healthy and the stricter policy is
-  intentional, set `context_tools.<name>.min_score` explicitly. The
-  diagnostic never lowers the threshold automatically.
+  search — the counter tracks observations, the warning stays one-shot. Check
+  the LTM embedding/search backend first: on the baseline RRF scale the default
+  `min_score` admits any memory both retrieval legs found, so a persistent
+  ceiling below it means one leg is not contributing (for example, missing
+  embedding extras) or the two legs are returning disjoint candidates. If the
+  backend is healthy and the stricter policy is intentional, set
+  `context_tools.<name>.min_score` explicitly. The diagnostic never lowers the
+  threshold automatically.
 
   Core 0.3.12+ names the scale its scores are on (`score_scale`:
   `rrf` / `bm25` / `dense` / `none` / `rerank`, core #1781) in structured
@@ -736,7 +739,7 @@ hit:
   non-RRF scale: a per-tool `context_tools.<name>.min_score` pin is
   present, or `scale_gated_min_score=false` — then STM warns on the
   **first** below-threshold observation (no five-call streak, the
-  threshold is calibrated against RRF) and records a
+  threshold is drawn on the RRF scale) and records a
   `score_scale_mismatch` diagnostic on every such observation. `stm_surfacing_stats` shows the last
   core-reported scale as a `Score scale:` line (annotated when the filter
   is suspended), the reranker model ID when one is active, and each event

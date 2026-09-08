@@ -58,7 +58,39 @@ class SurfacingConfig(BaseModel):
     """Network endpoint for ``sse`` / ``streamable_http`` LTM transports."""
     ltm_mcp_headers: dict[str, str] | None = None
     """Optional static headers for network LTM transports."""
-    min_score: float = Field(default=0.03, ge=0.0, le=1.0)
+    min_score: float = Field(default=0.017, ge=0.0, le=1.0)
+    """Global result-score floor, applied unless a per-tool pin or the scale
+    gate overrides it (see ``scale_gated_min_score``).
+
+    On the RRF scale an absolute floor is a *rank-agreement* dial, because a
+    fused score is ``sum(w / (k + rank))`` over the contributing legs. Under
+    the core's baseline fusion — two unmodified, equally weighted lists of at
+    most ``C`` candidates each, ``k=60``, ``C=50`` — the only scale-intrinsic
+    boundary is "the memory placed in **both** legs": a single-leg hit tops
+    out at ``1/(k+1) = 0.0164`` and the worst two-leg hit still scores
+    ``2/(k+C) = 0.0182``. The default sits inside ``(0.01639, 0.01818]``, so
+    a result that both retrievers found survives no matter how deep either
+    ranked it, and a result only one retriever found does not.
+
+    This is a *default preference for agreement under the baseline*, not a
+    universal RRF invariant. A different ``rrf_k``, non-equal ``rrf_weights``,
+    different candidate limits, a rescue leg, or the core's time-decay /
+    access-boost stages all move the boundary while keeping the ``rrf``
+    label — pin ``context_tools.<tool>.min_score`` when running off the
+    baseline. Two healthy retrievers can also return disjoint candidates, so
+    a below-floor ceiling is not by itself proof that a leg is broken.
+
+    The agreement reading needs the four-decimal scores ``structured``
+    carries. Under the ``compact`` fallback (see ``result_format``) the core
+    renders scores to two decimals, so a single-leg ``0.0164`` arrives as
+    ``0.02`` and passes this floor; no threshold can separate values that
+    rounding has merged.
+
+    The previous default (``0.03``, #329) came from a synthetic fixture sweep
+    whose seeds ran up to ``0.065`` — above what baseline RRF can produce at
+    all — so it was never an RRF calibration. On the baseline it demanded
+    ``1/(60+r1) + 1/(60+r2) >= 0.03``, i.e. agreement *and* a shallow rank in
+    at least one leg (#875)."""
     max_results: int = Field(default=3, gt=0)
     min_query_tokens: int = Field(default=3, gt=0)
     cooldown_seconds: float = Field(default=5.0, ge=0.0)
@@ -160,13 +192,16 @@ class SurfacingConfig(BaseModel):
     legacy core text format (``[rank] score | source``).
 
     Score fidelity (#560): the compact format renders scores rounded to
-    two decimals, and RRF fusion scores live in ``(0, ~0.033]`` — so
-    under ``compact`` every score that survives the default ``min_score``
-    filter (0.03) parses back as exactly ``0.03``. The degenerate
-    distribution blinds ``min_score`` calibration and the auto-tuner
-    (both were benchmarked against full-precision scores, #329) and is
-    why ``structured`` is the default. Only pin ``compact`` for cores
-    that predate the structured format.
+    two decimals, and baseline RRF fusion scores live in ``(0, ~0.033]`` —
+    so under ``compact`` the whole surviving distribution collapses onto
+    the two representable values ``0.02`` and ``0.03``. That degenerate
+    distribution blinds ``min_score`` and the auto-tuner, which need the
+    four decimals ``structured`` carries (the core rounds there too, but
+    four places keep the baseline single-leg/two-leg values apart at this
+    default), and is why ``structured`` is the default. It also erases the single-leg/two-leg
+    distinction the default ``min_score`` is drawn on (#875): ``1/61``
+    renders as ``0.02`` and passes a ``0.017`` floor. Only pin ``compact``
+    for cores that predate the structured format.
 
     Per-memory feedback fidelity (EN-2/3): the formatter renders each
     memory's ``chunk.id`` so the agent can rate memories individually via
@@ -189,11 +224,13 @@ class SurfacingConfig(BaseModel):
     Surfacing is latency-bounded by design — the rerank stage is ~99% of
     retrieval latency on a rerank-enabled core (compose p50 4,247ms vs
     42ms bypassed) and blows the daemon/engine budget on every call, while
-    survival past the default ``min_score`` (0.03) is measured identical
-    with rerank on or off. Bypassing trades ranking precision within the
+    survival past the then-default ``min_score`` of 0.03 was measured
+    identical with rerank on or off (#727; the 0.017 default of #875
+    postdates that measurement and was not re-measured against it).
+    Under that measurement bypassing traded ranking precision within the
     result set, not result existence. Note the bypassed scores come back
-    on the RRF scale (``(0, ~0.033]``), the scale ``min_score`` and the
-    auto-tuner were calibrated against.
+    on the RRF scale (baseline ``(0, ~0.033]``), the scale ``min_score``
+    and the auto-tuner operate on.
 
     Old-core safety: the parameter is only ever sent when the connected
     core advertises ``rerank`` in its ``mem_search`` tool schema
@@ -202,9 +239,9 @@ class SurfacingConfig(BaseModel):
     behavior instead of tripping the server's argument validation. Env:
     ``MEMTOMEM_STM_SURFACING__RERANK`` (``true`` / ``false`` / ``none``)."""
     scale_gated_min_score: bool = True
-    """Suspend the RRF-calibrated score filter when the core names a
-    foreign scale. ``min_score`` and the auto-tuner are calibrated against
-    RRF fusion scores (``(0, ~0.033]``); when a batch's core-reported
+    """Suspend the RRF-scale score filter when the core names a
+    foreign scale. ``min_score`` and the auto-tuner are drawn on RRF
+    fusion scores (baseline ``(0, ~0.033]``); when a batch's core-reported
     ``score_scale`` (#1781) is a known non-RRF label (``bm25`` / ``dense``
     / ``none`` / ``rerank`` — e.g. raw cross-encoder logits spanning
     negative values), no fixed constant is meaningful, so the
@@ -238,7 +275,7 @@ class SurfacingConfig(BaseModel):
         than the band it moves within.
 
         The default ceiling/floor (0.05 / 0.005) bracket the default
-        min_score (0.03). When an operator raises or lowers min_score
+        min_score. When an operator raises or lowers min_score
         without touching the bounds, the unset bound widens to include it so
         a previously-valid config never fails. Explicitly setting a bound on
         the wrong side of min_score is a real misconfiguration and is

@@ -205,6 +205,45 @@ class TestSurfacingLtmTransportConfig:
         assert cfg.ltm_mcp_headers == {"Authorization": "Bearer token"}
 
 
+class TestSurfacingMinScoreDefault:
+    """#875 — the default ``min_score`` is drawn on the baseline RRF scale.
+
+    Core fuses with ``sum(w / (k + rank))`` (``search/fusion.py``) over two
+    equally weighted legs of at most ``C`` candidates, ``k=60``, ``C=50``.
+    The default must sit strictly above the best single-leg score and at or
+    below the worst two-leg score, so "found by both legs" is the boundary
+    it encodes.
+    """
+
+    RRF_K = 60
+    CANDIDATES = 50
+
+    def test_default_sits_on_the_rrf_two_leg_boundary(self) -> None:
+        best_single_leg = 1 / (self.RRF_K + 1)
+        worst_two_leg = 2 / (self.RRF_K + self.CANDIDATES)
+        default = SurfacingConfig().min_score
+
+        assert best_single_leg < default <= worst_two_leg, (
+            f"min_score={default} must lie in ({best_single_leg}, {worst_two_leg}] "
+            "so a memory both retrieval legs found survives at any rank and a "
+            "single-leg hit does not"
+        )
+
+    def test_default_admits_the_deepest_two_leg_agreement(self) -> None:
+        """The worst case a two-leg agreement can produce still passes."""
+        deepest_agreement = 1 / (self.RRF_K + self.CANDIDATES) * 2
+        assert deepest_agreement >= SurfacingConfig().min_score
+
+    def test_default_rejects_the_best_single_leg_hit(self) -> None:
+        """Rank 1 in one leg and absent from the other does not pass."""
+        best_single_leg = 1 / (self.RRF_K + 1)
+        assert best_single_leg < SurfacingConfig().min_score
+
+    def test_auto_tune_bounds_still_bracket_the_default(self) -> None:
+        cfg = SurfacingConfig()
+        assert cfg.auto_tune_score_floor <= cfg.min_score <= cfg.auto_tune_score_ceiling
+
+
 class TestSurfacingWarmupConfig:
     """#664 PR 2: background LTM warm-up defaults on and is env-toggleable
     (surfacing config is env-only — there is no surfacing JSON section)."""

@@ -48,10 +48,12 @@ confirm the client registered `mms` and restarted or refreshed its MCP list.
 
 Check the surfacing section of `mms stats`. Five consecutive non-empty searches
 whose candidates remain below `min_score` produce a
-`score_ceiling_below_min` diagnostic. This commonly indicates a BM25-only LTM
-score scale or an intentionally high threshold. STM never lowers `min_score`
-because of this diagnostic; pin a per-tool threshold only after inspecting the
-score distribution.
+`score_ceiling_below_min` diagnostic. On the baseline RRF scale the default
+`min_score` admits anything both retrieval legs found, so a persistent ceiling
+below it points at one leg not contributing (a BM25-only LTM, for example), two
+legs returning disjoint candidates, or an intentionally high threshold. STM
+never lowers `min_score` because of this diagnostic; pin a per-tool threshold
+only after inspecting the score distribution.
 
 When `MEMTOMEM_STM_SURFACING__USE_DAEMON=true`, also run `mms daemon status`.
 `warming` means the shared child/model is still starting; `warm` is ready.

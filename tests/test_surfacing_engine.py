@@ -4008,6 +4008,66 @@ class TestPerToolMinScoreOverride:
             tracker.close()
 
 
+class TestDefaultMinScoreOnRrfScale:
+    """#875 — the default floor admits two-leg agreement, rejects single-leg.
+
+    Drives the real ``surface()`` path with RRF-shaped scores rather than
+    inspecting the constant, so the filter at the end of the pipeline is what
+    gets pinned. ``_make_config`` overrides ``min_score`` for every other test
+    in this module, so these build the config from the production default.
+    """
+
+    RRF_K = 60
+    CANDIDATES = 50
+
+    @classmethod
+    def _default_config(cls, **overrides):
+        cfg = _make_config(**overrides)
+        return cfg.model_copy(update={"min_score": SurfacingConfig().min_score})
+
+    @classmethod
+    def _engine(cls, score: float, *, min_score: float | None = None):
+        result = FakeSearchResult(
+            chunk=FakeChunk(content="rrf shaped candidate"),
+            score=score,
+            score_scale="rrf",
+        )
+        config = cls._default_config() if min_score is None else _make_config(min_score=min_score)
+        return SurfacingEngine(
+            config=config,
+            mcp_adapter=_make_mcp_adapter([result]),
+        )
+
+    async def test_worst_two_leg_agreement_surfaces(self):
+        """Last place in both legs: 2/(k+C) still clears the default floor."""
+        engine = self._engine(2 / (self.RRF_K + self.CANDIDATES))
+        out = await engine.surface(
+            "gh", "read_file", {"_context_query": "two leg agreement query"}, LONG_RESPONSE
+        )
+        assert "rrf shaped candidate" in out
+
+    async def test_best_single_leg_hit_is_filtered(self):
+        """Rank 1 in one leg only: 1/(k+1) stays below the default floor.
+
+        Same query as the surfacing case above, so the only difference
+        between the two outcomes is the score.
+        """
+        engine = self._engine(1 / (self.RRF_K + 1))
+        out = await engine.surface(
+            "gh", "read_file", {"_context_query": "two leg agreement query"}, LONG_RESPONSE
+        )
+        assert out == LONG_RESPONSE
+
+    async def test_positive_control_old_default_filtered_the_agreement(self):
+        """The same two-leg batch under the pre-#875 default surfaced nothing,
+        so the test above is pinning the new default and not the pipeline."""
+        engine = self._engine(2 / (self.RRF_K + self.CANDIDATES), min_score=0.03)
+        out = await engine.surface(
+            "gh", "read_file", {"_context_query": "two leg agreement query"}, LONG_RESPONSE
+        )
+        assert out == LONG_RESPONSE
+
+
 class TestScoreScaleDiagnostic:
     @staticmethod
     def _engine(*, score: float = 0.016, tracker=None, min_score: float = 0.03):
