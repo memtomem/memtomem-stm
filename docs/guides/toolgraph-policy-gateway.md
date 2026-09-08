@@ -117,6 +117,18 @@ visibility change appears after restart. A malformed or missing strict bundle
 causes startup to fail closed. Review keeps the last known good snapshot and
 surfaces degraded status instead.
 
+Under a **stdio** gateway (`toolgraph.source: "stdio"`) the consult runs once,
+at startup, and the verdict map is held for the session. The snapshot also
+records which candidates it covered, so a tool an upstream adds *after* that
+consult was never put to the graph and is treated as unjudged rather than
+approved: it takes the `toolgraph_unconsulted` reason, which rides the profile
+ladder like any other — `strict` withholds it, `review` demotes it, `explore`
+ignores it. Under `strict` this means a genuinely new upstream tool cannot be
+advertised until STM restarts, **even when the graph would have granted it**.
+Restart STM/the MCP client to pick it up. Bundle mode has no equivalent state:
+its decisions are rebound against the live catalogue on every refresh, so a new
+tool becomes `toolgraph_unmapped` or `toolgraph_drifted` instead.
+
 ## Trust and troubleshooting
 
 - `bundle_digest` is the SHA-256 of the exact artifact bytes for identity and
