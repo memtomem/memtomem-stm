@@ -951,7 +951,7 @@ class SurfacingEngine:
 
         Two evidence tiers share this tripwire (#1781): when the core NAMES a
         non-RRF scale on the results, a below-threshold ceiling is a definitive
-        calibration mismatch — ``min_score`` is calibrated against RRF — and
+        calibration mismatch — ``min_score`` is drawn on the RRF scale — and
         the ``score_scale_mismatch`` diagnostic fires on first observation.
         Both the structured ``mem_search`` path and a compose schema-4 core
         (#1796) report the scale, so the definitive tier now covers the
@@ -1004,7 +1004,7 @@ class SurfacingEngine:
 
         if scale is not None and scale in KNOWN_SCORE_SCALES and scale != "rrf":
             # Definitive tier: no streak needed — the core itself says the
-            # scores are not on the scale min_score was calibrated against.
+            # scores are not on the scale min_score is drawn on.
             # Unrecognized labels stay on the heuristic tier: a renamed core
             # label must not fire a diagnostic whose wording it may not match.
             if key not in self._score_scale_mismatch_active:
@@ -1024,7 +1024,7 @@ class SurfacingEngine:
                 if pin_cfg is not None and pin_cfg.min_score is not None:
                     scale_fix = (
                         f"the context_tools.{tool}.min_score pin keeps the "
-                        "RRF-calibrated filter active on this scale; adjust "
+                        "RRF-scale filter active on this scale; adjust "
                         "or remove the pin"
                     )
                 else:
@@ -1042,7 +1042,7 @@ class SurfacingEngine:
                     remedy = scale_fix
                 logger.warning(
                     "Surfacing score-scale mismatch for %s/%s: core reports "
-                    "score_scale=%r%s but min_score=%.4f is calibrated for the "
+                    "score_scale=%r%s but min_score=%.4f is drawn on the "
                     "RRF scale (observed ceiling=%.4f). Every result is being "
                     "filtered out; %s. STM did not change the threshold.",
                     server,
@@ -1086,13 +1086,20 @@ class SurfacingEngine:
         # write reopens an episode one of them may have closed (#944).
         if previous is None or previous.count < _SCORE_SCALE_WARNING_STREAK:
             if scale == "rrf":
-                # Core confirmed the scale, so the wide "may be running
-                # single-leg/BM25-only" hedge collapses to the two causes
-                # that survive on a confirmed RRF scale.
+                # Core confirmed the scale, which narrows the causes but does
+                # not pin one: the label survives Core's post-fusion score
+                # modifiers (time decay, access boost) and non-baseline fusion
+                # settings, either of which can push a genuine two-leg
+                # agreement under the floor. So this stays a list of
+                # possibilities, not an inference (#875).
                 cause = (
-                    "Core confirms score_scale=rrf, so the fusion is running "
-                    "single-leg (one retriever contributing) or min_score is "
-                    "intentionally high; check embedding extras and LTM logs"
+                    "Core confirms score_scale=rrf; possible causes include "
+                    "the fusion running single-leg (one retriever "
+                    "contributing), the legs returning disjoint candidates, "
+                    "Core's post-fusion score modifiers or non-baseline "
+                    "fusion settings lowering the fused scores, or min_score "
+                    "being intentionally high; check embedding extras, the "
+                    "Core search settings and the LTM logs"
                 )
             else:
                 cause = (
@@ -2265,7 +2272,7 @@ class SurfacingEngine:
         # min_score precedence: tool_cfg override > scale gate > auto-tune >
         # global default — resolved AFTER retrieval so the gate can see the
         # batch's core-reported scale (nothing upstream consumes min_score).
-        # maybe_adjust is skipped on a suspended batch so the RRF-calibrated
+        # maybe_adjust is skipped on a suspended batch so the RRF-scale
         # tuner doesn't move on evidence from a foreign scale; on a pinned
         # tool ``_active_min_score`` returns the pin before the tuner runs,
         # so the pre-existing "pinned tools don't learn" behavior holds.
@@ -2308,7 +2315,7 @@ class SurfacingEngine:
         # memories cross the threshold mid-TTL (e.g. via another process).
         pinned_results = [r for r in results if getattr(r, "pinned", False)]
         if filter_suspended:
-            # Core-named non-RRF scale: the RRF-calibrated floor does not
+            # Core-named non-RRF scale: the RRF-scale floor does not
             # apply. Keep the finite guard the ``>=`` comparison used to
             # provide — a NaN score must not be injected or persisted into
             # ``surfacing_events.scores``. Volume stays bounded by the
@@ -2318,8 +2325,8 @@ class SurfacingEngine:
                 self._scale_gate_logged = True
                 logger.info(
                     "Surfacing min_score filter suspended for %s/%s: core "
-                    "reports score_scale=%r and min_score=%.4f is calibrated "
-                    "for the RRF scale. Results stay bounded by max_results; "
+                    "reports score_scale=%r and min_score=%.4f is drawn on "
+                    "the RRF scale. Results stay bounded by max_results; "
                     "per-tool context_tools.<tool>.min_score pins still "
                     "apply; set surfacing.scale_gated_min_score=false to "
                     "restore unconditional filtering.",

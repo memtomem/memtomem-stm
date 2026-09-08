@@ -2146,7 +2146,8 @@ def _render_surfacing_block(summary: dict[str, Any]) -> None:
             "  "
             + _warn(
                 "LTM candidates repeatedly stayed below active min_score — "
-                "the LTM may be single-leg/BM25-only or min_score may be "
+                "the LTM may be single-leg/BM25-only, the legs may be "
+                "returning disjoint candidates, or min_score may be "
                 "intentionally high; check embedding extras and LTM logs. "
                 "STM did not lower the threshold"
             )
@@ -9461,7 +9462,7 @@ def doctor(
                             "core reports a non-RRF score scale while min_score assumes RRF "
                             "(unrecovered score_scale_mismatch episode in the last 7 UTC days)",
                             "set surfacing.scale_gated_min_score=true (default) to suspend the "
-                            "RRF-calibrated filter on core-named non-RRF scales, or adjust/"
+                            "RRF-scale filter on core-named non-RRF scales, or adjust/"
                             "remove the context_tools.<tool>.min_score pin keeping it active; "
                             "if the scale is 'rerank', also check surfacing.rerank (default "
                             "false returns RRF scores)",
@@ -9472,7 +9473,11 @@ def doctor(
                             "ltm score scale",
                             "FAIL",
                             "unrecovered score_ceiling_below_min episode in the last 7 UTC days",
-                            "verify dense embeddings and min_score, then run a successful warm search",
+                            "possible causes: one retrieval leg not contributing (check "
+                            "the dense embedding extras), the legs returning disjoint "
+                            "candidates, Core's post-fusion score modifiers or non-baseline "
+                            "fusion settings, or min_score pinned above the scale; then run "
+                            "a successful warm search",
                         )
                     elif not supported:
                         check(
