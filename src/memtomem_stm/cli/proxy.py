@@ -8166,6 +8166,7 @@ def _surfacing_bootstrap_status(
     reads the same file as the command's own proxy checks (#839).
     """
     try:
+        from memtomem_stm.cli.rrf_diagnostics import rrf_boundary_doctor_checks
         from memtomem_stm.config import stm_config_for_cli
         from memtomem_stm.surfacing.feedback_store import (
             inspect_feedback_db,
@@ -8175,16 +8176,27 @@ def _surfacing_bootstrap_status(
         config = stm_config_for_cli(config_path)
         surfacing = config.surfacing
         db_status = inspect_feedback_db(surfacing.feedback_db_path)
+        ltm_status = _ltm_status(
+            config,
+            timeout,
+            measure_ltm=measure_ltm,
+            prefer_hook_daemon=prefer_hook_daemon,
+        )
         return {
             "enabled": surfacing.enabled,
             "feedback_enabled": surfacing.feedback_enabled,
             "feedback_db": db_status,
             "feedback_summary": read_surfacing_summary(surfacing.feedback_db_path),
-            "ltm_server": _ltm_status(
-                config,
-                timeout,
-                measure_ltm=measure_ltm,
-                prefer_hook_daemon=prefer_hook_daemon,
+            "ltm_server": ltm_status,
+            "rrf_boundary_checks": (
+                [
+                    dict(zip(("id", "label", "status", "detail", "next_action"), row, strict=True))
+                    for row in rrf_boundary_doctor_checks(
+                        ltm_status.get("runtime_profile"), surfacing
+                    )
+                ]
+                if ltm_status.get("connected")
+                else []
             ),
             "timeouts": {
                 "surfacing_seconds": float(surfacing.timeout_seconds),
@@ -9449,6 +9461,15 @@ def doctor(
                 check("ltm", "ltm server", "PASS", f"connectable ({detail})")
                 for runtime_check in _runtime_profile_doctor_checks(ltm.get("runtime_profile")):
                     check(*runtime_check)
+
+                for rrf_check in surfacing_status.get("rrf_boundary_checks", []):
+                    check(
+                        rrf_check["id"],
+                        rrf_check["label"],
+                        rrf_check["status"],
+                        rrf_check["detail"],
+                        rrf_check["next_action"],
+                    )
 
                 feedback_summary = surfacing_status.get("feedback_summary")
                 if isinstance(feedback_summary, dict):

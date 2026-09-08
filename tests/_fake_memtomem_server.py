@@ -63,6 +63,7 @@ _RERANKER_ID: str | None = None
 # score-scale keys are added to the bundle envelope only at schema 4 (core
 # #1796), mirroring the additive envelope contract.
 _COMPOSE_SCHEMA: int | None = None
+_RUNTIME_PROFILE: dict | None = None
 
 _SEARCH_DELAY: float = 0.0
 """Seconds each ``mem_search`` takes, standing in for a real core's latency.
@@ -325,12 +326,17 @@ async def mem_do(action: str, params: dict | None = None) -> str:
         capabilities: dict = {"search_formats": ["compact", "structured"]}
         if _COMPOSE_SCHEMA is not None:
             capabilities["context_compose"] = {"schema_version": _COMPOSE_SCHEMA}
-        return json.dumps({"version": "0.3.0-fake", "capabilities": capabilities})
+        payload = {"version": "0.3.0-fake", "capabilities": capabilities}
+        if _RUNTIME_PROFILE is not None:
+            capabilities["runtime_profile"] = {"schema_version": 1}
+            payload["runtime_profile"] = _RUNTIME_PROFILE
+        return json.dumps(payload)
     return f"Error: unknown action '{action}'."
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fake memtomem MCP server.")
+    parser.add_argument("--runtime-profile", help="Optional runtime-profile JSON fixture")
     parser.add_argument(
         "--seeds",
         metavar="PATH",
@@ -404,6 +410,9 @@ if __name__ == "__main__":
     _SCORE_SCALE = args.score_scale
     _RERANKER_ID = args.reranker_id
     _COMPOSE_SCHEMA = args.compose_schema
+    if args.runtime_profile:
+        with open(args.runtime_profile, encoding="utf-8") as profile_file:
+            _RUNTIME_PROFILE = json.load(profile_file)
     _SEARCH_DELAY = args.search_delay
     _SEARCH_DELAY_BLOCKS = args.search_delay_blocking
     if args.rerank_capable:
