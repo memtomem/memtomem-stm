@@ -15,8 +15,9 @@ changes inline only. See the deprecation policy in
 
 - **Default `surfacing.min_score` `0.03` → `0.017`, drawn on the RRF scale**
   (#875). **Behavior change**: surfacing injects memories it previously
-  filtered out. On Core's baseline fusion — `rrf_k=60`, two equally weighted
-  legs of at most 50 candidates, `score = sum(w / (k + rank))` — the new
+  filtered out. On Core's baseline fusion — `rrf_k=60`, `rrf_weights=[1.0,
+  1.0]`, two legs of at most 50 candidates, `score = sum(w / (k + rank))`
+  added without normalization — the new
   default is the "found by both retrieval legs" boundary: a single-leg hit
   tops out at `1/61 ≈ 0.0164`, while the deepest possible two-leg agreement
   still scores `2/110 ≈ 0.0182`. The old `0.03` additionally demanded a
@@ -24,18 +25,21 @@ changes inline only. See the deprecation policy in
   is why a correctly configured hybrid Core kept recording
   `score_ceiling_below_min` diagnostics.
 
-  The previous value came from the #329 fixture sweep, whose seeds ran to
-  `0.065` — above anything baseline RRF can produce — so it was never an RRF
-  calibration despite the docstrings saying so. Those claims are corrected.
+  The previous value came from the #329 fixture sweep, run over a synthetic
+  distribution containing scores above the baseline RRF maximum (seeds up to
+  `0.065`, against a maximum of `0.0328`), so it was never an RRF calibration
+  despite the docstrings saying so. Those claims are corrected.
 
   Scope: this is a default *preference for agreement under the baseline*, not
-  a universal RRF invariant. A different `rrf_k`, non-equal `rrf_weights`,
+  a universal RRF invariant. A different `rrf_k`, `rrf_weights` other than
+  `[1.0, 1.0]` (`[0.5, 0.5]` is equally weighted too and halves every score),
   different candidate limits, a rescue leg, or Core's decay/boost stages move
   the boundary while keeping the `rrf` label — pin
   `context_tools.<tool>.min_score` when running off the baseline. Two healthy
   legs can also return disjoint candidates, so a below-floor ceiling is not
   by itself proof that a leg is broken; the `score_ceiling_below_min` guidance
-  in `mms stats`, `mms doctor` and the docs now says so. Under the `compact`
+  in the engine warning, `mms stats`, `mms doctor`, `docs/surfacing.md` and the
+  operations guide now lists possible causes instead of naming one. Under the `compact`
   result format the agreement reading does not hold at all: Core renders
   scores to two decimals, so a single-leg `0.0164` arrives as `0.02` and
   passes the floor. `structured` remains the default for that reason.

@@ -63,9 +63,11 @@ class SurfacingConfig(BaseModel):
     gate overrides it (see ``scale_gated_min_score``).
 
     On the RRF scale an absolute floor is a *rank-agreement* dial, because a
-    fused score is ``sum(w / (k + rank))`` over the contributing legs. Under
-    the core's baseline fusion — two unmodified, equally weighted lists of at
-    most ``C`` candidates each, ``k=60``, ``C=50`` — the only scale-intrinsic
+    fused score is ``sum(w / (k + rank))`` over the contributing legs — the
+    core adds the weighted terms without normalizing, so the weights scale
+    the result directly. Under the core's baseline fusion — two unmodified
+    lists of at most ``C`` candidates each at unit weight,
+    ``rrf_weights=[1.0, 1.0]``, ``k=60``, ``C=50`` — the only scale-intrinsic
     boundary is "the memory placed in **both** legs": a single-leg hit tops
     out at ``1/(k+1) = 0.0164`` and the worst two-leg hit still scores
     ``2/(k+C) = 0.0182``. The default sits inside ``(0.01639, 0.01818]``, so
@@ -73,12 +75,14 @@ class SurfacingConfig(BaseModel):
     ranked it, and a result only one retriever found does not.
 
     This is a *default preference for agreement under the baseline*, not a
-    universal RRF invariant. A different ``rrf_k``, non-equal ``rrf_weights``,
-    different candidate limits, a rescue leg, or the core's time-decay /
-    access-boost stages all move the boundary while keeping the ``rrf``
-    label — pin ``context_tools.<tool>.min_score`` when running off the
-    baseline. Two healthy retrievers can also return disjoint candidates, so
-    a below-floor ceiling is not by itself proof that a leg is broken.
+    universal RRF invariant. A different ``rrf_k``, ``rrf_weights`` other
+    than ``[1.0, 1.0]`` (``[0.5, 0.5]`` is equally weighted too and halves
+    every score, putting the two-leg maximum at ``1/61``), different
+    candidate limits, a rescue leg, or the core's time-decay / access-boost
+    stages all move the boundary while keeping the ``rrf`` label — pin
+    ``context_tools.<tool>.min_score`` when running off the baseline. Two
+    healthy retrievers can also return disjoint candidates, so a below-floor
+    ceiling is not by itself proof that a leg is broken.
 
     The agreement reading needs the four-decimal scores ``structured``
     carries. Under the ``compact`` fallback (see ``result_format``) the core
@@ -86,9 +90,10 @@ class SurfacingConfig(BaseModel):
     ``0.02`` and passes this floor; no threshold can separate values that
     rounding has merged.
 
-    The previous default (``0.03``, #329) came from a synthetic fixture sweep
-    whose seeds ran up to ``0.065`` — above what baseline RRF can produce at
-    all — so it was never an RRF calibration. On the baseline it demanded
+    The previous default (``0.03``, #329) came from a sweep over a synthetic
+    distribution containing scores above the baseline RRF maximum (seeds up
+    to ``0.065``, against a maximum of ``0.0328``), so it was never an RRF
+    calibration. On the baseline it demanded
     ``1/(60+r1) + 1/(60+r2) >= 0.03``, i.e. agreement *and* a shallow rank in
     at least one leg (#875)."""
     max_results: int = Field(default=3, gt=0)

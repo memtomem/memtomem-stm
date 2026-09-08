@@ -49,9 +49,10 @@ confirm the client registered `mms` and restarted or refreshed its MCP list.
 Check the surfacing section of `mms stats`. Five consecutive non-empty searches
 whose candidates remain below `min_score` produce a
 `score_ceiling_below_min` diagnostic. On the baseline RRF scale the default
-`min_score` admits anything both retrieval legs found, so a persistent ceiling
-below it points at one leg not contributing (a BM25-only LTM, for example), two
-legs returning disjoint candidates, or an intentionally high threshold. STM
+`min_score` admits anything both retrieval legs found, so possible causes for a
+persistent ceiling below it include one leg not contributing (a BM25-only LTM,
+for example), two legs returning disjoint candidates, Core's post-fusion score
+modifiers or non-baseline fusion settings, and an intentionally high threshold. STM
 never lowers `min_score` because of this diagnostic; pin a per-tool threshold
 only after inspecting the score distribution.
 

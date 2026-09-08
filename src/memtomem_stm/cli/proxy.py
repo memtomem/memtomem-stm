@@ -9473,9 +9473,11 @@ def doctor(
                             "ltm score scale",
                             "FAIL",
                             "unrecovered score_ceiling_below_min episode in the last 7 UTC days",
-                            "verify both retrieval legs are contributing (dense embeddings "
-                            "installed) and that min_score is not pinned above the scale, "
-                            "then run a successful warm search",
+                            "possible causes: one retrieval leg not contributing (check "
+                            "the dense embedding extras), the legs returning disjoint "
+                            "candidates, Core's post-fusion score modifiers or non-baseline "
+                            "fusion settings, or min_score pinned above the scale; then run "
+                            "a successful warm search",
                         )
                     elif not supported:
                         check(

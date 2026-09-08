@@ -176,7 +176,7 @@ CLI never describes a healthy-but-miscalibrated search as a timeout/failure.
 ``score_ceiling_below_min`` is the streak heuristic (five consecutive
 non-empty searches under the threshold, scale unknown);
 ``score_scale_mismatch`` is its definitive tier — the core NAMED a non-RRF
-``score_scale`` (#1781) while the ceiling sat below the RRF-calibrated
+``score_scale`` (#1781) while the ceiling sat below the RRF-scale
 ``min_score``, so it fires on first observation without streak evidence.
 """
 
@@ -1464,8 +1464,8 @@ class FeedbackStore:
         min_samples: int,
     ) -> float | None:
         # AutoTuner-facing ratios count only feedback earned on RRF or
-        # unstamped surfacings: the tuner moves an RRF-calibrated threshold,
-        # and ratings earned on a scale-gated (pass-all) batch measure a
+        # unstamped surfacings: the tuner moves a threshold drawn on the RRF
+        # scale, and ratings earned on a scale-gated (pass-all) batch measure a
         # different filtering policy on a different scale. The LEFT JOIN +
         # IS NULL keeps two row classes counting as before: events rows with
         # no reported scale, and orphaned feedback whose events row was aged

@@ -202,7 +202,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `enabled` | `true` | Global on/off switch |
 | `use_daemon` | `false` | Opt-in standalone route through the shared local daemon. Keeps feedback/cache/tuning local while sharing one LTM connection per matching config. Never falls back to a private child. |
 | `warmup_enabled` | `true` | Kick a background LTM warm-up right after server/daemon startup, pre-paying the ~9s cold start so the first surfacing call is warm **if** warm-up has finished by then (a call arriving mid-warm-up still times out, then the abandoned start finishes for the next one — see `timeout_seconds`) (#664). Runs in a host-owned task and never blocks the proxy's own MCP initialize handshake. Best-effort: on failure, the lazy start on first use is the retry. Disable when eagerly spawning an LTM child per proxy process is undesirable (e.g. many short-lived proxies). |
-| `min_score` | `0.017` | Minimum search score to include a result. On the baseline RRF scale (`rrf_k=60`, two equally weighted legs of ≤50 candidates) this is the "found by both legs" boundary: single-leg hits top out at `1/61 ≈ 0.0164`, the worst two-leg hit still scores `2/110 ≈ 0.0182`. Pin per tool when running off that baseline. |
+| `min_score` | `0.017` | Minimum search score to include a result. On the baseline RRF scale (`rrf_k=60`, `rrf_weights=[1.0, 1.0]`, two legs of ≤50 candidates) this is the "found by both legs" boundary: single-leg hits top out at `1/61 ≈ 0.0164`, the worst two-leg hit still scores `2/110 ≈ 0.0182`. Pin per tool when running off that baseline. |
 | `max_results` | `3` | Maximum memories surfaced per tool call (model-scaled) |
 | `max_injection_chars` | `3000` | Maximum total chars injected, truncated if exceeded (model-scaled) |
 | `min_response_chars` | `5000` | Skip surfacing when a tool response is shorter than this (logged as `response_too_short`). Measured on the cleaned upstream response *before* compression; an explicit agent query (`_context_query`) bypasses the gate. Precision/cost gate — distinct from the library-only extraction threshold described below. |
@@ -717,9 +717,11 @@ hit:
   `score_ceiling_below_min` diagnostic for `mms stats` on every such
   search — the counter tracks observations, the warning stays one-shot. Check
   the LTM embedding/search backend first: on the baseline RRF scale the default
-  `min_score` admits any memory both retrieval legs found, so a persistent
-  ceiling below it means one leg is not contributing (for example, missing
-  embedding extras) or the two legs are returning disjoint candidates. If the
+  `min_score` admits any memory both retrieval legs found, so possible causes
+  for a persistent ceiling below it include one leg not contributing (for
+  example, missing embedding extras), the two legs returning disjoint
+  candidates, and Core's post-fusion score modifiers or non-baseline fusion
+  settings lowering the fused scores. If the
   backend is healthy and the stricter policy is intentional, set
   `context_tools.<name>.min_score` explicitly. The diagnostic never lowers the
   threshold automatically.
