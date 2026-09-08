@@ -247,6 +247,51 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `feedback_demotion_negative_threshold` | `3` | Distinct negative surfacing events required before local STM demotion applies to a memory |
 | `fire_webhook` | `true` | Fire surfacing event webhooks |
 
+### RRF boundary diagnostics
+
+`mms doctor` (or `mms doctor --json`) compares configured score floors with
+Core's two-leg RRF agreement interval. This requires the additive fusion fields
+in `runtime_profile.search` introduced by
+[Core #2377](https://github.com/memtomem/memtomem/issues/2377). Older Core
+profiles produce a WARN requesting an upgrade; schema 1 alone does not prove
+support. After updating Core or its configuration, restart the LTM/daemon to
+refresh its negotiated profile. An existing daemon is inspected via ping;
+doctor does not start a private Core on that route.
+
+For weights `w1, w2`, RRF constant `k`, and effective candidate limits `C1, C2`,
+the unmodified two-leg interval is
+`(max(w1,w2)/(k+1), w1/(k+C1)+w2/(k+C2)]`. Each candidate limit is the larger
+of Core's configured limit and the request's `top_k`. Doctor uses the engine's
+`top_k = 2 * max_results`, including consumer-model limits and per-tool
+overrides. It checks the default floor and each enabled `context_tools` entry.
+
+The configured floor must separate both raw compose scores and four-decimal
+structured-search scores. If it does not, doctor suggests the middle safe
+four-decimal value within `[0, 1]` (ties choose the larger value). For the
+baseline, `0.017` passes; weights `[0.5, 0.5]` with the same limits produce a
+suggestion of `0.0087`. For example, after checking the assumptions, merge
+`{"read_file": {"min_score": 0.0087}}` into
+`MEMTOMEM_STM_SURFACING__CONTEXT_TOOLS`, preserving other tool settings.
+A pin overrides auto-tuning **and** the score-scale gate.
+
+This is configuration advice, not a live-quality assessment. The profile is a
+collection/negotiation-time snapshot; the check evaluates configured floors,
+not persisted or in-memory auto-tuned values. It assumes two positive-weight
+retrievers before rescue, reranking, time decay, or boosts. A PASS only certifies
+the theoretical intervals under those assumptions, not that both retrievers
+actually returned matching memories. No safe interval, rounded-score collapse,
+unsupported/malformed metadata, a single retrieval leg, compact output, or
+possible reranking produces a WARN without a numeric pin. Doctor never changes
+the floor or tuning state, and these warnings alone keep exit code 0.
+The snapshot must report Core reranking disabled before doctor recommends a
+pin. `surfacing.rerank=false` alone is insufficient: the adapter may withhold
+that argument if tool-schema negotiation fails, and the diagnostic snapshot
+does not confirm a negotiated bypass.
+Doctor also requires confirmed structured output. Direct probes check Core's
+advertised formats; daemon probes use the adapter's actual parser, including
+compact downgrades after negotiation failures. Older daemons without format
+metadata produce WARN without a numeric pin; restart after upgrading.
+
 ### Scoping surfacing per upstream
 
 `exclude_tools` is global config (top-level `SurfacingConfig`), set via env.

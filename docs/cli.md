@@ -578,6 +578,7 @@ Checks, in order:
 | `ltm server` | the `health` LTM probe | WARN: LTM unconfigured/unreachable — **never FAIL**; only LTM-dependent features are disabled |
 | `ltm runtime profile` / `dependencies` | Core runtime-profile schema 1 | FAIL when active dense/rerank dependencies are missing or Core cannot read effective config; older Core is WARN |
 | `ltm retrieval mode` | Core configured/effective search mode | FAIL on disabled or unexpected dense-to-BM25 degradation; intentional BM25-only is WARN |
+| `ltm RRF boundary` | Core fusion settings and configured STM floors | PASS when the configured floor lies inside both theoretical RRF intervals; otherwise WARN with a conditional pin suggestion or a reason no pin is available. See [RRF boundary diagnostics](surfacing.md#rrf-boundary-diagnostics) for the Core requirement and assumptions |
 | `ltm score scale` | feedback diagnostics | FAIL while a recent score-scale mismatch episode remains unrecovered |
 | `ltm measurement` / timeout checks | daemon latency telemetry | WARN when measurement cannot run or configured surfacing/hook deadlines are too small |
 | `surfacing outcomes` | daemon `latency.surface` counters | WARN when the surface series records a request that timed out, faulted after issuing a search, or never issued one, with that breakdown; healthy skips (allowlist, gate, cache) and requests refused before admission (`expired`, `busy`) are not in this population, and raw/synthetic `retrieval` traffic is not counted here — see `ltm measurement`. A daemon predating the counters WARNs asking for a restart rather than reading their absence as zero. Independent of whether there is enough data to size a timeout |
@@ -589,6 +590,13 @@ The default doctor run is passive: it performs no search or inference and change
 running shared daemon (plus one prime search when cold), discards their content,
 and updates daemon latency telemetry. It never starts a missing daemon and never
 edits STM configuration or LTM content.
+
+The surfacing bootstrap payload also carries `rrf_boundary_checks`, using the
+same `id`, `label`, `status`, `detail`, `next_action` row shape as doctor checks.
+The default check ID is `ltm_rrf_boundary`; enabled configured tools add
+`ltm_rrf_boundary:<tool>` rows. `health --json` carries the same additive
+bootstrap field; its existing exit-code behavior is unchanged. No new search
+is issued for these checks.
 
 ### `status`
 

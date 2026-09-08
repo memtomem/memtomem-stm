@@ -11,6 +11,16 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Added
+
+- `mms doctor` reports configured RRF agreement intervals and safe per-tool
+  score-pin suggestions from Core's additive fusion settings (#1012; Core
+  #2377). The check handles asymmetric/request-expanded candidate limits and
+  both raw and four-decimal scores. Unsupported profiles, single-leg retrieval,
+  compact/reranked scores, and impossible intervals warn without inventing a
+  pin. This is configuration advice only: it performs no search or writes and
+  leaves filtering, auto-tuning, cache behavior, and WARN-only exit codes intact.
+
 ### Changed
 
 - **Default `surfacing.min_score` `0.03` → `0.017`, drawn on the RRF scale**
