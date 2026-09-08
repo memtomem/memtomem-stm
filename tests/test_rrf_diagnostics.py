@@ -185,12 +185,35 @@ def test_compact_requires_structured_before_any_pin():
     assert "RESULT_FORMAT=structured" in check[4]
 
 
-@pytest.mark.parametrize("rerank", [True, None])
-def test_possible_rerank_is_not_treated_as_rrf(rerank):
+@pytest.mark.parametrize("rerank", [False, True, None])
+@pytest.mark.parametrize("remote_rerank", [None, {}, {"enabled": True}, {"enabled": "false"}])
+def test_possible_rerank_is_not_treated_as_rrf(rerank, remote_rerank):
     data = profile()
-    data["rerank"]["enabled"] = True
+    data["rerank"] = remote_rerank
     check = rrf_boundary_doctor_checks(data, SurfacingConfig(rerank=rerank))[0]
     assert check[2] == "WARN" and "reranked" in check[3]
+    assert "min_score" not in (check[4] or "")
+
+
+@pytest.mark.asyncio
+async def test_failed_bypass_probe_cannot_produce_a_numeric_pin():
+    from memtomem_stm.surfacing.mcp_client import McpClientSearchAdapter
+
+    class FailedToolProbe:
+        async def list_tools(self):
+            raise RuntimeError("temporary tools/list failure")
+
+    cfg = SurfacingConfig(rerank=False)
+    adapter = McpClientSearchAdapter(cfg)
+    await adapter._probe_rerank_support(FailedToolProbe())
+    args = {}
+    adapter._refresh_rerank_arg(args)
+    assert "rerank" not in args
+    data = profile(rrf_weights=[0.5, 0.5])
+    data["rerank"]["enabled"] = True
+    check = rrf_boundary_doctor_checks(data, cfg)[0]
+    assert check[2] == "WARN"
+    assert "Suggested" not in check[3]
     assert "min_score" not in (check[4] or "")
 
 

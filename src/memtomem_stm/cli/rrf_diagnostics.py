@@ -106,12 +106,14 @@ def rrf_boundary_doctor_checks(profile: Any, config: SurfacingConfig) -> list[Do
             "set MEMTOMEM_STM_SURFACING__RESULT_FORMAT=structured, then rerun mms doctor",
         )
     rerank = profile.get("rerank")
-    if config.rerank is not False and (
-        not isinstance(rerank, dict) or rerank.get("enabled") is not False
-    ):
+    # A configured bypass is only sent after successful tool-schema negotiation.
+    # This snapshot carries no negotiated bypass evidence (including via daemon
+    # ping), so require Core itself to report reranking disabled.
+    if not isinstance(rerank, dict) or rerank.get("enabled") is not False:
         return unavailable(
             "Surfacing may use reranked scores; an RRF threshold is not applicable",
-            "inspect surfacing.rerank and Core rerank settings before choosing a score pin",
+            "Core must report reranking disabled before this snapshot can recommend a score pin; "
+            "surfacing.rerank=false alone does not prove a negotiated bypass",
         )
 
     k = search["rrf_k"]

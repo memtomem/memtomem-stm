@@ -283,6 +283,10 @@ actually returned matching memories. No safe interval, rounded-score collapse,
 unsupported/malformed metadata, a single retrieval leg, compact output, or
 possible reranking produces a WARN without a numeric pin. Doctor never changes
 the floor or tuning state, and these warnings alone keep exit code 0.
+The snapshot must report Core reranking disabled before doctor recommends a
+pin. `surfacing.rerank=false` alone is insufficient: the adapter may withhold
+that argument if tool-schema negotiation fails, and the diagnostic snapshot
+does not confirm a negotiated bypass.
 
 ### Scoping surfacing per upstream
 
