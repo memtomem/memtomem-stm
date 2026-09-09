@@ -121,8 +121,16 @@ Three parts compose it, in this order:
 `max_description_chars` is an exact cap on that whole assembled string, prefix
 included. It is set globally and per server, and the effective budget is
 `min(server, global)`: raising only the global value does not widen a stricter
-per-server one. Both default to `200` and both require at least `32`, which
+per-server one. Both default to `4000` and both require at least `32`, which
 leaves room for the prefix and some surviving text.
+
+The default is a sanity bound against a pathological upstream, not a token
+budget — a policy choice with headroom over the descriptions sampled in #1015,
+not a derived threshold. Lower it when the client pays for every advertised
+character on every request, and note that the convention suffix rides at the end
+of the advertisement: a cap large enough that the client truncates first leaves
+that client naming no follow-up tool, just as a cap too small to fit the suffix
+does.
 
 When the budget is tight the convention suffix wins over upstream text, because
 it names the follow-up tool the response requires. If even the suffix alone

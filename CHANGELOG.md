@@ -23,6 +23,33 @@ changes inline only. See the deprecation policy in
 
 ### Changed
 
+- **Default `max_description_chars` `200` → `4000` at both the global and the
+  per-server level** (#1015). The old default left 190 characters for upstream
+  text once the `[proxied] ` prefix is reserved, which truncated most of the
+  tool descriptions sampled in #1015 — in the worst case removing a tool's
+  entire usage section. The new value is a sanity bound against a pathological
+  upstream rather than a token budget; #1015 carries the measurements and the
+  argument, and `DEFAULT_DESCRIPTION_CHARS` points at it. Set a real budget
+  explicitly when the client pays for every advertised character on every
+  request.
+
+  **Behavior change**: advertised descriptions grow, so such a client sees a
+  larger tool list and query-aware tool ranking scores more text. A field set
+  explicitly keeps its value, but the effective budget is `min(server, global)`,
+  so a config that sets only one level can change: an explicit global `1000`
+  beside an omitted per-server value goes from `200` to `1000`, while an
+  explicit `100` stays `100` — it was already the smaller operand.
+
+  The convention suffix rides at the end of the advertisement, so a description
+  long enough that a truncating client cuts before the suffix leaves that client
+  naming no follow-up tool. Servers that advertise a suffix (`selective`,
+  `progressive`, `hybrid` with a TOC tail) and proxy long descriptions should
+  set an explicit cap — see
+  [Advertised tool descriptions](docs/reference/proxy-config.md#advertised-tool-descriptions).
+
+  The floor stays at `32` and the cap still applies: this raises the default, it
+  does not remove the bound.
+
 - **Default `surfacing.min_score` `0.03` → `0.017`, drawn on the RRF scale**
   (#875). **Behavior change**: surfacing injects memories it previously
   filtered out. On Core's baseline fusion — `rrf_k=60`, `rrf_weights=[1.0,
