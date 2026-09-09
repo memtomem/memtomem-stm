@@ -54,10 +54,12 @@ changes inline only. See the deprecation policy in
   the budget** (#1016). **Behavior change**: a proxied description whose last
   sentence separator sits further back than that is cut at a word boundary and
   marked with an ellipsis, instead of being shortened silently to wherever that
-  separator happened to fall. The advertised text changes for any upstream whose
-  description exceeds the cap and whose tail carries no sentence separator — a
-  bullet list or a code block, where the old search walked back past the whole
-  block.
+  separator happened to fall. The advertised text changes for a description that
+  exceeds its cap and whose last sentence boundary inside that cap keeps less
+  than 90% of it — in practice text whose tail is a bullet list or a code block,
+  where the search walked back past the whole block. It does not change for a
+  description that fits, that carries no sentence separator at all (already the
+  word-boundary path), or whose last boundary already sat inside the top 10%.
 
   The old rule accepted a boundary anywhere past a third of the budget, so a
   configured cap meant "somewhere between a third of this and this", decided by
