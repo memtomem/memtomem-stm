@@ -54,6 +54,20 @@ _MISSING = object()
 #: from ``tool_metadata``, which imports this module.
 MIN_DESCRIPTION_CHARS = 32
 
+#: Default for ``max_description_chars`` at both levels.
+#:
+#: A sanity bound against a pathological upstream, not a token budget: a policy
+#: choice with headroom over the tool descriptions sampled in #1015, which is
+#: where the measurements and the argument for it live. Set a real budget
+#: explicitly when the client pays for every advertised character on every
+#: request.
+#:
+#: One thing to know before lowering it: the convention suffix rides at the END
+#: of the advertisement, so both a cap too small to fit it (dropped whole, see
+#: ``manager.get_proxy_tools``) and a cap so large the client truncates first
+#: can leave the client naming no follow-up tool.
+DEFAULT_DESCRIPTION_CHARS = 4000
+
 
 @dataclass(frozen=True)
 class EnvOverlayResult:
@@ -1598,7 +1612,7 @@ class UpstreamServerConfig(BaseModel):
     """
     circuit_reset_seconds: float = Field(default=60.0, gt=0.0)
     """Seconds an open circuit breaker waits before allowing a probe call."""
-    max_description_chars: int = Field(default=200, ge=MIN_DESCRIPTION_CHARS)
+    max_description_chars: int = Field(default=DEFAULT_DESCRIPTION_CHARS, ge=MIN_DESCRIPTION_CHARS)
     """Cap on the CLIENT-VISIBLE description, ``[proxied] `` prefix included.
 
     Composes with the global setting as ``min(server, global)``, not as an
@@ -2199,7 +2213,7 @@ class ProxyConfig(BaseModel):
     Default 0.65 ensures at least 65% of every response survives compression.
     Set to 0 to disable and use fixed budgets only.
     """
-    max_description_chars: int = Field(default=200, ge=MIN_DESCRIPTION_CHARS)
+    max_description_chars: int = Field(default=DEFAULT_DESCRIPTION_CHARS, ge=MIN_DESCRIPTION_CHARS)
     """Cap on the CLIENT-VISIBLE description, ``[proxied] `` prefix included.
 
     The effective budget for an upstream is ``min(server, global)``, so raising
