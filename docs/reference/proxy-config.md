@@ -90,9 +90,15 @@ Three parts compose it, in this order:
   as upstream text. Truncation prefers a sentence boundary; failing that a word
   boundary, marked with an ellipsis; failing that a cut mid-word, also marked.
   The ellipsis is dropped when the remaining budget cannot hold both it and at
-  least one character of text — under four characters, the text is cut raw. A
-  boundary counts only if it falls in the last two thirds of the budget, so
-  text whose only boundary comes early is cut rather than shortened drastically.
+  least one character of text — under four characters, the text is cut raw. The
+  sentence boundary used is the last one inside the budget, and it is used only
+  when it keeps at least 90% of that budget; text whose tail carries no sentence
+  separator, such as a bullet list or a code block, therefore gets the marked
+  word-boundary cut instead of retreating past the whole block. So text that was
+  shortened without an ellipsis is always within 10% of the cap; a cut that gives
+  up more than that always carries the ellipsis that says so. What no cut can
+  express is how much text lies beyond the cap — a sentence cut inside that 10%
+  reads as a finished description.
 - **The convention suffix** is appended only by strategies that change how the
   agent must interact with the response — see
   [Compression Strategies](../compression.md). It follows the compression

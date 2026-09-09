@@ -50,6 +50,41 @@ changes inline only. See the deprecation policy in
   The floor stays at `32` and the cap still applies: this raises the default, it
   does not remove the bound.
 
+- **A sentence-boundary cut of a tool description must now keep at least 90% of
+  the budget** (#1016). **Behavior change**: a proxied description whose last
+  sentence separator sits further back than that is cut at a word boundary and
+  marked with an ellipsis, instead of being shortened silently to wherever that
+  separator happened to fall. The advertised text changes for a description that
+  exceeds its cap and whose last sentence boundary inside that cap keeps less
+  than 90% of it — in practice text whose tail is a bullet list or a code block,
+  where the search walked back past the whole block. It does not change for a
+  description that fits, that carries no sentence separator at all (already the
+  word-boundary path), or whose last boundary already sat inside the top 10%.
+
+  The old rule accepted a boundary anywhere past a third of the budget, so a
+  configured cap meant "somewhere between a third of this and this", decided by
+  the source text. Measured against the nine core tool descriptions published in
+  `memtomem` 0.5.0, worst-case retention at a 200-character cap rises from 35% to
+  96%, and no description at any measured cap now keeps less than 90%:
+
+  | cap | descriptions cut | worst before | worst after |
+  |---|---|---|---|
+  | 200 | 8 | 35% | 96% |
+  | 400 | 6 | 82% | 90% |
+  | 800 | 3 | 79% | 90% |
+  | 1200 | 2 | 78% | 91% |
+  | 2038 | 2 | 59% | 94% |
+
+  The boundary is now also chosen by position rather than by the order the
+  terminators are checked in, which is a second, consequent change: at a
+  2038-character cap `mem_add` was cut at 1207 characters by a `". "` the old
+  loop tested first, where a later separator sat at 1934.
+
+  Known residual, and the open half of the issue: a sentence cut still appends
+  nothing, so it reads as a finished description. The floor bounds how much of
+  the *budget* it may discard, not how much text lies beyond the cap. Whether
+  that cut should carry an ellipsis too is left open in #1016.
+
 - **Default `surfacing.min_score` `0.03` → `0.017`, drawn on the RRF scale**
   (#875). **Behavior change**: surfacing injects memories it previously
   filtered out. On Core's baseline fusion — `rrf_k=60`, `rrf_weights=[1.0,

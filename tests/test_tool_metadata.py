@@ -63,9 +63,15 @@ class TestTruncateDescription:
         assert len(result) == 100
 
     def test_question_mark_boundary(self):
+        """A boundary that keeps only 65% of the budget no longer wins.
+
+        Re-pinned for #1016: the sentence branch used to accept any boundary
+        past a third of the budget, so this returned an unmarked 13 characters
+        of a 20-character budget. It now falls through to the word-boundary
+        branch, which keeps more and marks the cut."""
         text = "What is this? This is a tool. It does things."
         result = ProxyManager._truncate_description(text, 20)
-        assert result == "What is this?"
+        assert result == "What is this?..."
 
     def test_budget_too_small_for_an_ellipsis(self):
         """Under four chars there is no room for text plus ``...``, so the
@@ -74,6 +80,80 @@ class TestTruncateDescription:
             result = ProxyManager._truncate_description("hello world", max_chars)
             assert result == "hello world"[:max_chars]
             assert "..." not in result
+
+    def test_a_far_sentence_retreat_falls_through_to_a_marked_cut(self):
+        """The #1016 case: text whose tail is a bullet list has no sentence
+        separator near the cap, so the last one sits far back. Accepting it
+        would discard a quarter of the budget and leave nothing to show for
+        it. The marked word-boundary cut is used instead."""
+        prose = (
+            "Runs shell-like queries over the documentation tree, "
+            "returning file contents and search results. "
+            "Every call is stateless and starts from the root. "
+        )
+        text = prose + "\n".join(f"- command {i} <path>" for i in range(12))
+        budget = 200
+        # Preconditions that make this the #1016 shape rather than a tautology:
+        # a sentence boundary exists inside the budget, and it is the last one.
+        assert text[:budget].rfind(". ") == len(prose) - 2
+        assert len(prose) - 1 < budget
+
+        result = ProxyManager._truncate_description(text, budget)
+
+        assert len(result) <= budget
+        assert result.endswith("...")
+        assert len(result) >= (budget * 90) // 100
+
+    def test_a_sentence_cut_that_costs_almost_nothing_stays_unmarked(self):
+        """The other side of the same threshold: a boundary that keeps at
+        least 90% of the budget is still preferred, and still appends
+        nothing, because it costs the budget almost nothing (#1016)."""
+        text = "First sentence. Second sentence. Third sentence that is long."
+        result = ProxyManager._truncate_description(text, 35)
+        assert result == "First sentence. Second sentence."
+        assert not result.endswith("...")
+        assert len(result) >= (35 * 90) // 100
+
+    def test_the_latest_boundary_wins_over_terminator_order(self):
+        """The boundary is chosen by position, not by which terminator the
+        implementation happens to check first (#1016). Both boundaries here
+        clear the retention floor; the later one keeps seven more characters."""
+        text = "a" * 90 + ". " + "b" * 5 + "? " + "c" * 20
+        result = ProxyManager._truncate_description(text, 100)
+        assert result.endswith("?")
+        assert len(result) == 98
+
+    def test_an_unmarked_cut_keeps_nine_tenths_of_the_budget(self):
+        """The guarantee the reference documents (#1016): text shortened
+        without an ellipsis kept at least 90% of the budget, so an unmarked
+        description is never a drastic retreat. A cut that gives up more than
+        that carries the ellipsis instead. Text beyond the budget is a
+        different question, and this says nothing about it.
+
+        The budgets are chosen so the guarantee is actually exercised rather
+        than skipped past: several pairs below produce an accepted, unmarked
+        sentence cut, and ``asserted`` fails the test if a future change makes
+        every pair fall into one of the two exempt shapes."""
+        texts = [
+            "First sentence. Second sentence. Third sentence that runs long.",
+            "What is this? This is a tool. It does things and more things.",
+            "Prose leading in. Then a list with no terminator:\n"
+            + "\n".join(f"- item {i}" for i in range(20)),
+            "one two three four five six seven eight nine ten eleven twelve",
+            "no-spaces-at-all-in-this-quite-long-hyphenated-description-here",
+            "a" * 300,
+        ]
+        asserted = 0
+        for max_chars in (4, 10, 16, 18, 25, 30, 35, 100, 250):
+            for text in texts:
+                result = ProxyManager._truncate_description(text, max_chars)
+                if len(result) == len(text) or result.endswith("..."):
+                    continue
+                asserted += 1
+                # Exact, not floor-rounded: the code rounds the floor up, and a
+                # floor-rounded comparison here would accept 88.6% at cap 35.
+                assert len(result) * 100 >= max_chars * 90, (max_chars, result)
+        assert asserted >= 4, f"guarantee never exercised ({asserted} unmarked cuts)"
 
     def test_negative_budget_yields_empty(self):
         """A negative budget must not slice from the end of the string."""
