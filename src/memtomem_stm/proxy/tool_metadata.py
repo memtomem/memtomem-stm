@@ -15,6 +15,29 @@ PROXIED_PREFIX = "[proxied] "
 
 _ELLIPSIS = "..."
 
+#: Sentence terminators, each followed by the whitespace that ends the
+#: sentence. The latest match across all of them wins, so the cut is chosen by
+#: position rather than by the order this tuple happens to list (#1016).
+_SENTENCE_SEPARATORS = (". ", ".\n", "! ", "? ")
+
+#: Smallest share of the budget, in percent, that a sentence-boundary cut must
+#: retain to be used (#1016).
+#:
+#: That branch appends nothing, so its result reads as a finished description:
+#: neither the model nor the operator can tell text was dropped. It is worth
+#: that only when it costs the budget almost nothing. A boundary further back
+#: falls through to the word-boundary branch below, which spends three
+#: characters on an ellipsis and so announces the cut -- and, for text whose
+#: tail carries no sentence separator at all (a bullet list, a code block),
+#: keeps considerably more of the budget as well.
+_SENTENCE_MIN_RETAINED_PERCENT = 90
+
+#: The word-boundary branch accepts a much earlier cut, keeping the pre-#1016
+#: rule: it is already marked with an ellipsis, so retreating costs budget but
+#: cannot be mistaken for complete text. Named here so the two thresholds read
+#: as two different rules rather than one literal repeated twice.
+_WORD_BOUNDARY_EARLIEST_DIVISOR = 3
+
 
 def truncate_description(desc: str, max_chars: int) -> str:
     """Truncate description at sentence boundary within budget.
@@ -24,22 +47,32 @@ def truncate_description(desc: str, max_chars: int) -> str:
     ``len(_ELLIPSIS) + 1`` there is no room for both, so the result is a hard
     slice with no ellipsis. A negative budget yields the empty string, the
     closest the contract can come to a length it cannot represent.
+
+    The sentence boundary is the latest one in the budget, and it is used only
+    when it retains at least ``_SENTENCE_MIN_RETAINED_PERCENT`` of that budget.
+    Anything further back falls through to the marked branches, so a cut that
+    discards a large part of the budget always shows that it did (#1016).
+
+    A cut still cannot say how much text lies *beyond* the budget: a sentence
+    cut inside the retention floor is unmarked, and reads as finished. That is
+    the open half of #1016 and is deliberately unchanged here.
     """
     if not desc or len(desc) <= max_chars:
         return desc
     if max_chars < len(_ELLIPSIS) + 1:
         return desc[: max(max_chars, 0)]
-    # Try to cut at last sentence boundary. This branch appends nothing, so it
-    # may spend the whole budget.
+    # Try to cut at the last sentence boundary. This branch appends nothing, so
+    # it may spend the whole budget -- and so it must not retreat far.
     truncated = desc[:max_chars]
-    for sep in (". ", ".\n", "! ", "? "):
-        idx = truncated.rfind(sep)
-        if idx > max_chars // 3:  # don't cut too early
-            return truncated[: idx + 1].rstrip()
+    # Rounded up, so the floor is never weaker than the percentage says.
+    min_retained = (max_chars * _SENTENCE_MIN_RETAINED_PERCENT + 99) // 100
+    idx = max(truncated.rfind(sep) for sep in _SENTENCE_SEPARATORS)
+    if idx + 1 >= min_retained:
+        return truncated[: idx + 1].rstrip()
     # The remaining branches append an ellipsis, so they cut short of the cap.
     body = desc[: max_chars - len(_ELLIPSIS)]
     idx = body.rfind(" ")
-    if idx > max_chars // 3:
+    if idx > max_chars // _WORD_BOUNDARY_EARLIEST_DIVISOR:
         return body[:idx] + _ELLIPSIS
     return body + _ELLIPSIS
 
