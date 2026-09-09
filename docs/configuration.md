@@ -106,7 +106,7 @@ export MEMTOMEM_STM_PROXY__MIN_RESULT_RETENTION=0.65
 export MEMTOMEM_STM_PROXY__CONSUMER_MODEL=claude-sonnet-4
 export MEMTOMEM_STM_PROXY__CONTEXT_BUDGET_RATIO=0.05
 export MEMTOMEM_STM_PROXY__CHARS_PER_TOKEN=3.5
-export MEMTOMEM_STM_PROXY__MAX_DESCRIPTION_CHARS=200
+export MEMTOMEM_STM_PROXY__MAX_DESCRIPTION_CHARS=4000
 export MEMTOMEM_STM_PROXY__STRIP_SCHEMA_DESCRIPTIONS=false
 export MEMTOMEM_STM_PROXY__LOCK_TIMEOUT_SECONDS=30.0
 export MEMTOMEM_STM_PROXY__CACHE__ENABLED=true
@@ -303,7 +303,7 @@ Representative configuration (see the linked reference for omitted fields):
   "consumer_model": "",
   "context_budget_ratio": 0.05,
   "chars_per_token": 3.5,
-  "max_description_chars": 200,
+  "max_description_chars": 4000,
   "strip_schema_descriptions": false,
   "lock_timeout_seconds": 30.0,
   "upstream_servers": {
@@ -323,7 +323,7 @@ Representative configuration (see the linked reference for omitted fields):
       "overall_deadline_seconds": 180.0,
       "circuit_max_failures": 3,
       "circuit_reset_seconds": 60.0,
-      "max_description_chars": 200,
+      "max_description_chars": 4000,
       "strip_schema_descriptions": false,
       "cleaning": {
         "strip_html": true,

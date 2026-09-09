@@ -10,6 +10,7 @@ import pytest
 from pydantic import ValidationError
 
 from memtomem_stm.proxy.config import (
+    DEFAULT_DESCRIPTION_CHARS,
     MIN_DESCRIPTION_CHARS,
     CompressionStrategy,
     HybridConfig,
@@ -955,3 +956,97 @@ class TestMaxDescriptionCharsValidation:
         """The floor is a usability choice, but it must at least clear the
         costs the budget charges before any upstream text survives."""
         assert MIN_DESCRIPTION_CHARS > len(PROXIED_PREFIX) + len("...")
+
+
+class TestDefaultDescriptionBudget:
+    """The default budget is a sanity bound above measured description lengths,
+    applied at both levels and reaching the client-visible description
+    (#1015)."""
+
+    def test_both_levels_default_to_the_sanity_bound(self):
+        proxy = ProxyConfig(config_path=Path("/tmp/proxy.json"))
+        server = UpstreamServerConfig(prefix="test")
+        assert DEFAULT_DESCRIPTION_CHARS == 4000
+        assert proxy.max_description_chars == DEFAULT_DESCRIPTION_CHARS
+        assert server.max_description_chars == DEFAULT_DESCRIPTION_CHARS
+
+    def test_an_unconfigured_proxy_advertises_a_long_description_whole(self):
+        """The behaviour the default change buys: text an upstream actually
+        ships survives to the client. The body is ~1100 chars: past the old
+        default of 200 and inside the new one, so this fails against that
+        default rather than merely restating the constant above. It is also
+        past a 1014-char budget, the level at which four of the eighteen
+        descriptions measured for #1015 were still being cut.
+
+        ``get_proxy_tools`` returns the budgeted BODY; registration prepends
+        ``[proxied] `` afterwards, which is why the budget reserves it."""
+        body = ". ".join(f"sentence {i} about the tool" for i in range(40))
+        assert 200 < len(body) < DEFAULT_DESCRIPTION_CHARS - len(PROXIED_PREFIX)
+        tools = [_fake_tool("t", description=body)]
+        # Defaults at both levels: no ``max_description_chars`` anywhere.
+        server_cfg = UpstreamServerConfig(prefix="test", compression=CompressionStrategy.NONE)
+        proxy_cfg = ProxyConfig(
+            config_path=Path("/tmp/proxy.json"),
+            upstream_servers={"srv": server_cfg},
+        )
+        mgr = ProxyManager(proxy_cfg, TokenTracker())
+        mgr._connections = {
+            "srv": UpstreamConnection(
+                name="srv", config=server_cfg, session=AsyncMock(), tools=tools
+            )
+        }
+        desc = mgr.get_proxy_tools()[0].description
+        assert desc == body
+
+    def test_the_default_still_bounds_a_longer_upstream_text(self):
+        """Raising the default is not the same as removing the cap.
+
+        Pinned to the exact expected body, not just an upper bound: a bound
+        alone passes against the old default and against an implementation
+        that returns nothing at all."""
+        body = "x" * (DEFAULT_DESCRIPTION_CHARS * 2)
+        tools = [_fake_tool("t", description=body)]
+        server_cfg = UpstreamServerConfig(prefix="test", compression=CompressionStrategy.NONE)
+        proxy_cfg = ProxyConfig(
+            config_path=Path("/tmp/proxy.json"),
+            upstream_servers={"srv": server_cfg},
+        )
+        mgr = ProxyManager(proxy_cfg, TokenTracker())
+        mgr._connections = {
+            "srv": UpstreamConnection(
+                name="srv", config=server_cfg, session=AsyncMock(), tools=tools
+            )
+        }
+        desc = mgr.get_proxy_tools()[0].description
+        budget = DEFAULT_DESCRIPTION_CHARS - len(PROXIED_PREFIX)
+        # No sentence separator and no space in the body, so truncation falls
+        # through to the hard slice, which spends the ellipsis from the budget.
+        assert desc == "x" * (budget - 3) + "..."
+        assert len(desc) == budget
+
+    def test_one_explicit_level_now_composes_against_the_new_default(self):
+        """``min(server, global)`` means a config that sets only one level is
+        not insulated from the default change: the omitted level supplies the
+        other operand."""
+        server_cfg = UpstreamServerConfig(prefix="test", compression=CompressionStrategy.NONE)
+        proxy_cfg = ProxyConfig(
+            config_path=Path("/tmp/proxy.json"),
+            upstream_servers={"srv": server_cfg},
+            max_description_chars=1000,
+        )
+        # The explicit field keeps its value; the omitted one is the default.
+        assert proxy_cfg.max_description_chars == 1000
+        assert server_cfg.max_description_chars == DEFAULT_DESCRIPTION_CHARS
+        # ...and an explicit value already below the old default is unmoved by
+        # the change, since it stays the smaller operand.
+        assert min(100, DEFAULT_DESCRIPTION_CHARS) == min(100, 200) == 100
+
+        body = "y" * 2000
+        mgr = ProxyManager(proxy_cfg, TokenTracker())
+        mgr._connections = {
+            "srv": UpstreamConnection(
+                name="srv", config=server_cfg, session=AsyncMock(), tools=[_fake_tool("t", body)]
+            )
+        }
+        # Effective budget is min(1000, 4000) = 1000, not the old min(1000, 200).
+        assert len(mgr.get_proxy_tools()[0].description) == 1000 - len(PROXIED_PREFIX)
