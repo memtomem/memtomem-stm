@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from memtomem_stm.proxy.config import CompressionStrategy, HybridConfig, TailMode
@@ -113,6 +114,127 @@ def convention_suffix(
         if cfg.tail_mode == TailMode.TOC:
             return " | Head+TOC: use stm_proxy_select_chunks"
     return ""
+
+
+@dataclass(frozen=True)
+class DescriptionBudget:
+    """How one advertised description spends ``max_description_chars``.
+
+    The cap is on what the CLIENT sees, so every fixed cost comes out of it:
+    the ``[proxied] `` prefix registration prepends later, and the convention
+    suffix. The two levels compose as ``min(server, global)`` rather than as an
+    override, which is why an operator can raise the global one and change
+    nothing (#1015). Holding that arithmetic here keeps the advertisement
+    (``manager.get_proxy_tools``) and the ``mms doctor`` advisory on one rule
+    with two readers, the way #926 requires of the strategy resolution feeding
+    ``suffix``.
+    """
+
+    server_cap: int
+    global_cap: int
+    #: ``convention_suffix`` output for the resolved strategy; ``""`` when the
+    #: strategy needs no hint.
+    suffix: str = ""
+
+    @property
+    def cap(self) -> int:
+        """The effective cap: neither level overrides the other."""
+        return min(self.server_cap, self.global_cap)
+
+    @property
+    def binding(self) -> str:
+        """Which level the cap came from -- ``server``, ``global`` or ``both``.
+
+        ``both`` on a tie, because raising either one alone leaves the cap
+        where it is. That is the case an operator most often misreads.
+        """
+        if self.server_cap < self.global_cap:
+            return "server"
+        if self.global_cap < self.server_cap:
+            return "global"
+        return "both"
+
+    @property
+    def total(self) -> int:
+        """Chars left for the composed text once the prefix is reserved."""
+        return self.cap - len(PROXIED_PREFIX)
+
+    @property
+    def suffix_fits(self) -> bool:
+        """Whether a configured suffix can be carried whole.
+
+        A suffix that cannot fit is dropped rather than cut: a cut hint is
+        incomplete, and depending on where it lands may not name its tool at
+        all (#893).
+        """
+        return bool(self.suffix) and len(self.suffix) <= self.total
+
+    @property
+    def body(self) -> int:
+        """Chars left for upstream text after a suffix that fits took its own."""
+        return self.total - len(self.suffix) if self.suffix_fits else self.total
+
+    def overflow(self, source_chars: int) -> int:
+        """Chars of a ``source_chars``-long source this budget discards."""
+        return max(0, source_chars - self.body)
+
+    def cap_to_fit(self, source_chars: int) -> int:
+        """Smallest cap that would advertise that source whole, suffix included.
+
+        Written from the configured suffix rather than from the one that fits,
+        so the answer stays true for a cap too small to carry it today.
+        """
+        return source_chars + len(PROXIED_PREFIX) + len(self.suffix)
+
+
+@dataclass(frozen=True)
+class ComposedDescription:
+    """One advertised description, plus what composing it had to give up."""
+
+    text: str
+    #: Source chars the cap discarded. An ellipsis counts as shown text, so
+    #: this is the loss the client sees, not the loss the budget caused.
+    chars_cut: int
+    #: A configured suffix was dropped whole for want of room.
+    suffix_dropped: bool
+
+
+def advertised_source_text(upstream: str | None, override: str | None, prefixed_name: str) -> str:
+    """Resolve the text an advertisement budgets, before any cap applies.
+
+    An override replaces upstream text outright; both are stripped, so
+    whitespace-only counts as none. An upstream (or override) that supplies
+    none falls back to the prefixed name -- the only text the proxy holds that
+    says something true about the tool without inventing a claim (#922).
+    """
+    desc = (upstream or "").strip()
+    if override is not None:
+        desc = override.strip()
+    return desc or prefixed_name
+
+
+def compose_description(source: str, budget: DescriptionBudget) -> ComposedDescription:
+    """Compose the client-visible description and report what it cost.
+
+    The suffix wins over upstream text whenever it fits, since it is what tells
+    the client which follow-up tool to call (#893). Truncation owns its own
+    ellipsis, so the result never exceeds ``budget.total``.
+    """
+    if budget.suffix_fits:
+        body = truncate_description(source, budget.body)
+        # The suffix opens with a space and the prefix closes with one. With a
+        # body between them both separate something; with no body left they
+        # would meet, which is where the doubled space in ``[proxied]  | ...``
+        # came from (#922).
+        text = body + budget.suffix if body else budget.suffix.lstrip()
+    else:
+        body = truncate_description(source, budget.total)
+        text = body
+    return ComposedDescription(
+        text=text,
+        chars_cut=len(source) - len(body),
+        suffix_dropped=bool(budget.suffix) and not budget.suffix_fits,
+    )
 
 
 def tag_title(title: str | None, server_name: str) -> str | None:

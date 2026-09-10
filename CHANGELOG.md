@@ -13,6 +13,21 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- `mms doctor` adds a `description budget: <server>` advisory (#1015): per
+  upstream, how many probed descriptions `max_description_chars` would
+  truncate and by how much, the smallest cap that would advertise them all
+  whole, whether the resolved compression strategy's convention suffix fits,
+  and which of the global and per-server levels is binding — raising only the
+  global one is a no-op under `min(server, global)`. WARN or PASS only, so
+  WARN-only runs still exit 0. It is computed from the config file, so it
+  describes what the next start would advertise rather than what a running
+  proxy holds, it carries counts and lengths but never description text, and
+  it is distinct from any cap the client's host applies to a description STM
+  did send (#1014). The advertisement's source and budget rules now live in
+  `proxy.tool_metadata` (`advertised_source_text`, `DescriptionBudget`,
+  `compose_description`), shared by the proxy and the check so the advice
+  cannot drift from what is advertised.
+
 - `mms doctor` reports configured RRF agreement intervals and safe per-tool
   score-pin suggestions from Core's additive fusion settings (#1012; Core
   #2377). The check handles asymmetric/request-expanded candidate limits and

@@ -141,7 +141,9 @@ from memtomem_stm.proxy.tool_relevance import (
     penalty_source,
 )
 from memtomem_stm.proxy.tool_metadata import (
-    PROXIED_PREFIX,
+    DescriptionBudget,
+    advertised_source_text,
+    compose_description,
     convention_suffix,
     distill_schema,
     truncate_description,
@@ -3242,40 +3244,24 @@ class ProxyManager:
                 )
                 suffix = self._convention_suffix(effective_compression, effective_hybrid)
 
-                # Resolve description. ``max_description_chars`` caps what the
-                # CLIENT sees, so every fixed cost comes out of the budget
-                # here: the ``[proxied] `` prefix registration prepends later,
-                # and the convention suffix. Truncation owns its own ellipsis.
-                # A suffix that cannot fit is dropped whole rather than cut — a
-                # cut hint is incomplete, and depending on where it lands may
-                # not name its tool at all — and otherwise wins over upstream
-                # text, since it is what tells the client which follow-up tool
-                # to call (#893).
-                #
-                # Source text is stripped, so whitespace-only text counts as
-                # none, and an upstream (or override) that supplies none falls
-                # back to the prefixed name (#922). The name is the only text
-                # the proxy holds that says something true about the tool
-                # without inventing a claim, and it is budgeted like any other
-                # text — the cap is on what the client sees, and nothing here
-                # is exempt from it. What this replaces is a bare ``[proxied] ``
-                # advertisement carrying no statement at all.
+                # Resolve description. The source rule (#922) and the budget
+                # rule (#893) both live in ``proxy.tool_metadata``, because the
+                # ``mms doctor`` description-budget advisory answers questions
+                # about this exact composition and must not restate it (#1015).
+                # What they encode: the cap is on what the CLIENT sees, so the
+                # ``[proxied] `` prefix registration prepends later and the
+                # convention suffix both come out of it; a suffix that cannot
+                # fit is dropped whole; and an upstream supplying no text falls
+                # back to the prefixed name rather than to a bare prefix.
                 prefixed_name = f"{cfg.prefix}__{t.name}"
-                desc = (t.description or "").strip()
-                if advert_override is not None and advert_override.description_override is not None:
-                    desc = advert_override.description_override.strip()
-                if not desc:
-                    desc = prefixed_name
-                budget = min(max_desc, global_max_desc) - len(PROXIED_PREFIX)
-                if suffix and len(suffix) <= budget:
-                    body = self._truncate_description(desc, budget - len(suffix))
-                    # The suffix opens with a space and the prefix closes with
-                    # one. With a body between them both separate something;
-                    # with no body left they would meet, which is where the
-                    # doubled space in ``[proxied]  | …`` came from (#922).
-                    desc = body + suffix if body else suffix.lstrip()
-                else:
-                    desc = self._truncate_description(desc, budget)
+                desc = advertised_source_text(
+                    t.description,
+                    advert_override.description_override if advert_override is not None else None,
+                    prefixed_name,
+                )
+                desc = compose_description(
+                    desc, DescriptionBudget(max_desc, global_max_desc, suffix)
+                ).text
 
                 # Resolve schema
                 schema = t.input_schema or {"type": "object"}
