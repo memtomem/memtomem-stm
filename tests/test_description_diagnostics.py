@@ -7,6 +7,10 @@ live connection (#1015).
 
 from __future__ import annotations
 
+import re
+
+import pytest
+
 from memtomem_stm.cli.description_diagnostics import (
     _SCOPE,
     description_budget_doctor_checks,
@@ -286,6 +290,41 @@ class TestStrategyPrecedence:
         # Only the tool that kept the suffix loses room to it.
         assert "1 of 2 discovered descriptions exceed the text budget" in detail
         assert "'hinted'" in detail
+
+
+@pytest.mark.parametrize(
+    "server_cap, global_cap, compression, rows",
+    [
+        (100, None, None, (("search", 1830), ("ls", 10))),
+        (32, None, CompressionStrategy.SELECTIVE, (("a", 5),)),
+        (32, None, CompressionStrategy.SELECTIVE, (("a", 500),)),
+        (100, 4000, None, (("a", 5000),)),
+        (4000, 100, None, (("a", 5000),)),
+        (100, 100, CompressionStrategy.PROGRESSIVE, (("a", 900), ("b", 20))),
+    ],
+)
+def test_the_recommended_cap_actually_clears_the_finding(server_cap, global_cap, compression, rows):
+    """The advice is a claim about the state after the edit, so that is what
+    has to be checked.
+
+    Applying the recommended number to every level must silence the check, and
+    one char less must not. A recommendation verified only against today's
+    numbers is how a check ends up repeating, one step later, the very
+    ``min(server, global)`` mistake it exists to catch.
+    """
+    server: dict[str, object] = {"max_description_chars": server_cap}
+    if compression is not None:
+        server["compression"] = compression
+
+    warned = _check(_config(global_cap=global_cap, **server), _probe(*rows))
+    assert warned[2] == "WARN"
+    need = int(re.search(r"a cap of (\d+)", warned[3]).group(1))
+
+    server["max_description_chars"] = need
+    assert _check(_config(global_cap=need, **server), _probe(*rows))[2] == "PASS"
+
+    server["max_description_chars"] = need - 1
+    assert _check(_config(global_cap=need - 1, **server), _probe(*rows))[2] == "WARN"
 
 
 def test_a_server_with_no_probe_entry_is_still_assessed():
