@@ -7542,6 +7542,18 @@ def eject(
 # ── health command ──────────────────────────────────────────────────────
 
 
+def _raw_description_override(entry: Any) -> str | None:
+    """Read ``description_override`` out of an unvalidated tool-override entry.
+
+    The probe runs against the raw config dict, which may not satisfy the
+    schema, so anything but a string is read as no override at all.
+    """
+    if not isinstance(entry, dict):
+        return None
+    value = entry.get("description_override")
+    return value if isinstance(value, str) else None
+
+
 async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
     """Probe a single upstream server: connect, initialize, list tools.
 
@@ -7578,10 +7590,13 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
         # exhausted budget.
         return max(1e-3, deadline - asyncio.get_running_loop().time())
 
+    from memtomem_stm.proxy.tool_metadata import advertised_source_text
+
     transport = str(cfg.get("transport", "stdio"))
     stage = ProbeStage.CONFIGURED
     tools = 0
     overflowing: tuple[str, ...] = ()
+    description_chars: tuple[tuple[str, int], ...] = ()
     try:
         if transport == "stdio":
             ctx = stdio_client(
@@ -7629,6 +7644,26 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
                 overflowing = tuple(
                     t.name for t in result.tools if tool_name_budget.overflows(prefix, t.name)
                 )
+                # Same shape as the name-overflow line above: an advertisement
+                # rule applied here, where the text exists, so nothing
+                # downstream has to mirror it (#1015). The config is the raw
+                # per-server dict and may be schema-invalid, so an override is
+                # read only when it is actually a string.
+                raw_overrides = cfg.get("tool_overrides")
+                overrides = raw_overrides if isinstance(raw_overrides, dict) else {}
+                description_chars = tuple(
+                    (
+                        t.name,
+                        len(
+                            advertised_source_text(
+                                getattr(t, "description", None),
+                                _raw_description_override(overrides.get(t.name)),
+                                f"{prefix}__{t.name}",
+                            )
+                        ),
+                    )
+                    for t in result.tools
+                )
                 # Only now is discovery genuinely complete. Setting the stage
                 # after processing the result (not right after list_tools)
                 # keeps a malformed-result failure classified as an
@@ -7644,7 +7679,11 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
         # error (it's not actionable for a connectivity probe).
         if stage is ProbeStage.TOOLS_DISCOVERED:
             return StagedProbeResult(
-                stage=stage, transport=transport, tools=tools, overflowing=overflowing
+                stage=stage,
+                transport=transport,
+                tools=tools,
+                overflowing=overflowing,
+                description_chars=description_chars,
             )
         # ``asyncio.wait_for`` raises ``TimeoutError`` directly, but anyio's
         # TaskGroup (wrapped by the SDK transports) re-raises failures as
@@ -7657,7 +7696,13 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
         else:
             error = _sanitize_probe_error(_root_cause_message(exc), cfg)
         return StagedProbeResult(stage=stage, transport=transport, error=error)
-    return StagedProbeResult(stage=stage, transport=transport, tools=tools, overflowing=overflowing)
+    return StagedProbeResult(
+        stage=stage,
+        transport=transport,
+        tools=tools,
+        overflowing=overflowing,
+        description_chars=description_chars,
+    )
 
 
 def _format_command_for_display(command: str, args: list[str]) -> str:
@@ -9266,6 +9311,29 @@ def doctor(
                     else:
                         next_cmd = f"mms health {cfg_arg}"
                     check(f"upstream:{n}", f"upstream: {n}", "FAIL", detail, next_cmd)
+
+                # 7b. What the configured description cap does to those tools.
+                # Advisory only: a cap that truncates is a choice, but a cap
+                # that truncates unknowingly — or that a raised global does not
+                # widen, because the two compose as min(server, global) — is
+                # the silent failure (#1015). Guarded on the effective config
+                # for the same reason ``path_hint`` is defined under it.
+                if effective_config is not None:
+                    from memtomem_stm.cli.description_diagnostics import (
+                        description_budget_doctor_checks,
+                    )
+
+                    for desc_check in description_budget_doctor_checks(
+                        effective_config, results, path_hint=path_hint
+                    ):
+                        check_id, label, status, detail, action = desc_check
+                        check(
+                            check_id,
+                            label,
+                            status,
+                            detail,
+                            _HINT_UNRENDERABLE if action and unrenderable else action,
+                        )
             else:
                 check(
                     "upstreams",

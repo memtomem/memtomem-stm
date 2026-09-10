@@ -104,10 +104,17 @@ def _conflict(source: str, source_ref: dict | None = None):
     return _ConflictRecord(source, source_ref if source_ref is not None else {"kind": kind})
 
 
-def _probe_ok(tools: int = 1, overflowing: tuple[str, ...] = ()) -> StagedProbeResult:
+def _probe_ok(
+    tools: int = 1,
+    overflowing: tuple[str, ...] = (),
+    description_chars: tuple[tuple[str, int], ...] = (),
+) -> StagedProbeResult:
     """Fully-successful staged probe result for fake ``_probe_servers``."""
     return StagedProbeResult(
-        stage=ProbeStage.TOOLS_DISCOVERED, tools=tools, overflowing=overflowing
+        stage=ProbeStage.TOOLS_DISCOVERED,
+        tools=tools,
+        overflowing=overflowing,
+        description_chars=description_chars,
     )
 
 
@@ -15126,6 +15133,107 @@ asyncio.run(main())
         assert results["up"].error == "timeout (0.1s)"
         assert results["up"].stage is ProbeStage.CONFIGURED
 
+    @pytest.mark.parametrize(
+        "description, overrides, expected",
+        [
+            # Stripped, because whitespace is not text the client can read.
+            ("  Hello world  ", None, 11),
+            # An override replaces upstream text on the advertisement path too.
+            ("  Hello world  ", {"t1": {"description_override": "Custom"}}, 6),
+            # No text anywhere falls back to the prefixed name (#922).
+            ("", None, len("up__t1")),
+            # The raw config may not satisfy the schema; the probe must not die
+            # on it, and must read no override out of it.
+            ("Hello world", "junk", 11),
+            ("Hello world", {"t1": {"description_override": 7}}, 11),
+        ],
+    )
+    def test_probe_collects_description_lengths_not_text(
+        self, monkeypatch, description, overrides, expected
+    ):
+        """#1015: doctor sizes the description cap from what the probe saw.
+
+        Lengths only — the probe result feeds a report, so it must not become a
+        carrier for upstream description text.
+        """
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        class FakeTransport:
+            async def __aenter__(self):
+                return (object(), object())
+
+            async def __aexit__(self, *_args):
+                return None
+
+        class FakeSession:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def initialize(self):
+                return None
+
+            async def list_tools(self):
+                return SimpleNamespace(
+                    tools=[SimpleNamespace(name="t1", description=description)]
+                )
+
+        monkeypatch.setattr("mcp.client.sse.sse_client", lambda url, **_kw: FakeTransport())
+        monkeypatch.setattr("mcp.ClientSession", FakeSession)
+
+        cfg = {"transport": "sse", "url": "https://up.example/sse", "prefix": "up"}
+        if overrides is not None:
+            cfg["tool_overrides"] = overrides
+        result = asyncio.run(proxy_mod._probe_one(cfg, 5.0))
+
+        assert result.connected is True
+        assert result.description_chars == (("t1", expected),)
+        assert "Hello" not in json.dumps(result.as_dict())
+
+    def test_probe_survives_tools_without_a_description_attribute(self, monkeypatch):
+        """An SDK tool object need not carry ``description``; reading it must
+        not turn discovery into an MCP-stage failure."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        class FakeTransport:
+            async def __aenter__(self):
+                return (object(), object())
+
+            async def __aexit__(self, *_args):
+                return None
+
+        class FakeSession:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def initialize(self):
+                return None
+
+            async def list_tools(self):
+                return SimpleNamespace(tools=[SimpleNamespace(name="t1")])
+
+        monkeypatch.setattr("mcp.client.sse.sse_client", lambda url, **_kw: FakeTransport())
+        monkeypatch.setattr("mcp.ClientSession", FakeSession)
+
+        result = asyncio.run(
+            proxy_mod._probe_one(
+                {"transport": "sse", "url": "https://up.example/sse", "prefix": "up"}, 5.0
+            )
+        )
+        assert result.connected is True
+        assert result.description_chars == (("t1", len("up__t1")),)
+
     @staticmethod
     def _fake_session_cls(*, init_exc: Exception | None = None, tools_exc: Exception | None = None):
         """ClientSession stand-in that fails at a chosen probe phase."""
@@ -15817,6 +15925,78 @@ class TestDoctor:
     def _check_by_id(result, check_id):
         payload = json.loads(result.output)
         return next((c for c in payload["checks"] if c["id"] == check_id), None)
+
+    def test_description_budget_warns_from_probe_lengths(self, runner, config, monkeypatch):
+        """#1015: the cap is enforced but silent — doctor has to say it bit.
+
+        The lengths come off the staged probe the run already made, so the
+        advisory costs no extra upstream round-trip.
+        """
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        async def fake_probe_servers(servers, timeout):
+            return {
+                n: _probe_ok(tools=2, description_chars=(("search", 5000), ("ls", 10)))
+                for n in servers
+            }
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "cache": {"tool_annotation_policy": "strict"},
+                    "upstream_servers": {
+                        "fake": {
+                            "prefix": "fk",
+                            "transport": "stdio",
+                            "command": "x",
+                            "max_description_chars": 100,
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+        check = self._check_by_id(result, "description_budget:fake")
+        assert check is not None
+        assert check["status"] == "WARN"
+        assert "1 of 2 discovered descriptions exceed the text budget" in check["detail"]
+        assert "upstream_servers.fake" in check["next_action"]
+        assert str(config) in check["next_action"]
+        assert "restart" in check["next_action"]
+        # Advisory only: a WARN-only run still exits 0.
+        assert result.exit_code == 0, result.output
+
+    def test_description_budget_passes_by_default_without_leaking_text(
+        self, runner, config, monkeypatch
+    ):
+        """Lengths inform the check; the probe payload keeps its documented shape."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=1, description_chars=(("search", 300),)) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        self._healthy_config(config)
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+        check = self._check_by_id(result, "description_budget:fake")
+        assert check is not None
+        assert check["status"] == "PASS"
+        assert check["next_action"] is None
+        payload = json.loads(result.output)
+        assert set(payload["servers"]["fake"]) == {
+            "connected",
+            "tools",
+            "overflowing",
+            "error",
+            "stage",
+            "failed_stage",
+            "transport",
+        }
 
     def test_unset_enabled_with_upstreams_fails(self, runner, config, monkeypatch):
         """#831: the upstream probes pass while the proxy advertises none of
@@ -17909,6 +18089,7 @@ class TestDoctor:
             "server_transports",
             "prefixes",
             "upstream:fake",
+            "description_budget:fake",
             "host_registration",
             "cache_policy",
             "tuning",

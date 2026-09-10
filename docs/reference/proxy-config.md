@@ -160,9 +160,18 @@ connect-time snapshot, so it takes effect when that upstream next connects; a
 `tools/list_changed` refresh replaces the catalogue but not the configuration
 it is advertised under.
 
+`mms doctor` reports, per upstream, how many of the discovered descriptions
+exceed this cap and by how much (the cut itself can remove more, since it
+retreats to a boundary), the smallest cap that would carry every description and
+its convention suffix whole, whether that suffix fits today, and which levels sit
+below the number it recommends — raising one level of a `min(server, global)`
+pair stops at the other. It reads the config file, so it describes what the next start
+would advertise rather than what a running proxy holds, and it does not measure
+any cap the client's own host applies afterwards.
+
 `stm_proxy_stats` and `stm_proxy_health` report counts, and the `mms` commands
 report configuration and health — tool names among it, but never the advertised
-description text. To see exactly what a client receives, list tools from the
+description text (`mms doctor` reports lengths and counts only). To see exactly what a client receives, list tools from the
 client itself.
 
 ## Compression sections

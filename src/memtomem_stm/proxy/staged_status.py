@@ -74,6 +74,14 @@ class StagedProbeResult:
     error: str | None = None
     tools: int = 0
     overflowing: tuple[str, ...] = ()
+    #: ``(tool name, length of the text the advertisement would budget for it)``
+    #: per discovered tool, with the override and name-fallback rules already
+    #: applied. Lengths only, never the text: this is what the ``mms doctor``
+    #: description-budget advisory needs, and description text is not something
+    #: a probe result should carry into a report (#1015). Deliberately absent
+    #: from ``as_dict()`` -- the JSON probe shape stays as documented, and
+    #: doctor reads this off the object.
+    description_chars: tuple[tuple[str, int], ...] = ()
 
     @property
     def connected(self) -> bool:

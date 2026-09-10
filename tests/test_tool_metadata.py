@@ -23,6 +23,9 @@ from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.proxy.tool_metadata import (
     PROXIED_PREFIX,
+    DescriptionBudget,
+    advertised_source_text,
+    compose_description,
     convention_suffix,
     truncate_description,
 )
@@ -661,6 +664,104 @@ class TestGlobalDefaultCompressionSuffix:
         )
 
         assert mgr.get_proxy_tools()[0].description == "Reads a file."
+
+
+class TestDescriptionBudget:
+    """The budget arithmetic the advertisement and ``mms doctor`` share (#1015)."""
+
+    def test_neither_level_overrides_the_other(self):
+        assert DescriptionBudget(100, 4000).cap == 100
+        assert DescriptionBudget(4000, 100).cap == 100
+        assert DescriptionBudget(100, 100).cap == 100
+
+    def test_binding_names_the_level_an_edit_has_to_land_on(self):
+        assert DescriptionBudget(100, 4000).binding == "server"
+        assert DescriptionBudget(4000, 100).binding == "global"
+        # A tie is "both", because raising either one alone moves nothing.
+        assert DescriptionBudget(100, 100).binding == "both"
+
+    def test_the_prefix_comes_out_of_the_cap(self):
+        assert DescriptionBudget(100, 100).total == 100 - len(PROXIED_PREFIX)
+
+    def test_suffix_fit_boundary_matches_the_advertisement(self):
+        boundary = len(SELECTIVE_SUFFIX) + len(PROXIED_PREFIX)  # 54
+        assert DescriptionBudget(boundary, 9000, SELECTIVE_SUFFIX).suffix_fits
+        assert not DescriptionBudget(boundary - 1, 9000, SELECTIVE_SUFFIX).suffix_fits
+
+    def test_a_fitting_suffix_takes_its_chars_from_the_body(self):
+        plain = DescriptionBudget(200, 200)
+        suffixed = DescriptionBudget(200, 200, SELECTIVE_SUFFIX)
+        assert plain.body == plain.total
+        assert suffixed.body == suffixed.total - len(SELECTIVE_SUFFIX)
+        # A suffix that cannot fit is dropped, so it costs the body nothing.
+        unfit = DescriptionBudget(32, 200, SELECTIVE_SUFFIX)
+        assert unfit.body == unfit.total
+
+    def test_overflow_is_zero_exactly_at_the_body_edge(self):
+        budget = DescriptionBudget(200, 200, SELECTIVE_SUFFIX)
+        assert budget.overflow(budget.body) == 0
+        assert budget.overflow(budget.body + 1) == 1
+        assert budget.overflow(0) == 0
+
+    def test_cap_to_fit_is_the_smallest_cap_that_loses_nothing(self):
+        """At the returned cap the whole advertisement fits; one char less loses
+        something.
+
+        "Something" is deliberately either half: one char below the cap a
+        zero-length source does not overflow, because what falls off is the
+        suffix instead. A cap-to-fit that only counted body chars would call
+        that a fit while the client loses the follow-up-tool hint.
+        """
+        for suffix in ("", SELECTIVE_SUFFIX):
+            for chars in (0, 1, 500):
+                need = DescriptionBudget(9000, 9000, suffix).cap_to_fit(chars)
+                fits = DescriptionBudget(need, need, suffix)
+                assert fits.overflow(chars) == 0
+                assert fits.suffix_fits == bool(suffix)
+
+                short = DescriptionBudget(need - 1, need - 1, suffix)
+                assert short.overflow(chars) > 0 or (bool(suffix) and not short.suffix_fits)
+
+    @pytest.mark.parametrize("cap", [200, 60, 54, 53, 32])
+    def test_compose_agrees_with_the_advertisement(self, cap):
+        """One rule, two readers: the helper must reproduce what is advertised."""
+        source = "A" * 100
+        mgr = _make_manager_with_tools(
+            [_fake_tool("t", description=source)],
+            compression=CompressionStrategy.SELECTIVE,
+            max_description_chars=cap,
+            server_max_desc=cap,
+        )
+        composed = compose_description(
+            source, DescriptionBudget(cap, cap, SELECTIVE_SUFFIX)
+        )
+        assert composed.text == mgr.get_proxy_tools()[0].description
+
+    def test_compose_reports_what_it_gave_up(self):
+        fits = compose_description("A" * 10, DescriptionBudget(200, 200))
+        assert fits.chars_cut == 0
+        assert fits.suffix_dropped is False
+
+        cut = compose_description("A" * 500, DescriptionBudget(200, 200))
+        assert cut.chars_cut == 500 - len(cut.text)
+
+        dropped = compose_description("A" * 100, DescriptionBudget(32, 200, SELECTIVE_SUFFIX))
+        assert dropped.suffix_dropped is True
+        assert "stm_proxy_select_chunks" not in dropped.text
+
+    def test_an_empty_body_still_carries_the_suffix_without_a_doubled_space(self):
+        boundary = len(SELECTIVE_SUFFIX) + len(PROXIED_PREFIX)
+        composed = compose_description("A" * 100, DescriptionBudget(boundary, 9000, SELECTIVE_SUFFIX))
+        assert composed.text == SELECTIVE_SUFFIX.lstrip()
+
+    def test_source_text_precedence(self):
+        assert advertised_source_text("upstream", "override", "srv__t") == "override"
+        assert advertised_source_text("upstream", None, "srv__t") == "upstream"
+        assert advertised_source_text("  padded  ", None, "srv__t") == "padded"
+        # Whitespace is not text, so both sources fall through to the name.
+        assert advertised_source_text("   ", None, "srv__t") == "srv__t"
+        assert advertised_source_text("upstream", "  ", "srv__t") == "srv__t"
+        assert advertised_source_text(None, None, "srv__t") == "srv__t"
 
 
 class TestSuffixBudget:
