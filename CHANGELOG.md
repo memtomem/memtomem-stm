@@ -13,34 +13,37 @@ changes inline only. See the deprecation policy in
 
 ### Upgrade notes
 
-- **Advertised tool descriptions get much longer by default** (#1015). The
-  `max_description_chars` default moves from `200` to `4000` at both the global
-  and the per-server level, so a client that pays for every advertised character
-  on every request sees a larger tool list, and query-aware tool ranking scores
-  more text. The old default reserved the `[proxied] ` prefix out of 200 and
-  truncated most of the descriptions sampled in #1015. Set a real budget
+- **Advertised tool descriptions get much longer by default** (#1015; merged
+  in #1017, #1019). The `max_description_chars` default moves from `200` to
+  `4000` at both the global and the per-server level, so a client that pays for
+  every advertised character on every request sees a larger tool list, and
+  query-aware tool ranking scores more text. The old default reserved the
+  `[proxied] ` prefix out of 200 and truncated most of the descriptions sampled
+  in #1015. Set a real budget
   explicitly if you were relying on the old one; the effective budget is
   `min(server, global)`, so a config that sets only one level can still move.
   `mms doctor` gained a `description budget: <server>` advisory that reports how
   many descriptions exceed the budget and the smallest cap that carries them all.
 
 - **A description that does not fit is cut differently, and can now end in an
-  ellipsis** (#1016). The sentence-boundary retreat is floored at 90% of the
-  budget: a description whose last sentence separator inside the cap sits
-  further back than that is now cut at a word boundary and marked with an
-  ellipsis, rather than shortened silently to wherever that separator fell. In
+  ellipsis** (#1016; merged in #1018). The sentence-boundary retreat is floored
+  at 90% of the budget: a description whose last sentence separator inside the
+  cap sits further back than that is now cut at a word boundary and marked with
+  an ellipsis, rather than shortened silently to wherever that separator fell. In
   practice this is text whose tail is a bullet list or a code block. The
   boundary is also chosen by position now rather than by the order terminators
   are checked in.
 
-- **Surfacing injects memories it previously filtered out** (#875). The
-  `surfacing.min_score` default moves from `0.03` to `0.017`, placed at the
-  "found by both retrieval legs" boundary of Core's baseline RRF fusion. If you
+- **Surfacing injects memories it previously filtered out** (#875; merged in
+  #1011). The `surfacing.min_score` default moves from `0.03` to `0.017`,
+  placed at the "found by both retrieval legs" boundary of Core's baseline RRF
+  fusion. If you
   run off that baseline — a different `rrf_k`, weights other than `[1.0, 1.0]`,
   different candidate limits, a rescue leg, or Core's decay/boost stages — pin
   `context_tools.<tool>.min_score` instead of relying on the default; under the
   `compact` result format the agreement reading does not hold at all.
-  `mms doctor` now reports the configured agreement interval and a safe pin.
+  `mms doctor` now reports the configured agreement interval, and a safe pin
+  when the configured profile supports one (#1012; merged in #1013).
 
 - **Exited surfacing daemon children are reaped while their host lives**
   (#1008). Detached children no longer linger as zombies, and a reaped pid stops
@@ -49,6 +52,14 @@ changes inline only. See the deprecation policy in
   outright with its cause instead of retrying it for the whole readiness window.
 
 ### Added
+
+- Pushing a `v*` tag now creates the GitHub Release from the tag workflow
+  (#1007). The Release object had been forgotten by hand three times (v0.1.3,
+  v0.2.0, v0.4.0) while the tag and the PyPI upload went out fine, leaving
+  `gh release list` showing an older release as Latest — for ten days after
+  v0.2.0. **Behavior change**: none external; the installed package is
+  unaffected, and what changes is what appears on the repository's releases
+  page after a tag push.
 
 - `mms doctor` adds a `description budget: <server>` advisory (#1015): per
   upstream, how many discovered descriptions exceed the `max_description_chars`
