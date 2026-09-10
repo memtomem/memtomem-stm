@@ -64,7 +64,7 @@ class TestStatusContract:
         assert check[0] == "description_budget:docs"
         assert check[1] == "description budget: docs"
         assert check[2] == "PASS"
-        assert "all 2 descriptions fit whole" in check[3]
+        assert "all 2 discovered descriptions fit whole" in check[3]
         assert "longest 300 chars" in check[3]
         assert check[4] is None
 
@@ -103,16 +103,28 @@ class TestBindingLevel:
 
     def test_global_binds_when_it_is_the_stricter(self):
         config = _config(global_cap=100, max_description_chars=4000)
-        check = _check(config, _probe(("a", 5000)))
+        check = _check(config, _probe(("a", 500)))
         assert "the global value binds" in check[3]
-        assert "top-level" in check[4]
+        assert "the top level" in check[4]
+        # Only the global is under the requirement, so only it is named.
         assert "upstream_servers.docs" not in check[4]
 
     def test_equal_levels_name_both(self):
         config = _config(global_cap=100, max_description_chars=100)
         check = _check(config, _probe(("a", 5000)))
         assert "both levels bind equally" in check[3]
-        assert "top level and on upstream_servers.docs" in check[4]
+        assert "upstream_servers.docs and the top level" in check[4]
+
+    def test_every_level_below_the_requirement_is_named(self):
+        """Raising the binding level alone stops at whichever level is next.
+
+        server 100 / global 4000 needing 5010: an edit to the server alone
+        leaves the global capping it at 4000, which is the very mistake this
+        check exists to catch.
+        """
+        check = _check(_config(global_cap=4000, max_description_chars=100), _probe(("a", 5000)))
+        assert "5010" in check[4]
+        assert "upstream_servers.docs and the top level" in check[4]
 
     def test_binding_alone_is_not_a_finding(self):
         """A deliberately lower per-server cap that truncates nothing is fine."""
@@ -125,10 +137,21 @@ class TestTruncation:
     def test_counts_and_sizes_the_overflow(self):
         check = _check(_config(max_description_chars=100), _probe(("search", 1830), ("ls", 10)))
         assert check[2] == "WARN"
-        assert "1 of 2 descriptions truncated" in check[3]
-        assert "longest by 1740 chars ('search', 1830 chars)" in check[3]
+        assert "1 of 2 discovered descriptions exceed the text budget" in check[3]
+        assert "largest by 1740 chars over it ('search', 1830 chars)" in check[3]
         assert "a cap of 1840" in check[3]
         assert "1840" in check[4]
+
+    def test_the_overflow_is_named_as_a_budget_excess_not_the_cut(self):
+        """The cut can remove more than the excess, so the line must not claim
+        the excess IS the loss.
+
+        A word-boundary retreat plus the ellipsis drops far more than the
+        overflow: 101 chars into a 90-char budget shows 43, not 79.
+        """
+        detail = _check(_config(max_description_chars=100), _probe(("a", 101)))[3]
+        assert "over it" in detail
+        assert "retreats to a word or sentence boundary" in detail
 
     def test_a_fitting_suffix_shrinks_the_body(self):
         """The suffix takes its chars first, so it moves the truncation edge."""
@@ -145,20 +168,28 @@ class TestTruncation:
     def test_unreachable_upstream_says_it_did_not_measure(self):
         check = _check(_config(max_description_chars=100), _probe(connected=False))
         assert "per-tool truncation was not assessed" in check[3]
-        assert "not reachable" in check[3]
-        assert "descriptions truncated" not in check[3]
+        assert "tool discovery did not complete" in check[3]
+        assert "exceed the text budget" not in check[3]
 
     def test_each_silence_names_its_own_reason(self):
         """A reachable upstream that advertises nothing is not an unreachable one."""
         config = _config(max_description_chars=100)
         assert "not probed in this run" in _check(config, {})[3]
-        assert "not reachable" in _check(config, _probe(connected=False))[3]
+        assert "tool discovery did not complete" in _check(config, _probe(connected=False))[3]
         assert "advertises no tools" in _check(config, _probe())[3]
 
-        stale = {
-            "docs": StagedProbeResult(stage=ProbeStage.TOOLS_DISCOVERED, tools=2)
-        }
+        stale = {"docs": StagedProbeResult(stage=ProbeStage.TOOLS_DISCOVERED, tools=2)}
         assert "no per-tool description lengths" in _check(config, stale)[3]
+
+    def test_a_failed_discovery_names_the_stage_it_reached(self):
+        """Connect and initialize can succeed while ``tools/list`` fails; calling
+        that "unreachable" sends the operator after the wrong thing."""
+        probes = {
+            "docs": StagedProbeResult(stage=ProbeStage.MCP_INITIALIZED, error="boom", tools=0)
+        }
+        detail = _check(_config(), probes)[3]
+        assert "tool discovery did not complete" in detail
+        assert "tools discovered" in detail
 
     def test_hidden_tools_are_not_counted(self):
         config = _config(
@@ -167,7 +198,14 @@ class TestTruncation:
         )
         check = _check(config, _probe(("search", 5000), ("ls", 10)))
         assert check[2] == "PASS"
-        assert "all 1 descriptions fit whole" in check[3]
+        assert "all 1 discovered descriptions fit whole" in check[3]
+
+    def test_the_scope_admits_what_it_did_not_apply(self):
+        """Hidden is the only exposure rule applied, so the counts are about
+        discovered tools, not advertised ones — and must say so."""
+        detail = _check(_config(), _probe(("a", 10)))[3]
+        assert "exposure filtering" in detail
+        assert "can withhold more" in detail
 
 
 class TestSuffixFit:
@@ -178,7 +216,34 @@ class TestSuffixFit:
         assert "convention suffix" in check[3]
         assert "(44 chars) is dropped" in check[3]
         assert "only 22 chars remain" in check[3]
-        assert "54" in check[4]
+        # 54 readmits the suffix but leaves zero body: the 5-char description
+        # would be cut to nothing. Keeping both needs 5 + 10 + 44.
+        assert "59" in check[4]
+        assert "a cap of 59" in check[3]
+
+    def test_a_recommendation_keeps_the_body_it_restores_the_suffix_beside(self):
+        for chars, need in ((5, 59), (100, 154)):
+            config = _config(
+                max_description_chars=32, compression=CompressionStrategy.SELECTIVE
+            )
+            check = _check(config, _probe(("a", chars)))
+            assert f"a cap of {need}" in check[3]
+
+    def test_mixed_suffix_lengths_report_the_one_that_sets_the_requirement(self):
+        """Two strategies drop two different suffixes; the line must not depend
+        on which row happened to come last."""
+        config = _config(
+            max_description_chars=32,
+            compression=CompressionStrategy.HYBRID,
+            hybrid=HybridConfig(tail_mode=TailMode.TOC),
+            tool_overrides={
+                "long": ToolOverrideConfig(compression=CompressionStrategy.SELECTIVE)
+            },
+        )
+        forward = _check(config, _probe(("long", 5), ("short", 5)))[3]
+        reverse = _check(config, _probe(("short", 5), ("long", 5)))[3]
+        assert "(44 chars) is dropped on 2 tool(s)" in forward
+        assert forward == reverse
 
     def test_it_is_reported_without_a_reachable_upstream(self):
         """The fit is a config fact, so a dead upstream does not hide it."""
@@ -219,7 +284,7 @@ class TestStrategyPrecedence:
         )
         detail = _check(config, _probe(("plain", 90), ("hinted", 90)))[3]
         # Only the tool that kept the suffix loses room to it.
-        assert "1 of 2 descriptions truncated" in detail
+        assert "1 of 2 discovered descriptions exceed the text budget" in detail
         assert "'hinted'" in detail
 
 

@@ -15963,7 +15963,7 @@ class TestDoctor:
         check = self._check_by_id(result, "description_budget:fake")
         assert check is not None
         assert check["status"] == "WARN"
-        assert "1 of 2 descriptions truncated" in check["detail"]
+        assert "1 of 2 discovered descriptions exceed the text budget" in check["detail"]
         assert "upstream_servers.fake" in check["next_action"]
         assert str(config) in check["next_action"]
         assert "restart" in check["next_action"]

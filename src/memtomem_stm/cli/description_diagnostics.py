@@ -30,7 +30,8 @@ _SCOPE = (
     "Computed from the config file as the proxy would advertise it at its next start; a "
     "running proxy keeps the per-server budget it connected with until then. A host may cut "
     "descriptions again on its own side, which is a separate limit and is not measured here "
-    "(#1014)."
+    "(#1014). Counts cover the tools this upstream reported, minus any hidden by config; "
+    "exposure filtering — profiles, the tool-name budget, collisions — can withhold more."
 )
 
 
@@ -47,22 +48,28 @@ def _binding_clause(budget: DescriptionBudget) -> str:
 
 
 def _next_action(budget: DescriptionBudget, name: str, need: int, path_hint: str) -> str:
+    """Name every level that has to move, not just the one binding today.
+
+    The cap is ``min(server, global)``, so raising the binding level alone
+    stops at whichever level is next. Recommending only that one is the same
+    mistake this check exists to catch, one step further along.
+    """
     # Edit-this-file instructions lead with ``#``: a pasted ``next:`` line must
     # never *do* anything (same rule as doctor's other config hints).
     tail = "restart the proxy to apply"
-    if budget.binding == "server":
-        return (
-            f'# set "max_description_chars": {need} on upstream_servers.{name} in {path_hint}'
-            f"  (the global {budget.global_cap} is not the limit; {tail})"
-        )
-    if budget.binding == "global":
-        return (
-            f'# set the top-level "max_description_chars": {need} in {path_hint}'
-            f"  (server '{name}' allows {budget.server_cap}; {tail})"
-        )
+    below = []
+    if budget.server_cap < need:
+        below.append(f"upstream_servers.{name}")
+    if budget.global_cap < need:
+        below.append("the top level")
+    if not below:
+        # Nothing is under the requirement, so the finding is not about the
+        # numbers: it is a suffix that no valid cap change would restore.
+        return f"# review the compression strategy for upstream_servers.{name} in {path_hint}"
+    where = " and ".join(below)
     return (
-        f'# set "max_description_chars": {need} at top level and on '
-        f"upstream_servers.{name} in {path_hint}  (the budget is min(server, global); {tail})"
+        f'# set "max_description_chars": {need} on {where} in {path_hint}'
+        f"  (the budget is min(server, global), so every level below {need} has to move; {tail})"
     )
 
 
@@ -76,7 +83,9 @@ def _unmeasured_reason(probe: StagedProbeResult | None, name: str) -> str:
     if probe is None:
         return "this upstream was not probed in this run"
     if not probe.connected:
-        return f"upstream not reachable in this run — see upstream: {name}"
+        stage = probe.failed_stage
+        reached = f" — failed at '{stage.display()}'" if stage is not None else ""
+        return f"tool discovery did not complete{reached}; see upstream: {name}"
     if not probe.tools:
         return "this upstream advertises no tools"
     return "the probe reported no per-tool description lengths"
@@ -114,15 +123,17 @@ def description_budget_doctor_checks(
 
         truncated: list[tuple[str, int, int]] = []  # (tool, overflow, source chars)
         needs: list[int] = []
-        dropped_tools: list[str] = []
-        dropped_suffix = ""
+        dropped: list[str] = []  # suffixes dropped, one entry per tool
         assessed = 0
         longest = 0
 
         for tool, chars in rows:
             override = server_cfg.tool_overrides.get(tool)
             if override is not None and override.hidden:
-                # Never advertised, so its length spends no budget.
+                # Hidden tools are advertised nowhere, so their length spends
+                # no budget. Other exposure rules are NOT applied here -- see
+                # the scope note, which is why the counts below are worded as
+                # discovered rather than advertised.
                 continue
             assessed += 1
             longest = max(longest, chars)
@@ -132,17 +143,26 @@ def description_budget_doctor_checks(
                 convention_suffix(*effective_compression_pair(server_cfg, override, config)),
             )
             overflow = budget.overflow(chars)
+            suffix_lost = bool(budget.suffix) and not budget.suffix_fits
             if overflow:
                 truncated.append((tool, overflow, chars))
+            if suffix_lost:
+                dropped.append(budget.suffix)
+            if overflow or suffix_lost:
+                # The cap that loses nothing for THIS tool: its own body plus
+                # the prefix plus its own resolved suffix. A cap that merely
+                # readmits the suffix would starve the body it displaces, and
+                # a per-tool strategy makes the requirement per-tool too, so
+                # the recommendation is the maximum over the findings rather
+                # than an arithmetic minimum computed once.
                 needs.append(budget.cap_to_fit(chars))
-            if budget.suffix and not budget.suffix_fits:
-                dropped_tools.append(tool)
-                dropped_suffix = budget.suffix
 
         # With no probed tools the suffix is still a config fact, so a dead or
-        # unprobed upstream does not hide it.
+        # unprobed upstream does not hide it. Nothing is known about body
+        # lengths there, so the requirement covers the suffix alone.
         if not rows and server_budget.suffix and not server_budget.suffix_fits:
-            dropped_suffix = server_budget.suffix
+            dropped.append(server_budget.suffix)
+            needs.append(server_budget.cap_to_fit(0))
 
         parts = [
             f"cap {server_budget.cap} = min("
@@ -163,28 +183,35 @@ def description_budget_doctor_checks(
         elif truncated:
             tool, overflow, chars = max(truncated, key=lambda row: row[1])
             parts.append(
-                f"{len(truncated)} of {assessed} descriptions truncated, longest by "
-                f"{overflow} chars ('{tool}', {chars} chars); a cap of {max(needs)} would "
-                "advertise every description whole"
+                f"{len(truncated)} of {assessed} discovered descriptions exceed the text "
+                f"budget, largest by {overflow} chars over it ('{tool}', {chars} chars) — the "
+                "cut itself drops at least that much, and more when it retreats to a word or "
+                "sentence boundary"
             )
         else:
-            parts.append(f"all {assessed} descriptions fit whole (longest {longest} chars)")
-
-        if dropped_suffix:
-            where = f"{len(dropped_tools)} tool(s)" if dropped_tools else "this server"
             parts.append(
-                f"the convention suffix '{dropped_suffix.strip()}' "
-                f"({len(dropped_suffix)} chars) is dropped on {where}: only "
-                f"{server_budget.total} chars remain after the prefix, so the client is not "
-                "told which follow-up tool to call before it calls"
+                f"all {assessed} discovered descriptions fit whole (longest {longest} chars)"
+            )
+
+        if dropped:
+            # Strategies can differ per tool, so report the longest dropped
+            # suffix: it is the one that sets the requirement, and picking any
+            # other would make the line depend on the order rows arrived in.
+            worst = max(dropped, key=len)
+            parts.append(
+                f"the convention suffix '{worst.strip()}' ({len(worst)} chars) is dropped on "
+                f"{len(dropped)} tool(s): only {server_budget.total} chars remain after the "
+                "prefix, so the client is not told which follow-up tool to call before it calls"
+            )
+
+        if needs:
+            parts.append(
+                f"a cap of {max(needs)} would carry every discovered description and its hint whole"
             )
 
         detail = "; ".join(parts) + ". " + _SCOPE
-        if truncated or dropped_suffix:
-            need = max(
-                needs + ([len(dropped_suffix) + len(PROXIED_PREFIX)] if dropped_suffix else [])
-            )
-            action: str | None = _next_action(server_budget, name, need, path_hint)
+        if needs:
+            action: str | None = _next_action(server_budget, name, max(needs), path_hint)
             status = "WARN"
         else:
             action = None
