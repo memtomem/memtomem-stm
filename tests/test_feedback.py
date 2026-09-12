@@ -11,7 +11,12 @@ import pytest
 
 from memtomem_stm.proxy.compression_feedback_store import CompressionFeedbackStore
 from memtomem_stm.surfacing.config import SurfacingConfig
-from memtomem_stm.surfacing.feedback import AutoTuner, FeedbackTracker, record_feedback_batch
+from memtomem_stm.surfacing.feedback import (
+    AutoTuner,
+    FeedbackTracker,
+    _rejection_message,
+    record_feedback_batch,
+)
 from memtomem_stm.surfacing.feedback_store import (
     FeedbackRejection,
     FeedbackStore,
@@ -195,9 +200,43 @@ class TestFeedbackStore:
         tracker = FeedbackTracker(SurfacingConfig(feedback_db_path=tmp_path / "fb.db"))
         try:
             msg = tracker.record_feedback("ghost", "helpful", None)
-            assert "ghost" in msg and "not found" in msg
+            # The whole string, not substrings: the change claims this reply is
+            # byte-identical to the pre-fix one, and only equality pins that.
+            assert msg == "Error: surfacing event 'ghost' not found"
         finally:
             tracker.close()
+
+    def test_every_rejection_renders_a_distinct_message(self) -> None:
+        """The renderer is the whole user-facing contract, so pin each branch.
+
+        Three of the five reasons are unreachable through ``FeedbackTracker``
+        (its own validation or a healthy store precedes them), so a store-level
+        outcome test cannot reach their wording — only calling the renderer can.
+        """
+        msgs = {r: _rejection_message(r, "evt1", "mem1") for r in FeedbackRejection}
+        assert len(set(msgs.values())) == len(FeedbackRejection), "messages must be distinct"
+        # Only the membership failure may claim the event is still usable, and
+        # only the absent-event branch may say "not found" — the whole point.
+        assert "still valid" in msgs[FeedbackRejection.MEMORY_NOT_IN_EVENT]
+        assert [r for r, m in msgs.items() if "not found" in m] == [
+            FeedbackRejection.EVENT_NOT_FOUND
+        ]
+        assert "unreadable" in msgs[FeedbackRejection.EVENT_MEMORY_IDS_UNREADABLE]
+        assert "closed" in msgs[FeedbackRejection.STORE_CLOSED]
+        assert "encoded" in msgs[FeedbackRejection.UNUSABLE_IDENTIFIER]
+        # STORE_CLOSED concerns neither identifier, so it must name neither.
+        assert "evt1" not in msgs[FeedbackRejection.STORE_CLOSED]
+        assert "mem1" not in msgs[FeedbackRejection.STORE_CLOSED]
+
+    def test_unhandled_rejection_raises_rather_than_claiming_not_found(self) -> None:
+        """``assert_never`` is the guard; prove it fires instead of falling through.
+
+        A future member left unhandled must not be rendered as "event not
+        found" — that is the defect this module exists to undo. mypy catches
+        the omission first; this pins the runtime half.
+        """
+        with pytest.raises(AssertionError):
+            _rejection_message("not_a_member", "evt1", None)  # type: ignore[arg-type]
 
     def test_batch_path_reports_the_same_distinction(self, tmp_path: Path) -> None:
         """``record_feedback_batch`` renders per entry, so it inherits the defect."""

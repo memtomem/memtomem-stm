@@ -75,10 +75,11 @@ def _rejection_message(
 ) -> str:
     """Render one rejection for the agent that tried to rate.
 
-    Each branch says which of the two identifiers is the problem, because the
-    agent's next move differs: a dead event means stop, a wrong ``memory_id``
-    means retry with one the event actually surfaced. The old single message
-    claimed the event was missing in both cases (#1023).
+    Each branch explains the refusal and, where there is an offending argument,
+    identifies which one — because the agent's next move differs: a dead event
+    means stop, a wrong ``memory_id`` means retry with one the event actually
+    surfaced. ``STORE_CLOSED`` concerns neither identifier, so it names none.
+    The old single message claimed the event was missing in every case (#1023).
     """
     if rejection is FeedbackRejection.MEMORY_NOT_IN_EVENT:
         return (
