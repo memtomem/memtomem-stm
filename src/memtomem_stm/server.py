@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Any
 
 from mcp.server.mcpserver import Context, MCPServer
+from pydantic import StrictInt
 
 # Module-level on purpose: the proxy handler's ``-> CallToolResult`` return
 # annotation is a STRING under ``from __future__ import annotations``, and
@@ -36,6 +37,11 @@ from memtomem_stm.proxy.config import (
     warn_if_upstreams_inert,
 )
 from memtomem_stm.proxy.manager import ProxyManager, ProxyToolInfo
+from memtomem_stm.proxy.metadata_recovery import (
+    DEFAULT_RECOVERY_PAGE_CHARS,
+    RecoveryPart,
+    recovery_result,
+)
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
 from memtomem_stm.proxy.selection_log import aggregate_selection_log
@@ -1249,19 +1255,31 @@ async def stm_proxy_stats(
 async def stm_proxy_describe_tool(
     name: str,
     ctx: CtxType = None,  # type: ignore[assignment]
-) -> dict[str, Any]:
-    """Read the uncut instructions and input schema for a registered proxied tool.
+    *,
+    part: RecoveryPart = "description",
+    offset: StrictInt = 0,
+    limit: StrictInt = DEFAULT_RECOVERY_PAGE_CHARS,
+    generation: str | None = None,
+) -> CallToolResult:
+    """Read bounded pages of a registered tool's full metadata.
 
-    Use when a description is truncated or says 'full: stm_proxy_describe_tool',
-    or schema descriptions were removed. Pass STM's prefix__tool name, e.g.
-    cedar__search_docs, WITHOUT a host-added mcp__server__ prefix.
-    description follows operator overrides. response_hint explains proxy
-    follow-ups. Text fields have a length ceiling of their own: omitted_chars,
-    when present, counts what it dropped, and that remainder cannot be paged
-    for. upstream_description appears only when the operator opted in.
-    This reads cached metadata and does not execute the upstream tool.
+    Pass STM's prefix__tool name WITHOUT a host-added mcp__server__ prefix.
+    part defaults to description (effective instructions respecting overrides).
+    Choose input_schema explicitly to recover its descriptions and examples;
+    concatenate the pages' text, then parse the JSON. upstream_description is
+    available only when the operator opted in and configured an override.
+    Every page contains text, format, total_chars, generation and next_offset.
+    Continue with the same name, part and generation, using next_offset as
+    offset; null next_offset means complete. A changed generation requires a
+    restart at offset 0 without generation. Offsets and limit count characters;
+    limit is 1..16000 (default 4000), but the 16384-byte whole-result budget can
+    shorten a page. response_hint explains the tool's compression follow-ups.
+    This reads registered metadata without executing the upstream tool.
     """
-    return _get_ctx(ctx).proxy_manager.describe_tool(name)
+    page = _get_ctx(ctx).proxy_manager.describe_tool(
+        name, part=part, offset=offset, limit=limit, generation=generation
+    )
+    return recovery_result(page)
 
 
 # ---------------------------------------------------------------------------
