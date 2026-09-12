@@ -505,6 +505,11 @@ def _flags_sensitive_metadata(candidate: ExposureCandidate) -> bool:
     """
     info = candidate.info
     texts = [candidate.raw_description, info.description, info.prefixed_name]
+    # A full override can now be recovered even when its tail did not fit in
+    # tools/list. Scan it separately, like every other text boundary here.
+    override = candidate.server_config.tool_overrides.get(info.original_name)
+    if override is not None and override.description_override is not None:
+        texts.append(override.description_override)
     try:
         tagged_annotations = tag_annotations_title(info.annotations, info.server)
         # Only when the upstream supplied one: registration passes no

@@ -2222,11 +2222,31 @@ class ProxyConfig(BaseModel):
     registered keeps the length it was given until the next registration — a
     restart, or an upstream catalogue change (#893).
     """
+    host_description_cap: int | None = Field(default=None, ge=MIN_DESCRIPTION_CHARS)
+    """Explicit host description limit, including the proxy prefix and hints.
+
+    Unset means unknown: no host limit is inferred. Applied at the next
+    advertisement alongside min(server, global); restart to apply reliably.
+    """
     strip_schema_descriptions: bool = False
     advertise_context_query: bool = False
     """Advertise the proxy-only ``_context_query`` string in every upstream
     tool schema. Opt-in preserves existing catalogs; the argument is stripped
     before forwarding and only guides query-aware compression and surfacing."""
+    recover_upstream_description: bool = False
+    """Also return the text a ``description_override`` replaced (#1014).
+
+    Off by default, and the default is the safe direction rather than the
+    convenient one. An override exists to decide what the MODEL is told; one
+    legitimate use is neutralizing an upstream description that is misleading
+    or actively hostile. Handing that same text back through recovery would
+    undo the override for the one reader it was written for, and no scan here
+    can help: the credential patterns look for secrets, not for instructions.
+
+    Turn it on when the operator wants recovery to double as a diagnostic and
+    accepts that upstream text reaches the model. Shaped like
+    ``advertise_context_query`` above: global-only, read at the next
+    advertisement, restart to apply reliably."""
     # Bounded lock acquisition timeout (#208). Applies to internal state
     # locks in ``ProxyManager`` (selective compressor, LLM compressor,
     # extractor). A timeout here raises ``LockTimeoutError`` → recorded as

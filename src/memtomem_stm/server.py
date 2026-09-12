@@ -586,7 +586,9 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
             # to what actually registered so health counts, relevance ranking
             # and selection telemetry describe the tools a client can call
             # (#908).
-            proxy_manager.retain_registered_advertisement(list(registered_proxy_tools))
+            proxy_manager.retain_registered_advertisement(
+                list(registered_proxy_tools), registered_infos=registered_proxy_tools
+            )
 
             # Proxied tools are now in front; re-insert STM utility tools at
             # the end so ``tools/list`` yields domain tools first (#228).
@@ -607,10 +609,15 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                 embedding host owns must go on being declined rather than
                 stolen — so removal reads ``registered_proxy_tools`` and every
                 claim goes back through ``register_proxy_tool``'s own probe.
-                A surviving tool whose advertised metadata moved is
-                re-registered too, because ``get_proxy_tools`` has already
-                rewritten the snapshot that ranking and telemetry read and the
-                registry would otherwise describe a different tool than they do.
+                A surviving tool whose metadata moved is re-registered too,
+                because ``get_proxy_tools`` has already rewritten the snapshot
+                that ranking and telemetry read and the registry would
+                otherwise describe a different tool than they do. "Metadata"
+                here reaches past what ``tools/list`` carries: recovery details
+                are compared as well (see ``ProxyToolInfo``), so a change only
+                ``stm_proxy_describe_tool`` would show still re-registers and
+                still announces -- the claim loop below skips names already
+                held, so nothing else would refresh the recovery snapshot.
                 """
                 desired = {info.prefixed_name: info for info in manager.get_proxy_tools()}
                 changed = False
@@ -648,7 +655,9 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                 # Unconditional: ``get_proxy_tools`` rebuilt every ``_advertised_*``
                 # field from scratch, so a name the registry declined is back in
                 # the snapshot until this narrows it out again.
-                manager.retain_registered_advertisement(list(registered_proxy_tools))
+                manager.retain_registered_advertisement(
+                    list(registered_proxy_tools), registered_infos=registered_proxy_tools
+                )
                 if not changed:
                     return
                 _move_stm_tools_to_end(server)
@@ -926,6 +935,7 @@ def _hidden_obs_tools_hint() -> str | None:
 # tools* matters; see ``_move_stm_tools_to_end``.
 _STM_UTILITY_TOOL_NAMES: tuple[str, ...] = (
     "stm_proxy_stats",
+    "stm_proxy_describe_tool",
     "stm_proxy_select_chunks",
     "stm_proxy_read_more",
     "stm_proxy_cache_clear",
@@ -1233,6 +1243,25 @@ async def stm_proxy_stats(
         lines.append("\nSurfacing: disabled")
 
     return "\n".join(lines)
+
+
+@mcp.tool()
+async def stm_proxy_describe_tool(
+    name: str,
+    ctx: CtxType = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Read the uncut instructions and input schema for a registered proxied tool.
+
+    Use when a description is truncated or says 'full: stm_proxy_describe_tool',
+    or schema descriptions were removed. Pass STM's prefix__tool name, e.g.
+    cedar__search_docs, WITHOUT a host-added mcp__server__ prefix.
+    description follows operator overrides. response_hint explains proxy
+    follow-ups. Text fields have a length ceiling of their own: omitted_chars,
+    when present, counts what it dropped, and that remainder cannot be paged
+    for. upstream_description appears only when the operator opted in.
+    This reads cached metadata and does not execute the upstream tool.
+    """
+    return _get_ctx(ctx).proxy_manager.describe_tool(name)
 
 
 # ---------------------------------------------------------------------------

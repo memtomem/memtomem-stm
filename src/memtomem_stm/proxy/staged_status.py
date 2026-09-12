@@ -82,6 +82,9 @@ class StagedProbeResult:
     #: from ``as_dict()`` -- the JSON probe shape stays as documented, and
     #: doctor reads this off the object.
     description_chars: tuple[tuple[str, int], ...] = ()
+    #: Names whose schemas contain removable descriptions/examples. No raw
+    #: metadata is retained; the global/per-server strip flags are applied by doctor.
+    schema_description_tools: tuple[str, ...] = ()
 
     @property
     def connected(self) -> bool:

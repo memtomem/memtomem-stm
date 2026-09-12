@@ -1346,7 +1346,7 @@ def test_public_tool_counts_match_runtime_registration_sets() -> None:
     for name in _OBSERVABILITY_TOOL_NAMES:
         assert f"`{name}`" in mcp_ref
     assert len(_OBSERVABILITY_TOOL_NAMES) == 8
-    assert "four model-facing tools" in mcp_ref
+    assert "five model-facing tools" in mcp_ref
     assert "`stm_memory_propose`" in mcp_ref
 
 
