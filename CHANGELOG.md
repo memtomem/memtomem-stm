@@ -11,18 +11,25 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Behavior change**: the unreleased `stm_proxy_describe_tool` response is now
+  a selected-part page. Calls with only `name` return description text; request
+  `part="input_schema"` separately. Read `text` and continue with `next_offset`
+  and `generation`; concatenate schema text before parsing JSON. The old
+  all-fields response and lossy `omitted_chars` field are replaced. If metadata
+  changes, discard accumulated pages and restart at offset 0 without a token.
+
 ### Added
 
-- Full metadata recovery for advertised tools (#1014):
-  `stm_proxy_describe_tool(name)` returns effective instructions past the
-  advertised cap, restored input-schema descriptions, and compression follow-up
-  guidance. It is model-facing by default (five tools, up from four) and reads
-  only successfully registered metadata snapshots. Each free-text field is
-  itself capped at 16,000 characters, with any overflow counted in an
-  `omitted_chars` field rather than marked inside the text; the cut is made
-  once when the advertisement is built and text past it is not retrievable by
-  any call (#1026). The input schema is returned whole and is not capped
-  (#1027).
+- Full metadata recovery for advertised tools (#1014, #1026, #1027):
+  `stm_proxy_describe_tool` reads complete registered sources through bounded,
+  generation-pinned pages. `part` selects effective instructions, restored
+  input schema, or explicitly opted-in upstream instructions. Every MCP result
+  stays within 16,384 UTF-8 bytes including text/structured duplication and
+  metadata; `offset`, `limit`, and `generation` allow lossless continuation.
+  It is model-facing by default (five tools, up from four) and never executes
+  upstream tools or runs the response pipeline.
 - Optional global `recover_upstream_description` (default `false`) lets recovery
   also return the text a `description_override` replaced (#1014). Off by
   default because an override decides what the model is told, and one

@@ -160,14 +160,13 @@ budget; this setting uses the same character count as `max_description_chars`.
 If source text is cut, or schema descriptions/examples are removed, STM appends
 ` | full: stm_proxy_describe_tool` when it fits. The model can call that tool
 with the exact advertised `prefix__tool` name to recover the instructions this
-cap discarded, together with the input schema. Recovery has a ceiling of its
-own — see [full tool metadata](mcp-tools.md#full-tool-metadata) — and that
-ceiling is on the **source**, not on the cap it undoes: a description whose
-source fits in 16,000 characters comes back whole however small the advertised
-cap was, and one longer than that stays cut at 16,000 no matter how generous
-the cap, with `omitted_chars` reporting the overflow nothing can retrieve. The
-tool is always advertised, including when observability tools are hidden. An
-uncut description with an unchanged schema needs no hint.
+cap discarded. The default call returns a description page; choose
+`part="input_schema"` to recover the schema separately. Recovery pages share a
+16,384-byte whole-MCP-result budget and can be continued using `next_offset`
+and `generation`, so there is no source-length cut. See
+[full tool metadata](mcp-tools.md#full-tool-metadata) for arguments and schema
+reassembly. The tool is always advertised, including when observability tools
+are hidden. An uncut description with an unchanged schema needs no hint.
 
 The compression hint is reserved first, the recovery hint second, then the
 remaining budget goes to source text. Neither hint is shortened. At tiny budgets

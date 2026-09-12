@@ -8,7 +8,7 @@ All connected upstream tools are added as `{prefix}__{tool}`.
 
 | Tool | Arguments | Purpose |
 |---|---|---|
-| `stm_proxy_describe_tool` | `name` | Retrieve full instructions and input schema for an advertised `prefix__tool` |
+| `stm_proxy_describe_tool` | `name`, `part?`, `offset?=0`, `limit?=4000`, `generation?` | Read bounded pages of instructions or input schema for an advertised `prefix__tool` |
 | `stm_proxy_select_chunks` | `key`, `sections[]` | Retrieve selected TOC sections |
 | `stm_proxy_read_more` | `key`, `offset?=0`, `limit?` | Continue a progressive response |
 | `stm_surfacing_feedback` | `surfacing_id`, `rating?`, `memory_id?`, `ratings?` | Rate surfaced memories. Use either the legacy `rating`/`memory_id` shape or batched `ratings`, never both. |
@@ -16,49 +16,84 @@ All connected upstream tools are added as `{prefix}__{tool}`.
 
 ## Full tool metadata
 
-`stm_proxy_describe_tool(name)` reads cached metadata for the exact advertised
-`prefix__tool` name, without a host-added `mcp__server__` prefix; it never
-executes the upstream tool. It returns:
+`stm_proxy_describe_tool(name)` reads the effective instructions for the exact
+advertised `prefix__tool` name, without a host-added `mcp__server__` prefix. It
+reads registered metadata and never executes the upstream tool, compression,
+or surfacing. The default call returns only the description; request the
+schema separately so instruction recovery does not also spend schema tokens.
 
-- `name`: the advertised tool name.
-- `description`: the effective instructions as the advertisement budgeted them
-  before any cap, respecting the operator's override and the ordinary
-  empty-description name fallback.
-- `input_schema`: the input schema with descriptions and examples restored,
-  including `_context_query` when advertised by STM.
-- `response_hint`: the compression follow-up hint from that advertisement, as a
-  standalone sentence — without the `|` separator the advertised description
-  uses to join it onto the body.
-- `upstream_description`: the text a `description_override` replaced. Returned
-  only when the global `recover_upstream_description` is on **and** an override
-  is configured. It is off by default: an override decides what the model is
-  told, and one legitimate use is neutralizing a misleading or hostile upstream
-  description, which returning it here would undo.
-- `omitted_chars`: present only when a free-text field hit its length ceiling,
-  mapping that field name to the characters dropped.
+| Argument | Default | Meaning |
+|---|---|---|
+| `name` | required | Exact STM `prefix__tool` name |
+| `part` | `"description"` | `description`, `input_schema`, or `upstream_description` |
+| `offset` | `0` | Character offset into this part's returned source |
+| `limit` | `4000` | Requested maximum characters, from 1 through 16,000 |
+| `generation` | absent | Snapshot token; required when `offset > 0` |
 
-`description` and `upstream_description` are each capped at 16,000 characters —
-far above any workable `max_description_chars`, but bounded, because the result
-lands verbatim in the model's context. The cut happens once, when the
-advertisement is built, and there is no pagination: text past the ceiling is
-**not retrievable by any call**, and `omitted_chars` reports how much was lost
-rather than offering a way to read it ([#1026][i1026]). `input_schema` is not
-capped at all, so one call can return a schema of any size the upstream
-published ([#1027][i1027]). Both are known limitations of this first version,
-not properties to rely on.
+`description` respects the operator's override and the ordinary empty-source
+name fallback. `input_schema` restores descriptions and examples, including
+`_context_query` when advertised by STM. `upstream_description` is available
+only when `recover_upstream_description` is enabled **and** an override is
+configured; requesting it otherwise returns an unavailable error. Selecting
+another part never implicitly includes that replaced text.
+
+Every page has these fields:
+
+- `name`, `part`: the requested tool and selected source.
+- `text`, `format`: page content and `"text"` or `"json"`. Schema pages contain
+  serialized JSON text, not partial schema objects.
+- `generation`: the registered metadata snapshot token.
+- `offset`, `next_offset`, `total_chars`: character positions in this source.
+  `next_offset: null` means complete; otherwise it is the next request's offset.
+- `response_hint`: this advertisement's compression follow-up guidance,
+  without the joining `|` separator.
+
+For example, start schema recovery with:
+
+```json
+{"name": "cedar__search_docs", "part": "input_schema"}
+```
+
+When the response has a non-null `next_offset`, call the same tool with the
+same `name`, `part`, and `generation`, and set `offset` to that `next_offset`.
+Concatenate each page's `text` exactly, in order. For `input_schema`, parse the
+combined text as JSON **after** the final page. Individual schema chunks need
+not be independently parseable JSON schemas; every response envelope is valid
+JSON. Ordinary Unicode is preserved; unencodable lone surrogates in prose use
+the project's literal escape convention, while schema JSON preserves them as
+JSON escapes. Offsets count characters in the returned, transport-safe source.
+
+The complete MCP tool result is limited to **16,384 UTF-8 bytes**, including
+both text and structured representations, escaping, and all page metadata.
+The JSON-RPC transport envelope is excluded. `limit` can shorten a page but
+cannot raise this ceiling. A page may therefore contain fewer characters than
+requested, especially for non-ASCII or heavily escaped content. There is no
+source-length cut and no `omitted_chars`: all remaining content can be read
+from the same generation ([#1026][i1026], [#1027][i1027]). Host-specific response
+limits still apply independently.
+
+Negative offsets, offsets beyond the source, and limits outside 1..16000 are
+errors. An offset exactly at the end returns an empty completed page. A result
+whose metadata alone cannot fit returns a short error rather than truncating
+identifiers or returning a page that cannot advance.
+
+A successful metadata change invalidates the old token: discard accumulated
+pages and restart at offset 0 without `generation`. Identical registrations
+keep their token; a failed removal that leaves the old registration installed
+also keeps it. Tokens are process-local and do not survive restart or removal
+and re-registration. Previous generations are not retained.
+
+Unknown, hidden, rejected and unregistered tools are unavailable on **every**
+page, including continuations. The live Toolgraph call policy is checked each
+time. Failed registration cannot expose new metadata, and shutdown invalidates
+all snapshots. These pages use `stm_proxy_describe_tool` itself, not the
+compression pipeline's `stm_proxy_read_more` store.
 
 [i1026]: https://github.com/memtomem/memtomem-stm/issues/1026
 [i1027]: https://github.com/memtomem/memtomem-stm/issues/1027
 
-Unknown, hidden, rejected and unregistered tools are unavailable through this
-endpoint. Catalogue changes update recovery metadata when registration succeeds;
-failed registration cannot expose a newly discovered tool. The existing live
-Toolgraph call policy also applies. Reading metadata does not run response
-compression or surfacing.
-
 See [description budgets](proxy-config.md#advertised-tool-descriptions) for
-`host_description_cap` and recovery hints. Host response-size limits still apply
-to this tool's result; this API does not add pagination or bypass them.
+`host_description_cap` and recovery hints.
 
 ## Optional operator tools
 
