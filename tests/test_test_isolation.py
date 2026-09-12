@@ -34,10 +34,6 @@ def assert_isolated():
     assert config.proxy.default_max_result_chars == 16000
 
 
-def test_defaults():
-    assert_isolated()
-
-
 @pytest.fixture
 def explicit_override(monkeypatch):
     assert_isolated()
@@ -69,6 +65,7 @@ def test_next_test_starts_clean():
 _RUNNER = """\
 import os
 import pytest
+from memtomem_stm.config import STMConfig
 
 
 def environment_snapshot():
@@ -80,9 +77,15 @@ def environment_snapshot():
 
 
 before = environment_snapshot()
+before_stm_keys = [name for name in before if name.lower().startswith("memtomem_stm_")]
+before_host = STMConfig().daemon.host
+# Keep an odd number of child tests: two order reversals would hide the bug.
 result = pytest.main(["-q", "--tb=short", "--confcutdir=.", "test_contract.py"])
 assert result == int(os.environ["ISOLATION_EXPECT_FAILURE"]), result
 assert environment_snapshot() == before, "pytest did not restore the inherited environment"
+assert STMConfig().daemon.host == before_host, "pytest changed case-insensitive env precedence"
+after_stm_keys = [name for name in os.environ if name.lower().startswith("memtomem_stm_")]
+assert after_stm_keys == before_stm_keys, "pytest changed STM environment order"
 print("INHERITED_ENVIRONMENT_RESTORED")
 """
 
@@ -129,6 +132,10 @@ def test_shared_fixtures_isolate_and_restore_inherited_environment(
             "PYTEST_PLUGINS": "",
         }
     )
+    if sys.platform != "win32":
+        # POSIX permits two spellings; settings folds them and the last wins.
+        # Windows already normalizes environment keys case-insensitively.
+        env["memtomem_stm_daemon__host"] = "127.0.0.3"
     result = subprocess.run(
         [sys.executable, "run_contract.py"],
         cwd=suite,
@@ -139,4 +146,4 @@ def test_shared_fixtures_isolate_and_restore_inherited_environment(
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "INHERITED_ENVIRONMENT_RESTORED" in result.stdout
-    assert ("1 failed, 3 passed" if fail_test else "4 passed") in result.stdout
+    assert ("1 failed, 2 passed" if fail_test else "3 passed") in result.stdout

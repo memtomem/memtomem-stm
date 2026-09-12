@@ -38,7 +38,10 @@ def isolate_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
     """
     with pytest.MonkeyPatch.context() as patch:
         set_home(patch, tmp_path_factory.mktemp("home"))
-        for name in list(os.environ):
+        # MonkeyPatch restores deletions in reverse. Delete backwards so STM
+        # keys regain their original order: case-equivalent names are resolved
+        # last-one-wins by settings on POSIX.
+        for name in reversed(list(os.environ)):
             if name.lower().startswith("memtomem_stm_"):
                 patch.delenv(name, raising=False)
         yield
