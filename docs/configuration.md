@@ -85,8 +85,8 @@ When unset or `false`, hides STM's eight observability / admin tools
 `tools/list` surface so eager-loading clients (e.g. OpenAI Codex CLI)
 don't pay schema tokens for tools the model rarely calls. Hidden admin
 tools are not registered with the MCP server while the flag is unset or
-`false`.  The four model-facing tools
-(`stm_proxy_read_more`, `stm_proxy_select_chunks`,
+`false`.  The five model-facing tools
+(`stm_proxy_describe_tool`, `stm_proxy_read_more`, `stm_proxy_select_chunks`,
 `stm_surfacing_feedback`, `stm_compression_feedback`) stay advertised
 regardless.  Set this flag to `true` to advertise the admin tools over
 MCP again.  Read once at import — restart to apply changes.  Claude Code
@@ -304,7 +304,9 @@ Representative configuration (see the linked reference for omitted fields):
   "context_budget_ratio": 0.05,
   "chars_per_token": 3.5,
   "max_description_chars": 4000,
+  "host_description_cap": null,
   "strip_schema_descriptions": false,
+  "recover_upstream_description": false,
   "lock_timeout_seconds": 30.0,
   "upstream_servers": {
     "filesystem": {
@@ -814,7 +816,7 @@ The config file is **hot-reloaded** — changes take effect on the next tool cal
 | `relevance_scorer.*` | Yes | All six fields (`scorer`, `embedding_provider`, `embedding_model`, `embedding_base_url`, `embedding_timeout`, `embedding_cache_size`). A change in any field rebuilds the scorer instance in place, which discards the embedding cache with it. The SELECTIVE and HYBRID compressors capture the scorer they were built with and are keyed on `selective`, so on that path a scorer-only edit arrives at the next selective rebuild. |
 | `llm.*` compressor config | Yes | Changing any field closes the old `LLMCompressor` and constructs a new one lazily on the next tool call. |
 | Per-server `prefix` | **No** (restart) | Part of the tool names registered with the client; only an upstream catalogue change re-derives the advertisement (#917), and a `prefix` edit is not one. |
-| Anything shaping **advertised tool metadata** (`max_description_chars`, `description_override`, suffix-driving `compression`/`hybrid`, `strip_schema_descriptions`, `advertise_context_query`, `hidden`, `expose_in_profiles`, `exposure.profile`) | **No** (next registration) | Applied where a tool is advertised, so an edit reaches a client only when the advertisement is rebuilt — a restart or an upstream catalogue change. Global values (`max_description_chars`, `strip_schema_descriptions`, `advertise_context_query`, `exposure.profile`) are read live but still only at that rebuild, as are the suffix-driving `compression`/`hybrid` values at every level — the suffix predicts what a **call** will do, and calls read those live, so a rebuild resolves them the same way (#924). The remaining per-server and per-tool values (`description_override`, `hidden`, `expose_in_profiles`, per-server `max_description_chars`, `strip_schema_descriptions`) come from the connect-time snapshot, so they need a reconnect on top of the rebuild. `exposure.health_window_hours`, `health_min_calls`, and `health_error_rate_threshold` are **restart-bound**: the health flags they produce are computed once at startup and reused by every later rebuild. `max_description_chars` composes as `min(server, global)` and `strip_schema_descriptions` as `server or global`, neither as an override — see [Advertised tool descriptions](reference/proxy-config.md#advertised-tool-descriptions). |
+| Anything shaping **advertised tool metadata** (`max_description_chars`, `host_description_cap`, `description_override`, `recover_upstream_description`, suffix-driving `compression`/`hybrid`, `strip_schema_descriptions`, `advertise_context_query`, `hidden`, `expose_in_profiles`, `exposure.profile`) | **No** (next registration) | Applied where a tool is advertised, so an edit reaches a client only when the advertisement is rebuilt — a restart or an upstream catalogue change. Global values (`max_description_chars`, `host_description_cap`, `strip_schema_descriptions`, `advertise_context_query`, `recover_upstream_description`, `exposure.profile`) are read live but still only at that rebuild, as are the suffix-driving `compression`/`hybrid` values at every level — the suffix predicts what a **call** will do, and calls read those live, so a rebuild resolves them the same way (#924). The remaining per-server and per-tool values (`description_override`, `hidden`, `expose_in_profiles`, per-server `max_description_chars`, `strip_schema_descriptions`) come from the connect-time snapshot, so they need a reconnect on top of the rebuild. `exposure.health_window_hours`, `health_min_calls`, and `health_error_rate_threshold` are **restart-bound**: the health flags they produce are computed once at startup and reused by every later rebuild. Description limits compose as `min(server, global, host_description_cap)` with the host term omitted when unset and `strip_schema_descriptions` as `server or global`, neither as an override — see [Advertised tool descriptions](reference/proxy-config.md#advertised-tool-descriptions). |
 | Toolgraph bundle decisions | Calls: **Yes**; advertised list: only on an upstream catalogue change | A changed strict denial gates the next call before cache/upstream access. The advertised list is rebuilt when an upstream replaces its catalogue (#917); otherwise restart STM/the MCP client. |
 | Per-server `circuit_*` breaker thresholds | **No** (restart) | The breaker is built at connect time on the connection object (#608). |
 | Adding / removing upstream servers | **No** (restart) | Transport connections are established once at startup. |

@@ -22,6 +22,7 @@ from memtomem_stm.proxy.config import (
 from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.proxy.tool_metadata import (
+    RECOVERY_SUFFIX,
     PROXIED_PREFIX,
     DescriptionBudget,
     advertised_source_text,
@@ -733,7 +734,7 @@ class TestDescriptionBudget:
             server_max_desc=cap,
         )
         composed = compose_description(
-            source, DescriptionBudget(cap, cap, SELECTIVE_SUFFIX)
+            source, DescriptionBudget(cap, cap, SELECTIVE_SUFFIX).for_source(len(source))
         )
         assert composed.text == mgr.get_proxy_tools()[0].description
 
@@ -751,7 +752,9 @@ class TestDescriptionBudget:
 
     def test_an_empty_body_still_carries_the_suffix_without_a_doubled_space(self):
         boundary = len(SELECTIVE_SUFFIX) + len(PROXIED_PREFIX)
-        composed = compose_description("A" * 100, DescriptionBudget(boundary, 9000, SELECTIVE_SUFFIX))
+        composed = compose_description(
+            "A" * 100, DescriptionBudget(boundary, 9000, SELECTIVE_SUFFIX)
+        )
         assert composed.text == SELECTIVE_SUFFIX.lstrip()
 
     def test_source_text_precedence(self):
@@ -776,7 +779,7 @@ class TestSuffixBudget:
         )
         desc = mgr.get_proxy_tools()[0].description
         assert len(desc) <= 200 - len(PROXIED_PREFIX)
-        assert desc.endswith(SELECTIVE_SUFFIX)
+        assert desc.endswith(SELECTIVE_SUFFIX + RECOVERY_SUFFIX)
 
     def test_tight_budget_keeps_the_suffix_and_starves_the_body(self):
         """The suffix is functional — it names the follow-up tool — so it wins
@@ -1022,7 +1025,7 @@ class TestClientVisibleCap:
             if suffix and len(suffix) <= cap - len(PROXIED_PREFIX):
                 # Holds in the zero-body case too: the suffix is stored without
                 # its leading space, and the prefix's trailing one supplies it.
-                assert tool.description.endswith(suffix)
+                assert tool.description.endswith((suffix, suffix + RECOVERY_SUFFIX))
             elif suffix:
                 # Dropped whole: not one fragment of the suffix may survive,
                 # which absence of "stm_proxy_" alone would not catch. Only the
@@ -1132,7 +1135,7 @@ class TestDefaultDescriptionBudget:
         budget = DEFAULT_DESCRIPTION_CHARS - len(PROXIED_PREFIX)
         # No sentence separator and no space in the body, so truncation falls
         # through to the hard slice, which spends the ellipsis from the budget.
-        assert desc == "x" * (budget - 3) + "..."
+        assert desc == "x" * (budget - 3 - len(RECOVERY_SUFFIX)) + "..." + RECOVERY_SUFFIX
         assert len(desc) == budget
 
     def test_one_explicit_level_now_composes_against_the_new_default(self):

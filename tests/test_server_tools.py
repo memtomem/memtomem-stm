@@ -2862,6 +2862,7 @@ _FLAG_ENV = "MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS"
 _FORMATION_ENV = "MEMTOMEM_STM_FORMATION__ENABLED"
 
 _MODEL_FACING_TOOLS = {
+    "stm_proxy_describe_tool",
     "stm_proxy_read_more",
     "stm_proxy_select_chunks",
     "stm_surfacing_feedback",
@@ -2938,20 +2939,20 @@ class TestAdvertiseObservabilityFlagEndToEnd:
         assert names == _MODEL_FACING_TOOLS
         assert _OBSERVABILITY_TOOLS.isdisjoint(names)
 
-    def test_flag_true_advertises_all_twelve(self):
+    def test_flag_true_advertises_all_thirteen(self):
         names = set(self._list_registered(env_override="true"))
         assert names == _MODEL_FACING_TOOLS | _OBSERVABILITY_TOOLS
         assert len(_OBSERVABILITY_TOOLS) == 8
-        assert len(names) == 12
+        assert len(names) == 13
         assert "stm_index_stats" not in names
 
-    def test_formation_is_an_independent_thirteenth_tool(self):
+    def test_formation_is_an_independent_fourteenth_tool(self):
         formation_only = set(self._list_registered(env_override="false", formation_enabled=True))
         all_enabled = set(self._list_registered(env_override="true", formation_enabled=True))
         assert formation_only == _MODEL_FACING_TOOLS | {"stm_memory_propose"}
-        assert len(formation_only) == 5
+        assert len(formation_only) == 6
         assert all_enabled == _MODEL_FACING_TOOLS | _OBSERVABILITY_TOOLS | {"stm_memory_propose"}
-        assert len(all_enabled) == 13
+        assert len(all_enabled) == 14
 
     def test_flag_false_keeps_only_model_facing(self):
         names = set(self._list_registered(env_override="false"))
@@ -3717,6 +3718,79 @@ class TestLifespanTeardownSymmetry:
             tools_dict.clear()
             tools_dict.update(snapshot)
 
+    async def test_readvertisement_refreshes_recovery_only_metadata(self):
+        """A change only ``stm_proxy_describe_tool`` can show still reconciles.
+
+        Recovery details ride in ``ProxyToolInfo`` but never reach
+        ``tools/list``, so an upstream that rewrites a description tail past
+        the cap produces an identical advertisement. The claim loop skips names
+        it already holds, so if that info compared EQUAL nothing would refresh
+        the recovery snapshot and the tool would serve the old generation
+        forever. Pinned here because the equality is what carries that, and
+        dropping ``description_details`` from it would be silent (#1014).
+        """
+        from memtomem_stm.server import app_lifespan, mcp
+
+        base = self._infos("fake__alpha")[0]
+
+        def _with_details(tail):
+            return type(base)(
+                prefixed_name=base.prefixed_name,
+                description=base.description,
+                input_schema=base.input_schema,
+                server=base.server,
+                original_name=base.original_name,
+                description_details={
+                    "name": base.prefixed_name,
+                    "description": f"fake proxied tool {tail}",
+                    "input_schema": base.input_schema,
+                    "response_hint": "",
+                },
+            )
+
+        first, moved, same = _with_details("one"), _with_details("two"), _with_details("two")
+        # The advertised half is byte-identical across all three.
+        assert first.description == moved.description == same.description
+        assert first.input_schema == moved.input_schema
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.side_effect = [[first], [moved], [same]]
+
+        tools_dict = mcp._tool_manager._tools
+        snapshot = dict(tools_dict)
+        published: list[object] = []
+        unsubscribe = mcp._subscriptions.subscribe(published.append)
+        try:
+            with (
+                patch("memtomem_stm.server.STMConfig") as MockConfig,
+                patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+            ):
+                self._mock_config(MockConfig)
+                async with app_lifespan(mcp) as _ctx:
+                    advertised = tools_dict["fake__alpha"].description
+
+                    await self._readvertise(mock_pm_instance)
+
+                    # What the client sees did not move...
+                    assert tools_dict["fake__alpha"].description == advertised
+                    # ...but the registry now holds the new generation, which is
+                    # what ``describe_tool`` reads back.
+                    _, kwargs = mock_pm_instance.retain_registered_advertisement.call_args
+                    assert kwargs["registered_infos"]["fake__alpha"] is moved
+                    assert len(published) == 1
+
+                    # An identical generation must not re-register or re-notify.
+                    await self._readvertise(mock_pm_instance)
+                    _, kwargs = mock_pm_instance.retain_registered_advertisement.call_args
+                    assert kwargs["registered_infos"]["fake__alpha"] is moved
+                    assert len(published) == 1
+        finally:
+            unsubscribe()
+            tools_dict.clear()
+            tools_dict.update(snapshot)
+
     async def test_stop_runs_when_a_second_advertisement_pass_would_raise(self):
         """The teardown ``get_proxy_tools()`` call was the one statement in the
         cleanup block outside a guard, so anything it raised skipped
@@ -3895,7 +3969,10 @@ class TestLifespanTeardownSymmetry:
                 async with app_lifespan(mcp) as _ctx:
                     pass
 
-            mock_pm_instance.retain_registered_advertisement.assert_called_once_with(["fake__beta"])
+            mock_pm_instance.retain_registered_advertisement.assert_called_once_with(
+                ["fake__beta"],
+                registered_infos={"fake__beta": mock_pm_instance.get_proxy_tools.return_value[1]},
+            )
         finally:
             tools_dict.clear()
             tools_dict.update(snapshot)

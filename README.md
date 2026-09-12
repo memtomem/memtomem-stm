@@ -206,7 +206,7 @@ selected stdio definitions into the proxy with provenance and conflict checks. S
 | [Environment variables](https://github.com/memtomem/memtomem-stm/blob/main/docs/reference/environment-variables.md) | Complete startup/runtime variable inventory and precedence |
 | [Architecture decisions](https://github.com/memtomem/memtomem-stm/blob/main/docs/adr/README.md) | Accepted contracts, status, and deferral gates |
 
-STM advertises four model-facing MCP tools by default. Eight observability and
+STM advertises five model-facing MCP tools by default. Eight observability and
 admin tools (`stm_proxy_stats`, `stm_surfacing_stats`, etc.)
 are hidden unless `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` is set,
 which keeps eager-loading clients from paying schema tokens for rarely used

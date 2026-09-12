@@ -9,6 +9,71 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
+## [Unreleased]
+
+### Added
+
+- Full metadata recovery for advertised tools (#1014):
+  `stm_proxy_describe_tool(name)` returns effective instructions past the
+  advertised cap, restored input-schema descriptions, and compression follow-up
+  guidance. It is model-facing by default (five tools, up from four) and reads
+  only successfully registered metadata snapshots. Each free-text field is
+  itself capped at 16,000 characters, with any overflow counted in an
+  `omitted_chars` field rather than marked inside the text; the cut is made
+  once when the advertisement is built and text past it is not retrievable by
+  any call (#1026). The input schema is returned whole and is not capped
+  (#1027).
+- Optional global `recover_upstream_description` (default `false`) lets recovery
+  also return the text a `description_override` replaced (#1014). Off by
+  default because an override decides what the model is told, and one
+  legitimate use is neutralizing a misleading or hostile upstream description.
+- Optional global `host_description_cap` (default `null`, minimum 32) bounds
+  the complete advertised description together with existing server/global
+  limits. Restart to apply. Truncated descriptions and stripped schemas carry
+  a recovery hint when it fits; compression hints retain priority. Doctor uses
+  the same arithmetic and reports dropped recovery hints. Full override text
+  now participates in the existing exposure credential scan, including its tail.
+
+### Changed
+
+- Advertised descriptions that are truncated, or whose schema descriptions are
+  stripped, now spend 32 characters of their budget on the recovery hint
+  whenever that hint fits — at a budget too small to carry it whole it is
+  dropped instead, and `mms doctor` reports the loss (#1014). With
+  `strip_schema_descriptions` enabled this shifts every affected description,
+  not only long ones; `stm_proxy_describe_tool` carries what the hint
+  displaces, and `mms doctor` reports the new requirement.
+- Under the `strict` exposure profile, a tool whose `description_override` holds
+  credential-shaped text past the advertised cap is now withheld. Previously
+  only the part of the override that fit was scanned.
+- An upstream catalogue change that alters only recoverable metadata — a
+  description tail past the cap, or a nested schema description under
+  `strip_schema_descriptions` — now re-registers the tool and emits
+  `tools/list_changed`, though `tools/list` itself is unchanged. This is what
+  keeps recovery from serving a stale generation.
+
+### Fixed
+
+- A refused surfacing rating no longer reports the surfacing event as missing
+  when the event exists and only `memory_id` was wrong (#1023; merged in #1024).
+  The store's `record_feedback` folded every refusal into one `False`, and the
+  tracker rendered all of them as `Error: surfacing event '<id>' not found` — so an
+  agent that mistyped a `memory_id` was told the handle it had just been given
+  no longer existed, which is a reason to stop rating rather than to retry. The
+  store now returns a `FeedbackRejection` reason (or `None` on success) and the
+  tracker renders one message per reason, identifying the offending argument
+  where there is one. `record_feedback_batch` renders per entry and inherits
+  the fix. **Behavior change**: `FeedbackStore.record_feedback`'s return type
+  changes from `bool` to `FeedbackRejection | None`, which inverts the
+  truthiness of the old contract — success is now falsy. The sole production
+  consumer did read it as a boolean (`if not ok`) and was updated to test the
+  rejection explicitly. Seven assertions on this call were updated for the new
+  contract — four written as truthiness checks, which the inversion would have
+  turned into loud failures rather than silent passes, and three boolean
+  identity checks that now name the specific rejection. The MCP-facing
+  `stm_surfacing_feedback` reply text is unchanged for success and for a
+  genuinely absent event.
+
 ## [0.5.0] — 2026-09-10
 
 ### Upgrade notes

@@ -357,8 +357,8 @@ class TestDeleteEventsOlderThan:
         _record_event(store, "old", age_seconds=10_000)
         _record_event(store, "new", age_seconds=10)
         # A feedback row on the old event must go too.
-        assert store.record_feedback("old", "helpful", memory_id="m1")
-        assert store.record_feedback("new", "helpful", memory_id="m1")
+        assert store.record_feedback("old", "helpful", memory_id="m1") is None
+        assert store.record_feedback("new", "helpful", memory_id="m1") is None
 
         deleted = store.delete_events_older_than(retention_seconds=1_000)
 

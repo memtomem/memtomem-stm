@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from memtomem_stm.proxy.config import CompressionStrategy, HybridConfig, TailMode
@@ -15,6 +15,17 @@ from memtomem_stm.proxy.config import CompressionStrategy, HybridConfig, TailMod
 PROXIED_PREFIX = "[proxied] "
 
 _ELLIPSIS = "..."
+
+RECOVERY_SUFFIX = " | full: stm_proxy_describe_tool"
+
+#: Ceiling on ONE free-text field in a recovery response. Recovery exists to
+#: get past a host's description cap, so this has to sit far above any sane cap
+#: -- but the result still lands verbatim in a model's context, which is the
+#: budget this proxy exists to defend, and no upstream should be able to spend
+#: it in a single call. The input schema is deliberately NOT bounded by this:
+#: cutting a JSON Schema mid-structure yields an invalid schema, which is worse
+#: than a large valid one.
+MAX_RECOVERED_TEXT_CHARS = 16000
 
 #: Sentence terminators, each followed by the whitespace that ends the
 #: sentence. The latest match across all of them wins, so the cut is chosen by
@@ -122,7 +133,8 @@ class DescriptionBudget:
 
     The cap is on what the CLIENT sees, so every fixed cost comes out of it:
     the ``[proxied] `` prefix registration prepends later, and the convention
-    suffix. The two levels compose as ``min(server, global)`` rather than as an
+    suffix. The configured limits compose as ``min(server, global, host)`` (omit an
+    unknown host cap) rather than as an
     override, which is why an operator can raise the global one and change
     nothing (#1015). Holding that arithmetic here keeps the advertisement
     (``manager.get_proxy_tools``) and the ``mms doctor`` advisory on one rule
@@ -135,19 +147,73 @@ class DescriptionBudget:
     #: ``convention_suffix`` output for the resolved strategy; ``""`` when the
     #: strategy needs no hint.
     suffix: str = ""
+    host_cap: int | None = None
+    source_chars: int | None = None
+    schema_removed: bool = False
+
+    def for_source(self, chars: int, *, schema_removed: bool = False) -> DescriptionBudget:
+        """Pin recovery budgeting from source length; diagnostics need no raw text."""
+        return replace(self, source_chars=chars, schema_removed=schema_removed)
+
+    @property
+    def recovery_required(self) -> bool:
+        return self.schema_removed or (
+            self.source_chars is not None and self.source_chars > self._body_without_recovery
+        )
+
+    @property
+    def recovery_fits(self) -> bool:
+        # ``<=``, not ``<``: a budget with room for the hint and nothing else
+        # still advertises something ACTIONABLE -- the tool name the client
+        # already has, plus where to read the rest -- whereas the same budget
+        # spent on source text advertises an unrecoverable fragment.
+        #
+        # Zero body WITH this hint carried lands at ``len(PROXIED_PREFIX) +
+        # len(the suffix that fits) + len(RECOVERY_SUFFIX)``, which is two caps
+        # for a strategy that HAS a convention suffix: 42, where that suffix is
+        # too long and is dropped, and 86 (44-char selective/progressive) or 82
+        # (40-char hybrid TOC) where it is carried too. A strategy with no
+        # suffix has only the 42.
+        #
+        # Distinct from all of those is zero body with the convention suffix
+        # alone, at ``len(PROXIED_PREFIX) + len(suffix)`` -- 54, 54, 50 -- where
+        # this property is False because the recovery hint does not fit.
+        #
+        # Measured by sweeping every cap from MIN_DESCRIPTION_CHARS per
+        # strategy. A sweep that fixes the suffix at "" sees only the 42
+        # (codex R1); one that tests ``body == 0`` without also reading
+        # ``recovery_fits`` folds the convention-only caps in (codex R2).
+        return self.recovery_required and len(RECOVERY_SUFFIX) <= self._body_without_recovery
+
+    @property
+    def combined_suffix(self) -> str:
+        return (self.suffix if self.suffix_fits else "") + (
+            RECOVERY_SUFFIX if self.recovery_fits else ""
+        )
+
+    @property
+    def _body_without_recovery(self) -> int:
+        return self.total - len(self.suffix) if self.suffix_fits else self.total
 
     @property
     def cap(self) -> int:
         """The effective cap: neither level overrides the other."""
-        return min(self.server_cap, self.global_cap)
+        return (
+            min(self.server_cap, self.global_cap, self.host_cap)
+            if self.host_cap is not None
+            else min(self.server_cap, self.global_cap)
+        )
 
     @property
     def binding(self) -> str:
-        """Which level the cap came from -- ``server``, ``global`` or ``both``.
+        """Binding level: ``server``, ``global``, ``both``, or ``host``.
 
-        ``both`` on a tie, because raising either one alone leaves the cap
+        A binding host limit takes precedence, including ties: STM cannot
+        raise it. Otherwise ``both`` on a tie, because raising either alone leaves the cap
         where it is. That is the case an operator most often misreads.
         """
+        if self.host_cap is not None and self.host_cap <= min(self.server_cap, self.global_cap):
+            return "host"
         if self.server_cap < self.global_cap:
             return "server"
         if self.global_cap < self.server_cap:
@@ -172,7 +238,7 @@ class DescriptionBudget:
     @property
     def body(self) -> int:
         """Chars left for upstream text after a suffix that fits took its own."""
-        return self.total - len(self.suffix) if self.suffix_fits else self.total
+        return self._body_without_recovery - (len(RECOVERY_SUFFIX) if self.recovery_fits else 0)
 
     def overflow(self, source_chars: int) -> int:
         """Chars of a ``source_chars``-long source this budget discards."""
@@ -184,7 +250,12 @@ class DescriptionBudget:
         Written from the configured suffix rather than from the one that fits,
         so the answer stays true for a cap too small to carry it today.
         """
-        return source_chars + len(PROXIED_PREFIX) + len(self.suffix)
+        return (
+            source_chars
+            + len(PROXIED_PREFIX)
+            + len(self.suffix)
+            + (len(RECOVERY_SUFFIX) if self.schema_removed else 0)
+        )
 
 
 @dataclass(frozen=True)
@@ -197,6 +268,35 @@ class ComposedDescription:
     chars_cut: int
     #: A configured suffix was dropped whole for want of room.
     suffix_dropped: bool
+    # No ``recovery_dropped`` twin: unlike the configured suffix, whether the
+    # recovery hint was dropped is answerable from the BUDGET alone
+    # (``recovery_required and not recovery_fits``), which is the form doctor
+    # reads -- it never has the source text to compose. A second copy here
+    # would be a rule with two readers and no second caller (#926).
+
+
+def hint_text(suffix: str) -> str:
+    """One convention hint as a standalone value, without the joining separator.
+
+    ``convention_suffix`` returns text shaped to be APPENDED to a description,
+    so it opens with the ``" | "`` separator that divides it from the body. A
+    field carrying the hint on its OWN -- the recovery tool's
+    ``response_hint`` -- must not inherit that separator, or the client reads a
+    dangling ``|`` as the first character of the instruction (#1014).
+    """
+    return suffix.strip().removeprefix("|").strip()
+
+
+def bound_recovered_text(text: str, limit: int = MAX_RECOVERED_TEXT_CHARS) -> tuple[str, int]:
+    """Cap one recovered free-text field; return it with the chars dropped.
+
+    The count is returned OUT OF BAND rather than marked inside the text: an
+    in-band marker is forgeable by the upstream text it is meant to describe,
+    and the caller has a structured response to put the number in (#948).
+    """
+    if len(text) <= limit:
+        return text, 0
+    return text[:limit], len(text) - limit
 
 
 def advertised_source_text(upstream: str | None, override: str | None, prefixed_name: str) -> str:
@@ -217,19 +317,15 @@ def compose_description(source: str, budget: DescriptionBudget) -> ComposedDescr
     """Compose the client-visible description and report what it cost.
 
     The suffix wins over upstream text whenever it fits, since it is what tells
-    the client which follow-up tool to call (#893). Truncation owns its own
-    ellipsis, so the result never exceeds ``budget.total``.
+    the client which follow-up tool to call (#893). Call ``budget.for_source``
+    before composing to include recovery hints; the raw budget remains useful
+    for configuration-only diagnostics. Recovery comes after compression hints.
+    Truncation owns its own ellipsis, so the result never exceeds
+    ``budget.total``.
     """
-    if budget.suffix_fits:
-        body = truncate_description(source, budget.body)
-        # The suffix opens with a space and the prefix closes with one. With a
-        # body between them both separate something; with no body left they
-        # would meet, which is where the doubled space in ``[proxied]  | ...``
-        # came from (#922).
-        text = body + budget.suffix if body else budget.suffix.lstrip()
-    else:
-        body = truncate_description(source, budget.total)
-        text = body
+    body = truncate_description(source, budget.body)
+    suffix = budget.combined_suffix
+    text = body + suffix if body else suffix.lstrip()
     return ComposedDescription(
         text=text,
         chars_cut=len(source) - len(body),

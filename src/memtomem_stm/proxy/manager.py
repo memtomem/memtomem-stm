@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import functools
 import hashlib
 import inspect
@@ -15,7 +16,7 @@ import uuid
 from collections import Counter
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
-from collections.abc import Awaitable, Callable, Collection, Coroutine
+from collections.abc import Awaitable, Callable, Collection, Coroutine, Mapping
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -143,9 +144,11 @@ from memtomem_stm.proxy.tool_relevance import (
 from memtomem_stm.proxy.tool_metadata import (
     DescriptionBudget,
     advertised_source_text,
+    bound_recovered_text,
     compose_description,
     convention_suffix,
     distill_schema,
+    hint_text,
     truncate_description,
 )
 from memtomem_stm.proxy.progressive import (
@@ -299,6 +302,18 @@ class ProxyToolInfo:
     # nothing the proxy could budget or shorten without breaking it.
     title: str | None = None  # top-level ``Tool.title`` (MCP ``BaseMetadata``)
     icons: list[Any] | None = None  # MCP ``Icon`` list (SEP-973)
+    # Full, detached metadata for the same advertisement generation. Never
+    # forwarded in tools/list; exposed only by the registered recovery tool.
+    #
+    # It IS part of this dataclass's ``__eq__``, and deliberately so: the
+    # re-advertisement reconcile (``server.app_lifespan``) re-registers a
+    # surviving tool when its info stops comparing equal, and that is the only
+    # thing keeping recovery from serving a stale generation -- the claim loop
+    # skips names already registered. The cost is that an upstream edit the
+    # CLIENT cannot see (a description tail past the cap; a nested schema
+    # description under ``strip_schema_descriptions``) now costs a
+    # remove/re-register and a ``tools/list_changed`` (#1014).
+    description_details: dict[str, Any] | None = None
     # Deliberately NOT carried: ``execution`` (MCP 2025-11-25 task support).
     # The proxy's call path is synchronous-only, so forwarding it would
     # advertise task support nothing here can bridge. ``taskSupport:
@@ -676,6 +691,7 @@ class ProxyManager:
         # penalties. Empty until the first advertisement.
         self._advertised_tools: list[str] = []
         self._advertised_infos: list[ProxyToolInfo] = []
+        self._registered_description_infos: dict[str, ProxyToolInfo] = {}
         self._advertised_reject_reasons: dict[str, str] = {}
         # Called after an upstream replaces its tool catalogue mid-session so
         # the owner of the downstream registry can re-derive the verdict and
@@ -2864,6 +2880,7 @@ class ProxyManager:
             )
 
     async def stop(self) -> None:
+        self._registered_description_infos.clear()
         # Close the spawn path first: a stage that schedules its replacement
         # while unwinding would otherwise outrun the drain loop forever (#868).
         self._background_closed = True
@@ -3259,16 +3276,49 @@ class ProxyManager:
                     advert_override.description_override if advert_override is not None else None,
                     prefixed_name,
                 )
-                desc = compose_description(
-                    desc, DescriptionBudget(max_desc, global_max_desc, suffix)
-                ).text
-
-                # Resolve schema
-                schema = t.input_schema or {"type": "object"}
-                if strip:
-                    schema = self._distill_schema(schema, True)
+                # Snapshot before distillation, independently of the SDK's
+                # mutable catalogue. Recovery returns the schema the client
+                # can call, including the optional proxy-only context field.
+                full_schema = deepcopy(t.input_schema or {"type": "object"})
+                schema = self._distill_schema(full_schema, True) if strip else full_schema
+                schema_removed = schema != full_schema
                 if cfg_snap.advertise_context_query:
                     schema = self._with_context_query_schema(schema)
+                    full_schema = self._with_context_query_schema(full_schema)
+                # Bounded HERE, not per call: the ceiling then also applies to
+                # what the snapshot holds, and the count it reports is a
+                # property of the advertisement rather than of who asked.
+                recovered_desc, desc_omitted = bound_recovered_text(desc)
+                omitted: dict[str, int] = {}
+                if desc_omitted:
+                    omitted["description"] = desc_omitted
+                details: dict[str, Any] = {
+                    "name": prefixed_name,
+                    "description": recovered_desc,
+                    "input_schema": deepcopy(full_schema),
+                    "response_hint": hint_text(suffix),
+                }
+                if (
+                    cfg_snap.recover_upstream_description
+                    and advert_override is not None
+                    and advert_override.description_override is not None
+                ):
+                    # Opt-in: an override decides what the model is told, and
+                    # returning the text it replaced hands that decision back
+                    # to the upstream that lost it (#1014).
+                    details["upstream_description"], up_omitted = bound_recovered_text(
+                        t.description or ""
+                    )
+                    if up_omitted:
+                        omitted["upstream_description"] = up_omitted
+                if omitted:
+                    details["omitted_chars"] = omitted
+                desc = compose_description(
+                    desc,
+                    DescriptionBudget(
+                        max_desc, global_max_desc, suffix, cfg_snap.host_description_cap
+                    ).for_source(len(desc), schema_removed=schema_removed),
+                ).text
 
                 # ``execution`` never reaches ``ProxyToolInfo``; it is a
                 # judgment input only (#892). ``getattr`` twice so an SDK
@@ -3284,6 +3334,7 @@ class ProxyManager:
                             input_schema=schema,
                             server=conn.name,
                             original_name=t.name,
+                            description_details=details,
                             annotations=getattr(t, "annotations", None),
                             output_schema=getattr(t, "output_schema", None),
                             meta=getattr(t, "meta", None),
@@ -3405,7 +3456,12 @@ class ProxyManager:
                 exc_info=True,
             )
 
-    def retain_registered_advertisement(self, registered: Collection[str]) -> list[str]:
+    def retain_registered_advertisement(
+        self,
+        registered: Collection[str],
+        *,
+        registered_infos: Mapping[str, ProxyToolInfo] | None = None,
+    ) -> list[str]:
         """Narrow the advertisement snapshot to what the server registered (#908).
 
         ``get_proxy_tools()`` commits the snapshot when it decides exposure,
@@ -3417,7 +3473,10 @@ class ProxyManager:
         relevance ranker, and recorded as a candidate in selection telemetry.
 
         Call this once after the registration loop with the names that were
-        actually taken. Declined names move from the advertised set to
+        actually taken. Pass ``registered_infos`` when a re-advertisement may
+        retain older Tool objects (for example, after a failed removal), so
+        recovery metadata follows the actual registry rather than the desired
+        advertisement. Declined names move from the advertised set to
         ``registration_declined`` rejects, so they stay *visible* as a withhold
         rather than silently vanishing. Returns the dropped names.
 
@@ -3433,6 +3492,17 @@ class ProxyManager:
         re-advertises.
         """
         keep = set(registered)
+        # The bundled server supplies the actual registry, including an old
+        # generation whose removal failed. Library callers may omit it when
+        # registration took exactly the freshly generated infos.
+        infos = (
+            registered_infos
+            if registered_infos is not None
+            else {info.prefixed_name: info for info in self._advertised_infos}
+        )
+        self._registered_description_infos = {
+            name: info for name, info in infos.items() if name in keep
+        }
         dropped = [name for name in self._advertised_tools if name not in keep]
         if not dropped:
             return []
@@ -3451,6 +3521,27 @@ class ProxyManager:
             self._advertised_risk_penalty_sources.pop(name, None)
             self._advertised_graph_facts.pop(name, None)
         return dropped
+
+    def describe_tool(self, name: str) -> dict[str, Any]:
+        """Read a registered advertisement's full metadata without contacting upstream.
+
+        Do not rebuild exposure here: that would resurrect registration
+        declines and mix catalogue generations. The live Toolgraph call gate
+        still applies, just as it does before ordinary calls and cache hits.
+        """
+        from mcp.server.mcpserver.exceptions import ToolError
+
+        unavailable = "Tool metadata is unavailable for this name."
+        info = self._registered_description_infos.get(name)
+        if info is None or info.description_details is None or name not in self._advertised_tools:
+            # A failed removal can leave a rejected tool installed. Ownership
+            # preserves its old snapshot, but does not override exposure.
+            raise ToolError(unavailable)
+        try:
+            self._enforce_toolgraph_call_policy(info.server, info.original_name)
+        except ToolError:
+            raise ToolError(unavailable) from None
+        return deepcopy(info.description_details)
 
     @staticmethod
     def _with_context_query_schema(schema: dict[str, Any]) -> dict[str, Any]:

@@ -15180,7 +15180,7 @@ asyncio.run(main())
 
             async def list_tools(self):
                 return SimpleNamespace(
-                    tools=[SimpleNamespace(name="t1", description=description)]
+                    tools=[SimpleNamespace(name="t1", description=description, input_schema={"type": "object", "description": "private schema prose"})]
                 )
 
         monkeypatch.setattr("mcp.client.sse.sse_client", lambda url, **_kw: FakeTransport())
@@ -15193,6 +15193,8 @@ asyncio.run(main())
 
         assert result.connected is True
         assert result.description_chars == (("t1", expected),)
+        assert result.schema_description_tools == ("t1",)
+        assert "private schema prose" not in json.dumps(result.as_dict())
         assert "Hello" not in json.dumps(result.as_dict())
 
     def test_probe_survives_tools_without_a_description_attribute(self, monkeypatch):
