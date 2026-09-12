@@ -17,14 +17,6 @@ from memtomem_stm.cli._defaults import (
 )
 
 
-@pytest.fixture(autouse=True)
-def _no_ambient_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    import os
-
-    for name in [n for n in os.environ if n.upper().startswith("MEMTOMEM_STM_PROXY")]:
-        monkeypatch.delenv(name, raising=False)
-
-
 class TestResolveCliConfigPath:
     def test_flag_beats_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(_CONFIG_PATH_ENV, "/tmp/env.json")

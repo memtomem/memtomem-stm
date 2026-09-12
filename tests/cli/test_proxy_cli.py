@@ -15765,11 +15765,6 @@ class TestDoctor:
     @pytest.fixture(autouse=True)
     def _isolated_home(self, monkeypatch, tmp_path):
         set_home(monkeypatch, tmp_path / "home")
-        # Doctor reads the env-overlaid config, so an inherited
-        # MEMTOMEM_STM_PROXY__* would silently rewrite the config under test —
-        # an ambient ENABLED=true turns the #831 FAIL cases into PASSes.
-        for name in [n for n in os.environ if n.startswith("MEMTOMEM_STM_PROXY__")]:
-            monkeypatch.delenv(name, raising=False)
         monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND", "__missing_ltm__")
         project = tmp_path / "project"
         project.mkdir()
