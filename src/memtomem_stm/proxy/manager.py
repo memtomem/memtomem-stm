@@ -144,12 +144,18 @@ from memtomem_stm.proxy.tool_relevance import (
 from memtomem_stm.proxy.tool_metadata import (
     DescriptionBudget,
     advertised_source_text,
-    bound_recovered_text,
     compose_description,
     convention_suffix,
     distill_schema,
     hint_text,
     truncate_description,
+)
+from memtomem_stm.proxy.metadata_recovery import (
+    DEFAULT_RECOVERY_PAGE_CHARS,
+    RecoveryPage,
+    RecoveryPart,
+    RecoverySnapshot,
+    metadata_page,
 )
 from memtomem_stm.proxy.progressive import (
     PROGRESSIVE_FOOTER_TOKEN,
@@ -692,6 +698,7 @@ class ProxyManager:
         self._advertised_tools: list[str] = []
         self._advertised_infos: list[ProxyToolInfo] = []
         self._registered_description_infos: dict[str, ProxyToolInfo] = {}
+        self._registered_recovery_snapshots: dict[str, RecoverySnapshot] = {}
         self._advertised_reject_reasons: dict[str, str] = {}
         # Called after an upstream replaces its tool catalogue mid-session so
         # the owner of the downstream registry can re-derive the verdict and
@@ -2881,6 +2888,7 @@ class ProxyManager:
 
     async def stop(self) -> None:
         self._registered_description_infos.clear()
+        self._registered_recovery_snapshots.clear()
         # Close the spawn path first: a stage that schedules its replacement
         # while unwinding would otherwise outrun the drain loop forever (#868).
         self._background_closed = True
@@ -3285,16 +3293,10 @@ class ProxyManager:
                 if cfg_snap.advertise_context_query:
                     schema = self._with_context_query_schema(schema)
                     full_schema = self._with_context_query_schema(full_schema)
-                # Bounded HERE, not per call: the ceiling then also applies to
-                # what the snapshot holds, and the count it reports is a
-                # property of the advertisement rather than of who asked.
-                recovered_desc, desc_omitted = bound_recovered_text(desc)
-                omitted: dict[str, int] = {}
-                if desc_omitted:
-                    omitted["description"] = desc_omitted
+                # Keep full sources: the recovery endpoint budgets pages, not storage.
                 details: dict[str, Any] = {
                     "name": prefixed_name,
-                    "description": recovered_desc,
+                    "description": desc,
                     "input_schema": deepcopy(full_schema),
                     "response_hint": hint_text(suffix),
                 }
@@ -3306,13 +3308,7 @@ class ProxyManager:
                     # Opt-in: an override decides what the model is told, and
                     # returning the text it replaced hands that decision back
                     # to the upstream that lost it (#1014).
-                    details["upstream_description"], up_omitted = bound_recovered_text(
-                        t.description or ""
-                    )
-                    if up_omitted:
-                        omitted["upstream_description"] = up_omitted
-                if omitted:
-                    details["omitted_chars"] = omitted
+                    details["upstream_description"] = t.description or ""
                 desc = compose_description(
                     desc,
                     DescriptionBudget(
@@ -3503,6 +3499,17 @@ class ProxyManager:
         self._registered_description_infos = {
             name: info for name, info in infos.items() if name in keep
         }
+        # Commit recovery only from the ACTUAL registration. Equal snapshots
+        # keep their token, including when removing an old registration failed.
+        snapshots: dict[str, RecoverySnapshot] = {}
+        for name, info in self._registered_description_infos.items():
+            if info.description_details is not None:
+                current = RecoverySnapshot.from_details(info.description_details)
+                previous = self._registered_recovery_snapshots.get(name)
+                snapshots[name] = (
+                    previous if previous is not None and previous == current else current
+                )
+        self._registered_recovery_snapshots = snapshots
         dropped = [name for name in self._advertised_tools if name not in keep]
         if not dropped:
             return []
@@ -3522,7 +3529,15 @@ class ProxyManager:
             self._advertised_graph_facts.pop(name, None)
         return dropped
 
-    def describe_tool(self, name: str) -> dict[str, Any]:
+    def describe_tool(
+        self,
+        name: str,
+        *,
+        part: RecoveryPart = "description",
+        offset: int = 0,
+        limit: int = DEFAULT_RECOVERY_PAGE_CHARS,
+        generation: str | None = None,
+    ) -> RecoveryPage:
         """Read a registered advertisement's full metadata without contacting upstream.
 
         Do not rebuild exposure here: that would resurrect registration
@@ -3541,7 +3556,10 @@ class ProxyManager:
             self._enforce_toolgraph_call_policy(info.server, info.original_name)
         except ToolError:
             raise ToolError(unavailable) from None
-        return deepcopy(info.description_details)
+        snapshot = self._registered_recovery_snapshots.get(name)
+        if snapshot is None:
+            raise ToolError(unavailable)
+        return metadata_page(snapshot, part, offset, limit, generation)
 
     @staticmethod
     def _with_context_query_schema(schema: dict[str, Any]) -> dict[str, Any]:

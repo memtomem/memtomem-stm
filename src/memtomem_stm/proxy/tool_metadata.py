@@ -18,15 +18,6 @@ _ELLIPSIS = "..."
 
 RECOVERY_SUFFIX = " | full: stm_proxy_describe_tool"
 
-#: Ceiling on ONE free-text field in a recovery response. Recovery exists to
-#: get past a host's description cap, so this has to sit far above any sane cap
-#: -- but the result still lands verbatim in a model's context, which is the
-#: budget this proxy exists to defend, and no upstream should be able to spend
-#: it in a single call. The input schema is deliberately NOT bounded by this:
-#: cutting a JSON Schema mid-structure yields an invalid schema, which is worse
-#: than a large valid one.
-MAX_RECOVERED_TEXT_CHARS = 16000
-
 #: Sentence terminators, each followed by the whitespace that ends the
 #: sentence. The latest match across all of them wins, so the cut is chosen by
 #: position rather than by the order this tuple happens to list (#1016).
@@ -285,18 +276,6 @@ def hint_text(suffix: str) -> str:
     dangling ``|`` as the first character of the instruction (#1014).
     """
     return suffix.strip().removeprefix("|").strip()
-
-
-def bound_recovered_text(text: str, limit: int = MAX_RECOVERED_TEXT_CHARS) -> tuple[str, int]:
-    """Cap one recovered free-text field; return it with the chars dropped.
-
-    The count is returned OUT OF BAND rather than marked inside the text: an
-    in-band marker is forgeable by the upstream text it is meant to describe,
-    and the caller has a structured response to put the number in (#948).
-    """
-    if len(text) <= limit:
-        return text, 0
-    return text[:limit], len(text) - limit
 
 
 def advertised_source_text(upstream: str | None, override: str | None, prefixed_name: str) -> str:
