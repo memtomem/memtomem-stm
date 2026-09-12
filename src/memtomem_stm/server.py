@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Any
 
 from mcp.server.mcpserver import Context, MCPServer
+from pydantic import StrictInt
 
 # Module-level on purpose: the proxy handler's ``-> CallToolResult`` return
 # annotation is a STRING under ``from __future__ import annotations``, and
@@ -1256,8 +1257,8 @@ async def stm_proxy_describe_tool(
     ctx: CtxType = None,  # type: ignore[assignment]
     *,
     part: RecoveryPart = "description",
-    offset: int = 0,
-    limit: int = DEFAULT_RECOVERY_PAGE_CHARS,
+    offset: StrictInt = 0,
+    limit: StrictInt = DEFAULT_RECOVERY_PAGE_CHARS,
     generation: str | None = None,
 ) -> CallToolResult:
     """Read bounded pages of a registered tool's full metadata.

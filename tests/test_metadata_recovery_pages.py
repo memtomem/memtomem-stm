@@ -211,6 +211,27 @@ def test_invalid_page_requests_do_not_echo_inputs(args, reason):
         manager.describe_tool("test__t", **args)
 
 
+@pytest.mark.parametrize("field", ["offset", "limit"])
+@pytest.mark.parametrize("value", [True, False, 0.0, 1.0])
+async def test_mcp_page_arguments_require_strict_integers(field, value):
+    manager = _manager([_fake_tool("t", "abc")])
+    _register(manager)
+    generation = manager.describe_tool("test__t")["generation"]
+    async with _client(manager) as session:
+        # A valid token prevents a coerced offset=1 from merely failing the
+        # continuation guard and disguising SDK argument coercion.
+        with patch.object(manager, "describe_tool", wraps=manager.describe_tool) as describe:
+            result = await session.call_tool(
+                "stm_proxy_describe_tool",
+                {"name": "test__t", "generation": generation, field: value},
+            )
+            assert result.is_error
+            describe.assert_not_called()
+        wire = result.model_dump_json(by_alias=True, exclude_none=True)
+        assert "int_type" in wire
+        assert len(wire.encode("utf-8")) <= 16_384
+
+
 def test_offsets_limit_one_empty_source_and_detached_pages():
     manager = _manager(
         [_fake_tool("t", "")],
