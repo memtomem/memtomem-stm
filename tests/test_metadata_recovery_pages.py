@@ -41,7 +41,11 @@ def _check_result(result):
 
 
 @pytest.mark.parametrize("part", ["description", "input_schema"])
-@pytest.mark.parametrize("body", ["a" * 1_120_000, '한국어🙂"\\\n\t\x00' * 3000])
+# pytest exports node IDs as PYTEST_CURRENT_TEST; keep megabyte payloads out
+# of IDs so setup/teardown stays below Windows' environment-variable limit.
+@pytest.mark.parametrize(
+    "body", ["a" * 1_120_000, '한국어🙂"\\\n\t\x00' * 3000], ids=["large-ascii", "unicode-escaped"]
+)
 async def test_complete_recovery_through_mcp_is_bounded_and_lossless(part, body):
     schema = {
         "type": "object",
