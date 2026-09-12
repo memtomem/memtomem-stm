@@ -69,6 +69,7 @@ Status meanings:
 | `MEMTOMEM_STM_PROXY__HOST_DESCRIPTION_CAP` | integer `>= 32` or null | — | Declared host tool-description limit, including prefix and hints; unset means unknown. | Bundled |
 | `MEMTOMEM_STM_PROXY__STRIP_SCHEMA_DESCRIPTIONS` | boolean | `false` | Remove nested schema descriptions from proxied tools. | Bundled |
 | `MEMTOMEM_STM_PROXY__ADVERTISE_CONTEXT_QUERY` | boolean | `false` | Add the proxy-only `_context_query` argument. | Bundled |
+| `MEMTOMEM_STM_PROXY__RECOVER_UPSTREAM_DESCRIPTION` | boolean | `false` | Let `stm_proxy_describe_tool` also return the text a `description_override` replaced. | Bundled |
 | `MEMTOMEM_STM_PROXY__LOCK_TIMEOUT_SECONDS` | positive float | `30.0` | Internal proxy state-lock deadline. | Bundled |
 | `MEMTOMEM_STM_PROXY__CONSUMER_MODEL` | string | empty | Consumer model used for conservative budget calculation. | Bundled |
 | `MEMTOMEM_STM_PROXY__CONTEXT_BUDGET_RATIO` | float `0..1` | `0.05` | Fraction of a known model context allotted to one response. | Bundled |

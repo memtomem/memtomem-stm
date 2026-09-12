@@ -3718,6 +3718,79 @@ class TestLifespanTeardownSymmetry:
             tools_dict.clear()
             tools_dict.update(snapshot)
 
+    async def test_readvertisement_refreshes_recovery_only_metadata(self):
+        """A change only ``stm_proxy_describe_tool`` can show still reconciles.
+
+        Recovery details ride in ``ProxyToolInfo`` but never reach
+        ``tools/list``, so an upstream that rewrites a description tail past
+        the cap produces an identical advertisement. The claim loop skips names
+        it already holds, so if that info compared EQUAL nothing would refresh
+        the recovery snapshot and the tool would serve the old generation
+        forever. Pinned here because the equality is what carries that, and
+        dropping ``description_details`` from it would be silent (#1014).
+        """
+        from memtomem_stm.server import app_lifespan, mcp
+
+        base = self._infos("fake__alpha")[0]
+
+        def _with_details(tail):
+            return type(base)(
+                prefixed_name=base.prefixed_name,
+                description=base.description,
+                input_schema=base.input_schema,
+                server=base.server,
+                original_name=base.original_name,
+                description_details={
+                    "name": base.prefixed_name,
+                    "description": f"fake proxied tool {tail}",
+                    "input_schema": base.input_schema,
+                    "response_hint": "",
+                },
+            )
+
+        first, moved, same = _with_details("one"), _with_details("two"), _with_details("two")
+        # The advertised half is byte-identical across all three.
+        assert first.description == moved.description == same.description
+        assert first.input_schema == moved.input_schema
+
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.side_effect = [[first], [moved], [same]]
+
+        tools_dict = mcp._tool_manager._tools
+        snapshot = dict(tools_dict)
+        published: list[object] = []
+        unsubscribe = mcp._subscriptions.subscribe(published.append)
+        try:
+            with (
+                patch("memtomem_stm.server.STMConfig") as MockConfig,
+                patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+            ):
+                self._mock_config(MockConfig)
+                async with app_lifespan(mcp) as _ctx:
+                    advertised = tools_dict["fake__alpha"].description
+
+                    await self._readvertise(mock_pm_instance)
+
+                    # What the client sees did not move...
+                    assert tools_dict["fake__alpha"].description == advertised
+                    # ...but the registry now holds the new generation, which is
+                    # what ``describe_tool`` reads back.
+                    _, kwargs = mock_pm_instance.retain_registered_advertisement.call_args
+                    assert kwargs["registered_infos"]["fake__alpha"] is moved
+                    assert len(published) == 1
+
+                    # An identical generation must not re-register or re-notify.
+                    await self._readvertise(mock_pm_instance)
+                    _, kwargs = mock_pm_instance.retain_registered_advertisement.call_args
+                    assert kwargs["registered_infos"]["fake__alpha"] is moved
+                    assert len(published) == 1
+        finally:
+            unsubscribe()
+            tools_dict.clear()
+            tools_dict.update(snapshot)
+
     async def test_stop_runs_when_a_second_advertisement_pass_would_raise(self):
         """The teardown ``get_proxy_tools()`` call was the one statement in the
         cleanup block outside a guard, so anything it raised skipped

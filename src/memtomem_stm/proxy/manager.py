@@ -144,9 +144,11 @@ from memtomem_stm.proxy.tool_relevance import (
 from memtomem_stm.proxy.tool_metadata import (
     DescriptionBudget,
     advertised_source_text,
+    bound_recovered_text,
     compose_description,
     convention_suffix,
     distill_schema,
+    hint_text,
     truncate_description,
 )
 from memtomem_stm.proxy.progressive import (
@@ -302,6 +304,15 @@ class ProxyToolInfo:
     icons: list[Any] | None = None  # MCP ``Icon`` list (SEP-973)
     # Full, detached metadata for the same advertisement generation. Never
     # forwarded in tools/list; exposed only by the registered recovery tool.
+    #
+    # It IS part of this dataclass's ``__eq__``, and deliberately so: the
+    # re-advertisement reconcile (``server.app_lifespan``) re-registers a
+    # surviving tool when its info stops comparing equal, and that is the only
+    # thing keeping recovery from serving a stale generation -- the claim loop
+    # skips names already registered. The cost is that an upstream edit the
+    # CLIENT cannot see (a description tail past the cap; a nested schema
+    # description under ``strip_schema_descriptions``) now costs a
+    # remove/re-register and a ``tools/list_changed`` (#1014).
     description_details: dict[str, Any] | None = None
     # Deliberately NOT carried: ``execution`` (MCP 2025-11-25 task support).
     # The proxy's call path is synchronous-only, so forwarding it would
@@ -3274,14 +3285,34 @@ class ProxyManager:
                 if cfg_snap.advertise_context_query:
                     schema = self._with_context_query_schema(schema)
                     full_schema = self._with_context_query_schema(full_schema)
+                # Bounded HERE, not per call: the ceiling then also applies to
+                # what the snapshot holds, and the count it reports is a
+                # property of the advertisement rather than of who asked.
+                recovered_desc, desc_omitted = bound_recovered_text(desc)
+                omitted: dict[str, int] = {}
+                if desc_omitted:
+                    omitted["description"] = desc_omitted
                 details: dict[str, Any] = {
                     "name": prefixed_name,
-                    "description": desc,
+                    "description": recovered_desc,
                     "input_schema": deepcopy(full_schema),
-                    "response_hint": suffix.strip(),
+                    "response_hint": hint_text(suffix),
                 }
-                if advert_override is not None and advert_override.description_override is not None:
-                    details["upstream_description"] = t.description or ""
+                if (
+                    cfg_snap.recover_upstream_description
+                    and advert_override is not None
+                    and advert_override.description_override is not None
+                ):
+                    # Opt-in: an override decides what the model is told, and
+                    # returning the text it replaced hands that decision back
+                    # to the upstream that lost it (#1014).
+                    details["upstream_description"], up_omitted = bound_recovered_text(
+                        t.description or ""
+                    )
+                    if up_omitted:
+                        omitted["upstream_description"] = up_omitted
+                if omitted:
+                    details["omitted_chars"] = omitted
                 desc = compose_description(
                     desc,
                     DescriptionBudget(

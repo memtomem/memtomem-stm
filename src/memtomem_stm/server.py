@@ -609,10 +609,15 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                 embedding host owns must go on being declined rather than
                 stolen — so removal reads ``registered_proxy_tools`` and every
                 claim goes back through ``register_proxy_tool``'s own probe.
-                A surviving tool whose advertised metadata moved is
-                re-registered too, because ``get_proxy_tools`` has already
-                rewritten the snapshot that ranking and telemetry read and the
-                registry would otherwise describe a different tool than they do.
+                A surviving tool whose metadata moved is re-registered too,
+                because ``get_proxy_tools`` has already rewritten the snapshot
+                that ranking and telemetry read and the registry would
+                otherwise describe a different tool than they do. "Metadata"
+                here reaches past what ``tools/list`` carries: recovery details
+                are compared as well (see ``ProxyToolInfo``), so a change only
+                ``stm_proxy_describe_tool`` would show still re-registers and
+                still announces -- the claim loop below skips names already
+                held, so nothing else would refresh the recovery snapshot.
                 """
                 desired = {info.prefixed_name: info for info in manager.get_proxy_tools()}
                 changed = False
@@ -1245,13 +1250,15 @@ async def stm_proxy_describe_tool(
     name: str,
     ctx: CtxType = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Read full instructions and input schema for a registered proxied tool.
+    """Read the uncut instructions and input schema for a registered proxied tool.
 
     Use when a description is truncated or says 'full: stm_proxy_describe_tool',
     or schema descriptions were removed. Pass STM's prefix__tool name, e.g.
     cedar__search_docs, WITHOUT a host-added mcp__server__ prefix.
-    description follows operator overrides; upstream_description, when
-    present, is the upstream original. response_hint explains proxy follow-ups.
+    description follows operator overrides. response_hint explains proxy
+    follow-ups. Text fields have a length ceiling of their own: omitted_chars,
+    when present, counts what it dropped, and that remainder cannot be paged
+    for. upstream_description appears only when the operator opted in.
     This reads cached metadata and does not execute the upstream tool.
     """
     return _get_ctx(ctx).proxy_manager.describe_tool(name)

@@ -52,33 +52,60 @@ def _binding_clause(budget: DescriptionBudget) -> str:
 def _next_action(budget: DescriptionBudget, name: str, need: int, path_hint: str) -> str:
     """Name every level that has to move, not just the one binding today.
 
-    The cap is ``min(server, global)``, so raising the binding level alone
-    stops at whichever level is next. Recommending only that one is the same
-    mistake this check exists to catch, one step further along.
+    The cap is ``min(server, global, host)``, so raising the binding level
+    alone stops at whichever level is next. Recommending only that one is the
+    same mistake this check exists to catch, one step further along -- and a
+    configured host limit does not exempt the STM levels from it.
+
+    ``host_description_cap`` is not STM's to raise, so it bounds what an edit
+    can REACH (``min(need, host_cap)``); it does not decide whether an edit is
+    worth making. Every STM level still below that reach has to move, and only
+    the remainder past it is recovery's to carry. Answering "the host binds" to
+    a cap the host is not binding stranded the operator on a budget an edit
+    would have widened, while the same report's ``binding`` clause said
+    otherwise (#1014).
     """
-    if budget.host_cap is not None and budget.host_cap < need:
-        return (
-            "# use stm_proxy_describe_tool with the advertised tool name for full metadata; "
-            "verify host_description_cap against the host if the recovery hint cannot fit; "
-            "raising max_description_chars alone cannot widen the host limit"
-        )
     # Edit-this-file instructions lead with ``#``: a pasted ``next:`` line must
     # never *do* anything (same rule as doctor's other config hints).
+    recover = (
+        "# use stm_proxy_describe_tool with the advertised tool name for full metadata; "
+        "verify host_description_cap against the host if the recovery hint cannot fit"
+    )
+    if budget.binding == "host":
+        # Reading ``binding``, not ``host_cap < need``: only a host limit at or
+        # under both STM levels makes every STM edit a no-op.
+        return f"{recover}; no max_description_chars edit can widen the host limit"
+    reach = min(need, budget.host_cap) if budget.host_cap is not None else need
     tail = "restart the proxy to apply"
     below = []
-    if budget.server_cap < need:
+    if budget.server_cap < reach:
         below.append(f"upstream_servers.{name}")
-    if budget.global_cap < need:
+    if budget.global_cap < reach:
         below.append("the top level")
     if not below:
+        # ``reach < need`` cannot land here: it means ``host_cap < need``, and
+        # an empty ``below`` means both STM levels are at or above ``reach``,
+        # which is the ``binding == "host"`` case already returned above.
         # Nothing is under the requirement, so the finding is not about the
         # numbers: it is a suffix that no valid cap change would restore.
         return f"# review the compression strategy for upstream_servers.{name} in {path_hint}"
     where = " and ".join(below)
-    return (
-        f'# set "max_description_chars": {need} on {where} in {path_hint}'
-        f"  (the budget is min(server, global), so every level below {need} has to move; {tail})"
+    levels = "min(server, global, host)" if budget.host_cap is not None else "min(server, global)"
+    action = (
+        f'# set "max_description_chars": {reach} on {where} in {path_hint}'
+        f"  (the budget is {levels}, so every level below {reach} has to move; {tail})"
     )
+    if reach < need:
+        # The gap is stated as CAPS, not as surviving source chars: the hint
+        # this edit keeps affordable takes its own 32 out of the body, so a
+        # char count here would be short by that much (codex R1).
+        action += (
+            f"; {reach} is as far as the host limit allows and a lossless advertisement "
+            f"needs {need}, so the advertisement stays incomplete (cut text, a dropped hint, "
+            "or both) — stm_proxy_describe_tool serves the "
+            "full instructions and the follow-up hint, up to its own per-field ceiling"
+        )
+    return action
 
 
 def _unmeasured_reason(probe: StagedProbeResult | None, name: str) -> str:

@@ -159,16 +159,30 @@ budget; this setting uses the same character count as `max_description_chars`.
 
 If source text is cut, or schema descriptions/examples are removed, STM appends
 ` | full: stm_proxy_describe_tool` when it fits. The model can call that tool
-with the exact advertised `prefix__tool` name to recover the full instructions
-and input schema. The tool is always advertised, including when observability
-tools are hidden. An uncut description with an unchanged schema needs no hint.
+with the exact advertised `prefix__tool` name to recover the instructions this
+cap discarded, together with the input schema. Recovery has a ceiling of its
+own — see [full tool metadata](mcp-tools.md#full-tool-metadata) — and that
+ceiling is on the **source**, not on the cap it undoes: a description whose
+source fits in 16,000 characters comes back whole however small the advertised
+cap was, and one longer than that stays cut at 16,000 no matter how generous
+the cap, with `omitted_chars` reporting the overflow nothing can retrieve. The
+tool is always advertised, including when observability tools are hidden. An
+uncut description with an unchanged schema needs no hint.
 
 The compression hint is reserved first, the recovery hint second, then the
 remaining budget goes to source text. Neither hint is shortened. At tiny budgets
-one or both hints may be absent; `mms doctor` warns about the lost hints. If the
-host limit binds, doctor recommends full-metadata retrieval rather than raising
-STM's own budget beyond the host's capability. Its advice reflects declared
-limits and discovered lengths, not measured host behavior or model adoption.
+one or both hints may be absent; `mms doctor` warns about the lost hints.
+
+A configured host limit is not automatically the binding one. Doctor recommends
+full-metadata retrieval *instead of* a budget edit only when the host limit sits
+at or under both STM levels, where no edit could recover a character. When an STM
+level is the lower one, it still recommends raising that level — to whichever is
+smaller, the cap a lossless advertisement needs or the host limit, never past
+the host limit. When the host limit is the smaller of those two, it also reports
+the cap a lossless advertisement would have needed, so the shortfall is visible
+as the gap between two caps rather than as a count of surviving text. Its advice
+reflects declared limits and discovered lengths, not measured host behavior or
+model adoption.
 
 When the budget is tight the convention suffix wins over upstream text, because
 it names the follow-up tool the response requires. If even the suffix alone

@@ -18,6 +18,15 @@ _ELLIPSIS = "..."
 
 RECOVERY_SUFFIX = " | full: stm_proxy_describe_tool"
 
+#: Ceiling on ONE free-text field in a recovery response. Recovery exists to
+#: get past a host's description cap, so this has to sit far above any sane cap
+#: -- but the result still lands verbatim in a model's context, which is the
+#: budget this proxy exists to defend, and no upstream should be able to spend
+#: it in a single call. The input schema is deliberately NOT bounded by this:
+#: cutting a JSON Schema mid-structure yields an invalid schema, which is worse
+#: than a large valid one.
+MAX_RECOVERED_TEXT_CHARS = 16000
+
 #: Sentence terminators, each followed by the whitespace that ends the
 #: sentence. The latest match across all of them wins, so the cut is chosen by
 #: position rather than by the order this tuple happens to list (#1016).
@@ -154,6 +163,26 @@ class DescriptionBudget:
 
     @property
     def recovery_fits(self) -> bool:
+        # ``<=``, not ``<``: a budget with room for the hint and nothing else
+        # still advertises something ACTIONABLE -- the tool name the client
+        # already has, plus where to read the rest -- whereas the same budget
+        # spent on source text advertises an unrecoverable fragment.
+        #
+        # Zero body WITH this hint carried lands at ``len(PROXIED_PREFIX) +
+        # len(the suffix that fits) + len(RECOVERY_SUFFIX)``, which is two caps
+        # for a strategy that HAS a convention suffix: 42, where that suffix is
+        # too long and is dropped, and 86 (44-char selective/progressive) or 82
+        # (40-char hybrid TOC) where it is carried too. A strategy with no
+        # suffix has only the 42.
+        #
+        # Distinct from all of those is zero body with the convention suffix
+        # alone, at ``len(PROXIED_PREFIX) + len(suffix)`` -- 54, 54, 50 -- where
+        # this property is False because the recovery hint does not fit.
+        #
+        # Measured by sweeping every cap from MIN_DESCRIPTION_CHARS per
+        # strategy. A sweep that fixes the suffix at "" sees only the 42
+        # (codex R1); one that tests ``body == 0`` without also reading
+        # ``recovery_fits`` folds the convention-only caps in (codex R2).
         return self.recovery_required and len(RECOVERY_SUFFIX) <= self._body_without_recovery
 
     @property
@@ -239,7 +268,35 @@ class ComposedDescription:
     chars_cut: int
     #: A configured suffix was dropped whole for want of room.
     suffix_dropped: bool
-    recovery_dropped: bool = False
+    # No ``recovery_dropped`` twin: unlike the configured suffix, whether the
+    # recovery hint was dropped is answerable from the BUDGET alone
+    # (``recovery_required and not recovery_fits``), which is the form doctor
+    # reads -- it never has the source text to compose. A second copy here
+    # would be a rule with two readers and no second caller (#926).
+
+
+def hint_text(suffix: str) -> str:
+    """One convention hint as a standalone value, without the joining separator.
+
+    ``convention_suffix`` returns text shaped to be APPENDED to a description,
+    so it opens with the ``" | "`` separator that divides it from the body. A
+    field carrying the hint on its OWN -- the recovery tool's
+    ``response_hint`` -- must not inherit that separator, or the client reads a
+    dangling ``|`` as the first character of the instruction (#1014).
+    """
+    return suffix.strip().removeprefix("|").strip()
+
+
+def bound_recovered_text(text: str, limit: int = MAX_RECOVERED_TEXT_CHARS) -> tuple[str, int]:
+    """Cap one recovered free-text field; return it with the chars dropped.
+
+    The count is returned OUT OF BAND rather than marked inside the text: an
+    in-band marker is forgeable by the upstream text it is meant to describe,
+    and the caller has a structured response to put the number in (#948).
+    """
+    if len(text) <= limit:
+        return text, 0
+    return text[:limit], len(text) - limit
 
 
 def advertised_source_text(upstream: str | None, override: str | None, prefixed_name: str) -> str:
@@ -263,8 +320,8 @@ def compose_description(source: str, budget: DescriptionBudget) -> ComposedDescr
     the client which follow-up tool to call (#893). Call ``budget.for_source``
     before composing to include recovery hints; the raw budget remains useful
     for configuration-only diagnostics. Recovery comes after compression hints.
-    Truncation owns its own
-    ellipsis, so the result never exceeds ``budget.total``.
+    Truncation owns its own ellipsis, so the result never exceeds
+    ``budget.total``.
     """
     body = truncate_description(source, budget.body)
     suffix = budget.combined_suffix
@@ -273,7 +330,6 @@ def compose_description(source: str, budget: DescriptionBudget) -> ComposedDescr
         text=text,
         chars_cut=len(source) - len(body),
         suffix_dropped=bool(budget.suffix) and not budget.suffix_fits,
-        recovery_dropped=budget.recovery_required and not budget.recovery_fits,
     )
 
 

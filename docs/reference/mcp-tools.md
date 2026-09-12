@@ -21,13 +21,34 @@ All connected upstream tools are added as `{prefix}__{tool}`.
 executes the upstream tool. It returns:
 
 - `name`: the advertised tool name.
-- `description`: full effective instructions, respecting the operator's override
-  and the ordinary empty-description name fallback.
+- `description`: the effective instructions as the advertisement budgeted them
+  before any cap, respecting the operator's override and the ordinary
+  empty-description name fallback.
 - `input_schema`: the input schema with descriptions and examples restored,
   including `_context_query` when advertised by STM.
-- `response_hint`: the compression follow-up hint from that advertisement.
-- `upstream_description`: the original upstream description, included only when
-  an operator override is configured, separately from the effective instructions.
+- `response_hint`: the compression follow-up hint from that advertisement, as a
+  standalone sentence — without the `|` separator the advertised description
+  uses to join it onto the body.
+- `upstream_description`: the text a `description_override` replaced. Returned
+  only when the global `recover_upstream_description` is on **and** an override
+  is configured. It is off by default: an override decides what the model is
+  told, and one legitimate use is neutralizing a misleading or hostile upstream
+  description, which returning it here would undo.
+- `omitted_chars`: present only when a free-text field hit its length ceiling,
+  mapping that field name to the characters dropped.
+
+`description` and `upstream_description` are each capped at 16,000 characters —
+far above any workable `max_description_chars`, but bounded, because the result
+lands verbatim in the model's context. The cut happens once, when the
+advertisement is built, and there is no pagination: text past the ceiling is
+**not retrievable by any call**, and `omitted_chars` reports how much was lost
+rather than offering a way to read it ([#1026][i1026]). `input_schema` is not
+capped at all, so one call can return a schema of any size the upstream
+published ([#1027][i1027]). Both are known limitations of this first version,
+not properties to rely on.
+
+[i1026]: https://github.com/memtomem/memtomem-stm/issues/1026
+[i1027]: https://github.com/memtomem/memtomem-stm/issues/1027
 
 Unknown, hidden, rejected and unregistered tools are unavailable through this
 endpoint. Catalogue changes update recovery metadata when registration succeeds;
