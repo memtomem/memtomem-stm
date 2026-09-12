@@ -9,6 +9,30 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
+## [Unreleased]
+
+### Fixed
+
+- A refused surfacing rating no longer reports the surfacing event as missing
+  when the event exists and only `memory_id` was wrong (#1023; merged in #1024).
+  The store's `record_feedback` folded every refusal into one `False`, and the
+  tracker rendered all of them as `Error: surfacing event '<id>' not found` — so an
+  agent that mistyped a `memory_id` was told the handle it had just been given
+  no longer existed, which is a reason to stop rating rather than to retry. The
+  store now returns a `FeedbackRejection` reason (or `None` on success) and the
+  tracker renders one message per reason, identifying the offending argument
+  where there is one. `record_feedback_batch` renders per entry and inherits
+  the fix. **Behavior change**: `FeedbackStore.record_feedback`'s return type
+  changes from `bool` to `FeedbackRejection | None`, which inverts the
+  truthiness of the old contract — success is now falsy. The sole production
+  consumer did read it as a boolean (`if not ok`) and was updated to test the
+  rejection explicitly. Seven assertions on this call were updated for the new
+  contract — four written as truthiness checks, which the inversion would have
+  turned into loud failures rather than silent passes, and three boolean
+  identity checks that now name the specific rejection. The MCP-facing
+  `stm_surfacing_feedback` reply text is unchanged for success and for a
+  genuinely absent event.
+
 ## [0.5.0] — 2026-09-10
 
 ### Upgrade notes
