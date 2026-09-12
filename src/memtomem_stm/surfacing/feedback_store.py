@@ -10,6 +10,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Iterable, Iterator
+from enum import StrEnum
 from pathlib import Path
 from typing import TypedDict
 
@@ -479,6 +480,30 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
         db.close()
 
     return summary
+
+
+class FeedbackRejection(StrEnum):
+    """Why a feedback write did not land.
+
+    ``record_feedback`` returns ``None`` on success and one of these
+    otherwise. It exists because the two most common rejections are not the
+    same news to the caller: an absent event means the handle is dead, while
+    a memory that is not part of the event means the handle is fine and one
+    argument was wrong. Folding both into ``False`` made the renderer report
+    the first for both, so an agent that mis-typed a ``memory_id`` was told
+    its surfacing handle no longer existed and stopped rating (#1023).
+    """
+
+    #: The store is closed; nothing can be written now.
+    STORE_CLOSED = "store_closed"
+    #: An identifier could not be encoded, so it can address nothing.
+    UNUSABLE_IDENTIFIER = "unusable_identifier"
+    #: No ``surfacing_events`` row carries this id.
+    EVENT_NOT_FOUND = "event_not_found"
+    #: The event exists, but its stored ``memory_ids`` will not parse.
+    EVENT_MEMORY_IDS_UNREADABLE = "event_memory_ids_unreadable"
+    #: The event exists and this memory is simply not one it surfaced.
+    MEMORY_NOT_IN_EVENT = "memory_not_in_event"
 
 
 class FeedbackStore:
@@ -961,37 +986,44 @@ class FeedbackStore:
         surfacing_id: str,
         rating: str,
         memory_id: str | None = None,
-    ) -> bool:
+    ) -> FeedbackRejection | None:
+        """Write one rating. ``None`` on success, else why it was refused.
+
+        The reason is returned rather than rendered here: the wording belongs
+        to the caller that faces the agent, but the *distinction* is only
+        knowable at this layer, which is why the two cannot be rejoined into
+        a bool (#1023).
+        """
         if self._db is None:
-            return False
+            return FeedbackRejection.STORE_CLOSED
         if has_lone_surrogate(surfacing_id):
-            return False
+            return FeedbackRejection.UNUSABLE_IDENTIFIER
         if memory_id is not None and has_lone_surrogate(memory_id):
-            return False
+            return FeedbackRejection.UNUSABLE_IDENTIFIER
         with self._lock:
             db = self._db
             if db is None:
-                return False
+                return FeedbackRejection.STORE_CLOSED
             # Verify surfacing event exists
             event = db.execute(
                 "SELECT memory_ids FROM surfacing_events WHERE id = ?", (surfacing_id,)
             ).fetchone()
             if not event:
-                return False
+                return FeedbackRejection.EVENT_NOT_FOUND
             if memory_id is not None:
                 try:
                     event_memory_ids = json.loads(event[0])
                 except (json.JSONDecodeError, TypeError):
-                    return False
+                    return FeedbackRejection.EVENT_MEMORY_IDS_UNREADABLE
                 if memory_id not in event_memory_ids:
-                    return False
+                    return FeedbackRejection.MEMORY_NOT_IN_EVENT
             db.execute(
                 "INSERT INTO surfacing_feedback (surfacing_id, memory_id, rating, created_at) "
                 "VALUES (?, ?, ?, ?)",
                 (surfacing_id, memory_id, rating, time.time()),
             )
             db.commit()
-        return True
+        return None
 
     def get_memory_ids_for_surfacing(self, surfacing_id: str) -> list[str]:
         """Return memory_ids from a surfacing event."""

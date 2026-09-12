@@ -11,8 +11,9 @@ import pytest
 
 from memtomem_stm.proxy.compression_feedback_store import CompressionFeedbackStore
 from memtomem_stm.surfacing.config import SurfacingConfig
-from memtomem_stm.surfacing.feedback import AutoTuner, FeedbackTracker
+from memtomem_stm.surfacing.feedback import AutoTuner, FeedbackTracker, record_feedback_batch
 from memtomem_stm.surfacing.feedback_store import (
+    FeedbackRejection,
     FeedbackStore,
     _REQUIRED_TABLES,
     inspect_feedback_db,
@@ -84,8 +85,16 @@ class TestFeedbackStore:
             raw,
             literal,
         ]
-        assert feedback_store.record_feedback("surfacing", "not_relevant", literal)
-        assert not feedback_store.record_feedback("surfacing", "not_relevant", raw)
+        # #1023: success is ``None`` and a rejection is a truthy enum, so these
+        # must not be written as truthiness checks — the polarity is inverted.
+        assert feedback_store.record_feedback("surfacing", "not_relevant", literal) is None
+        # ``raw`` carries a lone surrogate, so it is refused as unencodable
+        # before the membership check ever runs — a different rejection than a
+        # well-formed id that the event simply did not surface.
+        assert (
+            feedback_store.record_feedback("surfacing", "not_relevant", raw)
+            is FeedbackRejection.UNUSABLE_IDENTIFIER
+        )
 
     def test_inspect_feedback_db_missing(self, tmp_path: Path):
         status = inspect_feedback_db(tmp_path / "missing.db")
@@ -150,12 +159,61 @@ class TestFeedbackStore:
 
     def test_record_feedback_valid_id(self, feedback_store: FeedbackStore):
         feedback_store.record_surfacing("surf1", "s", "t", "q", ["m1"], [0.9])
-        ok = feedback_store.record_feedback("surf1", "helpful")
-        assert ok is True
+        assert feedback_store.record_feedback("surf1", "helpful") is None
 
     def test_record_feedback_unknown_id(self, feedback_store: FeedbackStore):
-        ok = feedback_store.record_feedback("nonexistent", "helpful")
-        assert ok is False
+        assert (
+            feedback_store.record_feedback("nonexistent", "helpful")
+            is FeedbackRejection.EVENT_NOT_FOUND
+        )
+
+    # --- #1023: a rejected write must say WHICH thing was missing -----------
+    # The store folded "no such event" and "that memory is not in this event"
+    # into one ``False``, and the tracker rendered both as "surfacing event
+    # '<id>' not found". An agent that reads that about a handle it was just
+    # given concludes the handle is dead and stops rating — which is the
+    # difference between a fixable argument and an abandoned feedback channel.
+
+    def test_memory_not_in_event_does_not_claim_the_event_is_missing(self, tmp_path: Path) -> None:
+        tracker = FeedbackTracker(SurfacingConfig(feedback_db_path=tmp_path / "fb.db"))
+        try:
+            tracker.record_surfacing("surf1", "s", "t", "q", ["m1"], [0.9])
+            msg = tracker.record_feedback("surf1", "helpful", "m-not-in-event")
+            assert "surf1" in msg, "the message must still name the event it is about"
+            assert "not found" not in msg, (
+                "the event exists; saying it is missing sends the agent away from a "
+                f"handle that still works (got: {msg!r})"
+            )
+            assert "m-not-in-event" in msg, (
+                f"the message must name the argument that was actually wrong (got: {msg!r})"
+            )
+        finally:
+            tracker.close()
+
+    def test_unknown_event_still_reports_the_event_as_missing(self, tmp_path: Path) -> None:
+        """Guard against swapping the bug: a genuinely absent event keeps its message."""
+        tracker = FeedbackTracker(SurfacingConfig(feedback_db_path=tmp_path / "fb.db"))
+        try:
+            msg = tracker.record_feedback("ghost", "helpful", None)
+            assert "ghost" in msg and "not found" in msg
+        finally:
+            tracker.close()
+
+    def test_batch_path_reports_the_same_distinction(self, tmp_path: Path) -> None:
+        """``record_feedback_batch`` renders per entry, so it inherits the defect."""
+        tracker = FeedbackTracker(SurfacingConfig(feedback_db_path=tmp_path / "fb.db"))
+        try:
+            tracker.record_surfacing("surf1", "s", "t", "q", ["m1"], [0.9])
+            results = record_feedback_batch(
+                tracker, "surf1", [("m1", "helpful"), ("m-absent", "not_relevant")]
+            )
+            assert "recorded" in results[0]
+            assert "not found" not in results[1], (
+                f"batch entry inherited the misleading message (got: {results[1]!r})"
+            )
+            assert "m-absent" in results[1]
+        finally:
+            tracker.close()
 
     def test_feedback_summary_by_rating(self, feedback_store: FeedbackStore):
         feedback_store.record_surfacing("s1", "sv", "tool_a", "q", ["m1"], [0.5])

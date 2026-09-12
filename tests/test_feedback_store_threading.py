@@ -20,6 +20,7 @@ import pytest
 
 from memtomem_stm.surfacing.feedback_store import (
     FAULT_KINDS,
+    FeedbackRejection,
     FeedbackStore,
     read_surfacing_summary,
 )
@@ -219,7 +220,7 @@ class TestCloseRacingAWrite:
         store.record_surfacing("sid", "gh", "read_file", "q", ["mem"], [0.5])
         store.save_adjustment("read_file", 0.04)
 
-        assert store.record_feedback("sid", "helpful") is False
+        assert store.record_feedback("sid", "helpful") is FeedbackRejection.STORE_CLOSED
         assert store.get_seen_ids(10_000_000.0) == set()
         assert store.get_stats()["events_total"] == 0
         assert store.load_adjustments() == {}

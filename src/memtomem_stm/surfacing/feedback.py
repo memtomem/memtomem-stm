@@ -10,6 +10,7 @@ from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.feedback_store import (
     DIAGNOSTIC_KINDS,
     FeedbackDbStatus,
+    FeedbackRejection,
     FeedbackStore,
     inspect_feedback_db,
 )
@@ -66,6 +67,34 @@ Distinct from :data:`FEEDBACK_STORE_BUSY` on the one point the agent acts on:
 nothing was written and nothing is on its way, so retrying later is right —
 where a busy write is already in flight and a retry would double it.
 """
+
+
+def _rejection_message(
+    rejection: FeedbackRejection, surfacing_id: str, memory_id: str | None
+) -> str:
+    """Render one rejection for the agent that tried to rate.
+
+    Each branch says which of the two identifiers is the problem, because the
+    agent's next move differs: a dead event means stop, a wrong ``memory_id``
+    means retry with one the event actually surfaced. The old single message
+    claimed the event was missing in both cases (#1023).
+    """
+    if rejection is FeedbackRejection.MEMORY_NOT_IN_EVENT:
+        return (
+            f"Error: memory {memory_id!r} is not one of the memories surfacing event "
+            f"{surfacing_id!r} returned. The event is still valid — retry with a "
+            "memory_id from that surfacing, or omit memory_id to rate the whole event."
+        )
+    if rejection is FeedbackRejection.EVENT_MEMORY_IDS_UNREADABLE:
+        return (
+            f"Error: surfacing event {surfacing_id!r} has an unreadable memory list, so "
+            "a per-memory rating cannot be checked against it."
+        )
+    if rejection is FeedbackRejection.UNUSABLE_IDENTIFIER:
+        return "Error: the surfacing_id or memory_id could not be encoded."
+    if rejection is FeedbackRejection.STORE_CLOSED:
+        return "Error: the feedback store is closed, so the rating was not recorded."
+    return f"Error: surfacing event '{surfacing_id}' not found"
 
 
 def record_feedback_batch(
@@ -176,9 +205,9 @@ class FeedbackTracker:
             except ValueError as exc:
                 return f"Error: {exc}"
 
-        ok = self._store.record_feedback(surfacing_id, rating, memory_id)
-        if not ok:
-            return f"Error: surfacing event '{surfacing_id}' not found"
+        rejection = self._store.record_feedback(surfacing_id, rating, memory_id)
+        if rejection is not None:
+            return _rejection_message(rejection, surfacing_id, memory_id)
 
         return f"Feedback recorded: {rating}"
 
