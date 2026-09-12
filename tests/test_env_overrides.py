@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from pathlib import Path
 
@@ -222,8 +221,6 @@ class TestComplexEnvValuesMatchSettings:
         """
         from memtomem_stm.config import STMConfig
 
-        for name in [n for n in os.environ if n.upper().startswith("MEMTOMEM_STM_PROXY")]:
-            monkeypatch.delenv(name, raising=False)
         for name, value in items:
             monkeypatch.setenv(name.replace("…", "MEMTOMEM_STM_PROXY"), value)
 
@@ -367,8 +364,6 @@ class TestComplexEnvValuesMatchSettings:
         """
         from memtomem_stm.config import STMConfig
 
-        for name in [n for n in os.environ if n.upper().startswith("MEMTOMEM_STM_PROXY")]:
-            monkeypatch.delenv(name, raising=False)
         for name, value in env.items():
             monkeypatch.setenv(name, value)
 
@@ -408,8 +403,6 @@ class TestSettingsSourceCanaries:
         was handed — a wrong answer, not an error. Contrast a variable set only
         in the process with one set only in the mapping.
         """
-        for name in [n for n in os.environ if n.upper().startswith("MEMTOMEM_STM_PROXY")]:
-            monkeypatch.delenv(name, raising=False)
         monkeypatch.setenv("MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS", "1111")
 
         result = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY__MAX_UPSTREAM_CHARS": "2222"})
@@ -601,8 +594,6 @@ class TestDivergenceEightIsClosedByDelegating:
         """
         from memtomem_stm.config import STMConfig
 
-        for name in [n for n in os.environ if n.upper().startswith("MEMTOMEM_STM_PROXY")]:
-            monkeypatch.delenv(name, raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.setenv("MEMTOMEM_STM_PROXY__EXTRACTION", '{"LLM": {"provider": "ollama"}}')
         monkeypatch.setenv("MEMTOMEM_STM_PROXY__EXTRACTION__LLM__LLM_TIMEOUT_SECONDS", "30")
@@ -1917,8 +1908,6 @@ class TestBareProxyPayload:
 
         from memtomem_stm.config import STMConfig
 
-        for name in [n for n in os.environ if n.upper().startswith("MEMTOMEM_STM_PROXY")]:
-            monkeypatch.delenv(name, raising=False)
         monkeypatch.setenv("MEMTOMEM_STM_PROXY", "{not json")
 
         with pytest.raises(SettingsError):
@@ -1950,7 +1939,5 @@ class TestBareProxyPayload:
 
         assert overrides.fragment == {}
         assert not caplog.records
-        for name in [n for n in os.environ if n.upper().startswith("MEMTOMEM_STM_PROXY")]:
-            monkeypatch.delenv(name, raising=False)
         monkeypatch.setenv("MEMTOMEM_STM_PROXY", "null")
         assert STMConfig().proxy.default_max_result_chars == 16000
