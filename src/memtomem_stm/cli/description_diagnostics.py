@@ -103,7 +103,7 @@ def _next_action(budget: DescriptionBudget, name: str, need: int, path_hint: str
             f"; {reach} is as far as the host limit allows and a lossless advertisement "
             f"needs {need}, so the advertisement stays incomplete (cut text, a dropped hint, "
             "or both) — stm_proxy_describe_tool serves the "
-            "full instructions and the follow-up hint, up to its own per-field ceiling"
+            "full instructions and the follow-up hint through bounded, continuable pages"
         )
     return action
 

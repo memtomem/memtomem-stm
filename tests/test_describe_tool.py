@@ -1,11 +1,13 @@
 """Recover the registered generation of metadata across host truncation (#1014)."""
 
+import json
+
 from types import SimpleNamespace
-from typing import Any
 from unittest.mock import patch
 
 import pytest
 from mcp import ClientSession
+from mcp.types import CallToolResult
 from mcp.client._memory import InMemoryTransport
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -22,11 +24,11 @@ from memtomem_stm.proxy.config import (
 )
 from memtomem_stm.proxy.staged_status import ProbeStage, StagedProbeResult
 from memtomem_stm.proxy.tool_metadata import (
-    MAX_RECOVERED_TEXT_CHARS,
     PROXIED_PREFIX,
     RECOVERY_SUFFIX,
     convention_suffix,
 )
+from memtomem_stm.proxy.metadata_recovery import MAX_RECOVERY_RESPONSE_BYTES, recovery_result
 from memtomem_stm.server import stm_proxy_describe_tool
 from test_tool_metadata import _fake_tool, _make_manager_with_tools
 
@@ -43,6 +45,29 @@ def _register(manager):
     infos = {i.prefixed_name: i for i in manager.get_proxy_tools()}
     manager.retain_registered_advertisement(list(infos), registered_infos=infos)
     return infos
+
+
+def _read_all(manager, name="test__t", part="description", limit=4000):
+    pages = []
+    offset, generation = 0, None
+    while True:
+        page = manager.describe_tool(
+            name, part=part, offset=offset, limit=limit, generation=generation
+        )
+        wire = recovery_result(page).model_dump_json(by_alias=True, exclude_none=True)
+        assert len(wire.encode("utf-8")) <= MAX_RECOVERY_RESPONSE_BYTES
+        assert page["offset"] == offset
+        if generation is not None:
+            assert page["generation"] == generation
+        pages.append(page["text"])
+        if page["next_offset"] is None:
+            break
+        assert page["next_offset"] == offset + len(page["text"])
+        assert page["next_offset"] > offset
+        offset, generation = page["next_offset"], page["generation"]
+    text = "".join(pages)
+    assert len(text) == page["total_chars"]
+    return text
 
 
 def _doctor(manager, tools):
@@ -76,7 +101,7 @@ async def test_host_cap_listed_hint_and_full_response_through_mcp():
     )
 
     @server.tool(name="stm_proxy_describe_tool")
-    async def describe(name: str) -> dict[str, Any]:
+    async def describe(name: str) -> CallToolResult:
         return await stm_proxy_describe_tool(name, ctx=ctx)
 
     async with InMemoryTransport(server) as streams:
@@ -91,7 +116,7 @@ async def test_host_cap_listed_hint_and_full_response_through_mcp():
             assert tail not in received
             result = await session.call_tool("stm_proxy_describe_tool", {"name": advertised.name})
     assert not result.is_error
-    assert result.structured_content["description"] == source
+    assert result.structured_content["text"] == source
     assert tail in "".join(c.text for c in result.content)
     manager._connections["srv"].session.call_tool.assert_not_called()
 
@@ -118,7 +143,7 @@ def test_host_boundaries_keep_complete_hints(cap, strategy):
     elif suffix:
         assert suffix.strip() not in advertised
     assert (RECOVERY_SUFFIX.strip() in advertised) == (available >= len(RECOVERY_SUFFIX))
-    assert manager.describe_tool("test__t")["description"] == source.strip()
+    assert _read_all(manager) == source.strip()
     if cap is not None and available < len(RECOVERY_SUFFIX):
         check = _doctor(manager, [tool])
         assert check[2] == "WARN"
@@ -145,7 +170,7 @@ def test_schema_recovery_includes_nested_descriptions_and_proxy_context():
     info = _register(manager)["test__t"]
     assert RECOVERY_SUFFIX in info.description
     assert "description" not in info.input_schema["properties"]["q"]
-    recovered = manager.describe_tool("test__t")
+    recovered = {"input_schema": json.loads(_read_all(manager, part="input_schema"))}
     assert recovered["input_schema"]["properties"]["q"] == schema["properties"]["q"]
     assert recovered["input_schema"]["$defs"] == schema["$defs"]
     assert (
@@ -156,7 +181,7 @@ def test_schema_recovery_includes_nested_descriptions_and_proxy_context():
     recovered["input_schema"]["properties"]["q"]["description"] = "mutated reply"
     tool.input_schema["properties"]["q"]["description"] = "mutated upstream"
     assert (
-        manager.describe_tool("test__t")["input_schema"]["properties"]["q"]["description"]
+        json.loads(_read_all(manager, part="input_schema"))["properties"]["q"]["description"]
         == "필수 검색어"
     )
 
@@ -169,7 +194,7 @@ def test_override_and_empty_description_are_unambiguous(override):
     )
     _register(manager)
     result = manager.describe_tool("test__t")
-    assert result["description"] == (
+    assert result["text"] == (
         "Original text." if override is None else override.strip() or "test__t"
     )
     # Never by default, override or not: see the opt-in test below.
@@ -191,14 +216,14 @@ def test_an_override_does_not_hand_the_replaced_text_back_to_the_model():
     manager = _manager(tools, tool_overrides=overrides)
     _register(manager)
     result = manager.describe_tool("test__t")
-    assert result["description"] == "Search the docs."
+    assert result["text"] == "Search the docs."
     assert "upstream_description" not in result
     assert hostile not in str(result)
 
     opted_in = _manager(tools, tool_overrides=overrides)
     opted_in._config.recover_upstream_description = True
     _register(opted_in)
-    assert opted_in.describe_tool("test__t")["upstream_description"] == hostile
+    assert _read_all(opted_in, part="upstream_description") == hostile
 
 
 def test_the_opt_in_still_needs_an_override_to_have_anything_to_report():
@@ -214,12 +239,12 @@ def test_snapshot_changes_only_when_registration_commits_and_failed_removal_keep
     old = _register(manager)
     tool.description = "New generation"
     desired = {i.prefixed_name: i for i in manager.get_proxy_tools()}
-    assert manager.describe_tool("test__t")["description"] == "Old generation"
+    assert _read_all(manager) == "Old generation"
     # Removal failed: the old Tool is still installed in the server registry.
     manager.retain_registered_advertisement(list(old), registered_infos=old)
-    assert manager.describe_tool("test__t")["description"] == "Old generation"
+    assert _read_all(manager) == "Old generation"
     manager.retain_registered_advertisement(list(desired), registered_infos=desired)
-    assert manager.describe_tool("test__t")["description"] == "New generation"
+    assert _read_all(manager) == "New generation"
     manager.retain_registered_advertisement([], registered_infos={})
     with pytest.raises(ToolError, match="unavailable"):
         manager.describe_tool("test__t")
@@ -342,7 +367,7 @@ def test_three_description_limits_compose_by_minimum(server_cap, global_cap, hos
 def test_empty_upstream_uses_name_fallback():
     manager = _manager([_fake_tool("t", "  ")])
     _register(manager)
-    assert manager.describe_tool("test__t")["description"] == "test__t"
+    assert _read_all(manager) == "test__t"
 
 
 def test_doctor_recommends_the_stm_edit_a_non_binding_host_limit_still_allows():
@@ -402,16 +427,8 @@ def test_response_hint_carries_no_joining_separator():
     assert convention_suffix(CompressionStrategy.SELECTIVE, None).endswith(hint)
 
 
-def test_recovered_text_is_bounded_and_counts_what_it_dropped():
-    """Recovery must beat a host cap, not become an unbounded context dump.
-
-    This pins CURRENT behavior, and current behavior is lossy: the cut happens
-    once at snapshot time and the remainder is reachable by no call, while the
-    advertised hint still says ``full``. That is a known limitation of this
-    first version, recorded here so the loss is visible rather than incidental
-    -- it is not the behavior to preserve if paging is added (codex fresh pass).
-    """
-    over = MAX_RECOVERED_TEXT_CHARS + 500
+def test_recovered_text_past_old_ceiling_is_lossless_and_separately_selectable():
+    over = 16_000 + 500
     manager = _manager(
         [_fake_tool("t", "y" * over)],
         tool_overrides={"t": ToolOverrideConfig(description_override="z" * over)},
@@ -419,19 +436,22 @@ def test_recovered_text_is_bounded_and_counts_what_it_dropped():
     manager._config.recover_upstream_description = True
     _register(manager)
     result = manager.describe_tool("test__t")
-    assert len(result["description"]) == MAX_RECOVERED_TEXT_CHARS
-    assert len(result["upstream_description"]) == MAX_RECOVERED_TEXT_CHARS
-    # Out of band: an in-band marker is forgeable by the text describing it.
-    assert result["omitted_chars"] == {"description": 500, "upstream_description": 500}
-    assert "omitted" not in result["description"]
-    # Nothing on the response offers a way to continue past the ceiling.
-    assert not [k for k in result if "offset" in k or "next" in k or "more" in k]
+    assert result["part"] == "description"
+    assert "input_schema" not in result
+    assert "upstream_description" not in result
+    assert "omitted_chars" not in result
+    assert result["next_offset"] is not None
+    assert _read_all(manager) == "z" * over
+    assert _read_all(manager, part="upstream_description") == "y" * over
 
 
-def test_a_field_within_the_ceiling_reports_no_omission():
-    manager = _manager([_fake_tool("t", "y" * MAX_RECOVERED_TEXT_CHARS)])
+def test_short_field_is_complete_in_one_page():
+    manager = _manager([_fake_tool("t", "y" * 100)])
     _register(manager)
-    assert "omitted_chars" not in manager.describe_tool("test__t")
+    page = manager.describe_tool("test__t")
+    assert page["text"] == "y" * 100
+    assert page["next_offset"] is None
+    assert page["total_chars"] == 100
 
 
 _LONG = "Search the documentation corpus. " * 8
@@ -477,7 +497,7 @@ def test_a_budget_with_room_for_only_the_hints_advertises_only_the_hints(
     # hint is dropped, because the prefix already ends in one (#922).
     assert len(PROXIED_PREFIX + info.description) == expected_cap - 1
     # The full text is still reachable, which is what makes the trade sound.
-    assert manager.describe_tool("test__t")["description"] == _LONG.strip()
+    assert _read_all(manager) == _LONG.strip()
     # One cap either side keeps a body, so this cap really is a single point.
     for cap in (expected_cap - 1, expected_cap + 1):
         other = _manager(

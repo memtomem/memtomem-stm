@@ -1166,7 +1166,7 @@ The five model-facing tools are advertised by default:
 
 | Tool | Arguments | Description |
 |------|-----------|-------------|
-| `stm_proxy_describe_tool` | `name` | Read full tool instructions and restored input schema; use the STM `prefix__tool` name without a host prefix |
+| `stm_proxy_describe_tool` | `name`, `part?`, `offset?`, `limit?`, `generation?` | Read bounded metadata pages; defaults to instructions, use `part="input_schema"` for schema recovery and the STM `prefix__tool` name without a host prefix |
 | `stm_proxy_select_chunks` | `key`, `sections[]` | Retrieve sections from a selective/hybrid TOC response |
 | `stm_proxy_read_more` | `key`, `offset?=0`, `limit?` | Read next chunk from a progressive delivery response |
 | `stm_surfacing_feedback` | `surfacing_id`, `rating?`, `memory_id?`, `ratings?` | Rate surfaced memories (`helpful` / `partially_helpful` / `not_relevant` / `already_known`); `ratings=[{memory_id, rating}]` for batched per-memory feedback |
