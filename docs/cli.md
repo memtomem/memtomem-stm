@@ -1158,14 +1158,15 @@ discovered in project-local config files under the current directory are
 refused unless `--allow-project-configs` is passed. REMOVE and sidecar
 BACKFILL are not gated, since neither adopts a new registry command.
 
-## MCP Tools (4 default + 8 opt-in + proxied)
+## MCP Tools (5 default + 8 opt-in + proxied)
 
 These are exposed by the `memtomem-stm` MCP server and become available to your agent once it's connected.
 
-The four model-facing tools are advertised by default:
+The five model-facing tools are advertised by default:
 
 | Tool | Arguments | Description |
 |------|-----------|-------------|
+| `stm_proxy_describe_tool` | `name` | Read full tool instructions and restored input schema; use the STM `prefix__tool` name without a host prefix |
 | `stm_proxy_select_chunks` | `key`, `sections[]` | Retrieve sections from a selective/hybrid TOC response |
 | `stm_proxy_read_more` | `key`, `offset?=0`, `limit?` | Read next chunk from a progressive delivery response |
 | `stm_surfacing_feedback` | `surfacing_id`, `rating?`, `memory_id?`, `ratings?` | Rate surfaced memories (`helpful` / `partially_helpful` / `not_relevant` / `already_known`); `ratings=[{memory_id, rating}]` for batched per-memory feedback |
@@ -1238,8 +1239,8 @@ See [Configuration → General](configuration.md#general) for details.
 
 ## Trimming the advertised MCP tool surface
 
-STM advertises four model-facing MCP tools by default (progressive-delivery
-unlocks and feedback channels). Eight additional tools are operator-facing
+STM advertises five model-facing MCP tools by default (full tool metadata,
+progressive-delivery unlocks and feedback channels). Eight additional tools are operator-facing
 (observability / admin). On clients that eager-load MCP tool schemas into
 the model context at session start, the eight observability tools would
 pay schema tokens for calls the model rarely makes.

@@ -7590,13 +7590,14 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
         # exhausted budget.
         return max(1e-3, deadline - asyncio.get_running_loop().time())
 
-    from memtomem_stm.proxy.tool_metadata import advertised_source_text
+    from memtomem_stm.proxy.tool_metadata import advertised_source_text, distill_schema
 
     transport = str(cfg.get("transport", "stdio"))
     stage = ProbeStage.CONFIGURED
     tools = 0
     overflowing: tuple[str, ...] = ()
     description_chars: tuple[tuple[str, int], ...] = ()
+    schema_description_tools: tuple[str, ...] = ()
     try:
         if transport == "stdio":
             ctx = stdio_client(
@@ -7664,6 +7665,12 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
                     )
                     for t in result.tools
                 )
+                schema_description_tools = tuple(
+                    t.name
+                    for t in result.tools
+                    if distill_schema(getattr(t, "input_schema", None) or {}, True)
+                    != (getattr(t, "input_schema", None) or {})
+                )
                 # Only now is discovery genuinely complete. Setting the stage
                 # after processing the result (not right after list_tools)
                 # keeps a malformed-result failure classified as an
@@ -7684,6 +7691,7 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
                 tools=tools,
                 overflowing=overflowing,
                 description_chars=description_chars,
+                schema_description_tools=schema_description_tools,
             )
         # ``asyncio.wait_for`` raises ``TimeoutError`` directly, but anyio's
         # TaskGroup (wrapped by the SDK transports) re-raises failures as
@@ -7702,6 +7710,7 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
         tools=tools,
         overflowing=overflowing,
         description_chars=description_chars,
+        schema_description_tools=schema_description_tools,
     )
 
 

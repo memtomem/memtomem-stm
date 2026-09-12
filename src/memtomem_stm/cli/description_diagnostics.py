@@ -28,9 +28,9 @@ DoctorCheck = tuple[str, str, str, str, str | None]
 
 _SCOPE = (
     "Computed from the config file as the proxy would advertise it at its next start; a "
-    "running proxy keeps the per-server budget it connected with until then. A host may cut "
-    "descriptions again on its own side, which is a separate limit and is not measured here "
-    "(#1014). Counts cover the tools this upstream reported, minus any hidden by config; "
+    "running proxy keeps the per-server budget it connected with until then. The host cap "
+    "is operator-supplied, not measured; when unset, host-only cuts may lose the recovery "
+    "hint (#1014). Counts cover the tools this upstream reported, minus any hidden by config; "
     "exposure filtering — profiles, the tool-name budget, collisions — can withhold more."
 )
 
@@ -40,6 +40,8 @@ def _level(cap: int, stated: bool) -> str:
 
 
 def _binding_clause(budget: DescriptionBudget) -> str:
+    if budget.binding == "host":
+        return "the configured host limit binds; STM settings cannot raise the host limit"
     if budget.binding == "server":
         return "the server value binds, so raising only the global is a no-op"
     if budget.binding == "global":
@@ -54,6 +56,12 @@ def _next_action(budget: DescriptionBudget, name: str, need: int, path_hint: str
     stops at whichever level is next. Recommending only that one is the same
     mistake this check exists to catch, one step further along.
     """
+    if budget.host_cap is not None and budget.host_cap < need:
+        return (
+            "# use stm_proxy_describe_tool with the advertised tool name for full metadata; "
+            "verify host_description_cap against the host if the recovery hint cannot fit; "
+            "raising max_description_chars alone cannot widen the host limit"
+        )
     # Edit-this-file instructions lead with ``#``: a pasted ``next:`` line must
     # never *do* anything (same rule as doctor's other config hints).
     tail = "restart the proxy to apply"
@@ -116,6 +124,7 @@ def description_budget_doctor_checks(
             server_cap,
             global_cap,
             convention_suffix(*effective_compression_pair(server_cfg, None, config)),
+            config.host_description_cap,
         )
 
         probe = probes.get(name)
@@ -123,6 +132,7 @@ def description_budget_doctor_checks(
 
         truncated: list[tuple[str, int, int]] = []  # (tool, overflow, source chars)
         needs: list[int] = []
+        recovery_dropped = 0
         dropped: list[str] = []  # suffixes dropped, one entry per tool
         assessed = 0
         longest = 0
@@ -141,6 +151,14 @@ def description_budget_doctor_checks(
                 server_cap,
                 global_cap,
                 convention_suffix(*effective_compression_pair(server_cfg, override, config)),
+                config.host_description_cap,
+            ).for_source(
+                chars,
+                schema_removed=(
+                    (server_cfg.strip_schema_descriptions or config.strip_schema_descriptions)
+                    and probe is not None
+                    and tool in probe.schema_description_tools
+                ),
             )
             overflow = budget.overflow(chars)
             suffix_lost = bool(budget.suffix) and not budget.suffix_fits
@@ -148,7 +166,10 @@ def description_budget_doctor_checks(
                 truncated.append((tool, overflow, chars))
             if suffix_lost:
                 dropped.append(budget.suffix)
-            if overflow or suffix_lost:
+            recovery_lost = budget.recovery_required and not budget.recovery_fits
+            if recovery_lost:
+                recovery_dropped += 1
+            if overflow or suffix_lost or recovery_lost:
                 # The cap that loses nothing for THIS tool: its own body plus
                 # the prefix plus its own resolved suffix. A cap that merely
                 # readmits the suffix would starve the body it displaces, and
@@ -167,7 +188,13 @@ def description_budget_doctor_checks(
         parts = [
             f"cap {server_budget.cap} = min("
             f"server {_level(server_cap, server_stated)}, "
-            f"global {_level(global_cap, global_stated)}) — {_binding_clause(server_budget)}",
+            f"global {_level(global_cap, global_stated)}"
+            + (
+                f", host {config.host_description_cap}"
+                if config.host_description_cap is not None
+                else ""
+            )
+            + f") — {_binding_clause(server_budget)}",
             f"{server_budget.total} chars for text after the '{PROXIED_PREFIX}' prefix",
         ]
         if server_budget.suffix_fits:
@@ -204,6 +231,11 @@ def description_budget_doctor_checks(
                 "prefix, so the client is not told which follow-up tool to call before it calls"
             )
 
+        if recovery_dropped:
+            parts.append(
+                f"the full-metadata recovery hint is dropped on {recovery_dropped} tool(s); "
+                "existing compression hints take priority, and hints are never cut mid-name"
+            )
         if needs:
             parts.append(
                 f"a cap of {max(needs)} would carry every discovered description and its hint whole"

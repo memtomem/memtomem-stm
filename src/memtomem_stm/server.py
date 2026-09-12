@@ -586,7 +586,9 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
             # to what actually registered so health counts, relevance ranking
             # and selection telemetry describe the tools a client can call
             # (#908).
-            proxy_manager.retain_registered_advertisement(list(registered_proxy_tools))
+            proxy_manager.retain_registered_advertisement(
+                list(registered_proxy_tools), registered_infos=registered_proxy_tools
+            )
 
             # Proxied tools are now in front; re-insert STM utility tools at
             # the end so ``tools/list`` yields domain tools first (#228).
@@ -648,7 +650,9 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                 # Unconditional: ``get_proxy_tools`` rebuilt every ``_advertised_*``
                 # field from scratch, so a name the registry declined is back in
                 # the snapshot until this narrows it out again.
-                manager.retain_registered_advertisement(list(registered_proxy_tools))
+                manager.retain_registered_advertisement(
+                    list(registered_proxy_tools), registered_infos=registered_proxy_tools
+                )
                 if not changed:
                     return
                 _move_stm_tools_to_end(server)
@@ -926,6 +930,7 @@ def _hidden_obs_tools_hint() -> str | None:
 # tools* matters; see ``_move_stm_tools_to_end``.
 _STM_UTILITY_TOOL_NAMES: tuple[str, ...] = (
     "stm_proxy_stats",
+    "stm_proxy_describe_tool",
     "stm_proxy_select_chunks",
     "stm_proxy_read_more",
     "stm_proxy_cache_clear",
@@ -1233,6 +1238,23 @@ async def stm_proxy_stats(
         lines.append("\nSurfacing: disabled")
 
     return "\n".join(lines)
+
+
+@mcp.tool()
+async def stm_proxy_describe_tool(
+    name: str,
+    ctx: CtxType = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Read full instructions and input schema for a registered proxied tool.
+
+    Use when a description is truncated or says 'full: stm_proxy_describe_tool',
+    or schema descriptions were removed. Pass STM's prefix__tool name, e.g.
+    cedar__search_docs, WITHOUT a host-added mcp__server__ prefix.
+    description follows operator overrides; upstream_description, when
+    present, is the upstream original. response_hint explains proxy follow-ups.
+    This reads cached metadata and does not execute the upstream tool.
+    """
+    return _get_ctx(ctx).proxy_manager.describe_tool(name)
 
 
 # ---------------------------------------------------------------------------

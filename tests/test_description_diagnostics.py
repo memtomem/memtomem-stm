@@ -142,7 +142,7 @@ class TestTruncation:
         check = _check(_config(max_description_chars=100), _probe(("search", 1830), ("ls", 10)))
         assert check[2] == "WARN"
         assert "1 of 2 discovered descriptions exceed the text budget" in check[3]
-        assert "largest by 1740 chars over it ('search', 1830 chars)" in check[3]
+        assert "largest by 1772 chars over it ('search', 1830 chars)" in check[3]
         assert "a cap of 1840" in check[3]
         assert "1840" in check[4]
 
@@ -262,7 +262,7 @@ class TestSuffixFit:
                 max_description_chars=cap, compression=CompressionStrategy.SELECTIVE
             )
             check = _check(config, _probe(("a", 5)))
-            assert ("is dropped" in check[3]) is dropped
+            assert ("the convention suffix '" in check[3]) is dropped
 
     def test_a_hybrid_truncate_tail_needs_no_suffix(self):
         config = _config(

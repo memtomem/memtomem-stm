@@ -2862,6 +2862,7 @@ _FLAG_ENV = "MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS"
 _FORMATION_ENV = "MEMTOMEM_STM_FORMATION__ENABLED"
 
 _MODEL_FACING_TOOLS = {
+    "stm_proxy_describe_tool",
     "stm_proxy_read_more",
     "stm_proxy_select_chunks",
     "stm_surfacing_feedback",
@@ -2938,20 +2939,20 @@ class TestAdvertiseObservabilityFlagEndToEnd:
         assert names == _MODEL_FACING_TOOLS
         assert _OBSERVABILITY_TOOLS.isdisjoint(names)
 
-    def test_flag_true_advertises_all_twelve(self):
+    def test_flag_true_advertises_all_thirteen(self):
         names = set(self._list_registered(env_override="true"))
         assert names == _MODEL_FACING_TOOLS | _OBSERVABILITY_TOOLS
         assert len(_OBSERVABILITY_TOOLS) == 8
-        assert len(names) == 12
+        assert len(names) == 13
         assert "stm_index_stats" not in names
 
-    def test_formation_is_an_independent_thirteenth_tool(self):
+    def test_formation_is_an_independent_fourteenth_tool(self):
         formation_only = set(self._list_registered(env_override="false", formation_enabled=True))
         all_enabled = set(self._list_registered(env_override="true", formation_enabled=True))
         assert formation_only == _MODEL_FACING_TOOLS | {"stm_memory_propose"}
-        assert len(formation_only) == 5
+        assert len(formation_only) == 6
         assert all_enabled == _MODEL_FACING_TOOLS | _OBSERVABILITY_TOOLS | {"stm_memory_propose"}
-        assert len(all_enabled) == 13
+        assert len(all_enabled) == 14
 
     def test_flag_false_keeps_only_model_facing(self):
         names = set(self._list_registered(env_override="false"))
@@ -3895,7 +3896,10 @@ class TestLifespanTeardownSymmetry:
                 async with app_lifespan(mcp) as _ctx:
                     pass
 
-            mock_pm_instance.retain_registered_advertisement.assert_called_once_with(["fake__beta"])
+            mock_pm_instance.retain_registered_advertisement.assert_called_once_with(
+                ["fake__beta"],
+                registered_infos={"fake__beta": mock_pm_instance.get_proxy_tools.return_value[1]},
+            )
         finally:
             tools_dict.clear()
             tools_dict.update(snapshot)

@@ -11,6 +11,20 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Added
+
+- Full metadata recovery for advertised tools (#1014):
+  `stm_proxy_describe_tool(name)` returns uncut effective instructions, original
+  upstream instructions when overridden, restored input-schema descriptions,
+  and compression follow-up guidance. It is model-facing by default (five tools,
+  up from four) and reads only successfully registered metadata snapshots.
+- Optional global `host_description_cap` (default `null`, minimum 32) bounds
+  the complete advertised description together with existing server/global
+  limits. Restart to apply. Truncated descriptions and stripped schemas carry
+  a recovery hint when it fits; compression hints retain priority. Doctor uses
+  the same arithmetic and reports dropped recovery hints. Full override text
+  now participates in the existing exposure credential scan, including its tail.
+
 ### Fixed
 
 - A refused surfacing rating no longer reports the surfacing event as missing

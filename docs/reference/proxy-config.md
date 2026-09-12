@@ -61,8 +61,9 @@ remain restart-bound.
 
 Most per-server and per-tool values override global proxy settings. Two
 description-shaping fields compose instead, so a per-server value cannot relax a
-stricter global one: `max_description_chars` takes `min(server, global)` (see
-[Advertised tool descriptions](#advertised-tool-descriptions)), and
+stricter global one: description limits take
+`min(server, global, host_description_cap)`, omitting the host term when unset
+(see [Advertised tool descriptions](#advertised-tool-descriptions)), and
 `strip_schema_descriptions` takes `server or global`, so a global `true` cannot
 be switched off for one upstream. A tool override can set
 compression/cache budgets and `description_override`, which supplies the
@@ -77,10 +78,10 @@ or mutating the upstream contract.
 ## Advertised tool descriptions
 
 The description a client receives for a proxied tool is assembled, not copied.
-Three parts compose it, in this order:
+The parts appear in this order:
 
 ```
-[proxied] <upstream text, truncated to fit><convention suffix, if any>
+[proxied] <source text, truncated to fit><compression hint, if any><recovery hint, if needed>
 ```
 
 - **`[proxied] `** is prepended to every proxied tool. It is not configurable.
@@ -126,9 +127,10 @@ Three parts compose it, in this order:
 
 `max_description_chars` is an exact cap on that whole assembled string, prefix
 included. It is set globally and per server, and the effective budget is
-`min(server, global)`: raising only the global value does not widen a stricter
-per-server one. Both default to `4000` and both require at least `32`, which
-leaves room for the prefix and some surviving text.
+`min(server, global, host_description_cap)`, omitting the host term when unset.
+Raising only the global value does not widen a stricter per-server one. Server
+and global limits default to `4000` and require at least `32`, which leaves room
+for the prefix and some surviving text.
 
 The default is a sanity bound against a pathological upstream, not a token
 budget — a policy choice with headroom over the descriptions sampled in #1015,
@@ -137,6 +139,36 @@ character on every request, and note that the convention suffix rides at the end
 of the advertisement: a cap large enough that the client truncates first leaves
 that client naming no follow-up tool, just as a cap too small to fit the suffix
 does.
+
+The optional **global** `host_description_cap` declares the client's independent
+per-tool description limit. It defaults to `null` (unknown) and accepts integers
+of at least 32. For a host measured to cap descriptions at 2048 characters:
+
+```json
+{
+  "max_description_chars": 4000,
+  "host_description_cap": 2048
+}
+```
+
+Merge these fields into the existing proxy config and restart the proxy. STM
+does not detect the limit or assume every host uses 2048. When unset, STM-only
+cuts receive recovery hints, but a subsequent host-only cut may lose the hint.
+Host limits expressed in bytes or tokens need a conservatively chosen character
+budget; this setting uses the same character count as `max_description_chars`.
+
+If source text is cut, or schema descriptions/examples are removed, STM appends
+` | full: stm_proxy_describe_tool` when it fits. The model can call that tool
+with the exact advertised `prefix__tool` name to recover the full instructions
+and input schema. The tool is always advertised, including when observability
+tools are hidden. An uncut description with an unchanged schema needs no hint.
+
+The compression hint is reserved first, the recovery hint second, then the
+remaining budget goes to source text. Neither hint is shortened. At tiny budgets
+one or both hints may be absent; `mms doctor` warns about the lost hints. If the
+host limit binds, doctor recommends full-metadata retrieval rather than raising
+STM's own budget beyond the host's capability. Its advice reflects declared
+limits and discovered lengths, not measured host behavior or model adoption.
 
 When the budget is tight the convention suffix wins over upstream text, because
 it names the follow-up tool the response requires. If even the suffix alone
@@ -163,11 +195,11 @@ it is advertised under.
 `mms doctor` reports, per upstream, how many of the discovered descriptions
 exceed this cap and by how much (the cut itself can remove more, since it
 retreats to a boundary), the smallest cap that would carry every description and
-its convention suffix whole, whether that suffix fits today, and which levels sit
-below the number it recommends — raising one level of a `min(server, global)`
-pair stops at the other. It reads the config file, so it describes what the next start
-would advertise rather than what a running proxy holds, and it does not measure
-any cap the client's own host applies afterwards.
+its required hints whole, whether each hint fits today, and which configured
+limit binds. Raising one STM budget cannot widen a lower server, global or host
+limit. It reads the config file, so it describes what the next start would
+advertise rather than what a running proxy holds; it does not measure any cap
+the client's host applies afterwards.
 
 `stm_proxy_stats` and `stm_proxy_health` report counts, and the `mms` commands
 report configuration and health — tool names among it, but never the advertised

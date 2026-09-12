@@ -2222,6 +2222,12 @@ class ProxyConfig(BaseModel):
     registered keeps the length it was given until the next registration — a
     restart, or an upstream catalogue change (#893).
     """
+    host_description_cap: int | None = Field(default=None, ge=MIN_DESCRIPTION_CHARS)
+    """Explicit host description limit, including the proxy prefix and hints.
+
+    Unset means unknown: no host limit is inferred. Applied at the next
+    advertisement alongside min(server, global); restart to apply reliably.
+    """
     strip_schema_descriptions: bool = False
     advertise_context_query: bool = False
     """Advertise the proxy-only ``_context_query`` string in every upstream
