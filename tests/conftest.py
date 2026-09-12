@@ -17,7 +17,7 @@ from helpers import set_home
 
 @pytest.fixture(autouse=True)
 def isolate_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
-    """Keep the developer's own ``~/.memtomem`` out of every test.
+    """Keep the developer's home and STM environment out of every test.
 
     ``STMConfig()`` reads the proxy config file when the environment overrides
     a field of an upstream server (#835), and its path defaults under ``~``. A
@@ -27,25 +27,28 @@ def isolate_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
     home directory isolates that default (and every other ``expanduser()``)
     without adding a ``MEMTOMEM_STM_*`` variable that tests would then see.
 
-    This holds its OWN ``MonkeyPatch`` rather than taking the fixture: a test
-    that calls ``monkeypatch.undo()`` (``test_helpers.py`` does, to prove
-    ``set_home`` is undoable) would otherwise unwind this isolation too and
-    restore the real home mid-test.
+    ``STMConfig()`` also reads the whole ``MEMTOMEM_STM_`` namespace (#1028).
+    Clear it case-insensitively, including flat hook knobs read directly from
+    ``os.environ``. Tests and their fixtures set intentional overrides with
+    ``monkeypatch.setenv`` AFTER isolation; unrelated namespaces are untouched.
+
+    This owns its patch so a test's ``monkeypatch.undo()`` cannot restore the
+    ambient environment mid-test. The monkeypatch fixture below depends on
+    this one: its changes must unwind BEFORE we restore the developer's values.
     """
-    patch = pytest.MonkeyPatch()
-    set_home(patch, tmp_path_factory.mktemp("home"))
-    # HOME isolation alone no longer covers the config path: since #848 an
-    # ambient MEMTOMEM_STM_PROXY__CONFIG_PATH (any case-equivalent spelling,
-    # or the bare MEMTOMEM_STM_PROXY payload) steers no-flag CLI commands
-    # straight past the redirected home to a developer's real config. Clear
-    # exactly the variables that can name a config path; tests that exercise
-    # them set their own afterward.
-    for name in list(os.environ):
-        lowered = name.lower()
-        if lowered in ("memtomem_stm_proxy__config_path", "memtomem_stm_proxy"):
-            patch.delenv(name, raising=False)
-    yield
-    patch.undo()
+    with pytest.MonkeyPatch.context() as patch:
+        set_home(patch, tmp_path_factory.mktemp("home"))
+        for name in list(os.environ):
+            if name.lower().startswith("memtomem_stm_"):
+                patch.delenv(name, raising=False)
+        yield
+
+
+@pytest.fixture
+def monkeypatch(isolate_home: None) -> Iterator[pytest.MonkeyPatch]:
+    """Standard per-test patching, nested inside home/environment isolation."""
+    with pytest.MonkeyPatch.context() as patch:
+        yield patch
 
 
 @pytest.fixture

@@ -233,7 +233,6 @@ def test_configure_logging_foreground_uses_stderr(tmp_path, _restore_root_loggin
 
 
 def test_config_fingerprint_stable_and_broad(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", raising=False)
     fp = discovery.config_fingerprint(STMConfig())
     assert fp == discovery.config_fingerprint(STMConfig())  # stable
 
@@ -254,12 +253,11 @@ def test_config_fingerprint_stable_and_broad(monkeypatch: pytest.MonkeyPatch):
     assert discovery.config_fingerprint(STMConfig()) != fp
 
 
-def test_config_fingerprint_separates_daemon_concurrency(monkeypatch: pytest.MonkeyPatch):
+def test_config_fingerprint_separates_daemon_concurrency():
     # Both admission bounds change what the daemon does, so both split identity.
     # Without this a caller that configured the serialized daemon
     # (`max_concurrent_ltm_ops=1`) keys to the same handshake as a running
     # four-way one and silently reuses it (#874).
-    monkeypatch.delenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", raising=False)
     fp = discovery.config_fingerprint(STMConfig())
 
     serialized = STMConfig()
@@ -286,7 +284,6 @@ def test_config_fingerprint_survives_a_hostile_surface_tools_env(
     # involved (#761). Before the fix this raised ``UnicodeEncodeError`` out of
     # ``DaemonServer.__init__`` and out of ``client._live_handshake_candidate``,
     # i.e. no daemon could start and ``mms daemon status`` printed a traceback.
-    monkeypatch.delenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", raising=False)
     clean = discovery.config_fingerprint(STMConfig())
 
     monkeypatch.setenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", "Read,\udcff")
@@ -324,14 +321,12 @@ def test_config_fingerprint_includes_protocol_version(monkeypatch: pytest.Monkey
     # at different PROTOCOL_VERSIONs key to distinct handshake/lock paths and
     # coexist (the stale one idle-times-out) instead of exchanging frames one
     # side can't parse.
-    monkeypatch.delenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", raising=False)
     fp = discovery.config_fingerprint(STMConfig())
     monkeypatch.setattr("memtomem_stm.daemon.discovery.PROTOCOL_VERSION", 999)
     assert discovery.config_fingerprint(STMConfig()) != fp
 
 
-def test_config_fingerprint_excludes_client_only_hook_fields(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delenv("MEMTOMEM_STM_HOOK_SURFACE_TOOLS", raising=False)
+def test_config_fingerprint_excludes_client_only_hook_fields():
     fp = discovery.config_fingerprint(STMConfig())
     # Client-only hook fields must NOT move the fingerprint — the daemon's
     # behavior is independent of them, so a live daemon must still match a hook
@@ -2186,8 +2181,6 @@ class TestBrokenConfigObservability:
 
     @pytest.fixture(autouse=True)
     def _broken_proxy_env(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-        for name in [n for n in os.environ if n.startswith("MEMTOMEM_STM_PROXY")]:
-            monkeypatch.delenv(name, raising=False)
         monkeypatch.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(tmp_path / "absent.json"))
         monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND", "x")
 

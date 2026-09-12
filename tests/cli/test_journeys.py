@@ -16,7 +16,6 @@ internals (those pins live next to the per-command unit tests).
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -45,9 +44,6 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     cwd = tmp_path / "cwd"
     cwd.mkdir()
     monkeypatch.chdir(cwd)
-    for var in list(os.environ):
-        if var.startswith(("MEMTOMEM_STM_HOOK__", "MEMTOMEM_STM_SURFACING__")):
-            monkeypatch.delenv(var, raising=False)
     return home
 
 
