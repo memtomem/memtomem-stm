@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import assert_never
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -91,10 +92,17 @@ def _rejection_message(
             "a per-memory rating cannot be checked against it."
         )
     if rejection is FeedbackRejection.UNUSABLE_IDENTIFIER:
+        # Defensive: ``record_feedback`` above rejects the same characters with
+        # ``require_utf8_identifier`` before the store is called, so this branch
+        # is unreachable through the tracker and covers direct store callers.
         return "Error: the surfacing_id or memory_id could not be encoded."
     if rejection is FeedbackRejection.STORE_CLOSED:
         return "Error: the feedback store is closed, so the rating was not recorded."
-    return f"Error: surfacing event '{surfacing_id}' not found"
+    if rejection is FeedbackRejection.EVENT_NOT_FOUND:
+        return f"Error: surfacing event '{surfacing_id}' not found"
+    # Exhaustive on purpose: a catch-all here would render a future rejection as
+    # "event not found", which is the exact defect this function exists to undo.
+    assert_never(rejection)
 
 
 def record_feedback_batch(

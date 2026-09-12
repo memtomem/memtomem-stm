@@ -24,10 +24,12 @@ changes inline only. See the deprecation policy in
   actually the problem. `record_feedback_batch` renders per entry and inherits
   the fix. **Behavior change**: `FeedbackStore.record_feedback`'s return type
   changes from `bool` to `FeedbackRejection | None`, which inverts the
-  truthiness of the old contract — success is now falsy. No caller inside this
-  package relied on that (the one call site tests the reason explicitly), and
-  the MCP-facing `stm_surfacing_feedback` reply text is unchanged for success
-  and for a genuinely absent event.
+  truthiness of the old contract — success is now falsy. The sole production
+  consumer did read it as a boolean (`if not ok`) and was updated to test the
+  rejection explicitly; four test assertions written the same way would have
+  passed backwards and are now identity checks. The MCP-facing
+  `stm_surfacing_feedback` reply text is unchanged for success and for a
+  genuinely absent event.
 
 ## [0.5.0] — 2026-09-10
 
