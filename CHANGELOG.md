@@ -11,53 +11,86 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-09-13
+
 ### Upgrade notes
 
-- **Behavior change**: the unreleased `stm_proxy_describe_tool` response is now
-  a selected-part page. Calls with only `name` return description text; request
-  `part="input_schema"` separately. Read `text` and continue with `next_offset`
-  and `generation`; concatenate schema text before parsing JSON. The old
-  all-fields response and lossy `omitted_chars` field are replaced. If metadata
-  changes, discard accumulated pages and restart at offset 0 without a token.
+- **A fifth model-facing tool is advertised by default** (#1014; merged in
+  #1025, #1029). `stm_proxy_describe_tool` joins the default tool list, so
+  every client pays its schema on each `tools/list`.
+- **Truncated or schema-stripped descriptions spend 32 characters on a
+  recovery hint** (#1014; merged in #1025). The advertised text changes, and
+  so does what query-aware tool ranking scores; with
+  `strip_schema_descriptions` enabled this reaches short descriptions too.
+  `mms doctor` reports the new requirement and any hint that did not fit.
+- **Credential-shaped text past the cap of a `description_override` now
+  counts** (#1014; merged in #1025). Under `strict` the tool is withheld, so
+  a tool that was in the picker before can be gone; under `review` it stays
+  advertised with the configured risk penalty. Remove the text from the
+  override to restore it.
+- **`tools/list_changed` fires for changes `tools/list` does not show**
+  (#1014; merged in #1025). An upstream change confined to a description tail
+  past the cap, or to a stripped schema description, now re-registers the
+  tool.
+- **Refused surfacing ratings get a message per reason** (#1023; merged in
+  #1024). `stm_surfacing_feedback` now names a wrong `memory_id`, an unreadable
+  stored memory list, or a closed store instead of saying the event was not
+  found. Python callers of
+  `FeedbackStore.record_feedback` get `FeedbackRejection | None` instead of
+  `bool`: success is now falsy.
 
 ### Added
 
-- Full metadata recovery for advertised tools (#1014, #1026, #1027):
+- Full metadata recovery for advertised tools (#1014, #1026, #1027; merged in
+  #1025, #1029):
   `stm_proxy_describe_tool` reads complete registered sources through bounded,
   generation-pinned pages. `part` selects effective instructions, restored
   input schema, or explicitly opted-in upstream instructions. Every MCP result
   stays within 16,384 UTF-8 bytes including text/structured duplication and
   metadata; `offset`, `limit`, and `generation` allow lossless continuation.
-  It is model-facing by default (five tools, up from four) and never executes
-  upstream tools or runs the response pipeline.
+  Calls with only `name` return description text; request
+  `part="input_schema"` separately and concatenate its pages before parsing
+  JSON. If metadata changes mid-read, discard accumulated pages and restart at
+  offset 0 without a `generation`. The tool never executes upstream tools or
+  runs the response pipeline. **Behavior change**: it is model-facing by
+  default, so the default tool list grows from four tools to five.
 - Optional global `recover_upstream_description` (default `false`) lets recovery
-  also return the text a `description_override` replaced (#1014). Off by
-  default because an override decides what the model is told, and one
-  legitimate use is neutralizing a misleading or hostile upstream description.
+  also return the text a `description_override` replaced (#1014; merged in
+  #1025). Off by default because an override decides what the model is told,
+  and one legitimate use is neutralizing a misleading or hostile upstream
+  description.
 - Optional global `host_description_cap` (default `null`, minimum 32) bounds
   the complete advertised description together with existing server/global
-  limits. Restart to apply. Truncated descriptions and stripped schemas carry
-  a recovery hint when it fits; compression hints retain priority. Doctor uses
-  the same arithmetic and reports dropped recovery hints. Full override text
-  now participates in the existing exposure credential scan, including its tail.
+  limits (#1014; merged in #1025). Restart to apply. Truncated descriptions and
+  stripped schemas carry a recovery hint when it fits; compression hints retain
+  priority. Doctor uses the same arithmetic and reports dropped recovery hints.
+  Full override text now participates in the existing exposure credential scan,
+  including its tail.
 
 ### Changed
 
 - Advertised descriptions that are truncated, or whose schema descriptions are
   stripped, now spend 32 characters of their budget on the recovery hint
   whenever that hint fits — at a budget too small to carry it whole it is
-  dropped instead, and `mms doctor` reports the loss (#1014). With
-  `strip_schema_descriptions` enabled this shifts every affected description,
-  not only long ones; `stm_proxy_describe_tool` carries what the hint
-  displaces, and `mms doctor` reports the new requirement.
-- Under the `strict` exposure profile, a tool whose `description_override` holds
-  credential-shaped text past the advertised cap is now withheld. Previously
-  only the part of the override that fit was scanned.
+  dropped instead, and `mms doctor` reports the loss (#1014; merged in #1025).
+  With `strip_schema_descriptions` enabled this shifts every affected
+  description, not only long ones; `stm_proxy_describe_tool` carries what the
+  hint displaces, and `mms doctor` reports the new requirement.
+  **Behavior change**: the advertised description text differs for every
+  affected tool, and query-aware tool ranking scores that text.
+- A `description_override` is now scanned for credential-shaped text in full,
+  including the part past the advertised cap (#1014; merged in #1025).
+  Previously only the part of the override that fit was scanned.
+  **Behavior change**: under the `strict` exposure profile such a tool is now
+  withheld; under `review` it stays advertised with the configured risk
+  penalty.
 - An upstream catalogue change that alters only recoverable metadata — a
   description tail past the cap, or a nested schema description under
   `strip_schema_descriptions` — now re-registers the tool and emits
-  `tools/list_changed`, though `tools/list` itself is unchanged. This is what
-  keeps recovery from serving a stale generation.
+  `tools/list_changed`, though `tools/list` itself is unchanged (#1014; merged
+  in #1025). This is what keeps recovery from serving a stale generation.
+  **Behavior change**: clients see list-changed notifications they did not
+  see before.
 
 ### Fixed
 
