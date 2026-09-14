@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -12,10 +13,12 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 from mcp.server.mcpserver import Context, MCPServer
-from pydantic import StrictInt
+from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase, FuncMetadata, func_metadata
+from mcp.server.mcpserver.exceptions import ToolError
+from pydantic import ConfigDict, StrictInt, ValidationError
 
 # Module-level on purpose: the proxy handler's ``-> CallToolResult`` return
 # annotation is a STRING under ``from __future__ import annotations``, and
@@ -34,6 +37,7 @@ from memtomem_stm.proxy.config import (
     collect_proxy_env_overrides,
     env_var_hint_for_validation_error,
     model_upstream_inert_state,
+    validation_error_summary,
     warn_if_upstreams_inert,
 )
 from memtomem_stm.proxy.manager import ProxyManager, ProxyToolInfo
@@ -869,15 +873,34 @@ def _should_advertise_obs_tools() -> bool:
     ).strip().lower() not in ("false", "0", "no")
 
 
-def _obs_tool(fn):
-    """Register ``fn`` as an MCP tool only when the flag is on.
+@dataclass(frozen=True)
+class _ObsAction:
+    """One ``stm_admin`` action: the function and the SDK's argument model for it."""
 
-    When off, return the function unchanged — it stays importable and
-    callable from Python (tests, CLI paths), but is not surfaced in the
-    MCP ``tools/list``.
+    fn: Callable[..., Awaitable[str]]
+    meta: FuncMetadata
+
+
+_OBSERVABILITY_ACTIONS: dict[str, _ObsAction] = {}
+"""Action name (tool name minus ``stm_``) → action, filled by ``@_obs_action``."""
+
+
+def _obs_action(fn):
+    """Record ``fn`` as an ``stm_admin`` action; never register it as its own tool.
+
+    The eight observability functions used to be separate MCP tools. On an
+    eager-loading client each one's schema was paid on every request for calls
+    that are rarely made, so they are reached through one dispatcher instead and
+    advertised only as that. The functions stay importable and directly callable.
+
+    The argument model comes from the SDK's own ``func_metadata`` — the same
+    validation the individual tools had — so a dispatched call coerces exactly
+    as a direct call did (JSON-string pre-parse, pydantic coercion). A
+    per-parameter ``TypeAdapter`` differs: it keeps ``"null"`` as a string where
+    the SDK yields ``None``, which would silently widen a filter.
     """
-    if _should_advertise_obs_tools():
-        return mcp.tool()(fn)
+    name = fn.__name__.removeprefix("stm_")
+    _OBSERVABILITY_ACTIONS[name] = _ObsAction(fn=fn, meta=func_metadata(fn, skip_names=["ctx"]))
     return fn
 
 
@@ -896,11 +919,10 @@ def _formation_tool(fn):
     return fn
 
 
-# The observability tools gated behind ``@_obs_tool`` — the ones hidden from
-# ``tools/list`` when ``MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS`` is off.
-# Source of truth for the "N tools hidden" discoverability hint (#613) so the
-# count stays in sync with the decorated set; a regression test pins this tuple
-# against the actually-gated tools (flag-on minus flag-off).
+# The observability functions reached through ``stm_admin`` (``@_obs_action``);
+# their action names are these minus ``stm_``. Source of truth for the
+# "N observability actions hidden" hint (#613) and for the docs; a regression
+# test pins this tuple against the populated action registry.
 _OBSERVABILITY_TOOL_NAMES: tuple[str, ...] = (
     "stm_proxy_stats",
     "stm_proxy_cache_clear",
@@ -914,23 +936,23 @@ _OBSERVABILITY_TOOL_NAMES: tuple[str, ...] = (
 
 
 def _hidden_obs_tools_hint() -> str | None:
-    """One-line hint that observability tools are hidden, or ``None`` (#613).
+    """One-line hint that the observability actions are hidden, or ``None`` (#613).
 
-    Returns ``None`` when the tools are advertised. Driven off
+    Returns ``None`` when ``stm_admin`` is advertised. Driven off
     ``_should_advertise_obs_tools()`` — the same signal that actually gates
-    registration — so the hint never claims tools are hidden when they aren't
-    (or vice versa).
+    registration — so the hint never claims the actions are hidden when they
+    aren't (or vice versa).
 
-    Consumed by the ``mms health`` CLI, not by ``stm_proxy_health``: that MCP
-    tool is itself one of the gated tools, so it is unreachable over MCP in the
-    exact state (flag off) where the hint applies. The CLI command is always
-    available regardless of the flag, so it is the reachable operator surface.
+    Consumed by the ``mms health`` CLI, not by the ``proxy_health`` action:
+    that action is reachable only through the gated dispatcher, so it is
+    unreachable over MCP in the exact state (flag off) where the hint applies.
+    The CLI command is always available, so it is the reachable operator surface.
     """
     if _should_advertise_obs_tools():
         return None
     return (
-        f"{len(_OBSERVABILITY_TOOL_NAMES)} observability tools hidden; "
-        "set MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true to expose them"
+        f"{len(_OBSERVABILITY_TOOL_NAMES)} observability actions hidden; "
+        "set MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true to advertise the stm_admin tool"
     )
 
 
@@ -940,19 +962,12 @@ def _hidden_obs_tools_hint() -> str | None:
 # inside this tuple does not matter — only position *relative to proxied
 # tools* matters; see ``_move_stm_tools_to_end``.
 _STM_UTILITY_TOOL_NAMES: tuple[str, ...] = (
-    "stm_proxy_stats",
     "stm_proxy_describe_tool",
     "stm_proxy_select_chunks",
     "stm_proxy_read_more",
-    "stm_proxy_cache_clear",
-    "stm_proxy_health",
     "stm_surfacing_feedback",
-    "stm_surfacing_stats",
-    "stm_selection_stats",
     "stm_compression_feedback",
-    "stm_compression_stats",
-    "stm_progressive_stats",
-    "stm_tuning_recommendations",
+    "stm_admin",
 ) + (("stm_memory_propose",) if _should_advertise_formation_tool() else ())
 
 
@@ -1075,8 +1090,8 @@ async def _publish_tools_list_changed(server: MCPServer) -> None:
 def _move_stm_tools_to_end(server: MCPServer) -> None:
     """Re-insert STM utility tools so proxied tools advertise first (#228).
 
-    STM utility tools are registered at module import via ``@_obs_tool`` /
-    ``@mcp.tool()`` decorators, before ``app_lifespan`` runs; proxied tools
+    STM utility tools are registered at module import via ``@mcp.tool()``
+    (and ``stm_admin`` via the flag gate), before ``app_lifespan`` runs; proxied tools
     are registered inside the lifespan once upstream servers are reachable.
     The SDK's ``_tool_manager._tools`` is an insertion-ordered dict, so
     without this step ``tools/list`` yields STM utility tools before the
@@ -1116,7 +1131,7 @@ def _get_ctx(ctx: CtxType) -> STMContext:
 # ---------------------------------------------------------------------------
 
 
-@_obs_tool
+@_obs_action
 async def stm_proxy_stats(
     ctx: CtxType = None,  # type: ignore[assignment]
 ) -> str:
@@ -1341,7 +1356,7 @@ async def stm_proxy_read_more(
 # ---------------------------------------------------------------------------
 
 
-@_obs_tool
+@_obs_action
 async def stm_proxy_cache_clear(
     server: str | None = None,
     tool: str | None = None,
@@ -1411,7 +1426,7 @@ _CB_STATE_LABELS = {
 }
 
 
-@_obs_tool
+@_obs_action
 async def stm_proxy_health(
     ctx: CtxType = None,  # type: ignore[assignment]
 ) -> str:
@@ -1431,9 +1446,9 @@ async def stm_proxy_health(
         )
 
     # NB: the observability-tools discoverability hint (#613) is intentionally
-    # NOT emitted here. ``stm_proxy_health`` is itself gated by ``@_obs_tool``,
-    # so in the only state where the hint applies (flag off) this tool is not in
-    # ``tools/list`` and an MCP client cannot reach it; with the flag on there
+    # NOT emitted here. This function is reachable over MCP only as the
+    # ``proxy_health`` action of the flag-gated ``stm_admin`` tool, so in the only
+    # state where the hint applies (flag off) an MCP client cannot reach it; with the flag on there
     # is nothing to hint. The reachable operator surface is ``mms health`` (a
     # CLI command, always available), which carries the hint instead.
     # OTLP export state belongs in BOTH branches: it is independent of the
@@ -1894,7 +1909,7 @@ async def _record_batched_via_tracker(
 # ---------------------------------------------------------------------------
 
 
-@_obs_tool
+@_obs_action
 async def stm_surfacing_stats(
     tool: str | None = None,
     since: str | None = None,
@@ -2373,7 +2388,7 @@ def _format_observability_sections(snapshot: dict, *, tool_filter: str | None) -
 # ---------------------------------------------------------------------------
 
 
-@_obs_tool
+@_obs_action
 async def stm_selection_stats(
     ctx: CtxType = None,  # type: ignore[assignment]
 ) -> str:
@@ -2521,7 +2536,8 @@ async def stm_compression_feedback(
     Use this after a prior ``stm_proxy_*`` call returned a response whose
     compression stripped something you needed for downstream work. This
     is a *learning signal* — it does not repair the current turn. Reports
-    accumulate for later inspection via ``stm_compression_stats`` and
+    accumulate for later inspection via
+    ``stm_admin(action="compression_stats")`` and
     will feed future auto-tuning of compression strategies per tool.
 
     Args:
@@ -2553,7 +2569,7 @@ async def stm_compression_feedback(
 # ---------------------------------------------------------------------------
 
 
-@_obs_tool
+@_obs_action
 async def stm_compression_stats(
     tool: str | None = None,
     ctx: CtxType = None,  # type: ignore[assignment]
@@ -2607,7 +2623,7 @@ async def stm_compression_stats(
 # ---------------------------------------------------------------------------
 
 
-@_obs_tool
+@_obs_action
 async def stm_progressive_stats(
     tool: str | None = None,
     ctx: CtxType = None,  # type: ignore[assignment]
@@ -2699,7 +2715,7 @@ async def stm_progressive_stats(
 # ---------------------------------------------------------------------------
 
 
-@_obs_tool
+@_obs_action
 async def stm_tuning_recommendations(
     since_hours: float = 24.0,
     tool: str | None = None,
@@ -2737,6 +2753,183 @@ async def stm_tuning_recommendations(
     profiles = tuner.get_profiles(since_seconds=since)
     recs = tuner.analyze(since_seconds=since, tool_filter=tool)
     return format_recommendations(recs, profiles, since_hours)
+
+
+# ---------------------------------------------------------------------------
+# Tool: stm_admin — dispatcher over the observability actions
+# ---------------------------------------------------------------------------
+
+_ADMIN_HELP_ACTION = "help"
+
+
+def _admin_param_line(name: str, parameter: inspect.Parameter) -> str:
+    """``name: type = default`` for one action parameter, as help renders it."""
+    annotation = parameter.annotation
+    type_text = annotation if isinstance(annotation, str) else getattr(annotation, "__name__", "")
+    line = f"{name}: {type_text}" if type_text else name
+    if parameter.default is not inspect.Parameter.empty:
+        line += f" = {parameter.default!r}"
+    return line
+
+
+def _admin_help(only: str | None = None) -> str:
+    """Catalog of actions, or one action's full documentation.
+
+    Rendered from each function's signature and docstring rather than kept as a
+    separate table, so adding an action or a parameter cannot leave help stale.
+    The catalog shows only each summary line; ``only`` returns that action's
+    whole docstring, which is where the argument semantics live (for example,
+    which caches an unfiltered ``proxy_cache_clear`` flushes).
+    """
+    if only is not None and only not in _OBSERVABILITY_ACTIONS:
+        raise ToolError(
+            f"unknown action '{escape_lone_surrogates(only)}'. "
+            f"Available: {', '.join(_OBSERVABILITY_ACTIONS)}."
+        )
+
+    def _params_line(fn: Callable[..., Awaitable[str]]) -> str | None:
+        rendered = [
+            _admin_param_line(p_name, p)
+            for p_name, p in inspect.signature(fn).parameters.items()
+            if p_name != "ctx"
+        ]
+        return f"params: {', '.join(rendered)}" if rendered else None
+
+    if only is not None:
+        fn = _OBSERVABILITY_ACTIONS[only].fn
+        lines = [f"stm_admin action '{only}'"]
+        params_line = _params_line(fn)
+        lines.append(params_line or "params: (none)")
+        lines.extend(["", inspect.getdoc(fn) or ""])
+        return "\n".join(lines)
+
+    lines = [
+        "stm_admin actions (pass arguments as params={...}; "
+        'params={"action": "<name>"} with action="help" shows one in full):'
+    ]
+    for name, entry in _OBSERVABILITY_ACTIONS.items():
+        summary = (inspect.getdoc(entry.fn) or "").split("\n", 1)[0]
+        lines.append(f"- {name}: {summary}")
+        params_line = _params_line(entry.fn)
+        if params_line:
+            lines.append(f"    {params_line}")
+    return "\n".join(lines)
+
+
+async def stm_admin(
+    action: str,
+    params: dict[str, Any] | None = None,
+    ctx: CtxType = None,  # type: ignore[assignment]
+) -> str:
+    """STM observability and admin actions behind one tool.
+
+    Actions: proxy_stats, proxy_health, proxy_cache_clear, surfacing_stats,
+    selection_stats, compression_stats, progressive_stats,
+    tuning_recommendations. action="help" lists each action's parameters.
+    CLI equivalents: mms stats, mms health, mms tune.
+
+    Args:
+        action: Action name, or "help".
+        params: Arguments for the action as an object, e.g. {"tool": "mem_search"}.
+    """
+    # Every refusal raises ``ToolError``: the SDK turns it into a result with
+    # ``isError`` set, as it did when it rejected an argument to one of the eight
+    # individual tools. A returned string would read as a successful call.
+    #
+    # The envelope is checked once, before help or dispatch branch, so every
+    # action — help included — gets the same refusals. Over MCP the SDK has
+    # already enforced these types; a direct Python caller has not.
+    if not isinstance(action, str):
+        raise ToolError("action must be a string.")
+    # The SDK's validate_arguments copies its input, so None must become {}
+    # here or the commonest call — an action with no arguments — would raise.
+    arguments = {} if params is None else params
+    if not isinstance(arguments, dict):
+        raise ToolError(f"params for action '{escape_lone_surrogates(action)}' must be an object.")
+
+    if action == _ADMIN_HELP_ACTION:
+        unknown_help = [key for key in arguments if key != "action"]
+        if unknown_help:
+            shown = escape_lone_surrogates(str(unknown_help[0]))
+            raise ToolError(f"unknown parameter '{shown}' for action 'help'; accepted: action.")
+        only = arguments.get("action")
+        if only is not None and not isinstance(only, str):
+            raise ToolError("invalid parameter for action 'help' — action (string_type).")
+        return _admin_help(only)
+
+    entry = _OBSERVABILITY_ACTIONS.get(action)
+    if entry is None:
+        raise ToolError(
+            f"unknown action '{escape_lone_surrogates(action)}'. "
+            f"Available: {', '.join(_OBSERVABILITY_ACTIONS)}, {_ADMIN_HELP_ACTION}."
+        )
+
+    # Stricter than the SDK, which silently drops keys its model does not know:
+    # a misspelled filter would otherwise run the unfiltered action, and for
+    # proxy_cache_clear that means clearing every cache. ``ctx`` is injected, not
+    # accepted, so it is rejected here too rather than colliding at call time.
+    accepted = list(entry.meta.arg_model.model_fields)
+    unknown = [key for key in arguments if key not in accepted]
+    if unknown:
+        shown = escape_lone_surrogates(str(unknown[0]))
+        raise ToolError(
+            f"unknown parameter '{shown}' for action '{action}'; "
+            f"accepted: {', '.join(accepted) or '(none)'}."
+        )
+
+    try:
+        validated = entry.meta.validate_arguments(arguments)
+    except ValidationError as exc:
+        # loc + type only: str(exc) embeds input_value=, the rejected value itself.
+        # ``from None`` keeps that text out of the chained traceback as well.
+        raise ToolError(
+            f"invalid parameter for action '{action}' — {validation_error_summary(exc)}."
+        ) from None
+    return await entry.fn(**validated, ctx=ctx)
+
+
+def _forbid_unknown_admin_arguments(server: MCPServer) -> bool:
+    """Make the registered ``stm_admin`` refuse top-level keys it does not declare.
+
+    The SDK's argument model ignores unknown keys, and it validates before the
+    function runs, so ``stm_admin`` never sees them. A misspelled envelope —
+    ``param`` for ``params`` — would otherwise arrive as ``params=None`` and run
+    the action unfiltered, which for ``proxy_cache_clear`` clears every cache.
+    Swapping in a subclass with ``extra="forbid"`` turns that into a validation
+    error the SDK reports with ``isError`` set, and the advertised schema is
+    rebuilt from it so it says ``additionalProperties: false`` too.
+
+    Reaches the registered tool through the same private ``_tool_manager`` the
+    reorder helper uses. Returns whether it worked; if the SDK moved it, unknown
+    top-level keys are dropped as the SDK drops them for every other tool, and a
+    warning says so.
+    """
+    try:
+        tool = server._tool_manager._tools["stm_admin"]
+        base = tool.fn_metadata.arg_model
+        strict = cast(
+            "type[ArgModelBase]",
+            type(
+                base.__name__,
+                (base,),
+                {"model_config": ConfigDict(**{**base.model_config, "extra": "forbid"})},
+            ),
+        )
+        tool.fn_metadata.arg_model = strict
+        tool.parameters = strict.model_json_schema(by_alias=True)
+    except (AttributeError, KeyError, TypeError):
+        logger.warning(
+            "Cannot make stm_admin refuse unknown top-level arguments — MCPServer "
+            "internal API changed. A misspelled key (e.g. 'param') is ignored rather "
+            "than refused."
+        )
+        return False
+    return True
+
+
+if _should_advertise_obs_tools():
+    mcp.tool()(stm_admin)
+    _forbid_unknown_admin_arguments(mcp)
 
 
 # ---------------------------------------------------------------------------

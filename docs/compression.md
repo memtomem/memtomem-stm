@@ -273,7 +273,7 @@ By default, the retention floor scales dynamically with response size (< 1KB →
 }
 ```
 
-The auto-tuner (`stm_tuning_recommendations`) can recommend `retention_floor` adjustments based on observed violation patterns.
+The auto-tuner (`stm_admin(action="tuning_recommendations")`) can recommend `retention_floor` adjustments based on observed violation patterns.
 
 ## LLM Compression
 

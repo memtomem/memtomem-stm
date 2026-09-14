@@ -54,7 +54,7 @@ built-in readers skip them, and a consumer parsing the file itself must do the
 same.
 
 Skipped is not the same as uncounted, and the two counts reported here mean
-different things. `stm_selection_stats`' `total_lines` counts *admitted* lines,
+different things. The `selection_stats` action's `total_lines` counts *admitted* lines,
 so a log of five records reports five. The per-file `lines` in a replay report
 counts *physical* lines, blank ones included, because it numbers records for
 ordering — the same log reports ten. Each record therefore costs one extra byte
@@ -302,9 +302,9 @@ counted (`write_errors`) and logged, and the call proceeds untouched.
 
 ## Reading the telemetry
 
-The `stm_selection_stats` MCP tool reads the active log back into a quick
+The `stm_admin(action="selection_stats")` MCP action reads the active log back into a quick
 operator summary, so a health check needs no hand-parsing of JSONL. It is one
-of the opt-in observability tools — advertise it with
+of the opt-in observability actions — advertise `stm_admin` with
 `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` (see [cli.md](cli.md)) — and
 it reports two views:
 

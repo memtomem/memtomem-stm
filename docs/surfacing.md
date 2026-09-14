@@ -320,7 +320,7 @@ When an upstream is disabled this way the skip happens *before* the LTM search
 (saving the round-trip) and is enforced in `ProxyManager` — not the
 `RelevanceGate` — because the engine is built once at startup from the top-level
 `SurfacingConfig` and never sees per-upstream config. It is counted as
-`upstream_disabled` (a healthy skip) in `stm_surfacing_stats`.
+`upstream_disabled` (a healthy skip) in `stm_admin(action="surfacing_stats")`.
 
 Reach for the env glob for cross-server / tool-grained scope or quick
 experiments; reach for `surfacing_enabled` to durably opt one upstream out —
@@ -333,7 +333,7 @@ should never become an LTM query.
 `min_response_chars` (default `5000`) gates surfacing on the **size of the
 upstream tool response**: when a response is shorter than this, surfacing is
 skipped before any LTM work and the call is recorded as `response_too_short`
-in `stm_surfacing_stats`. The rationale is that very short responses rarely
+in `stm_admin(action="surfacing_stats")`. The rationale is that very short responses rarely
 carry enough context for `ContextExtractor` to synthesize a useful query, so
 surfacing on them would spend an LTM round-trip (and a `max_surfacings_per_minute`
 / `cooldown_seconds` slot) to inject memories that are often noise relative to
@@ -649,7 +649,7 @@ Requires `auto_tune_min_samples` (default 20) feedback entries before adjusting.
 
 **Search boost from feedback**: when you rate memories as "helpful", their `access_count` is incremented in the core search index (once per surfacing event, capped at `max_boost=1.5`). This creates a positive feedback loop where useful memories rank higher in future searches.
 
-Check effectiveness with `stm_surfacing_stats`:
+Check effectiveness with `stm_admin(action="surfacing_stats")`:
 
 ```
 Surfacing Stats
@@ -787,7 +787,7 @@ hit:
   present, or `scale_gated_min_score=false` — then STM warns on the
   **first** below-threshold observation (no five-call streak, the
   threshold is drawn on the RRF scale) and records a
-  `score_scale_mismatch` diagnostic on every such observation. `stm_surfacing_stats` shows the last
+  `score_scale_mismatch` diagnostic on every such observation. The `surfacing_stats` action shows the last
   core-reported scale as a `Score scale:` line (annotated when the filter
   is suspended), the reranker model ID when one is active, and each event
   row records its scale in `stm_feedback.db`. The compact format and the

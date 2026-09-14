@@ -77,19 +77,16 @@ warning, not a crash.
 export MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true   # opt in
 ```
 
-When unset or `false`, hides STM's eight observability / admin tools
-(`stm_proxy_stats`, `stm_proxy_health`, `stm_proxy_cache_clear`,
-`stm_surfacing_stats`, `stm_selection_stats`,
-`stm_compression_stats`, `stm_progressive_stats`,
-`stm_tuning_recommendations`) from the MCP
-`tools/list` surface so eager-loading clients (e.g. OpenAI Codex CLI)
-don't pay schema tokens for tools the model rarely calls. Hidden admin
-tools are not registered with the MCP server while the flag is unset or
-`false`.  The five model-facing tools
+When set to `true`, advertises the `stm_admin` tool, which dispatches STM's
+eight observability / admin actions (`proxy_stats`, `proxy_health`,
+`proxy_cache_clear`, `surfacing_stats`, `selection_stats`,
+`compression_stats`, `progressive_stats`, `tuning_recommendations`) behind
+one schema — see [MCP Tools](cli.md#mcp-tools-5-default--1-opt-in--proxied).
+When unset or `false`, `stm_admin` is not registered with the MCP server, so
+eager-loading clients (e.g. OpenAI Codex CLI) pay nothing for it.  The five model-facing tools
 (`stm_proxy_describe_tool`, `stm_proxy_read_more`, `stm_proxy_select_chunks`,
 `stm_surfacing_feedback`, `stm_compression_feedback`) stay advertised
-regardless.  Set this flag to `true` to advertise the admin tools over
-MCP again.  Read once at import — restart to apply changes.  Claude Code
+regardless.  Read once at import — restart to apply changes.  Claude Code
 defers MCP tool schemas via its own `ToolSearch` mechanism so this flag
 has no practical effect there; it's primarily useful for eager-loading
 clients that lack a per-server `disabled_tools` filter of their own.
@@ -506,7 +503,7 @@ paying the full retry/deadline cost, while cached responses keep serving and
 other upstreams are unaffected. After `circuit_reset_seconds` the next call
 goes through as a probe — success closes the breaker, failure re-opens it.
 Set `circuit_max_failures: 0` to disable the breaker for that upstream.
-Per-upstream breaker state is visible in `stm_proxy_health`. Unlike
+Per-upstream breaker state is visible in `stm_admin(action="proxy_health")`. Unlike
 `max_retries` and the timeout knobs (read per call from the hot-reloaded
 config), the `circuit_*` thresholds are baked into the breaker at connect
 time: edits apply on the next restart, not via hot-reload.
@@ -648,8 +645,8 @@ cannot produce a usable verdict:
 
 A failure that resolves to `open` SKIPS the external rule family for the
 session — so it is surfaced loudly: a startup WARNING and a `DEGRADED` line in
-`stm_proxy_health`, so a one-time `open` cannot silently become a permanent
-enforcement blind spot. `stm_proxy_health` also reports a `WITHHOLDING ALL`
+`stm_admin(action="proxy_health")`, so a one-time `open` cannot silently become a permanent
+enforcement blind spot. The `proxy_health` action also reports a `WITHHOLDING ALL`
 posture (a `closed` knob fired) and, on success, the active graph generation,
 the count of graph-rejected tools, the count carrying a graph risk penalty, and
 the count with a recorded `rank_features` row (which distinguishes an
@@ -700,7 +697,7 @@ an empty map assumes identity.
 
 If every candidate from an upstream comes back as `TOOL_NOT_FOUND`, check crawl
 coverage and `server_name_map` before treating the result as a governance
-denial. `stm_proxy_health` confirms that the provider is active and shows the
+denial. `stm_admin(action="proxy_health")` confirms that the provider is active and shows the
 graph generation and aggregate enforced rejects; the startup warning `All N
 tool(s) from upstream ... are unknown to the tool-graph` identifies the
 specific unmapped upstream. Under the default `on_tool_not_found: "open"`,

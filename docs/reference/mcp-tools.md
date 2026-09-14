@@ -1,7 +1,8 @@
 # STM MCP Tools
 
-STM advertises five model-facing tools by default and hides eight operator tools
-unless `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` is set before startup.
+STM advertises five model-facing tools by default. Eight operator actions sit
+behind one `stm_admin` tool, advertised only when
+`MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` is set before startup.
 All connected upstream tools are added as `{prefix}__{tool}`.
 
 ## Default model-facing tools
@@ -95,21 +96,32 @@ compression pipeline's `stm_proxy_read_more` store.
 See [description budgets](proxy-config.md#advertised-tool-descriptions) for
 `host_description_cap` and recovery hints.
 
-## Optional operator tools
+## Optional operator tool: `stm_admin`
 
-| Tool | Key arguments | Purpose |
+`stm_admin(action, params?)` dispatches the operator actions below; pass an
+action's arguments as the `params` object. `action="help"` lists them, and
+`params={"action": "<name>"}` returns one action's full documentation. When the
+dispatcher refuses the arguments, the result is a tool error with `isError` set;
+an action's own messages, such as a bad `since` timestamp, are still text. Unknown actions and unknown keys,
+inside `params` or at the top level, are refused rather than ignored. An
+ill-typed value inside `params` is refused with the parameter name and error
+type, never the value.
+
+| Action (`stm_admin(action=...)`) | Key `params` | Purpose |
 |---|---|---|
-| `stm_proxy_stats` | — | Token, compression, and cache statistics |
-| `stm_proxy_cache_clear` | `server?`, `tool?` | Clear response-cache scope |
-| `stm_proxy_health` | — | Runtime upstream and breaker health |
-| `stm_surfacing_stats` | `tool?`, `since?`, `limit=10` | Surfacing outcomes, faults, and feedback |
-| `stm_selection_stats` | — | Selection telemetry and execution outcomes |
-| `stm_compression_stats` | `tool?` | Compression feedback counts |
-| `stm_progressive_stats` | `tool?` | Follow-up and coverage statistics |
-| `stm_tuning_recommendations` | `since_hours?`, `tool?` | Per-tool tuning suggestions |
+| `proxy_stats` (`stm_proxy_stats`) | — | Token, compression, and cache statistics |
+| `proxy_cache_clear` (`stm_proxy_cache_clear`) | `server?`, `tool?` | Clear response-cache scope |
+| `proxy_health` (`stm_proxy_health`) | — | Runtime upstream and breaker health |
+| `surfacing_stats` (`stm_surfacing_stats`) | `tool?`, `since?`, `limit=10` | Surfacing outcomes, faults, and feedback |
+| `selection_stats` (`stm_selection_stats`) | — | Selection telemetry and execution outcomes |
+| `compression_stats` (`stm_compression_stats`) | `tool?` | Compression feedback counts |
+| `progressive_stats` (`stm_progressive_stats`) | `tool?` | Follow-up and coverage statistics |
+| `tuning_recommendations` (`stm_tuning_recommendations`) | `since_hours?`, `tool?` | Per-tool tuning suggestions |
 
-Operator tools are hidden only from MCP `tools/list`; the corresponding CLI
-diagnostics remain available. Upstream tool titles are prefixed with the server
+The name in parentheses is the implementing function, which was a separate
+MCP tool before `stm_admin` replaced them. Functions that emit a trace span
+still name it this way. When `stm_admin` is not
+advertised, the corresponding CLI diagnostics remain available. Upstream tool titles are prefixed with the server
 name when the upstream provides an MCP annotation title.
 
 ## Optional review-first tool

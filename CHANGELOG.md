@@ -11,6 +11,46 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **`MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` advertises one tool,
+  `stm_admin`, instead of eight.** The eight observability and admin tools
+  (`stm_proxy_stats`, `stm_proxy_health`, `stm_proxy_cache_clear`,
+  `stm_surfacing_stats`, `stm_selection_stats`, `stm_compression_stats`,
+  `stm_progressive_stats`, `stm_tuning_recommendations`) are no longer MCP
+  tools. Call them as `stm_admin(action="proxy_stats")`, passing arguments as
+  `params`. A client `disabled_tools` list that named them should name
+  `stm_admin`. The default, with the flag unset, is unchanged: five tools.
+- **`mms health` hint text changed.** It now reads `8 observability actions
+  hidden; set MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true to advertise the
+  stm_admin tool`. The `obs_tools_hidden` and `obs_tools_hint` JSON keys are
+  unchanged.
+
+### Changed
+
+- **Observability tools collapse into one `stm_admin` dispatcher** — with the
+  flag on, an eager-loading client paid for eight rarely called tool schemas on
+  every request: 4,954 characters of description and schema. `stm_admin` costs
+  720, so the flag-on surface drops from 13 tools and 10,640 characters to 6
+  tools and 6,422. The default five tools grow by 16 characters, because
+  `stm_compression_feedback` now points at the new action by name.
+  `stm_admin(action="help")` lists the actions and their parameters, and
+  `params={"action": "<name>"}` returns one action's full documentation.
+  Arguments go through the same SDK argument model the individual tools used,
+  so coercion is unchanged: `"null"` still becomes `None` for an optional
+  string, and `"10"` still becomes `10`. When the dispatcher refuses the
+  arguments, the result is a tool error with `isError` set, as an SDK
+  validation failure did before. An action's own messages, such as a bad
+  `since` timestamp, are still returned as text, as they were. The
+  dispatcher is stricter in one way: an unknown key is refused instead of
+  silently dropped, both inside `params` and at the top level, where a
+  misspelled `param` would otherwise run `proxy_cache_clear` unfiltered and
+  clear every cache. The advertised schema says so with
+  `additionalProperties: false`. A value of the wrong type inside `params` is
+  refused with the parameter name and error type, never the value. The spans
+  the functions emit keep their names. **Behavior change**: see the upgrade
+  notes above.
+
 ## [0.5.1] — 2026-09-13
 
 ### Upgrade notes

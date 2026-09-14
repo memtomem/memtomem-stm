@@ -2166,7 +2166,7 @@ class SurfacingEngine:
                             "Surfacing degraded: LTM declared context_compose "
                             "schema %s but the call failed (%s). Subsequent "
                             "failures counted as 'ltm_call_failed' in "
-                            "stm_surfacing_stats.",
+                            "stm_admin(action='surfacing_stats').",
                             capabilities.context_compose_schema,
                             redact_exception_text(str(exc), self._config.ltm_mcp_url or ""),
                         )
@@ -2235,7 +2235,7 @@ class SurfacingEngine:
                 logger.warning(
                     "Surfacing skipped: LTM MCP %s target %r is not reachable "
                     "(outcome=%s). Subsequent skips counted as 'ltm_unavailable' "
-                    "in stm_surfacing_stats. Run `mms health` to diagnose or "
+                    "in stm_admin(action='surfacing_stats'). Run `mms health` to diagnose or "
                     "set `surfacing.enabled=false` to silence.",
                     ltm_transport,
                     ltm_target,

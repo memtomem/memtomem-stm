@@ -76,8 +76,8 @@ def isolate_stm_state(prefix: str = "mms_nb_", *, enable_surfacing: bool = False
     so that nothing the notebook does touches the user's real
     ``~/.memtomem/`` directory — including the surfacing feedback store
     that holds cross-session dedup state. Observability tools are enabled only
-    for this tutorial process so the notebook can call ``stm_proxy_stats`` even
-    though installed STM hides operator-facing tools by default.
+    for this tutorial process so the notebook can call ``stm_admin`` (action
+    ``proxy_stats``) even though installed STM hides it by default.
 
     Parameters
     ----------
@@ -171,7 +171,7 @@ async def stm_session() -> AsyncIterator[ClientSession]:
 
         async with stm_session() as session:
             tools = await session.list_tools()
-            result = await session.call_tool("stm_proxy_stats", {})
+            result = await session.call_tool("stm_admin", {"action": "proxy_stats"})
 
     Notes
     -----
@@ -219,9 +219,9 @@ def extract_text(result: Any) -> str:
 
 
 def pretty_stats(result: Any) -> str:
-    """Format a ``stm_proxy_stats`` result for notebook display.
+    """Format a ``proxy_stats`` action result for notebook display.
 
-    ``stm_proxy_stats`` already returns a human-readable multi-line string,
+    ``stm_admin(action="proxy_stats")`` already returns a human-readable multi-line string,
     so this just extracts the text and wraps it in a fenced code block for
     clean rendering in a notebook Markdown cell (use ``IPython.display.Markdown``).
     """

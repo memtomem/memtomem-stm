@@ -431,7 +431,7 @@ class TestHealth:
         pm = _make_proxy_manager()
         ctx = _make_ctx(proxy_manager=pm)
         result = await stm_proxy_health(ctx=ctx)
-        assert "observability tools hidden" not in result
+        assert "observability actions hidden" not in result
 
     async def test_config_error_shown_without_upstreams(self):
         """#611: a broken config file typically manifests as zero upstreams —
@@ -2874,6 +2874,9 @@ _OBSERVABILITY_TOOLS = {
     "stm_progressive_stats",
     "stm_tuning_recommendations",
 }
+"""The observability functions. None is an MCP tool; each is an ``stm_admin`` action."""
+
+_ADMIN_TOOL = "stm_admin"
 
 
 class TestShouldAdvertiseObsTools:
@@ -2933,26 +2936,28 @@ class TestAdvertiseObservabilityFlagEndToEnd:
         names = set(self._list_registered(env_override=None))
         assert names == _MODEL_FACING_TOOLS
         assert _OBSERVABILITY_TOOLS.isdisjoint(names)
+        assert _ADMIN_TOOL not in names
 
-    def test_flag_true_advertises_all_thirteen(self):
+    def test_flag_true_advertises_one_dispatcher_not_eight_tools(self):
         names = set(self._list_registered(env_override="true"))
-        assert names == _MODEL_FACING_TOOLS | _OBSERVABILITY_TOOLS
-        assert len(_OBSERVABILITY_TOOLS) == 8
-        assert len(names) == 13
+        assert names == _MODEL_FACING_TOOLS | {_ADMIN_TOOL}
+        assert len(names) == 6
+        assert _OBSERVABILITY_TOOLS.isdisjoint(names)
         assert "stm_index_stats" not in names
 
-    def test_formation_is_an_independent_fourteenth_tool(self):
+    def test_formation_is_an_independent_seventh_tool(self):
         formation_only = set(self._list_registered(env_override="false", formation_enabled=True))
         all_enabled = set(self._list_registered(env_override="true", formation_enabled=True))
         assert formation_only == _MODEL_FACING_TOOLS | {"stm_memory_propose"}
         assert len(formation_only) == 6
-        assert all_enabled == _MODEL_FACING_TOOLS | _OBSERVABILITY_TOOLS | {"stm_memory_propose"}
-        assert len(all_enabled) == 14
+        assert all_enabled == _MODEL_FACING_TOOLS | {_ADMIN_TOOL, "stm_memory_propose"}
+        assert len(all_enabled) == 7
 
     def test_flag_false_keeps_only_model_facing(self):
         names = set(self._list_registered(env_override="false"))
         assert names == _MODEL_FACING_TOOLS
         assert _OBSERVABILITY_TOOLS.isdisjoint(names)
+        assert _ADMIN_TOOL not in names
 
     def test_hidden_functions_stay_importable(self):
         """When flag hides them from MCP, Python import and direct call still work."""
@@ -2964,14 +2969,19 @@ class TestAdvertiseObservabilityFlagEndToEnd:
         assert callable(stm_tuning_recommendations)
 
     def test_obs_tool_names_constant_matches_gated_set(self):
-        """#613: ``_OBSERVABILITY_TOOL_NAMES`` (source of truth for the
-        hidden-tools hint count) must equal the tools that actually appear
-        only when the flag is on — otherwise the "N tools hidden" count drifts
-        when an observability tool is added or removed."""
+        """#613: the flag gates exactly one tool, and ``_OBSERVABILITY_TOOL_NAMES``
+        (source of truth for the hint count and the docs) must equal the action
+        registry the dispatcher serves — otherwise the "N actions hidden" count
+        drifts when an observability function is added or removed."""
+        from memtomem_stm.server import _OBSERVABILITY_ACTIONS
+
         on = set(self._list_registered(env_override="true"))
         off = set(self._list_registered(env_override="false"))
-        gated = on - off
-        assert set(_OBSERVABILITY_TOOL_NAMES) == gated
+        assert on - off == {_ADMIN_TOOL}
+        assert set(_OBSERVABILITY_ACTIONS) == {
+            name.removeprefix("stm_") for name in _OBSERVABILITY_TOOL_NAMES
+        }
+        assert set(_OBSERVABILITY_TOOL_NAMES) == _OBSERVABILITY_TOOLS
 
     def test_hidden_hint_count_matches_constant(self, monkeypatch):
         """The hint's number is derived from the constant, not hardcoded."""
@@ -2979,7 +2989,8 @@ class TestAdvertiseObservabilityFlagEndToEnd:
         hint = _hidden_obs_tools_hint()
         assert hint is not None
         assert len(_OBSERVABILITY_TOOL_NAMES) == 8
-        assert hint.startswith("8 observability tools hidden")
+        assert hint.startswith("8 observability actions hidden")
+        assert "stm_admin" in hint
 
         monkeypatch.setenv(_FLAG_ENV, "true")
         assert _hidden_obs_tools_hint() is None
@@ -3110,7 +3121,7 @@ class TestAdvertiseOrder:
 
         initial = [
             # STM utility tools (inserted first at module import)
-            "stm_proxy_stats",
+            "stm_admin",
             "stm_proxy_read_more",
             "stm_surfacing_feedback",
             # Proxied tools (inserted later during lifespan)
@@ -3134,9 +3145,9 @@ class TestAdvertiseOrder:
 
     def test_reorder_skips_missing_stm_tools(self):
         """When ``MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=false`` hides
-        the 8 observability tools, ``_tool_manager._tools`` only holds the
-        4 model-facing STM tools. The reorder helper must not KeyError on
-        the absent names — ``.pop(name, None)`` is the contract."""
+        ``stm_admin``, ``_tool_manager._tools`` holds only model-facing STM
+        tools. The reorder helper must not KeyError on the absent names —
+        ``.pop(name, None)`` is the contract."""
         from memtomem_stm.server import _move_stm_tools_to_end
 
         # Only the 4 model-facing stm_* tools + proxied.
@@ -3288,13 +3299,13 @@ class TestAdvertiseOrder:
 
     def test_utility_tool_names_tuple_matches_registered_set(self):
         """Exhaustiveness guard: every STM utility tool registered by the
-        ``@mcp.tool()`` / ``@_obs_tool`` decorators at module import must
+        ``@mcp.tool()`` decorator (or the flag-gated ``stm_admin``) at import must
         be listed in ``_STM_UTILITY_TOOL_NAMES``. A new ``stm_*`` tool
         that forgets to land in the tuple would silently skip the reorder
         and slip ahead of proxied tools again."""
         from memtomem_stm.server import _STM_UTILITY_TOOL_NAMES
 
-        expected = _MODEL_FACING_TOOLS | _OBSERVABILITY_TOOLS
+        expected = _MODEL_FACING_TOOLS | {_ADMIN_TOOL}
         assert set(_STM_UTILITY_TOOL_NAMES) == expected, (
             "_STM_UTILITY_TOOL_NAMES drifted from the actual registered set; "
             "add the new stm_* tool to the tuple so the advertise-order "

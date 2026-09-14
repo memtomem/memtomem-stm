@@ -475,6 +475,21 @@ def warn_if_upstreams_inert(
     )
 
 
+def validation_error_summary(exc: ValidationError) -> str:
+    """``loc (type)`` for each error, joined — never the offending value.
+
+    Both ``input_value=`` (what ``str(exc)`` embeds) and the rendered ``msg``
+    can carry the value that failed validation, so neither is used. Shared by
+    the config-load path below and ``stm_admin``'s parameter errors, which both
+    reach an MCP client.
+    """
+    parts = []
+    for err in exc.errors(include_url=False, include_input=False):
+        loc = ".".join(str(part) for part in err["loc"])
+        parts.append(f"{loc} ({err['type']})" if loc else err["type"])
+    return "; ".join(parts)
+
+
 def _sanitized_load_error(exc: Exception) -> str:
     """Error summary safe to surface beyond the local process log.
 
@@ -493,11 +508,7 @@ def _sanitized_load_error(exc: Exception) -> str:
     ``ValueError``) describe positions/types, not config values.
     """
     if isinstance(exc, ValidationError):
-        parts = []
-        for err in exc.errors(include_url=False, include_input=False):
-            loc = ".".join(str(part) for part in err["loc"])
-            parts.append(f"{loc} ({err['type']})" if loc else err["type"])
-        summary = "; ".join(parts)
+        summary = validation_error_summary(exc)
         return f"{exc.error_count()} validation error(s): {summary}"
     return str(exc)
 

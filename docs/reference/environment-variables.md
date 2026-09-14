@@ -219,7 +219,7 @@ Status meanings:
 | `MEMTOMEM_STM_DAEMON__MAX_PENDING_REQUESTS` | integer `1..1024` | `32` | Bound concurrently admitted surfacing requests. | Startup |
 | `MEMTOMEM_STM_DAEMON__MAX_CONCURRENT_LTM_OPS` | integer `1..16` | `4` | Admitted requests allowed to hold the LTM session at once; `1` serializes. | Startup |
 | `MEMTOMEM_STM_DATA_DIR` | path | `~/.memtomem` | Daemon handshakes, locks, and detached-log directory. | Startup |
-| `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS` | boolean | `false` | Advertise eight operator/admin MCP tools at import time. | Startup |
+| `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS` | boolean | `false` | Advertise the `stm_admin` tool (eight operator/admin actions) at import time. | Startup |
 <!-- stmconfig-env:end -->
 
 ### Caveat: `EXTRACTION__LLM__*` defaults are not the extractor's defaults

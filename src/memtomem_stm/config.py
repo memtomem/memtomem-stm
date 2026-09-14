@@ -589,16 +589,15 @@ class STMConfig(BaseSettings):
     data_dir: Path = Path("~/.memtomem")
 
     advertise_observability_tools: bool = False
-    """Whether STM's own observability/admin MCP tools (``stm_proxy_stats``,
-    ``stm_proxy_health``, ``stm_proxy_cache_clear``, ``stm_surfacing_stats``,
-    ``stm_selection_stats``, ``stm_compression_stats``,
-    ``stm_progressive_stats``, ``stm_tuning_recommendations``) are
-    advertised to MCP clients. When ``False``, these are not registered
-    with the MCP server — useful for eager-loading clients (e.g. OpenAI
-    Codex CLI) where every advertised tool pays schema tokens upfront. Set
-    ``MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true`` to opt these admin
-    tools back into MCP advertisement. Claude Code defers tool schemas via
-    its own mechanism so this flag has no effect there. Read via env var
+    """Whether the ``stm_admin`` MCP tool is advertised. It dispatches STM's
+    eight observability/admin actions (``proxy_stats``, ``proxy_health``,
+    ``proxy_cache_clear``, ``surfacing_stats``, ``selection_stats``,
+    ``compression_stats``, ``progressive_stats``, ``tuning_recommendations``)
+    behind one schema, so an eager-loading client (e.g. OpenAI Codex CLI) that
+    turns it on pays for one tool, not eight. When ``False`` it is not
+    registered. Set ``MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true`` to
+    advertise it. Claude Code defers tool schemas via its own mechanism, so
+    the flag costs nothing there either way. Read via env var
     ``MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS`` at server import time."""
 
     @classmethod
