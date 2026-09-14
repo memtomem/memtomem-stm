@@ -862,6 +862,8 @@ mcp = MCPServer(
 def _should_advertise_obs_tools() -> bool:
     """Read the ``MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS`` env-var flag.
 
+    On unless set to ``false``, ``0`` or ``no``.
+
     Factored out so tests can monkeypatch this function directly instead of
     juggling env vars and module reloads. The env read is the source of
     truth; the matching ``STMConfig`` field exists for documentation and
@@ -869,7 +871,7 @@ def _should_advertise_obs_tools() -> bool:
     module import, before ``app_lifespan`` loads the JSON config file.
     """
     return os.environ.get(
-        "MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS", "false"
+        "MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS", "true"
     ).strip().lower() not in ("false", "0", "no")
 
 
@@ -906,7 +908,7 @@ def _obs_action(fn):
 
 
 def _should_advertise_formation_tool() -> bool:
-    """Formation is opt-in and import-time gated like observability tools."""
+    """Formation is opt-in, and import-time gated like the observability dispatcher."""
     return os.environ.get("MEMTOMEM_STM_FORMATION__ENABLED", "false").strip().lower() not in (
         "false",
         "0",
@@ -939,7 +941,8 @@ _OBSERVABILITY_TOOL_NAMES: tuple[str, ...] = (
 def _hidden_obs_tools_hint() -> str | None:
     """One-line hint that the observability actions are hidden, or ``None`` (#613).
 
-    Returns ``None`` when ``stm_admin`` is advertised. Driven off
+    Returns ``None`` when ``stm_admin`` is advertised, which is the default; the
+    hint appears only after an operator turns the flag off. Driven off
     ``_should_advertise_obs_tools()`` — the same signal that actually gates
     registration — so the hint never claims the actions are hidden when they
     aren't (or vice versa).
@@ -952,8 +955,8 @@ def _hidden_obs_tools_hint() -> str | None:
     if _should_advertise_obs_tools():
         return None
     return (
-        f"{len(_OBSERVABILITY_TOOL_NAMES)} observability actions hidden; "
-        "set MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true to advertise the stm_admin tool"
+        f"{len(_OBSERVABILITY_TOOL_NAMES)} observability actions hidden by "
+        "MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS; unset it to advertise the stm_admin tool"
     )
 
 

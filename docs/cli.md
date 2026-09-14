@@ -1158,7 +1158,7 @@ discovered in project-local config files under the current directory are
 refused unless `--allow-project-configs` is passed. REMOVE and sidecar
 BACKFILL are not gated, since neither adopts a new registry command.
 
-## MCP Tools (5 default + 1 opt-in + proxied)
+## MCP Tools (6 default + proxied)
 
 These are exposed by the `memtomem-stm` MCP server and become available to your agent once it's connected.
 
@@ -1173,8 +1173,10 @@ The five model-facing tools are advertised by default:
 | `stm_compression_feedback` | `server`, `tool`, `missing`, `kind?`, `trace_id?` | Report missing info from a compressed response (learning signal) |
 
 Eight observability/admin actions are reached through one tool,
-`stm_admin(action, params?)`, which is advertised only when
-`MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` is set before server start.
+`stm_admin(action, params?)`, which is also advertised by default; set
+`MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=false` before server start to hide it.
+It is a local STM tool, so upstream exposure profiles and Toolgraph policy do
+not gate it: a model can call `proxy_cache_clear` whenever `stm_admin` is advertised.
 Pass the action's arguments as `params`, e.g.
 `stm_admin(action="surfacing_stats", params={"tool": "mem_search", "limit": 5})`.
 `stm_admin(action="help")` lists the actions and their parameters, and
@@ -1252,22 +1254,22 @@ See [Configuration → General](configuration.md#general) for details.
 ## Trimming the advertised MCP tool surface
 
 STM advertises five model-facing MCP tools by default (full tool metadata,
-progressive-delivery unlocks and feedback channels). Eight operator-facing
-observability / admin actions are served by one more tool, `stm_admin`, which is
-off by default. On clients that eager-load MCP tool schemas into the model
+progressive-delivery unlocks and feedback channels). Eight observability /
+admin actions are served by one more tool, `stm_admin`, which is also on by
+default. On clients that eager-load MCP tool schemas into the model
 context at session start, every advertised tool costs schema tokens on each
 request, so the eight actions share one schema instead of carrying eight.
 
-Set the following and restart STM to advertise `stm_admin` over MCP:
+Set the following and restart STM to stop advertising `stm_admin` over MCP:
 
 ```bash
-export MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true
+export MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=false
 ```
 
 - **Claude Code**: no effect needed — Claude Code lazy-loads MCP
   tool schemas via `ToolSearch`, so advertised count is
   near-free.
-- **OpenAI Codex CLI** and other eager-loading clients: turning it on
+- **OpenAI Codex CLI** and other eager-loading clients: `stm_admin`
   costs one tool schema. To keep it off regardless of the environment,
   use the downstream per-server filter if your client supports one. For Codex:
 

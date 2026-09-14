@@ -1,8 +1,8 @@
 # STM MCP Tools
 
-STM advertises five model-facing tools by default. Eight operator actions sit
-behind one `stm_admin` tool, advertised only when
-`MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` is set before startup.
+STM advertises five model-facing tools by default, plus one admin dispatcher:
+eight operator actions sit behind one `stm_admin` tool, hidden only when
+`MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=false` is set before startup.
 All connected upstream tools are added as `{prefix}__{tool}`.
 
 ## Default model-facing tools
@@ -96,7 +96,7 @@ compression pipeline's `stm_proxy_read_more` store.
 See [description budgets](proxy-config.md#advertised-tool-descriptions) for
 `host_description_cap` and recovery hints.
 
-## Optional operator tool: `stm_admin`
+## Admin dispatcher: `stm_admin`
 
 `stm_admin(action, params?)` dispatches the operator actions below; pass an
 action's arguments as the `params` object. `action="help"` lists them, and
@@ -117,6 +117,14 @@ type, never the value.
 | `compression_stats` (`stm_compression_stats`) | `tool?` | Compression feedback counts |
 | `progressive_stats` (`stm_progressive_stats`) | `tool?` | Follow-up and coverage statistics |
 | `tuning_recommendations` (`stm_tuning_recommendations`) | `since_hours?`, `tool?` | Per-tool tuning suggestions |
+
+`stm_admin` is a local STM tool, registered directly rather than proxied, so
+upstream exposure profiles (`strict` / `review`) and Toolgraph policy do not
+gate it. With the default flag, a model can call `proxy_cache_clear`. Without
+`server` or `tool` it clears every response-cache entry and the in-memory
+surfacing results; with either, only the matching response-cache entries. It
+does not touch memories, feedback, pending progressive responses, or the
+Toolgraph consult cache.
 
 The name in parentheses is the implementing function, which was a separate
 MCP tool before `stm_admin` replaced them. Functions that emit a trace span

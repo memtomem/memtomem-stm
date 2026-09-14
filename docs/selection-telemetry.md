@@ -304,8 +304,8 @@ counted (`write_errors`) and logged, and the call proceeds untouched.
 
 The `stm_admin(action="selection_stats")` MCP action reads the active log back into a quick
 operator summary, so a health check needs no hand-parsing of JSONL. It is one
-of the opt-in observability actions — advertise `stm_admin` with
-`MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` (see [cli.md](cli.md)) — and
+of the observability actions served by `stm_admin`, which is advertised unless
+`MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=false` (see [cli.md](cli.md)) — and
 it reports two views:
 
 - **Live counters** — this process's write-path counters (`events_written` /

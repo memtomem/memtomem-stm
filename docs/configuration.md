@@ -74,15 +74,15 @@ isn't writable. A path that can't be opened degrades to a stderr
 warning, not a crash.
 
 ```bash
-export MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true   # opt in
+export MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=false  # hide stm_admin (on by default)
 ```
 
-When set to `true`, advertises the `stm_admin` tool, which dispatches STM's
+Unset or `true` (the default) advertises the `stm_admin` tool, which dispatches STM's
 eight observability / admin actions (`proxy_stats`, `proxy_health`,
 `proxy_cache_clear`, `surfacing_stats`, `selection_stats`,
 `compression_stats`, `progressive_stats`, `tuning_recommendations`) behind
-one schema — see [MCP Tools](cli.md#mcp-tools-5-default--1-opt-in--proxied).
-When unset or `false`, `stm_admin` is not registered with the MCP server, so
+one schema — see [MCP Tools](cli.md#mcp-tools-6-default--proxied).
+When set to `false`, `0` or `no`, `stm_admin` is not registered with the MCP server, so
 eager-loading clients (e.g. OpenAI Codex CLI) pay nothing for it.  The five model-facing tools
 (`stm_proxy_describe_tool`, `stm_proxy_read_more`, `stm_proxy_select_chunks`,
 `stm_surfacing_feedback`, `stm_compression_feedback`) stay advertised

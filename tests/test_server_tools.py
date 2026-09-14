@@ -2884,7 +2884,7 @@ class TestShouldAdvertiseObsTools:
 
     def test_default_when_unset(self, monkeypatch):
         monkeypatch.delenv(_FLAG_ENV, raising=False)
-        assert _should_advertise_obs_tools() is False
+        assert _should_advertise_obs_tools() is True
 
     def test_false_variants_disable(self, monkeypatch):
         for value in ("false", "FALSE", "False", "0", "no", "NO", "  false  "):
@@ -2932,11 +2932,11 @@ class TestAdvertiseObservabilityFlagEndToEnd:
         )
         return json.loads(result.stdout.strip().splitlines()[-1])
 
-    def test_default_keeps_only_model_facing(self):
+    def test_default_advertises_the_dispatcher(self):
         names = set(self._list_registered(env_override=None))
-        assert names == _MODEL_FACING_TOOLS
+        assert names == _MODEL_FACING_TOOLS | {_ADMIN_TOOL}
+        assert len(names) == 6
         assert _OBSERVABILITY_TOOLS.isdisjoint(names)
-        assert _ADMIN_TOOL not in names
 
     def test_flag_true_advertises_one_dispatcher_not_eight_tools(self):
         names = set(self._list_registered(env_override="true"))
@@ -2985,7 +2985,7 @@ class TestAdvertiseObservabilityFlagEndToEnd:
 
     def test_hidden_hint_count_matches_constant(self, monkeypatch):
         """The hint's number is derived from the constant, not hardcoded."""
-        monkeypatch.delenv(_FLAG_ENV, raising=False)
+        monkeypatch.setenv(_FLAG_ENV, "false")
         hint = _hidden_obs_tools_hint()
         assert hint is not None
         assert len(_OBSERVABILITY_TOOL_NAMES) == 8
@@ -2993,6 +2993,8 @@ class TestAdvertiseObservabilityFlagEndToEnd:
         assert "stm_admin" in hint
 
         monkeypatch.setenv(_FLAG_ENV, "true")
+        assert _hidden_obs_tools_hint() is None
+        monkeypatch.delenv(_FLAG_ENV, raising=False)
         assert _hidden_obs_tools_hint() is None
 
 

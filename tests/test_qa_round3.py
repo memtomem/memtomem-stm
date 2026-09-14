@@ -180,7 +180,7 @@ class TestDocsToolCount:
     def test_cli_md_has_current_tool_counts(self):
         cli_md = Path(__file__).parent.parent / "docs" / "cli.md"
         content = cli_md.read_text(encoding="utf-8")
-        assert "5 default + 1 opt-in + proxied" in content
+        assert "6 default + proxied" in content
         assert "`stm_admin(action, params?)`" in content
         assert "stm_compression_feedback" in content
         assert "| `proxy_health` |" in content
@@ -190,7 +190,7 @@ class TestDocsToolCount:
     def test_readme_has_current_tool_counts(self):
         readme = Path(__file__).parent.parent / "README.md"
         content = readme.read_text(encoding="utf-8")
-        assert "five model-facing MCP tools by default" in content
+        assert "five model-facing MCP tools by default, plus one admin" in content
         assert "Eight observability and" in content
         assert "`stm_admin` tool" in content
 
