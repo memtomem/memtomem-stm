@@ -51,6 +51,20 @@ changes inline only. See the deprecation policy in
   the functions emit keep their names. **Behavior change**: see the upgrade
   notes above.
 
+### Fixed
+
+- **An empty `server` or `tool` filter no longer clears every cache** (#1035) —
+  `proxy_cache_clear` checked for a filter by truthiness. A call such as
+  `stm_admin(action="proxy_cache_clear", params={"server": ""})` therefore took the
+  unfiltered path and flushed the whole response cache along with the in-memory
+  surfacing results. The response cache's own `clear` already treated `""` as a
+  filter. The action now applies the same `is not None` test. An empty string is
+  therefore a literal filter: it deletes only response-cache rows whose server or
+  tool is empty, which normally means none, and it never touches the surfacing
+  cache. With the response cache disabled, the reply is `Cache not enabled` instead
+  of a surfacing flush. Through `stm_admin`, `"null"` still coerces to `None` and
+  still means no filter. The defect dates from #539.
+
 ## [0.5.1] — 2026-09-13
 
 ### Upgrade notes

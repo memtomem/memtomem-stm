@@ -263,6 +263,43 @@ class TestDispatchReachesTheAction:
         engine.clear_cache.assert_called_once_with()
         assert "response-cache" in result and "surfacing-cache" in result
 
+    @pytest.mark.parametrize(
+        ("params", "reply"),
+        [
+            ({"server": ""}, "Cleared 0 cache entries for server ''."),
+            ({"tool": ""}, "Cleared 0 cache entries for tool ''."),
+            ({"server": "", "tool": ""}, "Cleared 0 cache entries for /."),
+            ({"server": "", "tool": "t"}, "Cleared 0 cache entries for /t."),
+            ({"server": "srv", "tool": ""}, "Cleared 0 cache entries for srv/."),
+        ],
+    )
+    async def test_empty_filter_is_a_filter_not_a_clear_all(self, params, reply):
+        """An empty string is a literal filter, not an absent filter.
+
+        A model given ``stm_admin`` can send ``{"server": ""}``. Treating that as
+        unfiltered flushed the response cache and the surfacing results.
+        """
+        pm, cache = _pm_with_cache(cleared=0)
+        engine = MagicMock()
+        ctx = _make_ctx(proxy_manager=pm, surfacing_engine=engine)
+
+        result = await stm_admin("proxy_cache_clear", params, ctx=ctx)
+
+        cache.clear.assert_called_once_with(server=params.get("server"), tool=params.get("tool"))
+        engine.clear_cache.assert_not_called()
+        assert result == reply
+
+    async def test_empty_filter_with_response_cache_disabled_leaves_surfacing(self):
+        pm, _ = _pm_with_cache()
+        pm._cache = None
+        engine = MagicMock()
+        ctx = _make_ctx(proxy_manager=pm, surfacing_engine=engine)
+
+        result = await stm_admin("proxy_cache_clear", {"server": ""}, ctx=ctx)
+
+        engine.clear_cache.assert_not_called()
+        assert result == "Cache not enabled. Set proxy.cache.enabled = true in stm_proxy.json."
+
 
 # ── validation parity with the SDK ───────────────────────────────────────
 
