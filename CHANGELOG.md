@@ -11,6 +11,8 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-09-15
+
 ### Upgrade notes
 
 - **`MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` advertises one tool,
@@ -25,6 +27,10 @@ changes inline only. See the deprecation policy in
   hidden; set MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true to advertise the
   stm_admin tool`. The `obs_tools_hidden` and `obs_tools_hint` JSON keys are
   unchanged.
+- **An empty cache-clear filter is a filter** (#1035). `proxy_cache_clear` with
+  `server=""` or `tool=""` used to flush the whole response cache and the in-memory
+  surfacing results. It now deletes only rows with that literal empty name, which
+  normally means none.
 
 ### Changed
 
@@ -63,7 +69,8 @@ changes inline only. See the deprecation policy in
   tool is empty, which normally means none, and it never touches the surfacing
   cache. With the response cache disabled, the reply is `Cache not enabled` instead
   of a surfacing flush. Through `stm_admin`, `"null"` still coerces to `None` and
-  still means no filter. The defect dates from #539.
+  still means no filter. The defect dates from #539. **Behavior change**: see the
+  upgrade notes above.
 
 ## [0.5.1] — 2026-09-13
 
