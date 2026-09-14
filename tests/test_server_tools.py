@@ -427,7 +427,7 @@ class TestHealth:
         is itself gated, so it is unreachable in the flag-off state where the
         hint would apply; emitting it here would be dead + misleading. The hint
         lives on the always-available ``mms health`` CLI instead."""
-        monkeypatch.setenv("MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS", "false")
+        monkeypatch.delenv("MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS", raising=False)
         pm = _make_proxy_manager()
         ctx = _make_ctx(proxy_manager=pm)
         result = await stm_proxy_health(ctx=ctx)
@@ -2884,7 +2884,7 @@ class TestShouldAdvertiseObsTools:
 
     def test_default_when_unset(self, monkeypatch):
         monkeypatch.delenv(_FLAG_ENV, raising=False)
-        assert _should_advertise_obs_tools() is True
+        assert _should_advertise_obs_tools() is False
 
     def test_false_variants_disable(self, monkeypatch):
         for value in ("false", "FALSE", "False", "0", "no", "NO", "  false  "):
@@ -2932,11 +2932,11 @@ class TestAdvertiseObservabilityFlagEndToEnd:
         )
         return json.loads(result.stdout.strip().splitlines()[-1])
 
-    def test_default_advertises_the_dispatcher(self):
+    def test_default_keeps_only_model_facing(self):
         names = set(self._list_registered(env_override=None))
-        assert names == _MODEL_FACING_TOOLS | {_ADMIN_TOOL}
-        assert len(names) == 6
+        assert names == _MODEL_FACING_TOOLS
         assert _OBSERVABILITY_TOOLS.isdisjoint(names)
+        assert _ADMIN_TOOL not in names
 
     def test_flag_true_advertises_one_dispatcher_not_eight_tools(self):
         names = set(self._list_registered(env_override="true"))
@@ -2985,7 +2985,7 @@ class TestAdvertiseObservabilityFlagEndToEnd:
 
     def test_hidden_hint_count_matches_constant(self, monkeypatch):
         """The hint's number is derived from the constant, not hardcoded."""
-        monkeypatch.setenv(_FLAG_ENV, "false")
+        monkeypatch.delenv(_FLAG_ENV, raising=False)
         hint = _hidden_obs_tools_hint()
         assert hint is not None
         assert len(_OBSERVABILITY_TOOL_NAMES) == 8
@@ -2993,8 +2993,6 @@ class TestAdvertiseObservabilityFlagEndToEnd:
         assert "stm_admin" in hint
 
         monkeypatch.setenv(_FLAG_ENV, "true")
-        assert _hidden_obs_tools_hint() is None
-        monkeypatch.delenv(_FLAG_ENV, raising=False)
         assert _hidden_obs_tools_hint() is None
 
 

@@ -75,9 +75,9 @@ you judge which tools are visible.
 
 In the Toolgraph fixture, both `demo__read_note` and `demo__publish_note` remain
 visible under review. Calls are allowed, while `stm_admin(action="proxy_health")`
-reports the review would-block count. `stm_admin` is advertised unless the MCP
-client registration sets `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=false`;
-call `stm_admin(action="proxy_health")` from the client.
+reports the review would-block count when the MCP client registration sets
+`MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true`. Restart the client after
+adding that environment value, then call `stm_admin(action="proxy_health")` from the client.
 The underlying gateway status field is `would_block_calls`.
 
 The counter records policy decisions, not raw arguments or results.

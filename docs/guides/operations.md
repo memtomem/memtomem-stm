@@ -65,11 +65,9 @@ versions differ; `mms daemon stop --all` removes pinned stale-version daemons.
 
 ### Observability MCP tools are absent
 
-The eight observability and admin actions are served by the `stm_admin` tool,
-which is advertised by default. If it is missing, check whether
-`MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS` is set to `false`, `0` or `no` in the
-server's environment (`mms health` names the flag when it is), or whether the
-client filters it with `disabled_tools`. CLI diagnostics remain available when it is hidden.
+The eight observability and admin actions, served by the `stm_admin` tool, are hidden by default to save tool-schema tokens. Set
+`MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` before server start to advertise
+`stm_admin`. CLI diagnostics remain available when it is hidden.
 
 ### A native hook is quiet
 

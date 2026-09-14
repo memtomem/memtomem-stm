@@ -206,11 +206,11 @@ selected stdio definitions into the proxy with provenance and conflict checks. S
 | [Environment variables](https://github.com/memtomem/memtomem-stm/blob/main/docs/reference/environment-variables.md) | Complete startup/runtime variable inventory and precedence |
 | [Architecture decisions](https://github.com/memtomem/memtomem-stm/blob/main/docs/adr/README.md) | Accepted contracts, status, and deferral gates |
 
-STM advertises five model-facing MCP tools by default, plus one admin
-dispatcher. Eight observability and admin actions (`proxy_stats`,
-`surfacing_stats`, etc.) sit behind that one `stm_admin` tool, so eager-loading
-clients pay for one tool schema, not eight. Set
-`MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=false` to stop advertising it.
+STM advertises five model-facing MCP tools by default. Eight observability and
+admin actions (`proxy_stats`, `surfacing_stats`, etc.) sit behind one
+`stm_admin` tool, which is advertised only when
+`MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` is set. Eager-loading
+clients that turn it on pay for one tool schema, not eight.
 
 ## Compatibility & deprecation policy
 

@@ -14252,16 +14252,15 @@ class TestHealth:
         assert "No upstream servers configured" in result.output
 
     def test_health_obs_tools_hint_when_hidden(self, runner, config, monkeypatch):
-        """#613: flag set off → ``mms health`` surfaces the hint so a user learns
-        which env flag hides the observability tools."""
-        monkeypatch.setenv("MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS", "false")
+        """#613: flag off → ``mms health`` surfaces the hint so a user learns
+        the env flag that exposes the hidden observability tools."""
+        monkeypatch.delenv("MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS", raising=False)
         config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
         result = runner.invoke(cli, ["health", *_cfg_args(config)])
         assert result.exit_code == 0
-        assert (
-            "8 observability actions hidden by MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS; "
-            "unset it to advertise the stm_admin tool"
-        ) in result.output
+        assert "8 observability actions hidden" in result.output
+        assert "MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true" in result.output
+        assert "stm_admin" in result.output
 
     def test_health_obs_tools_hint_absent_when_advertised(self, runner, config, monkeypatch):
         monkeypatch.setenv("MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS", "true")
@@ -14270,17 +14269,8 @@ class TestHealth:
         assert result.exit_code == 0
         assert "observability actions hidden" not in result.output
 
-    def test_health_obs_tools_hint_absent_by_default(self, runner, config, monkeypatch):
-        monkeypatch.delenv("MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS", raising=False)
-        config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
-        result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
-        assert result.exit_code == 0
-        data = json.loads(result.output)
-        assert data["obs_tools_hidden"] is False
-        assert data["obs_tools_hint"] is None
-
     def test_health_json_obs_tools_hidden_key(self, runner, config, monkeypatch):
-        monkeypatch.setenv("MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS", "false")
+        monkeypatch.delenv("MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS", raising=False)
         config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
         result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
         assert result.exit_code == 0
