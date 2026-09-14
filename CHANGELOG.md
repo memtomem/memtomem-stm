@@ -14,21 +14,21 @@ changes inline only. See the deprecation policy in
 ### Upgrade notes
 
 - **`MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` advertises one tool,
-  `stm_admin`, instead of eight.** The eight observability and admin tools
+  `stm_admin`, instead of eight** (#1032). The eight observability and admin tools
   (`stm_proxy_stats`, `stm_proxy_health`, `stm_proxy_cache_clear`,
   `stm_surfacing_stats`, `stm_selection_stats`, `stm_compression_stats`,
   `stm_progressive_stats`, `stm_tuning_recommendations`) are no longer MCP
   tools. Call them as `stm_admin(action="proxy_stats")`, passing arguments as
   `params`. A client `disabled_tools` list that named them should name
   `stm_admin`. The default, with the flag unset, is unchanged: five tools.
-- **`mms health` hint text changed.** It now reads `8 observability actions
+- **`mms health` hint text changed** (#1032). It now reads `8 observability actions
   hidden; set MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true to advertise the
   stm_admin tool`. The `obs_tools_hidden` and `obs_tools_hint` JSON keys are
   unchanged.
 
 ### Changed
 
-- **Observability tools collapse into one `stm_admin` dispatcher** — with the
+- **Observability tools collapse into one `stm_admin` dispatcher** (#1032) — with the
   flag on, an eager-loading client paid for eight rarely called tool schemas on
   every request: 4,954 characters of description and schema. `stm_admin` costs
   720, so the flag-on surface drops from 13 tools and 10,640 characters to 6

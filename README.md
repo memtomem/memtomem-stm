@@ -183,7 +183,7 @@ selected stdio definitions into the proxy with provenance and conflict checks. S
 
 ## Tutorial notebooks
 
-> **Try it without wiring into your AI client first.** A [quickstart Jupyter notebook](https://github.com/memtomem/memtomem-stm/blob/main/notebooks/01_quickstart_proxy_setup.ipynb) registers upstream MCP servers, calls proxied tools, verifies selective compression, and reads `stm_proxy_stats` end-to-end. Clone the repo, `uv sync`, and `uv run jupyter lab notebooks/` — no external services needed.
+> **Try it without wiring into your AI client first.** A [quickstart Jupyter notebook](https://github.com/memtomem/memtomem-stm/blob/main/notebooks/01_quickstart_proxy_setup.ipynb) registers upstream MCP servers, calls proxied tools, verifies selective compression, and reads `stm_admin(action="proxy_stats")` end-to-end. Clone the repo, `uv sync`, and `uv run jupyter lab notebooks/` — no external services needed.
 
 ## Documentation
 

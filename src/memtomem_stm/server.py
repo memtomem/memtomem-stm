@@ -897,7 +897,8 @@ def _obs_action(fn):
     validation the individual tools had — so a dispatched call coerces exactly
     as a direct call did (JSON-string pre-parse, pydantic coercion). A
     per-parameter ``TypeAdapter`` differs: it keeps ``"null"`` as a string where
-    the SDK yields ``None``, which would silently widen a filter.
+    the SDK yields ``None``, so ``tool="null"`` would filter on the literal name
+    "null" instead of applying no filter — a silent change in filter meaning.
     """
     name = fn.__name__.removeprefix("stm_")
     _OBSERVABILITY_ACTIONS[name] = _ObsAction(fn=fn, meta=func_metadata(fn, skip_names=["ctx"]))
