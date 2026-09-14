@@ -11,6 +11,8 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-09-15
+
 ### Upgrade notes
 
 - **`MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` advertises one tool,
@@ -20,11 +22,20 @@ changes inline only. See the deprecation policy in
   `stm_progressive_stats`, `stm_tuning_recommendations`) are no longer MCP
   tools. Call them as `stm_admin(action="proxy_stats")`, passing arguments as
   `params`. A client `disabled_tools` list that named them should name
-  `stm_admin`. The default, with the flag unset, is unchanged: five tools.
-- **`mms health` hint text changed** (#1032). It now reads `8 observability actions
-  hidden; set MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true to advertise the
-  stm_admin tool`. The `obs_tools_hidden` and `obs_tools_hint` JSON keys are
-  unchanged.
+  `stm_admin`. With the flag unset the tool count stays at five; one description
+  grows by 16 characters.
+- **CLI text that named the old tools changed** (#1032).
+  - The `mms health` hint now reads `8 observability actions hidden; set
+    MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true to advertise the stm_admin
+    tool`. The `obs_tools_hidden` and `obs_tools_hint` JSON keys are unchanged.
+  - The `data_source` value in `mms stats --json`, and its `Data` line, now end
+    `via the stm_admin MCP tool (action proxy_stats)` instead of `via the
+    stm_proxy_stats MCP tool`. The key is unchanged. A script that matched the old
+    string needs updating.
+- **An empty cache-clear filter is a filter** (#1035). `proxy_cache_clear` with
+  `server=""` or `tool=""`, and no other non-empty filter, used to flush the whole
+  response cache and the in-memory surfacing results. It now deletes only rows with
+  that literal empty name, which normally means none.
 
 ### Changed
 
@@ -48,8 +59,10 @@ changes inline only. See the deprecation policy in
   clear every cache. The advertised schema says so with
   `additionalProperties: false`. A value of the wrong type inside `params` is
   refused with the parameter name and error type, never the value. The spans
-  the functions emit keep their names. **Behavior change**: see the upgrade
-  notes above.
+  the functions emit keep their names. Text that pointed at the old tools now names
+  `stm_admin`: the `mms health` hint, the `mms stats` data source, `mms tune --help`,
+  and two surfacing log warnings.
+  **Behavior change**: see the upgrade notes above.
 
 ### Fixed
 
@@ -63,7 +76,10 @@ changes inline only. See the deprecation policy in
   tool is empty, which normally means none, and it never touches the surfacing
   cache. With the response cache disabled, the reply is `Cache not enabled` instead
   of a surfacing flush. Through `stm_admin`, `"null"` still coerces to `None` and
-  still means no filter. The defect dates from #539.
+  still means no filter. The defect dates from #539. One reply changes wording where
+  nothing else did: a call with one empty and one non-empty filter, which already
+  deleted only matching rows, now reports both, e.g. `Cleared 0 cache entries for /t.`
+  instead of `… for tool 't'.` **Behavior change**: see the upgrade notes above.
 
 ## [0.5.1] — 2026-09-13
 
