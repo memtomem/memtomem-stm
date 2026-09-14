@@ -183,7 +183,7 @@ selected stdio definitions into the proxy with provenance and conflict checks. S
 
 ## Tutorial notebooks
 
-> **Try it without wiring into your AI client first.** A [quickstart Jupyter notebook](https://github.com/memtomem/memtomem-stm/blob/main/notebooks/01_quickstart_proxy_setup.ipynb) registers upstream MCP servers, calls proxied tools, verifies selective compression, and reads `stm_proxy_stats` end-to-end. Clone the repo, `uv sync`, and `uv run jupyter lab notebooks/` — no external services needed.
+> **Try it without wiring into your AI client first.** A [quickstart Jupyter notebook](https://github.com/memtomem/memtomem-stm/blob/main/notebooks/01_quickstart_proxy_setup.ipynb) registers upstream MCP servers, calls proxied tools, verifies selective compression, and reads `stm_admin(action="proxy_stats")` end-to-end. Clone the repo, `uv sync`, and `uv run jupyter lab notebooks/` — no external services needed.
 
 ## Documentation
 
@@ -207,10 +207,10 @@ selected stdio definitions into the proxy with provenance and conflict checks. S
 | [Architecture decisions](https://github.com/memtomem/memtomem-stm/blob/main/docs/adr/README.md) | Accepted contracts, status, and deferral gates |
 
 STM advertises five model-facing MCP tools by default. Eight observability and
-admin tools (`stm_proxy_stats`, `stm_surfacing_stats`, etc.)
-are hidden unless `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` is set,
-which keeps eager-loading clients from paying schema tokens for rarely used
-operator tools.
+admin actions (`proxy_stats`, `surfacing_stats`, etc.) sit behind one
+`stm_admin` tool, which is advertised only when
+`MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` is set. Eager-loading
+clients that turn it on pay for one tool schema, not eight.
 
 ## Compatibility & deprecation policy
 

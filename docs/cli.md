@@ -510,7 +510,7 @@ Options:
   --config TEXT  [default: (~/.memtomem/stm_proxy.json)]
 ```
 
-Toggles `surfacing_enabled` on an upstream in `stm_proxy.json` (default `on`). With no state it prints the current value; `mms list` shows it per server (SURFACING column). A running proxy hot-reloads the change without a restart. Because the flag lives in the shared proxy config — not per-client `env` — every MCP client that proxies through this `mms` sees the same scope. When off, surfacing is skipped before the LTM search for every tool on that server (counted as `upstream_disabled` in `stm_surfacing_stats`). For tool-grained or cross-server glob scope, use the `MEMTOMEM_STM_SURFACING__EXCLUDE_TOOLS` env glob instead (matches `server__tool`). See [surfacing.md](surfacing.md#scoping-surfacing-per-upstream).
+Toggles `surfacing_enabled` on an upstream in `stm_proxy.json` (default `on`). With no state it prints the current value; `mms list` shows it per server (SURFACING column). A running proxy hot-reloads the change without a restart. Because the flag lives in the shared proxy config — not per-client `env` — every MCP client that proxies through this `mms` sees the same scope. When off, surfacing is skipped before the LTM search for every tool on that server (counted as `upstream_disabled` in `stm_admin(action="surfacing_stats")`). For tool-grained or cross-server glob scope, use the `MEMTOMEM_STM_SURFACING__EXCLUDE_TOOLS` env glob instead (matches `server__tool`). See [surfacing.md](surfacing.md#scoping-surfacing-per-upstream).
 
 ### `health`
 
@@ -529,7 +529,7 @@ Options:
                            registration (#261).
 ```
 
-Connects to each configured upstream server (MCP initialize + list-tools) and reports whether it's reachable and how many tools it exposes. Unlike `stm_proxy_health` (the MCP tool), this command probes servers directly — the proxy does not need to be running. It also prints a **Surfacing Bootstrap** section that checks surfacing config, feedback DB readiness, and the configured LTM MCP server.
+Connects to each configured upstream server (MCP initialize + list-tools) and reports whether it's reachable and how many tools it exposes. Unlike `stm_admin(action="proxy_health")` (the MCP action), this command probes servers directly — the proxy does not need to be running. It also prints a **Surfacing Bootstrap** section that checks surfacing config, feedback DB readiness, and the configured LTM MCP server.
 
 Probe results are **staged**: a failing server's `DISCONNECTED` line names the last stage that completed (`configured → transport connected → MCP initialized → tools discovered`), so a dead binary, a broken MCP handshake, and a failing `tools/list` are distinguishable at a glance. `--json` server entries carry the additive `stage` / `failed_stage` / `transport` keys next to the unchanged `connected` / `tools` / `overflowing` / `error` fields. Probe error strings are sanitized before rendering — configured `env` / `headers` values and URL credentials are replaced with `<REDACTED>` even when an upstream echoes them back in an exception message. For a pass/fail verdict with next actions instead of raw connectivity detail, use [`mms doctor`](#doctor).
 
@@ -679,7 +679,7 @@ Options:
   --json               Preview as JSON for scripting.
 ```
 
-Runs the same analysis as the `stm_tuning_recommendations` MCP tool against the on-disk metrics/feedback stores (no running server needed) and renders the per-tool `tool_overrides` diff it suggests — `max_result_chars` budget changes and `compression` strategy pins, with the reason and a confidence level per tool.
+Runs the same analysis as the `stm_admin` MCP tool's `tuning_recommendations` action against the on-disk metrics/feedback stores (no running server needed) and renders the per-tool `tool_overrides` diff it suggests — `max_result_chars` budget changes and `compression` strategy pins, with the reason and a confidence level per tool.
 
 Three modes:
 
@@ -1158,7 +1158,7 @@ discovered in project-local config files under the current directory are
 refused unless `--allow-project-configs` is passed. REMOVE and sidecar
 BACKFILL are not gated, since neither adopts a new registry command.
 
-## MCP Tools (5 default + 8 opt-in + proxied)
+## MCP Tools (5 default + 1 opt-in + proxied)
 
 These are exposed by the `memtomem-stm` MCP server and become available to your agent once it's connected.
 
@@ -1172,19 +1172,31 @@ The five model-facing tools are advertised by default:
 | `stm_surfacing_feedback` | `surfacing_id`, `rating?`, `memory_id?`, `ratings?` | Rate surfaced memories (`helpful` / `partially_helpful` / `not_relevant` / `already_known`); `ratings=[{memory_id, rating}]` for batched per-memory feedback |
 | `stm_compression_feedback` | `server`, `tool`, `missing`, `kind?`, `trace_id?` | Report missing info from a compressed response (learning signal) |
 
-Eight observability/admin tools are hidden unless
-`MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` is set before server start:
+Eight observability/admin actions are reached through one tool,
+`stm_admin(action, params?)`, which is advertised only when
+`MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` is set before server start.
+Pass the action's arguments as `params`, e.g.
+`stm_admin(action="surfacing_stats", params={"tool": "mem_search", "limit": 5})`.
+`stm_admin(action="help")` lists the actions and their parameters, and
+`params={"action": "<name>"}` with `action="help"` returns one action's full
+documentation. When the dispatcher refuses the arguments, the result is a tool
+error with `isError` set; an action's own messages, such as a bad `since`
+timestamp, are still returned as text. An unknown
+action, an unknown key inside `params`, and an unknown top-level key such as a
+misspelled `param` are all refused rather than ignored. A value of the wrong
+type inside `params` is refused with the parameter name and error type, never
+the value.
 
-| Tool | Arguments | Description |
-|------|-----------|-------------|
-| `stm_proxy_stats` | — | Token savings, compression stats, cache hit/miss ratio |
-| `stm_proxy_cache_clear` | `server?`, `tool?` | Clear response cache (all, by server, by tool, or by server+tool) |
-| `stm_proxy_health` | — | Upstream server connectivity and circuit breaker status |
-| `stm_surfacing_stats` | `tool?`, `since?`, `limit=10` | Top-line health verdict, surfacing event counts, feedback breakdown, helpfulness %, plus per-tool skip reasons / outcomes / cache hit ratio |
-| `stm_selection_stats` | — | Tool-selection telemetry: live write-path counters plus persisted selections by ranker version, server/tool, execution outcomes, and reject reasons |
-| `stm_compression_stats` | `tool?` | Compression feedback counts by kind and tool |
-| `stm_progressive_stats` | `tool?` | Progressive-delivery follow-up rate, coverage, and per-tool breakdown |
-| `stm_tuning_recommendations` | `since_hours?`, `tool?` | Per-tool compression tuning recommendations from the auto-tuner (apply them with [`mms tune --apply`](#tune)) |
+| Action | `params` | Description |
+|--------|----------|-------------|
+| `proxy_stats` | — | Token savings, compression stats, cache hit/miss ratio |
+| `proxy_cache_clear` | `server?`, `tool?` | Clear response cache (all, by server, by tool, or by server+tool) |
+| `proxy_health` | — | Upstream server connectivity and circuit breaker status |
+| `surfacing_stats` | `tool?`, `since?`, `limit=10` | Top-line health verdict, surfacing event counts, feedback breakdown, helpfulness %, plus per-tool skip reasons / outcomes / cache hit ratio |
+| `selection_stats` | — | Tool-selection telemetry: live write-path counters plus persisted selections by ranker version, server/tool, execution outcomes, and reject reasons |
+| `compression_stats` | `tool?` | Compression feedback counts by kind and tool |
+| `progressive_stats` | `tool?` | Progressive-delivery follow-up rate, coverage, and per-tool breakdown |
+| `tuning_recommendations` | `since_hours?`, `tool?` | Per-tool compression tuning recommendations from the auto-tuner (apply them with [`mms tune --apply`](#tune)) |
 
 Plus all proxied tools named `{prefix}__{original_tool_name}` (e.g. `fs__read_file`, `gh__search_repositories`).
 
@@ -1205,8 +1217,8 @@ sequenceDiagram
     Note over Agent,STM: agent reads memories injected at top of fs__read_file response
     Agent->>STM: stm_surfacing_feedback(surfacing_id, "helpful")
     STM-->>Agent: ack (auto-tuner notes positive sample)
-    Note over Agent,STM: if observability tools are advertised
-    Agent->>STM: stm_proxy_stats
+    Note over Agent,STM: if stm_admin is advertised
+    Agent->>STM: stm_admin(action="proxy_stats")
     STM-->>Agent: token savings · cache hit ratio · latency p50/p95/p99
 ```
 
@@ -1240,12 +1252,13 @@ See [Configuration → General](configuration.md#general) for details.
 ## Trimming the advertised MCP tool surface
 
 STM advertises five model-facing MCP tools by default (full tool metadata,
-progressive-delivery unlocks and feedback channels). Eight additional tools are operator-facing
-(observability / admin). On clients that eager-load MCP tool schemas into
-the model context at session start, the eight observability tools would
-pay schema tokens for calls the model rarely makes.
+progressive-delivery unlocks and feedback channels). Eight operator-facing
+observability / admin actions are served by one more tool, `stm_admin`, which is
+off by default. On clients that eager-load MCP tool schemas into the model
+context at session start, every advertised tool costs schema tokens on each
+request, so the eight actions share one schema instead of carrying eight.
 
-Set the following and restart STM to advertise them over MCP:
+Set the following and restart STM to advertise `stm_admin` over MCP:
 
 ```bash
 export MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true
@@ -1254,20 +1267,14 @@ export MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true
 - **Claude Code**: no effect needed — Claude Code lazy-loads MCP
   tool schemas via `ToolSearch`, so advertised count is
   near-free.
-- **OpenAI Codex CLI** and other eager-loading clients: leave this
-  unset/`false`, or use the downstream per-server filter if your
-  client supports one. For Codex:
+- **OpenAI Codex CLI** and other eager-loading clients: turning it on
+  costs one tool schema. To keep it off regardless of the environment,
+  use the downstream per-server filter if your client supports one. For Codex:
 
   ```toml
   # ~/.codex/config.toml
   [mcp_servers.memtomem-stm]
-  disabled_tools = [
-    "stm_proxy_stats", "stm_proxy_health", "stm_proxy_cache_clear",
-    "stm_surfacing_stats", "stm_selection_stats",
-    "stm_compression_stats", "stm_progressive_stats",
-    "stm_tuning_recommendations",
-  ]
+  disabled_tools = ["stm_admin"]
   ```
 
-The STM-side flag is a convenience that keeps the list in one
-place; the downstream filter is equivalent at the wire level.
+The STM-side flag and the downstream filter are equivalent at the wire level.

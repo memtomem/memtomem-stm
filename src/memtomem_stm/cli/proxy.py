@@ -2254,7 +2254,7 @@ def stats(
     # surfacing.feedback_db_path are both configurable.
     data_source = (
         "on-disk stores only (metrics DB + surfacing-feedback DB); "
-        "live in-memory counters via the stm_proxy_stats MCP tool"
+        "live in-memory counters via the stm_admin MCP tool (action proxy_stats)"
     )
 
     if as_json:
@@ -6147,8 +6147,9 @@ def tune(
     mms tune --apply         # pick recommendations, write tool_overrides
     mms tune --apply --yes   # apply all, no prompts
 
-    Runs the same analysis as the ``stm_tuning_recommendations`` MCP tool
-    against the on-disk metrics/feedback stores (no running server needed)
+    Runs the same analysis as the ``stm_admin`` MCP tool's
+    ``tuning_recommendations`` action against the on-disk metrics/feedback
+    stores (no running server needed)
     and shows the per-tool ``tool_overrides`` diff it suggests. ``--apply``
     writes the accepted overrides under the config write lock, after
     snapshotting the config to a timestamped ``.bak-<UTC>`` file next to it;

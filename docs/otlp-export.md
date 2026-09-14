@@ -114,8 +114,9 @@ first is exportable.
 raised. `stm.trace_id` is STM's application correlation id, **not** a W3C
 trace id.
 
-Every other span STM emits — the STM control tools (`stm_surfacing_feedback`,
-`stm_surfacing_stats`, `stm_selection_stats`) and the surfacing engine's own
+Every other span STM emits — the spans of STM's own control tools and
+`stm_admin` actions (`stm_surfacing_feedback`, `stm_surfacing_stats`,
+`stm_selection_stats`) and the surfacing engine's own
 spans — carries **no attributes at all**, because its metadata comes from MCP
 call arguments. Those spans still contribute timing and lineage.
 
@@ -220,7 +221,7 @@ telemetry consumer is never a dependency of the calls it accounts for.
 - A collector that is down at startup is not an error. There is no
   preflight; OTLP/HTTP is per-batch.
 
-Counters appear in `stm_proxy_health`, including when no upstream servers are
+Counters appear in `stm_admin(action="proxy_health")`, including when no upstream servers are
 configured — export is independent of the proxy block, so it stays visible in
 control-only mode:
 

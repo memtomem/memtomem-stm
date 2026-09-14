@@ -557,7 +557,7 @@ def test_public_proxy_config_examples_match_runtime_schema() -> None:
 
 
 def test_surfacing_md_documents_phase_1_observability_sample() -> None:
-    """docs/surfacing.md's ``stm_surfacing_stats`` example must include
+    """docs/surfacing.md's ``surfacing_stats`` action example must include
     the Phase 1 ``Healthy skips`` / ``Fault skips`` / ``Outcomes`` /
     ``Cache`` sections.
 
@@ -569,7 +569,7 @@ def test_surfacing_md_documents_phase_1_observability_sample() -> None:
     explains *why* surfacing skipped, and the RFC's "no more
     DEBUG-log only skips" promise becomes invisible. Scope the
     assertion to the fenced code block immediately after the
-    "Check effectiveness with `stm_surfacing_stats`" prose so a
+    "Check effectiveness with `stm_admin(action="surfacing_stats")`" prose so a
     new section pasted into an unrelated part of the file cannot
     satisfy the check.
     """
@@ -599,7 +599,7 @@ def test_surfacing_md_documents_phase_1_observability_sample() -> None:
     # picking the one preceded by that phrase keeps the check tied to
     # the operator-facing example, not any other code block in the
     # file (e.g. a config snippet that happens to mention surfacing).
-    anchor = "Check effectiveness with `stm_surfacing_stats`:"
+    anchor = 'Check effectiveness with `stm_admin(action="surfacing_stats")`:'
     if anchor not in surfacing_md:
         pytest.fail(
             f"docs/surfacing.md no longer contains the {anchor!r} "
@@ -612,14 +612,14 @@ def test_surfacing_md_documents_phase_1_observability_sample() -> None:
         pytest.fail(
             "docs/surfacing.md no longer has a fenced sample block "
             "after the 'Check effectiveness' anchor — restore the "
-            "stm_surfacing_stats example or update this test."
+            "surfacing_stats example or update this test."
         )
     block = block_match.group(1)
 
     missing_in_docs = [h for h in required_headers if h not in block]
     if missing_in_docs:
         pytest.fail(
-            f"docs/surfacing.md `stm_surfacing_stats` sample block is "
+            f"docs/surfacing.md `surfacing_stats` sample block is "
             f"missing Phase 1 observability header(s): {missing_in_docs!r}. "
             "These ship in server.py's _format_observability_sections "
             "and are the operator-facing surface for skip reasons, "
@@ -706,8 +706,8 @@ def test_surfacing_md_ltm_connection_distinguishes_from_generic_upstream() -> No
 
 
 def test_cli_md_describes_surfacing_observability_columns() -> None:
-    """docs/cli.md's ``stm_surfacing_stats`` row in the observability
-    tools table must mention the Phase 1 axes (skip / outcome / cache)
+    """docs/cli.md's ``surfacing_stats`` row in the ``stm_admin`` actions
+    table must mention the Phase 1 axes (skip / outcome / cache)
     in addition to the legacy event/feedback summary.
 
     The MCP tool keeps its name and arguments shape across v0.1.18 →
@@ -717,18 +717,18 @@ def test_cli_md_describes_surfacing_observability_columns() -> None:
     pre-#256 wording is silent drift — the tool is still listed, the
     arg is still ``tool?``, but the new axes are invisible to anyone
     not reading CHANGELOG. Scope the assertion to the row that names
-    `stm_surfacing_stats` to avoid false-passing on prose elsewhere
+    `surfacing_stats` to avoid false-passing on prose elsewhere
     in the file.
     """
     cli_md = _read("docs/cli.md")
     # Markdown table rows are single-line. Match the row that names
-    # ``stm_surfacing_stats`` in a backtick to avoid hitting prose
-    # references that happen to mention the tool.
-    row_match = re.search(r"^\|\s*`stm_surfacing_stats`\s*\|.*$", cli_md, re.MULTILINE)
+    # ``surfacing_stats`` in a backtick to avoid hitting prose
+    # references that happen to mention the action.
+    row_match = re.search(r"^\|\s*`surfacing_stats`\s*\|.*$", cli_md, re.MULTILINE)
     if not row_match:
         pytest.fail(
-            "docs/cli.md no longer has a `stm_surfacing_stats` row in "
-            "the observability tools table — the table was restructured "
+            "docs/cli.md no longer has a `surfacing_stats` row in "
+            "the stm_admin actions table — the table was restructured "
             "or the tool was renamed. Update this test alongside the "
             "docs change."
         )
@@ -740,7 +740,7 @@ def test_cli_md_describes_surfacing_observability_columns() -> None:
     missing_axes = [a for a in required_axes if a not in row]
     if missing_axes:
         pytest.fail(
-            f"docs/cli.md `stm_surfacing_stats` row is missing Phase 1 "
+            f"docs/cli.md `surfacing_stats` row is missing Phase 1 "
             f"axis keyword(s): {missing_axes!r}. The row description "
             "must surface skip reasons / outcomes / cache hit ratio "
             "alongside the legacy event/feedback summary so operators "
@@ -1338,7 +1338,7 @@ def test_public_tool_counts_match_runtime_registration_sets() -> None:
     from memtomem_stm.server import _OBSERVABILITY_TOOL_NAMES
 
     operations = _read("docs/guides/operations.md")
-    assert "eight observability and admin tools" in operations
+    assert "eight observability and admin actions" in operations
     assert "nine operator tools" not in operations
     assert "ten operator tools" not in operations
 

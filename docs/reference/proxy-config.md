@@ -165,8 +165,8 @@ cap discarded. The default call returns a description page; choose
 16,384-byte whole-MCP-result budget and can be continued using `next_offset`
 and `generation`, so there is no source-length cut. See
 [full tool metadata](mcp-tools.md#full-tool-metadata) for arguments and schema
-reassembly. The tool is always advertised, including when observability tools
-are hidden. An uncut description with an unchanged schema needs no hint.
+reassembly. The tool is always advertised, including when `stm_admin` is
+hidden. An uncut description with an unchanged schema needs no hint.
 
 The compression hint is reserved first, the recovery hint second, then the
 remaining budget goes to source text. Neither hint is shortened. At tiny budgets
@@ -214,7 +214,7 @@ limit. It reads the config file, so it describes what the next start would
 advertise rather than what a running proxy holds; it does not measure any cap
 the client's host applies afterwards.
 
-`stm_proxy_stats` and `stm_proxy_health` report counts, and the `mms` commands
+The `proxy_stats` and `proxy_health` actions of `stm_admin` report counts, and the `mms` commands
 report configuration and health — tool names among it, but never the advertised
 description text (`mms doctor` reports lengths and counts only). To see exactly what a client receives, list tools from the
 client itself.

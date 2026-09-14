@@ -112,7 +112,7 @@ class TestMmsStats:
         assert result.exit_code == 0, result.output
         assert "Data   :" in result.output
         assert "on-disk stores only" in result.output
-        assert "stm_proxy_stats" in result.output
+        assert "stm_admin MCP tool (action proxy_stats)" in result.output
 
     def test_json_output_includes_data_source(self, runner, tmp_path, monkeypatch):
         set_home(monkeypatch, tmp_path)
@@ -123,7 +123,7 @@ class TestMmsStats:
         assert result.exit_code == 0, result.output
         data = json.loads(result.output)
         assert data["data_source"]
-        assert "stm_proxy_stats" in data["data_source"]
+        assert "stm_admin MCP tool (action proxy_stats)" in data["data_source"]
 
     def test_empty_state_renders_cleanly(self, runner, tmp_path, monkeypatch):
         set_home(monkeypatch, tmp_path)

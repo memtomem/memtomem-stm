@@ -189,11 +189,11 @@ data from constructing a new structural memory boundary. It cannot guarantee
 that arbitrary natural-language prose will never persuade a model, so surfaced
 memories must still be treated as reference data rather than instructions.
 
-Each result line shows a relevance bucket (`[weak]`, `[related]`, or `[strong]`) instead of the raw search score. Buckets are computed across the active `[min_score, 1.0]` range, so changing `min_score` also shifts the bucket boundaries. The tag is suppressed for results the core stamped with a known non-RRF `score_scale` (`bm25` / `dense` / `none` / `rerank`) — the `[min_score, 1.0]` band math only holds on the RRF scale, and e.g. rerank logits can be negative. Suppression keys on each result's own stamp, so cache hits render the same way the original miss did; unstamped results and unrecognized labels keep the bucket. Exact raw-score distributions remain available through `stm_surfacing_stats`.
+Each result line shows a relevance bucket (`[weak]`, `[related]`, or `[strong]`) instead of the raw search score. Buckets are computed across the active `[min_score, 1.0]` range, so changing `min_score` also shifts the bucket boundaries. The tag is suppressed for results the core stamped with a known non-RRF `score_scale` (`bm25` / `dense` / `none` / `rerank`) — the `[min_score, 1.0]` band math only holds on the RRF scale, and e.g. rerank logits can be negative. Suppression keys on each result's own stamp, so cache hits render the same way the original miss did; unstamped results and unrecognized labels keep the bucket. Exact raw-score distributions remain available through `stm_admin(action="surfacing_stats")`.
 
 Each bullet also carries its memory's id as a backticked token (e.g. `` `a1b2c3d4e5f6a7b8` ``). Pass it as a `memory_id` in the batched `stm_surfacing_feedback(ratings=[...])` call to rate individual memories — `not_relevant` / `already_known` then invalidate exactly those memories on the next cache hit. Under the default `result_format="structured"` this id is the real LTM `chunk_id`, carried end to end, so `helpful` boosts reach the underlying chunk. Under `result_format="compact"` (legacy fallback, auto-selected when the core doesn't advertise structured support) the id is a content-derived surrogate (`sha256(content)[:16]`): it drives STM-side cache invalidation but not the LTM `increment_access` boost, and two memories with identical content collide on one id. Compact also renders scores rounded to two decimals, which collapses the RRF score distribution onto the two values above `min_score` (`0.02` and `0.03`) — the reason structured is the default (#560). It also erases the single-leg/two-leg distinction the default `min_score` is drawn on: a single-leg `0.0164` arrives as `0.02` and passes (#875).
 
-The injection mode is configurable: `append` (default), `prepend`, or `section`. `prepend` is skipped on the progressive-delivery path because it would shift character offsets and break `stm_proxy_read_more` — the skip is counted as `progressive_mode_conflict` in `stm_surfacing_stats`.
+The injection mode is configurable: `append` (default), `prepend`, or `section`. `prepend` is skipped on the progressive-delivery path because it would shift character offsets and break `stm_proxy_read_more` — the skip is counted as `progressive_mode_conflict` in `stm_admin(action="surfacing_stats")`.
 
 ## Surfacing Controls
 
@@ -210,7 +210,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `timeout_seconds` | `3.0` | Surfacing timeout (falls back to original response). Bounds the LTM round trip only: the waits a call makes on the shared feedback-store worker have their own budget, derived from the store's SQLite lock timeout rather than from this one (#996), so tightening this does not turn a neighbour writing `stm_feedback.db` into a surfacing failure. First-call latency includes the LTM child spawn + embedding-model load (~9s with ONNX `bge-m3`); on timeout the in-flight start is abandoned to finish warming in the background, so a later call meets a warm session (#664). With `warmup_enabled` (default) the child already starts warming at startup, so the first call usually fits this budget. Raise via `MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS` (surfacing config is env-only) if warm-up is disabled and first-call injection matters more than latency. |
 | `cooldown_seconds` | `5.0` | Skip duplicate queries (Jaccard > 0.95) within this window |
 | `max_surfacings_per_minute` | `15` | Global rate limit |
-| `injection_mode` | `append` | Where to inject: `prepend`, `append`, `section`. `prepend` is skipped on the progressive-delivery path (would break `stm_proxy_read_more` offsets) — counted as `progressive_mode_conflict` in `stm_surfacing_stats`. |
+| `injection_mode` | `append` | Where to inject: `prepend`, `append`, `section`. `prepend` is skipped on the progressive-delivery path (would break `stm_proxy_read_more` offsets) — counted as `progressive_mode_conflict` in `stm_admin(action="surfacing_stats")`. |
 | `section_header` | `## Relevant Memories` | Header text for injected section |
 | `default_namespace` | `null` | Restrict search to a specific namespace |
 | `exclude_tools` | `[]` | fnmatch patterns to never surface, matched against **both** the bare tool name and `server__tool` — so a server-qualified glob like `["context7__*"]` disables a whole upstream (e.g. `["*debug*", "langfuse-docs__*"]`). See [Scoping surfacing per upstream](#scoping-surfacing-per-upstream). |
@@ -219,8 +219,8 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `include_session_context` | `true` | Include working memory (scratch) items |
 | `dedup_ttl_seconds` | `604800` (7d) | Cross-session dedup window; `0` to disable |
 | `query_retention_days` | `30` | Days to keep the raw extracted query text in `surfacing_events.query` before the opportunistic cleanup nulls it out; `0` to disable (column keeps whatever `record_surfacing` wrote, indefinitely). This knob only clears the column — the event row itself is deleted by `stats_retention_days` (below), not here. |
-| `stats_retention_days` | `90` | Days to keep the `surfacing_events` row itself (and its `surfacing_feedback`) before the cleanup **deletes** it; `0` to disable (rows kept indefinitely — the pre-#584 behavior). Unlike `query_retention_days` (which only nulls the query column, keeping the row for aggregates), this bounds the table so `stm_surfacing_stats` cannot full-scan an ever-growing history. Runs both opportunistically from `surface()` and once at startup, so a stats read right after a restart still sees a bounded table. Keep it `>= query_retention_days` if you want the nulled-query rows to survive for aggregates before deletion. |
-| `persist_query_text` | `true` | When `false`, `FeedbackStore` stores `sha256:<16-hex>` instead of the raw extracted query in `surfacing_events.query`. The in-process surfacing call (relevance cooldown, formatter, MCP search) keeps the raw text — this knob only governs what gets persisted to disk. `stm_surfacing_stats` renders the hash verbatim and prints a one-line legend so the substitution is visible. |
+| `stats_retention_days` | `90` | Days to keep the `surfacing_events` row itself (and its `surfacing_feedback`) before the cleanup **deletes** it; `0` to disable (rows kept indefinitely — the pre-#584 behavior). Unlike `query_retention_days` (which only nulls the query column, keeping the row for aggregates), this bounds the table so the `surfacing_stats` action cannot full-scan an ever-growing history. Runs both opportunistically from `surface()` and once at startup, so a stats read right after a restart still sees a bounded table. Keep it `>= query_retention_days` if you want the nulled-query rows to survive for aggregates before deletion. |
+| `persist_query_text` | `true` | When `false`, `FeedbackStore` stores `sha256:<16-hex>` instead of the raw extracted query in `surfacing_events.query`. The in-process surfacing call (relevance cooldown, formatter, MCP search) keeps the raw text — this knob only governs what gets persisted to disk. The `surfacing_stats` action renders the hash verbatim and prints a one-line legend so the substitution is visible. |
 | `context_window_size` | `0` | Expand ±N adjacent chunks around search hits; `0` to disable |
 | `result_content_max_chars` | `500` | Max chars retained per LTM result before the formatter sees it |
 | `preview_max_chars` | `300` | Max chars per result preview in the injected memory block |
@@ -320,7 +320,7 @@ When an upstream is disabled this way the skip happens *before* the LTM search
 (saving the round-trip) and is enforced in `ProxyManager` — not the
 `RelevanceGate` — because the engine is built once at startup from the top-level
 `SurfacingConfig` and never sees per-upstream config. It is counted as
-`upstream_disabled` (a healthy skip) in `stm_surfacing_stats`.
+`upstream_disabled` (a healthy skip) in `stm_admin(action="surfacing_stats")`.
 
 Reach for the env glob for cross-server / tool-grained scope or quick
 experiments; reach for `surfacing_enabled` to durably opt one upstream out —
@@ -333,7 +333,7 @@ should never become an LTM query.
 `min_response_chars` (default `5000`) gates surfacing on the **size of the
 upstream tool response**: when a response is shorter than this, surfacing is
 skipped before any LTM work and the call is recorded as `response_too_short`
-in `stm_surfacing_stats`. The rationale is that very short responses rarely
+in `stm_admin(action="surfacing_stats")`. The rationale is that very short responses rarely
 carry enough context for `ContextExtractor` to synthesize a useful query, so
 surfacing on them would spend an LTM round-trip (and a `max_surfacings_per_minute`
 / `cooldown_seconds` slot) to inject memories that are often noise relative to
@@ -551,11 +551,11 @@ the same event cannot demote a memory by themselves.
 
 ### Query text lifecycle in `stm_feedback.db`
 
-Every successful surfacing call writes one `surfacing_events` row containing the extracted query — typically file paths, the first sentence of a description argument, or an explicit `_context_query` from the agent. On the proxy path the text is verbatim; hook/daemon-path rows carry `server='builtin'` and a `sha256:` digest instead (the daemon forces `persist_query_text=false`, so a Bash command carrying secrets never persists raw). The text is kept so `stm_surfacing_stats` can render the most recent queries when an operator investigates skip-reason imbalances, and so per-tool query previews remain available for triage.
+Every successful surfacing call writes one `surfacing_events` row containing the extracted query — typically file paths, the first sentence of a description argument, or an explicit `_context_query` from the agent. On the proxy path the text is verbatim; hook/daemon-path rows carry `server='builtin'` and a `sha256:` digest instead (the daemon forces `persist_query_text=false`, so a Bash command carrying secrets never persists raw). The text is kept so the `surfacing_stats` action can render the most recent queries when an operator investigates skip-reason imbalances, and so per-tool query previews remain available for triage.
 
-To keep the per-user DB from accumulating raw query text indefinitely, the opportunistic cleanup loop (one pass per hour from `SurfacingEngine.surface()`) clears the `query` column on rows older than `query_retention_days` (default `30`). The row itself is preserved so `SELECT COUNT(*)` aggregates in `stm_surfacing_stats` stay accurate; only the user-derived text is dropped. Set `query_retention_days=0` to disable the sweep entirely, or lower it for tighter retention. The DB path is `~/.memtomem/stm_feedback.db` by default; you can also delete the file manually to clear all history.
+To keep the per-user DB from accumulating raw query text indefinitely, the opportunistic cleanup loop (one pass per hour from `SurfacingEngine.surface()`) clears the `query` column on rows older than `query_retention_days` (default `30`). The row itself is preserved so `SELECT COUNT(*)` aggregates in the `surfacing_stats` action stay accurate; only the user-derived text is dropped. Set `query_retention_days=0` to disable the sweep entirely, or lower it for tighter retention. The DB path is `~/.memtomem/stm_feedback.db` by default; you can also delete the file manually to clear all history.
 
-A second knob, `stats_retention_days` (default `90`), bounds the table itself: the same cleanup loop **deletes** `surfacing_events` rows (and their `surfacing_feedback`) older than the window, rather than just nulling the query column. Without it the table is append-only and `stm_surfacing_stats` — which reads `get_stats` directly — would eventually full-scan an ever-growing history on the event loop. Because that stats tool can be called before the first `surface()` fires after a restart, the deletion also runs once at engine startup, so the first read always sees a bounded table. Set `stats_retention_days=0` to keep every row indefinitely (the pre-#584 behavior); keep it `>= query_retention_days` if you want rows to survive with nulled queries for aggregates before they are deleted. The `created_at` column is indexed so both the delete and the stats scan stay cheap.
+A second knob, `stats_retention_days` (default `90`), bounds the table itself: the same cleanup loop **deletes** `surfacing_events` rows (and their `surfacing_feedback`) older than the window, rather than just nulling the query column. Without it the table is append-only and the `surfacing_stats` action — which reads `get_stats` directly — would eventually full-scan an ever-growing history on the event loop. Because that stats tool can be called before the first `surface()` fires after a restart, the deletion also runs once at engine startup, so the first read always sees a bounded table. Set `stats_retention_days=0` to keep every row indefinitely (the pre-#584 behavior); keep it `>= query_retention_days` if you want rows to survive with nulled queries for aggregates before they are deleted. The `created_at` column is indexed so both the delete and the stats scan stay cheap.
 
 ## Feedback & Auto-Tuning
 
@@ -649,7 +649,7 @@ Requires `auto_tune_min_samples` (default 20) feedback entries before adjusting.
 
 **Search boost from feedback**: when you rate memories as "helpful", their `access_count` is incremented in the core search index (once per surfacing event, capped at `max_boost=1.5`). This creates a positive feedback loop where useful memories rank higher in future searches.
 
-Check effectiveness with `stm_surfacing_stats`:
+Check effectiveness with `stm_admin(action="surfacing_stats")`:
 
 ```
 Surfacing Stats
@@ -787,7 +787,7 @@ hit:
   present, or `scale_gated_min_score=false` — then STM warns on the
   **first** below-threshold observation (no five-call streak, the
   threshold is drawn on the RRF scale) and records a
-  `score_scale_mismatch` diagnostic on every such observation. `stm_surfacing_stats` shows the last
+  `score_scale_mismatch` diagnostic on every such observation. The `surfacing_stats` action shows the last
   core-reported scale as a `Score scale:` line (annotated when the filter
   is suspended), the reranker model ID when one is active, and each event
   row records its scale in `stm_feedback.db`. The compact format and the
