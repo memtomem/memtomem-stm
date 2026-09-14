@@ -1385,8 +1385,10 @@ async def stm_proxy_cache_clear(
     engine = app.surfacing_engine
 
     # Filtered: response cache only (surfacing has no server/tool dimension).
-    # Preserve the original proxy-only behavior and messages exactly.
-    if server or tool:
+    # Preserve the original proxy-only behavior and messages exactly. A filter is
+    # present when it is not None, the same test ``ResponseCache.clear`` applies:
+    # an empty string matches no rows, where truthiness made it clear everything.
+    if server is not None or tool is not None:
         if proxy_cache is None:
             return "Cache not enabled. Set proxy.cache.enabled = true in stm_proxy.json."
         removed = proxy_cache.clear(server=server, tool=tool)
@@ -1396,9 +1398,9 @@ async def stm_proxy_cache_clear(
         # failure one step further out (#781).
         shown_server = escape_lone_surrogates(server or "")
         shown_tool = escape_lone_surrogates(tool or "")
-        if server and tool:
+        if server is not None and tool is not None:
             return f"Cleared {removed} cache entries for {shown_server}/{shown_tool}."
-        elif server:
+        elif server is not None:
             return f"Cleared {removed} cache entries for server '{shown_server}'."
         else:
             return f"Cleared {removed} cache entries for tool '{shown_tool}'."

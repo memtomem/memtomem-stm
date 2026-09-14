@@ -427,7 +427,7 @@ class TestHealth:
         is itself gated, so it is unreachable in the flag-off state where the
         hint would apply; emitting it here would be dead + misleading. The hint
         lives on the always-available ``mms health`` CLI instead."""
-        monkeypatch.delenv("MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS", raising=False)
+        monkeypatch.setenv("MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS", "false")
         pm = _make_proxy_manager()
         ctx = _make_ctx(proxy_manager=pm)
         result = await stm_proxy_health(ctx=ctx)

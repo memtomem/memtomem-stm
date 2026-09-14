@@ -263,6 +263,31 @@ class TestDispatchReachesTheAction:
         engine.clear_cache.assert_called_once_with()
         assert "response-cache" in result and "surfacing-cache" in result
 
+    @pytest.mark.parametrize(
+        ("params", "label"),
+        [
+            ({"server": ""}, "server ''"),
+            ({"tool": ""}, "tool ''"),
+            ({"server": "", "tool": ""}, "/."),
+        ],
+    )
+    async def test_empty_filter_is_a_filter_not_a_clear_all(self, params, label):
+        """An empty string is a filter that matches nothing, not an absent filter.
+
+        ``stm_admin`` is advertised by default, so a model can send
+        ``{"server": ""}``. Treating that as unfiltered flushed every cache.
+        """
+        pm, cache = _pm_with_cache(cleared=0)
+        engine = MagicMock()
+        ctx = _make_ctx(proxy_manager=pm, surfacing_engine=engine)
+
+        result = await stm_admin("proxy_cache_clear", params, ctx=ctx)
+
+        cache.clear.assert_called_once_with(server=params.get("server"), tool=params.get("tool"))
+        engine.clear_cache.assert_not_called()
+        assert "Cleared all caches" not in result
+        assert label in result
+
 
 # ── validation parity with the SDK ───────────────────────────────────────
 

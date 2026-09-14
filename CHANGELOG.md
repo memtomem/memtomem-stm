@@ -43,7 +43,7 @@ changes inline only. See the deprecation policy in
   flag on, an eager-loading client paid for eight rarely called tool schemas on
   every request: 4,954 characters of description and schema. `stm_admin` costs
   720, so the flag-on surface drops from 13 tools and 10,640 characters to 6
-  tools and 6,422. The default five tools grow by 16 characters, because
+  tools and 6,422. The five model-facing tools grow by 16 characters, because
   `stm_compression_feedback` now points at the new action by name.
   `stm_admin(action="help")` lists the actions and their parameters, and
   `params={"action": "<name>"}` returns one action's full documentation.
@@ -63,13 +63,25 @@ changes inline only. See the deprecation policy in
   notes above.
 - **`stm_admin` is advertised by default** (#1034) — the dispatcher gives an agent
   in-session self-diagnosis (`proxy_health`, `surfacing_stats`, and the rest) for
-  one 720-character schema, so it no longer waits for an operator to opt in. Clients
-  that defer tool schemas, such as Claude Code, pay nothing either way.
+  one 720-character schema, so it no longer waits for an operator to opt in. A client
+  that loads tool schemas only on demand, such as Claude Code, pays nothing for it
+  until the tool is loaded.
   `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS` still turns it off: `false`, `0` and
   `no` hide it, and any other value, or none, advertises it.
   `STMConfig.advertise_observability_tools` now defaults to `True` to match. The
   registration itself reads the environment variable at import. **Behavior change**:
   see the upgrade notes above.
+
+### Fixed
+
+- **An empty `server` or `tool` filter no longer clears every cache** (#1034) —
+  `proxy_cache_clear` decided whether a filter was present by truthiness, so
+  `params={"server": ""}` ran the unfiltered path. That path flushes the whole response
+  cache and the in-memory surfacing results. The response cache's own `clear` already
+  treated `""` as a filter. The action now applies the same `is not None` test, so an
+  empty filter matches no rows and leaves the surfacing cache alone. The defect
+  predates this release. `stm_admin` being advertised by default is what put the call
+  within a model's reach. `"null"` still coerces to `None` and still means no filter.
 
 ## [0.5.1] — 2026-09-13
 
