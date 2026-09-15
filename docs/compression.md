@@ -228,11 +228,6 @@ Progressive is **opt-in only** — `auto` strategy never selects it because it c
 
 ## Progressive Fallback Ladder
 
-The minimum retained length is rounded up to a whole character. Plain-text truncation
-chooses sentence or word boundaries only when they meet that minimum; otherwise it
-uses the available character budget. A minor boundary shortfall therefore does not
-change the response into a multi-call delivery.
-
 When the compression ratio guard detects that a strategy cut below the dynamic retention floor (`min_result_retention`), it uses a three-tier fallback ladder:
 
 ```mermaid
@@ -259,6 +254,11 @@ flowchart TD
 **Tier 3 — Truncate (guaranteed floor)**: Falls back to boundary-aware `TruncateCompressor` at the effective budget. This is lossy but immediate, and always succeeds. Fires when progressive and hybrid aren't applicable or fail.
 
 The metrics `compression_strategy` field records the full transition path (e.g. `"hybrid→progressive_fallback"`, `"truncate→hybrid_fallback"`, or `"skeleton→truncate_fallback"`) so the three tiers can be audited independently via SQL.
+
+The minimum retained length is rounded up to a whole character. Plain-text truncation
+chooses sentence or word boundaries only when they meet that minimum; otherwise it
+uses the available character budget. A minor boundary shortfall therefore does not
+change the response into a multi-call delivery.
 
 ### Per-tool retention floor
 

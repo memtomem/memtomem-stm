@@ -213,7 +213,8 @@ class TruncateCompressor:
 
     ``min_chars`` limits boundary adjustment only for plain-text cuts.
     Structural and tail-anomaly paths may return less; minimum retention
-    is enforced at the pipeline level (ProxyManager / BenchHarness).
+    is enforced by ProxyManager's pipeline guard. BenchHarness raises the
+    budget using its own floor but does not implement that fallback guard.
     The compressor trusts the max_chars budget it receives.
     """
 
