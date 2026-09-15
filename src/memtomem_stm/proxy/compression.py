@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import math
@@ -12,7 +13,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, Self, cast
 
 if TYPE_CHECKING:
     from memtomem_stm.proxy.pending_store import PendingStore
@@ -194,7 +195,19 @@ def _scores_or_none(
     return scores
 
 
-class TruncateCompressor:
+class _PlainTextRetention:
+    """Per-call retention for plain-text cuts, not structural compression."""
+
+    _min_chars: int
+
+    def with_min_chars(self, minimum: int) -> Self:
+        """Return a shallow copy with a raised floor, preserving scorer and settings."""
+        compressor = copy.copy(self)
+        compressor._min_chars = max(self._min_chars, minimum)
+        return compressor
+
+
+class TruncateCompressor(_PlainTextRetention):
     """Character limit with sentence/word boundary awareness.
 
     For text with markdown headings, prefers to cut at heading boundaries
@@ -1795,7 +1808,7 @@ class FieldExtractCompressor:
         return text[: max_chars - len(suffix)] + suffix
 
 
-class SchemaPruningCompressor:
+class SchemaPruningCompressor(_PlainTextRetention):
     """JSON schema-preserving pruner — keeps ALL keys, limits values.
 
     Strategy: recursively walk JSON tree, preserving the full key structure.
@@ -1823,7 +1836,10 @@ class SchemaPruningCompressor:
         max_string: int = 80,
         max_array_items: int = 3,
         scorer: RelevanceScorer | None = None,
+        *,
+        min_chars: int = 0,
     ) -> None:
+        self._min_chars = min_chars
         self._max_string = max_string
         self._max_array = max_array_items
         self._scorer = scorer or BM25Scorer()
@@ -1834,7 +1850,7 @@ class SchemaPruningCompressor:
         try:
             data = _mm_json_loads(text)
         except (json.JSONDecodeError, ValueError):
-            return TruncateCompressor(scorer=self._scorer).compress(
+            return TruncateCompressor(scorer=self._scorer, min_chars=self._min_chars).compress(
                 text, max_chars=max_chars, context_query=context_query
             )
 
@@ -2073,7 +2089,7 @@ class SchemaPruningCompressor:
         return "null"
 
 
-class SkeletonCompressor:
+class SkeletonCompressor(_PlainTextRetention):
     """Markdown skeleton — preserves ALL headings + structural lines.
 
     For documents with many parallel sections (API docs, changelogs),
@@ -2092,7 +2108,8 @@ class SkeletonCompressor:
 
     _HEADING_RE = re.compile(r"^(#{1,6}\s.+)$", re.MULTILINE)
 
-    def __init__(self, scorer: RelevanceScorer | None = None) -> None:
+    def __init__(self, scorer: RelevanceScorer | None = None, *, min_chars: int = 0) -> None:
+        self._min_chars = min_chars
         self._scorer = scorer or BM25Scorer()
 
     def compress(self, text: str, *, max_chars: int, context_query: str | None = None) -> str:
@@ -2109,7 +2126,7 @@ class SkeletonCompressor:
 
         headings = list(self._HEADING_RE.finditer(text))
         if len(headings) < 2:
-            return TruncateCompressor(scorer=self._scorer).compress(
+            return TruncateCompressor(scorer=self._scorer, min_chars=self._min_chars).compress(
                 text, max_chars=max_chars, context_query=context_query
             )
 

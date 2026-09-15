@@ -4152,7 +4152,7 @@ class ProxyManager:
             scorer = self._relevance_scorer_for(cfg_snap)
             return (
                 await self._compress_maybe_offthread(
-                    SchemaPruningCompressor(scorer=scorer),
+                    SchemaPruningCompressor(scorer=scorer, min_chars=min_chars),
                     text,
                     max_chars=max_chars,
                     context_query=context_query,
@@ -4165,7 +4165,7 @@ class ProxyManager:
             scorer = self._relevance_scorer_for(cfg_snap)
             return (
                 await self._compress_maybe_offthread(
-                    SkeletonCompressor(scorer=scorer),
+                    SkeletonCompressor(scorer=scorer, min_chars=min_chars),
                     text,
                     max_chars=max_chars,
                     context_query=context_query,

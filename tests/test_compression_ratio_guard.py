@@ -1251,6 +1251,8 @@ class TestGetToolProfiles:
     [
         (CompressionStrategy.AUTO, "truncate"),
         (CompressionStrategy.TRUNCATE, "truncate"),
+        (CompressionStrategy.SKELETON, "skeleton"),
+        (CompressionStrategy.SCHEMA_PRUNING, "schema_pruning"),
         (CompressionStrategy.LLM_SUMMARY, "llm_summary→no_config_fallback"),
     ],
 )

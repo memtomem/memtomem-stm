@@ -5,7 +5,11 @@ import math
 import pytest
 
 from memtomem_stm.proxy.cleaning import DefaultContentCleaner
-from memtomem_stm.proxy.compression import TruncateCompressor
+from memtomem_stm.proxy.compression import (
+    SchemaPruningCompressor,
+    SkeletonCompressor,
+    TruncateCompressor,
+)
 from memtomem_stm.proxy.config import CleaningConfig
 
 from bench.harness import BenchHarness, BenchTask
@@ -14,9 +18,12 @@ from bench.harness import BenchHarness, BenchTask
 @pytest.mark.parametrize(
     "text", ["word " * 6000, "This sentence has useful context. " * 1000, "x" * 30001]
 )
+@pytest.mark.parametrize(
+    "compressor_type", [TruncateCompressor, SchemaPruningCompressor, SkeletonCompressor]
+)
 @pytest.mark.parametrize("mode", ["plain", "query", "surfacing"])
-async def test_benchmark_retention_boundaries(text, mode):
-    compressor = TruncateCompressor()
+async def test_benchmark_retention_boundaries(text, mode, compressor_type):
+    compressor = compressor_type()
     harness = BenchHarness(
         cleaner=DefaultContentCleaner(CleaningConfig(enabled=False)),
         compressor=compressor,

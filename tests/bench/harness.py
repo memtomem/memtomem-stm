@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import math
 import re
 import time as _time
@@ -331,9 +330,8 @@ class BenchHarness:
     @staticmethod
     def _with_retention(compressor: Compressor, minimum: int) -> Compressor:
         """Apply a per-call floor without mutating a shared truncate instance."""
-        if isinstance(compressor, TruncateCompressor):
-            compressor = copy.copy(compressor)
-            compressor._min_chars = max(compressor._min_chars, minimum)
+        if isinstance(compressor, (TruncateCompressor, SchemaPruningCompressor, SkeletonCompressor)):
+            compressor = compressor.with_min_chars(minimum)
         return compressor
 
     def _run_pipeline(

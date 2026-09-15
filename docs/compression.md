@@ -255,7 +255,8 @@ flowchart TD
 
 The metrics `compression_strategy` field records the full transition path (e.g. `"hybrid→progressive_fallback"`, `"truncate→hybrid_fallback"`, or `"skeleton→truncate_fallback"`) so the three tiers can be audited independently via SQL.
 
-The minimum retained length is rounded up to a whole character. Plain-text truncation
+In the proxy pipeline, the minimum retained length is rounded up to a whole character.
+Plain-text truncation (including schema-pruning and skeleton fallbacks)
 chooses sentence or word boundaries only when they meet that minimum; otherwise it
 uses the available character budget. A minor boundary shortfall therefore does not
 change the response into a multi-call delivery.
