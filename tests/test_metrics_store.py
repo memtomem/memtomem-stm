@@ -1800,3 +1800,50 @@ class TestBusyTimeoutReachesTuning:
             store.close()
 
         assert calls == [{}], "a store with no budget of its own must take the shared default"
+
+
+def test_summary_reports_accounting_provenance_without_rewriting_history(tmp_path):
+    from memtomem_stm.proxy.metrics_store import read_compression_summary
+
+    path = tmp_path / "metrics.db"
+    store = MetricsStore(path)
+    store.initialize()
+    try:
+        store.record(
+            CallMetrics(
+                server="s",
+                tool="t",
+                original_chars=10000,
+                compressed_chars=10000,
+                compression_strategy="progressive",
+            )
+        )
+        store.record(
+            CallMetrics(
+                server="s",
+                tool="t",
+                original_chars=10000,
+                compressed_chars=4000,
+                compression_strategy="progressive",
+                compression_accounting="initial_response_v1",
+            )
+        )
+        store.record(
+            CallMetrics(
+                server="builtin",
+                tool="Bash",
+                original_chars=100,
+                compressed_chars=100,
+                source="hook",
+            )
+        )
+        summary = read_compression_summary(path)
+        assert summary["initial_response_calls"] == 1
+        assert summary["unclassified_mcp_calls"] == 1
+        assert summary["total_compressed_chars"] == 14100
+        hooks = read_compression_summary(path, source="hook")
+        assert hooks["unclassified_mcp_calls"] == 0
+        assert hooks["initial_response_calls"] == 0
+        assert read_compression_summary(path, tool="missing")["unclassified_mcp_calls"] == 0
+    finally:
+        store.close()

@@ -5,8 +5,8 @@ refactor (PR1 → PR4b) must preserve byte-for-byte. They intentionally target t
 ORCHESTRATION seams the refactor touches, which the per-stage unit tests do not
 exercise end-to-end:
 
-- **R1**  ``compressed_chars`` is ``len(compressed)`` on the compress branch but
-  ``len(cleaned)`` on the progressive branch (the two branches disagree by design).
+- **R1**  ``compressed_chars`` is the initial ``len(compressed)`` on both
+  branches (the former dual basis was corrected by #1039).
 - **R3**  the cache stores the PRE-surfacing ``compressed`` — not ``cleaned`` and
   not ``surfaced``.
 - **R5**  the cache key uses the unmutated ``cache_args`` (no ``_trace_id``).
@@ -24,8 +24,8 @@ exercise end-to-end:
   receives the unmutated ``cache_args``.
 - ``scorer_fallback`` reflects a relevance-scorer fallback during compression.
 
-This module must stay GREEN UNCHANGED through PR1-PR4b — that invariant is the
-behavior-preservation proof of the refactor.
+These contracts originally protected PR1-PR4b from behavior changes. Subsequent
+intentional fixes are identified alongside their amended assertions.
 """
 
 from __future__ import annotations
@@ -135,7 +135,7 @@ def _row_count(store: MetricsStore) -> int:
 
 
 @pytest.mark.asyncio
-class TestCompressedCharsDualValue:
+class TestCompressedCharsInitialResponse:
     async def test_compress_branch_records_len_of_returned_compressed(self, make_mgr):
         mgr, store, _ = make_mgr(
             compression=CompressionStrategy.TRUNCATE,
@@ -150,7 +150,7 @@ class TestCompressedCharsDualValue:
         assert row["compressed_chars"] == len(result)  # metric == len(compressed)
         assert row["compressed_chars"] < row["cleaned_chars"]
 
-    async def test_progressive_branch_records_cleaned_length(self, make_mgr):
+    async def test_progressive_branch_records_initial_response_length(self, make_mgr):
         mgr, store, _ = make_mgr(
             compression=CompressionStrategy.PROGRESSIVE,
             progressive=ProgressiveConfig(chunk_size=500),
@@ -165,7 +165,7 @@ class TestCompressedCharsDualValue:
         row = _latest(store, "compressed_chars", "cleaned_chars", "compression_strategy")
         assert row["compression_strategy"] == "progressive"
         assert row["cleaned_chars"] == len(text)
-        assert row["compressed_chars"] == len(text)  # zero-loss → len(cleaned)
+        assert row["compressed_chars"] == len(result) < len(text)
 
 
 # ── R3 / R5: cache stores pre-surfacing compressed, keyed on cache_args ───
@@ -264,7 +264,9 @@ class TestArgsRouting:
             auto_index=AutoIndexConfig(enabled=True, background=False, min_chars=1),
             extraction=ExtractionConfig(enabled=True, background=False, min_response_chars=1),
         )
-        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result("some upstream text body")
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result(
+            "some upstream text body"
+        )
 
         captured: dict = {}
 

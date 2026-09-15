@@ -438,3 +438,23 @@ Model names are prefix-matched against the runtime registry, so a dated name
 such as `claude-sonnet-4-20250514` can match its base entry. The proxy-level
 `consumer_model` propagates to surfacing only when surfacing has no explicit
 consumer model of its own.
+
+
+## Measuring progressive delivery
+
+New MCP compression rows measure the initial response text, including compression
+footers but before surfacing, for both explicit `progressive` and progressive
+fallback. This is an initial-delivery reduction, not a full-interaction saving.
+`mms stats` excludes follow-up reads and reports unclassified legacy MCP rows:
+older explicit progressive rows counted the entire stored response, whereas
+fallback rows counted the first chunk. These historical values are not rewritten
+or silently treated as measurements made on the new basis.
+
+Use `stm_admin(action="progressive_stats")` for recorded initial and follow-up
+payload volumes. Repeated or overlapping reads count again, including a follow-up
+at offset zero. These volumes exclude footers and surfaced text; they cannot be
+added directly to initial-response totals as a full wire-size measurement.
+Legacy read events without an explicit creation/follow-up marker are reported as
+unclassified. Tracking is best-effort: disabled tracking, failed writes, expiry,
+and retention purges can leave gaps. Missing telemetry does not prove zero use,
+and the observed volumes do not establish end-to-end token or cost savings.

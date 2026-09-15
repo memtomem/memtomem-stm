@@ -28,6 +28,9 @@ class TestProgressiveReadsStore:
         try:
             stats = store.get_stats()
             assert stats == {
+                "initial_payload_chars": 0,
+                "follow_up_payload_chars": 0,
+                "unclassified_reads": 0,
                 "total_reads": 0,
                 "total_responses": 0,
                 "follow_up_rate": 0.0,
@@ -366,3 +369,60 @@ class TestProgressiveReadsTracker:
             assert (tmp_path / "pr_expand.db").exists()
         finally:
             tracker.close()
+
+
+@pytest.mark.parametrize(
+    "follow_ups", [[], [(4000, 6000)], [(0, 4000), (4000, 6000), (4000, 6000)]]
+)
+def test_delivery_volume_counts_repeated_reads(tmp_path, follow_ups):
+    tracker = ProgressiveReadsTracker(tmp_path / "reads.db", retention_days=0)
+    try:
+        tracker.record_initial(
+            key="k", trace_id=None, server="s", tool="t", initial_chars=4000, total_chars=10000
+        )
+        for offset, chars in follow_ups:
+            tracker.record_follow_up(
+                key="k",
+                trace_id=None,
+                server="s",
+                tool="t",
+                offset=offset,
+                chars=chars,
+                total_chars=10000,
+            )
+        stats = tracker.get_stats("t")
+        assert stats["initial_payload_chars"] == 4000
+        assert stats["follow_up_payload_chars"] == sum(chars for _, chars in follow_ups)
+        assert stats["unclassified_reads"] == 0
+        # Legacy/third-party writers cannot be classified by offset alone.
+        tracker.store.record("old", None, "s", "t", 0, 123, 123, 10000)
+        stats = tracker.get_stats("t")
+        assert stats["unclassified_reads"] == 1
+        assert stats["initial_payload_chars"] == 4000
+        assert stats["follow_up_payload_chars"] == sum(chars for _, chars in follow_ups)
+    finally:
+        tracker.close()
+
+
+def test_read_kind_migration_preserves_unknown_legacy_rows(tmp_path):
+    import sqlite3
+    from memtomem_stm.proxy.progressive_reads_store import _SCHEMA
+
+    path = tmp_path / "legacy.db"
+    with sqlite3.connect(path) as db:
+        db.executescript(_SCHEMA)
+        db.execute(
+            "INSERT INTO progressive_reads "
+            "(key, server, tool, offset, chars, served_to, total_chars, created_at) "
+            "VALUES ('old', 's', 't', 0, 4000, 4000, 10000, 0)"
+        )
+    for _ in range(2):
+        store = ProgressiveReadsStore(path, retention_days=0)
+        store.initialize()
+        try:
+            stats = store.get_stats()
+            assert stats["unclassified_reads"] == 1
+            assert stats["initial_payload_chars"] == 0
+            assert stats["follow_up_payload_chars"] == 0
+        finally:
+            store.close()

@@ -78,6 +78,13 @@ class ProgressiveReadsStore:
             ensure_private_db_files(self._db_path)
             tune_connection(db)
             db.executescript(_SCHEMA)
+            # Serialize inspection + migration across concurrently starting MCPs.
+            db.execute("BEGIN IMMEDIATE")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(progressive_reads)")}
+            if "is_initial" not in columns:
+                db.execute(
+                    "ALTER TABLE progressive_reads ADD COLUMN is_initial INTEGER DEFAULT NULL"
+                )
             # Startup purge of aged-out rows (#584) — the table is append-only
             # and otherwise unbounded. Runs once per process start, mirroring
             # ProxyCache's startup expiry purge. ``retention_days=0`` disables.
@@ -113,6 +120,8 @@ class ProgressiveReadsStore:
         chars: int,
         served_to: int,
         total_chars: int,
+        *,
+        is_initial: bool | None = None,
     ) -> None:
         """Persist one read event.
 
@@ -144,8 +153,8 @@ class ProgressiveReadsStore:
             self._db.execute(
                 "INSERT INTO progressive_reads "
                 "(key, trace_id, server, tool, offset, chars, served_to, "
-                "total_chars, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "total_chars, created_at, is_initial) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     key,
                     trace_id,
@@ -156,6 +165,7 @@ class ProgressiveReadsStore:
                     served_to,
                     total_chars,
                     time.time(),
+                    None if is_initial is None else int(is_initial),
                 ),
             )
             self._db.commit()
@@ -182,6 +192,9 @@ class ProgressiveReadsStore:
         same as a 0-follow-up response.
         """
         empty = {
+            "initial_payload_chars": 0,
+            "follow_up_payload_chars": 0,
+            "unclassified_reads": 0,
             "total_reads": 0,
             "total_responses": 0,
             "follow_up_rate": 0.0,
@@ -208,6 +221,16 @@ class ProgressiveReadsStore:
         ).fetchone()[0]
         if total_reads == 0:
             return empty
+
+        # Sum deliveries, not max offsets: repeated/overlapping reads consume
+        # context again. Old rows cannot identify creation vs offset=0 rereads.
+        delivery = self._db.execute(
+            "SELECT COALESCE(SUM(CASE WHEN is_initial = 1 THEN chars ELSE 0 END), 0), "
+            "COALESCE(SUM(CASE WHEN is_initial = 0 THEN chars ELSE 0 END), 0), "
+            "SUM(CASE WHEN is_initial IS NULL THEN 1 ELSE 0 END) "
+            f"FROM progressive_reads {where}",
+            params,
+        ).fetchone()
 
         # Per-key aggregate: last served_to (= cumulative coverage),
         # total_chars, tool, and row count per key.
@@ -247,6 +270,9 @@ class ProgressiveReadsStore:
                 }
 
         return {
+            "initial_payload_chars": delivery[0],
+            "follow_up_payload_chars": delivery[1],
+            "unclassified_reads": delivery[2],
             "total_reads": total_reads,
             "total_responses": total_responses,
             "follow_up_rate": follow_up_rate,

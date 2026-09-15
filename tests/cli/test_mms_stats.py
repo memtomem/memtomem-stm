@@ -304,3 +304,16 @@ class TestMmsStats:
         assert data["config_status"] == "missing"
         assert data["enabled"] is True
         assert data["servers"] == 1
+
+
+def test_stats_explains_initial_delivery_and_unknown_legacy_accounting(
+    runner, tmp_path, monkeypatch
+):
+    set_home(monkeypatch, tmp_path)
+    _seed_metrics(tmp_path)
+    result = runner.invoke(cli, ["stats", "--source", "mcp"])
+    assert result.exit_code == 0, result.output
+    assert "follow-up reads are excluded" in result.output
+    assert "unclassified/legacy accounting" in result.output
+    data = json.loads(runner.invoke(cli, ["stats", "--source", "mcp", "--json"]).output)
+    assert data["compression"]["unclassified_mcp_calls"] == 2

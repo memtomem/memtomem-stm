@@ -6194,7 +6194,7 @@ class ProxyManager:
 
         Returns a ``CompressionResult`` carrying both ``compressed`` (pre-surfacing,
         the cache payload) and ``surfaced`` (post-surfacing, the return/index
-        input), the branch-dependent ``compressed_chars_for_metrics``, the
+        input), the initial-response ``compressed_chars_for_metrics``, the
         fully-mutated ``metrics_strategy`` label, and the surfacing outcome. The
         scorer-fallback delta is computed by the caller (it brackets this call plus
         the later index/extract stages), so it is intentionally not a field here.
@@ -6274,7 +6274,7 @@ class ProxyManager:
                     compressed = cleaned
                     progressive_passthrough_on_error = True
             _compress_ms = 0.0
-            compressed_chars_for_metrics = len(cleaned)
+            compressed_chars_for_metrics = len(compressed)
             # The metrics record at the bottom reads ``metrics_strategy`` on
             # every path; mirror the assignment at the top of the compression
             # branch (pre-fix this branch left it unbound and every
@@ -7566,7 +7566,7 @@ class ProxyManager:
         # from the same estimator so the recorded decision and the counts
         # reconcile. Keyed on the gate having RUN (not on the mode alone):
         # mode without a token budget, and the PROGRESSIVE branch with its
-        # deliberate ``len(cleaned)`` accounting basis, keep the static path.
+        # static estimation mode, keep the static path.
         # On the gated (non-progressive) branch ``comp.compressed`` is exactly
         # the text whose length static mode measures.
         if comp.unicode_token_gate:
@@ -7591,6 +7591,7 @@ class ProxyManager:
                 surface_ms=_surface_ms,
                 surfaced_chars=len(surfaced),
                 compression_strategy=metrics_strategy,
+                compression_accounting="initial_response_v1",
                 strategy_auto_selected=comp.strategy_auto_selected,
                 ratio_violation=ratio_violation,
                 scorer_fallback=getattr(_scorer, "fallback_count", 0) > _pre_scorer_fb,

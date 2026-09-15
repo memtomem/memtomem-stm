@@ -70,6 +70,9 @@ _BASE_COLUMNS = frozenset(
 # migration runs — adding an entry here cannot get out of sync with the
 # fingerprint, so there is no version number to forget to bump.
 _MIGRATIONS: dict[str, str] = {
+    "compression_accounting": (
+        "ALTER TABLE proxy_metrics ADD COLUMN compression_accounting TEXT DEFAULT NULL"
+    ),
     "is_error": "ALTER TABLE proxy_metrics ADD COLUMN is_error INTEGER NOT NULL DEFAULT 0",
     "error_category": "ALTER TABLE proxy_metrics ADD COLUMN error_category TEXT DEFAULT NULL",
     "error_code": "ALTER TABLE proxy_metrics ADD COLUMN error_code INTEGER DEFAULT NULL",
@@ -213,6 +216,9 @@ def read_compression_summary(
         "schema_outdated": False,
         "total_calls": 0,
         "error_count": 0,
+        "initial_response_calls": 0,
+        "unclassified_mcp_calls": 0,
+        "measurement": "initial text before surfacing; excludes follow-up reads",
         "total_original_chars": 0,
         "total_compressed_chars": 0,
         "saved_chars": 0,
@@ -230,6 +236,8 @@ def read_compression_summary(
         return summary
 
     try:
+        # Provenance counts and size totals describe one read-only snapshot.
+        db.execute("BEGIN")
         cols = {row[1] for row in db.execute("PRAGMA table_info(proxy_metrics)")}
         if "original_chars" not in cols:
             # Missing file would have returned above; an empty column set here
@@ -275,6 +283,22 @@ def read_compression_summary(
             conditions.append("source = ?")
             params.append(source)
         where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+        # Old progressive writers used incompatible bases. Preserve their
+        # values, but expose unknown provenance rather than relabelling them.
+        mcp_predicate = "source = 'mcp'" if has_source else "1"
+        known = (
+            "compression_accounting = 'initial_response_v1'"
+            if "compression_accounting" in cols
+            else "0"
+        )
+        basis = db.execute(
+            f"SELECT SUM(CASE WHEN {mcp_predicate} AND {known} THEN 1 ELSE 0 END), "
+            f"SUM(CASE WHEN {mcp_predicate} AND NOT COALESCE(({known}), 0) "
+            f"THEN 1 ELSE 0 END) FROM proxy_metrics{where}",
+            params,
+        ).fetchone()
+        summary["initial_response_calls"] = basis[0] or 0
+        summary["unclassified_mcp_calls"] = basis[1] or 0
         rows = db.execute(
             "SELECT server, tool, COUNT(*), SUM(original_chars), "
             f"SUM(compressed_chars), {error_expr} "
@@ -550,6 +574,7 @@ class MetricsStore:
         require_utf8_identifier(metrics.trace_id, "trace_id")
         require_utf8_identifier(metrics.compression_strategy, "compression_strategy")
         require_utf8_identifier(metrics.source, "source")
+        require_utf8_identifier(metrics.compression_accounting, "compression_accounting")
         now = time.time()
         with self._lock:
             cursor = self._db.execute(
@@ -560,8 +585,8 @@ class MetricsStore:
                 "ratio_violation, scorer_fallback, "
                 "index_ok, index_error, chunks_indexed, "
                 "extract_ok, extract_error, "
-                "surfacing_on_progressive_ok, surface_error, source, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "surfacing_on_progressive_ok, surface_error, source, created_at, compression_accounting) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     metrics.server,
                     metrics.tool,
@@ -602,6 +627,7 @@ class MetricsStore:
                     ),
                     metrics.source,
                     now,
+                    metrics.compression_accounting,
                 ),
             )
             # One transaction for the insert and the trim it may trigger. If the

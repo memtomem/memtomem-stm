@@ -1279,3 +1279,28 @@ async def test_truncation_boundary_does_not_trigger_progressive(
         assert "stm_proxy_read_more" not in result
     finally:
         store.close()
+
+
+async def test_progressive_paths_measure_the_same_initial_response(tmp_path):
+    import json
+
+    text = json.dumps([{"id": i, "body": "alpha beta gamma " * 20} for i in range(60)])
+    lengths = []
+    for strategy in (CompressionStrategy.PROGRESSIVE, CompressionStrategy.AUTO):
+        directory = tmp_path / strategy.value
+        directory.mkdir()
+        mgr, store = _make_manager_with_store(
+            directory, compression=strategy, max_result_chars=1000
+        )
+        mgr._connections["srv"].session.call_tool.return_value = _make_result(text)
+        try:
+            result = await mgr.call_tool("srv", "tool", {})
+            row = _latest_row(store)
+            assert "stm_proxy_read_more" in result
+            assert row["compressed_chars"] == len(result) < len(text)
+            basis = store._db.execute("SELECT compression_accounting FROM proxy_metrics").fetchone()
+            assert basis == ("initial_response_v1",)
+            lengths.append(row["compressed_chars"])
+        finally:
+            store.close()
+    assert lengths[0] == lengths[1]
