@@ -1636,7 +1636,7 @@ class TestProgressiveStats:
             "avg_chars_served": 7200.0,
             "initial_payload_chars": 4000,
             "follow_up_payload_chars": 3200,
-            "unclassified_reads": 0,
+            "unclassified_reads": 2,
             "avg_total_chars": 9500.0,
             "avg_coverage": 0.76,
             "by_tool": {
@@ -1652,6 +1652,12 @@ class TestProgressiveStats:
         assert "Total responses: 5" in result
         assert "Follow-up rate: 40.0%" in result
         assert "Avg coverage: 76.0%" in result
+        # The delivery volumes and their caveats are advertised output (#1039).
+        assert "Recorded initial payload chars: 4000" in result
+        assert "Recorded follow-up payload chars: 3200" in result
+        assert "Unclassified legacy read events: 2" in result
+        assert "count repeated reads again" in result
+        assert "absent events do not establish zero delivery" in result
         assert "By tool:" in result
         assert "docfix:get_doc" in result
         assert "responses=3" in result
