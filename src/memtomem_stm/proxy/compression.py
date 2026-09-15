@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import math
@@ -12,7 +13,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, Self, cast
 
 if TYPE_CHECKING:
     from memtomem_stm.proxy.pending_store import PendingStore
@@ -194,7 +195,19 @@ def _scores_or_none(
     return scores
 
 
-class TruncateCompressor:
+class _PlainTextRetention:
+    """Per-call retention for plain-text cuts, not structural compression."""
+
+    _min_chars: int
+
+    def with_min_chars(self, minimum: int) -> Self:
+        """Return a shallow copy with a raised floor, preserving scorer and settings."""
+        compressor = copy.copy(self)
+        compressor._min_chars = max(self._min_chars, minimum)
+        return compressor
+
+
+class TruncateCompressor(_PlainTextRetention):
     """Character limit with sentence/word boundary awareness.
 
     For text with markdown headings, prefers to cut at heading boundaries
@@ -211,15 +224,18 @@ class TruncateCompressor:
         Input:  "First sentence. Second sentence explains more. Third sentence adds context."
         Output: "First sentence. Second sentence explains more.\\n... (truncated, original: 76 chars)"
 
-    Note: minimum retention is enforced at the pipeline level
-    (ProxyManager / BenchHarness), not in the compressor. The compressor
-    trusts the max_chars budget it receives.
+    ``min_chars`` limits boundary adjustment only for plain-text cuts.
+    Structural and tail-anomaly paths may return less; minimum retention
+    is enforced by ProxyManager's pipeline guard. BenchHarness raises the
+    budget using its own floor but does not implement that fallback guard.
+    The compressor trusts the max_chars budget it receives.
     """
 
     _HEADING_RE = re.compile(r"(?:^|\n)(#{1,6}\s+.+)")
 
-    def __init__(self, scorer: RelevanceScorer | None = None) -> None:
+    def __init__(self, scorer: RelevanceScorer | None = None, *, min_chars: int = 0) -> None:
         self._scorer = scorer or BM25Scorer()
+        self._min_chars = min_chars
 
     # Patterns for code structure boundaries (function/class/method definitions)
     _CODE_BOUNDARY_RE = re.compile(
@@ -282,7 +298,11 @@ class TruncateCompressor:
         suffix = f"\n... (truncated, original: {len(text)} chars){summary}"
         if len(suffix) >= max_chars:
             suffix = "…"
-        break_at = self._find_break(text, max(1, max_chars - len(suffix)))
+        break_at = self._find_break(
+            text,
+            max(1, max_chars - len(suffix)),
+            min_chars=max(0, self._min_chars - len(suffix)),
+        )
         result = text[:break_at] + suffix
         return result if len(result) <= max_chars else result[:max_chars]
 
@@ -781,11 +801,15 @@ class TruncateCompressor:
         return self._fit_with_footer(body, footer, max_chars)
 
     @staticmethod
-    def _find_break(text: str, max_chars: int) -> int:
+    def _find_break(text: str, max_chars: int, *, min_chars: int = 0) -> int:
         if max_chars <= 0:
             return 0
         end = min(max_chars, len(text) - 1)
-        floor = max(1, int(max_chars * 0.8))
+        # A sentence/word boundary is a preference, not permission to discard
+        # the pipeline's minimum retained length. With no boundary in the
+        # permitted interval, use the full budget instead of triggering a
+        # different delivery protocol for a few missing characters (#1038).
+        floor = max(1, int(max_chars * 0.8), min_chars)
         for i in range(end, floor - 1, -1):
             if i >= 1 and text[i - 1] in ".!?\n。！？" and (i >= len(text) or text[i] in " \n\t"):
                 return i
@@ -1784,7 +1808,7 @@ class FieldExtractCompressor:
         return text[: max_chars - len(suffix)] + suffix
 
 
-class SchemaPruningCompressor:
+class SchemaPruningCompressor(_PlainTextRetention):
     """JSON schema-preserving pruner — keeps ALL keys, limits values.
 
     Strategy: recursively walk JSON tree, preserving the full key structure.
@@ -1812,7 +1836,10 @@ class SchemaPruningCompressor:
         max_string: int = 80,
         max_array_items: int = 3,
         scorer: RelevanceScorer | None = None,
+        *,
+        min_chars: int = 0,
     ) -> None:
+        self._min_chars = min_chars
         self._max_string = max_string
         self._max_array = max_array_items
         self._scorer = scorer or BM25Scorer()
@@ -1823,7 +1850,7 @@ class SchemaPruningCompressor:
         try:
             data = _mm_json_loads(text)
         except (json.JSONDecodeError, ValueError):
-            return TruncateCompressor(scorer=self._scorer).compress(
+            return TruncateCompressor(scorer=self._scorer, min_chars=self._min_chars).compress(
                 text, max_chars=max_chars, context_query=context_query
             )
 
@@ -2062,7 +2089,7 @@ class SchemaPruningCompressor:
         return "null"
 
 
-class SkeletonCompressor:
+class SkeletonCompressor(_PlainTextRetention):
     """Markdown skeleton — preserves ALL headings + structural lines.
 
     For documents with many parallel sections (API docs, changelogs),
@@ -2081,7 +2108,8 @@ class SkeletonCompressor:
 
     _HEADING_RE = re.compile(r"^(#{1,6}\s.+)$", re.MULTILINE)
 
-    def __init__(self, scorer: RelevanceScorer | None = None) -> None:
+    def __init__(self, scorer: RelevanceScorer | None = None, *, min_chars: int = 0) -> None:
+        self._min_chars = min_chars
         self._scorer = scorer or BM25Scorer()
 
     def compress(self, text: str, *, max_chars: int, context_query: str | None = None) -> str:
@@ -2098,7 +2126,7 @@ class SkeletonCompressor:
 
         headings = list(self._HEADING_RE.finditer(text))
         if len(headings) < 2:
-            return TruncateCompressor(scorer=self._scorer).compress(
+            return TruncateCompressor(scorer=self._scorer, min_chars=self._min_chars).compress(
                 text, max_chars=max_chars, context_query=context_query
             )
 

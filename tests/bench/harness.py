@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import time as _time
 from dataclasses import dataclass, field
@@ -309,9 +310,12 @@ class BenchHarness:
 
     @staticmethod
     def _apply_retention(cleaned_len: int, budget: int) -> int:
-        """Enforce dynamic minimum retention — single source of truth.
+        """Raise the budget to the benchmark's integer retention minimum.
 
-        Mirrors ProxyManager logic so bench results match production behavior.
+        Uses production rounding with the benchmark's historical 0.5 base
+        floor, rather than ProxyConfig's configurable (default 0.65) floor.
+        Structural compressors may still return less; this harness does not
+        implement ProxyManager's progressive fallback ladder.
         """
         if cleaned_len < 1000:
             min_r = 0.9
@@ -321,7 +325,14 @@ class BenchHarness:
             min_r = 0.65
         else:
             min_r = 0.5
-        return max(budget, int(cleaned_len * min_r))
+        return max(budget, math.ceil(cleaned_len * min_r))
+
+    @staticmethod
+    def _with_retention(compressor: Compressor, minimum: int) -> Compressor:
+        """Apply a per-call floor without mutating a shared truncate instance."""
+        if isinstance(compressor, (TruncateCompressor, SchemaPruningCompressor, SkeletonCompressor)):
+            compressor = compressor.with_min_chars(minimum)
+        return compressor
 
     def _run_pipeline(
         self,
@@ -341,8 +352,10 @@ class BenchHarness:
             cleaned = self._cleaner.clean(task.content)
             clean_ms = (_time.monotonic() - t0) * 1000
 
-            # Enforce retention at harness level (matches ProxyManager behavior)
+            # Keep the minimum separate from a possibly larger requested budget.
+            minimum = self._apply_retention(len(cleaned), 0)
             budget = self._apply_retention(len(cleaned), budget)
+            comp = self._with_retention(comp, minimum)
 
             t0 = _time.monotonic()
             # Forward context_query to the query-aware compressors (truncate,
@@ -407,9 +420,12 @@ class BenchHarness:
             clean_ms = (_time.monotonic() - t0) * 1000
 
             effective_budget = self._apply_retention(len(cleaned), task.max_chars)
+            comp = self._with_retention(
+                self._compressor, self._apply_retention(len(cleaned), 0)
+            )
 
             t0 = _time.monotonic()
-            compressed = self._compressor.compress(cleaned, max_chars=effective_budget)
+            compressed = comp.compress(cleaned, max_chars=effective_budget)
             compress_ms = (_time.monotonic() - t0) * 1000
 
             surfaced = compressed

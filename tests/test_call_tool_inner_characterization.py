@@ -326,8 +326,11 @@ class TestSurfacingHelperSelection:
             progressive=ProgressiveConfig(chunk_size=500),
         )
         mgr._connections["srv"].session.call_tool.return_value = fake_tool_result(
-            "content paragraph. " * 800  # ~15k → truncate to 500 violates the floor
+            "content paragraph. " * 800  # enough content for progressive delivery
         )
+        # Exercise a materially undersized result, not the boundary-rounding
+        # shortfall corrected by #1038; this test owns surfacing routing.
+        mgr._apply_compression = AsyncMock(return_value=("short output", None))
         plain, prog = self._spy_both(mgr)
         await mgr.call_tool("srv", "tool", {})
         row = _latest(store, "compression_strategy")
