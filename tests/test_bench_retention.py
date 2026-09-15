@@ -16,7 +16,9 @@ from bench.harness import BenchHarness, BenchTask
 
 
 @pytest.mark.parametrize(
-    "text", ["word " * 6000, "This sentence has useful context. " * 1000, "x" * 30001]
+    "text",
+    ["word " * 6000, "This sentence has useful context. " * 1000, "x" * 30001],
+    ids=["word-boundary", "sentence-boundary", "fractional-floor"],
 )
 @pytest.mark.parametrize(
     "compressor_type", [TruncateCompressor, SchemaPruningCompressor, SkeletonCompressor]
