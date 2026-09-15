@@ -848,3 +848,18 @@ sequenceDiagram
 | `streamable_http` | `url`, `headers` | HTTP streamable responses |
 
 `headers` values (e.g. `Authorization`) are stored in the config file in plaintext — the file is chmod `0600` best-effort, but treat it as secret-bearing. CLI `--json` surfaces (`mms list` / `status` / `add`) mask the values, keys preserved. Register headers with `mms add --header KEY=VALUE` (repeatable).
+
+
+### Explicit server character budgets
+
+An omitted server `max_result_chars` inherits the model-aware global budget.
+An explicit value, including `8000`, takes precedence over that global value.
+Tool character overrides and token-budget precedence still apply; the retention
+floor can raise the resulting budget to preserve content.
+
+The CLI's `mms add --max-chars` default and imported/generated server entries
+explicitly select `8000`. These now resolve to 8,000 characters as configured.
+Earlier versions incorrectly treated that exact value as omission, often using
+16,000 instead. To retain inheritance in an existing configuration, remove the
+server's `max_result_chars` field; to retain a fixed 16,000-character budget, set
+it explicitly. No configuration is automatically rewritten by this correction.

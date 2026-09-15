@@ -2601,7 +2601,7 @@ def effective_max_result_chars(
 
     Mirrors the strategy precedence above, for the other field a reader is
     likely to want: a token budget takes precedence over a char budget at the
-    same level, and a server that leaves ``max_result_chars`` at its default
+    same level, and a server that omits ``max_result_chars``
     defers to the model-aware global (``effective_max_result_chars()``) rather
     than to that literal default. The second element is the token budget when
     one is in force, so a caller can tell "1000 chars because 400 tokens" from
@@ -2631,7 +2631,6 @@ def effective_max_result_chars(
     response is compressed — but both still carry it into the response-cache
     fingerprint.
     """
-    default_server_max = UpstreamServerConfig.model_fields["max_result_chars"].default
     token_budget = cfg.max_result_tokens
     cpt = cfg.chars_per_token if cfg.chars_per_token is not None else proxy_cfg.chars_per_token
 
@@ -2655,7 +2654,7 @@ def effective_max_result_chars(
         # raw token budget still measures the response. ``mms tune`` reads
         # this same value.
         return max(1, tokens_to_chars(token_budget, cpt)), token_budget
-    if cfg.max_result_chars == default_server_max:
+    if "max_result_chars" not in cfg.model_fields_set:
         return proxy_cfg.effective_max_result_chars(), None
     return cfg.max_result_chars, None
 

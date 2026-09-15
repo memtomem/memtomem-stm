@@ -153,14 +153,13 @@ class TestSurfacingTierBudgets:
 class TestResolveToolConfigModelAware:
     def _make_manager(
         self,
-        server_max_chars: int = 8000,  # default
+        server_max_chars: int | None = None,  # omitted: inherit global
         consumer_model: str = "",
         context_budget_ratio: float = 0.05,
     ) -> ProxyManager:
-        server_cfg = UpstreamServerConfig(
-            prefix="test",
-            max_result_chars=server_max_chars,
-        )
+        server_cfg = UpstreamServerConfig(prefix="test")
+        if server_max_chars is not None:
+            server_cfg.max_result_chars = server_max_chars
         proxy_cfg = ProxyConfig(
             config_path=Path("/tmp/proxy.json"),
             upstream_servers={"srv": server_cfg},
@@ -178,7 +177,7 @@ class TestResolveToolConfigModelAware:
         return mgr
 
     def test_default_server_uses_model_budget(self):
-        """Server at default max_result_chars picks up model-aware budget."""
+        """A server omitting max_result_chars inherits the model-aware budget."""
         mgr = self._make_manager(consumer_model="gpt-4o", context_budget_ratio=0.05)
         tc = mgr._resolve_tool_config("srv", "any_tool")
         # gpt-4o: 128K * 0.05 * 3.5 = 22400, capped at 16000 (default_max_result_chars)

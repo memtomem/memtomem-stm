@@ -3844,7 +3844,7 @@ class ProxyManager:
         # #292/#924/#926: strategy and budget both resolve through the same
         # functions every other reader uses, so no two can drift apart. Token
         # budget takes precedence over char budget at each level; a server
-        # leaving ``max_result_chars`` at its default defers to the model-aware
+        # omitting ``max_result_chars`` defers to the model-aware
         # global.
         compression, hybrid_cfg = effective_compression_pair(cfg, override, config)
         max_chars, token_budget = effective_max_result_chars(cfg, override, config)
