@@ -1496,11 +1496,11 @@ class TestProgressiveDeliveryAccounting:
             assert budget_advice == []
         else:
             assert profile.avg_ratio == 1.0
-            # Known gap, deliberately out of scope for #1039: a single-chunk
-            # explicit progressive response still reads as "the budget always
-            # fits", so H2 advises shrinking a max_result_chars this path never
-            # consults. Pinned so the day it is fixed, this test says so.
-            assert [a.field for a in budget_advice] == ["max_result_chars"]
+            # The 1.00 ratio still reads as "the budget always fits", but the
+            # advice is gone: #1042 suppresses budget actions for a strategy
+            # that never consults ``max_result_chars``. The accounting gap
+            # #1039 pinned here is closed at the recommendation, not the ratio.
+            assert budget_advice == []
 
     async def test_cache_hit_adds_no_persisted_call_row(self, tmp_path):
         cache = ProxyCache(tmp_path / "cache.db", max_entries=100)

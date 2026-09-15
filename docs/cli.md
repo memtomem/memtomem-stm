@@ -683,7 +683,7 @@ Options:
   --json               Preview as JSON for scripting.
 ```
 
-Runs the same analysis as the `stm_admin` MCP tool's `tuning_recommendations` action against the on-disk metrics/feedback stores (no running server needed) and renders the per-tool `tool_overrides` diff it suggests — `max_result_chars` budget changes and `compression` strategy pins, with the reason and a confidence level per tool.
+Runs the same analysis as the `stm_admin` MCP tool's `tuning_recommendations` action against the on-disk metrics/feedback stores (no running server needed) and renders the per-tool `tool_overrides` diff it suggests — `max_result_chars` budget changes and `compression` strategy pins, with the reason and a confidence level per tool. Budget changes are suppressed where they would have no effect: a per-tool token budget outranks them, and the `none` and explicitly configured `progressive` strategies never read `max_result_chars` at all (#1042). Feedback-driven `compression` changes remain eligible for those tools; an AUTO pin is not, because a tool already pinned to `none` or `progressive` is not running AUTO.
 
 Three modes:
 

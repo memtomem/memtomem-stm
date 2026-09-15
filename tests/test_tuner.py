@@ -1046,3 +1046,91 @@ def test_mixed_history_averages_and_labels_only_classified_rows(metrics_store: M
     assert "over 12 classified of 25 calls" in rec.actions[0].reason
     assert rec.confidence == "medium"
     assert "(12 classified calls)" in format_recommendations([rec], [p], 24.0)
+
+
+@pytest.mark.parametrize("strategy", ["none", "progressive"])
+@pytest.mark.parametrize("level", ["global", "server", "tool"])
+@pytest.mark.parametrize("violation", [False, True])
+def test_budget_advice_requires_a_budget_using_strategy(metrics_store, strategy, level, violation):
+    srv = UpstreamServerConfig(prefix="s", max_result_chars=50000)
+    cfg = ProxyConfig(upstream_servers={"srv": srv})
+    if level == "global":
+        cfg.default_compression = CompressionStrategy(strategy)
+    elif level == "server":
+        srv.compression = CompressionStrategy(strategy)
+    else:
+        srv.tool_overrides = {"t": ToolOverrideConfig(compression=strategy)}
+    # These rows deliberately predate the current strategy; H1 and H2 would
+    # otherwise recommend changes from them regardless of current configuration.
+    _seed_metrics(
+        metrics_store,
+        "srv",
+        "t",
+        10,
+        original_chars=10000,
+        compressed_chars=1000 if violation else 10000,
+        strategy="truncate",
+        violation=violation,
+    )
+    actions = [a for r in CompressionTuner(metrics_store, config=cfg).analyze() for a in r.actions]
+    assert not any(a.field == "max_result_chars" for a in actions)
+
+
+@pytest.mark.parametrize("strategy", ["none", "progressive"])
+@pytest.mark.parametrize("feedback_kind", ["missing_example", "truncated"])
+def test_feedback_budget_advice_respects_current_strategy(
+    metrics_store, feedback_store, strategy, feedback_kind
+):
+    srv = UpstreamServerConfig(prefix="s", compression=strategy, max_result_chars=50000)
+    cfg = ProxyConfig(upstream_servers={"srv": srv})
+    _seed_metrics(metrics_store, "srv", "t", 10)
+    for _ in range(3):
+        feedback_store.record("srv", "t", feedback_kind, "details", None)
+    recs = CompressionTuner(metrics_store, feedback_store, config=cfg).analyze()
+    actions = [a for r in recs for a in r.actions]
+    assert not any(a.field == "max_result_chars" for a in actions)
+    # A strategy change still has an effect and must not be suppressed.
+    assert any(a.field == "compression" for a in actions) == (feedback_kind == "truncated")
+
+
+def test_current_budget_strategy_can_tune_after_old_passthrough_calls(metrics_store):
+    cfg = ProxyConfig(
+        upstream_servers={
+            "srv": UpstreamServerConfig(prefix="s", compression="truncate", max_result_chars=50000)
+        }
+    )
+    _seed_metrics(
+        metrics_store, "srv", "t", 10, original_chars=10000, compressed_chars=10000, strategy="none"
+    )
+    recs = CompressionTuner(metrics_store, config=cfg).analyze()
+    assert any(a.field == "max_result_chars" for r in recs for a in r.actions)
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        "truncate",
+        "extract_fields",
+        "schema_pruning",
+        "skeleton",
+        "llm_summary",
+        "selective",
+        "hybrid",
+        "auto",
+    ],
+)
+def test_budget_advice_survives_for_every_budget_reading_strategy(metrics_store, strategy):
+    """The suppression names two strategies; this pins the other eight.
+
+    A gate that suppressed unconditionally would pass every negative case
+    above, so the CHANGELOG's "every other strategy is unaffected" needs its
+    own assertions.
+    """
+    cfg = ProxyConfig(
+        upstream_servers={
+            "srv": UpstreamServerConfig(prefix="s", compression=strategy, max_result_chars=50000)
+        }
+    )
+    _seed_metrics(metrics_store, "srv", "t", 10, original_chars=10000, compressed_chars=10000)
+    actions = [a for r in CompressionTuner(metrics_store, config=cfg).analyze() for a in r.actions]
+    assert [a.field for a in actions] == ["max_result_chars"]

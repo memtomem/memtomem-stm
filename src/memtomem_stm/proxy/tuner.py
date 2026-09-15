@@ -213,9 +213,14 @@ class CompressionTuner:
         actions: list[TuningAction] = []
         evidence = p.call_count
         current_max, token_governed = self._current_budget(p.server, p.tool)
+        current_strategy = self._current_strategy(p.server, p.tool)
+        # These recommendations write a per-tool character budget. Neither
+        # passthrough nor explicit progressive delivery consumes it (#1042).
+        # Consult current configuration: the samples may predate a strategy edit.
+        budget_applies = not token_governed and current_strategy not in ("none", "progressive")
 
         # H1: High violation rate → increase budget
-        if p.violation_rate > VIOLATION_RATE_THRESHOLD and not token_governed:
+        if p.violation_rate > VIOLATION_RATE_THRESHOLD and budget_applies:
             recommended = max(
                 int(p.p95_original_chars * 0.8),
                 (current_max or 8000) + 2000,
@@ -238,7 +243,7 @@ class CompressionTuner:
             p.avg_ratio is not None
             and p.avg_ratio > OVER_GENEROUS_RATIO
             and p.violation_count == 0
-            and not token_governed
+            and budget_applies
         ):
             recommended = max(
                 int(p.p95_original_chars * 1.1),
@@ -311,7 +316,7 @@ class CompressionTuner:
             # to the same rule as H1/H2: a per-tool token budget outranks the
             # per-tool ``max_result_chars`` that ``--apply`` writes. Its
             # ``compression`` recommendation is unaffected.
-            if fb_action and not (token_governed and fb_action.field == "max_result_chars"):
+            if fb_action and (fb_action.field != "max_result_chars" or budget_applies):
                 actions.append(fb_action)
                 # Its reason reports the feedback count, and that is what it
                 # rests on: three reports against twenty-five calls are three
