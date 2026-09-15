@@ -211,9 +211,10 @@ class TruncateCompressor:
         Input:  "First sentence. Second sentence explains more. Third sentence adds context."
         Output: "First sentence. Second sentence explains more.\\n... (truncated, original: 76 chars)"
 
-    Note: minimum retention is enforced at the pipeline level
-    (ProxyManager / BenchHarness), not in the compressor. The compressor
-    trusts the max_chars budget it receives.
+    ``min_chars`` limits boundary adjustment only for plain-text cuts.
+    Structural and tail-anomaly paths may return less; minimum retention
+    is enforced at the pipeline level (ProxyManager / BenchHarness).
+    The compressor trusts the max_chars budget it receives.
     """
 
     _HEADING_RE = re.compile(r"(?:^|\n)(#{1,6}\s+.+)")

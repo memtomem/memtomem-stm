@@ -4121,7 +4121,7 @@ class ProxyManager:
             scorer = self._relevance_scorer_for(cfg_snap)
             return (
                 await self._compress_maybe_offthread(
-                    TruncateCompressor(scorer=scorer),
+                    TruncateCompressor(scorer=scorer, min_chars=min_chars),
                     text,
                     max_chars=max_chars,
                     context_query=context_query,

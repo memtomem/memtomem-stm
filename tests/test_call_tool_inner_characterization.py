@@ -264,9 +264,7 @@ class TestArgsRouting:
             auto_index=AutoIndexConfig(enabled=True, background=False, min_chars=1),
             extraction=ExtractionConfig(enabled=True, background=False, min_response_chars=1),
         )
-        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result(
-            "some upstream text body"
-        )
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result("some upstream text body")
 
         captured: dict = {}
 

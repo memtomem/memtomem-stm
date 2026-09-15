@@ -11,8 +11,8 @@ Covers:
 
 from __future__ import annotations
 
-import re
 import math
+import re
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -1246,13 +1246,22 @@ class TestGetToolProfiles:
         store.close()
 
 
-@pytest.mark.parametrize("compression", [CompressionStrategy.AUTO, CompressionStrategy.TRUNCATE])
+@pytest.mark.parametrize(
+    ("compression", "expected_strategy"),
+    [
+        (CompressionStrategy.AUTO, "truncate"),
+        (CompressionStrategy.TRUNCATE, "truncate"),
+        (CompressionStrategy.LLM_SUMMARY, "llm_summary→no_config_fallback"),
+    ],
+)
 @pytest.mark.parametrize(
     "text",
     ["word " * 6000, "This sentence has useful context. " * 1000, "x" * 30001],
     ids=["word-boundary", "sentence-boundary", "fractional-floor"],
 )
-async def test_truncation_boundary_does_not_trigger_progressive(tmp_path, compression, text):
+async def test_truncation_boundary_does_not_trigger_progressive(
+    tmp_path, compression, expected_strategy, text
+):
     """Real boundary cuts must honor retention without changing the read protocol (#1038)."""
     mgr, store = _make_manager_with_store(tmp_path, compression=compression, max_result_chars=1000)
     mgr._config.upstream_servers["srv"].cleaning = CleaningConfig(enabled=False)
@@ -1260,7 +1269,7 @@ async def test_truncation_boundary_does_not_trigger_progressive(tmp_path, compre
     try:
         result = await mgr.call_tool("srv", "tool", {})
         row = _latest_row(store)
-        assert row["compression_strategy"] == "truncate"
+        assert row["compression_strategy"] == expected_strategy
         assert row["ratio_violation"] == 0
         assert row["compressed_chars"] >= math.ceil(len(text) * 0.65)
         assert row["compressed_chars"] < len(text)
