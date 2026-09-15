@@ -300,8 +300,9 @@ class TestManagerStructuralForwardsQuery:
 
         captured: dict[str, object] = {}
 
-        def fake_factory(*, scorer=None):
+        def fake_factory(*, scorer=None, min_chars=0):
             captured["scorer"] = scorer
+            captured["min_chars"] = min_chars
 
             def compress(text, *, max_chars, context_query=None):
                 captured["context_query"] = context_query
@@ -322,9 +323,11 @@ class TestManagerStructuralForwardsQuery:
             "tool",
             context_query="orders total",
             cfg_snap=mgr._config,
+            min_chars=75,
         )
         assert out == "OUT"
         assert fallback is None
         assert captured["context_query"] == "orders total"
+        assert captured["min_chars"] == 75
         # The manager injects its own (hot-reload-aware) relevance scorer.
         assert captured["scorer"] is mgr._relevance_scorer
