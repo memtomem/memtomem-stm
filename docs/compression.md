@@ -228,6 +228,11 @@ Progressive is **opt-in only** — `auto` strategy never selects it because it c
 
 ## Progressive Fallback Ladder
 
+The minimum retained length is rounded up to a whole character. Plain-text truncation
+chooses sentence or word boundaries only when they meet that minimum; otherwise it
+uses the available character budget. A minor boundary shortfall therefore does not
+change the response into a multi-call delivery.
+
 When the compression ratio guard detects that a strategy cut below the dynamic retention floor (`min_result_retention`), it uses a three-tier fallback ladder:
 
 ```mermaid

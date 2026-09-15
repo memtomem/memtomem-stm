@@ -9,6 +9,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import sqlite3
 import threading
 import time as _time
@@ -3983,6 +3984,7 @@ class ProxyManager:
         tool: str,
         *,
         context_query: str | None = None,
+        min_chars: int = 0,
         cfg_snap: ProxyConfig,
     ) -> tuple[str, str | None]:
         """Return (compressed_text, llm_fallback_reason_or_None)."""
@@ -4001,6 +4003,7 @@ class ProxyManager:
                 server,
                 tool,
                 context_query=context_query,
+                min_chars=min_chars,
                 cfg_snap=cfg_snap,
             )
 
@@ -4131,7 +4134,7 @@ class ProxyManager:
             scorer = self._relevance_scorer_for(cfg_snap)
             return (
                 await self._compress_maybe_offthread(
-                    TruncateCompressor(scorer=scorer),
+                    TruncateCompressor(scorer=scorer, min_chars=min_chars),
                     text,
                     max_chars=max_chars,
                     context_query=context_query,
@@ -6325,6 +6328,7 @@ class ProxyManager:
                         int(len(cleaned) * tc.token_budget / estimated_tokens),
                     )
             min_retention = getattr(cfg_snap, "min_result_retention", 0.65)
+            min_budget = 0
             dynamic = 0.0  # effective retention floor applied to this call (0 = unset)
             if min_retention > 0:
                 n = len(cleaned)
@@ -6339,7 +6343,7 @@ class ProxyManager:
                     dynamic = max(min_retention, 0.65)
                 else:
                     dynamic = min_retention  # use config value for very large content
-                min_budget = int(n * dynamic)
+                min_budget = math.ceil(n * dynamic)
                 if effective_max_chars < min_budget:
                     effective_max_chars = min_budget
 
@@ -6371,6 +6375,7 @@ class ProxyManager:
                         server,
                         tool,
                         context_query=context_query,
+                        min_chars=min_budget,
                         cfg_snap=cfg_snap,
                     )
                 except sqlite3.Error:
@@ -6405,7 +6410,7 @@ class ProxyManager:
                     )
                     _fb_scorer = self._relevance_scorer_for(cfg_snap)
                     compressed = await self._compress_maybe_offthread(
-                        TruncateCompressor(scorer=_fb_scorer),
+                        TruncateCompressor(scorer=_fb_scorer, min_chars=min_budget),
                         cleaned,
                         max_chars=effective_max_chars,
                         context_query=context_query,
@@ -6537,7 +6542,7 @@ class ProxyManager:
                         if not progressive_fallback and not hybrid_fallback:
                             _fb_scorer = self._relevance_scorer_for(cfg_snap)
                             compressed = await self._compress_maybe_offthread(
-                                TruncateCompressor(scorer=_fb_scorer),
+                                TruncateCompressor(scorer=_fb_scorer, min_chars=min_budget),
                                 cleaned,
                                 max_chars=effective_max_chars,
                                 context_query=context_query,

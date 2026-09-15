@@ -218,8 +218,9 @@ class TruncateCompressor:
 
     _HEADING_RE = re.compile(r"(?:^|\n)(#{1,6}\s+.+)")
 
-    def __init__(self, scorer: RelevanceScorer | None = None) -> None:
+    def __init__(self, scorer: RelevanceScorer | None = None, *, min_chars: int = 0) -> None:
         self._scorer = scorer or BM25Scorer()
+        self._min_chars = min_chars
 
     # Patterns for code structure boundaries (function/class/method definitions)
     _CODE_BOUNDARY_RE = re.compile(
@@ -282,7 +283,11 @@ class TruncateCompressor:
         suffix = f"\n... (truncated, original: {len(text)} chars){summary}"
         if len(suffix) >= max_chars:
             suffix = "…"
-        break_at = self._find_break(text, max(1, max_chars - len(suffix)))
+        break_at = self._find_break(
+            text,
+            max(1, max_chars - len(suffix)),
+            min_chars=max(0, self._min_chars - len(suffix)),
+        )
         result = text[:break_at] + suffix
         return result if len(result) <= max_chars else result[:max_chars]
 
@@ -781,11 +786,15 @@ class TruncateCompressor:
         return self._fit_with_footer(body, footer, max_chars)
 
     @staticmethod
-    def _find_break(text: str, max_chars: int) -> int:
+    def _find_break(text: str, max_chars: int, *, min_chars: int = 0) -> int:
         if max_chars <= 0:
             return 0
         end = min(max_chars, len(text) - 1)
-        floor = max(1, int(max_chars * 0.8))
+        # A sentence/word boundary is a preference, not permission to discard
+        # the pipeline's minimum retained length. With no boundary in the
+        # permitted interval, use the full budget instead of triggering a
+        # different delivery protocol for a few missing characters (#1038).
+        floor = max(1, int(max_chars * 0.8), min_chars)
         for i in range(end, floor - 1, -1):
             if i >= 1 and text[i - 1] in ".!?\n。！？" and (i >= len(text) or text[i] in " \n\t"):
                 return i
