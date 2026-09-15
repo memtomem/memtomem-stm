@@ -2556,9 +2556,21 @@ def effective_compression(cfg: UpstreamServerConfig, proxy_cfg: ProxyConfig) -> 
     the proxy manager, the tuner and the CLI each held their own copy, and
     #924 was two of those copies disagreeing.
     """
-    if "compression" in cfg.model_fields_set:
+    if compression_source(cfg) == "server":
         return cfg.compression
     return proxy_cfg.default_compression
+
+
+def compression_source(cfg: UpstreamServerConfig) -> Literal["server", "global"]:
+    """Which level decides a server's strategy: its own field or the global default.
+
+    The predicate ``effective_compression`` resolves with, exposed for readers
+    that report where a strategy came from (``mms list --json``, #1043) so they
+    cannot drift from the resolver. ``server`` means the field was supplied at
+    the server level, by the file or by an environment variable addressing that
+    server; ``global`` means it was omitted and ``default_compression`` applies.
+    """
+    return "server" if "compression" in cfg.model_fields_set else "global"
 
 
 def effective_compression_pair(

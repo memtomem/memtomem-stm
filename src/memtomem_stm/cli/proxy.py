@@ -1987,7 +1987,35 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
     # var can make a malformed subtree irrelevant — validating the file
     # alone would warn here while `status` and `health` stay silent on the
     # very same config.
-    config_error = _runtime_schema_validation_error(data)
+    from memtomem_stm.proxy.config import (
+        ProxyConfig,
+        _deep_merge,
+        collect_proxy_env_overrides,
+        compression_source,
+        effective_compression_pair,
+    )
+
+    # Validate and describe one captured input set, including the environment.
+    # Keep the existing raw/redacted JSON map for configuration-file consumers.
+    effective_data = _deep_merge(data, collect_proxy_env_overrides().fragment)
+    config_error = _schema_validation_error(effective_data)
+    compression_info: dict[str, Any] = {}
+    if config_error is None:
+        typed_config = ProxyConfig.model_validate(effective_data)
+        for name in servers:
+            server = typed_config.upstream_servers.get(name)
+            if server is None:
+                continue
+            strategy, _ = effective_compression_pair(server, None, typed_config)
+            compression_info[name] = {
+                "strategy": strategy.value,
+                "source": compression_source(server),
+                "tool_overrides": {
+                    tool: effective_compression_pair(server, override, typed_config)[0].value
+                    for tool, override in server.tool_overrides.items()
+                    if override.compression is not None
+                },
+            }
 
     if as_json:
         click.echo(
@@ -1997,6 +2025,7 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
                     "config_valid": config_error is None,
                     "config_error": config_error,
                     "servers": _redacted_servers_json(servers),
+                    "effective_compression": compression_info,
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -2033,7 +2062,7 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
     for name, cfg in servers.items():
         transport = cfg.get("transport", "stdio")
         prefix = cfg.get("prefix", "")
-        compression = cfg.get("compression", "auto")
+        compression = compression_info.get(name, {}).get("strategy", "unknown")
         surfacing = "on" if cfg.get("surfacing_enabled", True) else "off"
         origin_cell = _origin_cell(cfg)
         any_pruned = any_pruned or origin_cell.endswith("*")
@@ -2052,6 +2081,16 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
             f"{_disp(compression):<12} {surfacing:<10} {_disp(origin_cell):<16} {_disp(detail)}"
         )
     click.echo(f"\n{len(servers)} server(s) configured.")
+    click.echo("COMPRESSION shows the resolved server default; tool overrides may differ.")
+    for name, info in compression_info.items():
+        for tool, strategy in info["tool_overrides"].items():
+            # JSON-quoted so a "/" inside either name cannot make two pairs render
+            # identically ("a/b"/"c" vs "a"/"b/c"). The surrogate-safe writer
+            # escapes lone surrogates; _disp covers what JSON leaves literal
+            # (bidi controls).
+            server_q = _disp(_json_dumps(name, ensure_ascii=False))
+            tool_q = _disp(_json_dumps(tool, ensure_ascii=False))
+            click.echo(f"  {server_q}/{tool_q}: {_disp(strategy)} (tool override)")
     if any_pruned:
         click.echo("* host original pruned — `mms eject NAME` restores it (see `mms eject -h`).")
 
