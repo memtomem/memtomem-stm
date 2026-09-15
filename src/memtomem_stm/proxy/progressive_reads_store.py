@@ -176,6 +176,9 @@ class ProgressiveReadsStore:
         Shape::
 
             {
+                "initial_payload_chars": int,    # content chars, creation events
+                "follow_up_payload_chars": int,  # content chars, follow-up reads
+                "unclassified_reads": int,   # legacy rows without is_initial
                 "total_reads": int,          # row count
                 "total_responses": int,      # DISTINCT keys
                 "follow_up_rate": float,     # keys w/ >1 row / total_responses
@@ -216,34 +219,25 @@ class ProgressiveReadsStore:
             where = "WHERE tool = ?"
             params = (tool,)
 
-        total_reads = self._db.execute(
-            f"SELECT COUNT(*) FROM progressive_reads {where}", params
-        ).fetchone()[0]
-        if total_reads == 0:
-            return empty
-
-        # Sum deliveries, not max offsets: repeated/overlapping reads consume
-        # context again. Old rows cannot identify creation vs offset=0 rereads.
-        delivery = self._db.execute(
-            "SELECT COALESCE(SUM(CASE WHEN is_initial = 1 THEN chars ELSE 0 END), 0), "
+        # One statement, so every figure below describes the same snapshot even
+        # while another process appends rows. Payload volumes sum deliveries,
+        # not max offsets: repeated/overlapping reads consume context again.
+        # Rows written before ``is_initial`` existed cannot tell creation from
+        # an offset-0 reread, so they are counted apart as unclassified.
+        per_key_rows = self._db.execute(
+            "SELECT key, MAX(served_to), MAX(total_chars), tool, COUNT(*), "
+            "COALESCE(SUM(CASE WHEN is_initial = 1 THEN chars ELSE 0 END), 0), "
             "COALESCE(SUM(CASE WHEN is_initial = 0 THEN chars ELSE 0 END), 0), "
             "SUM(CASE WHEN is_initial IS NULL THEN 1 ELSE 0 END) "
-            f"FROM progressive_reads {where}",
-            params,
-        ).fetchone()
-
-        # Per-key aggregate: last served_to (= cumulative coverage),
-        # total_chars, tool, and row count per key.
-        per_key_rows = self._db.execute(
-            "SELECT key, MAX(served_to), MAX(total_chars), tool, COUNT(*) "
             f"FROM progressive_reads {where} GROUP BY key",
             params,
         ).fetchall()
         total_responses = len(per_key_rows)
         if total_responses == 0:
             return empty
+        total_reads = sum(r[4] for r in per_key_rows)
 
-        followed_up = sum(1 for _, _, _, _, n in per_key_rows if n > 1)
+        followed_up = sum(1 for r in per_key_rows if r[4] > 1)
         follow_up_rate = followed_up / total_responses
         avg_chars_served = sum(r[1] for r in per_key_rows) / total_responses
         avg_total_chars = sum(r[2] for r in per_key_rows) / total_responses
@@ -259,7 +253,7 @@ class ProgressiveReadsStore:
         if tool is None:
             # Re-group per-key rows by tool for the breakdown.
             tool_buckets: dict[str, list[int]] = {}
-            for _, _, _, tool_name, n in per_key_rows:
+            for _, _, _, tool_name, n, *_ in per_key_rows:
                 tool_buckets.setdefault(tool_name, []).append(n)
             for tool_name, counts in tool_buckets.items():
                 responses = len(counts)
@@ -270,9 +264,9 @@ class ProgressiveReadsStore:
                 }
 
         return {
-            "initial_payload_chars": delivery[0],
-            "follow_up_payload_chars": delivery[1],
-            "unclassified_reads": delivery[2],
+            "initial_payload_chars": sum(r[5] for r in per_key_rows),
+            "follow_up_payload_chars": sum(r[6] for r in per_key_rows),
+            "unclassified_reads": sum(r[7] for r in per_key_rows),
             "total_reads": total_reads,
             "total_responses": total_responses,
             "follow_up_rate": follow_up_rate,

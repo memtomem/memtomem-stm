@@ -70,8 +70,8 @@ class CompressionResult:
     the cache stores the former while the agent and the index footer see the
     latter. ``compressed_chars_for_metrics`` is ``len(compressed)`` on every
     branch: the first returned text, including compression metadata but before
-    surfacing. Follow-up reads have separate telemetry. ``metrics_strategy`` is the fully-mutated label
-    (e.g. ``"truncate→progressive_fallback"``). ``progressive_passthrough_on_error``
+    surfacing. Follow-up reads have separate telemetry. ``metrics_strategy`` is
+    the fully-mutated label (e.g. ``"truncate→progressive_fallback"``). ``progressive_passthrough_on_error``
     gates the cache store: a transient progressive-store-failure passthrough must
     not be cached.
     """

@@ -68,7 +68,8 @@ class ToolProfile:
     auto_dominant_strategy_count: int = 0
     auto_strategy_count: int = 0
     ratio_count: int = 0
-    """Calls ``avg_ratio`` is averaged over — non-error, non-empty-cleaned."""
+    """Calls ``avg_ratio`` is averaged over — non-error, non-empty-cleaned, and
+    recorded on the ``initial_response_v1`` accounting basis (#1039)."""
     feedback_count: int = 0
     feedback_dominant_kind: str | None = None
 
@@ -251,14 +252,15 @@ class CompressionTuner:
                         recommended=str(recommended),
                         reason=(
                             f"avg ratio {p.avg_ratio:.2f} over {p.ratio_count} "
-                            f"of {p.call_count} calls — responses nearly "
+                            f"classified of {p.call_count} calls — responses nearly "
                             "always fit, budget can be reduced to save context"
                         ),
                     )
                 )
                 # The average is over the non-error calls that recorded a
-                # cleaned length; the rest contributed nothing to the number
-                # this advice rests on (#934).
+                # cleaned length on the classified accounting basis; the rest
+                # contributed nothing to the number this advice rests on
+                # (#934, #1039).
                 evidence = min(evidence, p.ratio_count)
 
         # H3: Strategy pinning — one settable strategy runs on > 80% of the
@@ -456,7 +458,10 @@ def format_recommendations(
                 f"({profile.violation_count}/{profile.call_count})"
             )
             if profile.avg_ratio is not None:
-                lines.append(f"  Avg compression ratio: {profile.avg_ratio:.2f}")
+                lines.append(
+                    f"  Avg compression ratio: {profile.avg_ratio:.2f} "
+                    f"({profile.ratio_count} classified calls)"
+                )
         for a in rec.actions:
             current = a.current or "default"
             lines.append(f"  -> {a.field}: {current} -> {a.recommended}")

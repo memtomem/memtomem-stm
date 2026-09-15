@@ -184,6 +184,15 @@ def _saved_ratio(original: int, compressed: int) -> float:
     return round(1.0 - (compressed / original), 4)
 
 
+_MEASUREMENT_CLASSIFIED = (
+    "MCP rows: initial response text before surfacing; progressive follow-up reads excluded"
+)
+_MEASUREMENT_MIXED = (
+    _MEASUREMENT_CLASSIFIED + "; includes unclassified legacy MCP rows whose progressive "
+    "accounting basis is unknown, so saved ratios may mix incompatible measurements"
+)
+
+
 def read_compression_summary(
     db_path: Path, tool: str | None = None, source: str | None = None
 ) -> dict[str, object]:
@@ -218,7 +227,7 @@ def read_compression_summary(
         "error_count": 0,
         "initial_response_calls": 0,
         "unclassified_mcp_calls": 0,
-        "measurement": "initial text before surfacing; excludes follow-up reads",
+        "measurement": _MEASUREMENT_CLASSIFIED,
         "total_original_chars": 0,
         "total_compressed_chars": 0,
         "saved_chars": 0,
@@ -236,8 +245,6 @@ def read_compression_summary(
         return summary
 
     try:
-        # Provenance counts and size totals describe one read-only snapshot.
-        db.execute("BEGIN")
         cols = {row[1] for row in db.execute("PRAGMA table_info(proxy_metrics)")}
         if "original_chars" not in cols:
             # Missing file would have returned above; an empty column set here
@@ -283,25 +290,29 @@ def read_compression_summary(
             conditions.append("source = ?")
             params.append(source)
         where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
-        # Old progressive writers used incompatible bases. Preserve their
-        # values, but expose unknown provenance rather than relabelling them.
-        mcp_predicate = "source = 'mcp'" if has_source else "1"
+        # Old progressive writers used incompatible bases (#1039). Their values
+        # stay in the totals, but rows of unknown basis are counted rather
+        # than relabelled. "Unclassified" is limited to what can distort a
+        # saved ratio: a successful MCP row that contributes size. Error and
+        # no-payload rows written by current code carry no stamp and no basis.
+        # Each term reads a column only when this DB has it: a pre-``is_error``
+        # DB cannot tell errors apart, so its sized rows all count.
+        mcp = "source = 'mcp'" if has_source else "1"
         known = (
-            "compression_accounting = 'initial_response_v1'"
+            "COALESCE(compression_accounting = 'initial_response_v1', 0)"
             if "compression_accounting" in cols
             else "0"
         )
-        basis = db.execute(
-            f"SELECT SUM(CASE WHEN {mcp_predicate} AND {known} THEN 1 ELSE 0 END), "
-            f"SUM(CASE WHEN {mcp_predicate} AND NOT COALESCE(({known}), 0) "
-            f"THEN 1 ELSE 0 END) FROM proxy_metrics{where}",
-            params,
-        ).fetchone()
-        summary["initial_response_calls"] = basis[0] or 0
-        summary["unclassified_mcp_calls"] = basis[1] or 0
+        success = "is_error = 0" if has_is_error else "1"
+        sized = "(original_chars > 0 OR compressed_chars > 0)"
+        # One statement, so the provenance counts and size totals share a
+        # snapshot while the server appends rows.
         rows = db.execute(
             "SELECT server, tool, COUNT(*), SUM(original_chars), "
-            f"SUM(compressed_chars), {error_expr} "
+            f"SUM(compressed_chars), {error_expr}, "
+            f"SUM(CASE WHEN {mcp} AND {known} THEN 1 ELSE 0 END), "
+            f"SUM(CASE WHEN {mcp} AND NOT {known} AND {success} AND {sized} "
+            "THEN 1 ELSE 0 END) "
             f"FROM proxy_metrics{where} GROUP BY server, tool "
             "ORDER BY COUNT(*) DESC",
             params,
@@ -314,7 +325,10 @@ def read_compression_summary(
 
     by_tool: list[dict[str, object]] = []
     total_calls = total_error = total_orig = total_comp = 0
-    for server, tool_name, calls, orig, comp, errors in rows:
+    classified = unclassified = 0
+    for server, tool_name, calls, orig, comp, errors, known_calls, unknown_calls in rows:
+        classified += known_calls or 0
+        unclassified += unknown_calls or 0
         calls = calls or 0
         orig = orig or 0
         comp = comp or 0
@@ -335,6 +349,10 @@ def read_compression_summary(
         )
 
     summary["available"] = True
+    summary["initial_response_calls"] = classified
+    summary["unclassified_mcp_calls"] = unclassified
+    if unclassified:
+        summary["measurement"] = _MEASUREMENT_MIXED
     summary["total_calls"] = total_calls
     summary["error_count"] = total_error
     summary["total_original_chars"] = total_orig
@@ -585,7 +603,8 @@ class MetricsStore:
                 "ratio_violation, scorer_fallback, "
                 "index_ok, index_error, chunks_indexed, "
                 "extract_ok, extract_error, "
-                "surfacing_on_progressive_ok, surface_error, source, created_at, compression_accounting) "
+                "surfacing_on_progressive_ok, surface_error, source, created_at, "
+                "compression_accounting) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     metrics.server,
@@ -792,9 +811,14 @@ class MetricsStore:
         ``p95_original_chars``, ``auto_dominant_strategy``,
         ``auto_dominant_strategy_count``, ``auto_strategy_count``,
         ``error_count``.
-        Only non-error rows with ``cleaned_chars > 0`` contribute to
-        ``avg_ratio``.  ``p95_original_chars`` is approximated by taking
-        the value at the 95th percentile rank within each group.
+        Only non-error rows with ``cleaned_chars > 0`` whose
+        ``compression_accounting`` is ``initial_response_v1`` contribute to
+        ``avg_ratio``: rows of unknown basis include explicit progressive
+        calls that recorded the whole cleaned text as delivered (#1039), a
+        ratio that would pass for "the budget always fits". With no such row
+        the tool reports ``avg_ratio=None`` and ``ratio_count=0``.
+        ``p95_original_chars`` is approximated by taking the value at the 95th
+        percentile rank within each group.
 
         ``ratio_count`` is the size of that contributing population, counted
         by the same predicate in the same statement as the average itself, so
@@ -844,11 +868,13 @@ class MetricsStore:
                     SUM(ratio_violation)                              AS violation_count,
                     AVG(
                         CASE WHEN cleaned_chars > 0 AND is_error = 0
+                              AND compression_accounting = 'initial_response_v1'
                              THEN CAST(compressed_chars AS REAL) / cleaned_chars
                         END
                     )                                                 AS avg_ratio,
                     SUM(
                         CASE WHEN cleaned_chars > 0 AND is_error = 0
+                              AND compression_accounting = 'initial_response_v1'
                              THEN 1 ELSE 0
                         END
                     )                                                 AS ratio_count,

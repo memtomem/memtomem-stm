@@ -445,16 +445,34 @@ consumer model of its own.
 New MCP compression rows measure the initial response text, including compression
 footers but before surfacing, for both explicit `progressive` and progressive
 fallback. This is an initial-delivery reduction, not a full-interaction saving.
-`mms stats` excludes follow-up reads and reports unclassified legacy MCP rows:
-older explicit progressive rows counted the entire stored response, whereas
-fallback rows counted the first chunk. These historical values are not rewritten
-or silently treated as measurements made on the new basis.
+Surfaced memories, later index annotations, non-text content, and MCP envelope
+metadata are not counted. `mms stats` excludes follow-up reads.
+
+Older explicit progressive rows counted the entire cleaned response, whereas
+fallback rows counted the first chunk. Those historical values stay in the totals
+and are not rewritten. `mms stats` reports a successful MCP row that contributes
+size but has no accounting stamp as unclassified legacy accounting, and the text
+and `--json` `measurement` description then say the saved ratio may mix
+incompatible measurements. Error rows and rows with no recorded size are not
+counted as unclassified; they carry no progressive basis. On a database written
+before the `is_error` column existed, every sized row counts, since errors cannot
+be told apart. The warning lasts while those rows remain in the retained history.
 
 Use `stm_admin(action="progressive_stats")` for recorded initial and follow-up
-payload volumes. Repeated or overlapping reads count again, including a follow-up
-at offset zero. These volumes exclude footers and surfaced text; they cannot be
+payload volumes. A payload is the content slice a read delivered, measured by the
+chunker itself, so content that happens to contain the progressive footer token is
+counted correctly. Repeated or overlapping reads count again, including a follow-up
+at offset zero. A read past the end or with an unknown key delivers nothing and
+records nothing. These volumes exclude footers and surfaced text; they cannot be
 added directly to initial-response totals as a full wire-size measurement.
 Legacy read events without an explicit creation/follow-up marker are reported as
 unclassified. Tracking is best-effort: disabled tracking, failed writes, expiry,
 and retention purges can leave gaps. Missing telemetry does not prove zero use,
 and the observed volumes do not establish end-to-end token or cost savings.
+
+The auto-tuner's average compression ratio, and the over-generous budget advice
+that rests on it, reads only successful MCP rows recorded on this accounting basis.
+A tool whose history is entirely unclassified reports no average and gets no
+ratio-based budget advice until new calls accumulate; its violation-rate and
+strategy advice are unchanged. The report states how many classified calls the
+average covers.

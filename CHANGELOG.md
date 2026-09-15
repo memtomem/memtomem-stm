@@ -11,6 +11,43 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Explicit progressive compression rows record the first delivered response**
+  (#1039). `compressed_chars` used to be the whole cleaned text on this path, so
+  its saved ratio was 0%. When the response is chunked, it is now the first chunk
+  plus its footer, the same basis progressive fallback already used. For example, a
+  21,650-character JSON response at the default chunk size records 4,142
+  characters, a ratio of 0.19 instead of 1.00. A response that fits one chunk still
+  records its full length. `mms stats` saved percentages rise for tools whose
+  explicit progressive responses are chunked. Existing rows are not rewritten.
+- **Tuning ratio advice ignores rows of unknown accounting** (#1039). The
+  `max_result_chars` reduction advice and the reported average ratio now read only
+  rows recorded on the new basis. A tool with only older rows gets no ratio-based
+  advice until new calls accumulate. Before this change, an explicit progressive
+  tool's 1.00 ratio could produce advice to shrink a `max_result_chars` that this
+  path does not read.
+
+### Fixed
+
+- **Explicit progressive and progressive fallback share one accounting basis**
+  (#1039) — both now record the initial response text: compression footers are
+  included, while surfacing, later index annotations, non-text content, and MCP
+  envelope metadata are excluded. Progressive read telemetry records the delivered
+  content length reported by the chunker instead of splitting the rendered text on
+  the footer token, which miscounted content containing that token. Repeated,
+  overlapping, and offset-zero reads each count again, and reads past the end or
+  with an unknown key record nothing. `stm_admin(action="progressive_stats")` adds
+  initial and follow-up payload volumes and a count of legacy read events without a
+  creation/follow-up marker, all from one query. `mms stats` states that it
+  measures initial text before surfacing and excludes follow-up reads. It warns
+  about successful MCP rows of unknown accounting. The `--json` summary adds
+  `initial_response_calls`, `unclassified_mcp_calls`, and a `measurement`
+  description. Error and no-payload rows never trigger that warning. Both stores
+  gain a nullable provenance column through an additive migration; `mms stats`
+  still opens the database read-only. **Behavior change**: see the upgrade notes
+  above.
+
 ## [0.5.2] — 2026-09-15
 
 ### Upgrade notes

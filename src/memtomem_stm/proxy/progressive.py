@@ -149,6 +149,20 @@ class ProgressiveStoreAdapter:
             close()
 
 
+@dataclass(frozen=True)
+class ChunkResult:
+    """One rendered progressive read and the content it delivers.
+
+    ``payload_chars`` is the length of the content slice, excluding the footer.
+    Telemetry reads it here instead of parsing ``text``: content may itself
+    contain ``PROGRESSIVE_FOOTER_TOKEN``. ``payload_chars == 0`` means nothing
+    was delivered (the ``(no more content)`` response).
+    """
+
+    text: str
+    payload_chars: int
+
+
 class ProgressiveChunker:
     """Splits content into cursor-based chunks with metadata footers."""
 
@@ -158,6 +172,12 @@ class ProgressiveChunker:
 
     def first_chunk(self, content: str, key: str, *, ttl_seconds: float | None = None) -> str:
         """Return the first chunk of *content* with a progressive metadata footer."""
+        return self.first_chunk_result(content, key, ttl_seconds=ttl_seconds).text
+
+    def first_chunk_result(
+        self, content: str, key: str, *, ttl_seconds: float | None = None
+    ) -> ChunkResult:
+        """Like :meth:`first_chunk`, also reporting the delivered payload length."""
         end = self._find_boundary(content, self._chunk_size)
         chunk = content[:end]
         remaining = len(content) - end
@@ -174,7 +194,7 @@ class ProgressiveChunker:
             next_offset=end,
             ttl_seconds=ttl_seconds,
         )
-        return chunk + footer
+        return ChunkResult(chunk + footer, len(chunk))
 
     def read_chunk(
         self,
@@ -186,8 +206,20 @@ class ProgressiveChunker:
         ttl_seconds: float | None = None,
     ) -> str:
         """Return a chunk starting at *offset* with a progressive metadata footer."""
+        return self.read_chunk_result(content, offset, limit, key, ttl_seconds=ttl_seconds).text
+
+    def read_chunk_result(
+        self,
+        content: str,
+        offset: int,
+        limit: int | None = None,
+        key: str = "",
+        *,
+        ttl_seconds: float | None = None,
+    ) -> ChunkResult:
+        """Like :meth:`read_chunk`, also reporting the delivered payload length."""
         if offset >= len(content):
-            return "(no more content)"
+            return ChunkResult("(no more content)", 0)
 
         chunk_size = limit or self._chunk_size
         target_end = min(offset + chunk_size, len(content))
@@ -206,7 +238,7 @@ class ProgressiveChunker:
                 next_offset=len(content),
                 ttl_seconds=ttl_seconds,
             )
-            return chunk + footer
+            return ChunkResult(chunk + footer, len(chunk))
 
         end = self._find_boundary(content, target_end, floor_offset=offset)
         chunk = content[offset:end]
@@ -222,7 +254,7 @@ class ProgressiveChunker:
             next_offset=end,
             ttl_seconds=ttl_seconds,
         )
-        return chunk + footer
+        return ChunkResult(chunk + footer, len(chunk))
 
     def _build_footer(
         self,
