@@ -44,6 +44,14 @@ changes inline only. See the deprecation policy in
   manually entered) and by `mms project` registry import omit it as well. A newly
   added server therefore inherits the global budget — 16,000 characters by
   default, which is what those entries already resolved to in practice.
+- **An explicit `retention_floor` now applies even with `min_result_retention: 0`**
+  (#1049, #1041). Setting the global floor to zero used to disable every
+  server-level and per-tool `retention_floor` with it, so the documented override
+  could not re-enable preservation for one tool. A tool configured that way now
+  stops truncating below its floor — at `1.0` its responses are preserved in full
+  where they were previously cut to the character budget. Configurations with no
+  explicit floor are unaffected, and an explicit `retention_floor: 0` remains the
+  opt-out at that level.
 
 ### Fixed
 
@@ -76,6 +84,16 @@ changes inline only. See the deprecation policy in
   stopped emitting a budget the operator never stated, so honoring the field does
   not halve the budget of newly generated servers. **Behavior change**: see the
   upgrade notes above.
+- **A disabled global retention floor no longer disables explicit ones** (#1049) —
+  the compression pipeline consulted the resolved tool/server `retention_floor`
+  only after `min_result_retention > 0` had already passed, so a global zero made
+  every explicit override inert. The gate now admits a stated floor on its own.
+  The precedence itself is unchanged and documented: a tool floor overrides a
+  server floor, which overrides the global size-based ladder; `null` inherits and
+  an explicit `0` opts that level out. Because a stated floor always takes the
+  first branch inside the block, the ladder is unreachable through the new
+  condition — the only inputs whose behavior changes are those with a global zero
+  and an explicit floor. **Behavior change**: see the upgrade notes above.
 
 ## [0.5.2] — 2026-09-15
 
