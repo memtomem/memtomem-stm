@@ -5256,6 +5256,10 @@ class ProxyManager:
                                 original_chars=0,
                                 compressed_chars=0,
                                 trace_id=trace_id,
+                                # ``record_error`` persists this object as-is;
+                                # without the flag the row reads as a success
+                                # to every store reader (#1045).
+                                is_error=True,
                                 error_category=pipeline_category,
                                 # LOCK_TIMEOUT bubbles out of ``bounded_lock``
                                 # before the per-stage ``index_error`` /

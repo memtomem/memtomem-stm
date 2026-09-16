@@ -76,6 +76,10 @@ changes inline only. See the deprecation policy in
   `source` (`server` or `global`), and `tool_overrides`; it is `{}` for an invalid
   configuration. A script that parsed the text table's COMPRESSION column reads
   different values for servers that omit `compression`.
+- **`mms stats` counts in-pipeline failures as errors** (#1045). A `lock_timeout` or
+  `internal_error` row recorded by the proxy's own call path now has `is_error = 1`,
+  so the error count in `mms stats` and the tuner's error totals rise for tools that
+  hit these failures. Rows recorded before the upgrade are not rewritten.
 
 ### Fixed
 
@@ -140,6 +144,14 @@ changes inline only. See the deprecation policy in
   wins. Not covered: an environment the server refuses at startup can still list
   as valid with a resolved strategy, as `config_valid` already could before this
   change (#1051).
+  **Behavior change**: see the upgrade notes above.
+- **Pipeline lock-timeout and internal-error rows count as errors** (#1045) — an
+  exception that escaped the guarded call path without being recorded elsewhere
+  (a pipeline stage, the cache lookup, or cache-hit handling) was counted by the
+  in-memory tracker but persisted with `is_error = 0`, so `mms stats` and every
+  other reader of the metrics database treated it as a successful call. These
+  `lock_timeout` and `internal_error` rows now persist `is_error = 1`. Rows recorded
+  before this fix keep `is_error = 0`; they are not rewritten.
   **Behavior change**: see the upgrade notes above.
 
 ## [0.5.2] — 2026-09-15

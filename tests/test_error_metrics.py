@@ -21,7 +21,7 @@ from memtomem_stm.proxy.metrics import (
     ErrorCategory,
     TokenTracker,
 )
-from memtomem_stm.proxy.metrics_store import MetricsStore
+from memtomem_stm.proxy.metrics_store import MetricsStore, read_compression_summary
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 from memtomem_stm.utils.mcp_transport import (
     INBOUND_MESSAGE_TOO_LARGE_CODE,
@@ -548,6 +548,17 @@ def _read_error_row(mgr: ProxyManager) -> tuple:
     ).fetchone()
 
 
+def _assert_persisted_as_error(mgr: ProxyManager, tmp_path: Path, category: str) -> None:
+    """Pipeline-exception rows must count as errors in the persistent store, not
+    only in the in-memory tracker (#1045): ``mms stats`` reads ``is_error``."""
+    row = mgr._test_store._db.execute(  # noqa: SLF001
+        "SELECT is_error, error_category FROM proxy_metrics"
+    ).fetchall()
+    assert row == [(1, category)]
+    assert mgr.tracker.get_summary()["total_errors"] == 1
+    assert read_compression_summary(tmp_path / "metrics.db")["error_count"] == 1
+
+
 class TestErrorMessagePersistence:
     """Each ErrorCategory writes ``error_message`` to ``proxy_metrics.db``.
 
@@ -686,6 +697,7 @@ class TestErrorMessagePersistence:
         cat, _code, msg = _read_error_row(mgr)
         assert cat == "internal_error"
         assert msg == "RuntimeError: boom"
+        _assert_persisted_as_error(mgr, tmp_path, "internal_error")
 
     async def test_lock_timeout_persists_message(self, tmp_path):
         """LockTimeoutError (#208) escapes ``bounded_lock`` *before* the
@@ -709,6 +721,7 @@ class TestErrorMessagePersistence:
         assert msg is not None
         assert "stm_lock" in msg
         assert msg.startswith("LockTimeoutError")
+        _assert_persisted_as_error(mgr, tmp_path, "lock_timeout")
 
 
 # ── CircuitBreaker properties ────────────────────────────────────────────
