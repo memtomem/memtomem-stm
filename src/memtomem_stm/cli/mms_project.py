@@ -154,7 +154,6 @@ def _registry_route_entry(
         "prefix": server.prefix,
         "transport": "stdio",
         "compression": "auto",
-        "max_result_chars": 8000,
         "origin": {
             "schema_version": 1,
             "source": {"kind": "mms-registry", "path": str(registry_path)},

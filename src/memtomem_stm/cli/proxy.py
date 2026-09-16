@@ -2335,7 +2335,12 @@ def stats(
     help="'auto' picks strategy per response by content type.",
 )
 @click.option(
-    "--max-chars", "max_result_chars", type=click.IntRange(min=1), default=8000, show_default=True
+    "--max-chars",
+    "max_result_chars",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Per-server character budget. Omitted by default so the server inherits "
+    "the model-aware global budget (default_max_result_chars); pass a value to pin one.",
 )
 @click.option(
     "--validate",
@@ -2417,7 +2422,7 @@ def add(
     env_pairs: tuple[str, ...],
     header_pairs: tuple[str, ...],
     compression: str,
-    max_result_chars: int,
+    max_result_chars: int | None,
     validate: bool,
     save_unverified: bool,
     validate_timeout: int,
@@ -2644,8 +2649,14 @@ def add(
         "prefix": prefix,
         "transport": transport,
         "compression": compression,
-        "max_result_chars": max_result_chars,
     }
+    # Written only when --max-chars was actually passed: the field's presence is
+    # what ``effective_max_result_chars`` reads to tell a stated budget from an
+    # omitted one, so emitting the option's default would pin every generated
+    # server at that literal instead of letting it inherit the model-aware
+    # global (#1040).
+    if max_result_chars is not None:
+        entry["max_result_chars"] = max_result_chars
     if transport == "stdio":
         entry["command"] = command
         if args_str:
@@ -2859,10 +2870,11 @@ def _normalize_client_entry(raw: dict[str, Any]) -> dict[str, Any] | None:
     else:
         return None
 
+    # No ``max_result_chars``: an imported server states no budget of its own,
+    # so it inherits the model-aware global (#1040).
     entry: dict[str, Any] = {
         "transport": transport,
         "compression": "auto",
-        "max_result_chars": 8000,
     }
     if transport == "stdio":
         entry["command"] = command
@@ -5318,7 +5330,6 @@ def init(
             "command": os.path.abspath(sys.executable),
             "args": ["-m", "memtomem_stm.demo_server"],
             "compression": "auto",
-            "max_result_chars": 8000,
             "cache": True,
         }
         click.echo(f"{_ok('Using bundled read-only demo server.')} No network access required.")
@@ -5386,11 +5397,10 @@ def init(
             show_default=True,
         )
 
-        entry = {
+        entry: dict[str, Any] = {
             "prefix": prefix,
             "transport": transport,
             "compression": "auto",
-            "max_result_chars": 8000,
         }
 
         if transport == "stdio":
@@ -5450,11 +5460,11 @@ def init(
             for key, value in per_server_fields.items():
                 # ``setdefault`` preserves any operator-explicit value the
                 # import flow already produced (an upstream MCP config could
-                # in principle carry these keys). Manual flow's hardcoded
-                # ``max_result_chars=8000`` is left in place; the token
-                # budget wins via ``ProxyManager._resolve_tool_config``
-                # precedence (PR #274), so the char value is dead code in
-                # the resolved budget but kept visible in the saved config.
+                # in principle carry these keys). No generated entry states a
+                # ``max_result_chars`` of its own any more (#1040), so the
+                # preset's per-server token budget is the only budget in the
+                # saved entry — and it would outrank a char one anyway via
+                # ``ProxyManager._resolve_tool_config`` precedence (PR #274).
                 entry.setdefault(key, value)
 
     do_validate = not no_validate and (json_mode or _confirm_validation())

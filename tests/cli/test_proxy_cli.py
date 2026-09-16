@@ -3314,8 +3314,9 @@ class TestInitLangPreset:
     def test_lang_ko_writes_proxy_and_per_server_fields(self, runner, config, no_discovery):
         """KO preset writes proxy-level chars_per_token /
         default_max_result_chars AND per-server max_result_tokens +
-        chars_per_token. The hardcoded manual-flow ``max_result_chars=8000``
-        stays in place — token budget wins via PR #274 precedence.
+        chars_per_token. The manual flow states no ``max_result_chars`` at all
+        (#1040), and the token budget would outrank one anyway via PR #274
+        precedence.
 
         The written config is also round-tripped through
         ``ProxyConfig.load_from_file`` so that a preset key the schema does
@@ -3345,8 +3346,9 @@ class TestInitLangPreset:
         srv = data["upstream_servers"]["filesystem"]
         assert srv["max_result_tokens"] == 2000
         assert srv["chars_per_token"] == 1.85
-        # Manual-flow hardcode preserved (token wins at resolution time)
-        assert srv["max_result_chars"] == 8000
+        # No manual-flow budget: an unstated one inherits the (preset-set)
+        # global rather than pinning a literal (#1040).
+        assert "max_result_chars" not in srv
 
         # Round-trip every written proxy-level key through schema validation
         # and assert the *effective* values — this is what catches a
@@ -3456,9 +3458,10 @@ class TestInitDiscoveryHelpers:
         assert entry["transport"] == "stdio"
         assert entry["command"] == "npx"
         assert entry["args"] == ["-y", "@modelcontextprotocol/server-filesystem"]
-        # Imported entries get our default compression/max_chars policy.
+        # Imported entries get our default compression policy and no budget of
+        # their own — an unstated one inherits the global (#1040).
         assert entry["compression"] == "auto"
-        assert entry["max_result_chars"] == 8000
+        assert "max_result_chars" not in entry
         # Prefix is intentionally absent — the caller prompts per-server.
         assert "prefix" not in entry
 

@@ -216,7 +216,11 @@ Options:
   --compression [auto|none|truncate|selective|hybrid]
                                   'auto' picks strategy per response by
                                   content type.  [default: auto]
-  --max-chars INTEGER RANGE       [default: 8000; x>=1]
+  --max-chars INTEGER RANGE       Per-server character budget. Omitted by
+                                  default so the server inherits the model-
+                                  aware global budget
+                                  (default_max_result_chars); pass a value to
+                                  pin one.  [x>=1]
   --validate                      Probe the server (MCP initialize +
                                   list-tools) before saving; abort on
                                   failure.

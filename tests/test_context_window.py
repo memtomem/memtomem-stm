@@ -153,14 +153,13 @@ class TestSurfacingTierBudgets:
 class TestResolveToolConfigModelAware:
     def _make_manager(
         self,
-        server_max_chars: int = 8000,  # default
+        server_max_chars: int | None = None,  # omitted: inherit global
         consumer_model: str = "",
         context_budget_ratio: float = 0.05,
     ) -> ProxyManager:
-        server_cfg = UpstreamServerConfig(
-            prefix="test",
-            max_result_chars=server_max_chars,
-        )
+        server_cfg = UpstreamServerConfig(prefix="test")
+        if server_max_chars is not None:
+            server_cfg.max_result_chars = server_max_chars
         proxy_cfg = ProxyConfig(
             config_path=Path("/tmp/proxy.json"),
             upstream_servers={"srv": server_cfg},
@@ -178,7 +177,7 @@ class TestResolveToolConfigModelAware:
         return mgr
 
     def test_default_server_uses_model_budget(self):
-        """Server at default max_result_chars picks up model-aware budget."""
+        """A server omitting max_result_chars inherits the model-aware budget."""
         mgr = self._make_manager(consumer_model="gpt-4o", context_budget_ratio=0.05)
         tc = mgr._resolve_tool_config("srv", "any_tool")
         # gpt-4o: 128K * 0.05 * 3.5 = 22400, capped at 16000 (default_max_result_chars)
@@ -194,9 +193,11 @@ class TestResolveToolConfigModelAware:
         assert tc.max_chars == 5000
 
     def test_no_model_uses_default(self):
-        """No consumer_model → server default used."""
+        """No consumer_model → the unscaled global budget."""
         mgr = self._make_manager(consumer_model="")
         tc = mgr._resolve_tool_config("srv", "any_tool")
-        # effective_max_result_chars returns 16000, which is > server default 2000
-        # But server at default → uses effective, which is 16000
+        # With no model to scale against, the global stays at its configured
+        # default_max_result_chars. The server states no budget of its own, so
+        # that is what it inherits — the schema's own 8000 field default never
+        # enters the resolution.
         assert tc.max_chars == 16000
