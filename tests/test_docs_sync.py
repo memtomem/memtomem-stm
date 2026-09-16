@@ -895,6 +895,61 @@ def test_cli_md_eject_usage_block_flags_match_command() -> None:
     )
 
 
+def test_cli_md_max_chars_help_matches_the_command() -> None:
+    """docs/cli.md's ``--max-chars`` help must be the command's own (#1040).
+
+    The option carries the one thing a reader cannot infer from the config
+    schema: leaving it off is not the same as passing its former default.
+    docs/cli.md pinned ``[default: 8000]`` for exactly as long as the command
+    emitted that literal into every generated entry, and the two drifted apart
+    silently the moment it stopped — a reader following the docs would have
+    expected a budget the CLI no longer writes. Pin the rendered help so the
+    next change to either side has to touch both.
+    """
+    from click.testing import CliRunner
+
+    from memtomem_stm.cli.proxy import cli as mms_cli
+
+    rendered = CliRunner().invoke(mms_cli, ["add", "--help"])
+    assert rendered.exit_code == 0, rendered.output
+    lines = rendered.output.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.strip().startswith("--max-chars"))
+    # Continuation lines are indented past the flag column; the next option
+    # starts back at two spaces.
+    end = next(
+        (i for i, line in enumerate(lines[start + 1 :], start + 1) if line.startswith("  -")),
+        len(lines),
+    )
+    block = "\n".join(lines[start:end]).rstrip()
+    assert "[default:" not in block, (
+        "`--max-chars` advertises a default again. The field's absence is what "
+        "makes a server inherit the global budget, so a click default would be "
+        "written into every generated entry as a stated one (#1040)."
+    )
+
+    # Undo the wrapping, keep the words: click re-wraps the help to the width it
+    # renders at, so a verbatim pin would fail on the line breaks rather than on
+    # the wording — the thing this test is here to hold. Word boundaries have to
+    # survive the normalization, or `default_max_result_chars` and
+    # `default_ max_result_chars` compare equal and the pin stops naming the
+    # setting it exists to name. A wrap taken at a hyphen inside a word
+    # ("model-\naware") is rejoined first, since collapsing it would otherwise
+    # leave a space that no rendering width produces.
+    def _unwrap(text: str) -> str:
+        return " ".join(re.sub(r"-\n\s+", "-", text).split())
+
+    cli_md = _read("docs/cli.md")
+    section_match = re.search(r"### `add`\n(.*?)(?=\n### |\n## |\Z)", cli_md, re.DOTALL)
+    assert section_match, "docs/cli.md must have a ### `add` section"
+    # Scoped to that section, not the whole document: `--max-chars` is also
+    # mentioned in prose and examples elsewhere, and a match there would let the
+    # usage block itself go stale.
+    assert _unwrap(block) in _unwrap(section_match.group(1)), (
+        "docs/cli.md's `### `add`` usage block no longer carries the command's "
+        f"own `--max-chars` help. Expected (rewrapped):\n{block}"
+    )
+
+
 def test_user_facing_surfaces_carry_no_private_docs_paths() -> None:
     """README, CHANGELOG, docs/, and src/ must not reference the private
     docs repo by path.

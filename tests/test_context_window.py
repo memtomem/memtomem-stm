@@ -193,9 +193,11 @@ class TestResolveToolConfigModelAware:
         assert tc.max_chars == 5000
 
     def test_no_model_uses_default(self):
-        """No consumer_model → server default used."""
+        """No consumer_model → the unscaled global budget."""
         mgr = self._make_manager(consumer_model="")
         tc = mgr._resolve_tool_config("srv", "any_tool")
-        # effective_max_result_chars returns 16000, which is > server default 2000
-        # But server at default → uses effective, which is 16000
+        # With no model to scale against, the global stays at its configured
+        # default_max_result_chars. The server states no budget of its own, so
+        # that is what it inherits — the schema's own 8000 field default never
+        # enters the resolution.
         assert tc.max_chars == 16000
