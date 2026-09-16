@@ -256,6 +256,8 @@ class CallMetrics:
     # (CLI/stats, the tuner) separate native-tool spend — otherwise invisible —
     # from proxied spend without splitting the store.
     source: str = "mcp"
+    # None marks old/unclassified writers; never infer their accounting basis.
+    compression_accounting: str | None = None
 
 
 class RPSTracker:

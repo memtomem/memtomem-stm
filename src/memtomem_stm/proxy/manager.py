@@ -159,7 +159,6 @@ from memtomem_stm.proxy.metadata_recovery import (
     metadata_page,
 )
 from memtomem_stm.proxy.progressive import (
-    PROGRESSIVE_FOOTER_TOKEN,
     ProgressiveChunker,
     ProgressiveResponse,
     ProgressiveStoreAdapter,
@@ -4896,22 +4895,19 @@ class ProxyManager:
             chunk_size=cfg.chunk_size,
             include_hint=cfg.include_structure_hint,
         )
-        first = chunker.first_chunk(text, key, ttl_seconds=cfg.ttl_seconds)
+        first = chunker.first_chunk_result(text, key, ttl_seconds=cfg.ttl_seconds)
         if self._progressive_reads_tracker is not None:
-            # The first_chunk return concatenates ``chunk + footer`` where
-            # the footer starts with PROGRESSIVE_FOOTER_TOKEN; splitting
-            # once on that sentinel recovers the exact chunk length
-            # without duplicating ``_find_boundary``.
-            initial_chars = len(first.split(PROGRESSIVE_FOOTER_TOKEN, 1)[0])
+            # The chunker reports the payload length directly; parsing the
+            # rendered text would miscount content containing the footer token.
             self._progressive_reads_tracker.record_initial(
                 key=key,
                 trace_id=trace_id,
                 server=server,
                 tool=tool,
-                initial_chars=initial_chars,
+                initial_chars=first.payload_chars,
                 total_chars=len(text),
             )
-        return first
+        return first.text
 
     def read_more(self, key: str, offset: int, limit: int | None = None) -> str:
         """Return next chunk from a progressive delivery response.
@@ -4998,30 +4994,25 @@ class ProxyManager:
                 chunker = ProgressiveChunker(
                     chunk_size=chunk_size, include_hint=resp.include_structure_hint
                 )
-                output = chunker.read_chunk(
+                output = chunker.read_chunk_result(
                     resp.content, offset, limit, key=key, ttl_seconds=resp.ttl_seconds
                 )
                 # Skip telemetry when ``read_chunk`` short-circuits with the
                 # ``(no more content)`` sentinel (offset >= len(content)) —
-                # that response carries no footer and no payload, so logging
-                # it would inflate ``follow_up_rate`` with calls that served
-                # zero new bytes and push ``avg_chars_served`` above
-                # ``total_chars``.
-                if (
-                    self._progressive_reads_tracker is not None
-                    and PROGRESSIVE_FOOTER_TOKEN in output
-                ):
-                    chunk_chars = len(output.split(PROGRESSIVE_FOOTER_TOKEN, 1)[0])
+                # that response delivers no payload, so logging it would
+                # inflate ``follow_up_rate`` with calls that served zero new
+                # bytes and push ``avg_chars_served`` above ``total_chars``.
+                if self._progressive_reads_tracker is not None and output.payload_chars > 0:
                     self._progressive_reads_tracker.record_follow_up(
                         key=key,
                         trace_id=resp.trace_id,
                         server=resp.server,
                         tool=resp.tool,
                         offset=offset,
-                        chars=chunk_chars,
+                        chars=output.payload_chars,
                         total_chars=resp.total_chars,
                     )
-                return output
+                return output.text
         finally:
             if temp_store is not None:
                 temp_store.close()
@@ -6194,7 +6185,7 @@ class ProxyManager:
 
         Returns a ``CompressionResult`` carrying both ``compressed`` (pre-surfacing,
         the cache payload) and ``surfaced`` (post-surfacing, the return/index
-        input), the branch-dependent ``compressed_chars_for_metrics``, the
+        input), the initial-response ``compressed_chars_for_metrics``, the
         fully-mutated ``metrics_strategy`` label, and the surfacing outcome. The
         scorer-fallback delta is computed by the caller (it brackets this call plus
         the later index/extract stages), so it is intentionally not a field here.
@@ -6274,7 +6265,7 @@ class ProxyManager:
                     compressed = cleaned
                     progressive_passthrough_on_error = True
             _compress_ms = 0.0
-            compressed_chars_for_metrics = len(cleaned)
+            compressed_chars_for_metrics = len(compressed)
             # The metrics record at the bottom reads ``metrics_strategy`` on
             # every path; mirror the assignment at the top of the compression
             # branch (pre-fix this branch left it unbound and every
@@ -7566,7 +7557,7 @@ class ProxyManager:
         # from the same estimator so the recorded decision and the counts
         # reconcile. Keyed on the gate having RUN (not on the mode alone):
         # mode without a token budget, and the PROGRESSIVE branch with its
-        # deliberate ``len(cleaned)`` accounting basis, keep the static path.
+        # static estimation mode, keep the static path.
         # On the gated (non-progressive) branch ``comp.compressed`` is exactly
         # the text whose length static mode measures.
         if comp.unicode_token_gate:
@@ -7591,6 +7582,7 @@ class ProxyManager:
                 surface_ms=_surface_ms,
                 surfaced_chars=len(surfaced),
                 compression_strategy=metrics_strategy,
+                compression_accounting="initial_response_v1",
                 strategy_auto_selected=comp.strategy_auto_selected,
                 ratio_violation=ratio_violation,
                 scorer_fallback=getattr(_scorer, "fallback_count", 0) > _pre_scorer_fb,

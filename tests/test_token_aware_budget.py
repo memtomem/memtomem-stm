@@ -852,8 +852,7 @@ class TestTokenEstimationMode:
 
     @pytest.mark.asyncio
     async def test_progressive_branch_never_sets_the_unicode_flag(self):
-        """PROGRESSIVE is zero-loss and skips the gate; its deliberate
-        ``len(cleaned)`` metrics basis must not flip to the envelope size."""
+        """PROGRESSIVE skips the token gate; a one-chunk response stays intact."""
         server_cfg = UpstreamServerConfig(
             prefix="x",
             compression="progressive",

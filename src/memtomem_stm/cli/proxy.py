@@ -2069,6 +2069,14 @@ def _render_compression_block(summary: dict[str, Any]) -> None:
     ratio = float(summary["saved_ratio"]) * 100
     click.echo(f"  calls: {summary['total_calls']}  (errors: {summary['error_count']})")
     click.echo(f"  chars: {orig:,} -> {comp:,}  (saved {summary['saved_chars']:,}, {ratio:.1f}%)")
+    click.echo("  MCP rows measure initial text before surfacing; follow-up reads are excluded.")
+    click.echo("  Read volume: stm_admin(action=progressive_stats); telemetry may be incomplete.")
+    unknown = summary.get("unclassified_mcp_calls", 0)
+    if unknown:
+        click.echo(
+            f"  Warning: {unknown} MCP rows have unclassified/legacy accounting; "
+            "saved ratios may mix incompatible progressive measurements."
+        )
     by_tool = summary.get("by_tool") or []
     if by_tool:
         click.echo("")

@@ -11,6 +11,7 @@ Covers:
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import sqlite3
@@ -837,6 +838,7 @@ class TestGetToolProfiles:
                     compressed_chars=3000,
                     cleaned_chars=5000 + i * 100,
                     compression_strategy="hybrid",
+                    compression_accounting="initial_response_v1",
                     strategy_auto_selected=True,
                     ratio_violation=(i < 2),
                 )
@@ -860,7 +862,7 @@ class TestGetToolProfiles:
     def test_ratio_count_counts_only_the_rows_avg_ratio_reads(self, tmp_path):
         """`avg_ratio`'s population is narrower than `call_count` (#934).
 
-        The average is taken over rows with `cleaned_chars > 0 AND
+        The average is taken over classified rows with `cleaned_chars > 0 AND
         is_error = 0`; error rows and rows that recorded no cleaned length
         contribute nothing to it, so the tuner cannot label an average over
         one response from a count of twenty-five.
@@ -875,6 +877,7 @@ class TestGetToolProfiles:
                 compressed_chars=1990,
                 cleaned_chars=2000,
                 compression_strategy="truncate",
+                compression_accounting="initial_response_v1",
             )
         )
         for _ in range(3):
@@ -886,6 +889,7 @@ class TestGetToolProfiles:
                     compressed_chars=2000,
                     cleaned_chars=2000,
                     compression_strategy=None,
+                    compression_accounting="initial_response_v1",
                     is_error=True,
                 )
             )
@@ -898,6 +902,7 @@ class TestGetToolProfiles:
                     compressed_chars=2000,
                     cleaned_chars=0,
                     compression_strategy="truncate",
+                    compression_accounting="initial_response_v1",
                 )
             )
         for _ in range(3):
@@ -909,6 +914,7 @@ class TestGetToolProfiles:
                     compressed_chars=1000,
                     cleaned_chars=1000,
                     compression_strategy=None,
+                    compression_accounting="initial_response_v1",
                     is_error=True,
                 )
             )
@@ -1279,3 +1285,346 @@ async def test_truncation_boundary_does_not_trigger_progressive(
         assert "stm_proxy_read_more" not in result
     finally:
         store.close()
+
+
+async def test_progressive_paths_measure_the_same_initial_response(tmp_path):
+    import json
+
+    text = json.dumps([{"id": i, "body": "alpha beta gamma " * 20} for i in range(60)])
+    lengths = []
+    for strategy in (CompressionStrategy.PROGRESSIVE, CompressionStrategy.AUTO):
+        directory = tmp_path / strategy.value
+        directory.mkdir()
+        mgr, store = _make_manager_with_store(
+            directory, compression=strategy, max_result_chars=1000
+        )
+        mgr._connections["srv"].session.call_tool.return_value = _make_result(text)
+        try:
+            result = await mgr.call_tool("srv", "tool", {})
+            row = _latest_row(store)
+            assert "stm_proxy_read_more" in result
+            assert row["compressed_chars"] == len(result) < len(text)
+            basis = store._db.execute("SELECT compression_accounting FROM proxy_metrics").fetchone()
+            assert basis == ("initial_response_v1",)
+            lengths.append(row["compressed_chars"])
+        finally:
+            store.close()
+    assert lengths[0] == lengths[1]
+
+
+# ── #1039: progressive delivery accounting ───────────────────────────────
+
+_FOOTER_RANGE = re.compile(r"\[progressive: chars=(\d+)-(\d+)/(\d+)")
+
+
+def _served_range(response: str) -> tuple[int, int, int]:
+    """The ``start-end/total`` the response's own (final) footer declares."""
+    start, end, total = _FOOTER_RANGE.findall(response)[-1]
+    return int(start), int(end), int(total)
+
+
+def _progressive_key(response: str) -> str:
+    return re.findall(r'stm_proxy_read_more\(key="([^"]+)"', response)[-1]
+
+
+def _attach_reads_tracker(mgr: ProxyManager, tmp_path: Path):
+    from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
+
+    tracker = ProgressiveReadsTracker(tmp_path / "reads.db", retention_days=0)
+    mgr._progressive_reads_tracker = tracker
+    return tracker
+
+
+@pytest.mark.asyncio
+class TestProgressiveDeliveryAccounting:
+    """One accounting basis for both progressive paths, and payload volumes
+    that neither parse the rendered text nor skip repeated reads (#1039)."""
+
+    @pytest.mark.parametrize(
+        "strategy", [CompressionStrategy.PROGRESSIVE, CompressionStrategy.AUTO]
+    )
+    async def test_payload_counts_survive_the_footer_token_inside_content(self, tmp_path, strategy):
+        from memtomem_stm.proxy.progressive import PROGRESSIVE_FOOTER_TOKEN
+
+        # The token sits inside the first chunk's content and again later, so
+        # splitting the rendered text on it undercounts both reads.
+        body = "prose line with words\n" * 30
+        text = body + PROGRESSIVE_FOOTER_TOKEN + "0-1/2]\n" + body * 3 + PROGRESSIVE_FOOTER_TOKEN
+        text += body * 2
+        mgr, store = _make_manager_with_store(
+            tmp_path,
+            compression=strategy,
+            max_result_chars=len(text) // 4,
+            progressive=ProgressiveConfig(chunk_size=1200),
+        )
+        mgr._config.upstream_servers["srv"].cleaning = CleaningConfig(enabled=False)
+        tracker = _attach_reads_tracker(mgr, tmp_path)
+        mgr._connections["srv"].session.call_tool.return_value = _make_result(text)
+        try:
+            first = await mgr.call_tool("srv", "tool", {})
+            assert "progressive" in _latest_row(store)["compression_strategy"]
+            start, end, total = _served_range(first)
+            assert (start, total) == (0, len(text))
+            assert first.index(PROGRESSIVE_FOOTER_TOKEN) < end, "token not inside the chunk"
+            key = _progressive_key(first)
+
+            delivered_follow_up = 0
+            offset = end
+            while offset < total:
+                chunk = mgr.read_more(key, offset)
+                s, e, _ = _served_range(chunk)
+                assert s == offset
+                delivered_follow_up += e - s
+                offset = e
+            assert delivered_follow_up == total - end
+
+            stats = tracker.get_stats("tool")
+            assert stats["initial_payload_chars"] == end
+            assert stats["follow_up_payload_chars"] == delivered_follow_up
+            assert stats["unclassified_reads"] == 0
+        finally:
+            tracker.close()
+
+    async def test_repeated_overlapping_and_offset_zero_reads_count_again(self, tmp_path):
+        text = "alpha beta gamma delta\n" * 400
+        mgr, store = _make_manager_with_store(
+            tmp_path,
+            compression=CompressionStrategy.PROGRESSIVE,
+            progressive=ProgressiveConfig(chunk_size=1000),
+        )
+        mgr._config.upstream_servers["srv"].cleaning = CleaningConfig(enabled=False)
+        tracker = _attach_reads_tracker(mgr, tmp_path)
+        mgr._connections["srv"].session.call_tool.return_value = _make_result(text)
+        try:
+            first = await mgr.call_tool("srv", "tool", {})
+            key = _progressive_key(first)
+            _, initial_end, total = _served_range(first)
+            expected_follow_up = 0
+            for offset in (initial_end, initial_end, initial_end // 2, 0):
+                s, e, _ = _served_range(mgr.read_more(key, offset))
+                expected_follow_up += e - s
+            # EOF and an unknown key deliver nothing and record nothing.
+            assert "no more content" in mgr.read_more(key, total)
+            assert "not found" in mgr.read_more("missing-key", 0)
+
+            stats = tracker.get_stats("tool")
+            assert stats["initial_payload_chars"] == initial_end
+            assert stats["follow_up_payload_chars"] == expected_follow_up
+            assert stats["total_reads"] == 5
+            assert stats["unclassified_reads"] == 0
+        finally:
+            tracker.close()
+
+    @pytest.mark.parametrize("failure", ["disabled", "write_fails"])
+    async def test_missing_read_telemetry_leaves_the_response_intact(self, tmp_path, failure):
+        text = "alpha beta gamma delta\n" * 400
+        responses = []
+        for arm in ("baseline", failure):
+            directory = tmp_path / arm
+            directory.mkdir()
+            mgr, store = _make_manager_with_store(
+                directory,
+                compression=CompressionStrategy.PROGRESSIVE,
+                progressive=ProgressiveConfig(chunk_size=1000),
+            )
+            mgr._config.upstream_servers["srv"].cleaning = CleaningConfig(enabled=False)
+            tracker = None
+            if arm != "disabled":
+                tracker = _attach_reads_tracker(mgr, directory)
+            if arm == "write_fails":
+                assert tracker is not None
+
+                def _boom(*_args, **_kwargs):
+                    raise sqlite3.OperationalError("disk I/O error")
+
+                tracker.store.record = _boom  # type: ignore[method-assign]
+            mgr._connections["srv"].session.call_tool.return_value = _make_result(text)
+            try:
+                first = await mgr.call_tool("srv", "tool", {})
+                key = _progressive_key(first)
+                second = mgr.read_more(key, _served_range(first)[1])
+                # Keys are random per call; compare everything else.
+                responses.append(
+                    (first.replace(key, "KEY"), second.replace(key, "KEY"), _latest_row(store))
+                )
+                if arm == "write_fails":
+                    assert tracker is not None
+                    tracker.store.record = type(tracker.store).record.__get__(tracker.store)
+                    assert tracker.get_stats()["total_reads"] == 0
+            finally:
+                if tracker is not None:
+                    tracker.close()
+        assert responses[0] == responses[1]
+
+    @pytest.mark.parametrize(
+        ("text", "chunked"),
+        [
+            (json.dumps([{"id": i, "b": "alpha beta " * 10} for i in range(20)]), False),
+            (json.dumps([{"id": i, "b": "alpha beta gamma " * 20} for i in range(60)]), True),
+        ],
+        ids=["fits-one-chunk", "chunked"],
+    )
+    async def test_explicit_progressive_ratio_and_budget_advice(self, tmp_path, text, chunked):
+        """The measured transition the changelog states.
+
+        Main recorded ``len(cleaned)`` for explicit progressive, a 1.00 ratio
+        that satisfied H2 and advised shrinking a ``max_result_chars`` this
+        path never reads. A chunked response now records its first delivery;
+        a response that fits one chunk still records 1.00.
+        """
+        from memtomem_stm.proxy.tuner import CompressionTuner
+
+        mgr, store = _make_manager_with_store(
+            tmp_path, compression=CompressionStrategy.PROGRESSIVE, max_result_chars=50000
+        )
+        mgr._connections["srv"].session.call_tool.return_value = _make_result(text)
+        responses = [await mgr.call_tool("srv", "tool", {"i": i}) for i in range(6)]
+        assert all(("stm_proxy_read_more" in r) is chunked for r in responses)
+        tuner = CompressionTuner(store, config=mgr._config)
+        (profile,) = tuner.get_profiles()
+        assert profile.ratio_count == 6
+        assert profile.avg_ratio is not None
+        budget_advice = [
+            a for rec in tuner.analyze() for a in rec.actions if a.field == "max_result_chars"
+        ]
+        rows = store._db.execute("SELECT cleaned_chars, compressed_chars FROM proxy_metrics")
+        if chunked:
+            # The example the changelog quotes.
+            assert set(rows.fetchall()) == {(21650, 4142)}
+            assert profile.avg_ratio < 0.95
+            assert budget_advice == []
+        else:
+            assert profile.avg_ratio == 1.0
+            # Known gap, deliberately out of scope for #1039: a single-chunk
+            # explicit progressive response still reads as "the budget always
+            # fits", so H2 advises shrinking a max_result_chars this path never
+            # consults. Pinned so the day it is fixed, this test says so.
+            assert [a.field for a in budget_advice] == ["max_result_chars"]
+
+    async def test_cache_hit_adds_no_persisted_call_row(self, tmp_path):
+        cache = ProxyCache(tmp_path / "cache.db", max_entries=100)
+        cache.initialize()
+        mgr, store = _make_manager_with_store(tmp_path)
+        mgr._cache = cache
+        mgr._connections["srv"].session.call_tool.return_value = _make_result("ok " * 50)
+        try:
+            await mgr.call_tool("srv", "tool", {})
+            rows = store._db.execute("SELECT COUNT(*) FROM proxy_metrics").fetchone()[0]
+            await mgr.call_tool("srv", "tool", {})
+            assert mgr._connections["srv"].session.call_tool.await_count == 1
+            assert store._db.execute("SELECT COUNT(*) FROM proxy_metrics").fetchone()[0] == rows
+        finally:
+            cache.close()
+
+
+def _big_json() -> str:
+    return json.dumps([{"id": i, "body": "alpha beta gamma " * 20} for i in range(60)])
+
+
+async def _scenario_truncate(mgr):
+    mgr._connections["srv"].session.call_tool.return_value = _make_result("word " * 20000)
+    await mgr.call_tool("srv", "tool", {})
+
+
+async def _scenario_passthrough(mgr):
+    mgr._connections["srv"].session.call_tool.return_value = _make_result("ok")
+    await mgr.call_tool("srv", "tool", {})
+
+
+async def _scenario_explicit_progressive(mgr):
+    mgr._config.upstream_servers["srv"].compression = CompressionStrategy.PROGRESSIVE
+    mgr._connections["srv"].config.compression = CompressionStrategy.PROGRESSIVE
+    mgr._connections["srv"].session.call_tool.return_value = _make_result(_big_json())
+    await mgr.call_tool("srv", "tool", {})
+
+
+async def _scenario_progressive_fallback(mgr):
+    mgr._config.upstream_servers["srv"].compression = CompressionStrategy.AUTO
+    mgr._connections["srv"].config.compression = CompressionStrategy.AUTO
+    mgr._config.upstream_servers["srv"].max_result_chars = 1000
+    mgr._connections["srv"].config.max_result_chars = 1000
+    mgr._connections["srv"].session.call_tool.return_value = _make_result(_big_json())
+    await mgr.call_tool("srv", "tool", {})
+
+
+async def _scenario_empty(mgr):
+    mgr._connections["srv"].session.call_tool.return_value = SimpleNamespace(
+        content=[], is_error=False
+    )
+    await mgr.call_tool("srv", "tool", {})
+
+
+async def _scenario_non_text(mgr):
+    img = SimpleNamespace(type="image", data="x", mimeType="image/png")
+    mgr._connections["srv"].session.call_tool.return_value = SimpleNamespace(
+        content=[img], is_error=False
+    )
+    await mgr.call_tool("srv", "tool", {})
+
+
+async def _scenario_upstream_is_error(mgr):
+    mgr._connections["srv"].session.call_tool.return_value = SimpleNamespace(
+        content=[_text_content("upstream says no " * 20)], is_error=True
+    )
+    await mgr.call_tool("srv", "tool", {})
+
+
+async def _scenario_lock_timeout(mgr):
+    from memtomem_stm.proxy._locks import LockTimeoutError
+
+    async def _stuck(*_args, **_kwargs):
+        raise LockTimeoutError("stuck", 0.01)
+
+    mgr._compress_and_surface = _stuck
+    mgr._connections["srv"].session.call_tool.return_value = _make_result("word " * 2000)
+    with pytest.raises(LockTimeoutError):
+        await mgr.call_tool("srv", "tool", {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scenario", "sized_success", "label"),
+    [
+        (_scenario_truncate, True, "truncate"),
+        (_scenario_passthrough, True, None),
+        (_scenario_explicit_progressive, True, "progressive"),
+        (_scenario_progressive_fallback, True, "progressive_fallback"),
+        (_scenario_empty, False, None),
+        (_scenario_non_text, None, None),
+        (_scenario_upstream_is_error, False, None),
+        (_scenario_lock_timeout, False, None),
+    ],
+    ids=lambda v: getattr(v, "__name__", str(v)).removeprefix("_scenario_"),
+)
+async def test_current_writers_never_read_as_legacy_accounting(
+    tmp_path, scenario, sized_success, label
+):
+    """Rows written by current code must not trigger the legacy warning (#1039).
+
+    Covers only the scenarios listed: a writer branch no scenario executes is
+    not protected here. ``sized_success`` says whether the scenario must write a
+    stamped successful row (``None``: not asserted either way).
+    """
+    from memtomem_stm.proxy.metrics_store import read_compression_summary
+
+    mgr, store = _make_manager_with_store(tmp_path)
+    await scenario(mgr)
+    rows = store._db.execute(
+        "SELECT is_error, original_chars, compressed_chars, compression_accounting, "
+        "compression_strategy FROM proxy_metrics"
+    ).fetchall()
+    assert rows, "the scenario wrote no metrics row"
+    if label is not None:
+        # The scenario reached the path it is named for.
+        assert any(r[4] is not None and r[4].endswith(label) for r in rows), rows
+    for is_error, original, compressed, accounting, _ in rows:
+        if not is_error and (original or compressed):
+            assert accounting == "initial_response_v1", rows
+    stamped = [r for r in rows if r[3] == "initial_response_v1"]
+    if sized_success is True:
+        assert stamped, rows
+    elif sized_success is False:
+        assert not stamped, rows
+    summary = read_compression_summary(tmp_path / "metrics.db")
+    assert summary["unclassified_mcp_calls"] == 0
+    assert "unclassified" not in summary["measurement"]

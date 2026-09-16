@@ -1800,3 +1800,152 @@ class TestBusyTimeoutReachesTuning:
             store.close()
 
         assert calls == [{}], "a store with no budget of its own must take the shared default"
+
+
+def test_summary_reports_accounting_provenance_without_rewriting_history(tmp_path):
+    from memtomem_stm.proxy.metrics_store import read_compression_summary
+
+    path = tmp_path / "metrics.db"
+    store = MetricsStore(path)
+    store.initialize()
+    try:
+        store.record(
+            CallMetrics(
+                server="s",
+                tool="t",
+                original_chars=10000,
+                compressed_chars=10000,
+                compression_strategy="progressive",
+            )
+        )
+        store.record(
+            CallMetrics(
+                server="s",
+                tool="t",
+                original_chars=10000,
+                compressed_chars=4000,
+                compression_strategy="progressive",
+                compression_accounting="initial_response_v1",
+            )
+        )
+        store.record(
+            CallMetrics(
+                server="builtin",
+                tool="Bash",
+                original_chars=100,
+                compressed_chars=100,
+                source="hook",
+            )
+        )
+        summary = read_compression_summary(path)
+        assert summary["initial_response_calls"] == 1
+        assert summary["unclassified_mcp_calls"] == 1
+        assert summary["total_compressed_chars"] == 14100
+        hooks = read_compression_summary(path, source="hook")
+        assert hooks["unclassified_mcp_calls"] == 0
+        assert hooks["initial_response_calls"] == 0
+        assert read_compression_summary(path, tool="missing")["unclassified_mcp_calls"] == 0
+    finally:
+        store.close()
+
+
+def test_current_error_and_empty_rows_do_not_read_as_legacy_accounting(tmp_path):
+    """Unstamped rows with no success size carry no basis to warn about (#1039).
+
+    Current code stamps only its successful compression row; errors (0/0 and
+    the upstream ``isError`` shape that records the error text size) and
+    no-payload successes stay unstamped and must not raise the legacy warning.
+    """
+    from memtomem_stm.proxy.metrics_store import read_compression_summary
+
+    path = tmp_path / "metrics.db"
+    store = MetricsStore(path)
+    store.initialize()
+    try:
+        for metrics in (
+            CallMetrics(server="s", tool="t", original_chars=0, compressed_chars=0, is_error=True),
+            CallMetrics(
+                server="s", tool="t", original_chars=340, compressed_chars=340, is_error=True
+            ),
+            CallMetrics(server="s", tool="t", original_chars=0, compressed_chars=0),
+        ):
+            store.record(metrics)
+    finally:
+        store.close()
+    summary = read_compression_summary(path)
+    assert summary["total_calls"] == 3
+    assert summary["unclassified_mcp_calls"] == 0
+    assert "unclassified" not in summary["measurement"]
+
+
+_LEGACY_OPTIONAL_COLUMNS = ("is_error", "source", "compression_accounting")
+
+
+@pytest.mark.parametrize(
+    "present",
+    [
+        frozenset(c)
+        for n in range(len(_LEGACY_OPTIONAL_COLUMNS) + 1)
+        for c in __import__("itertools").combinations(_LEGACY_OPTIONAL_COLUMNS, n)
+    ],
+    ids=lambda p: "+".join(sorted(p)) or "base",
+)
+def test_legacy_schemas_classify_without_migrating(tmp_path, present):
+    """Every present/absent optional-column combination reads without SQL error,
+    counts sized unstamped success rows (even with default-zero ``cleaned_chars``)
+    as unclassified, and leaves the file byte-for-byte unchanged (#1039)."""
+    from memtomem_stm.proxy.metrics_store import read_compression_summary
+
+    path = tmp_path / "legacy.db"
+    columns = [
+        "id INTEGER PRIMARY KEY AUTOINCREMENT",
+        "server TEXT",
+        "tool TEXT",
+        "original_chars INTEGER",
+        "compressed_chars INTEGER",
+        "cleaned_chars INTEGER DEFAULT 0",
+        "created_at REAL",
+    ]
+    if "is_error" in present:
+        columns.append("is_error INTEGER NOT NULL DEFAULT 0")
+    if "source" in present:
+        columns.append("source TEXT NOT NULL DEFAULT 'mcp'")
+    if "compression_accounting" in present:
+        columns.append("compression_accounting TEXT DEFAULT NULL")
+    db = sqlite3.connect(path)
+    db.execute(f"CREATE TABLE proxy_metrics ({', '.join(columns)})")
+    insert = (
+        "INSERT INTO proxy_metrics (server, tool, original_chars, compressed_chars, created_at)"
+    )
+    # Two legacy measured rows: explicit progressive (whole text) and fallback.
+    db.execute(insert + " VALUES ('s', 't', 10000, 10000, 0)")
+    db.execute(insert + " VALUES ('s', 't', 10000, 4000, 0)")
+    expected = 2
+    if "is_error" in present:
+        db.execute(
+            "INSERT INTO proxy_metrics (server, tool, original_chars, compressed_chars, "
+            "created_at, is_error) VALUES ('s', 't', 300, 300, 0, 1)"
+        )
+    if "source" in present:
+        db.execute(
+            "INSERT INTO proxy_metrics (server, tool, original_chars, compressed_chars, "
+            "created_at, source) VALUES ('builtin', 'Bash', 100, 100, 0, 'hook')"
+        )
+    if "compression_accounting" in present:
+        db.execute(
+            "INSERT INTO proxy_metrics (server, tool, original_chars, compressed_chars, "
+            "created_at, compression_accounting) "
+            "VALUES ('s', 't', 10000, 4000, 0, 'initial_response_v1')"
+        )
+    db.commit()
+    db.close()
+    before = path.read_bytes()
+
+    summary = read_compression_summary(path)
+
+    assert summary["error"] is None
+    assert summary["available"] is True
+    assert summary["unclassified_mcp_calls"] == expected
+    assert summary["initial_response_calls"] == (1 if "compression_accounting" in present else 0)
+    assert "unclassified" in summary["measurement"]
+    assert path.read_bytes() == before

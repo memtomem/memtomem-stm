@@ -39,6 +39,7 @@ def _seed_metrics(
     violation: bool = False,
     is_error: bool = False,
     auto_selected: bool | None = None,
+    accounting: str | None = "initial_response_v1",
 ) -> None:
     """Record ``count`` identical calls.
 
@@ -49,6 +50,8 @@ def _seed_metrics(
     default ``None`` for a row recording no provenance at all — what every
     row written before that column existed looks like.  H3 counts only the
     ``True`` rows, so a test about AUTO's behavior has to say so.
+    ``accounting=None`` seeds a row of unknown accounting basis (#1039), which
+    ``avg_ratio`` does not read.
     """
     for _ in range(count):
         store.record(
@@ -62,6 +65,7 @@ def _seed_metrics(
                 strategy_auto_selected=auto_selected,
                 ratio_violation=violation,
                 is_error=is_error,
+                compression_accounting=accounting,
             )
         )
 
@@ -448,7 +452,7 @@ class TestAnalyze:
         recs = tuner.analyze()
         assert len(recs) == 1
         assert [a.field for a in recs[0].actions] == ["max_result_chars"]
-        assert "over 1 of 25 calls" in recs[0].actions[0].reason
+        assert "over 1 classified of 25 calls" in recs[0].actions[0].reason
         assert recs[0].confidence == "low"
 
     def test_h2_confidence_rises_with_the_eligible_rows(self, metrics_store: MetricsStore):
@@ -988,3 +992,57 @@ class TestFormatRecommendations:
         output = format_recommendations(recs, profiles, 24.0)
         assert "srv/t1" in output
         assert "Violation rate" in output
+
+
+# ── #1039: ratio evidence is classified accounting only ───────────────────
+
+
+def test_legacy_only_history_gives_no_ratio_advice(metrics_store: MetricsStore):
+    """Rows of unknown basis include explicit progressive calls that recorded
+    their whole text as delivered; they must not read as "the budget fits"."""
+    cfg = ProxyConfig(
+        upstream_servers={"srv": UpstreamServerConfig(prefix="test", max_result_chars=50000)}
+    )
+    _seed_metrics(
+        metrics_store,
+        "srv",
+        "t1",
+        25,
+        original_chars=2000,
+        compressed_chars=2000,
+        strategy="progressive",
+        accounting=None,
+    )
+    tuner = CompressionTuner(metrics_store, config=cfg)
+    (p,) = tuner.get_profiles()
+    assert p.call_count == 25
+    assert p.avg_ratio is None
+    assert p.ratio_count == 0
+    assert tuner.analyze() == []
+
+
+def test_mixed_history_averages_and_labels_only_classified_rows(metrics_store: MetricsStore):
+    cfg = ProxyConfig(
+        upstream_servers={"srv": UpstreamServerConfig(prefix="test", max_result_chars=50000)}
+    )
+    # Legacy rows at ratio 0.5 would pull the average below the H2 threshold
+    # if they were read; the 12 classified rows sit above it.
+    _seed_metrics(
+        metrics_store,
+        "srv",
+        "t1",
+        13,
+        original_chars=2000,
+        compressed_chars=1000,
+        accounting=None,
+    )
+    _seed_metrics(metrics_store, "srv", "t1", 12, original_chars=2000, compressed_chars=1990)
+    tuner = CompressionTuner(metrics_store, config=cfg)
+    (p,) = tuner.get_profiles()
+    assert p.ratio_count == 12
+    assert p.avg_ratio == pytest.approx(0.995)
+    (rec,) = tuner.analyze()
+    assert [a.field for a in rec.actions] == ["max_result_chars"]
+    assert "over 12 classified of 25 calls" in rec.actions[0].reason
+    assert rec.confidence == "medium"
+    assert "(12 classified calls)" in format_recommendations([rec], [p], 24.0)

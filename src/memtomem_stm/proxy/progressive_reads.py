@@ -58,6 +58,7 @@ class ProgressiveReadsTracker:
                 offset=0,
                 chars=initial_chars,
                 served_to=initial_chars,
+                is_initial=True,
                 total_chars=total_chars,
             )
         except ValueError:
@@ -86,6 +87,7 @@ class ProgressiveReadsTracker:
                 offset=offset,
                 chars=chars,
                 served_to=offset + chars,
+                is_initial=False,
                 total_chars=total_chars,
             )
         except ValueError:

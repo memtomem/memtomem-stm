@@ -28,6 +28,9 @@ class TestProgressiveReadsStore:
         try:
             stats = store.get_stats()
             assert stats == {
+                "initial_payload_chars": 0,
+                "follow_up_payload_chars": 0,
+                "unclassified_reads": 0,
                 "total_reads": 0,
                 "total_responses": 0,
                 "follow_up_rate": 0.0,
@@ -366,3 +369,125 @@ class TestProgressiveReadsTracker:
             assert (tmp_path / "pr_expand.db").exists()
         finally:
             tracker.close()
+
+
+@pytest.mark.parametrize(
+    "follow_ups", [[], [(4000, 6000)], [(0, 4000), (4000, 6000), (4000, 6000)]]
+)
+def test_delivery_volume_counts_repeated_reads(tmp_path, follow_ups):
+    tracker = ProgressiveReadsTracker(tmp_path / "reads.db", retention_days=0)
+    try:
+        tracker.record_initial(
+            key="k", trace_id=None, server="s", tool="t", initial_chars=4000, total_chars=10000
+        )
+        for offset, chars in follow_ups:
+            tracker.record_follow_up(
+                key="k",
+                trace_id=None,
+                server="s",
+                tool="t",
+                offset=offset,
+                chars=chars,
+                total_chars=10000,
+            )
+        stats = tracker.get_stats("t")
+        assert stats["initial_payload_chars"] == 4000
+        assert stats["follow_up_payload_chars"] == sum(chars for _, chars in follow_ups)
+        assert stats["unclassified_reads"] == 0
+        # Legacy/third-party writers cannot be classified by offset alone.
+        tracker.store.record("old", None, "s", "t", 0, 123, 123, 10000)
+        stats = tracker.get_stats("t")
+        assert stats["unclassified_reads"] == 1
+        assert stats["initial_payload_chars"] == 4000
+        assert stats["follow_up_payload_chars"] == sum(chars for _, chars in follow_ups)
+    finally:
+        tracker.close()
+
+
+def test_read_kind_migration_preserves_unknown_legacy_rows(tmp_path):
+    import sqlite3
+    from memtomem_stm.proxy.progressive_reads_store import _SCHEMA
+
+    path = tmp_path / "legacy.db"
+    with sqlite3.connect(path) as db:
+        db.executescript(_SCHEMA)
+        db.execute(
+            "INSERT INTO progressive_reads "
+            "(key, server, tool, offset, chars, served_to, total_chars, created_at) "
+            "VALUES ('old', 's', 't', 0, 4000, 4000, 10000, 0)"
+        )
+    for _ in range(2):
+        store = ProgressiveReadsStore(path, retention_days=0)
+        store.initialize()
+        try:
+            stats = store.get_stats()
+            assert stats["unclassified_reads"] == 1
+            assert stats["initial_payload_chars"] == 0
+            assert stats["follow_up_payload_chars"] == 0
+        finally:
+            store.close()
+
+
+def test_stats_come_from_one_statement(tmp_path):
+    """Counts and volumes share one snapshot while other processes append (#1039)."""
+    tracker = ProgressiveReadsTracker(tmp_path / "reads.db", retention_days=0)
+    try:
+        tracker.record_initial(
+            key="k", trace_id=None, server="s", tool="t", initial_chars=40, total_chars=100
+        )
+        tracker.record_follow_up(
+            key="k", trace_id=None, server="s", tool="t", offset=40, chars=60, total_chars=100
+        )
+        real = tracker.store._db
+        statements: list[str] = []
+
+        class _Recording:
+            def execute(self, sql, params=()):
+                statements.append(sql)
+                return real.execute(sql, params)
+
+        tracker.store._db = _Recording()  # type: ignore[assignment]
+        try:
+            stats = tracker.get_stats()
+            assert len(statements) == 1, statements
+            assert stats["total_reads"] == 2
+            assert stats["initial_payload_chars"] + stats["follow_up_payload_chars"] == 100
+        finally:
+            tracker.store._db = real
+    finally:
+        tracker.close()
+
+
+def test_concurrent_startups_migrate_a_legacy_db_once(tmp_path):
+    import sqlite3
+    import threading
+
+    from memtomem_stm.proxy.progressive_reads_store import _SCHEMA
+
+    path = tmp_path / "legacy.db"
+    with sqlite3.connect(path) as db:
+        db.executescript(_SCHEMA)
+    barrier = threading.Barrier(6)
+    errors: list[BaseException] = []
+    stores: list[ProgressiveReadsStore] = []
+
+    def start():
+        store = ProgressiveReadsStore(path, retention_days=0)
+        barrier.wait()
+        try:
+            store.initialize()
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the assert
+            errors.append(exc)
+        stores.append(store)
+
+    threads = [threading.Thread(target=start) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    for store in stores:
+        store.close()
+    assert errors == []
+    with sqlite3.connect(path) as db:
+        columns = [row[1] for row in db.execute("PRAGMA table_info(progressive_reads)")]
+    assert columns.count("is_initial") == 1

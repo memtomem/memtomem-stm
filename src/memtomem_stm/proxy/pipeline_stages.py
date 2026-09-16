@@ -68,10 +68,10 @@ class CompressionResult:
     Carries BOTH ``compressed`` (pre-surfacing — the cache payload) and
     ``surfaced`` (post-surfacing — the return/index input) as distinct fields:
     the cache stores the former while the agent and the index footer see the
-    latter. ``compressed_chars_for_metrics`` is branch-dependent —
-    ``len(compressed)`` on the compress branch but ``len(cleaned)`` on the
-    zero-loss progressive branch. ``metrics_strategy`` is the fully-mutated label
-    (e.g. ``"truncate→progressive_fallback"``). ``progressive_passthrough_on_error``
+    latter. ``compressed_chars_for_metrics`` is ``len(compressed)`` on every
+    branch: the first returned text, including compression metadata but before
+    surfacing. Follow-up reads have separate telemetry. ``metrics_strategy`` is
+    the fully-mutated label (e.g. ``"truncate→progressive_fallback"``). ``progressive_passthrough_on_error``
     gates the cache store: a transient progressive-store-failure passthrough must
     not be cached.
     """
@@ -103,7 +103,7 @@ class CompressionResult:
     # ``token_estimation_mode == "unicode"``, non-progressive branch). Keys the
     # metrics estimator switch in ``_call_tool_inner`` so recorded token counts
     # always reconcile with the gate decision — and never flip the progressive
-    # branch's deliberate ``len(cleaned)`` accounting basis. No default: both
+    # branch's estimator. No default: both
     # branches set it explicitly.
     unicode_token_gate: bool
 
