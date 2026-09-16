@@ -6222,6 +6222,11 @@ class ProxyManager:
         # (not only in the else-branch) because the shared CompressionResult
         # construction at the end reads it on the PROGRESSIVE path too.
         selective_store_error = False
+        # Set True right after either ``_apply_progressive`` call below returns:
+        # the response now names a live progressive key and must not be cached.
+        # Carried out of band so this manager's own keys stay out of the cache
+        # regardless of how the footer is worded (#1046).
+        progressive_key_issued = False
         # Set True when the opt-in unicode token gate evaluates this response
         # (else-branch only — PROGRESSIVE is zero-loss and has no size gate).
         # Read by the metrics block in ``_call_tool_inner`` to pick the token
@@ -6247,6 +6252,7 @@ class ProxyManager:
                         trace_id=trace_id,
                         cfg_snap=cfg_snap,
                     )
+                    progressive_key_issued = True
                 except Exception:
                     # Progressive build/store failed (e.g. a SQLite-backed
                     # pending/reads store I/O error inside ``_apply_progressive``).
@@ -6471,6 +6477,7 @@ class ProxyManager:
                                 )
                                 metrics_strategy = f"{original_strategy}→progressive_fallback"
                                 progressive_fallback = True
+                                progressive_key_issued = True
                                 logger.info(
                                     "Progressive fallback for %s/%s: %s "
                                     "(ratio %.3f < %.3f, ttl=%ds)",
@@ -6638,6 +6645,7 @@ class ProxyManager:
             compress_ms=_compress_ms,
             surface_ms=_surface_ms,
             selective_store_error=selective_store_error,
+            progressive_key_issued=progressive_key_issued,
             unicode_token_gate=unicode_token_gate,
         )
 
@@ -7144,9 +7152,14 @@ class ProxyManager:
           ``stm_proxy_select_chunks`` key.
 
         Skipping the store makes the next identical call re-run the pipeline and
-        mint a fresh, live key. Detection is marker-based (shared with the startup
-        legacy purge in ``ProxyCache.initialize``); a false positive only costs one
-        un-cached response, never correctness.
+        mint a fresh, live key. A progressive first chunk this manager produced is
+        recognized by ``comp.progressive_key_issued``, set where the key is minted.
+        Text from upstream is checked by ``response_carries_transient_key``, shared
+        with the startup legacy purge in ``ProxyCache.initialize``: a progressive
+        footer counts only together with its ``stm_proxy_read_more(key=...)`` call,
+        so content that merely quotes the footer is cached, while a continuation
+        from another STM proxy upstream is not (#1046). A false positive only costs
+        one un-cached response, never correctness.
 
         The key uses ``cache_args`` — the pre-``_trace_id`` snapshot — never the
         trace-mutated upstream args; otherwise every entry is keyed on a per-request
@@ -7204,7 +7217,7 @@ class ProxyManager:
                 server,
                 tool,
             )
-        elif response_carries_transient_key(comp.compressed):
+        elif comp.progressive_key_issued or response_carries_transient_key(comp.compressed):
             self.tracker.record_cache_unstorable()
             logger.debug(
                 "Skipping cache store for %s/%s: response carries a transient "

@@ -80,6 +80,10 @@ changes inline only. See the deprecation policy in
   `internal_error` row recorded by the proxy's own call path now has `is_error = 1`,
   so the error count in `mms stats` and the tuner's error totals rise for tools that
   hit these failures. Rows recorded before the upgrade are not rewritten.
+- **Responses quoting the progressive footer are cached** (#1046). An upstream
+  result that contains `\n---\n[progressive: chars=` without a
+  `stm_proxy_read_more(key="…")` call used to miss the cache on every call; identical
+  calls now hit it, and the row survives restarts.
 
 ### Fixed
 
@@ -152,6 +156,21 @@ changes inline only. See the deprecation policy in
   other reader of the metrics database treated it as a successful call. These
   `lock_timeout` and `internal_error` rows now persist `is_error = 1`. Rows recorded
   before this fix keep `is_error = 0`; they are not rewritten.
+  **Behavior change**: see the upgrade notes above.
+- **Responses that quote the progressive footer are cached** (#1046) — the cache
+  store skipped any response whose text contained `\n---\n[progressive: chars=`,
+  so an upstream result quoting STM's own progressive output (documentation, logs,
+  earlier transcripts) was never cached. A progressive response now counts as
+  carrying a transient key in two cases: this proxy minted the key (recorded where
+  it is minted, on the PROGRESSIVE path and the ratio-guard progressive fallback), or
+  the text has the footer together with its `stm_proxy_read_more(key="…")` call,
+  which is how a continuation from another STM proxy upstream still stays out of the
+  cache. The startup purge of legacy transient-key rows uses the same pair, so it no
+  longer deletes a cached quotation on restart. Text that reproduces a complete
+  footer, key call included, is still not cached. SELECTIVE/HYBRID TOCs are detected
+  by their `"selection_key"` + `"ttl_seconds_remaining"` field pair as before, and a
+  single-chunk progressive passthrough stays cacheable. An older build sharing the
+  cache database still deletes quotation rows whenever it starts.
   **Behavior change**: see the upgrade notes above.
 
 ## [0.5.2] — 2026-09-15

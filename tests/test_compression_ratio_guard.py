@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from memtomem_stm.proxy import cache as cache_module
 from memtomem_stm.proxy.cache import ProxyCache
 from memtomem_stm.proxy.config import (
     CleaningConfig,
@@ -35,6 +36,7 @@ from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
 from memtomem_stm.proxy.metrics import CallMetrics, TokenTracker
 from memtomem_stm.proxy.metrics_store import MetricsStore
 from memtomem_stm.proxy.pending_store import SQLitePendingStore
+from memtomem_stm.proxy.progressive import PROGRESSIVE_FOOTER_TOKEN, ProgressiveChunker
 
 
 _CREATED_MANAGERS: list[ProxyManager] = []
@@ -564,6 +566,108 @@ class TestProxyManagerRatioGuard:
         assert "stm_proxy_read_more" not in first  # single chunk, no footer
         await mgr.call_tool("srv", "tool", {})  # identical call → should hit cache
         assert session.call_tool.call_count == 1  # cache hit → upstream NOT re-called
+        cache.close()
+        store.close()
+
+    async def test_response_quoting_progressive_footer_is_cached(self, tmp_path):
+        """A footer token alone does not mark a response as carrying a key
+        (#1046). Keys this manager minted are flagged where they are minted, and
+        upstream text counts only with its ``stm_proxy_read_more(key=...)`` call.
+        An upstream body that merely quotes the token is neither, so an identical
+        second call is a cache hit."""
+        cache = ProxyCache(tmp_path / "cache.db", max_entries=100)
+        cache.initialize()
+        mgr, store = _make_manager_with_store(tmp_path, max_result_chars=50000)
+        mgr._cache = cache
+        quoting = (
+            "doc quoting" + PROGRESSIVE_FOOTER_TOKEN + "0-1/2]\n" + "a normal response line\n" * 20
+        )
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _make_result(quoting)
+
+        first = await mgr.call_tool("srv", "tool", {})
+        assert PROGRESSIVE_FOOTER_TOKEN in first  # the quotation reaches the agent intact
+        second = await mgr.call_tool("srv", "tool", {})
+        assert session.call_tool.call_count == 1  # cache hit → upstream NOT re-called
+        assert second == first
+        cache.close()
+        store.close()
+
+    @pytest.mark.parametrize("path", ["progressive_strategy", "ratio_guard_fallback"])
+    async def test_own_progressive_key_stays_uncached_without_text_match(
+        self, tmp_path, monkeypatch, path
+    ):
+        """Keys this manager mints are gated by ``progressive_key_issued``, not by
+        the footer text, so rewording the footer cannot let them into the cache
+        (#1046). Disabling the text marker leaves the flag as the only guard, at
+        each of the two ``_apply_progressive`` call sites."""
+        monkeypatch.setattr(cache_module, "_READ_MORE_KEY_MARKER", "\x00never-matches\x00")
+        cache = ProxyCache(tmp_path / "cache.db", max_entries=100)
+        cache.initialize()
+        if path == "progressive_strategy":
+            mgr, store = _make_manager_with_store(
+                tmp_path,
+                compression=CompressionStrategy.PROGRESSIVE,
+                progressive=ProgressiveConfig(chunk_size=500),
+            )
+        else:
+            mgr, store = _make_manager_with_store(
+                tmp_path, min_retention=0.65, max_result_chars=500
+            )
+            mgr._apply_compression = AsyncMock(return_value=("x" * 100, None))
+        mgr._cache = cache
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _make_result("content paragraph. " * 800)
+
+        first = await mgr.call_tool("srv", "tool", {})
+        assert "stm_proxy_read_more" in first
+        assert not cache_module.response_carries_transient_key(first)  # text check is off
+        assert cache.stats()["total_entries"] == 0
+        cache.close()
+        store.close()
+
+    async def test_upstream_progressive_continuation_is_not_cached(self, tmp_path):
+        """An upstream that is itself an STM proxy returns a first chunk naming a
+        key in ITS progressive store. This manager minted nothing, but caching the
+        chunk would replay that key after the upstream expires it, so the text
+        check still refuses a footer that carries a read_more key call (#1046)."""
+        cache = ProxyCache(tmp_path / "cache.db", max_entries=100)
+        cache.initialize()
+        mgr, store = _make_manager_with_store(tmp_path, max_result_chars=50000)
+        mgr._cache = cache
+        upstream_chunk = ProgressiveChunker(chunk_size=500).first_chunk(
+            "paragraph sentence here. " * 200, "0123456789abcdef", ttl_seconds=1800
+        )
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _make_result(upstream_chunk)
+
+        first = await mgr.call_tool("srv", "tool", {})
+        assert 'stm_proxy_read_more(key="0123456789abcdef"' in first  # passed through
+        assert cache.stats()["total_entries"] == 0
+        await mgr.call_tool("srv", "tool", {})
+        assert session.call_tool.call_count == 2  # cache miss → upstream re-called
+        cache.close()
+        store.close()
+
+    async def test_progressive_fallback_first_chunk_is_not_cached(self, tmp_path):
+        """The ratio guard's Tier-1 progressive fallback mints a key too, so its
+        first chunk must stay out of the cache exactly like the PROGRESSIVE
+        strategy's."""
+        cache = ProxyCache(tmp_path / "cache.db", max_entries=100)
+        cache.initialize()
+        mgr, store = _make_manager_with_store(tmp_path, min_retention=0.65, max_result_chars=500)
+        mgr._cache = cache
+        large_text = "content paragraph. " * 800
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = _make_result(large_text)
+        mgr._apply_compression = AsyncMock(return_value=("x" * 100, None))
+
+        first = await mgr.call_tool("srv", "tool", {})
+        assert "→progressive_fallback" in _latest_row(store)["compression_strategy"]
+        assert "stm_proxy_read_more" in first
+        assert cache.stats()["total_entries"] == 0  # nothing stored under ANY key
+        await mgr.call_tool("srv", "tool", {})
+        assert session.call_tool.call_count == 2  # cache miss → upstream re-called
         cache.close()
         store.close()
 
