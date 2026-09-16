@@ -99,6 +99,14 @@ class CompressionResult:
     # transient, and must not be pinned for the cache TTL. No default (the
     # module contract above): the compress branch always sets it explicitly.
     selective_store_error: bool
+    # ``_apply_progressive`` returned on this call, so ``compressed`` is a first
+    # chunk whose footer names a key in the process-local progressive store. Gates
+    # the cache store: that key dies long before the cache TTL. Set where the key
+    # is minted, so this manager's own keys do not depend on the footer wording;
+    # the text check in the cache layer covers keys from an upstream (#1046). No
+    # default (the module contract above): the compress stage always sets it
+    # explicitly.
+    progressive_key_issued: bool
     # The opt-in unicode token gate evaluated THIS response (token budget set,
     # ``token_estimation_mode == "unicode"``, non-progressive branch). Keys the
     # metrics estimator switch in ``_call_tool_inner`` so recorded token counts

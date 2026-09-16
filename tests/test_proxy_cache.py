@@ -20,7 +20,7 @@ from memtomem_stm.proxy.cache import (
     response_carries_transient_key,
 )
 from memtomem_stm.proxy.compression import HybridCompressor, SelectiveCompressor
-from memtomem_stm.proxy.progressive import PROGRESSIVE_FOOTER_TOKEN
+from memtomem_stm.proxy.progressive import PROGRESSIVE_FOOTER_TOKEN, ProgressiveChunker
 
 # Markdown with enough sections that SELECTIVE/HYBRID emit a chunk TOC (which
 # embeds a transient ``selection_key``) instead of falling back to truncation.
@@ -28,6 +28,9 @@ _TOC_TEXT = "# Doc\n\n" + "\n\n".join(
     f"## Section {i} heading text\n" + ("alpha beta gamma delta epsilon zeta " * 12)
     for i in range(12)
 )
+
+_PROGRESSIVE_TEXT = "paragraph sentence here. " * 200  # 5000 chars
+_QUOTED_FOOTER = f"doc quoting{PROGRESSIVE_FOOTER_TOKEN}0-1/2]\na normal response line\n"
 
 
 def _read_privacy_policy_stamp(db_path: Path) -> str | None:
@@ -252,8 +255,28 @@ class TestTransientKeyDetector:
         assert not response_carries_transient_key("just a normal tool response")
 
     def test_progressive_footer_is_transient(self):
-        text = f"chunk body{PROGRESSIVE_FOOTER_TOKEN}0-100/500] use stm_proxy_read_more"
+        text = ProgressiveChunker(chunk_size=500).first_chunk(
+            _PROGRESSIVE_TEXT, "0123456789abcdef", ttl_seconds=1800
+        )
         assert response_carries_transient_key(text)
+
+    def test_mid_read_more_chunk_is_transient(self):
+        # A non-final ``stm_proxy_read_more`` result names the key as well; one
+        # proxied from another STM upstream must not be cached either.
+        text = ProgressiveChunker(chunk_size=500).read_chunk(
+            _PROGRESSIVE_TEXT, 1000, None, "0123456789abcdef", ttl_seconds=1800
+        )
+        assert response_carries_transient_key(text)
+
+    def test_quoted_footer_without_key_call_is_not_transient(self):
+        # Upstream content quoting the footer token names no key (#1046).
+        assert not response_carries_transient_key(_QUOTED_FOOTER)
+        # Neither is the final chunk of a delivery, which carries no key call.
+        last = ProgressiveChunker(chunk_size=500).read_chunk(
+            _PROGRESSIVE_TEXT, 4800, None, "0123456789abcdef"
+        )
+        assert PROGRESSIVE_FOOTER_TOKEN in last
+        assert not response_carries_transient_key(last)
 
     def test_selective_toc_is_transient(self):
         out = SelectiveCompressor().compress(_TOC_TEXT, max_chars=600)
@@ -303,9 +326,12 @@ class TestLegacyTransientPurge:
                 "s",
                 "prog",
                 {},
-                f"chunk{PROGRESSIVE_FOOTER_TOKEN}0-9/99] more",
+                ProgressiveChunker(chunk_size=500).first_chunk(
+                    _PROGRESSIVE_TEXT, "0123456789abcdef", ttl_seconds=1800
+                ),
                 ttl_seconds=None,
             )
+            seed.set("s", "quote", {}, _QUOTED_FOOTER, ttl_seconds=None)
             seed.set(
                 "s",
                 "sel",
@@ -331,6 +357,28 @@ class TestLegacyTransientPurge:
             assert reopened.get("s", "prog", {}) is None
             assert reopened.get("s", "sel", {}) is None
             assert reopened.get("s", "hyb", {}) is None
+            # Content that only quotes the footer is not a transient row (#1046).
+            assert reopened.get("s", "quote", {}) == _QUOTED_FOOTER
+            remaining = {row[0] for row in reopened._db.execute("SELECT tool FROM proxy_cache")}
+        finally:
+            reopened.close()
+        assert remaining == {"plain", "quote"}  # physically deleted, not just refused
+
+    def test_footer_quoting_row_survives_restart(self, tmp_path):
+        """The store gate caches content that quotes a progressive footer
+        (#1046), so the startup purge, which runs on every ``initialize``, must
+        not delete that row again."""
+        db = tmp_path / "quoting.db"
+        first = ProxyCache(db, max_entries=100)
+        first.initialize()
+        try:
+            first.set("s", "quote", {}, _QUOTED_FOOTER, ttl_seconds=None)
+        finally:
+            first.close()
+        reopened = ProxyCache(db, max_entries=100)
+        reopened.initialize()
+        try:
+            assert reopened.get("s", "quote", {}) == _QUOTED_FOOTER
         finally:
             reopened.close()
 
