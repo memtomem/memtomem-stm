@@ -263,6 +263,12 @@ change the response into a multi-call delivery.
 
 ### Per-tool retention floor
 
+An explicit tool floor overrides the server floor, which overrides the global
+size-based policy. `min_result_retention: 0` disables only the inherited global
+floor; a positive server/tool override still applies. A server/tool
+`retention_floor: 0` explicitly disables preservation at that level, while `null`
+inherits.
+
 By default, the retention floor scales dynamically with response size (< 1KB → 90%, < 3KB → 75%, < 10KB → 65%, else → `min_result_retention`). You can override this per server or per tool:
 
 ```json

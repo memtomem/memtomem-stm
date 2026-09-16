@@ -28,6 +28,7 @@ from memtomem_stm.proxy.config import (
     ProgressiveConfig,
     ProxyConfig,
     SelectiveConfig,
+    ToolOverrideConfig,
     UpstreamServerConfig,
 )
 from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
@@ -1628,3 +1629,39 @@ async def test_current_writers_never_read_as_legacy_accounting(
     summary = read_compression_summary(tmp_path / "metrics.db")
     assert summary["unclassified_mcp_calls"] == 0
     assert "unclassified" not in summary["measurement"]
+
+
+@pytest.mark.parametrize(
+    "global_floor,server_floor,tool_floor,preserve_all",
+    [
+        (0.0, None, 1.0, True),
+        (0.0, 1.0, None, True),
+        (0.0, 0.5, 1.0, True),
+        (0.0, 1.0, 0.0, False),
+        (0.65, 1.0, 0.0, False),
+        (0.0, None, None, False),
+    ],
+)
+async def test_explicit_retention_overrides_disabled_global(
+    tmp_path, global_floor, server_floor, tool_floor, preserve_all
+):
+    mgr, store = _make_manager_with_store(
+        tmp_path, min_retention=global_floor, max_result_chars=100
+    )
+    srv = mgr._config.upstream_servers["srv"]
+    srv.retention_floor = server_floor
+    srv.tool_overrides = {"tool": ToolOverrideConfig(retention_floor=tool_floor)}
+    srv.cleaning = CleaningConfig(enabled=False)
+    text = "word " * 1000
+    mgr._connections["srv"].session.call_tool.return_value = _make_result(text)
+    try:
+        result = await mgr.call_tool("srv", "tool", {})
+        row = _latest_row(store)
+        assert row["ratio_violation"] == 0
+        if preserve_all:
+            assert result == text
+            assert row["compressed_chars"] == len(text)
+        else:
+            assert row["compressed_chars"] <= 100
+    finally:
+        store.close()

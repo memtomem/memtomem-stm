@@ -6321,7 +6321,9 @@ class ProxyManager:
             min_retention = getattr(cfg_snap, "min_result_retention", 0.65)
             min_budget = 0
             dynamic = 0.0  # effective retention floor applied to this call (0 = unset)
-            if min_retention > 0:
+            # An explicit server/tool floor overrides even a disabled global
+            # floor. None inherits; zero explicitly opts this tool out (#1041).
+            if tc.retention_floor is not None or min_retention > 0:
                 n = len(cleaned)
                 if tc.retention_floor is not None:
                     # Per-tool override from config (set by operator or auto-tuner).
