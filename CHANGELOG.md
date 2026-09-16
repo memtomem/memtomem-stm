@@ -63,6 +63,19 @@ changes inline only. See the deprecation policy in
   where they were previously cut to the character budget. Configurations with no
   explicit floor are unaffected, and an explicit `retention_floor: 0` remains the
   opt-out at that level.
+- **`mms list` shows inherited compression strategies** (#1043). The COMPRESSION
+  column used to print the file's `compression` value, or `auto` when the server
+  omitted it — so a server inheriting `default_compression: none` displayed `auto`
+  while running with compression off. It now shows the resolved server default,
+  with `MEMTOMEM_STM_PROXY__*` environment overrides applied, and `unknown` when
+  the configuration fails validation. Tables with at least one server gain a
+  footer line, `COMPRESSION shows the resolved server default; tool overrides may
+  differ.`, followed by one `"server"/"tool": strategy (tool override)` line per
+  explicit tool-level `compression`. `--json` keeps the `servers` map unchanged
+  and adds `effective_compression`, keyed by server name, with `strategy`,
+  `source` (`server` or `global`), and `tool_overrides`; it is `{}` for an invalid
+  configuration. A script that parsed the text table's COMPRESSION column reads
+  different values for servers that omit `compression`.
 
 ### Fixed
 
@@ -115,6 +128,19 @@ changes inline only. See the deprecation policy in
   first branch inside the block, the ladder is unreachable through the new
   condition — the only inputs whose behavior changes are those with a global zero
   and an explicit floor. **Behavior change**: see the upgrade notes above.
+- **`mms list` resolves compression through the shared resolver** (#1043) — the
+  table read `cfg.get("compression", "auto")` from the raw file, so it ignored
+  `default_compression` and the environment overlay. It now validates one
+  env-merged snapshot of the configuration and resolves each server through
+  `effective_compression_pair()`, the function the proxy and the tuner call, so
+  the displayed default and the validity warning come from the same input. The
+  `source` label reads `compression_source()`, the predicate
+  `effective_compression()` now resolves with, rather than a copy of it. An
+  explicit server `compression`, including `auto` over a global `none`, still
+  wins. Not covered: an environment the server refuses at startup can still list
+  as valid with a resolved strategy, as `config_valid` already could before this
+  change (#1051).
+  **Behavior change**: see the upgrade notes above.
 
 ## [0.5.2] — 2026-09-15
 

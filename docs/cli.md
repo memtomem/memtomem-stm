@@ -326,6 +326,22 @@ The import→prune transition is reversible: every import records an `origin` pr
 
 ### `list`
 
+The COMPRESSION column shows the resolved server default, including global
+inheritance and proxy environment overrides. Explicit tool compression overrides
+are listed below the table because their strategy can differ. `--json` retains
+the raw redacted `servers` map and adds `effective_compression`, with each server's
+resolved strategy, its `global`/`server` source, and explicit tool overrides.
+`server` means the server level supplied `compression`, from the file or from an
+environment variable addressing that server. Override lines quote both names as
+JSON strings (`"server"/"tool": strategy (tool override)`), so a `/` inside a name
+stays unambiguous. An invalid configuration reports the strategy as unknown and
+leaves `effective_compression` empty. Like `config_valid`, the column does not
+reliably detect an environment the server refuses at startup. Both validate the
+collected environment fragment, which drops a `MEMTOMEM_STM_PROXY` payload that is
+not a JSON object, and an undecodable variable whose path a later variable covers;
+startup rejects both, so such an environment lists as valid with a resolved
+strategy (#1051).
+
 ```
 Usage: mms list [OPTIONS]
 
@@ -334,7 +350,7 @@ Options:
   --json         Output as JSON for scripting.
 ```
 
-Prints the configured upstream servers in a table — name, prefix, transport, compression strategy, surfacing toggle, origin, and the command (stdio) or URL (SSE / HTTP). This is the per-server view; [`mms status`](#status) is the config summary (#614). The SURFACING column is the visible home of the per-server [`mms surfacing`](#surfacing) toggle. `max_result_chars` deliberately has no column — the effective value is per-tool once [`mms tune --apply`](#tune) writes `tool_overrides`, so read it via `--json` or the config file. Reads the config only; does not probe connectivity (use `mms health` for that). With `--json` the output becomes `{"config_path": ..., "config_valid": ..., "config_error": ..., "servers": {...}}` for scripting; a missing config file returns `{"error": "config_not_found", "path": ...}` instead of a text fallthrough so callers can branch on shape. `config_valid` / `config_error` mirror [`mms status --json`](#status), including the env overlay — a file that only validates once `MEMTOMEM_STM_PROXY__*` vars are applied reports valid here, because the warning is about what a running server does.
+Prints the configured upstream servers in a table — name, prefix, transport, compression strategy, surfacing toggle, origin, and the command (stdio) or URL (SSE / HTTP). This is the per-server view; [`mms status`](#status) is the config summary (#614). The SURFACING column is the visible home of the per-server [`mms surfacing`](#surfacing) toggle. `max_result_chars` deliberately has no column — the effective value is per-tool once [`mms tune --apply`](#tune) writes `tool_overrides`, so read it via `--json` or the config file. Reads the config only; does not probe connectivity (use `mms health` for that). With `--json` the output becomes `{"config_path": ..., "config_valid": ..., "config_error": ..., "servers": {...}, "effective_compression": {...}}` for scripting; a missing config file returns `{"error": "config_not_found", "path": ...}` instead of a text fallthrough so callers can branch on shape. `config_valid` / `config_error` mirror [`mms status --json`](#status), including the env overlay — a file that only validates once `MEMTOMEM_STM_PROXY__*` vars are applied reports valid here, because the warning is about what a running server does.
 
 The ORIGIN column summarizes import provenance: `-` for entries added manually (or imported before provenance capture), `invalid` for an entry whose `origin` block is present but unreadable, otherwise the recorded source kind (`claude-user`, `claude-project`, `mcp-json`, `claude-desktop`, `cursor-user`, `cursor-project`). `invalid` is worth acting on: identity treats a broken claim as incomparable, so `mms prune` skips that entry and an import declines a same-command candidate against it. A trailing `*` marks an entry whose recorded host sources — the primary origin **and** any duplicate registrations — were all pruned: it now exists only behind STM, and [`mms eject`](#eject) can restore it. A `cursor-*` origin never reaches that state on its own, because nothing here prunes one; eject refuses those targets for the same reason. The same condition drives the [`mms remove`](#remove) hint, so the two surfaces never disagree about which entries removal would orphan. In `--json` output the `origin` block appears with `origin.original` redacted (`has_original` tells you whether one was captured) because the verbatim host entry may carry secrets. Every server's own active `env` and `headers` values are also masked (`<REDACTED>`, keys preserved) in `--json` output, since that output is routinely piped to scripts, CI logs, or issue comments.
 
