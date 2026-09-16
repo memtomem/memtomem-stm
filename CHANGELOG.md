@@ -44,6 +44,17 @@ changes inline only. See the deprecation policy in
   manually entered) and by `mms project` registry import omit it as well. A newly
   added server therefore inherits the global budget — 16,000 characters by
   default, which is what those entries already resolved to in practice.
+- **`mms tune` no longer advises a budget a strategy never reads** (#1042). A tool
+  whose resolved strategy is `none` or an explicitly configured `progressive` gets
+  no `max_result_chars` recommendation, because neither path consults that budget:
+  passthrough delivers the cleaned text and progressive delivers by `chunk_size`.
+  Such a tool previously saw advice like `max_result_chars: 50000 -> 11000` with a
+  reason claiming it would save context. Every other strategy is unaffected —
+  `truncate`, `extract_fields`, `schema_pruning`, `skeleton`, `llm_summary`,
+  `selective`, `hybrid`, and `auto`, which reads the budget when it selects. The
+  strategy is read from the current configuration, so a tool pinned since its calls
+  were recorded is judged by what it runs now. `compression` strategy
+  recommendations are unchanged.
 - **An explicit `retention_floor` now applies even with `min_result_retention: 0`**
   (#1049, #1041). Setting the global floor to zero used to disable every
   server-level and per-tool `retention_floor` with it, so the documented override
@@ -84,6 +95,16 @@ changes inline only. See the deprecation policy in
   stopped emitting a budget the operator never stated, so honoring the field does
   not halve the budget of newly generated servers. **Behavior change**: see the
   upgrade notes above.
+- **Budget recommendations respect the strategy in force** (#1042) — H1, H2, and
+  the feedback-driven `max_result_chars` action gated only on a per-tool token
+  budget, so a tool running `none` or explicit `progressive` was advised to change
+  a character budget its delivery path never reads. All three now share one
+  `budget_applies` gate that also resolves the current strategy through the
+  tool/server/global precedence `effective_compression_pair()` defines — the
+  recorded strategy of the sampled calls does not decide it. This closes at the
+  recommendation the gap #1039 left pinned at the ratio: an explicit progressive
+  response that fits one chunk still records a 1.00 ratio, but no longer produces
+  budget advice from it. **Behavior change**: see the upgrade notes above.
 - **A disabled global retention floor no longer disables explicit ones** (#1049) —
   the compression pipeline consulted the resolved tool/server `retention_floor`
   only after `min_result_retention > 0` had already passed, so a global zero made
