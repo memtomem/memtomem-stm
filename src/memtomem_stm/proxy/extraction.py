@@ -6,12 +6,15 @@ import asyncio
 import json
 import logging
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 try:
     import httpx
 except ImportError:  # pragma: no cover
     httpx = None  # type: ignore[assignment]
+
+from typing import Any
 
 from memtomem_stm.proxy.config import (
     ExtractionConfig,
@@ -31,7 +34,6 @@ from memtomem_stm.utils.numeric import safe_float
 logger = logging.getLogger(__name__)
 
 # Regex to extract JSON array from markdown code blocks or raw text
-_JSON_ARRAY_RE = re.compile(r"\[[\s\S]*?\]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,11 +46,46 @@ class ExtractedFact:
     tags: list[str] = field(default_factory=list)
 
 
+def _json_candidates(raw: str) -> Iterator[Any]:
+    """Every JSON value the model might have meant, best candidate first.
+
+    The whole string comes first, then one attempt at each ``[`` in the text —
+    which is how a fact array wrapped in prose or a markdown fence is found.
+
+    This used to be a regex, ``\\[[\\s\\S]*?\\]``. Being non-greedy it stopped at
+    the FIRST ``]``, which is the closing bracket of a NESTED array rather than
+    of the fact list — and ``tags`` is part of the schema this prompt asks for,
+    so nesting is the normal case, not an edge one. The truncated candidate
+    then failed to parse and any LATER array in the text won instead. Measured:
+    ``[{"content":"intended","tags":["technical"]}]`` followed by the prose
+    ``Example only: [{"content":"wrong"}]`` extracted ``wrong``; with a plain
+    ``Done.`` after it, nothing at all.
+
+    ``raw_decode`` is the stdlib parser, so nesting, escapes and brackets
+    inside strings are its problem rather than a pattern we maintain.
+    """
+    stripped = raw.strip()
+    if stripped:
+        try:
+            yield json.loads(stripped)
+        except ValueError:
+            pass
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(raw):
+        if char != "[":
+            continue
+        try:
+            value, _ = decoder.raw_decode(raw, index)
+        except ValueError:
+            continue
+        yield value
+
+
 def _parse_facts_json(raw: str, *, max_facts: int) -> list[ExtractedFact]:
     """Parse LLM output into ExtractedFact list. Tolerant of markdown wrapping."""
-    for candidate in (raw.strip(), *_JSON_ARRAY_RE.findall(raw)):
+    for candidate in _json_candidates(raw):
         try:
-            data = scrub_lone_surrogates(json.loads(candidate))
+            data = scrub_lone_surrogates(candidate)
             if isinstance(data, list):
                 facts = []
                 for item in data[:max_facts]:
@@ -408,10 +445,11 @@ class FactExtractor:
             )
         # Every text block, not ``content[0]`` — a leading ``thinking`` or
         # ``tool_use`` block used to mask the real answer. Blocks are joined
-        # with a blank line, which ``_parse_facts_json`` tolerates: it retries
-        # with ``_JSON_ARRAY_RE`` over the whole string, and JSON itself allows
-        # the inserted whitespace between array elements. A block with no
-        # ``type`` counts as text, the way the fixed-index read did.
+        # with a blank line. That join is what forced ``_json_candidates`` to
+        # become a real parser: with the old regex, a second block could make
+        # a LATER array win over the intended one, so joining silently changed
+        # which facts were extracted. A block with no ``type`` counts as text,
+        # the way the fixed-index read did.
         texts = [
             block["text"]
             for block in content

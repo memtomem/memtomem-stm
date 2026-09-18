@@ -1218,9 +1218,9 @@ class TestExtractionAnthropicTextBlocks:
 
     async def test_prose_block_before_the_array_still_parses(self):
         """The join inserts a blank line, so the whole string stops being valid
-        JSON — ``_parse_facts_json``'s ``_JSON_ARRAY_RE`` retry is what keeps
-        this working. Pin it, because that retry is the only thing standing
-        between the join and zero extracted facts."""
+        JSON — ``_json_candidates``' per-``[`` retry is what keeps this working.
+        Pin it, because that retry is the only thing standing between the join
+        and zero extracted facts."""
         raw = await self._raw(
             {
                 "content": [
@@ -1255,3 +1255,49 @@ class TestExtractionEmptyCompletion:
             facts = await extractor.extract(self.TEXT, server="s", tool="t")
         assert facts, "heuristic fallback should still produce facts"
         assert extractor._cb.failure_count == 0
+
+
+class TestFactsJsonCandidateSelection:
+    """``_parse_facts_json`` used to recover a fact array with the regex
+    ``\\[[\\s\\S]*?\\]``. Non-greedy, it stopped at the first ``]`` — the closing
+    bracket of a NESTED array, not of the fact list. ``tags`` is part of the
+    schema the extraction prompt asks for, so nesting is the normal case.
+
+    Joining several Anthropic text blocks made that reachable in a new and
+    worse way: a later array in the text could win over the intended one, so
+    the join silently changed WHICH facts were extracted. These pin the
+    stdlib-parser replacement.
+    """
+
+    def test_a_later_array_never_wins_over_the_first(self):
+        """Measured against the regex version: this returned ``wrong``."""
+        raw = "\n\n".join(
+            [
+                '[{"content":"intended","tags":["technical"]}]',
+                'Example only: [{"content":"wrong"}]',
+            ]
+        )
+        assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == ["intended"]
+
+    def test_trailing_prose_does_not_erase_the_facts(self):
+        """Measured against the regex version: this returned nothing at all."""
+        raw = '[{"content":"intended","tags":["technical"]}]\n\nDone.'
+        assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == ["intended"]
+
+    def test_prose_before_a_nested_array_parses(self):
+        """Pre-existing, independent of the join: a single block of prose plus a
+        fact array carrying ``tags`` extracted nothing. Fixed by the same
+        replacement."""
+        raw = 'Here are the facts: [{"content":"a","tags":["x"]}]'
+        assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == ["a"]
+
+    def test_a_bracket_inside_a_string_is_not_a_boundary(self):
+        """Positive control for the parser swap: the regex happened to get this
+        one right, so it must not regress."""
+        raw = '[{"content":"a[b]c"}]'
+        assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == ["a[b]c"]
+
+    def test_markdown_fenced_array_still_parses(self):
+        """The wrapping the docstring has always promised to tolerate."""
+        raw = '```json\n[{"content":"fenced"}]\n```'
+        assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == ["fenced"]
