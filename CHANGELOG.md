@@ -84,9 +84,32 @@ changes inline only. See the deprecation policy in
   result that contains `\n---\n[progressive: chars=` without a
   `stm_proxy_read_more(key="…")` call used to miss the cache on every call; identical
   calls now hit it, and the row survives restarts.
+- **An empty LLM summary no longer replaces the response with nothing** (#67
+  follow-up). A provider answering `200 OK` with an empty or whitespace-only
+  completion passed every guard #67 added — `isinstance(content, str)` is true for
+  `""` — and returned that empty string through the success path. Measured against
+  a 5,000-character response, `llm_summary` produced 0 characters while
+  `last_fallback` stayed `None`, so `mms stats` booked the call as a successful
+  compression with no `→*_fallback` suffix: the payload was destroyed silently.
+  Such a call now falls back to the truncated **original** text and records
+  `llm_summary→llm_empty_fallback`. All three providers (`openai`, `anthropic`,
+  `ollama`) were affected. Like `llm_overlength` it does not fail the circuit
+  breaker — the endpoint answered, the model produced nothing usable — so repeated
+  empty completions keep calling rather than opening the breaker. Rows recorded
+  before the upgrade are not rewritten, and a script matching on the fallback label
+  set gains one member.
 
 ### Fixed
 
+- **An empty LLM completion takes the truncate fallback** (#67 follow-up) — the
+  guards added for #67 reject a missing or non-string `content`, but an empty
+  string is a string, so it flowed through `compress()`'s success path and the
+  caller received nothing. `compress()` now checks the returned summary for
+  content once, next to the `llm_overlength` clamp, rather than in each of the
+  three provider methods: one site covers every provider, and the event keeps its
+  own label instead of being folded into `llm_error`, which would also have failed
+  the circuit breaker and then misreported the cause as `circuit_breaker`.
+  **Behavior change**: see the upgrade notes above.
 - **Explicit progressive and progressive fallback share one accounting basis**
   (#1039) — both now record the initial response text: compression footers are
   included, while surfacing, later index annotations, non-text content, and MCP
