@@ -588,7 +588,7 @@ class TestAnthropicResponseDefense:
         with patch.object(
             extractor._client, "post", AsyncMock(return_value=_mock_http_response(payload))
         ):
-            with pytest.raises(ValueError, match="content\\[0\\].text"):
+            with pytest.raises(ValueError, match="no 'text' block"):
                 await extractor._anthropic("text", "prompt")
 
 
@@ -1143,3 +1143,115 @@ class TestInFlightGate:
         gate.leave(live)
         assert gate.in_flight == 0
         assert gate.idle.is_set()
+
+
+# ---------------------------------------------------------------------------
+# Provider response SHAPE + Anthropic block selection (#67 follow-up)
+# ---------------------------------------------------------------------------
+
+
+# Twin of ``tests/test_compression.py::TestLLMProviderResponseShape``: this
+# module's provider methods were a verbatim copy of the compressor's, so they
+# carried the same gap. Measured pre-fix, each of these raised a bare
+# ``AttributeError`` from inside the provider method.
+_EXTRACTION_MALFORMED_SHAPES = [
+    (LLMProvider.OPENAI, {"choices": [None]}, "missing 'choices"),
+    (LLMProvider.OPENAI, {"choices": [{"message": "not an object"}]}, "missing 'choices"),
+    (LLMProvider.OPENAI, {"choices": "not a list"}, "empty 'choices'"),
+    (LLMProvider.OPENAI, [], "empty 'choices'"),
+    (LLMProvider.ANTHROPIC, {"content": [None]}, "no 'text' block"),
+    (LLMProvider.ANTHROPIC, {"content": "not a list"}, "empty 'content'"),
+    (LLMProvider.ANTHROPIC, [], "empty 'content'"),
+    (LLMProvider.OLLAMA, {"message": "not an object"}, "missing 'message.content'"),
+    (LLMProvider.OLLAMA, [], "missing 'message.content'"),
+]
+
+
+class TestExtractionProviderResponseShape:
+    @pytest.mark.parametrize("provider,payload,match", _EXTRACTION_MALFORMED_SHAPES)
+    async def test_malformed_shape_raises_valueerror(self, provider, payload, match):
+        extractor = _make_extractor(provider)
+        with patch.object(
+            extractor._client, "post", AsyncMock(return_value=_mock_http_response(payload))
+        ):
+            with pytest.raises(ValueError, match=match):
+                await getattr(extractor, f"_{provider.value}")("text", "prompt")
+
+
+class TestExtractionAnthropicTextBlocks:
+    """Extraction feeds the provider string straight into ``_parse_facts_json``,
+    so joining several text blocks is only safe if the joined string still
+    parses. These pin both halves: the right blocks are selected, and what
+    comes out the other end is still parseable."""
+
+    async def _raw(self, payload: dict) -> str:
+        extractor = _make_extractor(LLMProvider.ANTHROPIC)
+        with patch.object(
+            extractor._client, "post", AsyncMock(return_value=_mock_http_response(payload))
+        ):
+            return await extractor._anthropic("text", "prompt")
+
+    async def test_thinking_block_before_the_answer_is_skipped(self):
+        raw = await self._raw(
+            {
+                "content": [
+                    {"type": "thinking", "thinking": "considering…"},
+                    {"type": "text", "text": '[{"content": "fact"}]'},
+                ]
+            }
+        )
+        assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == ["fact"]
+
+    async def test_fact_array_split_across_blocks_still_parses(self):
+        raw = await self._raw(
+            {
+                "content": [
+                    {"type": "text", "text": '[{"content": "alpha is 3"},'},
+                    {"type": "text", "text": ' {"content": "beta is 7"}]'},
+                ]
+            }
+        )
+        assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == [
+            "alpha is 3",
+            "beta is 7",
+        ]
+
+    async def test_prose_block_before_the_array_still_parses(self):
+        """The join inserts a blank line, so the whole string stops being valid
+        JSON — ``_parse_facts_json``'s ``_JSON_ARRAY_RE`` retry is what keeps
+        this working. Pin it, because that retry is the only thing standing
+        between the join and zero extracted facts."""
+        raw = await self._raw(
+            {
+                "content": [
+                    {"type": "text", "text": "Here are the facts:"},
+                    {"type": "text", "text": '[{"content": "alpha is 3"}]'},
+                ]
+            }
+        )
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(raw)  # the joined string itself is no longer valid JSON
+        assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == ["alpha is 3"]
+
+
+class TestExtractionEmptyCompletion:
+    """An empty completion parsed to zero facts and returned as if the model
+    had simply found nothing — indistinguishable from a genuine empty result.
+    It now takes the heuristic, without failing the breaker (a model-quality
+    event, matching the compressor's ``llm_empty`` path)."""
+
+    TEXT = (
+        "Decision: we will use SQLite for the store. "
+        "See https://example.com/adr-7 for the rationale, dated 2026-04-14."
+    )
+
+    @pytest.mark.parametrize("body", ["", "   \n  "])
+    async def test_empty_completion_falls_back_to_heuristic(self, body):
+        extractor = _make_extractor(LLMProvider.OLLAMA)
+        payload = {"message": {"content": body}}
+        with patch.object(
+            extractor._client, "post", AsyncMock(return_value=_mock_http_response(payload))
+        ):
+            facts = await extractor.extract(self.TEXT, server="s", tool="t")
+        assert facts, "heuristic fallback should still produce facts"
+        assert extractor._cb.failure_count == 0

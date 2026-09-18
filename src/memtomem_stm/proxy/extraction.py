@@ -281,6 +281,20 @@ class FactExtractor:
             # tool-response path, so the wall clock must be bounded here.
             raw = await asyncio.wait_for(self._call_api(text), timeout=call_timeout)
             self._cb.record_success()
+            if not raw.strip():
+                # An empty or whitespace-only completion parses to zero facts
+                # and used to return silently as "the model found nothing",
+                # which is indistinguishable from a model that genuinely found
+                # nothing. Take the heuristic instead. Like the compressor's
+                # ``llm_empty`` path this is a model-quality event, so the
+                # breaker — already marked successful above — stays closed.
+                logger.warning(
+                    "LLM extraction returned an empty response for %s/%s, "
+                    "falling back to heuristic",
+                    server,
+                    tool,
+                )
+                return _extract_heuristic(text, max_facts=self._cfg.max_facts)
             facts = _parse_facts_json(raw, max_facts=self._cfg.max_facts)
             if not facts:
                 logger.debug("LLM returned no parseable facts for %s/%s", server, tool)
@@ -352,11 +366,15 @@ class FactExtractor:
         )
         resp.raise_for_status()
         data = resp.json()
-        choices = data.get("choices") or []
-        if not choices:
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not isinstance(choices, list) or not choices:
             raise ValueError("OpenAI response has empty 'choices' (likely quota or content filter)")
-        message = choices[0].get("message") or {}
-        content = message.get("content")
+        # Type-checked at every level, not presence-checked: see the twin in
+        # ``proxy/compression.py``. A gateway answering ``{"choices": [null]}``
+        # used to raise a bare ``AttributeError`` here.
+        first = choices[0]
+        message = first.get("message") if isinstance(first, dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, str):
             raise ValueError("OpenAI response missing 'choices[0].message.content'")
         return content
@@ -383,15 +401,27 @@ class FactExtractor:
         )
         resp.raise_for_status()
         data = resp.json()
-        content = data.get("content") or []
-        if not content:
+        content = data.get("content") if isinstance(data, dict) else None
+        if not isinstance(content, list) or not content:
             raise ValueError(
                 "Anthropic response has empty 'content' (likely empty completion or filter)"
             )
-        text_block = content[0].get("text")
-        if not isinstance(text_block, str):
-            raise ValueError("Anthropic response missing 'content[0].text'")
-        return text_block
+        # Every text block, not ``content[0]`` — a leading ``thinking`` or
+        # ``tool_use`` block used to mask the real answer. Blocks are joined
+        # with a blank line, which ``_parse_facts_json`` tolerates: it retries
+        # with ``_JSON_ARRAY_RE`` over the whole string, and JSON itself allows
+        # the inserted whitespace between array elements. A block with no
+        # ``type`` counts as text, the way the fixed-index read did.
+        texts = [
+            block["text"]
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type", "text") == "text"
+            and isinstance(block.get("text"), str)
+        ]
+        if not texts:
+            raise ValueError("Anthropic response has no 'text' block in 'content'")
+        return "\n\n".join(texts)
 
     async def _ollama(self, text: str, system_prompt: str) -> str:
         assert self._client is not None
@@ -411,8 +441,8 @@ class FactExtractor:
         )
         resp.raise_for_status()
         data = resp.json()
-        message = data.get("message") or {}
-        content = message.get("content")
+        message = data.get("message") if isinstance(data, dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, str):
             raise ValueError("Ollama response missing 'message.content'")
         return content
