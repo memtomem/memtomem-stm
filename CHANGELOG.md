@@ -125,16 +125,21 @@ changes inline only. See the deprecation policy in
   falls back to heuristic extraction and logs a warning. The circuit breaker is
   unaffected — the endpoint answered, so this is a model-quality event, the same
   judgement `llm_empty` makes on the compression side.
-- **Fact arrays containing `tags` are extracted from prose-wrapped responses** (#67
-  follow-up). Recovering the array from a response that also holds prose used the
-  regex `\[[\s\S]*?\]`. Being non-greedy it stopped at the first `]` — the closing
-  bracket of a **nested** array — and `tags` is part of the schema the extraction
-  prompt asks for, so nesting is the normal case. `Here are the facts:
-  [{"content":"a","tags":["x"]}]` extracted nothing. It now extracts the fact.
-  Responses that parsed before parse identically; this only adds results where
-  there were none. The recovery is now `json.JSONDecoder().raw_decode` at each `[`
-  rather than a pattern, so nesting, escapes and brackets inside strings are the
-  stdlib parser's business.
+- **Extraction stops mining prose for a fact array** (#67 follow-up). The parser
+  used to search the response for a bracketed substring and extract from whichever
+  candidate parsed first — `\[[\s\S]*?\]` originally, then a `raw_decode` attempt at
+  each `[`. Both were candidate-*selection* heuristics over untrusted text, and
+  each one had inputs that selected the wrong array: a nested `tags` array (part of
+  the schema the prompt asks for) truncating the match, a decoy array in an example
+  winning over the intended one, a deeply nested prefix exhausting the recursion
+  limit. The shared failure is facts that are silently **wrong**, on their way into
+  long-term memory. Only the whole response is parsed now, with a markdown fence
+  stripped. **A response wrapped in prose is no longer extracted from** — it is
+  reported unreadable and the heuristic extractor answers instead, which is a
+  behavior change for models that narrate around their JSON. `_parse_facts_json`
+  now distinguishes unreadable (`None`) from an empty fact array (`[]`); a model
+  that read the response and found nothing is still respected, and the heuristic
+  does not override it.
 
 ### Fixed
 
@@ -154,9 +159,10 @@ changes inline only. See the deprecation policy in
   (#67 follow-up) — the guards added for #67 checked that a container was present,
   never that it held the type they then indexed into. `{"choices": [null]}`, a bare
   string where the message object belongs, and a JSON body that is not an object at
-  all each crashed with `AttributeError: 'NoneType' object has no attribute 'get'`
-  from inside the provider method — the opaque failure #67 set out to remove, one
-  level deeper. `base_url` is user-configurable, so these shapes arrive from
+  all each crashed with an `AttributeError` from inside the provider method, naming
+  only the type it happened to get (`'NoneType'`, `'str'`, `'list'` — `object has
+  no attribute 'get'`) — the opaque failure #67 set out to remove, one level
+  deeper. `base_url` is user-configurable, so these shapes arrive from
   OpenAI-compatible gateways. The fallback behavior is unchanged (the caller
   already caught them); the log line now names the defect. Both the compressor and
   the fact extractor were affected, and both are fixed.
@@ -164,12 +170,13 @@ changes inline only. See the deprecation policy in
   read regardless of what the block was. **Behavior change**: see the upgrade notes
   above.
 - **Joining Anthropic text blocks no longer changes which facts are extracted**
-  (#67 follow-up) — joining blocks put a second array within reach of the regex
-  recovery above, and because the first candidate was truncated at a nested `]`,
-  the LATER array won. Measured: a block holding
+  (#67 follow-up) — joining put a decoy array within reach of the candidate search,
+  and the intended one lost. Measured: a block holding
   `[{"content":"intended","tags":["technical"]}]` followed by the prose
   `Example only: [{"content":"wrong"}]` extracted `wrong`; with a plain `Done.`
-  after it, nothing. Replacing the regex with the stdlib parser removes the class.
+  after it, nothing. Patching the candidate rule moved the failure rather than
+  removing it — a second review round found a decoy that beat the replacement and
+  an input that raised `RecursionError` inside it — so the search is gone instead.
   **Behavior change**: see the upgrade notes above.
 - **Explicit progressive and progressive fallback share one accounting basis**
   (#1039) — both now record the initial response text: compression footers are

@@ -79,11 +79,17 @@ class TestParseFactsJson:
         assert len(facts) == 1
         assert facts[0].content == "valid"
 
-    def test_invalid_json_returns_empty(self):
-        assert _parse_facts_json("not json at all", max_facts=10) == []
+    def test_unreadable_output_returns_none(self):
+        """``None`` and ``[]`` are different answers: one says the response was
+        not a fact array, the other that the model found nothing. The caller
+        takes the heuristic for the first and not the second."""
+        assert _parse_facts_json("not json at all", max_facts=10) is None
 
-    def test_empty_array_returns_empty(self):
+    def test_empty_array_returns_empty_not_none(self):
         assert _parse_facts_json("[]", max_facts=10) == []
+
+    def test_a_json_object_is_not_a_fact_array(self):
+        assert _parse_facts_json('{"content": "fact"}', max_facts=10) is None
 
     def test_defaults_for_missing_fields(self):
         raw = json.dumps([{"content": "just content"}])
@@ -1216,11 +1222,11 @@ class TestExtractionAnthropicTextBlocks:
             "beta is 7",
         ]
 
-    async def test_prose_block_before_the_array_still_parses(self):
-        """The join inserts a blank line, so the whole string stops being valid
-        JSON — ``_json_candidates``' per-``[`` retry is what keeps this working.
-        Pin it, because that retry is the only thing standing between the join
-        and zero extracted facts."""
+    async def test_prose_block_before_the_array_is_unreadable(self):
+        """The cost of dropping prose mining, stated as a test. The join makes
+        the whole string invalid JSON, so this is no longer parsed — it is
+        reported unreadable and the caller takes the heuristic. Mining it was
+        what produced wrong facts on neighbouring inputs."""
         raw = await self._raw(
             {
                 "content": [
@@ -1230,8 +1236,8 @@ class TestExtractionAnthropicTextBlocks:
             }
         )
         with pytest.raises(json.JSONDecodeError):
-            json.loads(raw)  # the joined string itself is no longer valid JSON
-        assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == ["alpha is 3"]
+            json.loads(raw)
+        assert _parse_facts_json(raw, max_facts=10) is None
 
 
 class TestExtractionEmptyCompletion:
@@ -1257,47 +1263,83 @@ class TestExtractionEmptyCompletion:
         assert extractor._cb.failure_count == 0
 
 
-class TestFactsJsonCandidateSelection:
-    """``_parse_facts_json`` used to recover a fact array with the regex
-    ``\\[[\\s\\S]*?\\]``. Non-greedy, it stopped at the first ``]`` — the closing
-    bracket of a NESTED array, not of the fact list. ``tags`` is part of the
-    schema the extraction prompt asks for, so nesting is the normal case.
-
-    Joining several Anthropic text blocks made that reachable in a new and
-    worse way: a later array in the text could win over the intended one, so
-    the join silently changed WHICH facts were extracted. These pin the
-    stdlib-parser replacement.
+class TestFactsJsonSingleCandidate:
+    """``_parse_facts_json`` tried to find a fact array inside arbitrary prose,
+    first with the regex ``\\[[\\s\\S]*?\\]`` and then with ``raw_decode`` at each
+    ``[``. Every review round produced an input that picked the wrong array.
+    These pin the inputs that motivated dropping the search, and the cost of
+    dropping it.
     """
 
-    def test_a_later_array_never_wins_over_the_first(self):
-        """Measured against the regex version: this returned ``wrong``."""
-        raw = "\n\n".join(
-            [
-                '[{"content":"intended","tags":["technical"]}]',
-                'Example only: [{"content":"wrong"}]',
-            ]
-        )
+    def test_a_decoy_array_no_longer_wins(self):
+        """Regex era: ``wrong``. raw_decode era: ``wrong`` (the decoy parses
+        first). Now: unreadable, so the heuristic answers instead."""
+        raw = 'Example: [[0], {"content":"wrong"}] Facts: [{"content":"right"}]'
+        assert _parse_facts_json(raw, max_facts=10) is None
+
+    def test_a_deeply_nested_prefix_does_not_blow_the_stack(self):
+        """raw_decode era: ``RecursionError`` raised out of the parser, which
+        the caller counted as a breaker failure."""
+        raw = "prefix " + "[" * 1100 + "0" + "]" * 1100 + ' Facts: [{"content":"right"}]'
+        assert _parse_facts_json(raw, max_facts=10) is None
+
+    def test_an_adversarial_nest_is_not_a_latency_problem(self):
+        """raw_decode era: ~400 ms on this input, because a decode was
+        attempted at every one of the nested brackets."""
+        import time
+
+        raw = "x " + "[" * 400 + ",".join(str(i) for i in range(9000)) + "]" * 400
+        started = time.perf_counter()
+        assert _parse_facts_json(raw, max_facts=10) is None
+        assert (time.perf_counter() - started) < 0.05
+
+    def test_a_fact_array_carrying_tags_parses(self):
+        """The schema's own ``tags`` field, which the regex truncated on."""
+        raw = '[{"content":"intended","tags":["technical"]}]'
         assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == ["intended"]
 
-    def test_trailing_prose_does_not_erase_the_facts(self):
-        """Measured against the regex version: this returned nothing at all."""
-        raw = '[{"content":"intended","tags":["technical"]}]\n\nDone.'
-        assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == ["intended"]
-
-    def test_prose_before_a_nested_array_parses(self):
-        """Pre-existing, independent of the join: a single block of prose plus a
-        fact array carrying ``tags`` extracted nothing. Fixed by the same
-        replacement."""
-        raw = 'Here are the facts: [{"content":"a","tags":["x"]}]'
-        assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == ["a"]
-
-    def test_a_bracket_inside_a_string_is_not_a_boundary(self):
-        """Positive control for the parser swap: the regex happened to get this
-        one right, so it must not regress."""
-        raw = '[{"content":"a[b]c"}]'
-        assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == ["a[b]c"]
+    def test_an_array_split_across_blocks_parses_after_joining(self):
+        """The join inserts a blank line between array elements, which JSON
+        treats as ordinary whitespace — so this stays readable."""
+        raw = '[{"content":"alpha is 3"},\n\n {"content":"beta is 7"}]'
+        assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == [
+            "alpha is 3",
+            "beta is 7",
+        ]
 
     def test_markdown_fenced_array_still_parses(self):
-        """The wrapping the docstring has always promised to tolerate."""
+        """The one wrapping still stripped, because it is unambiguous."""
         raw = '```json\n[{"content":"fenced"}]\n```'
         assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == ["fenced"]
+
+    def test_a_bare_fence_without_a_language_parses(self):
+        raw = '```\n[{"content":"fenced"}]\n```'
+        assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == ["fenced"]
+
+
+class TestUnreadableOutputTakesTheHeuristic:
+    """The three states, through the caller."""
+
+    TEXT = (
+        "Decision: we will use SQLite for the store. "
+        "See https://example.com/adr-7 for the rationale, dated 2026-04-14."
+    )
+
+    async def _extract(self, body: str):
+        extractor = _make_extractor(LLMProvider.OLLAMA)
+        payload = {"message": {"content": body}}
+        with patch.object(
+            extractor._client, "post", AsyncMock(return_value=_mock_http_response(payload))
+        ):
+            return await extractor.extract(self.TEXT, server="s", tool="t"), extractor
+
+    async def test_prose_response_falls_back_to_the_heuristic(self):
+        facts, extractor = await self._extract('Here are the facts: [{"content":"a"}]')
+        assert facts, "an unreadable response must not silently yield nothing"
+        assert extractor._cb.failure_count == 0
+
+    async def test_an_empty_fact_array_is_respected(self):
+        """``[]`` is an answer, not a failure — the heuristic must NOT override
+        a model that read the response and found nothing."""
+        facts, _ = await self._extract("[]")
+        assert facts == []

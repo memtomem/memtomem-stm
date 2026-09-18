@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import re
-from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 try:
@@ -14,7 +13,6 @@ try:
 except ImportError:  # pragma: no cover
     httpx = None  # type: ignore[assignment]
 
-from typing import Any
 
 from memtomem_stm.proxy.config import (
     ExtractionConfig,
@@ -46,64 +44,54 @@ class ExtractedFact:
     tags: list[str] = field(default_factory=list)
 
 
-def _json_candidates(raw: str) -> Iterator[Any]:
-    """Every JSON value the model might have meant, best candidate first.
+_FENCE_RE = re.compile(r"\A```[^\n]*\n(.*?)\n?```\Z", re.S)
 
-    The whole string comes first, then one attempt at each ``[`` in the text —
-    which is how a fact array wrapped in prose or a markdown fence is found.
 
-    This used to be a regex, ``\\[[\\s\\S]*?\\]``. Being non-greedy it stopped at
-    the FIRST ``]``, which is the closing bracket of a NESTED array rather than
-    of the fact list — and ``tags`` is part of the schema this prompt asks for,
-    so nesting is the normal case, not an edge one. The truncated candidate
-    then failed to parse and any LATER array in the text won instead. Measured:
-    ``[{"content":"intended","tags":["technical"]}]`` followed by the prose
-    ``Example only: [{"content":"wrong"}]`` extracted ``wrong``; with a plain
-    ``Done.`` after it, nothing at all.
+def _parse_facts_json(raw: str, *, max_facts: int) -> list[ExtractedFact] | None:
+    """Parse LLM output into an ExtractedFact list, or ``None`` if the response
+    is not a fact array at all.
 
-    ``raw_decode`` is the stdlib parser, so nesting, escapes and brackets
-    inside strings are its problem rather than a pattern we maintain.
+    Three states, not two. ``[]`` means the model read the response and found
+    nothing worth recording; ``None`` means we could not read the MODEL.
+    Collapsing them made an unreadable response look like a considered empty
+    answer, and left the caller unable to tell whether the heuristic should
+    take over.
+
+    Exactly one candidate is tried: the whole response, with a markdown fence
+    stripped. Earlier versions mined the text for a bracketed substring —
+    first with the non-greedy regex ``\\[[\\s\\S]*?\\]``, then by attempting
+    ``json.JSONDecoder().raw_decode`` at every ``[``. Both were candidate
+    SELECTION heuristics over untrusted prose, and each review round produced
+    an input that selected the wrong array: a nested ``tags`` array truncating
+    the match, a decoy array winning over the intended one, a deeply nested
+    prefix exhausting the recursion limit. The failure they share is facts that
+    are silently WRONG, on their way into long-term memory — strictly worse
+    than extracting nothing. A response that is not a fact array is now handed
+    back as unreadable, and the caller takes the heuristic.
     """
-    stripped = raw.strip()
-    if stripped:
-        try:
-            yield json.loads(stripped)
-        except ValueError:
-            pass
-    decoder = json.JSONDecoder()
-    for index, char in enumerate(raw):
-        if char != "[":
+    candidate = raw.strip()
+    fence = _FENCE_RE.match(candidate)
+    if fence is not None:
+        candidate = fence.group(1).strip()
+    try:
+        data = scrub_lone_surrogates(json.loads(candidate))
+    except (json.JSONDecodeError, ValueError, TypeError, RecursionError):
+        return None
+    if not isinstance(data, list):
+        return None
+    facts: list[ExtractedFact] = []
+    for item in data[:max_facts]:
+        if not isinstance(item, dict) or "content" not in item:
             continue
-        try:
-            value, _ = decoder.raw_decode(raw, index)
-        except ValueError:
-            continue
-        yield value
-
-
-def _parse_facts_json(raw: str, *, max_facts: int) -> list[ExtractedFact]:
-    """Parse LLM output into ExtractedFact list. Tolerant of markdown wrapping."""
-    for candidate in _json_candidates(raw):
-        try:
-            data = scrub_lone_surrogates(candidate)
-            if isinstance(data, list):
-                facts = []
-                for item in data[:max_facts]:
-                    if not isinstance(item, dict) or "content" not in item:
-                        continue
-                    facts.append(
-                        ExtractedFact(
-                            content=str(item["content"]).strip(),
-                            category=str(item.get("category", "technical")),
-                            confidence=safe_float(item.get("confidence", 0.5), 0.5),
-                            tags=[str(t) for t in item.get("tags", [])],
-                        )
-                    )
-                if facts:
-                    return facts
-        except (json.JSONDecodeError, ValueError, TypeError):
-            continue
-    return []
+        facts.append(
+            ExtractedFact(
+                content=str(item["content"]).strip(),
+                category=str(item.get("category", "technical")),
+                confidence=safe_float(item.get("confidence", 0.5), 0.5),
+                tags=[str(t) for t in item.get("tags", [])],
+            )
+        )
+    return facts
 
 
 # ── Heuristic extraction patterns ─────────────────────────────────────
@@ -333,8 +321,19 @@ class FactExtractor:
                 )
                 return _extract_heuristic(text, max_facts=self._cfg.max_facts)
             facts = _parse_facts_json(raw, max_facts=self._cfg.max_facts)
+            if facts is None:
+                # Unreadable, not empty: the model answered with something that
+                # is not a fact array. Mining prose for one is what kept
+                # producing wrong facts, so take the heuristic instead. The
+                # breaker stays closed — the endpoint answered.
+                logger.warning(
+                    "LLM response for %s/%s was not a JSON fact array, falling back to heuristic",
+                    server,
+                    tool,
+                )
+                return _extract_heuristic(text, max_facts=self._cfg.max_facts)
             if not facts:
-                logger.debug("LLM returned no parseable facts for %s/%s", server, tool)
+                logger.debug("LLM returned an empty fact array for %s/%s", server, tool)
             return facts
         except TimeoutError:
             self._cb.record_failure()
@@ -445,11 +444,11 @@ class FactExtractor:
             )
         # Every text block, not ``content[0]`` — a leading ``thinking`` or
         # ``tool_use`` block used to mask the real answer. Blocks are joined
-        # with a blank line. That join is what forced ``_json_candidates`` to
-        # become a real parser: with the old regex, a second block could make
-        # a LATER array win over the intended one, so joining silently changed
-        # which facts were extracted. A block with no ``type`` counts as text,
-        # the way the fixed-index read did.
+        # with a blank line. The join is why ``_parse_facts_json`` stopped
+        # mining prose: a second block put a decoy array within reach, and
+        # whichever candidate rule was in force, some input picked the wrong
+        # one. A block with no ``type`` counts as text, the way the
+        # fixed-index read did.
         texts = [
             block["text"]
             for block in content
