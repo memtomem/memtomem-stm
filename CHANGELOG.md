@@ -84,9 +84,33 @@ changes inline only. See the deprecation policy in
   result that contains `\n---\n[progressive: chars=` without a
   `stm_proxy_read_more(key="…")` call used to miss the cache on every call; identical
   calls now hit it, and the row survives restarts.
+- **A malformed embedding response is no longer cached** (#67 follow-up). The
+  embedding scorer checked that it got as many vectors as it sent texts, never that
+  each one was a vector, so a reply such as
+  `{"embeddings": [[0.1, 0.2], "not a vector", [0.3, 0.4]]}` satisfied the count and
+  was written to the embedding cache. Measured with three texts: three entries
+  cached, one of them a string; the next identical call issued **zero** HTTP
+  requests and fell back to BM25 again, logging `can't multiply sequence by non-int
+  of type 'float'`. Relevance scoring for those texts stayed degraded until the
+  process restarted, with no request left to blame. Such a response is now rejected
+  before the cache write, so the same call retries the provider and recovers as soon
+  as the provider does. Well-formed responses are cached exactly as before.
 
 ### Fixed
 
+- **Embedding responses are parsed defensively, and the reason is logged** (#67
+  follow-up) — `_embed_ollama` and `_embed_openai` indexed straight into the parsed
+  body: `resp.json()["embeddings"]`, `resp.json()["data"]` and `d["embedding"]`.
+  This is the same unchecked-access class #67 fixed for the chat-completion paths
+  and left untouched here. An Ollama error envelope raised `KeyError('embeddings')`,
+  a non-object body raised `TypeError`, and three shapes (`embeddings` null, a
+  string, or a list holding a non-vector) returned garbage downstream instead of
+  raising at all. `score_sections` logs the exception **message and nothing else**
+  — a deliberate choice, so an expected fallback does not bury real errors — which
+  made `'embeddings'` the operator's entire signal: it named neither the provider
+  nor what the body held. Each level is now type-checked and the `ValueError` names
+  the provider, the field, and the keys the body actually carried. The BM25 fallback
+  is unchanged. **Behavior change**: see the upgrade notes above.
 - **Explicit progressive and progressive fallback share one accounting basis**
   (#1039) — both now record the initial response text: compression footers are
   included, while surfacing, later index annotations, non-text content, and MCP

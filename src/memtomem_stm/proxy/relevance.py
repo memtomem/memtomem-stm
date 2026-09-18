@@ -153,6 +153,36 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+def _payload_list(payload: object, *, key: str, provider: str) -> list[Any]:
+    """Return ``payload[key]`` as a list, or raise saying what was wrong.
+
+    ``score_sections`` logs the exception MESSAGE and nothing else — a
+    deliberate choice, so that an expected fallback does not bury real errors
+    in a log aggregator. That makes the message the operator's entire signal,
+    and ``KeyError('embeddings')`` named neither the provider that answered nor
+    what the body actually held. An error envelope and a parser bug looked
+    identical.
+
+    An EMPTY list is returned as-is rather than rejected: ``_embed_exact``
+    owns the count contract, and embedding zero texts legitimately yields zero
+    vectors. A missing key is never softened into an empty result — that would
+    turn a failed request into a silent all-zero ranking.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"{provider} embedding response is not a JSON object (got {type(payload).__name__})"
+        )
+    if key not in payload:
+        present = ", ".join(sorted(str(k) for k in payload)) or "(no keys)"
+        raise ValueError(f"{provider} embedding response has no '{key}' field; it holds: {present}")
+    value = payload[key]
+    if not isinstance(value, list):
+        raise ValueError(
+            f"{provider} embedding response field '{key}' is {type(value).__name__}, not a list"
+        )
+    return value
+
+
 class EmbeddingScorer:
     """Semantic relevance scoring via embedding cosine similarity.
 
@@ -325,7 +355,14 @@ class EmbeddingScorer:
             timeout=self._timeout,
         )
         resp.raise_for_status()
-        return resp.json()["embeddings"]
+        vectors = _payload_list(resp.json(), key="embeddings", provider="ollama")
+        for i, vector in enumerate(vectors):
+            if not isinstance(vector, list):
+                raise ValueError(
+                    f"ollama embedding response: 'embeddings[{i}]' is "
+                    f"{type(vector).__name__}, not a list"
+                )
+        return vectors
 
     def _embed_openai(self, httpx_mod: object, texts: list[str]) -> list[list[float]]:
         import httpx as _httpx
@@ -338,13 +375,24 @@ class EmbeddingScorer:
             timeout=self._timeout,
         )
         resp.raise_for_status()
-        data = resp.json()["data"]
+        data = _payload_list(resp.json(), key="data", provider="openai")
         # Sort by "index" when the provider populates it (official OpenAI).
         # OpenAI-compatible servers — Ollama's compat layer, LiteLLM, LM Studio —
-        # often omit the field, in which case we trust the input order.
-        if data and all("index" in d for d in data):
+        # often omit the field, in which case we trust the input order. The
+        # isinstance guard matters: ``"index" in d`` on a string is a substring
+        # test, so a list of strings used to pass this check and then fail in
+        # the sort key.
+        if data and all(isinstance(d, dict) and "index" in d for d in data):
             data.sort(key=lambda x: x["index"])
-        return [d["embedding"] for d in data]
+        vectors: list[list[float]] = []
+        for i, item in enumerate(data):
+            embedding = item.get("embedding") if isinstance(item, dict) else None
+            if not isinstance(embedding, list):
+                raise ValueError(
+                    f"openai embedding response: 'data[{i}].embedding' is missing or not a list"
+                )
+            vectors.append(embedding)
+        return vectors
 
 
 # ── Factory ───────────────────────────────────────────────────────────

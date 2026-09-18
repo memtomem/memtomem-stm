@@ -387,6 +387,127 @@ class TestEmbeddingOpenAIResponseParsing:
         assert result == []
 
 
+# ── EmbeddingScorer response defense (#67 follow-up) ───────────────────
+
+
+# Every one of these raised a bare ``KeyError``/``TypeError`` before the fix.
+# ``score_sections`` logs the exception MESSAGE ONLY — no traceback, by an
+# explicit decision in the code — so ``KeyError('embeddings')`` was the whole
+# signal an operator got: it named neither the provider nor what the body
+# actually held.
+_OLLAMA_BAD_BODIES = [
+    ({"error": "model 'nomic-embed-text' not found"}, "embeddings"),
+    ({"embeddings": None}, "embeddings"),
+    ({"embeddings": "not a list"}, "embeddings"),
+    ([], "not a JSON object"),
+    ({"embeddings": [[0.1, 0.2], "not a vector"]}, "embeddings[1]"),
+]
+
+_OPENAI_BAD_BODIES = [
+    ({"error": {"message": "quota"}}, "data"),
+    ({"data": None}, "data"),
+    ({"data": "not a list"}, "data"),
+    ([], "not a JSON object"),
+    ({"data": [{"index": 0}]}, "data[0].embedding"),
+    ({"data": ["not an object"]}, "data[0].embedding"),
+]
+
+
+def _bad_body_response(payload):
+    from unittest.mock import MagicMock
+
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json = MagicMock(return_value=payload)
+    return resp
+
+
+class TestEmbeddingResponseDefense:
+    """The embedding paths indexed straight into the parsed body — the same
+    unchecked-access class #67 fixed for the chat-completion paths, left
+    untouched there. The fallback to BM25 already worked; what did not was
+    telling the operator why it happened."""
+
+    @pytest.fixture(autouse=True)
+    def _openai_key(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    def _scorer(self, provider):
+        from memtomem_stm.proxy.relevance import EmbeddingScorer
+
+        return EmbeddingScorer(
+            provider=provider,
+            model="test-model",
+            base_url="http://localhost:11434" if provider == "ollama" else "https://api.openai.com",
+        )
+
+    @pytest.mark.parametrize("payload,fragment", _OLLAMA_BAD_BODIES)
+    def test_ollama_bad_body_raises_named_valueerror(self, payload, fragment):
+        scorer = self._scorer("ollama")
+        with patch("httpx.post", return_value=_bad_body_response(payload)):
+            with pytest.raises(ValueError) as exc:
+                scorer._embed_ollama(None, ["a", "b"])
+        assert fragment in str(exc.value)
+        assert "ollama" in str(exc.value)
+
+    @pytest.mark.parametrize("payload,fragment", _OPENAI_BAD_BODIES)
+    def test_openai_bad_body_raises_named_valueerror(self, payload, fragment):
+        scorer = self._scorer("openai")
+        with patch("httpx.post", return_value=_bad_body_response(payload)):
+            with pytest.raises(ValueError) as exc:
+                scorer._embed_openai(None, ["a", "b"])
+        assert fragment in str(exc.value)
+        assert "openai" in str(exc.value)
+
+    def test_missing_field_message_names_the_keys_that_were_there(self):
+        """The message is the only signal, so it says what the body DID hold —
+        that is what separates 'the provider errored' from 'we parsed it wrong'."""
+        scorer = self._scorer("ollama")
+        payload = {"error": "model not found", "done": True}
+        with patch("httpx.post", return_value=_bad_body_response(payload)):
+            with pytest.raises(ValueError) as exc:
+                scorer._embed_ollama(None, ["a"])
+        assert "done" in str(exc.value) and "error" in str(exc.value)
+
+    def test_a_malformed_vector_is_never_cached(self):
+        """The count contract (``_embed_exact``) passed a list whose ELEMENT
+        was not a vector, so the bad value was written into the embedding
+        cache before anything looked at it.
+
+        Measured on the pre-fix code with 3 texts and one string among the
+        vectors: 3 entries cached, 1 of them poisoned; the next identical call
+        issued 0 HTTP requests and fell back again, logging ``can't multiply
+        sequence by non-int of type 'float'``. The scorer stayed degraded for
+        those texts until restart, with no request left to blame. Raising
+        before the cache write restores recovery — the next call retries the
+        provider.
+        """
+        scorer = self._scorer("ollama")
+        payload = {"embeddings": [[0.1, 0.2], "not a vector", [0.3, 0.4]]}
+        sections = [("Alpha", "alpha body"), ("Beta", "beta body")]
+        with patch("httpx.post", return_value=_bad_body_response(payload)):
+            scorer.score_sections("alpha", sections)
+        assert scorer._cache == {}, "a response that fails validation must not be cached"
+
+        with patch("httpx.post", return_value=_bad_body_response(payload)) as post:
+            scorer.score_sections("alpha", sections)
+        assert post.call_count == 1, "a recovered provider must be retried, not served poison"
+
+    def test_score_sections_still_falls_back_to_bm25(self, caplog):
+        """Behavior is unchanged: the caller catches it and scores with BM25.
+        Only the logged reason improves."""
+        import logging
+
+        scorer = self._scorer("ollama")
+        sections = [("Alpha", "alpha body text"), ("Beta", "beta body text")]
+        with patch("httpx.post", return_value=_bad_body_response({"error": "nope"})):
+            with caplog.at_level(logging.WARNING):
+                scores = scorer.score_sections("alpha", sections)
+        assert len(scores) == 2
+        assert scorer.fallback_count == 1
+        assert "embeddings" in caplog.text and "ollama" in caplog.text
+
+
 class TestEmbeddingCache:
     """Repeat texts are looked up instead of re-sent (#873).
 
