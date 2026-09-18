@@ -690,7 +690,12 @@ class TestLLMCompressorEmptyCompletion:
         comp = _comp_for(provider)
         _patch_post(comp, _EMPTY_COMPLETION_PAYLOADS[provider](""))
         for _ in range(4):
-            await comp.compress(self.TEXT, max_chars=200)
+            result = await comp.compress(self.TEXT, max_chars=200)
+            # Assert the outcome every round, not just at the end: the breaker
+            # check alone passes against the pre-fix code (which recorded no
+            # failure either, because it called nothing a failure).
+            assert result.strip()
+            assert comp.last_fallback == "llm_empty"
         assert not comp._cb.is_open
 
     @pytest.mark.parametrize("provider", list(_EMPTY_COMPLETION_PAYLOADS))

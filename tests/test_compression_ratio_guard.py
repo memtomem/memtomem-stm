@@ -17,7 +17,7 @@ import re
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -26,6 +26,8 @@ from memtomem_stm.proxy.cache import ProxyCache
 from memtomem_stm.proxy.config import (
     CleaningConfig,
     CompressionStrategy,
+    LLMCompressorConfig,
+    LLMProvider,
     ProgressiveConfig,
     ProxyConfig,
     SelectiveConfig,
@@ -1769,3 +1771,72 @@ async def test_explicit_retention_overrides_disabled_global(
             assert row["compressed_chars"] <= 100
     finally:
         store.close()
+
+
+# ── Empty LLM summary through the whole pipeline (#67 follow-up) ──────
+
+
+@pytest.mark.asyncio
+class TestEmptyLLMSummaryThroughPipeline:
+    """What an empty completion costs depends on the retention floor, so the
+    compressor-level defect and the delivered response are two questions.
+
+    Measured on both sides of the fix, same 5,599-char response:
+
+    | floor | before            | after                            |
+    |-------|-------------------|----------------------------------|
+    | 0.65  | llm_summary→progressive_fallback, 4139 chars (identical) |
+    | 0.0   | `llm_summary`, 0 chars | `llm_summary→llm_empty_fallback`, 191 chars |
+
+    So under the DEFAULT floor the ratio guard already caught it and this fix
+    changes nothing observable — it is the disabled-floor configuration
+    (`min_result_retention: 0` with no per-tool floor, supported since #1041)
+    where the response was actually destroyed and the row still said
+    `llm_summary`, with no `→*_fallback` suffix to find it by.
+    """
+
+    def _mgr(self, tmp_path: Path, *, min_retention: float):
+        mgr, store = _make_manager_with_store(
+            tmp_path,
+            min_retention=min_retention,
+            compression=CompressionStrategy.LLM_SUMMARY,
+            max_result_chars=200,
+        )
+        mgr._connections["srv"].config.llm = LLMCompressorConfig(
+            provider=LLMProvider.OLLAMA, base_url="http://localhost:11434"
+        )
+        mgr._connections["srv"].session.call_tool.return_value = _make_result(
+            "Long content. " * 400
+        )
+        return mgr, store
+
+    async def test_disabled_floor_no_longer_delivers_an_empty_response(self, tmp_path):
+        """The case the fix exists for: nothing downstream was left to catch it."""
+        from memtomem_stm.proxy.compression import LLMCompressor
+
+        mgr, store = self._mgr(tmp_path, min_retention=0.0)
+        try:
+            with patch.object(LLMCompressor, "_call_api", new=AsyncMock(return_value="")):
+                await mgr.call_tool("srv", "tool", {})
+            row = _latest_row(store)
+            assert row["compressed_chars"] > 0, "an empty summary must not be delivered as-is"
+            assert row["compression_strategy"] == "llm_summary→llm_empty_fallback"
+        finally:
+            store.close()
+
+    async def test_default_floor_is_unchanged_by_this_fix(self, tmp_path):
+        """Honesty pin: with the floor on, the ratio guard already handled it
+        and still does. If this ever starts reporting llm_empty, the guard's
+        ordering changed and the changelog's scope claim is stale."""
+        from memtomem_stm.proxy.compression import LLMCompressor
+
+        mgr, store = self._mgr(tmp_path, min_retention=0.65)
+        try:
+            with patch.object(LLMCompressor, "_call_api", new=AsyncMock(return_value="")):
+                await mgr.call_tool("srv", "tool", {})
+            row = _latest_row(store)
+            assert row["ratio_violation"] == 1
+            assert row["compression_strategy"] == "llm_summary→progressive_fallback"
+            assert row["compressed_chars"] > 1000
+        finally:
+            store.close()
