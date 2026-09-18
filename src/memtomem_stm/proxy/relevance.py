@@ -183,6 +183,34 @@ def _payload_list(payload: object, *, key: str, provider: str) -> list[Any]:
     return value
 
 
+def _require_vector(value: object, *, provider: str, where: str) -> list[float]:
+    """Return ``value`` as a vector of finite numbers, or say what it is not.
+
+    Checking that the container is a list is not enough. ``_embed_exact``'s
+    contract is a COUNT — as many vectors back as texts sent — so a reply like
+    ``{"embeddings": [[0.1, 0.2], ["bad", 0.2], [0.3, 0.4]]}`` satisfied it and
+    the bad row was written to the cache, where it answered every later call
+    for that text without a request. The element check is what makes the
+    cache-write guarantee true rather than nearly true.
+
+    ``bool`` is excluded deliberately: it passes ``isinstance(x, int)`` and is
+    never a component of an embedding.
+    """
+    if not isinstance(value, list):
+        raise ValueError(
+            f"{provider} embedding response: '{where}' is {type(value).__name__}, not a list"
+        )
+    for i, component in enumerate(value):
+        if isinstance(component, bool) or not isinstance(component, (int, float)):
+            raise ValueError(
+                f"{provider} embedding response: '{where}[{i}]' is "
+                f"{type(component).__name__}, not a number"
+            )
+        if not math.isfinite(component):
+            raise ValueError(f"{provider} embedding response: '{where}[{i}]' is {component}")
+    return value
+
+
 class EmbeddingScorer:
     """Semantic relevance scoring via embedding cosine similarity.
 
@@ -355,14 +383,11 @@ class EmbeddingScorer:
             timeout=self._timeout,
         )
         resp.raise_for_status()
-        vectors = _payload_list(resp.json(), key="embeddings", provider="ollama")
-        for i, vector in enumerate(vectors):
-            if not isinstance(vector, list):
-                raise ValueError(
-                    f"ollama embedding response: 'embeddings[{i}]' is "
-                    f"{type(vector).__name__}, not a list"
-                )
-        return vectors
+        raw = _payload_list(resp.json(), key="embeddings", provider="ollama")
+        return [
+            _require_vector(vector, provider="ollama", where=f"embeddings[{i}]")
+            for i, vector in enumerate(raw)
+        ]
 
     def _embed_openai(self, httpx_mod: object, texts: list[str]) -> list[list[float]]:
         import httpx as _httpx
@@ -386,12 +411,11 @@ class EmbeddingScorer:
             data.sort(key=lambda x: x["index"])
         vectors: list[list[float]] = []
         for i, item in enumerate(data):
-            embedding = item.get("embedding") if isinstance(item, dict) else None
-            if not isinstance(embedding, list):
-                raise ValueError(
-                    f"openai embedding response: 'data[{i}].embedding' is missing or not a list"
-                )
-            vectors.append(embedding)
+            if not isinstance(item, dict) or "embedding" not in item:
+                raise ValueError(f"openai embedding response: 'data[{i}].embedding' is missing")
+            vectors.append(
+                _require_vector(item["embedding"], provider="openai", where=f"data[{i}].embedding")
+            )
         return vectors
 
 

@@ -390,7 +390,11 @@ class TestEmbeddingOpenAIResponseParsing:
 # ── EmbeddingScorer response defense (#67 follow-up) ───────────────────
 
 
-# Every one of these raised a bare ``KeyError``/``TypeError`` before the fix.
+# Measured against the pre-fix code, these split two ways. Most raised a bare
+# ``KeyError``/``TypeError``. Three Ollama shapes did not raise at all —
+# ``embeddings`` set to null, set to a string, and a list holding a non-vector
+# each returned that value to the caller, which then failed further downstream
+# or, for the last one, was cached.
 # ``score_sections`` logs the exception MESSAGE ONLY — no traceback, by an
 # explicit decision in the code — so ``KeyError('embeddings')`` was the whole
 # signal an operator got: it named neither the provider nor what the body
@@ -401,6 +405,9 @@ _OLLAMA_BAD_BODIES = [
     ({"embeddings": "not a list"}, "embeddings"),
     ([], "not a JSON object"),
     ({"embeddings": [[0.1, 0.2], "not a vector"]}, "embeddings[1]"),
+    ({"embeddings": [["bad", 0.2]]}, "embeddings[0][0]"),
+    ({"embeddings": [[float("nan"), 0.2]]}, "embeddings[0][0]"),
+    ({"embeddings": [[True, 0.2]]}, "embeddings[0][0]"),
 ]
 
 _OPENAI_BAD_BODIES = [
@@ -410,6 +417,9 @@ _OPENAI_BAD_BODIES = [
     ([], "not a JSON object"),
     ({"data": [{"index": 0}]}, "data[0].embedding"),
     ({"data": ["not an object"]}, "data[0].embedding"),
+    ({"data": [{"embedding": "not a list"}]}, "data[0].embedding"),
+    ({"data": [{"embedding": ["x", 0.2]}]}, "data[0].embedding[0]"),
+    ({"data": [{"embedding": [float("inf")]}]}, "data[0].embedding[0]"),
 ]
 
 
@@ -489,21 +499,49 @@ class TestEmbeddingResponseDefense:
             scorer.score_sections("alpha", sections)
         assert scorer._cache == {}, "a response that fails validation must not be cached"
 
+        good = {"embeddings": [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]}
+        with patch("httpx.post", return_value=_bad_body_response(good)) as post:
+            scores = scorer.score_sections("alpha", sections)
+        assert post.call_count == 1, "a recovered provider must be retried, not served poison"
+        # And the retry must actually recover: these are cosine similarities,
+        # not the BM25 fallback. Asserting only the retry would leave "it asked
+        # again and failed again" indistinguishable from a working scorer.
+        assert scorer.fallback_count == 1
+        assert scores == pytest.approx([1.0, 0.0])
+
+    def test_a_vector_with_a_nonnumeric_component_is_not_cached(self):
+        """Checking the container alone was not enough: ``["bad", 0.2]`` IS a
+        list, so it passed the list check, satisfied ``_embed_exact``'s count
+        contract, and was cached. Measured on the container-only version: 3
+        entries cached, and the next identical call made 0 HTTP requests.
+        Element validation is what makes the no-cache guarantee true rather
+        than nearly true."""
+        scorer = self._scorer("ollama")
+        payload = {"embeddings": [[0.1, 0.2], ["bad", 0.2], [0.3, 0.4]]}
+        sections = [("Alpha", "alpha body"), ("Beta", "beta body")]
+        with patch("httpx.post", return_value=_bad_body_response(payload)):
+            scorer.score_sections("alpha", sections)
+        assert scorer._cache == {}
         with patch("httpx.post", return_value=_bad_body_response(payload)) as post:
             scorer.score_sections("alpha", sections)
-        assert post.call_count == 1, "a recovered provider must be retried, not served poison"
+        assert post.call_count == 1
 
     def test_score_sections_still_falls_back_to_bm25(self, caplog):
         """Behavior is unchanged: the caller catches it and scores with BM25.
         Only the logged reason improves."""
         import logging
 
+        from memtomem_stm.proxy.relevance import BM25Scorer
+
         scorer = self._scorer("ollama")
         sections = [("Alpha", "alpha body text"), ("Beta", "beta body text")]
         with patch("httpx.post", return_value=_bad_body_response({"error": "nope"})):
             with caplog.at_level(logging.WARNING):
                 scores = scorer.score_sections("alpha", sections)
-        assert len(scores) == 2
+        # Comparing against BM25's own output is what makes this a fallback
+        # assertion. ``len(scores) == 2`` and ``fallback_count == 1`` both
+        # survive reverting the fix, because the pre-fix code fell back too.
+        assert scores == BM25Scorer().score_sections("alpha", sections)
         assert scorer.fallback_count == 1
         assert "embeddings" in caplog.text and "ollama" in caplog.text
 

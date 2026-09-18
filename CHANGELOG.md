@@ -92,9 +92,14 @@ changes inline only. See the deprecation policy in
   cached, one of them a string; the next identical call issued **zero** HTTP
   requests and fell back to BM25 again, logging `can't multiply sequence by non-int
   of type 'float'`. Relevance scoring for those texts stayed degraded until the
-  process restarted, with no request left to blame. Such a response is now rejected
-  before the cache write, so the same call retries the provider and recovers as soon
-  as the provider does. Well-formed responses are cached exactly as before.
+  process restarted, with no request left to blame. Every vector is now checked
+  down to its components — each must be a finite number, so
+  `{"embeddings": [["bad", 0.2]]}` is rejected as well, which a container-only
+  check let through — and the rejection happens before the cache write, so the
+  next call retries the provider and recovers as soon as the provider does.
+  Well-formed responses are cached exactly as before; the extra validation
+  measured 0.41 ms for 8,064 components (21 texts at 384 dimensions), against an
+  HTTP round trip.
 
 ### Fixed
 
@@ -109,8 +114,9 @@ changes inline only. See the deprecation policy in
   — a deliberate choice, so an expected fallback does not bury real errors — which
   made `'embeddings'` the operator's entire signal: it named neither the provider
   nor what the body held. Each level is now type-checked and the `ValueError` names
-  the provider, the field, and the keys the body actually carried. The BM25 fallback
-  is unchanged. **Behavior change**: see the upgrade notes above.
+  the provider, the field, the offending index, and the keys the body actually
+  carried. The BM25 fallback is unchanged. **Behavior change**: see the upgrade
+  notes above.
 - **Explicit progressive and progressive fallback share one accounting basis**
   (#1039) — both now record the initial response text: compression footers are
   included, while surfacing, later index annotations, non-text content, and MCP
