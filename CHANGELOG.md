@@ -95,10 +95,15 @@ changes inline only. See the deprecation policy in
   `compression_strategy = llm_summary`, `compressed_chars = 0` — the response was
   destroyed and nothing in the row said a fallback had happened. It is now
   `llm_summary→llm_empty_fallback` with 191 characters, the truncated original.
-  Under the **default** floor of `0.65` the ratio guard already caught the empty
-  result and replaced it (`llm_summary→progressive_fallback`, 4,139 characters);
-  that path is measured to be byte-identical before and after, so configurations
-  that keep a floor see no change. All three providers (`openai`, `anthropic`,
+  With a floor set, what changes depends on the budget. The pipeline's ratio guard
+  fires when the compressed result falls below the floor, and the truncated
+  original may or may not clear it. Measured on the same response at the default
+  `0.65`: with `max_result_chars: 200` the 191-character fallback is still far
+  below the floor, so the guard replaces it exactly as before
+  (`llm_summary→progressive_fallback`, 4,139 characters, unchanged); with
+  `max_result_chars: 5000` the 4,993-character fallback clears the floor, the
+  guard no longer fires, and the row becomes `llm_summary→llm_empty_fallback` with
+  854 more characters preserved and the real cause named. Both are pinned. All three providers (`openai`, `anthropic`,
   `ollama`) were affected. Like `llm_overlength` this does not fail the circuit
   breaker — the endpoint answered, the model produced nothing usable — so repeated
   empty completions keep calling rather than opening it. Rows recorded before the
@@ -115,9 +120,10 @@ changes inline only. See the deprecation policy in
   three provider methods: one site covers every provider, and the event keeps its
   own label instead of being folded into `llm_error`, which would also have failed
   the circuit breaker and then misreported the cause as `circuit_breaker`. The
-  pipeline's retention ratio guard already caught this whenever a floor was set,
-  so what changes is the disabled-floor case and the recorded cause; both floor
-  settings are pinned by tests. **Behavior change**: see the upgrade notes above.
+  pipeline's retention ratio guard caught the empty result whenever the truncated
+  fallback also fell below the floor, which is why a small `max_result_chars`
+  shows no change; the cases that differ are a disabled floor and a budget large
+  enough for the fallback to clear it. All three are pinned by tests. **Behavior change**: see the upgrade notes above.
 - **Explicit progressive and progressive fallback share one accounting basis**
   (#1039) — both now record the initial response text: compression footers are
   included, while surfacing, later index annotations, non-text content, and MCP
