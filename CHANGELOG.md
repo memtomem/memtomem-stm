@@ -84,9 +84,65 @@ changes inline only. See the deprecation policy in
   result that contains `\n---\n[progressive: chars=` without a
   `stm_proxy_read_more(key="…")` call used to miss the cache on every call; identical
   calls now hit it, and the row survives restarts.
+- **A malformed embedding response is no longer cached** (#1058, #67 follow-up). The
+  embedding scorer checked that it got as many vectors as it sent texts, never that
+  each one was a vector, so a reply such as
+  `{"embeddings": [[0.1, 0.2], "not a vector", [0.3, 0.4]]}` satisfied the count and
+  was written to the embedding cache. Measured with three texts: three entries
+  cached, one of them a string; the next identical call issued **zero** HTTP
+  requests and fell back to BM25 again, logging `can't multiply sequence by non-int
+  of type 'float'`. Relevance scoring for those texts stayed degraded until the
+  process restarted, with no request left to blame. Three shapes were reaching the
+  cache, each passing the check above it: a non-list element, a list whose
+  *components* were not numbers (`[["bad", 0.2]]`), and two batch shapes that
+  satisfied the vectors-per-text count — `[[], [], []]`, which scores everything
+  0.0, and vectors of differing dimensions, where `zip` stops at the shorter one
+  and a 1-D against a 2-D vector scored a confident **1.0**. The last two raised
+  nothing at all, so no fallback was counted and no line was logged; the first two
+  were caught later, inside the cosine computation, which did log a BM25 fallback
+  but named the arithmetic rather than the response. All are now rejected before
+  the cache write, so the next call retries the provider and recovers as soon as
+  the provider does. The dimension check spans the **cache** as well as the batch:
+  a query cached by an earlier call and a section fetched now are compared to each
+  other, and the batch check alone could not see that. Where a provider states the
+  order with `index`, the indices must be integers forming exactly the requested
+  permutation — `[0, 0, 2]` used to sort without error and cache vectors with no
+  correspondence to the inputs. A response that omits `index` on some entries is
+  still accepted in input order, unchanged (#68). Well-formed responses are cached exactly as before;
+  the component validation measured 0.41 ms for 8,064 components (21 texts at 384
+  dimensions), against an HTTP round trip.
+- **A change in embedding dimension discards the cache** (#1058). One
+  `(provider, model)` pair has one embedding dimension, so a batch arriving at a
+  different one means the model answering changed and every vector already held came
+  from a different model. That batch is refused and the cache is dropped with it.
+  Without the drop the mismatch was permanent: two internally uniform batches of
+  different dimensions each passed their own check and were both cached, and three
+  later calls that mixed them produced three BM25 fallbacks and **zero** HTTP
+  requests against a healthy provider. The next call now re-fetches and recovers.
+  Steady traffic is unaffected — the cache is kept and no extra request issued.
+- **Cosine similarity no longer overflows to `nan`** (#1058, #67 follow-up). `1e308` is a
+  finite number a provider can serialise, but `1e308 ** 2` is not, so two identical
+  vectors scored `nan` — neither high nor low, and unpredictable under sorting.
+  Each vector is now divided by its own largest magnitude before multiplying, which
+  cancels exactly in the ratio, so ordinary similarities are unchanged (pinned by
+  test).
 
 ### Fixed
 
+- **Embedding responses are parsed defensively, and the reason is logged**
+  (#1058, #67 follow-up) — `_embed_ollama` and `_embed_openai` indexed straight into the parsed
+  body: `resp.json()["embeddings"]`, `resp.json()["data"]` and `d["embedding"]`.
+  This is the same unchecked-access class #67 fixed for the chat-completion paths
+  and left untouched here. An Ollama error envelope raised `KeyError('embeddings')`,
+  a non-object body raised `TypeError`, and three shapes (`embeddings` null, a
+  string, or a list holding a non-vector) returned garbage downstream instead of
+  raising at all. `score_sections` logs the exception **message and nothing else**
+  — a deliberate choice, so an expected fallback does not bury real errors — which
+  made `'embeddings'` the operator's entire signal: it named neither the provider
+  nor what the body held. Each level is now type-checked and the `ValueError` names
+  the provider and the field, plus the offending index when an element is at
+  fault and the keys the body carried when a top-level field is missing. The BM25
+  fallback is unchanged. **Behavior change**: see the upgrade notes above.
 - **Explicit progressive and progressive fallback share one accounting basis**
   (#1039) — both now record the initial response text: compression footers are
   included, while surfacing, later index annotations, non-text content, and MCP
