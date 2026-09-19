@@ -84,8 +84,8 @@ changes inline only. See the deprecation policy in
   result that contains `\n---\n[progressive: chars=` without a
   `stm_proxy_read_more(key="…")` call used to miss the cache on every call; identical
   calls now hit it, and the row survives restarts.
-- **An empty LLM summary no longer replaces the response with nothing** (#67
-  follow-up). A provider answering `200 OK` with an empty or whitespace-only
+- **An empty LLM summary no longer replaces the response with nothing** (#1056,
+  #67 follow-up). A provider answering `200 OK` with an empty or whitespace-only
   completion passed every guard #67 added — `isinstance(content, str)` is true for
   `""` — and `LLMCompressor.compress()` returned that empty string through its
   success path with `last_fallback` left at `None`. **This only reached the client
@@ -112,7 +112,8 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
-- **An empty LLM completion takes the truncate fallback** (#67 follow-up) — the
+- **An empty LLM completion takes the truncate fallback** (#1056, #67 follow-up) —
+  the
   guards added for #67 reject a missing or non-string `content`, but an empty
   string is a string, so it flowed through `compress()`'s success path and the
   caller received nothing. `compress()` now checks the returned summary for
