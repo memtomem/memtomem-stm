@@ -583,10 +583,10 @@ class TestLLMCompressorEmptyResponseGuard:
             await comp._anthropic("text", "system")
 
     @pytest.mark.asyncio
-    async def test_anthropic_content_without_a_text_block_raises(self):
+    async def test_anthropic_text_block_without_text_raises(self):
         comp = self._anthropic_comp()
         _patch_post(comp, {"content": [{"type": "text"}]})
-        with pytest.raises(ValueError, match="no 'text' block"):
+        with pytest.raises(ValueError, match="not a string"):
             await comp._anthropic("text", "system")
 
     @pytest.mark.asyncio
@@ -727,9 +727,9 @@ _MALFORMED_SHAPES = [
     (LLMProvider.OPENAI, {"choices": [{"message": "not an object"}]}, "missing 'choices"),
     (LLMProvider.OPENAI, {"choices": "not a list"}, "empty 'choices'"),
     (LLMProvider.OPENAI, [], "empty 'choices'"),
-    (LLMProvider.ANTHROPIC, {"content": [None]}, "no 'text' block"),
-    (LLMProvider.ANTHROPIC, {"content": ["not an object"]}, "no 'text' block"),
-    (LLMProvider.ANTHROPIC, {"content": [{"type": "text", "text": 42}]}, "no 'text' block"),
+    (LLMProvider.ANTHROPIC, {"content": [None]}, "content\\[0\\]' is NoneType"),
+    (LLMProvider.ANTHROPIC, {"content": ["not an object"]}, "content\\[0\\]' is str"),
+    (LLMProvider.ANTHROPIC, {"content": [{"type": "text", "text": 42}]}, "not a string"),
     (LLMProvider.ANTHROPIC, {"content": "not a list"}, "empty 'content'"),
     (LLMProvider.ANTHROPIC, [], "empty 'content'"),
     (LLMProvider.OLLAMA, {"message": "not an object"}, "missing 'message.content'"),
@@ -792,6 +792,25 @@ class TestAnthropicTextBlockSelection:
         comp = _comp_for(LLMProvider.ANTHROPIC)
         _patch_post(comp, {"content": [{"text": "summary"}]})
         assert await comp._anthropic("text", "system") == "summary"
+
+    @pytest.mark.asyncio
+    async def test_a_broken_text_block_beside_a_valid_one_raises(self):
+        """A block whose ``text`` is broken is not the same as a ``thinking``
+        block. Skipping it returned a PARTIAL summary through the success path
+        whenever a neighbouring block happened to be well formed — booked as a
+        complete compression, with no fallback label."""
+        comp = _comp_for(LLMProvider.ANTHROPIC)
+        _patch_post(
+            comp,
+            {
+                "content": [
+                    {"type": "text", "text": "prefix"},
+                    {"type": "text", "text": {"broken": "tail"}},
+                ]
+            },
+        )
+        with pytest.raises(ValueError, match="content\\[1\\].text"):
+            await comp._anthropic("text", "system")
 
     @pytest.mark.asyncio
     async def test_tool_use_only_response_raises(self):

@@ -140,6 +140,24 @@ changes inline only. See the deprecation policy in
   now distinguishes unreadable (`None`) from an empty fact array (`[]`); a model
   that read the response and found nothing is still respected, and the heuristic
   does not override it.
+- **A malformed Anthropic text block is rejected instead of skipped** (#67
+  follow-up). Collecting every `text` block treated a block whose `text` was
+  missing or not a string the same way it treats a `thinking` block — as
+  something to ignore — so a response that was half broken came back as a
+  complete answer whenever a neighbouring block happened to be well formed.
+  Compression returned the surviving prefix through its success path with no
+  fallback label. Such a response now takes the normal fallback. Deliberately
+  non-text block types (`thinking`, `tool_use`, `server_tool_use`) are still
+  skipped, and a block carrying no `type` still counts as text.
+- **A fact array whose entries are all unusable takes the heuristic** (#67
+  follow-up). Entry-level shape is now checked: `content` must be a string and
+  `tags` a list. `[null]`, `[{"oops": 1}]` and `[{"content": null}]` reported an
+  empty result, which claimed the model had read the response and found nothing;
+  they are now unreadable and the heuristic answers. A single malformed entry
+  among good ones is still skipped, as before. `[{"content": "a", "tags": null}]`
+  additionally raised `TypeError` out of the parser, which the caller read as an
+  **endpoint** failure and counted toward the circuit breaker — a model-quality
+  problem booked as a provider outage.
 
 ### Fixed
 

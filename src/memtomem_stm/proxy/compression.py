@@ -2595,13 +2595,24 @@ class LLMCompressor:
         # arrive split across several text blocks. A block carrying no ``type``
         # counts as text: OpenAI-compatible gateways omit the field and the old
         # fixed-index read accepted those.
-        texts = [
-            block["text"]
-            for block in content
-            if isinstance(block, dict)
-            and block.get("type", "text") == "text"
-            and isinstance(block.get("text"), str)
-        ]
+        texts: list[str] = []
+        for index, block in enumerate(content):
+            if not isinstance(block, dict):
+                raise ValueError(
+                    f"Anthropic response 'content[{index}]' is "
+                    f"{type(block).__name__}, not an object"
+                )
+            if block.get("type", "text") != "text":
+                continue  # thinking / tool_use / server_tool_use: not our answer
+            block_text = block.get("text")
+            if not isinstance(block_text, str):
+                # A BROKEN text block is not an ignorable one. Skipping it would
+                # return a partial summary through the success path whenever
+                # another block happened to be well formed.
+                raise ValueError(
+                    f"Anthropic response 'content[{index}].text' is missing or not a string"
+                )
+            texts.append(block_text)
         if not texts:
             raise ValueError("Anthropic response has no 'text' block in 'content'")
         return "\n\n".join(texts)

@@ -80,17 +80,34 @@ def _parse_facts_json(raw: str, *, max_facts: int) -> list[ExtractedFact] | None
     if not isinstance(data, list):
         return None
     facts: list[ExtractedFact] = []
+    skipped = 0
     for item in data[:max_facts]:
-        if not isinstance(item, dict) or "content" not in item:
+        # Field validation lives here, not in the ``try`` above, so state it
+        # explicitly rather than leaning on an exception: ``tags: null`` used to
+        # raise ``TypeError`` out of the list comprehension, which the caller
+        # read as an ENDPOINT failure and counted toward the circuit breaker.
+        # A model that writes bad JSON is a model-quality event.
+        if not isinstance(item, dict):
+            skipped += 1
+            continue
+        content_value = item.get("content")
+        tags_value = item.get("tags", [])
+        if not isinstance(content_value, str) or not isinstance(tags_value, list):
+            skipped += 1
             continue
         facts.append(
             ExtractedFact(
-                content=str(item["content"]).strip(),
+                content=content_value.strip(),
                 category=str(item.get("category", "technical")),
                 confidence=safe_float(item.get("confidence", 0.5), 0.5),
-                tags=[str(t) for t in item.get("tags", [])],
+                tags=[str(tag) for tag in tags_value],
             )
         )
+    if not facts and skipped:
+        # The array held entries and none was a fact. Returning ``[]`` here
+        # would claim the model read the response and found nothing, which is
+        # the one thing this return value is supposed to mean.
+        return None
     return facts
 
 
@@ -449,13 +466,24 @@ class FactExtractor:
         # whichever candidate rule was in force, some input picked the wrong
         # one. A block with no ``type`` counts as text, the way the
         # fixed-index read did.
-        texts = [
-            block["text"]
-            for block in content
-            if isinstance(block, dict)
-            and block.get("type", "text") == "text"
-            and isinstance(block.get("text"), str)
-        ]
+        texts: list[str] = []
+        for index, block in enumerate(content):
+            if not isinstance(block, dict):
+                raise ValueError(
+                    f"Anthropic response 'content[{index}]' is "
+                    f"{type(block).__name__}, not an object"
+                )
+            if block.get("type", "text") != "text":
+                continue  # thinking / tool_use / server_tool_use: not our answer
+            block_text = block.get("text")
+            if not isinstance(block_text, str):
+                # A BROKEN text block is not an ignorable one. Skipping it would
+                # book a partial answer as a complete success whenever another
+                # block happened to parse.
+                raise ValueError(
+                    f"Anthropic response 'content[{index}].text' is missing or not a string"
+                )
+            texts.append(block_text)
         if not texts:
             raise ValueError("Anthropic response has no 'text' block in 'content'")
         return "\n\n".join(texts)
