@@ -109,8 +109,8 @@ changes inline only. See the deprecation policy in
   empty completions keep calling rather than opening it. Rows recorded before the
   upgrade are not rewritten, and a script matching on the fallback label set gains
   one member.
-- **Anthropic responses are read from every text block, not `content[0]`** (#67
-  follow-up). A response whose first block is `thinking` or `tool_use` — what
+- **Anthropic responses are read from every text block, not `content[0]`**
+  (#1057, #67 follow-up). A response whose first block is `thinking` or `tool_use` — what
   extended thinking produces, and what a compatible gateway can forward — was
   rejected as missing `content[0].text`, so compression fell back to truncation and
   extraction to the heuristic even though the answer sat in the next block. Such a
@@ -119,13 +119,15 @@ changes inline only. See the deprecation policy in
   A block carrying no `type` still counts as text, so OpenAI-compatible gateways
   that omit the field are unaffected. A response holding no text block at all is
   rejected as before, with a message naming that instead of the missing index.
-- **An empty extraction response takes the heuristic** (#67 follow-up). An empty or
+- **An empty extraction response takes the heuristic** (#1057, #67 follow-up). An
+  empty or
   whitespace-only completion parsed to zero facts and returned as if the model had
   found nothing, which is indistinguishable from a genuinely empty result. It now
   falls back to heuristic extraction and logs a warning. The circuit breaker is
   unaffected — the endpoint answered, so this is a model-quality event, the same
   judgement `llm_empty` makes on the compression side.
-- **Extraction stops mining prose for a fact array** (#67 follow-up). The parser
+- **Extraction stops mining prose for a fact array** (#1057, #67 follow-up). The
+  parser
   used to search the response for a bracketed substring and extract from whichever
   candidate parsed first — `\[[\s\S]*?\]` originally, then a `raw_decode` attempt at
   each `[`. Both were candidate-*selection* heuristics over untrusted text, and
@@ -140,8 +142,8 @@ changes inline only. See the deprecation policy in
   now distinguishes unreadable (`None`) from an empty fact array (`[]`); a model
   that read the response and found nothing is still respected, and the heuristic
   does not override it.
-- **A malformed Anthropic text block is rejected instead of skipped** (#67
-  follow-up). Collecting every `text` block treated a block whose `text` was
+- **A malformed Anthropic text block is rejected instead of skipped** (#1057,
+  #67 follow-up). Collecting every `text` block treated a block whose `text` was
   missing or not a string the same way it treats a `thinking` block — as
   something to ignore — so a response that was half broken came back as a
   complete answer whenever a neighbouring block happened to be well formed.
@@ -149,8 +151,8 @@ changes inline only. See the deprecation policy in
   fallback label. Such a response now takes the normal fallback. Deliberately
   non-text block types (`thinking`, `tool_use`, `server_tool_use`) are still
   skipped, and a block carrying no `type` still counts as text.
-- **A fact array whose entries are all unusable takes the heuristic** (#67
-  follow-up). Entry-level shape is now checked: `content` must be a string and
+- **A fact array whose entries are all unusable takes the heuristic** (#1057,
+  #67 follow-up). Entry-level shape is now checked: `content` must be a string and
   `tags` a list. `[null]`, `[{"oops": 1}]` and `[{"content": null}]` reported an
   empty result, which claimed the model had read the response and found nothing;
   they are now unreadable and the heuristic answers. A single malformed entry
@@ -174,7 +176,8 @@ changes inline only. See the deprecation policy in
   shows no change; the cases that differ are a disabled floor and a budget large
   enough for the fallback to clear it. All three are pinned by tests. **Behavior change**: see the upgrade notes above.
 - **Malformed provider payloads raise a descriptive error, not `AttributeError`**
-  (#67 follow-up) — the guards added for #67 checked that a container was present,
+  (#1057, #67 follow-up) — the guards added for #67 checked that a container was
+  present,
   never that it held the type they then indexed into. `{"choices": [null]}`, a bare
   string where the message object belongs, and a JSON body that is not an object at
   all each crashed with an `AttributeError` from inside the provider method, naming
@@ -184,11 +187,13 @@ changes inline only. See the deprecation policy in
   OpenAI-compatible gateways. The fallback behavior is unchanged (the caller
   already caught them); the log line now names the defect. Both the compressor and
   the fact extractor were affected, and both are fixed.
-- **Anthropic text blocks are selected by type** (#67 follow-up) — `content[0]` was
+- **Anthropic text blocks are selected by type** (#1057, #67 follow-up) —
+  `content[0]` was
   read regardless of what the block was. **Behavior change**: see the upgrade notes
   above.
 - **Joining Anthropic text blocks no longer changes which facts are extracted**
-  (#67 follow-up) — joining put a decoy array within reach of the candidate search,
+  (#1057, #67 follow-up) — joining put a decoy array within reach of the candidate
+  search,
   and the intended one lost. Measured: a block holding
   `[{"content":"intended","tags":["technical"]}]` followed by the prose
   `Example only: [{"content":"wrong"}]` extracted `wrong`; with a plain `Done.`
