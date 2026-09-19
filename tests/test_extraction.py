@@ -79,11 +79,17 @@ class TestParseFactsJson:
         assert len(facts) == 1
         assert facts[0].content == "valid"
 
-    def test_invalid_json_returns_empty(self):
-        assert _parse_facts_json("not json at all", max_facts=10) == []
+    def test_unreadable_output_returns_none(self):
+        """``None`` and ``[]`` are different answers: one says the response was
+        not a fact array, the other that the model found nothing. The caller
+        takes the heuristic for the first and not the second."""
+        assert _parse_facts_json("not json at all", max_facts=10) is None
 
-    def test_empty_array_returns_empty(self):
+    def test_empty_array_returns_empty_not_none(self):
         assert _parse_facts_json("[]", max_facts=10) == []
+
+    def test_a_json_object_is_not_a_fact_array(self):
+        assert _parse_facts_json('{"content": "fact"}', max_facts=10) is None
 
     def test_defaults_for_missing_fields(self):
         raw = json.dumps([{"content": "just content"}])
@@ -588,7 +594,7 @@ class TestAnthropicResponseDefense:
         with patch.object(
             extractor._client, "post", AsyncMock(return_value=_mock_http_response(payload))
         ):
-            with pytest.raises(ValueError, match="content\\[0\\].text"):
+            with pytest.raises(ValueError, match="no 'text' block"):
                 await extractor._anthropic("text", "prompt")
 
 
@@ -1143,3 +1149,284 @@ class TestInFlightGate:
         gate.leave(live)
         assert gate.in_flight == 0
         assert gate.idle.is_set()
+
+
+# ---------------------------------------------------------------------------
+# Provider response SHAPE + Anthropic block selection (#67 follow-up)
+# ---------------------------------------------------------------------------
+
+
+# Twin of ``tests/test_compression.py::TestLLMProviderResponseShape``: this
+# module's provider methods were a verbatim copy of the compressor's, so they
+# carried the same gap. Measured pre-fix, each of these raised a bare
+# ``AttributeError`` from inside the provider method.
+_EXTRACTION_MALFORMED_SHAPES = [
+    (LLMProvider.OPENAI, {"choices": [None]}, "missing 'choices"),
+    (LLMProvider.OPENAI, {"choices": [{"message": "not an object"}]}, "missing 'choices"),
+    (LLMProvider.OPENAI, {"choices": "not a list"}, "empty 'choices'"),
+    (LLMProvider.OPENAI, [], "empty 'choices'"),
+    (LLMProvider.ANTHROPIC, {"content": [None]}, "content\\[0\\]' is NoneType"),
+    (LLMProvider.ANTHROPIC, {"content": "not a list"}, "empty 'content'"),
+    (LLMProvider.ANTHROPIC, [], "empty 'content'"),
+    (LLMProvider.OLLAMA, {"message": "not an object"}, "missing 'message.content'"),
+    (LLMProvider.OLLAMA, [], "missing 'message.content'"),
+]
+
+
+class TestExtractionProviderResponseShape:
+    @pytest.mark.parametrize("provider,payload,match", _EXTRACTION_MALFORMED_SHAPES)
+    async def test_malformed_shape_raises_valueerror(self, provider, payload, match):
+        extractor = _make_extractor(provider)
+        with patch.object(
+            extractor._client, "post", AsyncMock(return_value=_mock_http_response(payload))
+        ):
+            with pytest.raises(ValueError, match=match):
+                await getattr(extractor, f"_{provider.value}")("text", "prompt")
+
+
+class TestExtractionAnthropicTextBlocks:
+    """Extraction feeds the provider string straight into ``_parse_facts_json``,
+    so joining several text blocks is only safe if the joined string still
+    parses. These pin both halves: the right blocks are selected, and what
+    comes out the other end is still parseable."""
+
+    async def _raw(self, payload: dict) -> str:
+        extractor = _make_extractor(LLMProvider.ANTHROPIC)
+        with patch.object(
+            extractor._client, "post", AsyncMock(return_value=_mock_http_response(payload))
+        ):
+            return await extractor._anthropic("text", "prompt")
+
+    async def test_thinking_block_before_the_answer_is_skipped(self):
+        raw = await self._raw(
+            {
+                "content": [
+                    {"type": "thinking", "thinking": "considering…"},
+                    {"type": "text", "text": '[{"content": "fact"}]'},
+                ]
+            }
+        )
+        assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == ["fact"]
+
+    async def test_fact_array_split_across_blocks_still_parses(self):
+        raw = await self._raw(
+            {
+                "content": [
+                    {"type": "text", "text": '[{"content": "alpha is 3"},'},
+                    {"type": "text", "text": ' {"content": "beta is 7"}]'},
+                ]
+            }
+        )
+        assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == [
+            "alpha is 3",
+            "beta is 7",
+        ]
+
+    async def test_prose_block_before_the_array_is_unreadable(self):
+        """The cost of dropping prose mining, stated as a test. The join makes
+        the whole string invalid JSON, so this is no longer parsed — it is
+        reported unreadable and the caller takes the heuristic. Mining it was
+        what produced wrong facts on neighbouring inputs."""
+        raw = await self._raw(
+            {
+                "content": [
+                    {"type": "text", "text": "Here are the facts:"},
+                    {"type": "text", "text": '[{"content": "alpha is 3"}]'},
+                ]
+            }
+        )
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(raw)
+        assert _parse_facts_json(raw, max_facts=10) is None
+
+
+class TestExtractionEmptyCompletion:
+    """An empty completion parsed to zero facts and returned as if the model
+    had simply found nothing — indistinguishable from a genuine empty result.
+    It now takes the heuristic, without failing the breaker (a model-quality
+    event, matching the compressor's ``llm_empty`` path)."""
+
+    TEXT = (
+        "Decision: we will use SQLite for the store. "
+        "See https://example.com/adr-7 for the rationale, dated 2026-04-14."
+    )
+
+    @pytest.mark.parametrize("body", ["", "   \n  "])
+    async def test_empty_completion_falls_back_to_heuristic(self, body):
+        extractor = _make_extractor(LLMProvider.OLLAMA)
+        payload = {"message": {"content": body}}
+        with patch.object(
+            extractor._client, "post", AsyncMock(return_value=_mock_http_response(payload))
+        ):
+            facts = await extractor.extract(self.TEXT, server="s", tool="t")
+        assert facts, "heuristic fallback should still produce facts"
+        assert extractor._cb.failure_count == 0
+
+
+class TestFactsJsonSingleCandidate:
+    """``_parse_facts_json`` tried to find a fact array inside arbitrary prose,
+    first with the regex ``\\[[\\s\\S]*?\\]`` and then with ``raw_decode`` at each
+    ``[``. Every review round produced an input that picked the wrong array.
+    These pin the inputs that motivated dropping the search, and the cost of
+    dropping it.
+    """
+
+    def test_a_decoy_array_no_longer_wins(self):
+        """Measured per era on this fixture: the regex returned ``right`` (it
+        skipped the malformed prefix and matched the later array), the
+        ``raw_decode`` scan returned ``wrong`` (the decoy is the first thing
+        that parses). Both were accidents of the selection rule. Now:
+        unreadable, so the heuristic answers instead."""
+        raw = 'Example: [[0], {"content":"wrong"}] Facts: [{"content":"right"}]'
+        assert _parse_facts_json(raw, max_facts=10) is None
+
+    def test_a_deeply_nested_prefix_does_not_blow_the_stack(self):
+        """raw_decode era: ``RecursionError`` raised out of the parser, which
+        the caller counted as a breaker failure."""
+        raw = "prefix " + "[" * 1100 + "0" + "]" * 1100 + ' Facts: [{"content":"right"}]'
+        assert _parse_facts_json(raw, max_facts=10) is None
+
+    def test_an_adversarial_nest_is_not_a_latency_problem(self):
+        """raw_decode era: ~400 ms on this input, because a decode was
+        attempted at every one of the nested brackets."""
+        import time
+
+        raw = "x " + "[" * 400 + ",".join(str(i) for i in range(9000)) + "]" * 400
+        started = time.perf_counter()
+        assert _parse_facts_json(raw, max_facts=10) is None
+        assert (time.perf_counter() - started) < 0.05
+
+    def test_a_fact_array_carrying_tags_parses(self):
+        """Compatibility control — this passes against ``main`` too, because a
+        bare array parses as the whole string before any recovery runs. It is
+        here so the parser swap cannot regress the ordinary case; the regex's
+        ``tags`` defect showed up only once prose surrounded the array."""
+        raw = '[{"content":"intended","tags":["technical"]}]'
+        assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == ["intended"]
+
+    def test_an_array_split_across_blocks_parses_after_joining(self):
+        """The join inserts a blank line between array elements, which JSON
+        treats as ordinary whitespace — so this stays readable."""
+        raw = '[{"content":"alpha is 3"},\n\n {"content":"beta is 7"}]'
+        assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == [
+            "alpha is 3",
+            "beta is 7",
+        ]
+
+    def test_markdown_fenced_array_still_parses(self):
+        """The one wrapping still stripped, because it is unambiguous."""
+        raw = '```json\n[{"content":"fenced"}]\n```'
+        assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == ["fenced"]
+
+    def test_a_bare_fence_without_a_language_parses(self):
+        raw = '```\n[{"content":"fenced"}]\n```'
+        assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == ["fenced"]
+
+
+class TestUnreadableOutputTakesTheHeuristic:
+    """The three states, through the caller."""
+
+    TEXT = (
+        "Decision: we will use SQLite for the store. "
+        "See https://example.com/adr-7 for the rationale, dated 2026-04-14."
+    )
+
+    async def _extract(self, body: str):
+        extractor = _make_extractor(LLMProvider.OLLAMA)
+        payload = {"message": {"content": body}}
+        with patch.object(
+            extractor._client, "post", AsyncMock(return_value=_mock_http_response(payload))
+        ):
+            return await extractor.extract(self.TEXT, server="s", tool="t"), extractor
+
+    async def test_prose_response_falls_back_to_the_heuristic(self):
+        """``assert facts`` alone passes against ``main``, whose parser mined
+        ``a`` out of the prose — so it proved nothing about the heuristic ever
+        running. Compare against the heuristic's own output, and assert the
+        mined fact is absent."""
+        facts, extractor = await self._extract('Here are the facts: [{"content":"a"}]')
+        expected = _extract_heuristic(self.TEXT, max_facts=10)
+        assert [f.content for f in facts] == [f.content for f in expected]
+        assert "a" not in [f.content for f in facts]
+        assert extractor._cb.failure_count == 0
+
+    async def test_an_empty_fact_array_is_respected(self):
+        """``[]`` is an answer, not a failure — the heuristic must NOT override
+        a model that read the response and found nothing."""
+        facts, _ = await self._extract("[]")
+        assert facts == []
+
+
+class TestFactItemValidation:
+    """Item-level shape, which the outer-list check does not cover.
+
+    ``[]`` is supposed to mean the model read the response and found nothing.
+    An array whose ENTRIES are all malformed is not that, and reporting it as
+    ``[]`` suppressed the heuristic while claiming a considered empty answer.
+    """
+
+    @pytest.mark.parametrize(
+        "raw,label",
+        [
+            ("[null]", "the array holds null"),
+            ('[{"oops": 1}]', "no content field"),
+            ('[{"content": null}]', "content is null"),
+            ('[{"content": "a", "tags": null}]', "tags is null"),
+        ],
+    )
+    def test_an_array_of_unusable_entries_is_unreadable(self, raw, label):
+        assert _parse_facts_json(raw, max_facts=10) is None, label
+
+    def test_tags_null_does_not_raise_out_of_the_parser(self):
+        """This one was a crash, not a wrong answer. Field handling sits below
+        the ``try`` that guards decoding, so ``tags: null`` raised ``TypeError``
+        from the list comprehension, reached ``_extract_llm``'s endpoint-failure
+        handler, and counted toward the circuit breaker — a model-quality
+        problem booked as a provider outage."""
+        try:
+            result = _parse_facts_json('[{"content": "a", "tags": null}]', max_facts=10)
+        except Exception as exc:  # pragma: no cover - the point of the test
+            raise AssertionError(f"parser raised {type(exc).__name__}: {exc}") from exc
+        assert result is None
+
+    def test_one_bad_entry_among_good_ones_is_skipped(self):
+        """Unchanged: a single malformed entry does not discard the rest. Only
+        an array with NO usable entry is reported unreadable."""
+        raw = '[{"oops": 1}, {"content": "kept"}, {"content": "also kept"}]'
+        facts = _parse_facts_json(raw, max_facts=10)
+        assert [f.content for f in facts] == ["kept", "also kept"]
+
+
+class TestAnthropicMalformedBlockIsNotIgnorable:
+    """A block whose ``text`` is broken is not the same as a ``thinking``
+    block. Skipping it returned a PARTIAL answer through the success path
+    whenever a neighbouring block happened to be well formed."""
+
+    async def test_a_broken_text_block_beside_a_valid_one_raises(self):
+        extractor = _make_extractor(LLMProvider.ANTHROPIC)
+        payload = {
+            "content": [
+                {"type": "text", "text": '[{"content": "prefix"}]'},
+                {"type": "text", "text": {"broken": "tail"}},
+            ]
+        }
+        with patch.object(
+            extractor._client, "post", AsyncMock(return_value=_mock_http_response(payload))
+        ):
+            with pytest.raises(ValueError, match="content\\[1\\].text"):
+                await extractor._anthropic("text", "prompt")
+
+    async def test_a_thinking_block_beside_a_valid_one_is_still_skipped(self):
+        """Positive control: deliberate non-text types stay ignorable."""
+        extractor = _make_extractor(LLMProvider.ANTHROPIC)
+        payload = {
+            "content": [
+                {"type": "thinking", "thinking": "..."},
+                {"type": "text", "text": '[{"content": "kept"}]'},
+            ]
+        }
+        with patch.object(
+            extractor._client, "post", AsyncMock(return_value=_mock_http_response(payload))
+        ):
+            raw = await extractor._anthropic("text", "prompt")
+        assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == ["kept"]

@@ -583,10 +583,10 @@ class TestLLMCompressorEmptyResponseGuard:
             await comp._anthropic("text", "system")
 
     @pytest.mark.asyncio
-    async def test_anthropic_missing_text_raises(self):
+    async def test_anthropic_text_block_without_text_raises(self):
         comp = self._anthropic_comp()
         _patch_post(comp, {"content": [{"type": "text"}]})
-        with pytest.raises(ValueError, match="missing 'content\\[0\\].text'"):
+        with pytest.raises(ValueError, match="not a string"):
             await comp._anthropic("text", "system")
 
     @pytest.mark.asyncio
@@ -708,6 +708,116 @@ class TestLLMCompressorEmptyCompletion:
         result = await comp.compress(self.TEXT, max_chars=200)
         assert result == "real summary"
         assert comp.last_fallback is None
+
+
+# ---------------------------------------------------------------------------
+# LLMCompressor — provider response SHAPE (#67 follow-up)
+# ---------------------------------------------------------------------------
+
+
+# Each entry is a 200 OK body that is structurally wrong in a way the #67
+# guards did not cover. Measured against the pre-fix code, every one of these
+# raised a bare ``AttributeError: 'X' object has no attribute 'get'`` from deep
+# inside the provider method — the opaque crash #67 set out to replace, one
+# level further down. ``base_url`` is user-configurable, so these shapes are
+# reachable through an OpenAI-compatible gateway (LiteLLM, vLLM, LM Studio).
+_MALFORMED_SHAPES = [
+    (LLMProvider.OPENAI, {"choices": [None]}, "missing 'choices"),
+    (LLMProvider.OPENAI, {"choices": ["not an object"]}, "missing 'choices"),
+    (LLMProvider.OPENAI, {"choices": [{"message": "not an object"}]}, "missing 'choices"),
+    (LLMProvider.OPENAI, {"choices": "not a list"}, "empty 'choices'"),
+    (LLMProvider.OPENAI, [], "empty 'choices'"),
+    (LLMProvider.ANTHROPIC, {"content": [None]}, "content\\[0\\]' is NoneType"),
+    (LLMProvider.ANTHROPIC, {"content": ["not an object"]}, "content\\[0\\]' is str"),
+    (LLMProvider.ANTHROPIC, {"content": [{"type": "text", "text": 42}]}, "not a string"),
+    (LLMProvider.ANTHROPIC, {"content": "not a list"}, "empty 'content'"),
+    (LLMProvider.ANTHROPIC, [], "empty 'content'"),
+    (LLMProvider.OLLAMA, {"message": "not an object"}, "missing 'message.content'"),
+    (LLMProvider.OLLAMA, [], "missing 'message.content'"),
+]
+
+
+class TestLLMProviderResponseShape:
+    """#67 guarded presence (``or []``, ``or {}``, ``isinstance(..., str)``)
+    but not the type of what it indexed into, so a container of the wrong type
+    — or a null/scalar element inside a well-shaped container — still crashed
+    with ``AttributeError`` instead of a descriptive ``ValueError``.
+    """
+
+    @pytest.mark.parametrize("provider,payload,match", _MALFORMED_SHAPES)
+    @pytest.mark.asyncio
+    async def test_malformed_shape_raises_valueerror(self, provider, payload, match):
+        comp = _comp_for(provider)
+        _patch_post(comp, payload)
+        with pytest.raises(ValueError, match=match):
+            await getattr(comp, f"_{provider.value}")("text", "system")
+
+
+class TestAnthropicTextBlockSelection:
+    """``content[0].text`` assumed the answer is always the first block. It is
+    not: with extended thinking (or a gateway forwarding it) the first block is
+    ``thinking``/``tool_use``, and a long answer can arrive split across several
+    text blocks. The fixed index rejected the first case outright and silently
+    dropped the tail of the second.
+    """
+
+    @pytest.mark.asyncio
+    async def test_thinking_block_before_the_answer_is_skipped(self):
+        comp = _comp_for(LLMProvider.ANTHROPIC)
+        _patch_post(
+            comp,
+            {
+                "content": [
+                    {"type": "thinking", "thinking": "considering…"},
+                    {"type": "text", "text": "the real summary"},
+                ]
+            },
+        )
+        assert await comp._anthropic("text", "system") == "the real summary"
+
+    @pytest.mark.asyncio
+    async def test_multiple_text_blocks_are_joined(self):
+        comp = _comp_for(LLMProvider.ANTHROPIC)
+        _patch_post(
+            comp,
+            {"content": [{"type": "text", "text": "first"}, {"type": "text", "text": "second"}]},
+        )
+        assert await comp._anthropic("text", "system") == "first\n\nsecond"
+
+    @pytest.mark.asyncio
+    async def test_block_without_a_type_still_counts_as_text(self):
+        """OpenAI-compatible gateways omit ``type``, and the fixed-index read
+        accepted those. Requiring ``type == "text"`` would have regressed them.
+        """
+        comp = _comp_for(LLMProvider.ANTHROPIC)
+        _patch_post(comp, {"content": [{"text": "summary"}]})
+        assert await comp._anthropic("text", "system") == "summary"
+
+    @pytest.mark.asyncio
+    async def test_a_broken_text_block_beside_a_valid_one_raises(self):
+        """A block whose ``text`` is broken is not the same as a ``thinking``
+        block. Skipping it returned a PARTIAL summary through the success path
+        whenever a neighbouring block happened to be well formed — booked as a
+        complete compression, with no fallback label."""
+        comp = _comp_for(LLMProvider.ANTHROPIC)
+        _patch_post(
+            comp,
+            {
+                "content": [
+                    {"type": "text", "text": "prefix"},
+                    {"type": "text", "text": {"broken": "tail"}},
+                ]
+            },
+        )
+        with pytest.raises(ValueError, match="content\\[1\\].text"):
+            await comp._anthropic("text", "system")
+
+    @pytest.mark.asyncio
+    async def test_tool_use_only_response_raises(self):
+        comp = _comp_for(LLMProvider.ANTHROPIC)
+        _patch_post(comp, {"content": [{"type": "tool_use", "id": "t1", "input": {}}]})
+        with pytest.raises(ValueError, match="no 'text' block"):
+            await comp._anthropic("text", "system")
 
 
 # ---------------------------------------------------------------------------

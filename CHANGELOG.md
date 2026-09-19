@@ -151,6 +151,57 @@ changes inline only. See the deprecation policy in
   empty completions keep calling rather than opening it. Rows recorded before the
   upgrade are not rewritten, and a script matching on the fallback label set gains
   one member.
+- **Anthropic responses are read from every text block, not `content[0]`**
+  (#1057, #67 follow-up). A response whose first block is `thinking` or `tool_use` — what
+  extended thinking produces, and what a compatible gateway can forward — was
+  rejected as missing `content[0].text`, so compression fell back to truncation and
+  extraction to the heuristic even though the answer sat in the next block. Such a
+  response now yields its summary. A long answer split across several text blocks
+  is joined with a blank line instead of silently delivering only the first block.
+  A block carrying no `type` still counts as text, so OpenAI-compatible gateways
+  that omit the field are unaffected. A response holding no text block at all is
+  rejected as before, with a message naming that instead of the missing index.
+- **An empty extraction response takes the heuristic** (#1057, #67 follow-up). An
+  empty or
+  whitespace-only completion parsed to zero facts and returned as if the model had
+  found nothing, which is indistinguishable from a genuinely empty result. It now
+  falls back to heuristic extraction and logs a warning. The circuit breaker is
+  unaffected — the endpoint answered, so this is a model-quality event, the same
+  judgement `llm_empty` makes on the compression side.
+- **Extraction stops mining prose for a fact array** (#1057, #67 follow-up). The
+  parser
+  used to search the response for a bracketed substring and extract from whichever
+  candidate parsed first — `\[[\s\S]*?\]` originally, then a `raw_decode` attempt at
+  each `[`. Both were candidate-*selection* heuristics over untrusted text, and
+  each one had inputs that selected the wrong array: a nested `tags` array (part of
+  the schema the prompt asks for) truncating the match, a decoy array in an example
+  winning over the intended one, a deeply nested prefix exhausting the recursion
+  limit. The shared failure is facts that are silently **wrong**, on their way into
+  long-term memory. Only the whole response is parsed now, with a markdown fence
+  stripped. **A response wrapped in prose is no longer extracted from** — it is
+  reported unreadable and the heuristic extractor answers instead, which is a
+  behavior change for models that narrate around their JSON. `_parse_facts_json`
+  now distinguishes unreadable (`None`) from an empty fact array (`[]`); a model
+  that read the response and found nothing is still respected, and the heuristic
+  does not override it.
+- **A malformed Anthropic text block is rejected instead of skipped** (#1057,
+  #67 follow-up). Collecting every `text` block treated a block whose `text` was
+  missing or not a string the same way it treats a `thinking` block — as
+  something to ignore — so a response that was half broken came back as a
+  complete answer whenever a neighbouring block happened to be well formed.
+  Compression returned the surviving prefix through its success path with no
+  fallback label. Such a response now takes the normal fallback. Deliberately
+  non-text block types (`thinking`, `tool_use`, `server_tool_use`) are still
+  skipped, and a block carrying no `type` still counts as text.
+- **A fact array whose entries are all unusable takes the heuristic** (#1057,
+  #67 follow-up). Entry-level shape is now checked: `content` must be a string and
+  `tags` a list. `[null]`, `[{"oops": 1}]` and `[{"content": null}]` reported an
+  empty result, which claimed the model had read the response and found nothing;
+  they are now unreadable and the heuristic answers. A single malformed entry
+  among good ones is still skipped, as before. `[{"content": "a", "tags": null}]`
+  additionally raised `TypeError` out of the parser, which the caller read as an
+  **endpoint** failure and counted toward the circuit breaker — a model-quality
+  problem booked as a provider outage.
 
 ### Fixed
 
@@ -181,6 +232,32 @@ changes inline only. See the deprecation policy in
   fallback also fell below the floor, which is why a small `max_result_chars`
   shows no change; the cases that differ are a disabled floor and a budget large
   enough for the fallback to clear it. All three are pinned by tests. **Behavior change**: see the upgrade notes above.
+- **Malformed provider payloads raise a descriptive error, not `AttributeError`**
+  (#1057, #67 follow-up) — the guards added for #67 checked that a container was
+  present,
+  never that it held the type they then indexed into. `{"choices": [null]}`, a bare
+  string where the message object belongs, and a JSON body that is not an object at
+  all each crashed with an `AttributeError` from inside the provider method, naming
+  only the type it happened to get (`'NoneType'`, `'str'`, `'list'` — `object has
+  no attribute 'get'`) — the opaque failure #67 set out to remove, one level
+  deeper. `base_url` is user-configurable, so these shapes arrive from
+  OpenAI-compatible gateways. The fallback behavior is unchanged (the caller
+  already caught them); the log line now names the defect. Both the compressor and
+  the fact extractor were affected, and both are fixed.
+- **Anthropic text blocks are selected by type** (#1057, #67 follow-up) —
+  `content[0]` was
+  read regardless of what the block was. **Behavior change**: see the upgrade notes
+  above.
+- **Joining Anthropic text blocks no longer changes which facts are extracted**
+  (#1057, #67 follow-up) — joining put a decoy array within reach of the candidate
+  search,
+  and the intended one lost. Measured: a block holding
+  `[{"content":"intended","tags":["technical"]}]` followed by the prose
+  `Example only: [{"content":"wrong"}]` extracted `wrong`; with a plain `Done.`
+  after it, nothing. Patching the candidate rule moved the failure rather than
+  removing it — a second review round found a decoy that beat the replacement and
+  an input that raised `RecursionError` inside it — so the search is gone instead.
+  **Behavior change**: see the upgrade notes above.
 - **Explicit progressive and progressive fallback share one accounting basis**
   (#1039) — both now record the initial response text: compression footers are
   included, while surfacing, later index annotations, non-text content, and MCP

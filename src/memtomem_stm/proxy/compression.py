@@ -2545,11 +2545,17 @@ class LLMCompressor:
         )
         resp.raise_for_status()
         data = resp.json()
-        choices = data.get("choices") or []
-        if not choices:
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not isinstance(choices, list) or not choices:
             raise ValueError("OpenAI response has empty 'choices' (likely quota or content filter)")
-        message = choices[0].get("message") or {}
-        content = message.get("content")
+        # Every level is type-checked, not just presence-checked: a gateway that
+        # answers ``{"choices": [null]}`` or puts a bare string where the object
+        # belongs used to raise ``AttributeError: 'NoneType' object has no
+        # attribute 'get'`` — the same opaque crash #67 set out to remove, one
+        # level deeper.
+        first = choices[0]
+        message = first.get("message") if isinstance(first, dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, str):
             raise ValueError("OpenAI response missing 'choices[0].message.content'")
         return content
@@ -2577,15 +2583,39 @@ class LLMCompressor:
         )
         resp.raise_for_status()
         data = resp.json()
-        content = data.get("content") or []
-        if not content:
+        content = data.get("content") if isinstance(data, dict) else None
+        if not isinstance(content, list) or not content:
             raise ValueError(
                 "Anthropic response has empty 'content' (likely empty completion or filter)"
             )
-        text_block = content[0].get("text")
-        if not isinstance(text_block, str):
-            raise ValueError("Anthropic response missing 'content[0].text'")
-        return text_block
+        # Read every text block instead of ``content[0]``. With extended
+        # thinking — or a gateway that forwards it — the first block is
+        # ``thinking``/``tool_use`` and the summary sits behind it, so the fixed
+        # index rejected a perfectly good response. A long answer can also
+        # arrive split across several text blocks. A block carrying no ``type``
+        # counts as text: OpenAI-compatible gateways omit the field and the old
+        # fixed-index read accepted those.
+        texts: list[str] = []
+        for index, block in enumerate(content):
+            if not isinstance(block, dict):
+                raise ValueError(
+                    f"Anthropic response 'content[{index}]' is "
+                    f"{type(block).__name__}, not an object"
+                )
+            if block.get("type", "text") != "text":
+                continue  # thinking / tool_use / server_tool_use: not our answer
+            block_text = block.get("text")
+            if not isinstance(block_text, str):
+                # A BROKEN text block is not an ignorable one. Skipping it would
+                # return a partial summary through the success path whenever
+                # another block happened to be well formed.
+                raise ValueError(
+                    f"Anthropic response 'content[{index}].text' is missing or not a string"
+                )
+            texts.append(block_text)
+        if not texts:
+            raise ValueError("Anthropic response has no 'text' block in 'content'")
+        return "\n\n".join(texts)
 
     async def _ollama(self, text: str, system_prompt: str) -> str:
         if self._client is None:
@@ -2606,8 +2636,8 @@ class LLMCompressor:
         )
         resp.raise_for_status()
         data = resp.json()
-        message = data.get("message") or {}
-        content = message.get("content")
+        message = data.get("message") if isinstance(data, dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, str):
             raise ValueError("Ollama response missing 'message.content'")
         return content

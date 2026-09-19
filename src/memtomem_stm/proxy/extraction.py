@@ -13,6 +13,7 @@ try:
 except ImportError:  # pragma: no cover
     httpx = None  # type: ignore[assignment]
 
+
 from memtomem_stm.proxy.config import (
     ExtractionConfig,
     ExtractionStrategy,
@@ -31,7 +32,6 @@ from memtomem_stm.utils.numeric import safe_float
 logger = logging.getLogger(__name__)
 
 # Regex to extract JSON array from markdown code blocks or raw text
-_JSON_ARRAY_RE = re.compile(r"\[[\s\S]*?\]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,29 +44,71 @@ class ExtractedFact:
     tags: list[str] = field(default_factory=list)
 
 
-def _parse_facts_json(raw: str, *, max_facts: int) -> list[ExtractedFact]:
-    """Parse LLM output into ExtractedFact list. Tolerant of markdown wrapping."""
-    for candidate in (raw.strip(), *_JSON_ARRAY_RE.findall(raw)):
-        try:
-            data = scrub_lone_surrogates(json.loads(candidate))
-            if isinstance(data, list):
-                facts = []
-                for item in data[:max_facts]:
-                    if not isinstance(item, dict) or "content" not in item:
-                        continue
-                    facts.append(
-                        ExtractedFact(
-                            content=str(item["content"]).strip(),
-                            category=str(item.get("category", "technical")),
-                            confidence=safe_float(item.get("confidence", 0.5), 0.5),
-                            tags=[str(t) for t in item.get("tags", [])],
-                        )
-                    )
-                if facts:
-                    return facts
-        except (json.JSONDecodeError, ValueError, TypeError):
+_FENCE_RE = re.compile(r"\A```[^\n]*\n(.*?)\n?```\Z", re.S)
+
+
+def _parse_facts_json(raw: str, *, max_facts: int) -> list[ExtractedFact] | None:
+    """Parse LLM output into an ExtractedFact list, or ``None`` if the response
+    is not a fact array at all.
+
+    Three states, not two. ``[]`` means the model read the response and found
+    nothing worth recording; ``None`` means we could not read the MODEL.
+    Collapsing them made an unreadable response look like a considered empty
+    answer, and left the caller unable to tell whether the heuristic should
+    take over.
+
+    Exactly one candidate is tried: the whole response, with a markdown fence
+    stripped. Earlier versions mined the text for a bracketed substring —
+    first with the non-greedy regex ``\\[[\\s\\S]*?\\]``, then by attempting
+    ``json.JSONDecoder().raw_decode`` at every ``[``. Both were candidate
+    SELECTION heuristics over untrusted prose, and each review round produced
+    an input that selected the wrong array: a nested ``tags`` array truncating
+    the match, a decoy array winning over the intended one, a deeply nested
+    prefix exhausting the recursion limit. The failure they share is facts that
+    are silently WRONG, on their way into long-term memory — strictly worse
+    than extracting nothing. A response that is not a fact array is now handed
+    back as unreadable, and the caller takes the heuristic.
+    """
+    candidate = raw.strip()
+    fence = _FENCE_RE.match(candidate)
+    if fence is not None:
+        candidate = fence.group(1).strip()
+    try:
+        data = scrub_lone_surrogates(json.loads(candidate))
+    except (json.JSONDecodeError, ValueError, TypeError, RecursionError):
+        return None
+    if not isinstance(data, list):
+        return None
+    facts: list[ExtractedFact] = []
+    skipped = 0
+    for item in data[:max_facts]:
+        # Field validation lives here, not in the ``try`` above, so state it
+        # explicitly rather than leaning on an exception: ``tags: null`` used to
+        # raise ``TypeError`` out of the list comprehension, which the caller
+        # read as an ENDPOINT failure and counted toward the circuit breaker.
+        # A model that writes bad JSON is a model-quality event.
+        if not isinstance(item, dict):
+            skipped += 1
             continue
-    return []
+        content_value = item.get("content")
+        tags_value = item.get("tags", [])
+        if not isinstance(content_value, str) or not isinstance(tags_value, list):
+            skipped += 1
+            continue
+        facts.append(
+            ExtractedFact(
+                content=content_value.strip(),
+                category=str(item.get("category", "technical")),
+                confidence=safe_float(item.get("confidence", 0.5), 0.5),
+                tags=[str(tag) for tag in tags_value],
+            )
+        )
+    if not facts and skipped:
+        # The array held entries and none was a fact. Returning ``[]`` here
+        # would claim the model read the response and found nothing, which is
+        # the one thing this return value is supposed to mean.
+        return None
+    return facts
 
 
 # ── Heuristic extraction patterns ─────────────────────────────────────
@@ -281,9 +323,34 @@ class FactExtractor:
             # tool-response path, so the wall clock must be bounded here.
             raw = await asyncio.wait_for(self._call_api(text), timeout=call_timeout)
             self._cb.record_success()
+            if not raw.strip():
+                # An empty or whitespace-only completion parses to zero facts
+                # and used to return silently as "the model found nothing",
+                # which is indistinguishable from a model that genuinely found
+                # nothing. Take the heuristic instead. Like the compressor's
+                # ``llm_empty`` path this is a model-quality event, so the
+                # breaker — already marked successful above — stays closed.
+                logger.warning(
+                    "LLM extraction returned an empty response for %s/%s, "
+                    "falling back to heuristic",
+                    server,
+                    tool,
+                )
+                return _extract_heuristic(text, max_facts=self._cfg.max_facts)
             facts = _parse_facts_json(raw, max_facts=self._cfg.max_facts)
+            if facts is None:
+                # Unreadable, not empty: the model answered with something that
+                # is not a fact array. Mining prose for one is what kept
+                # producing wrong facts, so take the heuristic instead. The
+                # breaker stays closed — the endpoint answered.
+                logger.warning(
+                    "LLM response for %s/%s was not a JSON fact array, falling back to heuristic",
+                    server,
+                    tool,
+                )
+                return _extract_heuristic(text, max_facts=self._cfg.max_facts)
             if not facts:
-                logger.debug("LLM returned no parseable facts for %s/%s", server, tool)
+                logger.debug("LLM returned an empty fact array for %s/%s", server, tool)
             return facts
         except TimeoutError:
             self._cb.record_failure()
@@ -352,11 +419,15 @@ class FactExtractor:
         )
         resp.raise_for_status()
         data = resp.json()
-        choices = data.get("choices") or []
-        if not choices:
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not isinstance(choices, list) or not choices:
             raise ValueError("OpenAI response has empty 'choices' (likely quota or content filter)")
-        message = choices[0].get("message") or {}
-        content = message.get("content")
+        # Type-checked at every level, not presence-checked: see the twin in
+        # ``proxy/compression.py``. A gateway answering ``{"choices": [null]}``
+        # used to raise a bare ``AttributeError`` here.
+        first = choices[0]
+        message = first.get("message") if isinstance(first, dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, str):
             raise ValueError("OpenAI response missing 'choices[0].message.content'")
         return content
@@ -383,15 +454,39 @@ class FactExtractor:
         )
         resp.raise_for_status()
         data = resp.json()
-        content = data.get("content") or []
-        if not content:
+        content = data.get("content") if isinstance(data, dict) else None
+        if not isinstance(content, list) or not content:
             raise ValueError(
                 "Anthropic response has empty 'content' (likely empty completion or filter)"
             )
-        text_block = content[0].get("text")
-        if not isinstance(text_block, str):
-            raise ValueError("Anthropic response missing 'content[0].text'")
-        return text_block
+        # Every text block, not ``content[0]`` — a leading ``thinking`` or
+        # ``tool_use`` block used to mask the real answer. Blocks are joined
+        # with a blank line. The join is why ``_parse_facts_json`` stopped
+        # mining prose: a second block put a decoy array within reach, and
+        # whichever candidate rule was in force, some input picked the wrong
+        # one. A block with no ``type`` counts as text, the way the
+        # fixed-index read did.
+        texts: list[str] = []
+        for index, block in enumerate(content):
+            if not isinstance(block, dict):
+                raise ValueError(
+                    f"Anthropic response 'content[{index}]' is "
+                    f"{type(block).__name__}, not an object"
+                )
+            if block.get("type", "text") != "text":
+                continue  # thinking / tool_use / server_tool_use: not our answer
+            block_text = block.get("text")
+            if not isinstance(block_text, str):
+                # A BROKEN text block is not an ignorable one. Skipping it would
+                # book a partial answer as a complete success whenever another
+                # block happened to parse.
+                raise ValueError(
+                    f"Anthropic response 'content[{index}].text' is missing or not a string"
+                )
+            texts.append(block_text)
+        if not texts:
+            raise ValueError("Anthropic response has no 'text' block in 'content'")
+        return "\n\n".join(texts)
 
     async def _ollama(self, text: str, system_prompt: str) -> str:
         assert self._client is not None
@@ -411,8 +506,8 @@ class FactExtractor:
         )
         resp.raise_for_status()
         data = resp.json()
-        message = data.get("message") or {}
-        content = message.get("content")
+        message = data.get("message") if isinstance(data, dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, str):
             raise ValueError("Ollama response missing 'message.content'")
         return content
