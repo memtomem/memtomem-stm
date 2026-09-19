@@ -97,10 +97,18 @@ changes inline only. See the deprecation policy in
   *components* were not numbers (`[["bad", 0.2]]`), and two batch shapes that
   satisfied the vectors-per-text count — `[[], [], []]`, which scores everything
   0.0, and vectors of differing dimensions, where `zip` stops at the shorter one
-  and a 1-D against a 2-D vector scored a confident **1.0**. None of them raised,
-  so nothing was logged and the fallback counter never moved. All are now rejected
-  before the cache write, so the next call retries the provider and recovers as
-  soon as the provider does. Well-formed responses are cached exactly as before;
+  and a 1-D against a 2-D vector scored a confident **1.0**. The last two raised
+  nothing at all, so no fallback was counted and no line was logged; the first two
+  were caught later, inside the cosine computation, which did log a BM25 fallback
+  but named the arithmetic rather than the response. All are now rejected before
+  the cache write, so the next call retries the provider and recovers as soon as
+  the provider does. The dimension check spans the **cache** as well as the batch:
+  a query cached by an earlier call and a section fetched now are compared to each
+  other, and the batch check alone could not see that. Where a provider states the
+  order with `index`, the indices must be integers forming exactly the requested
+  permutation — `[0, 0, 2]` used to sort without error and cache vectors with no
+  correspondence to the inputs. A response that omits `index` on some entries is
+  still accepted in input order, unchanged (#68). Well-formed responses are cached exactly as before;
   the component validation measured 0.41 ms for 8,064 components (21 texts at 384
   dimensions), against an HTTP round trip.
 - **Cosine similarity no longer overflows to `nan`** (#67 follow-up). `1e308` is a

@@ -380,6 +380,26 @@ class TestEmbeddingOpenAIResponseParsing:
             result = scorer._embed_openai(None, ["a", "b", "c"])
         assert result == [[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]
 
+    @pytest.mark.parametrize(
+        "indices,match",
+        [
+            ([0, 0, 2], "not a permutation"),
+            ([0, 1, 5], "not a permutation"),
+            (["0", "1", "2"], "must be an integer"),
+        ],
+    )
+    def test_stated_indices_must_describe_the_requested_order(self, indices, match):
+        """Sorting by a field nobody checked accepted duplicates and
+        out-of-range values: ``[0, 0, 2]`` sorted without error and produced
+        vectors with no correspondence to the inputs, which were then cached.
+        Partial indexing is deliberately still tolerated — see
+        ``test_partial_index_preserves_input_order`` (#68)."""
+        scorer = self._make_scorer()
+        payload = {"data": [{"index": i, "embedding": [float(n)]} for n, i in enumerate(indices)]}
+        with patch("httpx.post", return_value=self._mock_response(payload)):
+            with pytest.raises(ValueError, match=match):
+                scorer._embed_openai(None, ["a", "b", "c"])
+
     def test_empty_data_returns_empty_list(self):
         scorer = self._make_scorer()
         with patch("httpx.post", return_value=self._mock_response({"data": []})):
@@ -421,6 +441,8 @@ _OPENAI_BAD_BODIES = [
     ({"data": [{"embedding": ["x", 0.2]}]}, "data[0].embedding[0]"),
     ({"data": [{"embedding": [float("inf")]}]}, "data[0].embedding[0]"),
 ]
+
+
 
 
 def _bad_body_response(payload):
@@ -576,12 +598,27 @@ class TestEmbeddingResponseDefense:
         assert _cosine_similarity([3.0, 4.0], [6.0, 8.0]) == pytest.approx(1.0)
         assert _cosine_similarity([0.0, 0.0], [1.0, 0.0]) == 0.0
 
+    def test_dimensions_are_checked_against_the_cache_too(self):
+        """The batch check cannot see a vector an earlier call cached. Measured
+        before this: a 2-D query cached by call 1, a 1-D section fetched by
+        call 2 — ``scores=[1.0]``, three cached entries, ``fallback_count``
+        still 0, and the second request served from cache thereafter."""
+        scorer = self._scorer("ollama")
+        with patch("httpx.post", return_value=_bad_body_response({"embeddings": [[1.0, 0.0], [1.0, 0.0]]})):
+            scorer.score_sections("alpha", [("A", "a body")])
+        assert len(scorer._cache) == 2
+
+        with patch("httpx.post", return_value=_bad_body_response({"embeddings": [[1.0]]})) as post:
+            scores = scorer.score_sections("alpha", [("B", "b body")])
+        assert scorer.fallback_count == 1
+        assert len(scorer._cache) == 2, "the disagreeing vector must not be cached"
+        assert post.call_count == 1
+        assert scores == BM25Scorer().score_sections("alpha", [("B", "b body")])
+
     def test_score_sections_still_falls_back_to_bm25(self, caplog):
         """Behavior is unchanged: the caller catches it and scores with BM25.
         Only the logged reason improves."""
         import logging
-
-        from memtomem_stm.proxy.relevance import BM25Scorer
 
         scorer = self._scorer("ollama")
         sections = [("Alpha", "alpha body text"), ("Beta", "beta body text")]

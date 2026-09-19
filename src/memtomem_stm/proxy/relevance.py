@@ -221,6 +221,29 @@ def _require_vector(value: object, *, provider: str, where: str) -> list[float]:
     return value
 
 
+def _require_uniform_dimensions(vectors: list[list[float]], *, provider: str) -> None:
+    """Every vector compared against another must have the same length.
+
+    ``_cosine_similarity`` pairs components with ``zip``, which stops at the
+    shorter vector — so a 1-D against a 2-D vector scores on the first
+    component alone and reports a confident similarity for what is really an
+    incomparable pair. Nothing raises, so no fallback is counted and nothing
+    is logged.
+
+    Checked over the vectors that will be COMPARED, not just the ones that
+    arrived together: a query cached by an earlier call and a section fetched
+    now are compared to each other.
+    """
+    dimensions = {len(vector) for vector in vectors}
+    if 0 in dimensions:
+        raise ValueError(f"{provider} embedding response contains an empty vector")
+    if len(dimensions) > 1:
+        raise ValueError(
+            f"{provider} embeddings have differing dimensions ({sorted(dimensions)}); "
+            "a similarity across them is silently wrong"
+        )
+
+
 class EmbeddingScorer:
     """Semantic relevance scoring via embedding cosine similarity.
 
@@ -345,11 +368,19 @@ class EmbeddingScorer:
 
         if misses:
             fetched = self._embed_exact(misses)
+            # Across the cache too, not only within this batch. The batch check
+            # in ``_embed_exact`` cannot see a vector an earlier call cached, so
+            # a 2-D query already held and a 1-D section fetched now passed both
+            # checks and compared 1.0. Validated BEFORE the write, so a reply
+            # that disagrees with what is held never becomes what is held.
+            _require_uniform_dimensions(list(held.values()) + fetched, provider=self._provider)
             with self._cache_lock:
                 for key, embedding in zip(miss_keys, fetched):
                     self._cache[key] = embedding
                 _fifo_prune(self._cache, self._cache_size)
             held.update(zip(miss_keys, fetched))
+        else:
+            _require_uniform_dimensions(list(held.values()), provider=self._provider)
 
         return [held[key] for key in keys]
 
@@ -379,14 +410,7 @@ class EmbeddingScorer:
         # Neither raised, so ``fallback_count`` never moved and nothing was
         # logged. Checked here rather than per provider: it is a property of
         # the batch, and this is the last point before ``_embed_cached`` writes.
-        dimensions = {len(vector) for vector in embeddings}
-        if 0 in dimensions:
-            raise ValueError(f"embedding provider returned an empty vector for {len(texts)} inputs")
-        if len(dimensions) > 1:
-            raise ValueError(
-                "embedding provider returned vectors of differing dimensions "
-                f"({sorted(dimensions)}); a similarity across them is silently wrong"
-            )
+        _require_uniform_dimensions(embeddings, provider=self._provider)
         return embeddings
 
     def _embed_batch(self, texts: list[str]) -> list[list[float]]:
@@ -436,6 +460,21 @@ class EmbeddingScorer:
         # test, so a list of strings used to pass this check and then fail in
         # the sort key.
         if data and all(isinstance(d, dict) and "index" in d for d in data):
+            # Sorting by a field nobody checked accepted duplicates and
+            # out-of-range values: indices ``[0, 0, 2]`` sorted without error
+            # and produced vectors with no correspondence to the inputs, which
+            # were then cached. When the provider states the order it must
+            # state it completely.
+            indices = [entry["index"] for entry in data]
+            if not all(isinstance(i, int) and not isinstance(i, bool) for i in indices):
+                raise ValueError(
+                    "openai embedding response: every 'data[].index' must be an integer"
+                )
+            if sorted(indices) != list(range(len(data))):
+                raise ValueError(
+                    f"openai embedding response: 'data[].index' is {sorted(indices)}, "
+                    f"not a permutation of 0..{len(data) - 1}"
+                )
             data.sort(key=lambda x: x["index"])
         vectors: list[list[float]] = []
         for i, item in enumerate(data):
