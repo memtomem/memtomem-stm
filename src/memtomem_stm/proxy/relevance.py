@@ -145,12 +145,103 @@ class BM25Scorer:
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
-    if norm_a == 0 or norm_b == 0:
+    # Each vector is divided by its own largest magnitude before multiplying.
+    # ``sum(x * y ...)`` overflows to ``inf`` on components a provider can
+    # legitimately serialise — ``1e308`` is finite, ``1e308 ** 2`` is not — and
+    # ``inf / inf`` is ``nan``, a score that is neither high nor low and that
+    # sorts unpredictably. Scaling cancels exactly in the ratio, which is all
+    # cosine needs, so ordinary inputs are unaffected.
+    scale_a = max(map(abs, a), default=0.0)
+    scale_b = max(map(abs, b), default=0.0)
+    if scale_a == 0.0 or scale_b == 0.0:
+        return 0.0
+    dot = sum((x / scale_a) * (y / scale_b) for x, y in zip(a, b))
+    norm_a = math.sqrt(sum((x / scale_a) ** 2 for x in a))
+    norm_b = math.sqrt(sum((y / scale_b) ** 2 for y in b))
+    if norm_a == 0.0 or norm_b == 0.0:
         return 0.0
     return dot / (norm_a * norm_b)
+
+
+def _payload_list(payload: object, *, key: str, provider: str) -> list[Any]:
+    """Return ``payload[key]`` as a list, or raise saying what was wrong.
+
+    ``score_sections`` logs the exception MESSAGE and nothing else — a
+    deliberate choice, so that an expected fallback does not bury real errors
+    in a log aggregator. That makes the message the operator's entire signal,
+    and ``KeyError('embeddings')`` named neither the provider that answered nor
+    what the body actually held. An error envelope and a parser bug looked
+    identical.
+
+    An EMPTY list is returned as-is rather than rejected: ``_embed_exact``
+    owns the count contract, and embedding zero texts legitimately yields zero
+    vectors. A missing key is never softened into an empty result — that would
+    turn a failed request into a silent all-zero ranking.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"{provider} embedding response is not a JSON object (got {type(payload).__name__})"
+        )
+    if key not in payload:
+        present = ", ".join(sorted(str(k) for k in payload)) or "(no keys)"
+        raise ValueError(f"{provider} embedding response has no '{key}' field; it holds: {present}")
+    value = payload[key]
+    if not isinstance(value, list):
+        raise ValueError(
+            f"{provider} embedding response field '{key}' is {type(value).__name__}, not a list"
+        )
+    return value
+
+
+def _require_vector(value: object, *, provider: str, where: str) -> list[float]:
+    """Return ``value`` as a vector of finite numbers, or say what it is not.
+
+    Checking that the container is a list is not enough. ``_embed_exact``'s
+    contract is a COUNT — as many vectors back as texts sent — so a reply like
+    ``{"embeddings": [[0.1, 0.2], ["bad", 0.2], [0.3, 0.4]]}`` satisfied it and
+    the bad row was written to the cache, where it answered every later call
+    for that text without a request. The element check is what makes the
+    cache-write guarantee true rather than nearly true.
+
+    ``bool`` is excluded deliberately: it passes ``isinstance(x, int)`` and is
+    never a component of an embedding.
+    """
+    if not isinstance(value, list):
+        raise ValueError(
+            f"{provider} embedding response: '{where}' is {type(value).__name__}, not a list"
+        )
+    for i, component in enumerate(value):
+        if isinstance(component, bool) or not isinstance(component, (int, float)):
+            raise ValueError(
+                f"{provider} embedding response: '{where}[{i}]' is "
+                f"{type(component).__name__}, not a number"
+            )
+        if not math.isfinite(component):
+            raise ValueError(f"{provider} embedding response: '{where}[{i}]' is {component}")
+    return value
+
+
+def _require_uniform_dimensions(vectors: list[list[float]], *, provider: str) -> None:
+    """Every vector compared against another must have the same length.
+
+    ``_cosine_similarity`` pairs components with ``zip``, which stops at the
+    shorter vector — so a 1-D against a 2-D vector scores on the first
+    component alone and reports a confident similarity for what is really an
+    incomparable pair. Nothing raises, so no fallback is counted and nothing
+    is logged.
+
+    Checked over the vectors that will be COMPARED, not just the ones that
+    arrived together: a query cached by an earlier call and a section fetched
+    now are compared to each other.
+    """
+    dimensions = {len(vector) for vector in vectors}
+    if 0 in dimensions:
+        raise ValueError(f"{provider} embedding response contains an empty vector")
+    if len(dimensions) > 1:
+        raise ValueError(
+            f"{provider} embeddings have differing dimensions ({sorted(dimensions)}); "
+            "a similarity across them is silently wrong"
+        )
 
 
 class EmbeddingScorer:
@@ -214,6 +305,10 @@ class EmbeddingScorer:
         self._cache_size = max(0, cache_size)
         self._cache: dict[str, list[float]] = {}
         self._cache_lock = threading.Lock()
+        # One (provider, model) has ONE embedding dimension. Established by the
+        # first accepted batch and guarded by ``_cache_lock``, because a change
+        # invalidates everything cached under it.
+        self._dimension: int | None = None
 
     def score_sections(self, query: str, sections: list[tuple[str, str]]) -> list[float]:
         if not query or not sections:
@@ -242,6 +337,46 @@ class EmbeddingScorer:
         embeddings = self._embed_cached(texts)
         query_emb = embeddings[0]
         return [_cosine_similarity(query_emb, emb) for emb in embeddings[1:]]
+
+    def _note_dimension(self, dimension: int) -> None:
+        """Pin the scorer's embedding dimension, or reject a batch that moved it.
+
+        A change means the model answering changed underneath us, so every
+        vector already held was produced by a different model and cannot be
+        compared with the new ones. Discarding them is the point: refusing the
+        batch alone left the disagreement in the cache, where it made every
+        later call that mixed the two fail identically and issue **no request**
+        — so a provider that had since recovered could never be observed.
+        """
+        with self._cache_lock:
+            established = self._dimension
+            if established is None or established == dimension:
+                self._dimension = dimension
+                return
+            self._cache.clear()
+            self._dimension = None
+        raise ValueError(
+            f"{self._provider} embedding dimension changed from {established} to "
+            f"{dimension} for model {self._model!r}; the cached vectors came from a "
+            "different model and have been discarded"
+        )
+
+    def _require_cache_agreement(self, vectors: list[list[float]]) -> None:
+        """Uniform dimensions across what will be compared — and on failure,
+        drop the cache so the next call can recover.
+
+        Measured before the eviction: two internally uniform batches of
+        different dimensions each passed their own check and were both cached;
+        three later calls that mixed them produced three BM25 fallbacks and
+        zero HTTP requests against a healthy provider.
+        """
+        try:
+            _require_uniform_dimensions(vectors, provider=self._provider)
+        except ValueError:
+            with self._cache_lock:
+                self._cache.clear()
+                self._dimension = None
+            raise
 
     def _embed_cached(self, texts: list[str]) -> list[list[float]]:
         """One embedding per text, fetching only the ones not already held.
@@ -277,11 +412,19 @@ class EmbeddingScorer:
 
         if misses:
             fetched = self._embed_exact(misses)
+            # Across the cache too, not only within this batch. The batch check
+            # in ``_embed_exact`` cannot see a vector an earlier call cached, so
+            # a 2-D query already held and a 1-D section fetched now passed both
+            # checks and compared 1.0. Validated BEFORE the write, so a reply
+            # that disagrees with what is held never becomes what is held.
+            self._require_cache_agreement(list(held.values()) + fetched)
             with self._cache_lock:
                 for key, embedding in zip(miss_keys, fetched):
                     self._cache[key] = embedding
                 _fifo_prune(self._cache, self._cache_size)
             held.update(zip(miss_keys, fetched))
+        else:
+            self._require_cache_agreement(list(held.values()))
 
         return [held[key] for key in keys]
 
@@ -301,6 +444,19 @@ class EmbeddingScorer:
             raise ValueError(
                 f"embedding provider returned {len(embeddings)} vectors for {len(texts)} inputs"
             )
+        # The count is not the whole contract. Two batch-level shapes passed it
+        # and were cached, where they answered every later call for those texts
+        # without a request:
+        #   [[], [], []]           -> every similarity 0.0, no ranking signal
+        #   [[1.0, 0.0], [1.0]]    -> ``zip`` stops at the shorter vector, so a
+        #                             1-D and a 2-D vector compared 1.0, a
+        #                             confidently WRONG similarity
+        # Neither raised, so ``fallback_count`` never moved and nothing was
+        # logged. Checked here rather than per provider: it is a property of
+        # the batch, and this is the last point before ``_embed_cached`` writes.
+        _require_uniform_dimensions(embeddings, provider=self._provider)
+        if embeddings:
+            self._note_dimension(len(embeddings[0]))
         return embeddings
 
     def _embed_batch(self, texts: list[str]) -> list[list[float]]:
@@ -325,7 +481,11 @@ class EmbeddingScorer:
             timeout=self._timeout,
         )
         resp.raise_for_status()
-        return resp.json()["embeddings"]
+        raw = _payload_list(resp.json(), key="embeddings", provider="ollama")
+        return [
+            _require_vector(vector, provider="ollama", where=f"embeddings[{i}]")
+            for i, vector in enumerate(raw)
+        ]
 
     def _embed_openai(self, httpx_mod: object, texts: list[str]) -> list[list[float]]:
         import httpx as _httpx
@@ -338,13 +498,38 @@ class EmbeddingScorer:
             timeout=self._timeout,
         )
         resp.raise_for_status()
-        data = resp.json()["data"]
+        data = _payload_list(resp.json(), key="data", provider="openai")
         # Sort by "index" when the provider populates it (official OpenAI).
         # OpenAI-compatible servers — Ollama's compat layer, LiteLLM, LM Studio —
-        # often omit the field, in which case we trust the input order.
-        if data and all("index" in d for d in data):
+        # often omit the field, in which case we trust the input order. The
+        # isinstance guard matters: ``"index" in d`` on a string is a substring
+        # test, so a list of strings used to pass this check and then fail in
+        # the sort key.
+        if data and all(isinstance(d, dict) and "index" in d for d in data):
+            # Sorting by a field nobody checked accepted duplicates and
+            # out-of-range values: indices ``[0, 0, 2]`` sorted without error
+            # and produced vectors with no correspondence to the inputs, which
+            # were then cached. When the provider states the order it must
+            # state it completely.
+            indices = [entry["index"] for entry in data]
+            if not all(isinstance(i, int) and not isinstance(i, bool) for i in indices):
+                raise ValueError(
+                    "openai embedding response: every 'data[].index' must be an integer"
+                )
+            if sorted(indices) != list(range(len(data))):
+                raise ValueError(
+                    f"openai embedding response: 'data[].index' is {sorted(indices)}, "
+                    f"not a permutation of 0..{len(data) - 1}"
+                )
             data.sort(key=lambda x: x["index"])
-        return [d["embedding"] for d in data]
+        vectors: list[list[float]] = []
+        for i, item in enumerate(data):
+            if not isinstance(item, dict) or "embedding" not in item:
+                raise ValueError(f"openai embedding response: 'data[{i}].embedding' is missing")
+            vectors.append(
+                _require_vector(item["embedding"], provider="openai", where=f"data[{i}].embedding")
+            )
+        return vectors
 
 
 # ── Factory ───────────────────────────────────────────────────────────
