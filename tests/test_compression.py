@@ -630,6 +630,87 @@ class TestLLMCompressorEmptyResponseGuard:
 
 
 # ---------------------------------------------------------------------------
+# LLMCompressor — empty / whitespace-only completions (#67 follow-up)
+# ---------------------------------------------------------------------------
+
+
+_EMPTY_COMPLETION_PAYLOADS = {
+    LLMProvider.OPENAI: lambda body: {"choices": [{"message": {"content": body}}]},
+    LLMProvider.ANTHROPIC: lambda body: {"content": [{"type": "text", "text": body}]},
+    LLMProvider.OLLAMA: lambda body: {"message": {"content": body}},
+}
+
+
+def _comp_for(provider: LLMProvider) -> LLMCompressor:
+    if provider is LLMProvider.OLLAMA:
+        cfg = LLMCompressorConfig(provider=provider, base_url="http://localhost:11434")
+    else:
+        cfg = LLMCompressorConfig(provider=provider, api_key="test")
+    return LLMCompressor(cfg)
+
+
+class TestLLMCompressorEmptyCompletion:
+    """A provider that answers 200 OK with an empty (or whitespace-only)
+    completion passes every guard #67 added: ``isinstance(content, str)``
+    is True for ``""``, so ``compress()`` returned that empty string as a
+    SUCCESS. A 5,000-char response became 0 chars with ``last_fallback``
+    still ``None`` — the payload was silently destroyed AND the call was
+    booked as a successful LLM compression (``compression_strategy`` never
+    records a ``→*_fallback`` suffix).
+
+    An empty completion is the same class of event as ``llm_overlength``:
+    the endpoint answered fine, the model just produced nothing usable. So
+    it takes the truncate fallback under its own label and, like overshoot,
+    does NOT accumulate toward opening the circuit breaker.
+    """
+
+    TEXT = "Long document content. " * 50
+
+    @pytest.mark.parametrize("body", ["", "   \n\t  "])
+    @pytest.mark.parametrize("provider", list(_EMPTY_COMPLETION_PAYLOADS))
+    @pytest.mark.asyncio
+    async def test_empty_completion_falls_back_to_truncate(self, provider, body):
+        comp = _comp_for(provider)
+        _patch_post(comp, _EMPTY_COMPLETION_PAYLOADS[provider](body))
+        result = await comp.compress(self.TEXT, max_chars=200)
+        # The payload survives: truncated, not annihilated.
+        assert result.strip()
+        assert len(result) <= 200
+        # And the call is booked as a fallback, not as a success.
+        assert comp.last_fallback == "llm_empty"
+
+    @pytest.mark.parametrize("provider", list(_EMPTY_COMPLETION_PAYLOADS))
+    @pytest.mark.asyncio
+    async def test_empty_completion_is_not_a_breaker_failure(self, provider):
+        """Also pins the choice of guard: raising from the provider methods
+        instead would take the ``except Exception`` arm, and four empty
+        completions would open the breaker (measured: opens on the 3rd, and
+        ``last_fallback`` then reports ``circuit_breaker`` — the wrong cause).
+        """
+        comp = _comp_for(provider)
+        _patch_post(comp, _EMPTY_COMPLETION_PAYLOADS[provider](""))
+        for _ in range(4):
+            result = await comp.compress(self.TEXT, max_chars=200)
+            # Assert the outcome every round, not just at the end: the breaker
+            # check alone passes against the pre-fix code (which recorded no
+            # failure either, because it called nothing a failure).
+            assert result.strip()
+            assert comp.last_fallback == "llm_empty"
+        assert not comp._cb.is_open
+
+    @pytest.mark.parametrize("provider", list(_EMPTY_COMPLETION_PAYLOADS))
+    @pytest.mark.asyncio
+    async def test_nonempty_completion_still_succeeds(self, provider):
+        """Positive control: the same payload shape carrying real content
+        must stay on the success path, or the guard above proves nothing."""
+        comp = _comp_for(provider)
+        _patch_post(comp, _EMPTY_COMPLETION_PAYLOADS[provider]("real summary"))
+        result = await comp.compress(self.TEXT, max_chars=200)
+        assert result == "real summary"
+        assert comp.last_fallback is None
+
+
+# ---------------------------------------------------------------------------
 # LLMCompressor — close() vs in-flight compress() race
 # ---------------------------------------------------------------------------
 

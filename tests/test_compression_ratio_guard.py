@@ -17,7 +17,7 @@ import re
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -26,6 +26,8 @@ from memtomem_stm.proxy.cache import ProxyCache
 from memtomem_stm.proxy.config import (
     CleaningConfig,
     CompressionStrategy,
+    LLMCompressorConfig,
+    LLMProvider,
     ProgressiveConfig,
     ProxyConfig,
     SelectiveConfig,
@@ -1769,3 +1771,96 @@ async def test_explicit_retention_overrides_disabled_global(
             assert row["compressed_chars"] <= 100
     finally:
         store.close()
+
+
+# ── Empty LLM summary through the whole pipeline (#67 follow-up) ──────
+
+
+@pytest.mark.asyncio
+class TestEmptyLLMSummaryThroughPipeline:
+    """What an empty completion costs depends on the retention floor, so the
+    compressor-level defect and the delivered response are two questions.
+
+    Measured on both sides of the fix, same 5,599-char response:
+
+    | floor | max_chars | before                         | after                          |
+    |-------|-----------|--------------------------------|--------------------------------|
+    | 0.65  | 200       | progressive_fallback, 4139     | progressive_fallback, 4139     |
+    | 0.65  | 5000      | progressive_fallback, 4139     | llm_empty_fallback,   4993     |
+    | 0.0   | 200       | `llm_summary`,           0     | llm_empty_fallback,    191     |
+
+    The guard fires when the compressed result is below the floor, so whether
+    anything changes depends on the BUDGET, not merely on having a floor: a
+    small `max_result_chars` leaves the fallback below the floor and the ladder
+    still replaces it, while a large one lets the fallback clear the floor and
+    the row keeps the real cause. The disabled-floor row
+    (`min_result_retention: 0` with no per-tool floor, supported since #1041) is
+    where the response was actually destroyed with no `→*_fallback` suffix to
+    find it by.
+    """
+
+    def _mgr(self, tmp_path: Path, *, min_retention: float, max_result_chars: int = 200):
+        mgr, store = _make_manager_with_store(
+            tmp_path,
+            min_retention=min_retention,
+            compression=CompressionStrategy.LLM_SUMMARY,
+            max_result_chars=max_result_chars,
+        )
+        mgr._connections["srv"].config.llm = LLMCompressorConfig(
+            provider=LLMProvider.OLLAMA, base_url="http://localhost:11434"
+        )
+        mgr._connections["srv"].session.call_tool.return_value = _make_result(
+            "Long content. " * 400
+        )
+        return mgr, store
+
+    async def test_disabled_floor_no_longer_delivers_an_empty_response(self, tmp_path):
+        """The case the fix exists for: nothing downstream was left to catch it."""
+        from memtomem_stm.proxy.compression import LLMCompressor
+
+        mgr, store = self._mgr(tmp_path, min_retention=0.0)
+        try:
+            with patch.object(LLMCompressor, "_call_api", new=AsyncMock(return_value="")):
+                await mgr.call_tool("srv", "tool", {})
+            row = _latest_row(store)
+            assert row["compressed_chars"] > 0, "an empty summary must not be delivered as-is"
+            assert row["compression_strategy"] == "llm_summary→llm_empty_fallback"
+        finally:
+            store.close()
+
+    async def test_default_floor_with_a_large_budget_reports_the_real_cause(self, tmp_path):
+        """Counterexample to "a floor means no change": at `max_result_chars`
+        5000 the 4,993-character fallback clears the 0.65 floor, so the guard
+        does not fire and the row keeps `llm_empty` — 854 more characters
+        preserved than the ladder's progressive replacement, and the cause
+        named. Nothing about the guard's ordering changed; the budget did."""
+        from memtomem_stm.proxy.compression import LLMCompressor
+
+        mgr, store = self._mgr(tmp_path, min_retention=0.65, max_result_chars=5000)
+        try:
+            with patch.object(LLMCompressor, "_call_api", new=AsyncMock(return_value="")):
+                await mgr.call_tool("srv", "tool", {})
+            row = _latest_row(store)
+            assert row["compression_strategy"] == "llm_summary→llm_empty_fallback"
+            assert row["ratio_violation"] == 0
+            assert row["compressed_chars"] > 4000
+        finally:
+            store.close()
+
+    async def test_default_floor_with_a_small_budget_is_unchanged(self, tmp_path):
+        """With the floor on AND a budget small enough that the truncated
+        fallback stays under it, the ratio ladder still replaces the result, so
+        this path is untouched by the fix. Pinned so the changelog's "no change"
+        claim keeps naming the configuration it is actually true for."""
+        from memtomem_stm.proxy.compression import LLMCompressor
+
+        mgr, store = self._mgr(tmp_path, min_retention=0.65)
+        try:
+            with patch.object(LLMCompressor, "_call_api", new=AsyncMock(return_value="")):
+                await mgr.call_tool("srv", "tool", {})
+            row = _latest_row(store)
+            assert row["ratio_violation"] == 1
+            assert row["compression_strategy"] == "llm_summary→progressive_fallback"
+            assert row["compressed_chars"] > 1000
+        finally:
+            store.close()

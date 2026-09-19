@@ -2441,6 +2441,22 @@ class LLMCompressor:
                 timeout=call_timeout,
             )
             self._cb.success()
+            if not result.strip():
+                # A 200 OK carrying an empty (or whitespace-only) completion
+                # passes every #67 parse guard — ``isinstance(content, str)``
+                # is True for ``""`` — and used to return through the success
+                # path, so a multi-KB response became 0 chars with no fallback
+                # label and no warning: silent total loss, booked as a
+                # successful compression. Treat it the way overshoot is
+                # treated below — the endpoint answered fine, the model just
+                # produced nothing usable — so fall back to truncate under a
+                # label of its own and leave the breaker closed.
+                logger.warning(
+                    "LLM returned an empty summary (strategy=llm/%s), falling back to truncate",
+                    self._cfg.provider.value,
+                )
+                self.last_fallback = "llm_empty"
+                return _plain_truncate(text, max_chars=max_chars)
             if len(result) > max_chars:
                 # The system prompt only ASKS the model to honor max_chars;
                 # models routinely overshoot length constraints, and nothing

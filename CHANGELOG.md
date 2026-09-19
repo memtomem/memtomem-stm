@@ -126,6 +126,31 @@ changes inline only. See the deprecation policy in
   Each vector is now divided by its own largest magnitude before multiplying, which
   cancels exactly in the ratio, so ordinary similarities are unchanged (pinned by
   test).
+- **An empty LLM summary no longer replaces the response with nothing** (#1056,
+  #67 follow-up). A provider answering `200 OK` with an empty or whitespace-only
+  completion passed every guard #67 added — `isinstance(content, str)` is true for
+  `""` — and `LLMCompressor.compress()` returned that empty string through its
+  success path with `last_fallback` left at `None`. **This only reached the client
+  when the retention floor was disabled.** Measured end to end on a 5,599-character
+  response: with `min_result_retention: 0` and no per-tool `retention_floor` (a
+  supported configuration since #1041), the recorded row was
+  `compression_strategy = llm_summary`, `compressed_chars = 0` — the response was
+  destroyed and nothing in the row said a fallback had happened. It is now
+  `llm_summary→llm_empty_fallback` with 191 characters, the truncated original.
+  With a floor set, what changes depends on the budget. The pipeline's ratio guard
+  fires when the compressed result falls below the floor, and the truncated
+  original may or may not clear it. Measured on the same response at the default
+  `0.65`: with `max_result_chars: 200` the 191-character fallback is still far
+  below the floor, so the guard replaces it exactly as before
+  (`llm_summary→progressive_fallback`, 4,139 characters, unchanged); with
+  `max_result_chars: 5000` the 4,993-character fallback clears the floor, the
+  guard no longer fires, and the row becomes `llm_summary→llm_empty_fallback` with
+  854 more characters preserved and the real cause named. Both are pinned. All three providers (`openai`, `anthropic`,
+  `ollama`) were affected. Like `llm_overlength` this does not fail the circuit
+  breaker — the endpoint answered, the model produced nothing usable — so repeated
+  empty completions keep calling rather than opening it. Rows recorded before the
+  upgrade are not rewritten, and a script matching on the fallback label set gains
+  one member.
 
 ### Fixed
 
@@ -143,6 +168,19 @@ changes inline only. See the deprecation policy in
   the provider and the field, plus the offending index when an element is at
   fault and the keys the body carried when a top-level field is missing. The BM25
   fallback is unchanged. **Behavior change**: see the upgrade notes above.
+- **An empty LLM completion takes the truncate fallback** (#1056, #67 follow-up) —
+  the
+  guards added for #67 reject a missing or non-string `content`, but an empty
+  string is a string, so it flowed through `compress()`'s success path and the
+  caller received nothing. `compress()` now checks the returned summary for
+  content once, next to the `llm_overlength` clamp, rather than in each of the
+  three provider methods: one site covers every provider, and the event keeps its
+  own label instead of being folded into `llm_error`, which would also have failed
+  the circuit breaker and then misreported the cause as `circuit_breaker`. The
+  pipeline's retention ratio guard caught the empty result whenever the truncated
+  fallback also fell below the floor, which is why a small `max_result_chars`
+  shows no change; the cases that differ are a disabled floor and a budget large
+  enough for the fallback to clear it. All three are pinned by tests. **Behavior change**: see the upgrade notes above.
 - **Explicit progressive and progressive fallback share one accounting basis**
   (#1039) — both now record the initial response text: compression footers are
   included, while surfacing, later index annotations, non-text content, and MCP
