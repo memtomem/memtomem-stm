@@ -92,14 +92,23 @@ changes inline only. See the deprecation policy in
   cached, one of them a string; the next identical call issued **zero** HTTP
   requests and fell back to BM25 again, logging `can't multiply sequence by non-int
   of type 'float'`. Relevance scoring for those texts stayed degraded until the
-  process restarted, with no request left to blame. Every vector is now checked
-  down to its components — each must be a finite number, so
-  `{"embeddings": [["bad", 0.2]]}` is rejected as well, which a container-only
-  check let through — and the rejection happens before the cache write, so the
-  next call retries the provider and recovers as soon as the provider does.
-  Well-formed responses are cached exactly as before; the extra validation
-  measured 0.41 ms for 8,064 components (21 texts at 384 dimensions), against an
-  HTTP round trip.
+  process restarted, with no request left to blame. Three shapes were reaching the
+  cache, each passing the check above it: a non-list element, a list whose
+  *components* were not numbers (`[["bad", 0.2]]`), and two batch shapes that
+  satisfied the vectors-per-text count — `[[], [], []]`, which scores everything
+  0.0, and vectors of differing dimensions, where `zip` stops at the shorter one
+  and a 1-D against a 2-D vector scored a confident **1.0**. None of them raised,
+  so nothing was logged and the fallback counter never moved. All are now rejected
+  before the cache write, so the next call retries the provider and recovers as
+  soon as the provider does. Well-formed responses are cached exactly as before;
+  the component validation measured 0.41 ms for 8,064 components (21 texts at 384
+  dimensions), against an HTTP round trip.
+- **Cosine similarity no longer overflows to `nan`** (#67 follow-up). `1e308` is a
+  finite number a provider can serialise, but `1e308 ** 2` is not, so two identical
+  vectors scored `nan` — neither high nor low, and unpredictable under sorting.
+  Each vector is now divided by its own largest magnitude before multiplying, which
+  cancels exactly in the ratio, so ordinary similarities are unchanged (pinned by
+  test).
 
 ### Fixed
 
@@ -114,9 +123,9 @@ changes inline only. See the deprecation policy in
   — a deliberate choice, so an expected fallback does not bury real errors — which
   made `'embeddings'` the operator's entire signal: it named neither the provider
   nor what the body held. Each level is now type-checked and the `ValueError` names
-  the provider, the field, the offending index, and the keys the body actually
-  carried. The BM25 fallback is unchanged. **Behavior change**: see the upgrade
-  notes above.
+  the provider and the field, plus the offending index when an element is at
+  fault and the keys the body carried when a top-level field is missing. The BM25
+  fallback is unchanged. **Behavior change**: see the upgrade notes above.
 - **Explicit progressive and progressive fallback share one accounting basis**
   (#1039) — both now record the initial response text: compression footers are
   included, while surfacing, later index annotations, non-text content, and MCP

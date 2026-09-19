@@ -145,10 +145,20 @@ class BM25Scorer:
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
-    if norm_a == 0 or norm_b == 0:
+    # Each vector is divided by its own largest magnitude before multiplying.
+    # ``sum(x * y ...)`` overflows to ``inf`` on components a provider can
+    # legitimately serialise — ``1e308`` is finite, ``1e308 ** 2`` is not — and
+    # ``inf / inf`` is ``nan``, a score that is neither high nor low and that
+    # sorts unpredictably. Scaling cancels exactly in the ratio, which is all
+    # cosine needs, so ordinary inputs are unaffected.
+    scale_a = max(map(abs, a), default=0.0)
+    scale_b = max(map(abs, b), default=0.0)
+    if scale_a == 0.0 or scale_b == 0.0:
+        return 0.0
+    dot = sum((x / scale_a) * (y / scale_b) for x, y in zip(a, b))
+    norm_a = math.sqrt(sum((x / scale_a) ** 2 for x in a))
+    norm_b = math.sqrt(sum((y / scale_b) ** 2 for y in b))
+    if norm_a == 0.0 or norm_b == 0.0:
         return 0.0
     return dot / (norm_a * norm_b)
 
@@ -358,6 +368,24 @@ class EmbeddingScorer:
         if len(embeddings) != len(texts):
             raise ValueError(
                 f"embedding provider returned {len(embeddings)} vectors for {len(texts)} inputs"
+            )
+        # The count is not the whole contract. Two batch-level shapes passed it
+        # and were cached, where they answered every later call for those texts
+        # without a request:
+        #   [[], [], []]           -> every similarity 0.0, no ranking signal
+        #   [[1.0, 0.0], [1.0]]    -> ``zip`` stops at the shorter vector, so a
+        #                             1-D and a 2-D vector compared 1.0, a
+        #                             confidently WRONG similarity
+        # Neither raised, so ``fallback_count`` never moved and nothing was
+        # logged. Checked here rather than per provider: it is a property of
+        # the batch, and this is the last point before ``_embed_cached`` writes.
+        dimensions = {len(vector) for vector in embeddings}
+        if 0 in dimensions:
+            raise ValueError(f"embedding provider returned an empty vector for {len(texts)} inputs")
+        if len(dimensions) > 1:
+            raise ValueError(
+                "embedding provider returned vectors of differing dimensions "
+                f"({sorted(dimensions)}); a similarity across them is silently wrong"
             )
         return embeddings
 

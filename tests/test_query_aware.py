@@ -526,6 +526,56 @@ class TestEmbeddingResponseDefense:
             scorer.score_sections("alpha", sections)
         assert post.call_count == 1
 
+    @pytest.mark.parametrize(
+        "payload,fragment",
+        [
+            ({"embeddings": [[], [], []]}, "empty vector"),
+            ({"embeddings": [[1.0, 0.0], [1.0], [0.0, 1.0]]}, "differing dimensions"),
+        ],
+    )
+    def test_batch_shapes_that_pass_the_count_are_still_rejected(self, payload, fragment):
+        """The count contract is not the whole contract. Measured before this
+        check: both shapes were cached with ``fallback_count == 0`` — nothing
+        raised, nothing logged. The dimension mismatch is the worse of the two,
+        because ``zip`` stops at the shorter vector and a 1-D against a 2-D
+        vector scored **1.0**: a confidently wrong similarity, not a missing
+        one."""
+        scorer = self._scorer("ollama")
+        sections = [("Alpha", "alpha body"), ("Beta", "beta body")]
+        with patch("httpx.post", return_value=_bad_body_response(payload)):
+            scorer.score_sections("alpha", sections)
+        assert scorer._cache == {}
+        assert scorer.fallback_count == 1
+        with patch("httpx.post", return_value=_bad_body_response(payload)) as post:
+            scorer.score_sections("alpha", sections)
+        assert post.call_count == 1
+
+    def test_huge_but_finite_components_do_not_produce_nan(self):
+        """``1e308`` is a finite number, so component validation passes it — and
+        ``1e308 ** 2`` is ``inf``, so the old cosine returned ``nan`` for two
+        identical vectors and cached them. A nan score is neither high nor low
+        and sorts unpredictably."""
+        import math as _math
+
+        scorer = self._scorer("ollama")
+        payload = {"embeddings": [[1e308, 1e308], [1e308, 1e308], [0.0, 1e308]]}
+        sections = [("Alpha", "alpha body"), ("Beta", "beta body")]
+        with patch("httpx.post", return_value=_bad_body_response(payload)):
+            scores = scorer.score_sections("alpha", sections)
+        assert all(_math.isfinite(s) for s in scores), scores
+        assert scores[0] == pytest.approx(1.0)
+
+    def test_scaling_does_not_change_ordinary_similarities(self):
+        """Positive control for the rewrite: the scaled form is algebraically
+        the same ratio, so everyday vectors must score exactly as before."""
+        from memtomem_stm.proxy.relevance import _cosine_similarity
+
+        assert _cosine_similarity([1.0, 0.0], [1.0, 0.0]) == pytest.approx(1.0)
+        assert _cosine_similarity([1.0, 0.0], [0.0, 1.0]) == pytest.approx(0.0)
+        assert _cosine_similarity([1.0, 1.0], [1.0, 0.0]) == pytest.approx(0.7071067811865475)
+        assert _cosine_similarity([3.0, 4.0], [6.0, 8.0]) == pytest.approx(1.0)
+        assert _cosine_similarity([0.0, 0.0], [1.0, 0.0]) == 0.0
+
     def test_score_sections_still_falls_back_to_bm25(self, caplog):
         """Behavior is unchanged: the caller catches it and scores with BM25.
         Only the logged reason improves."""
