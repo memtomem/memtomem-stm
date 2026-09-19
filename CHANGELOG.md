@@ -84,7 +84,7 @@ changes inline only. See the deprecation policy in
   result that contains `\n---\n[progressive: chars=` without a
   `stm_proxy_read_more(key="…")` call used to miss the cache on every call; identical
   calls now hit it, and the row survives restarts.
-- **A malformed embedding response is no longer cached** (#67 follow-up). The
+- **A malformed embedding response is no longer cached** (#1058, #67 follow-up). The
   embedding scorer checked that it got as many vectors as it sent texts, never that
   each one was a vector, so a reply such as
   `{"embeddings": [[0.1, 0.2], "not a vector", [0.3, 0.4]]}` satisfied the count and
@@ -111,7 +111,16 @@ changes inline only. See the deprecation policy in
   still accepted in input order, unchanged (#68). Well-formed responses are cached exactly as before;
   the component validation measured 0.41 ms for 8,064 components (21 texts at 384
   dimensions), against an HTTP round trip.
-- **Cosine similarity no longer overflows to `nan`** (#67 follow-up). `1e308` is a
+- **A change in embedding dimension discards the cache** (#1058). One
+  `(provider, model)` pair has one embedding dimension, so a batch arriving at a
+  different one means the model answering changed and every vector already held came
+  from a different model. That batch is refused and the cache is dropped with it.
+  Without the drop the mismatch was permanent: two internally uniform batches of
+  different dimensions each passed their own check and were both cached, and three
+  later calls that mixed them produced three BM25 fallbacks and **zero** HTTP
+  requests against a healthy provider. The next call now re-fetches and recovers.
+  Steady traffic is unaffected — the cache is kept and no extra request issued.
+- **Cosine similarity no longer overflows to `nan`** (#1058, #67 follow-up). `1e308` is a
   finite number a provider can serialise, but `1e308 ** 2` is not, so two identical
   vectors scored `nan` — neither high nor low, and unpredictable under sorting.
   Each vector is now divided by its own largest magnitude before multiplying, which
@@ -120,8 +129,8 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
-- **Embedding responses are parsed defensively, and the reason is logged** (#67
-  follow-up) — `_embed_ollama` and `_embed_openai` indexed straight into the parsed
+- **Embedding responses are parsed defensively, and the reason is logged**
+  (#1058, #67 follow-up) — `_embed_ollama` and `_embed_openai` indexed straight into the parsed
   body: `resp.json()["embeddings"]`, `resp.json()["data"]` and `d["embedding"]`.
   This is the same unchecked-access class #67 fixed for the chat-completion paths
   and left untouched here. An Ollama error envelope raised `KeyError('embeddings')`,

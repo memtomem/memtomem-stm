@@ -443,8 +443,6 @@ _OPENAI_BAD_BODIES = [
 ]
 
 
-
-
 def _bad_body_response(payload):
     from unittest.mock import MagicMock
 
@@ -604,16 +602,91 @@ class TestEmbeddingResponseDefense:
         call 2 — ``scores=[1.0]``, three cached entries, ``fallback_count``
         still 0, and the second request served from cache thereafter."""
         scorer = self._scorer("ollama")
-        with patch("httpx.post", return_value=_bad_body_response({"embeddings": [[1.0, 0.0], [1.0, 0.0]]})):
+        with patch(
+            "httpx.post", return_value=_bad_body_response({"embeddings": [[1.0, 0.0], [1.0, 0.0]]})
+        ):
             scorer.score_sections("alpha", [("A", "a body")])
         assert len(scorer._cache) == 2
 
         with patch("httpx.post", return_value=_bad_body_response({"embeddings": [[1.0]]})) as post:
             scores = scorer.score_sections("alpha", [("B", "b body")])
         assert scorer.fallback_count == 1
-        assert len(scorer._cache) == 2, "the disagreeing vector must not be cached"
         assert post.call_count == 1
         assert scores == BM25Scorer().score_sections("alpha", [("B", "b body")])
+        # The disagreeing vector is not cached, and neither is what disagreed
+        # with it: a dimension change means the model answering changed, so the
+        # vectors already held came from a different one. Keeping them is what
+        # made the mismatch permanent — see
+        # ``test_a_dimension_change_clears_the_cache_and_recovers``.
+        assert scorer._cache == {}
+
+    def test_a_dimension_change_clears_the_cache_and_recovers(self):
+        """Two internally uniform batches of different dimensions each passed
+        their own check and were both cached, so a later call that mixed them
+        failed and — this is the part that mattered — issued **no request**.
+        Measured before the fix: three such calls, three BM25 fallbacks, zero
+        HTTP, against a healthy provider.
+
+        One (provider, model) has one embedding dimension, so a change means
+        the model answering changed and everything held came from a different
+        one. The batch is refused AND the cache dropped, which is what lets the
+        next call observe a provider that has recovered.
+        """
+        scorer = self._scorer("ollama")
+        with patch(
+            "httpx.post", return_value=_bad_body_response({"embeddings": [[1.0, 0.0], [1.0, 0.0]]})
+        ):
+            scorer.score_sections("alpha", [("A", "a body")])
+        assert len(scorer._cache) == 2
+
+        # A batch at a different dimension: refused, and the cache goes with it.
+        with patch("httpx.post", return_value=_bad_body_response({"embeddings": [[0.5], [0.5]]})):
+            scorer.score_sections("beta", [("B", "b body")])
+        assert scorer._cache == {}
+        assert scorer.fallback_count == 1
+
+        # Recovery: the next call re-fetches rather than failing from cache.
+        healthy = {"embeddings": [[9.0, 9.0], [9.0, 9.0]]}
+        with patch("httpx.post", return_value=_bad_body_response(healthy)) as post:
+            scores = scorer.score_sections("alpha", [("B", "b body")])
+        assert post.call_count == 1
+        assert scorer.fallback_count == 1, "the recovered call must not count a fallback"
+        assert scores == pytest.approx([1.0])
+
+    def test_a_disagreeing_cache_is_dropped_rather_than_read_forever(self):
+        """The safety net behind the dimension pin. Pinning stops a mixed cache
+        from forming; if one exists anyway, reading it must not be permanent.
+        Injected directly, because the pin makes it unreachable through the
+        public path."""
+        scorer = self._scorer("ollama")
+        with patch(
+            "httpx.post", return_value=_bad_body_response({"embeddings": [[1.0, 0.0], [1.0, 0.0]]})
+        ):
+            scorer.score_sections("alpha", [("A", "a body")])
+        assert len(scorer._cache) == 2
+        scorer._cache[next(iter(scorer._cache))] = [1.0]  # a 1-D vector among 2-D
+
+        with patch(
+            "httpx.post", return_value=_bad_body_response({"embeddings": [[1.0, 0.0]]})
+        ) as post:
+            scorer.score_sections("alpha", [("A", "a body")])
+        assert scorer._cache == {}, "a disagreeing cache must be dropped, not re-read"
+        assert post.call_count == 0
+
+    def test_a_steady_dimension_keeps_the_cache(self):
+        """Positive control: the pin must not evict on ordinary traffic."""
+        scorer = self._scorer("ollama")
+        with patch(
+            "httpx.post", return_value=_bad_body_response({"embeddings": [[1.0, 0.0], [1.0, 0.0]]})
+        ):
+            scorer.score_sections("alpha", [("A", "a body")])
+        with patch(
+            "httpx.post", return_value=_bad_body_response({"embeddings": [[0.0, 1.0], [0.0, 1.0]]})
+        ) as post:
+            scorer.score_sections("beta", [("B", "b body")])
+        assert post.call_count == 1
+        assert len(scorer._cache) == 4
+        assert scorer.fallback_count == 0
 
     def test_score_sections_still_falls_back_to_bm25(self, caplog):
         """Behavior is unchanged: the caller catches it and scores with BM25.

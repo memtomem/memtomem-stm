@@ -305,6 +305,10 @@ class EmbeddingScorer:
         self._cache_size = max(0, cache_size)
         self._cache: dict[str, list[float]] = {}
         self._cache_lock = threading.Lock()
+        # One (provider, model) has ONE embedding dimension. Established by the
+        # first accepted batch and guarded by ``_cache_lock``, because a change
+        # invalidates everything cached under it.
+        self._dimension: int | None = None
 
     def score_sections(self, query: str, sections: list[tuple[str, str]]) -> list[float]:
         if not query or not sections:
@@ -333,6 +337,46 @@ class EmbeddingScorer:
         embeddings = self._embed_cached(texts)
         query_emb = embeddings[0]
         return [_cosine_similarity(query_emb, emb) for emb in embeddings[1:]]
+
+    def _note_dimension(self, dimension: int) -> None:
+        """Pin the scorer's embedding dimension, or reject a batch that moved it.
+
+        A change means the model answering changed underneath us, so every
+        vector already held was produced by a different model and cannot be
+        compared with the new ones. Discarding them is the point: refusing the
+        batch alone left the disagreement in the cache, where it made every
+        later call that mixed the two fail identically and issue **no request**
+        — so a provider that had since recovered could never be observed.
+        """
+        with self._cache_lock:
+            established = self._dimension
+            if established is None or established == dimension:
+                self._dimension = dimension
+                return
+            self._cache.clear()
+            self._dimension = None
+        raise ValueError(
+            f"{self._provider} embedding dimension changed from {established} to "
+            f"{dimension} for model {self._model!r}; the cached vectors came from a "
+            "different model and have been discarded"
+        )
+
+    def _require_cache_agreement(self, vectors: list[list[float]]) -> None:
+        """Uniform dimensions across what will be compared — and on failure,
+        drop the cache so the next call can recover.
+
+        Measured before the eviction: two internally uniform batches of
+        different dimensions each passed their own check and were both cached;
+        three later calls that mixed them produced three BM25 fallbacks and
+        zero HTTP requests against a healthy provider.
+        """
+        try:
+            _require_uniform_dimensions(vectors, provider=self._provider)
+        except ValueError:
+            with self._cache_lock:
+                self._cache.clear()
+                self._dimension = None
+            raise
 
     def _embed_cached(self, texts: list[str]) -> list[list[float]]:
         """One embedding per text, fetching only the ones not already held.
@@ -373,14 +417,14 @@ class EmbeddingScorer:
             # a 2-D query already held and a 1-D section fetched now passed both
             # checks and compared 1.0. Validated BEFORE the write, so a reply
             # that disagrees with what is held never becomes what is held.
-            _require_uniform_dimensions(list(held.values()) + fetched, provider=self._provider)
+            self._require_cache_agreement(list(held.values()) + fetched)
             with self._cache_lock:
                 for key, embedding in zip(miss_keys, fetched):
                     self._cache[key] = embedding
                 _fifo_prune(self._cache, self._cache_size)
             held.update(zip(miss_keys, fetched))
         else:
-            _require_uniform_dimensions(list(held.values()), provider=self._provider)
+            self._require_cache_agreement(list(held.values()))
 
         return [held[key] for key in keys]
 
@@ -411,6 +455,8 @@ class EmbeddingScorer:
         # logged. Checked here rather than per provider: it is a property of
         # the batch, and this is the last point before ``_embed_cached`` writes.
         _require_uniform_dimensions(embeddings, provider=self._provider)
+        if embeddings:
+            self._note_dimension(len(embeddings[0]))
         return embeddings
 
     def _embed_batch(self, texts: list[str]) -> list[list[float]]:
