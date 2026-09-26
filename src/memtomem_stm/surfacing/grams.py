@@ -22,6 +22,7 @@ import hmac
 import os
 import re
 import sys
+from pathlib import PurePath, PurePosixPath, PureWindowsPath
 from types import ModuleType
 
 KEY_BYTES = 32
@@ -41,6 +42,15 @@ A platform rule, not a per-volume one: macOS and Windows default to
 case-insensitive filesystems. On a case-sensitive APFS volume two files whose
 names differ only in case share a key. Collection and analysis fold the same
 way, so the rule is consistent; that collision is the documented limit."""
+
+MAX_SOURCE_CHARS = 4096
+"""Longest ``source_file`` that is eligible. Real paths are bounded by the OS
+(``PATH_MAX``), but a source is an arbitrary string from the LTM, and every
+ancestor directory of an eligible path is hashed — work quadratic in its
+length — on the shared store worker."""
+
+MAX_SOURCE_PARTS = 256
+"""Most path components an eligible ``source_file`` may have (same reason)."""
 
 _WORD_RE = re.compile(r"[a-z0-9_]{3,}")
 
@@ -122,20 +132,20 @@ def path_key(
 ) -> str:
     """The lexical key of *path*: never touches the filesystem or the account database.
 
-    A relative path is joined onto *cwd* when one is given; ``normpath``;
-    lower-cased when *casefold*. ``~`` is not expanded: ``expanduser`` can
-    consult the account database (``pwd.getpwnam`` for ``~user``), which may
-    block, and collection only keys absolute paths anyway. Lower-casing, not
-    ``str.casefold``: case-insensitive APFS and NTFS compare names by simple
-    per-character case mapping, under which ``Straße`` and ``STRASSE`` are two
-    files, and full case folding would give them one key. Collection passes no
-    *cwd* (only absolute paths are eligible); a transcript reader passes the
+    When *cwd* is given the path is joined onto it — ``join`` keeps a fully
+    qualified path as is and anchors a Windows rooted path (``\\notes\\a.md``)
+    to *cwd*'s drive — then ``normpath``, then lower-cased when *casefold*.
+    ``~`` is not expanded: ``expanduser`` can consult the account database
+    (``pwd.getpwnam`` for ``~user``), which may block, and collection only keys
+    fully qualified paths anyway. Lower-casing, not ``str.casefold``:
+    case-insensitive APFS and NTFS compare names by simple per-character case
+    mapping, under which ``Straße`` and ``STRASSE`` are two files, and full
+    case folding would give them one key. Collection passes no *cwd* (only
+    fully qualified paths are eligible); a transcript reader passes the
     record's ``cwd`` so a relative argument keys the same as its absolute form.
     *pathmod* is injectable so the Windows rules can be tested on any OS.
     """
-    joined = path
-    if cwd is not None and not pathmod.isabs(path):
-        joined = pathmod.join(cwd, path)
+    joined = pathmod.join(cwd, path) if cwd is not None else path
     normalized = pathmod.normpath(joined)
     return normalized.lower() if casefold else normalized
 
@@ -161,13 +171,20 @@ def basename_key(key: str, *, pathmod: ModuleType = os.path) -> str:
 def eligible_source(source: str | None, *, pathmod: ModuleType = os.path) -> bool:
     """Whether a delivered memory's ``source_file`` can anchor a file match.
 
-    Decided from the string alone, at render time: an absolute path that is not
-    an adapter sentinel. A relative path is ineligible because the only anchor
-    available later is the agent's ``cwd``, not the base the LTM indexed it
-    against; a ``~`` path is ineligible because expanding it can consult the
-    account database, which this hot path must not wait on. Nothing is looked
-    up, so a file deleted or moved after delivery cannot change the answer.
+    Decided from the string alone, at render time: a fully qualified path —
+    POSIX absolute, or on Windows a drive with a root (``C:\\notes``) or a UNC
+    share — that is not an adapter sentinel and is within
+    :data:`MAX_SOURCE_CHARS` / :data:`MAX_SOURCE_PARTS`. ``pathlib`` decides
+    "fully qualified" because ``ntpath.isabs`` changed meaning in Python 3.13:
+    3.12 calls a rooted ``\\notes\\a.md`` absolute although it names a file
+    only relative to the current drive. A relative path is ineligible because
+    the only anchor available later is the agent's ``cwd``, not the base the
+    LTM indexed it against; a ``~`` path because expanding it can consult the
+    account database. Nothing is looked up, so a file deleted or moved after
+    delivery cannot change the answer.
     """
-    if source is None or source in _SENTINEL_SOURCES:
+    if source is None or source in _SENTINEL_SOURCES or len(source) > MAX_SOURCE_CHARS:
         return False
-    return pathmod.isabs(source)
+    flavour: type[PurePath] = PureWindowsPath if pathmod.sep == "\\" else PurePosixPath
+    pure = flavour(source)
+    return pure.is_absolute() and len(pure.parts) <= MAX_SOURCE_PARTS

@@ -15,6 +15,7 @@ import pytest
 from memtomem_stm.surfacing.formatter import SurfacingFormatter
 from memtomem_stm.surfacing.grams import (
     MAX_SNIPPET_GRAMS,
+    MAX_SOURCE_CHARS,
     ancestor_keys,
     basename_key,
     eligible_source,
@@ -131,6 +132,18 @@ class TestPathKey:
             == "/proj/~user/a.md"
         )
 
+    def test_windows_cwd_join(self) -> None:
+        # A rooted path takes cwd's drive; a qualified or UNC path stays itself.
+        assert path_key("\\notes\\a.md", cwd="C:\\proj", pathmod=ntpath, casefold=True) == (
+            "c:\\notes\\a.md"
+        )
+        assert path_key("D:\\x\\a.md", cwd="C:\\proj", pathmod=ntpath, casefold=True) == (
+            "d:\\x\\a.md"
+        )
+        assert path_key("\\\\srv\\share\\a.md", cwd="C:\\proj", pathmod=ntpath, casefold=True) == (
+            "\\\\srv\\share\\a.md"
+        )
+
     def test_windows_rules(self) -> None:
         assert (
             path_key("C:/Users/X/Notes/../A.md", pathmod=ntpath, casefold=True)
@@ -167,5 +180,23 @@ class TestEligibleSource:
     def test_sentinels_and_relative_are_not(self, source: str | None) -> None:
         assert not eligible_source(source, pathmod=posixpath)
 
-    def test_windows_absolute_is_eligible(self) -> None:
-        assert eligible_source("C:\\notes\\a.md", pathmod=ntpath)
+    @pytest.mark.parametrize(
+        ("source", "eligible"),
+        [
+            ("C:\\notes\\a.md", True),
+            ("\\\\server\\share\\a.md", True),
+            # Rooted but driveless: ntpath.isabs said True on Python 3.12.
+            ("\\notes\\a.md", False),
+            ("C:notes\\a.md", False),  # drive-relative
+            ("/notes/a.md", False),  # a POSIX path is not qualified on Windows
+        ],
+    )
+    def test_windows_needs_a_fully_qualified_path(self, source: str, eligible: bool) -> None:
+        assert eligible_source(source, pathmod=ntpath) is eligible
+
+    def test_oversized_sources_are_not_eligible(self) -> None:
+        # ``parts`` counts the root too: "/" + 254 dirs + name = 256.
+        assert eligible_source("/" + "a/" * 254 + "x.md", pathmod=posixpath)
+        assert not eligible_source("/" + "a/" * 255 + "x.md", pathmod=posixpath)
+        assert eligible_source("/" + "a" * (MAX_SOURCE_CHARS - 1), pathmod=posixpath)
+        assert not eligible_source("/" + "a" * MAX_SOURCE_CHARS, pathmod=posixpath)

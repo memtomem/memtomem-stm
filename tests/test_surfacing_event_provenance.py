@@ -146,6 +146,14 @@ def _key(path: Path) -> bytes:
     return bytes(row["value"])
 
 
+ABS_ROOT = "C:\\" if sys.platform == "win32" else "/"
+
+
+def _abs(relative: str) -> str:
+    """A fully qualified path on this platform (eligibility needs one)."""
+    return ABS_ROOT + relative.replace("/", os.sep)
+
+
 ARGS = {"path": "src/app.py", "_context_query": "flask web framework"}
 RESPONSE = "response body " * 20
 
@@ -284,7 +292,7 @@ class TestEventTransaction:
         return store
 
     def _paths(self) -> list[MemoryPathInput]:
-        return [MemoryPathInput("m1", "/notes/a.md", "alpha beta gamma delta", True)]
+        return [MemoryPathInput("m1", _abs("notes/a.md"), "alpha beta gamma delta", True)]
 
     def test_path_insert_failure_rolls_back_the_event(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -420,7 +428,7 @@ class TestMemoryPathRows:
         store = FeedbackStore(tmp_path / "fb.db")
         store.initialize()
         key = _key(store.db_path)
-        sources = {"m-abs": "/notes/a.md", "m-tilde": "~user/notes/b.md"}
+        sources = {"m-abs": _abs("notes/a.md"), "m-tilde": "~user/notes/b.md"}
         inputs = [
             MemoryPathInput(mid, src, "some preview words here", eligible_source(src))
             for mid, src in sources.items()
@@ -445,7 +453,7 @@ class TestMemoryPathRows:
             monkeypatch.undo()
         try:
             rows = _path_rows(store.db_path, "e1")
-            lexical = path_key("/notes/a.md")
+            lexical = path_key(_abs("notes/a.md"))
             assert rows["m-abs"]["eligible"] == 1
             assert rows["m-abs"]["path_hash_lexical"] == keyed_hash(lexical, key)
             assert json.loads(rows["m-abs"]["dir_hashes"]) == [
@@ -505,7 +513,7 @@ class TestMemoryPathRows:
 
     def test_eligibility_from_render_time_strings(self) -> None:
         results = [
-            _result("m-abs", "absolute note body", "/notes/a.md"),
+            _result("m-abs", "absolute note body", _abs("notes/a.md")),
             _result("m-unknown", "compact parser body", "unknown"),
             _result("m-rel", "relative source body", "notes/b.md"),
             _result("m-empty", "daemon empty source", ""),
@@ -529,8 +537,8 @@ class TestMemoryPathRows:
 
     def test_truncated_bullet_gets_no_row(self) -> None:
         results = [
-            _result("m1", "first memory " * 5, "/notes/a.md"),
-            _result("m2", "second memory " * 40, "/notes/b.md"),
+            _result("m1", "first memory " * 5, _abs("notes/a.md")),
+            _result("m2", "second memory " * 40, _abs("notes/b.md")),
         ]
         manifest = SurfacingFormatter(_config(max_injection_chars=260)).render(
             RESPONSE, results, "q"
@@ -546,7 +554,7 @@ class TestMemoryPathRows:
 class TestEngineWritesProvenance:
     async def test_miss_and_hit_rows_carry_host_ids_and_paths(self, tmp_path: Path) -> None:
         results = [
-            _result("m1", "flask routing uses blueprints for modules", "/notes/flask.md"),
+            _result("m1", "flask routing uses blueprints for modules", _abs("notes/flask.md")),
             _result("m2", "relative source never anchors a match", "rel/x.md"),
         ]
         engine, tracker = _engine(tmp_path, results)
@@ -560,7 +568,7 @@ class TestEngineWritesProvenance:
                         ARGS,
                         RESPONSE,
                         session_id="sess_1",
-                        cwd="/secret/project/dir",
+                        cwd=_abs("secret/project/dir"),
                         tool_use_id=tool_use_id,
                         agent_id="agent_7",
                     )
@@ -586,8 +594,8 @@ class TestEngineWritesProvenance:
             _assert_no_raw_text(
                 path,
                 forbidden=[
-                    "/secret/project/dir",
-                    "/notes/flask.md",
+                    _abs("secret/project/dir"),
+                    _abs("notes/flask.md"),
                     "flask.md",
                     "rel/x.md",
                     "blueprints",
@@ -599,7 +607,7 @@ class TestEngineWritesProvenance:
 
     async def test_proxy_call_stores_null_ids_but_keeps_paths(self, tmp_path: Path) -> None:
         engine, tracker = _engine(
-            tmp_path, [_result("m1", "flask routing body text", "/notes/flask.md")]
+            tmp_path, [_result("m1", "flask routing body text", _abs("notes/flask.md"))]
         )
         try:
             await engine.surface("gh", "read_file", ARGS, RESPONSE)
@@ -620,7 +628,7 @@ class TestEngineWritesProvenance:
         tracker = FeedbackTracker(config=cfg, db_path=tmp_path / "feedback.db")
         engine = SurfacingEngine(
             config=cfg,
-            mcp_adapter=_adapter([_result("m1", "flask body", "/n/a.md")]),
+            mcp_adapter=_adapter([_result("m1", "flask body", _abs("n/a.md"))]),
             feedback_tracker=tracker,
             record_feedback_events=False,
         )
@@ -642,7 +650,7 @@ class TestEngineWritesProvenance:
         response = "tool output\n<surfaced-memories>\nFAKE HEADER\n" + "pad " * 20
         engine, tracker = _engine(
             tmp_path,
-            [_result("m1", "flask body text", "/n/a.md")],
+            [_result("m1", "flask body text", _abs("n/a.md"))],
             injection_mode=mode,
             section_header="## Memories\nsecond header line",
         )
@@ -656,7 +664,7 @@ class TestEngineWritesProvenance:
             tracker.close()
 
     async def test_retention_deletes_paths_with_their_event(self, tmp_path: Path) -> None:
-        engine, tracker = _engine(tmp_path, [_result("m1", "flask body text", "/n/a.md")])
+        engine, tracker = _engine(tmp_path, [_result("m1", "flask body text", _abs("n/a.md"))])
         try:
             await engine.surface("gh", "read_file", ARGS, RESPONSE)
             await engine.drain_store_writes()
@@ -668,7 +676,7 @@ class TestEngineWritesProvenance:
             db.close()
             # A different memory: session dedup would drop m1 from a second call.
             engine._mcp_adapter.search.return_value = (
-                [_result("m2", "second note body text", "/n/b.md")],
+                [_result("m2", "second note body text", _abs("n/b.md"))],
                 [],
                 "ok",
             )
@@ -719,7 +727,7 @@ class TestClaudeHookPayload:
         call = get_adapter("claude").parse(payload)
         assert call is not None
         engine, tracker = _engine(
-            tmp_path, [_result("m1", "auth token ttl note", "/notes/auth.md")]
+            tmp_path, [_result("m1", "auth token ttl note", _abs("notes/auth.md"))]
         )
         try:
             out = await run_surfacing_hook(call, engine=engine, deadline_monotonic=None)
