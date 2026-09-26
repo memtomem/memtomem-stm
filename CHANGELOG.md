@@ -19,7 +19,8 @@ changes inline only. See the deprecation policy in
   yet. The version is part of the daemon fingerprint, so after upgrading the hook
   starts a new v8 daemon. A running v7 daemon keeps running beside it until it idles
   out. A daemon pinned with `idle_timeout_seconds=0` never idles out, so stop it with
-  `mms daemon stop --all`.
+  `mms daemon stop --all`; on Windows that command cannot terminate it, so end the
+  process from Task Manager instead.
 - **Explicit progressive compression rows record the first delivered response**
   (#1039). `compressed_chars` used to be the whole cleaned text on this path, so
   its saved ratio was 0%. When the response is chunked, it is now the first chunk

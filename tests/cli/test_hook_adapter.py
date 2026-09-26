@@ -241,6 +241,18 @@ def test_to_wire_emits_host_ids():
     }
 
 
+def test_host_id_wire_requires_protocol_v8_or_later():
+    # A v7 daemon's from_wire drops these keys silently. The version is folded
+    # into the daemon fingerprint (tests/daemon/test_internals.py), so only a
+    # bump keeps a new hook from reusing a v7 daemon; reverting it must fail here.
+    from memtomem_stm.daemon.protocol import PROTOCOL_VERSION
+
+    assert {"session_id", "cwd", "tool_use_id", "agent_id"} <= CanonicalHookCall(
+        event_type="PostToolUse", tool_name="Read"
+    ).to_wire().keys()
+    assert PROTOCOL_VERSION >= 8
+
+
 # ── host call ids (session_id / cwd / tool_use_id / agent_id) ──────────────────
 
 _CLAUDE_DIR = _HOOK_FIXTURES / "claude"
