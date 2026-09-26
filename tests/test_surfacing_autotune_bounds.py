@@ -195,3 +195,94 @@ class TestClampOnLoad:
         tuner = AutoTuner(cfg, store)
         assert "read_file" not in tuner.adjustments
         store.save_adjustment.assert_not_called()
+
+
+class TestRrfReferenceCeiling:
+    """#1062: the configured ceiling (0.05) was drawn on a [0, 1] scale and
+    sits above the two-leg RRF reference ``2/61``. Capped only by it, eight
+    raises from 0.017 reach 0.033 and ``score >= min_score`` rejects every
+    two-leg result — the tool never surfaces again. The batch's reference
+    ceiling caps the tuned value too."""
+
+    BASELINE = 2 / 61
+
+    def test_raises_stop_at_the_reference_ceiling(self):
+        cfg = SurfacingConfig(auto_tune_enabled=True)
+        tuner = AutoTuner(cfg, _store(neg=0.9, helpful=0.0))
+        for _ in range(30):
+            tuner.maybe_adjust("read_file", score_ceiling=self.BASELINE)
+        assert tuner.get_effective_min_score("read_file") == self.BASELINE
+        # A rank-1/rank-1 result still passes the inclusive filter at the cap.
+        assert 1 / 61 + 1 / 61 >= tuner.get_effective_min_score("read_file")
+
+    def test_stamped_lower_ceiling_caps_lower(self):
+        # rrf_weights [0.5, 0.5] at k=60 → reference 1/61, below the default
+        # min_score 0.017: the cap stays at min_score, so no raise happens.
+        cfg = SurfacingConfig(auto_tune_enabled=True, min_score=0.015)
+        tuner = AutoTuner(cfg, _store(neg=0.9, helpful=0.0))
+        for _ in range(10):
+            tuner.maybe_adjust("read_file", score_ceiling=1 / 61)
+        assert tuner.get_effective_min_score("read_file") == 1 / 61
+
+    def test_config_ceiling_below_reference_still_wins(self):
+        cfg = SurfacingConfig(
+            auto_tune_enabled=True,
+            min_score=0.017,
+            auto_tune_score_ceiling=0.025,
+        )
+        tuner = AutoTuner(cfg, _store(neg=0.9, helpful=0.0))
+        for _ in range(30):
+            tuner.maybe_adjust("read_file", score_ceiling=self.BASELINE)
+        assert tuner.get_effective_min_score("read_file") == 0.025
+
+    def test_min_score_above_reference_is_not_lowered_by_a_raise(self):
+        # Operator intent: min_score 0.04 on purpose. The cap never drops
+        # below it, so a raise decision cannot move the value down.
+        cfg = SurfacingConfig(auto_tune_enabled=True, min_score=0.04)
+        tuner = AutoTuner(cfg, _store(neg=0.9, helpful=0.0))
+        tuner.maybe_adjust("read_file", score_ceiling=self.BASELINE)
+        assert tuner.get_effective_min_score("read_file") >= 0.04
+
+    def test_stuck_value_is_clamped_without_new_feedback(self):
+        # A tool stuck above the reference surfaces nothing and so draws no
+        # ratings; the clamp must not wait for the feedback watermark to move.
+        cfg = SurfacingConfig(auto_tune_enabled=True)
+        store = _store(neg=None, helpful=None, adjustments={"read_file": 0.04})
+        store.get_feedback_count.side_effect = None
+        store.get_feedback_count.return_value = 10
+        tuner = AutoTuner(cfg, store)
+        tuner.maybe_adjust("read_file", score_ceiling=self.BASELINE)  # sets the watermark
+        assert tuner.get_effective_min_score("read_file") == self.BASELINE
+        store.save_adjustment.assert_called_with("read_file", self.BASELINE)
+        store.save_adjustment.reset_mock()
+        assert tuner.maybe_adjust("read_file", score_ceiling=self.BASELINE) is None
+        store.save_adjustment.assert_not_called()
+
+    def test_lower_from_a_stuck_value_starts_at_the_cap(self):
+        cfg = SurfacingConfig(auto_tune_enabled=True)
+        tuner = AutoTuner(cfg, _store(neg=0.0, helpful=0.95, adjustments={"read_file": 0.04}))
+        new = tuner.maybe_adjust("read_file", score_ceiling=self.BASELINE)
+        assert new == pytest.approx(self.BASELINE - cfg.auto_tune_score_increment)
+
+    def test_no_ceiling_keeps_the_configured_bound(self):
+        # ``None`` (empty batch, direct callers): only the configured ceiling.
+        cfg = SurfacingConfig(auto_tune_enabled=True)
+        store = _store(neg=0.9, helpful=0.0, adjustments={"read_file": 0.04})
+        tuner = AutoTuner(cfg, store)
+        tuner.maybe_adjust("read_file", score_ceiling=None)
+        assert tuner.get_effective_min_score("read_file") == pytest.approx(0.042)
+
+    def test_failed_clamp_write_is_retried(self):
+        # The row is written before the map changes: a failed write leaves the
+        # stuck value in place, so the next batch clamps and saves again.
+        cfg = SurfacingConfig(auto_tune_enabled=True)
+        store = _store(neg=None, helpful=None, adjustments={"read_file": 0.04})
+        store.save_adjustment.side_effect = RuntimeError("database is locked")
+        tuner = AutoTuner(cfg, store)
+        with pytest.raises(RuntimeError):
+            tuner.maybe_adjust("read_file", score_ceiling=self.BASELINE)
+        assert tuner.get_effective_min_score("read_file") == 0.04
+        store.save_adjustment.side_effect = None
+        tuner.maybe_adjust("read_file", score_ceiling=self.BASELINE)
+        assert tuner.get_effective_min_score("read_file") == self.BASELINE
+        store.save_adjustment.assert_called_with("read_file", self.BASELINE)

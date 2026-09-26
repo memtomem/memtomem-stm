@@ -3995,8 +3995,18 @@ class TestPerToolMinScoreOverride:
 
             engine = SurfacingEngine(
                 config=config,
+                # Stamped ceiling 1.0 keeps the synthetic 0.6 raise legal
+                # (#1062 caps raises at the batch's RRF reference ceiling) and
+                # leaves the bucket band at [floor, 1.0].
                 mcp_adapter=_make_mcp_adapter(
-                    [FakeSearchResult(chunk=FakeChunk(content="near tuned floor"), score=0.70)]
+                    [
+                        FakeSearchResult(
+                            chunk=FakeChunk(content="near tuned floor"),
+                            score=0.70,
+                            score_scale="rrf",
+                            score_ceiling=1.0,
+                        )
+                    ]
                 ),
                 feedback_tracker=tracker,
             )
@@ -4785,7 +4795,8 @@ class TestScaleGatedMinScore:
         await engine.surface(
             "gh", "read_file", {"_context_query": "rrf control query"}, LONG_RESPONSE
         )
-        tuner.maybe_adjust.assert_called_once_with("read_file")
+        # Unstamped ceiling on an rrf batch → the 2/61 baseline (#1062).
+        tuner.maybe_adjust.assert_called_once_with("read_file", score_ceiling=2 / 61)
 
     async def test_suspended_batch_resets_streak_and_closes_both_kinds(self):
         tracker = MagicMock()
@@ -5497,3 +5508,112 @@ class TestRrfBucketCeiling:
             "gh", "read_file", {"_context_query": "ceiling probe query"}, LONG_RESPONSE
         )
         assert "[strong]: ceiling probe" in out
+
+
+class TestAutoTuneRrfReferenceCeiling:
+    """#1062: a tuned ``min_score`` above the batch's RRF reference ceiling
+    filters out every two-leg result, so the tool surfaces nothing and draws
+    no ratings to walk it back. The engine hands the tuner the batch ceiling
+    and the tuner clamps the stored value on the next non-empty batch."""
+
+    BASELINE = 2 / 61
+
+    def _make_tracker(self, tmp_path: Path, config: SurfacingConfig):
+        from memtomem_stm.surfacing.feedback import FeedbackTracker
+
+        return FeedbackTracker(config=config, db_path=tmp_path / "fb.db")
+
+    async def _surface_with_stuck_tool(self, tmp_path: Path, results):
+        config = _make_config(auto_tune_enabled=True, min_score=0.017)
+        tracker = self._make_tracker(tmp_path, config)
+        tracker.store.save_adjustment("read_file", 0.04)
+        engine = SurfacingEngine(
+            config=config,
+            mcp_adapter=_make_mcp_adapter(results),
+            feedback_tracker=tracker,
+        )
+        out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        return engine, tracker, out
+
+    async def test_stuck_tool_recovers_on_next_rrf_batch(self, tmp_path: Path):
+        top = FakeSearchResult(
+            chunk=FakeChunk(content="both legs rank first"),
+            score=1 / 61 + 1 / 61,
+            score_scale="rrf",
+            score_ceiling=self.BASELINE,
+        )
+        engine, tracker, out = await self._surface_with_stuck_tool(tmp_path, [top])
+        try:
+            assert "both legs rank first" in out
+            assert engine._auto_tuner.get_effective_min_score("read_file") == self.BASELINE
+            assert tracker.store.load_adjustments()["read_file"] == self.BASELINE
+        finally:
+            tracker.close()
+
+    async def test_stamped_ceiling_is_used(self, tmp_path: Path):
+        top = FakeSearchResult(
+            chunk=FakeChunk(content="half weights"),
+            score=0.03,
+            score_scale="rrf",
+            score_ceiling=0.03,
+        )
+        engine, tracker, _ = await self._surface_with_stuck_tool(tmp_path, [top])
+        try:
+            assert engine._auto_tuner.get_effective_min_score("read_file") == 0.03
+        finally:
+            tracker.close()
+
+    async def test_unstamped_batch_uses_the_baseline(self, tmp_path: Path):
+        top = FakeSearchResult(chunk=FakeChunk(content="compact"), score=0.03)
+        engine, tracker, _ = await self._surface_with_stuck_tool(tmp_path, [top])
+        try:
+            assert engine._auto_tuner.get_effective_min_score("read_file") == self.BASELINE
+        finally:
+            tracker.close()
+
+    async def test_empty_batch_leaves_the_stored_value(self, tmp_path: Path):
+        engine, tracker, _ = await self._surface_with_stuck_tool(tmp_path, [])
+        try:
+            assert engine._auto_tuner.get_effective_min_score("read_file") == 0.04
+            assert tracker.store.load_adjustments()["read_file"] == 0.04
+        finally:
+            tracker.close()
+
+
+class TestBatchScoreCeiling:
+    """Which batches hand the tuner an RRF reference ceiling (#1062)."""
+
+    BASELINE = 2 / 61
+
+    @staticmethod
+    def _r(**kw):
+        return FakeSearchResult(chunk=FakeChunk(), score=0.02, **kw)
+
+    def test_valid_rrf_stamp_is_used(self):
+        batch = [self._r(score_scale="rrf", score_ceiling=0.05)]
+        assert SurfacingEngine._batch_score_ceiling(batch) == 0.05
+
+    @pytest.mark.parametrize("stamp", [None, 0.0, -1.0, float("nan"), float("inf"), True, "0.05"])
+    def test_invalid_rrf_stamp_falls_back_to_baseline(self, stamp):
+        batch = [self._r(score_scale="rrf", score_ceiling=stamp)]
+        assert SurfacingEngine._batch_score_ceiling(batch) == self.BASELINE
+
+    @pytest.mark.parametrize("scale", [None, "", "some_future_scale"])
+    def test_unstamped_or_unknown_scale_gets_baseline(self, scale):
+        assert SurfacingEngine._batch_score_ceiling([self._r(score_scale=scale)]) == self.BASELINE
+
+    @pytest.mark.parametrize("scale", ["rerank", "bm25", "dense", "none"])
+    def test_named_non_rrf_scale_gives_no_ceiling(self, scale):
+        assert SurfacingEngine._batch_score_ceiling([self._r(score_scale=scale)]) is None
+
+    def test_empty_and_pinned_only_give_no_ceiling(self):
+        pinned = self._r(score_scale="rrf", score_ceiling=0.05)
+        pinned.pinned = True  # type: ignore[attr-defined]
+        assert SurfacingEngine._batch_score_ceiling([]) is None
+        assert SurfacingEngine._batch_score_ceiling([pinned]) is None
+
+    def test_first_retrieved_result_decides(self):
+        pinned = self._r(score_scale="rerank")
+        pinned.pinned = True  # type: ignore[attr-defined]
+        batch = [pinned, self._r(score_scale="rrf", score_ceiling=0.04), self._r()]
+        assert SurfacingEngine._batch_score_ceiling(batch) == 0.04

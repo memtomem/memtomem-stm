@@ -35,6 +35,7 @@ from memtomem_stm.surfacing.mcp_client import (
 )
 from memtomem_stm.surfacing.observability import _NOOP_OBSERVABILITY, SurfacingObservability
 from memtomem_stm.surfacing.relevance import RelevanceGate
+from memtomem_stm.surfacing.rrf_profile import RRF_BASELINE_CEILING, read_score_ceiling_hint
 from memtomem_stm.surfacing.store_io import (
     StoreWriteQueueFull,
     await_store_write,
@@ -763,6 +764,32 @@ class SurfacingEngine:
             )
         return None, None
 
+    @staticmethod
+    def _batch_score_ceiling(results: list[Any]) -> float | None:
+        """Return the RRF reference ceiling the auto-tuner caps against for *results*.
+
+        ``None`` when the batch says nothing about the RRF scale: nothing was
+        retrieved, or the first retrieved result carries a core-named non-RRF
+        scale (such a batch reaches the tuner only with
+        ``scale_gated_min_score`` off). Otherwise the ``score_ceiling`` the
+        adapter stamped on an ``rrf`` result, else :data:`RRF_BASELINE_CEILING`.
+        An unstamped batch (compact format, older cores) gets the baseline too:
+        ``min_score`` is drawn on the RRF scale, and a cap set too low costs a
+        little noise where one set too high silences the tool for good (#1062).
+        Same first-retrieved-result rule as :meth:`_result_score_scale`.
+        """
+        for r in results:
+            if getattr(r, "pinned", False):
+                continue
+            scale = getattr(r, "score_scale", None)
+            if scale == "rrf":
+                stamped = read_score_ceiling_hint(getattr(r, "score_ceiling", None))
+                return RRF_BASELINE_CEILING if stamped is None else stamped
+            if isinstance(scale, str) and scale in KNOWN_SCORE_SCALES:
+                return None
+            return RRF_BASELINE_CEILING
+        return None
+
     async def _run_within(self, coro: Any, timeout: float, scope: _TimerScope) -> Any:
         """Run *coro* under *timeout*, turning an abort *this* call's timer
         started into :class:`asyncio.TimeoutError` (#720).
@@ -1174,7 +1201,7 @@ class SurfacingEngine:
             return self._auto_tuner.get_effective_min_score(tool)
         return self._config.min_score
 
-    async def _maybe_auto_tune(self, tool: str) -> None:
+    async def _maybe_auto_tune(self, tool: str, score_ceiling: float | None = None) -> None:
         """Let the AutoTuner re-read feedback and move ``min_score``, off-loop.
 
         Skipped for a pinned tool: :meth:`_active_min_score` returns the pin
@@ -1182,6 +1209,10 @@ class SurfacingEngine:
         threshold nothing reads — the pre-existing "pinned tools don't learn"
         behavior, kept explicit now that the call is no longer nested inside
         the score lookup.
+
+        *score_ceiling* is the batch's RRF reference ceiling
+        (:meth:`_batch_score_ceiling`); the tuner keeps ``min_score`` at or
+        below it so a raise cannot filter out every two-leg result (#1062).
 
         A failure here is not the caller's problem: the tuner reads feedback
         aggregates on a database a peer process may hold, and a locked read
@@ -1193,7 +1224,9 @@ class SurfacingEngine:
         if tool_cfg is not None and tool_cfg.min_score is not None:
             return
         try:
-            await self._await_store_write(self._auto_tuner.maybe_adjust, tool)
+            await self._await_store_write(
+                functools.partial(self._auto_tuner.maybe_adjust, tool, score_ceiling=score_ceiling)
+            )
         except Exception:
             # Includes the queue ceiling: a tuner pass that cannot be afforded
             # leaves surfacing on the threshold it already had.
@@ -2288,7 +2321,7 @@ class SurfacingEngine:
         # so the pre-existing "pinned tools don't learn" behavior holds.
         filter_suspended = self._scale_gate_suspends(tool, score_scale)
         if not filter_suspended:
-            await self._maybe_auto_tune(tool)
+            await self._maybe_auto_tune(tool, self._batch_score_ceiling(retrieved_results))
         min_score = self._active_min_score(tool)
         self._observe_score_scale(
             server,

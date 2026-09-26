@@ -241,7 +241,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `auto_tune_min_samples` | `20` | Minimum feedback entries before adjusting per-tool score |
 | `auto_tune_score_increment` | `0.002` | Step size for `min_score` adjustments |
 | `auto_tune_score_floor` | `0.005` | Lower bound for auto-tuned `min_score`. When left at its default, the effective floor widens downward to include a lower configured top-level `min_score`. |
-| `auto_tune_score_ceiling` | `0.05` | Upper bound for auto-tuned `min_score`. When left at its default, the effective ceiling widens upward to include a higher configured top-level `min_score`. |
+| `auto_tune_score_ceiling` | `0.05` | Upper bound for auto-tuned `min_score`. When left at its default, the effective ceiling widens upward to include a higher configured top-level `min_score`. Raises also stop at the RRF reference score (see [Feedback & Auto-Tuning](#feedback--auto-tuning)). |
 | `feedback_enabled` | `true` | Enable feedback persistence and handling. `stm_surfacing_feedback` remains advertised when this is `false` and reports that tracking is not enabled. |
 | `feedback_demotion_enabled` | `true` | Locally filter memories that accumulated repeated negative feedback (`not_relevant` or `already_known`) before cache/injection |
 | `feedback_demotion_negative_threshold` | `3` | Distinct negative surfacing events required before local STM demotion applies to a memory |
@@ -625,6 +625,18 @@ score is clamped to the effective
 needed to include the configured top-level `min_score`. Explicit bounds must
 satisfy `floor <= min_score <= ceiling`.
 
+The `0.05` ceiling is above the RRF reference score `2/61` (about 0.0328), the
+score of a result both legs rank first at Core's default fusion. A threshold above
+it filters out every two-leg result, so the tuned value is also capped at the
+reference for each batch (#1062): the `score_ceiling` the LTM adapter stamps on an
+`rrf` result (`sum(rrf_weights) / (rrf_k + 1)`), or `2/61` when the batch carries no
+valid stamp. The effective cap is `min(auto_tune_score_ceiling, max(reference,
+min_score))`, so a top-level `min_score` you set above the reference is never lowered by the cap.
+A stored value above the cap is lowered the next time the tool's search returns
+`rrf` or unstamped results, without waiting for new feedback. An empty batch, or one
+with a named non-RRF scale, supplies no reference, so only the configured bounds
+apply to it.
+
 ```mermaid
 flowchart LR
     Sample["new feedback"] --> N{"≥ 20 samples<br/>for this tool?"}
@@ -635,13 +647,13 @@ flowchart LR
     R -->|"negative > 60%"| Up["min_score += 0.002<br/>(surface less)"]
     R -->|"helpful > 80%"| Down["min_score -= 0.002<br/>(surface more)"]
     R -->|"otherwise"| Hold["no change<br/>(incl. partially_helpful)"]
-    Up --> Cap["clamp to<br/>[0.005, 0.05]"]
+    Up --> Cap["clamp to<br/>[floor, min(ceiling,<br/>max(RRF ref, min_score)))]"]
     Down --> Cap
     Cap --> Tool[("per-tool<br/>min_score")]
     Tool -.->|next call| Sample
 ```
 
-Requires `auto_tune_min_samples` (default 20) feedback entries before adjusting. Score is capped between 0.005 and 0.05. **Cold-start fallback**: new tools with insufficient samples use the global ratio across all tools instead of waiting for 20 per-tool samples.
+Requires `auto_tune_min_samples` (default 20) feedback entries before adjusting. Score is capped between the floor and the cap above (with defaults, 0.005 and the RRF reference score). **Cold-start fallback**: new tools with insufficient samples use the global ratio across all tools instead of waiting for 20 per-tool samples.
 
 **Per-tool override wins:** if `context_tools.<name>.min_score` is set, auto-tune is skipped for that tool entirely — the tuner is not consulted and does not learn from its feedback (see [`min_score` precedence](#per-tool-templates)).
 

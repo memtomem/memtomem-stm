@@ -25,6 +25,16 @@ changes inline only. See the deprecation policy in
   1,194 `[related]` and 269 `[weak]`, where all 4,708 were `[weak]` before.
   Results without a `score_scale` stamp (compact format, older cores) keep the
   `[min_score, 1.0]` band.
+- **Auto-tune no longer raises `min_score` past the RRF reference score** (#1062).
+  A raise was capped only by `auto_tune_score_ceiling` (default `0.05`), which is
+  above the default two-leg reference `2/61` (about 0.0328). Starting from the default
+  `0.017`, eight raises reached `0.033`, which filtered out every two-leg result for
+  that tool. The tuned value is now also capped at the reference the LTM adapter
+  stamps on each `rrf` result, or `2/61` when a batch carries no valid stamp. A
+  `min_score` you set above the reference is kept: the cap never goes below it. A stored adjustment
+  above the cap is lowered and saved the next time that tool's search returns
+  `rrf` or unstamped results, even with no new feedback. This applies to the proxy and to the daemon
+  when `hook.record_feedback_events` is on (otherwise the daemon does not tune).
 - **The hook↔daemon protocol is now v8.** The `surface` payload carries the host's
   `session_id`, `cwd`, `tool_use_id` and `agent_id` (Claude sends `agent_id` only
   inside a subagent). The surfacing engine accepts them but does not store or log them
@@ -224,6 +234,19 @@ changes inline only. See the deprecation policy in
   problem booked as a provider outage.
 
 ### Fixed
+
+- **Auto-tuned `min_score` stays at or below the batch's RRF reference score**
+  (#1062) — `AutoTuner.maybe_adjust` capped a raise only at `auto_tune_score_ceiling`,
+  a bound written for a `[0, 1]` scale, the same class as #1034. Once the tuned value
+  crossed `2/61`, the filter `score >= min_score` rejected every two-leg result, so
+  the tool surfaced nothing and drew no ratings to walk it back. The engine now passes
+  the batch's reference ceiling to the tuner: the stamped `score_ceiling` of an `rrf`
+  batch, `2/61` for an unstamped batch or an invalid stamp, and nothing for an empty
+  batch or one with a named non-RRF scale (which reaches the tuner only when
+  `scale_gated_min_score` is off). The tuner
+  caps both directions at `min(auto_tune_score_ceiling, max(ceiling, min_score))`, and
+  clamps a stored value above that before checking for new feedback.
+  **Behavior change**: see the upgrade notes above.
 
 - **Embedding responses are parsed defensively, and the reason is logged**
   (#1058, #67 follow-up) — `_embed_ollama` and `_embed_openai` indexed straight into the parsed
