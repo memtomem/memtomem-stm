@@ -11,10 +11,12 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-09-26
+
 ### Upgrade notes
 
-- **Surfacing now writes one opportunity row per call it considers.** Engines with a
-  feedback tracker (the shared daemon, and the proxy with `feedback_enabled`) queue
+- **Surfacing now writes one opportunity row per call it considers** (#1068). Engines
+  with a feedback tracker (the shared daemon, and the proxy with `feedback_enabled`) queue
   a `surfacing_opportunities` row for every call that entered surfacing, including
   the ones it declined, at about 320 bytes a row, deleted with `stats_retention_days`.
   Rows hold counts about the arguments, never their keys or values. The write is
@@ -29,7 +31,7 @@ changes inline only. See the deprecation policy in
   shows `insufficient data` where it showed no verdict.
   Until an upgraded process opens `stm_feedback.db`, `mms doctor` reports the new
   table as missing.
-- **RRF results now show `[related]` and `[strong]`** (#1034). The relevance bucket
+- **RRF results now show `[related]` and `[strong]`** (#1064, #1034). The relevance bucket
   split `[min_score, 1.0]` into thirds, but hybrid RRF scores cluster below the
   default two-leg reference score `2/61` (about 0.033), far under the old `[related]`
   boundary of about 0.345. For results stamped `rrf` the band now ends at
@@ -57,14 +59,21 @@ changes inline only. See the deprecation policy in
   the daemon does not tune). A Core with non-default fusion weights and no usable
   `runtime_profile` is still capped at the `2/61` baseline, the assumption the default
   `min_score` already makes; `mms doctor` reports the missing profile.
-- **The hook↔daemon protocol is now v8.** The `surface` payload carries the host's
-  `session_id`, `cwd`, `tool_use_id` and `agent_id` (Claude sends `agent_id` only
-  inside a subagent). The surfacing event row stores the three ids (see *Added*);
+- **The hook↔daemon protocol is now v8** (#1063). The `surface` payload carries the
+  host's `session_id`, `cwd`, `tool_use_id` and `agent_id` (Claude sends `agent_id` only
+  inside a subagent). The surfacing event row stores the three ids (see *Added*, #1066);
   none is logged and `cwd` is never stored. The version is part of the daemon
-  fingerprint, so after upgrading the hook starts a new v8 daemon. A running v7 daemon keeps running beside it until it idles
-  out. A daemon pinned with `idle_timeout_seconds=0` never idles out, so stop it with
-  `mms daemon stop --all`; on Windows that command cannot terminate it, so end the
-  process from Task Manager instead.
+  fingerprint, so after upgrading the hook starts a new v8 daemon. A running v7 daemon
+  keeps running beside it until it idles out. A daemon pinned with
+  `idle_timeout_seconds=0` never idles out, so stop it with `mms daemon stop --all`; on
+  Windows that command cannot terminate it, so end the process from Task Manager instead.
+- **A plain-text cut that nearly meets the retention floor is delivered as is** (#1044, #1038).
+  Before, a truncation that fell a few characters short of the floor (a boundary cut or
+  rounding) switched the response to progressive delivery: a first chunk with a
+  `stm_proxy_read_more` footer. Such a response now arrives as one truncated result of
+  at least the floor. For example, 30,000 characters of `"word "` with
+  `compression="truncate"`, `max_result_chars=1000` and the 0.65 floor used to arrive
+  as a 4,146-character first chunk and now arrives as 19,500 characters.
 - **Explicit progressive compression rows record the first delivered response**
   (#1039). `compressed_chars` used to be the whole cleaned text on this path, so
   its saved ratio was 0%. When the response is chunked, it is now the first chunk
@@ -96,7 +105,7 @@ changes inline only. See the deprecation policy in
   manually entered) and by `mms project` registry import omit it as well. A newly
   added server therefore inherits the global budget — 16,000 characters by
   default, which is what those entries already resolved to in practice.
-- **`mms tune` no longer advises a budget a strategy never reads** (#1042). A tool
+- **`mms tune` no longer advises a budget a strategy never reads** (#1050, #1042). A tool
   whose resolved strategy is `none` or an explicitly configured `progressive` gets
   no `max_result_chars` recommendation, because neither path consults that budget:
   passthrough delivers the cleaned text and progressive delivers by `chunk_size`.
@@ -115,7 +124,7 @@ changes inline only. See the deprecation policy in
   where they were previously cut to the character budget. Configurations with no
   explicit floor are unaffected, and an explicit `retention_floor: 0` remains the
   opt-out at that level.
-- **`mms list` shows inherited compression strategies** (#1043). The COMPRESSION
+- **`mms list` shows inherited compression strategies** (#1052, #1043). The COMPRESSION
   column used to print the file's `compression` value, or `auto` when the server
   omitted it — so a server inheriting `default_compression: none` displayed `auto`
   while running with compression off. It now shows the resolved server default,
@@ -128,11 +137,11 @@ changes inline only. See the deprecation policy in
   `source` (`server` or `global`), and `tool_overrides`; it is `{}` for an invalid
   configuration. A script that parsed the text table's COMPRESSION column reads
   different values for servers that omit `compression`.
-- **`mms stats` counts in-pipeline failures as errors** (#1045). A `lock_timeout` or
+- **`mms stats` counts in-pipeline failures as errors** (#1053, #1045). A `lock_timeout` or
   `internal_error` row recorded by the proxy's own call path now has `is_error = 1`,
   so the error count in `mms stats` and the tuner's error totals rise for tools that
   hit these failures. Rows recorded before the upgrade are not rewritten.
-- **Responses quoting the progressive footer are cached** (#1046). An upstream
+- **Responses quoting the progressive footer are cached** (#1054, #1046). An upstream
   result that contains `\n---\n[progressive: chars=` without a
   `stm_proxy_read_more(key="…")` call used to miss the cache on every call; identical
   calls now hit it, and the row survives restarts.
@@ -184,9 +193,8 @@ changes inline only. See the deprecation policy in
   `""` — and `LLMCompressor.compress()` returned that empty string through its
   success path with `last_fallback` left at `None`. **This only reached the client
   when the retention floor was disabled.** Measured end to end on a 5,599-character
-  response: with `min_result_retention: 0` and no per-tool `retention_floor` (a
-  supported configuration since #1041), the recorded row was
-  `compression_strategy = llm_summary`, `compressed_chars = 0` — the response was
+  response: with `min_result_retention: 0` and no per-tool `retention_floor`, the
+  recorded row was `compression_strategy = llm_summary`, `compressed_chars = 0` — the response was
   destroyed and nothing in the row said a fallback had happened. It is now
   `llm_summary→llm_empty_fallback` with 191 characters, the truncated original.
   With a floor set, what changes depends on the budget. The pipeline's ratio guard
@@ -221,14 +229,13 @@ changes inline only. See the deprecation policy in
   unaffected — the endpoint answered, so this is a model-quality event, the same
   judgement `llm_empty` makes on the compression side.
 - **Extraction stops mining prose for a fact array** (#1057, #67 follow-up). The
-  parser
-  used to search the response for a bracketed substring and extract from whichever
-  candidate parsed first — `\[[\s\S]*?\]` originally, then a `raw_decode` attempt at
-  each `[`. Both were candidate-*selection* heuristics over untrusted text, and
-  each one had inputs that selected the wrong array: a nested `tags` array (part of
-  the schema the prompt asks for) truncating the match, a decoy array in an example
-  winning over the intended one, a deeply nested prefix exhausting the recursion
-  limit. The shared failure is facts that are silently **wrong**, on their way into
+  0.5.2 parser tried the whole response, then each non-greedy `\[[\s\S]*?\]` match, and
+  extracted from the first that parsed. That selection had inputs that picked the
+  wrong array: a nested `tags` array (part of the schema the prompt asks for) cut the
+  match short, so a prose-wrapped answer came back as an empty result, and a decoy
+  array in an example sentence won over the intended one (measured: `For example
+  [{"content":"wrong"}]. The facts: [{"content":"intended"}]` extracted `wrong`). The
+  failure is facts that are silently **wrong** or missing, on their way into
   long-term memory. Only the whole response is parsed now, with a markdown fence
   stripped. **A response wrapped in prose is no longer extracted from** — it is
   reported unreadable and the heuristic extractor answers instead, which is a
@@ -237,27 +244,31 @@ changes inline only. See the deprecation policy in
   that read the response and found nothing is still respected, and the heuristic
   does not override it.
 - **A malformed Anthropic text block is rejected instead of skipped** (#1057,
-  #67 follow-up). Collecting every `text` block treated a block whose `text` was
-  missing or not a string the same way it treats a `thinking` block — as
-  something to ignore — so a response that was half broken came back as a
-  complete answer whenever a neighbouring block happened to be well formed.
-  Compression returned the surviving prefix through its success path with no
-  fallback label. Such a response now takes the normal fallback. Deliberately
-  non-text block types (`thinking`, `tool_use`, `server_tool_use`) are still
-  skipped, and a block carrying no `type` still counts as text.
+  #67 follow-up). 0.5.2 read only `content[0]`, so a later `text` block whose `text`
+  was missing or not a string was ignored whenever the first block was well formed.
+  Now that every text block is read, such a block sends the response to the normal
+  fallback, on both the compression and the extraction side, instead of returning the
+  well-formed blocks as a complete answer. Deliberately non-text block types
+  (`thinking`, `tool_use`, `server_tool_use`) are still skipped, and a block carrying
+  no `type` still counts as text.
 - **A fact array whose entries are all unusable takes the heuristic** (#1057,
   #67 follow-up). Entry-level shape is now checked: `content` must be a string and
-  `tags` a list. `[null]`, `[{"oops": 1}]` and `[{"content": null}]` reported an
-  empty result, which claimed the model had read the response and found nothing;
-  they are now unreadable and the heuristic answers. A single malformed entry
-  among good ones is still skipped, as before. `[{"content": "a", "tags": null}]`
-  additionally raised `TypeError` out of the parser, which the caller read as an
-  **endpoint** failure and counted toward the circuit breaker — a model-quality
-  problem booked as a provider outage.
+  `tags` a list. In 0.5.2, `[null]`, `[{"oops": 1}]` and
+  `[{"content": "a", "tags": null}]` parsed to an empty result, which claimed the
+  model had read the response and found nothing, and `[{"content": null}]` became a
+  fact whose text is `None`. All four are now unreadable and the heuristic answers.
+  A malformed entry among good ones is skipped; a `"content": null` entry there is no
+  longer kept as `None`.
 
 ### Added
 
-- **Surfacing events record where and how they were delivered.** Each
+- **The hook sends the host's call identifiers to the daemon** (#1063). Every adapter
+  reads `session_id`, `cwd`, `tool_use_id` and `agent_id` from the hook payload's
+  standard keys when they are non-empty strings (`None` otherwise; host-specific
+  aliases such as Cursor's `conversation_id` are not mapped) and passes them through
+  `SurfacingEngine.surface()`. They are never logged. `PROTOCOL_VERSION` is now 8.
+  **Behavior change**: see the upgrade notes above.
+- **Surfacing events record where and how they were delivered** (#1066). Each
   `surfacing_events` row gains `tool_use_id`, `host_session_id` and `host_agent_id`
   (the hook's ids for the call, `NULL` on the proxy path), `injected_chars`,
   `id_advertised` and `header_digest`. A new `surfacing_memory_paths` table holds one
@@ -267,7 +278,7 @@ changes inline only. See the deprecation policy in
   bounded by `stats_retention_days`. Existing rows read `NULL` in the new columns.
   The migration now runs as one locked transaction, so two processes upgrading the
   same file at once no longer race each other.
-- **Surfacing logs every call it considers, not only the ones it delivers.** A new
+- **Surfacing logs every call it considers, not only the ones it delivers** (#1068). A new
   `surfacing_opportunities` table records one row per call that entered surfacing,
   labelled with how it ended: `surfaced`, `skip:<reason>`, `empty_render`, or
   `error:<kind>`. It also holds the event id the call tried to write, the hook
@@ -309,6 +320,12 @@ changes inline only. See the deprecation policy in
   over `rrf_k`, `rrf_weights` and both formats pins that a result both legs rank
   first always passes. **Behavior change**: see the upgrade notes above.
 
+- **Relevance buckets for RRF results span the RRF score range** (#1064, #1034) — bucket
+  boundaries were thirds of `[min_score, 1.0]`, but hybrid RRF scores sit below
+  `2/61` (about 0.033) with the default fusion, so every `rrf` result was labelled
+  `[weak]`. The band for `rrf` results now ends at the `score_ceiling` the LTM adapter
+  stamps from the serving session's `runtime_profile` (`2/61` without a valid one).
+  **Behavior change**: see the upgrade notes above.
 - **Embedding responses are parsed defensively, and the reason is logged**
   (#1058, #67 follow-up) — `_embed_ollama` and `_embed_openai` indexed straight into the parsed
   body: `resp.json()["embeddings"]`, `resp.json()["data"]` and `d["embedding"]`.
@@ -352,16 +369,19 @@ changes inline only. See the deprecation policy in
   `content[0]` was
   read regardless of what the block was. **Behavior change**: see the upgrade notes
   above.
-- **Joining Anthropic text blocks no longer changes which facts are extracted**
-  (#1057, #67 follow-up) — joining put a decoy array within reach of the candidate
-  search,
-  and the intended one lost. Measured: a block holding
-  `[{"content":"intended","tags":["technical"]}]` followed by the prose
-  `Example only: [{"content":"wrong"}]` extracted `wrong`; with a plain `Done.`
-  after it, nothing. Patching the candidate rule moved the failure rather than
-  removing it — a second review round found a decoy that beat the replacement and
-  an input that raised `RecursionError` inside it — so the search is gone instead.
-  **Behavior change**: see the upgrade notes above.
+- **Fact extraction parses the whole response, not the first bracketed match**
+  (#1057, #67 follow-up) — the non-greedy array search picked a decoy array over the
+  intended one and cut a match short at a nested `tags` array. A markdown fence is
+  still stripped; a response wrapped in prose is now unreadable and takes the
+  heuristic. **Behavior change**: see the upgrade notes above.
+- **Unusable extraction output takes the heuristic instead of passing as a result**
+  (#1057, #67 follow-up) — an empty or whitespace-only completion and a fact array
+  whose entries are all malformed (`[null]`, `[{"content": "a", "tags": null}]`)
+  parsed to an empty result, as if the model had found nothing, and
+  `[{"content": null}]` became a fact whose text is `None`. These now fall back to
+  heuristic extraction. An Anthropic response with a malformed later `text` block,
+  which 0.5.2 ignored, now takes the normal fallback on both the compression and the
+  extraction side. **Behavior change**: see the upgrade notes above.
 - **Explicit progressive and progressive fallback share one accounting basis**
   (#1039) — both now record the initial response text: compression footers are
   included, while surfacing, later index annotations, non-text content, and MCP
@@ -391,7 +411,7 @@ changes inline only. See the deprecation policy in
   stopped emitting a budget the operator never stated, so honoring the field does
   not halve the budget of newly generated servers. **Behavior change**: see the
   upgrade notes above.
-- **Budget recommendations respect the strategy in force** (#1042) — H1, H2, and
+- **Budget recommendations respect the strategy in force** (#1050, #1042) — H1, H2, and
   the feedback-driven `max_result_chars` action gated only on a per-tool token
   budget, so a tool running `none` or explicit `progressive` was advised to change
   a character budget its delivery path never reads. All three now share one
@@ -411,7 +431,20 @@ changes inline only. See the deprecation policy in
   first branch inside the block, the ladder is unreachable through the new
   condition — the only inputs whose behavior changes are those with a global zero
   and an explicit floor. **Behavior change**: see the upgrade notes above.
-- **`mms list` resolves compression through the shared resolver** (#1043) — the
+- **Boundary cuts no longer miss the retention floor by a few characters** (#1044, #1038) —
+  the pipeline raised the compressor's budget to `int(length × floor)` and then
+  rejected any result below the unrounded floor. A sentence or word boundary, or the
+  rounding itself, left results short by under a character to 30 characters in the
+  reported cases, and each one was replaced by progressive delivery. The minimum is now
+  rounded up to a whole character and passed
+  to plain-text truncation (the `truncate` strategy, `llm_summary` without an LLM
+  configured, the schema-pruning and skeleton plain-text fallbacks, store-error
+  degradation and the terminal truncate tier), which picks a boundary only at or above
+  it and otherwise cuts at the budget. The ratio guard itself is unchanged: a result
+  that still falls short, such as a structural or tail-anomaly cut, takes its fallback
+  as before, while `selective` tables of contents and store-error degradation stay
+  exempt from it. **Behavior change**: see the upgrade notes above.
+- **`mms list` resolves compression through the shared resolver** (#1052, #1043) — the
   table read `cfg.get("compression", "auto")` from the raw file, so it ignored
   `default_compression` and the environment overlay. It now validates one
   env-merged snapshot of the configuration and resolves each server through
@@ -424,7 +457,7 @@ changes inline only. See the deprecation policy in
   as valid with a resolved strategy, as `config_valid` already could before this
   change (#1051).
   **Behavior change**: see the upgrade notes above.
-- **Pipeline lock-timeout and internal-error rows count as errors** (#1045) — an
+- **Pipeline lock-timeout and internal-error rows count as errors** (#1053, #1045) — an
   exception that escaped the guarded call path without being recorded elsewhere
   (a pipeline stage, the cache lookup, or cache-hit handling) was counted by the
   in-memory tracker but persisted with `is_error = 0`, so `mms stats` and every
@@ -432,7 +465,7 @@ changes inline only. See the deprecation policy in
   `lock_timeout` and `internal_error` rows now persist `is_error = 1`. Rows recorded
   before this fix keep `is_error = 0`; they are not rewritten.
   **Behavior change**: see the upgrade notes above.
-- **Responses that quote the progressive footer are cached** (#1046) — the cache
+- **Responses that quote the progressive footer are cached** (#1054, #1046) — the cache
   store skipped any response whose text contained `\n---\n[progressive: chars=`,
   so an upstream result quoting STM's own progressive output (documentation, logs,
   earlier transcripts) was never cached. A progressive response now counts as
