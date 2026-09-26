@@ -120,9 +120,16 @@ class TestPathKey:
             "/n/STRASSE.md", pathmod=posixpath, casefold=True
         )
 
-    def test_expanduser(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("HOME", "/home/u")
-        assert path_key("~/n/./a.md", pathmod=posixpath, casefold=False) == "/home/u/n/a.md"
+    def test_tilde_is_not_expanded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def forbidden(*_: object) -> object:
+            raise AssertionError("account database lookup")
+
+        monkeypatch.setattr(posixpath, "expanduser", forbidden)
+        assert path_key("~/n/./a.md", pathmod=posixpath, casefold=False) == "~/n/a.md"
+        assert (
+            path_key("~user/a.md", cwd="/proj", pathmod=posixpath, casefold=False)
+            == "/proj/~user/a.md"
+        )
 
     def test_windows_rules(self) -> None:
         assert (
@@ -141,15 +148,18 @@ class TestPathKey:
 
 
 class TestEligibleSource:
-    @pytest.mark.parametrize("source", ["/notes/a.md", "~/notes/a.md"])
-    def test_absolute_or_home_is_eligible(
+    def test_absolute_is_eligible(self) -> None:
+        assert eligible_source("/notes/a.md", pathmod=posixpath)
+
+    @pytest.mark.parametrize("source", ["~/notes/a.md", "~no_such_user_4f2a/notes/a.md"])
+    def test_tilde_is_not_eligible_and_never_looked_up(
         self, source: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("HOME", "/home/u")
-        assert eligible_source(source, pathmod=posixpath)
+        def forbidden(*_: object) -> object:
+            raise AssertionError("account database lookup")
 
-    def test_tilde_that_does_not_expand_is_not(self) -> None:
-        assert not eligible_source("~no_such_user_4f2a/notes/a.md", pathmod=posixpath)
+        monkeypatch.setattr(posixpath, "expanduser", forbidden)
+        assert not eligible_source(source, pathmod=posixpath)
 
     @pytest.mark.parametrize(
         "source", [None, "", ".", "unknown", "pinned", "notes/a.md", "blk_0123abcd"]

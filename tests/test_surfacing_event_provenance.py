@@ -36,6 +36,7 @@ from memtomem_stm.surfacing.feedback_store import (
 from memtomem_stm.surfacing.formatter import SurfacingFormatter
 from memtomem_stm.surfacing.grams import (
     ancestor_keys,
+    eligible_source,
     basename_key,
     gram_hashes,
     keyed_hash,
@@ -413,33 +414,47 @@ class TestMemoryPathRows:
     def test_path_rows_never_touch_the_filesystem(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """No lookup can stall the shared store worker: every filesystem probe
-        raises here, and the event and its path rows still land."""
+        """Nothing on the shared store worker can block on I/O: every filesystem
+        probe and every account-database lookup raises here, and the event and
+        its path rows still land with their real values."""
         store = FeedbackStore(tmp_path / "fb.db")
         store.initialize()
+        key = _key(store.db_path)
+        sources = {"m-abs": "/notes/a.md", "m-tilde": "~user/notes/b.md"}
+        inputs = [
+            MemoryPathInput(mid, src, "some preview words here", eligible_source(src))
+            for mid, src in sources.items()
+        ]
 
         def forbidden(*_: Any, **__: Any) -> Any:
-            raise AssertionError("filesystem lookup on the store worker")
+            raise AssertionError("blocking lookup on the store worker")
 
-        for name in ("exists", "realpath", "lexists", "isfile", "isdir", "islink", "stat"):
-            if hasattr(os.path, name):
-                monkeypatch.setattr(os.path, name, forbidden)
+        for name in ("exists", "realpath", "lexists", "isfile", "isdir", "islink", "expanduser"):
+            monkeypatch.setattr(os.path, name, forbidden)
         monkeypatch.setattr(os, "stat", forbidden)
+        if sys.platform != "win32":
+            import pwd
+
+            monkeypatch.setattr(pwd, "getpwnam", forbidden)
+            monkeypatch.setattr(pwd, "getpwuid", forbidden)
         try:
             assert store.record_surfacing(
-                "e1",
-                "s",
-                "t",
-                "q",
-                ["m1"],
-                [0.5],
-                memory_paths=[
-                    MemoryPathInput("m1", "/notes/a.md", "some preview words here", True)
-                ],
+                "e1", "s", "t", "q", list(sources), [0.5, 0.4], memory_paths=inputs
             )
-            assert set(_path_rows(store.db_path, "e1")) == {"m1"}
         finally:
             monkeypatch.undo()
+        try:
+            rows = _path_rows(store.db_path, "e1")
+            lexical = path_key("/notes/a.md")
+            assert rows["m-abs"]["eligible"] == 1
+            assert rows["m-abs"]["path_hash_lexical"] == keyed_hash(lexical, key)
+            assert json.loads(rows["m-abs"]["dir_hashes"]) == [
+                keyed_hash(a, key) for a in ancestor_keys(lexical)
+            ]
+            assert rows["m-abs"]["basename_hash"] == keyed_hash(basename_key(lexical), key)
+            assert rows["m-tilde"]["eligible"] == 0
+            assert rows["m-tilde"]["path_hash_lexical"] is None
+        finally:
             store.close()
 
     def test_deleted_file_stays_eligible(self, tmp_path: Path) -> None:
