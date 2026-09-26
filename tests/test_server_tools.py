@@ -2029,6 +2029,8 @@ class TestLifespan:
             # MagicMock attrs are truthy — an implicit warmup_enabled would
             # create_task() a non-coroutine mock warm_up and blow up.
             mock_cfg.surfacing.warmup_enabled = False
+            mock_cfg.surfacing.holdout_rate = 0.0
+            mock_cfg.surfacing.holdout_rate_requested = None
             mock_cfg.langfuse = MagicMock()
             mock_cfg.langfuse.enabled = False
             mock_cfg.otlp = MagicMock()
@@ -2564,6 +2566,8 @@ class TestLifespan:
             mock_cfg.surfacing.enabled = True
             mock_cfg.surfacing.feedback_enabled = False
             mock_cfg.surfacing.warmup_enabled = False
+            mock_cfg.surfacing.holdout_rate = 0.0
+            mock_cfg.surfacing.holdout_rate_requested = None
             mock_cfg.langfuse = MagicMock()
             mock_cfg.langfuse.enabled = False
             mock_cfg.otlp = MagicMock()
@@ -2615,6 +2619,8 @@ class TestLifespan:
             mock_cfg.surfacing.enabled = True
             mock_cfg.surfacing.feedback_enabled = False
             mock_cfg.surfacing.warmup_enabled = warmup_enabled
+            mock_cfg.surfacing.holdout_rate = 0.0
+            mock_cfg.surfacing.holdout_rate_requested = None
             mock_cfg.langfuse = MagicMock()
             mock_cfg.langfuse.enabled = False
             mock_cfg.otlp = MagicMock()

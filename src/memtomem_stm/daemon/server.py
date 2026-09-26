@@ -51,6 +51,7 @@ from memtomem_stm.cli.hook_cmd import run_surfacing_hook
 from memtomem_stm.config import STMConfig, _is_loopback_host, log_stm_config_failure
 from memtomem_stm.daemon import discovery, locking
 from memtomem_stm.daemon.latency import DaemonLatencyTracker, LatencyKind, LatencyOutcome
+from memtomem_stm.surfacing.config import holdout_startup_warnings
 from memtomem_stm.surfacing.observability import CallLedger, attribute_call
 from memtomem_stm.surfacing.rrf_profile import read_score_ceiling_hint
 from memtomem_stm.surfacing.store_io import close_store_on_worker
@@ -356,6 +357,10 @@ class DaemonServer:
             "on" if self._tracker is not None else "off",
             record_events,
         )
+        for message in holdout_startup_warnings(
+            surfacing_cfg, proxy_path=False, has_tracker=self._tracker is not None
+        ):
+            logger.warning(message)
 
     async def _teardown(self) -> None:
         """Graceful resource release, mirroring app_lifespan's order: engine →

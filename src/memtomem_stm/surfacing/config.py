@@ -5,9 +5,40 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 
 from memtomem_stm.proxy.config import MODEL_CONTEXT_WINDOWS
+
+
+def holdout_startup_warnings(
+    config: SurfacingConfig, *, proxy_path: bool, has_tracker: bool
+) -> list[str]:
+    """Warnings a long-lived engine logs once at startup about ``holdout_rate``.
+
+    The config validator clamps silently (it runs on every construction,
+    including in the per-call hook process), so the clamp is reported here.
+    The proxy path never draws; an engine without a feedback tracker has no
+    event row to record a draw on, so it never draws either.
+    """
+    warnings: list[str] = []
+    requested = config.holdout_rate_requested
+    if requested is not None:
+        warnings.append(
+            f"surfacing.holdout_rate={requested} is outside [0, 0.5]; "
+            f"clamped to {config.holdout_rate}"
+        )
+    if config.holdout_rate > 0:
+        if proxy_path:
+            warnings.append(
+                "surfacing.holdout_rate is set, but the proxy path never draws; "
+                "only the hook daemon withholds injections"
+            )
+        elif not has_tracker:
+            warnings.append(
+                "surfacing.holdout_rate is set, but this engine has no feedback tracker "
+                "to record the draw on; holdout is off"
+            )
+    return warnings
 
 
 class ToolSurfacingConfig(BaseModel):
@@ -202,6 +233,18 @@ class SurfacingConfig(BaseModel):
     """Share of opportunity rows kept. ``1.0`` keeps every row, ``0.0``
     none; rows the rate drops are counted in ``stm_surfacing_stats`` but not
     stored. Caps the write load on a busy multi-agent host."""
+    holdout_rate: float = Field(default=0.0, allow_inf_nan=False)
+    """Share of eligible hook-path injections withheld at random, for
+    measuring whether surfacing changes what the agent does next. ``0.0``
+    (default) never draws. Values outside ``[0, 0.5]`` are clamped, not
+    rejected; the daemon and the proxy log the clamp once at startup. A
+    draw happens only on the Claude Code hook path, for a call carrying
+    both a ``tool_use_id`` and a ``session_id``, on an engine with a
+    feedback tracker, when at least one delivered memory is eligible. The
+    proxy path never draws. A withheld call returns the tool response
+    unchanged, and its event row records ``arm = 'withheld'``; every
+    other write is the same as for a shown call."""
+    _holdout_rate_requested: float | None = PrivateAttr(default=None)
     consumer_model: str = ""
     result_format: Literal["compact", "structured"] = "structured"
     """Parser format for mem_search output. ``structured`` (default)
@@ -288,6 +331,28 @@ class SurfacingConfig(BaseModel):
         if isinstance(value, str) and value.strip().lower() in ("", "none", "null"):
             return None
         return value
+
+    @model_validator(mode="after")
+    def _clamp_holdout_rate(self) -> SurfacingConfig:
+        """Clamp ``holdout_rate`` into ``[0, 0.5]`` without raising or logging.
+
+        This runs on every construction, and the hook process builds the
+        config more than once per call with no logging configured, so a
+        warning here would reach the host on each call. The requested value
+        is kept for the daemon and the proxy to report once at startup. A
+        re-validation sees the clamped value and must not erase the record.
+        """
+        clamped = min(max(self.holdout_rate, 0.0), 0.5)
+        if clamped != self.holdout_rate:
+            if self._holdout_rate_requested is None:
+                self._holdout_rate_requested = self.holdout_rate
+            self.holdout_rate = clamped
+        return self
+
+    @property
+    def holdout_rate_requested(self) -> float | None:
+        """The out-of-range ``holdout_rate`` that was clamped, else ``None``."""
+        return self._holdout_rate_requested
 
     @model_validator(mode="after")
     def _validate_auto_tune_bounds(self) -> SurfacingConfig:

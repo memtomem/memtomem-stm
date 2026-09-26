@@ -50,12 +50,13 @@ from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
 from memtomem_stm.proxy.selection_log import aggregate_selection_log
 from memtomem_stm.surfacing.engine import SurfacingEngine
+from memtomem_stm.surfacing.config import holdout_startup_warnings
 from memtomem_stm.surfacing.observability import (
+    COMPLETED_OUTCOMES,
     FAULT_OUTCOMES,
     FAULT_SKIP_REASONS,
     HEALTHY_SKIP_REASONS,
     SEARCH_COMPLETED_SKIP_REASONS,
-    SURFACED_OUTCOMES,
     SurfacingObservability,
 )
 from memtomem_stm.observability.tracing import traced
@@ -471,6 +472,12 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
                         feedback_db,
                         feedback_tables,
                     )
+                    for message in holdout_startup_warnings(
+                        config.surfacing,
+                        proxy_path=True,
+                        has_tracker=feedback_tracker is not None,
+                    ):
+                        logger.warning(message)
                     if config.surfacing.warmup_enabled:
                         warmup_task = asyncio.create_task(mcp_adapter.warm_up(), name="ltm-warmup")
 
@@ -1992,6 +1999,22 @@ async def stm_surfacing_stats(
             f"Total feedback:  {stats['total_feedback']}",
         ]
 
+        # Holdout (trial opt-in): withheld events are left out of every count
+        # above. ``holdout_unrecorded`` counts drawn calls whose event row is
+        # known lost — this process only, a lower bound, and untimestamped,
+        # so a ``since`` window or a ``tool`` filter leaves it out. Both zero
+        # → no line, keeping the default output unchanged.
+        withheld_total = int(stats.get("withheld_total") or 0)
+        if withheld_total:
+            lines.append(f"Withheld:        {withheld_total} (holdout, not counted above)")
+        if obs_snapshot is not None and since_ts is None and tool is None:
+            unrecorded = obs_snapshot.get("holdout_unrecorded") or {}
+            if any(unrecorded.values()):
+                lines.append(
+                    "Holdout unrecorded (this process): "
+                    + ", ".join(f"{arm} {unrecorded[arm]}" for arm in sorted(unrecorded))
+                )
+
         # Opportunities: calls that entered surfacing, surfaced or not. The
         # stored count is durable (every process writing this DB); the
         # sampled-out count is this process's only, so it is labelled as such,
@@ -2326,7 +2349,7 @@ def _surfacing_verdict_line(snapshot: dict, *, tool_filter: str | None) -> str |
     completed = sum(
         count
         for name, count in list(skips.items()) + list(outcomes.items())
-        if name in SURFACED_OUTCOMES or name in SEARCH_COMPLETED_SKIP_REASONS
+        if name in COMPLETED_OUTCOMES or name in SEARCH_COMPLETED_SKIP_REASONS
     )
     attempts = faults + completed
 

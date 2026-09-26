@@ -2136,6 +2136,23 @@ def _render_compression_block(summary: dict[str, Any]) -> None:
             )
 
 
+def _opportunity_lines(summary: dict[str, Any]) -> list[str]:
+    """``opportunities`` lines for a :func:`read_surfacing_summary` dict.
+
+    Calls that entered surfacing, surfaced or not, by how they ended. Empty
+    when the DB has no opportunity log or no rows in it.
+    """
+    total = summary.get("opportunities_total") or 0
+    if not total:
+        return []
+    decisions = summary.get("opportunity_decisions") or {}
+    ranked = sorted(decisions.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [
+        f"  opportunities: {total}",
+        "    by decision: " + ", ".join(f"{k} {v}" for k, v in ranked),
+    ]
+
+
 def _render_surfacing_block(summary: dict[str, Any]) -> None:
     click.echo(_hdr("Surfacing"))
     click.echo("=" * 30)
@@ -2146,6 +2163,11 @@ def _render_surfacing_block(summary: dict[str, Any]) -> None:
         f"  surfaced events: {summary['events_total']}  "
         f"(distinct tools: {summary['distinct_tools']})"
     )
+    withheld = summary.get("withheld_total") or 0
+    if withheld:
+        click.echo(f"  withheld (holdout): {withheld}  (not counted as surfaced)")
+    for line in _opportunity_lines(summary):
+        click.echo(line)
     click.echo(f"  feedback ratings: {summary['total_feedback']}")
     for rating, count in sorted((summary.get("rating_distribution") or {}).items()):
         click.echo(f"    {rating:<20} {count}")
@@ -9683,6 +9705,23 @@ def doctor(
                         "  # see docs/surfacing.md"
                     ),
                 )
+
+            # 10b. Opportunity log and holdout counts — informational, always
+            # PASS, and only once there is something to count, so a fresh
+            # install's report is unchanged. Read-only like the rest.
+            summary = surfacing_status.get("feedback_summary")
+            if isinstance(summary, dict):
+                opportunities = int(summary.get("opportunities_total") or 0)
+                withheld = int(summary.get("withheld_total") or 0)
+                if opportunities or withheld:
+                    check(
+                        "surfacing_opportunities",
+                        "surfacing opportunities",
+                        "PASS",
+                        f"{opportunities} opportunities logged, "
+                        f"{summary.get('events_total') or 0} surfaced, "
+                        f"{withheld} withheld (holdout)",
+                    )
 
             # 11. Warm-daemon timeout advice.  Ping telemetry is passive; the
             # optional measurement above is the only path that executes a
