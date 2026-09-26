@@ -180,7 +180,7 @@ CREATE TABLE IF NOT EXISTS surfacing_memory_paths (
 --                  ``error:<kind>``
 --   surfacing_id   the event this call minted and tried to write, when it got
 --                  that far; the event row can be missing (write failed)
---   arg_shape_json argument key names and shape counts, never values
+--   arg_shape_json counts about the arguments, never keys or values
 --                  (``arg_shape``)
 --   response_len   the response size the ``min_response_chars`` gate judged
 --   query_digest   ``sha256:`` + 16 hex of the extracted query, before the

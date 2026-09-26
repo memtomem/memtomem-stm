@@ -17,7 +17,7 @@ changes inline only. See the deprecation policy in
   feedback tracker (the shared daemon, and the proxy with `feedback_enabled`) queue
   a `surfacing_opportunities` row for every call that entered surfacing, including
   the ones it declined, at about 320 bytes a row, deleted with `stats_retention_days`.
-  Rows hold argument key names and shape counts, never values. The write is
+  Rows hold counts about the arguments, never their keys or values. The write is
   fire-and-forget and no response waits on it. Opt out with
   `MEMTOMEM_STM_SURFACING__OPPORTUNITIES_ENABLED=false`, or keep a share with
   `opportunities_sample_rate`. `stm_surfacing_stats` gains an `Opportunities` line
@@ -268,8 +268,8 @@ changes inline only. See the deprecation policy in
   labelled with how it ended: `surfaced`, `skip:<reason>`, `empty_render`, or
   `error:<kind>`. It also holds the event id the call tried to write, the hook
   session, the shape of the arguments and a digest of the extracted query. The
-  shape is key names that look like identifiers and do not name a credential, plus
-  a path's depth and, for a common file type, its extension. No value is stored.
+  shape is the number of arguments, a path's depth and, for a common file type, its
+  extension. No argument key or value is stored.
   Until now the skips existed only in in-process counters, which the daemon loses
   when it exits. Two exits that recorded nothing now have a skip reason:
   `empty_render` (the formatter rendered no bullet) and `cancelled` (the call was

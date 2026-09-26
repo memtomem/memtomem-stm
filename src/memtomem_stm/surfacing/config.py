@@ -193,8 +193,8 @@ class SurfacingConfig(BaseModel):
     opportunities_enabled: bool = True
     """Write one ``surfacing_opportunities`` row per call that entered
     surfacing (past the ``enabled`` check), labelled with how it ended —
-    surfaced, skipped and why, errored, cancelled. Rows carry the argument
-    key names and shape metrics, never values. Only engines that own a
+    surfaced, skipped and why, errored, cancelled. Rows carry counts about
+    the arguments, never their keys or values. Only engines that own a
     feedback tracker write them (the daemon, and the proxy with
     ``feedback_enabled``); the cold in-process hook writes none. Each row is
     a fire-and-forget write that no response waits on."""

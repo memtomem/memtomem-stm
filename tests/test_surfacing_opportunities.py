@@ -3,7 +3,7 @@
 Each call past the ``disabled`` check ends with exactly one label — surfaced,
 a skip and its reason, an empty render, an error, a cancellation — and engines
 that own a feedback tracker queue one fire-and-forget row carrying it. Rows
-hold argument key names and shape counts, never values.
+hold counts about the arguments, never their keys or values.
 """
 
 from __future__ import annotations
@@ -632,8 +632,7 @@ class TestArgShape:
         }
         shape = json.loads(arg_shape_json(arguments, 3))
         assert shape == {
-            "keys": ["file_path", "offset"],
-            "dropped_keys": 6,
+            "key_count": 8,
             "path_depth": len(Path(_abs("secret/project/report.alice")).parts),
             "ext": "other",
             "query_tokens": 3,
@@ -647,16 +646,18 @@ class TestArgShape:
 
     def test_non_mapping_arguments(self) -> None:
         assert json.loads(arg_shape_json(["x"], None)) == {
-            "keys": [],
-            "dropped_keys": 0,
+            "key_count": 0,
             "path_depth": None,
             "ext": None,
             "query_tokens": None,
         }
 
-    def test_key_cap(self) -> None:
-        shape = json.loads(arg_shape_json({f"k{i:02d}": 1 for i in range(40)}, None))
-        assert len(shape["keys"]) == 32 and shape["dropped_keys"] == 8
+    def test_caller_chosen_key_names_are_not_stored(self) -> None:
+        # A tool that accepts arbitrary keys lets the caller name them, so an
+        # identifier-shaped, credential-free key is still user text.
+        shape = arg_shape_json({"home_alice": 1, "customer_name": 2}, None)
+        assert "alice" not in shape and "customer" not in shape
+        assert json.loads(shape)["key_count"] == 2
 
     async def test_no_raw_text_in_any_row(self, tmp_path: Path) -> None:
         engine, tracker = _engine(tmp_path, [_result("m1")])
@@ -842,6 +843,16 @@ class TestStatsRendering:
             ),
         )
         assert "Opportunities:   1 stored (+2 sampled out, this process)" in out.splitlines()
+
+    async def test_since_window_leaves_out_the_untimed_count(self) -> None:
+        out = await stm_surfacing_stats(
+            since="2026-01-01T00:00:00",
+            ctx=self._ctx(
+                self._stats(opportunities_total=1, opportunity_decisions={"surfaced": 1}),
+                {"t": 2},
+            ),
+        )
+        assert "Opportunities:   1 stored" in out.splitlines()
 
     async def test_no_line_without_opportunities(self) -> None:
         out = await stm_surfacing_stats(ctx=self._ctx(self._stats(), {}))

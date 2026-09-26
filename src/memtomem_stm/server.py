@@ -1987,11 +1987,12 @@ async def stm_surfacing_stats(
 
         # Opportunities: calls that entered surfacing, surfaced or not. The
         # stored count is durable (every process writing this DB); the
-        # sampled-out count is this process's only, so it is labelled as such.
+        # sampled-out count is this process's only, so it is labelled as such,
+        # and carries no timestamps, so a ``since`` window leaves it out.
         # Both absent → no line, keeping the zero-traffic output unchanged.
         opportunities_total = int(stats.get("opportunities_total") or 0)
         sampled_out = 0
-        if obs_snapshot is not None:
+        if obs_snapshot is not None and since_ts is None:
             sampled_out = int(
                 (obs_snapshot.get("opportunities_sampled_out") or {}).get(
                     tool if tool is not None else "__total__", 0
