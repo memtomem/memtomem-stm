@@ -21,8 +21,10 @@ changes inline only. See the deprecation policy in
   fire-and-forget and no response waits on it. Opt out with
   `MEMTOMEM_STM_SURFACING__OPPORTUNITIES_ENABLED=false`, or keep a share with
   `opportunities_sample_rate`. `stm_surfacing_stats` gains an `Opportunities` line
-  and two healthy skip reasons, `empty_render` and `cancelled`; a process whose only
-  calls ended that way now shows `insufficient data` where it showed no verdict.
+  and two healthy skip reasons, `empty_render` and `cancelled`. `empty_render` now
+  counts as a completed search in the health verdict, so a process that hit it gains
+  attempts it did not count before; a process whose only calls were cancelled now
+  shows `insufficient data` where it showed no verdict.
   Until an upgraded process opens `stm_feedback.db`, `mms doctor` reports the new
   table as missing.
 - **RRF results now show `[related]` and `[strong]`** (#1034). The relevance bucket
@@ -273,8 +275,9 @@ changes inline only. See the deprecation policy in
   Until now the skips existed only in in-process counters, which the daemon loses
   when it exits. Two exits that recorded nothing now have a skip reason:
   `empty_render` (the formatter rendered no bullet) and `cancelled` (the call was
-  cancelled before a decision; the cancellation still propagates). Neither counts
-  as an LTM attempt in the health verdict. `RelevanceGate.should_surface` now returns
+  cancelled before a decision; the cancellation still propagates). The health
+  verdict counts `empty_render` as a completed search, like `no_results_*`, and
+  leaves `cancelled` out. `RelevanceGate.should_surface` now returns
   the rejecting `SkipReason` instead of `None`. The stats-retention sweep now rolls
   back as a whole when one of its deletes fails; before, the deletes that had already
   run were committed by the next unrelated write. New settings:

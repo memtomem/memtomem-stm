@@ -231,6 +231,19 @@ class TestOneRowPerCall:
         finally:
             await _close(engine, tracker)
 
+    @pytest.mark.parametrize(("reported", "stored"), [("bm25", "bm25"), ("/home/a/x", "other")])
+    async def test_score_scale_is_a_known_label_or_other(
+        self, tmp_path: Path, reported: str, stored: str
+    ) -> None:
+        engine, tracker = _engine(tmp_path, [_result("m1")], min_score=0.9)
+        engine._result_score_scale = lambda results: (reported, None)  # type: ignore[method-assign]
+        try:
+            await engine.surface("gh", "read_file", ARGS, RESPONSE)
+            await engine.drain_store_writes()
+            assert _opps(tracker.store.db_path)[-1]["score_scale"] == stored
+        finally:
+            await _close(engine, tracker)
+
     async def test_cooldown_label_comes_from_the_gate(self, tmp_path: Path) -> None:
         engine, tracker = _engine(tmp_path, [_result("m1")], cooldown_seconds=60.0)
         try:
@@ -860,7 +873,7 @@ class TestStatsRendering:
 
 
 class TestVerdictAndLedger:
-    def test_cancelled_and_empty_render_are_not_attempts(self) -> None:
+    def test_empty_render_completes_and_cancelled_does_not(self) -> None:
         line = _surfacing_verdict_line(
             {
                 "skip_reasons": {"__total__": {"cancelled": 4, "empty_render": 3}},
@@ -868,9 +881,9 @@ class TestVerdictAndLedger:
             },
             tool_filter=None,
         )
-        # Stated change: these calls used to record nothing, so no verdict was
-        # shown; now they are counted but are not LTM attempts.
-        assert line is not None and "insufficient data — 0 LTM attempts" in line
+        # These calls used to record nothing. An empty render follows a
+        # completed search, so it is an attempt; a cancellation decided nothing.
+        assert line is not None and "insufficient data — 3 LTM attempts" in line
 
     def test_cancelled_is_neither_a_fault_nor_a_timeout(self) -> None:
         ledger = CallLedger(skip_reasons=["cancelled"])

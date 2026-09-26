@@ -580,7 +580,7 @@ The hashes are HMAC-SHA256 truncated to 16 bytes, under a random per-install key
 
 ### Opportunity log
 
-`surfacing_events` only holds calls that surfaced something. `surfacing_opportunities` holds one row per call that **entered** surfacing — past the `enabled` check — including every call that was declined, so the calls that surfaced can be read against the calls that could have. Each row is queued fire-and-forget at the end of the call; no response waits on it, and a row the write queue refuses is lost rather than retried.
+`surfacing_events` only holds calls that tried to deliver something. `surfacing_opportunities` holds one row per call that **entered** surfacing — past the `enabled` check — including every call that was declined, so the calls that surfaced can be read against the calls that could have. Each row is queued fire-and-forget at the end of the call; no response waits on it, and a row the write queue refuses is lost rather than retried.
 
 | Column | Meaning |
 |---|---|
@@ -591,7 +591,7 @@ The hashes are HMAC-SHA256 truncated to 16 bytes, under a random per-install key
 | `arg_shape_json` | Counts about the call's arguments, never their keys or values: how many top-level arguments it had (`key_count`); the depth of a `file_path` / `path` argument and its extension when that is one of a fixed set of common file types (otherwise `"other"`); and the query's token count. Key names are left out because a tool that accepts arbitrary keys lets the caller choose them. |
 | `response_len` | The response size the `min_response_chars` gate judged. |
 | `query_digest` | `sha256:` + 16 hex of the extracted query, taken before a query that looks sensitive is replaced by its digest; `NULL` when the call ended before a query was extracted. For a non-sensitive query this equals the event row's `query` under `persist_query_text=false`. |
-| `score_scale` | The core-reported scale of the batch, when the call got that far. |
+| `score_scale` | The core-reported scale of the batch, when the call got that far; a label outside the known set (`rrf`, `bm25`, `dense`, `none`, `rerank`) is stored as `other`. |
 
 Coverage follows the feedback tracker: the shared daemon and a proxy with `feedback_enabled` write rows; the cold in-process hook and a proxy with feedback off write none, as they write no event rows either. Calls turned away before surfacing starts — hook-ineligible tools, `upstream_disabled`, `progressive_mode_conflict`, daemon load shedding — have no row. `opportunities_sample_rate` below `1.0` keeps a random share; the rest are counted, per tool, in the `surfacing_stats` action's `Opportunities` line for the current process (omitted when the action is given a `since` window, since the count is not time-stamped). Rows are deleted by their own `created_at` with `stats_retention_days`. A row takes about 320 bytes.
 
@@ -876,5 +876,6 @@ hit:
   caller's deadline, shutdown) before it reached a decision. The
   cancellation still propagates.
 
-Neither `empty_render` nor `cancelled` is an LTM attempt, so neither
-moves the verdict's fault ratio.
+The verdict counts `empty_render` as a completed search, like the
+`no_results_*` family: the LTM answered and only the render came out
+empty. `cancelled` is not an LTM attempt and does not move the ratio.

@@ -664,7 +664,14 @@ class SurfacingEngine:
                 host_session_id=session_id,
                 query_digest=opportunity.query_digest,
                 surfacing_id=opportunity.surfacing_id,
-                score_scale=opportunity.score_scale,
+                # The label comes from the LTM's response; an unknown one is
+                # stored as ``other`` rather than copied.
+                score_scale=(
+                    opportunity.score_scale
+                    if opportunity.score_scale is None
+                    or opportunity.score_scale in KNOWN_SCORE_SCALES
+                    else "other"
+                ),
             )
             self._submit_store_write(
                 functools.partial(tracker.record_opportunity, row),
