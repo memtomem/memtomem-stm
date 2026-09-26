@@ -81,6 +81,16 @@ SkipReason = Literal[
     # the top-level ``SurfacingConfig`` and never sees per-upstream config),
     # so it lands here rather than as a ``gate_*`` reason.
     "upstream_disabled",
+    # The render produced no bullet (every candidate failed the formatter's
+    # display gate), so the response passes through unchanged. Before the
+    # opportunity log this exit recorded nothing, leaving the call with no
+    # decision at all. Like ``no_results_*``, the search had completed.
+    "empty_render",
+    # The call was cancelled before it reached a decision — a client hanging
+    # up, a caller's deadline, a shutdown. Recorded so every ``surface()``
+    # call past the ``disabled`` check ends with exactly one label; the
+    # cancellation itself still propagates.
+    "cancelled",
 ]
 
 # Operator-facing categorization for ``stm_surfacing_stats`` (#362, #351 part 2).
@@ -117,6 +127,8 @@ HEALTHY_SKIP_REASONS: frozenset[str] = frozenset(
         "daemon_busy",
         "progressive_mode_conflict",
         "upstream_disabled",
+        "empty_render",
+        "cancelled",
     }
 )
 FAULT_SKIP_REASONS: frozenset[str] = frozenset(
@@ -167,6 +179,9 @@ SEARCH_COMPLETED_SKIP_REASONS: frozenset[str] = frozenset(
         "no_results_demoted",
         "no_results_invalidated",
         "no_results_empty_cache",
+        # The search completed and its results survived filtering; only the
+        # render came out empty. ``cancelled`` stays out: it decided nothing.
+        "empty_render",
     }
 )
 
@@ -351,6 +366,10 @@ class SurfacingObservability:
         self._skip_reasons: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
         self._outcomes: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
         self._cache: dict[str, int] = defaultdict(int)
+        # Opportunity rows the sample rate kept out of the store. Per tool plus
+        # the ``__total__`` aggregate, like the skip counters, so a
+        # ``tool=``-filtered report names only that tool's calls.
+        self._opportunities_sampled_out: dict[str, int] = defaultdict(int)
         # Tracks whether ``surface()`` has been called at least once. Used by
         # ``stm_surfacing_stats`` to suppress the new sections entirely when
         # the engine is wired but never invoked, keeping the legacy output
@@ -389,6 +408,13 @@ class SurfacingObservability:
             self._any_call = True
             self._cache[bucket] += 1
 
+    def record_opportunity_sampled_out(self, tool: str) -> None:
+        """Count an opportunity row the sample rate kept out of the store."""
+        with self._lock:
+            self._any_call = True
+            self._opportunities_sampled_out[tool] += 1
+            self._opportunities_sampled_out[_TOTAL_KEY] += 1
+
     def snapshot(self) -> dict:
         """Return a deep-copied point-in-time view of all counters.
 
@@ -404,6 +430,7 @@ class SurfacingObservability:
                 },
                 "outcomes": {tool: dict(outcomes) for tool, outcomes in self._outcomes.items()},
                 "cache": dict(self._cache),
+                "opportunities_sampled_out": dict(self._opportunities_sampled_out),
             }
 
 
@@ -433,6 +460,9 @@ class _NoOpObservability:
         return None
 
     def record_cache(self, bucket: CacheBucket) -> None:
+        return None
+
+    def record_opportunity_sampled_out(self, tool: str) -> None:
         return None
 
 

@@ -158,6 +158,7 @@ class TestFeedbackStore:
             "surfacing_faults",
             "stm_meta",
             "surfacing_memory_paths",
+            "surfacing_opportunities",
         ]
 
     def test_record_and_retrieve_surfacing(self, feedback_store: FeedbackStore):

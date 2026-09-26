@@ -24,7 +24,7 @@ from memtomem_stm.proxy.config import CleaningConfig
 from memtomem_stm.surfacing.config import SurfacingConfig, ToolSurfacingConfig
 from memtomem_stm.surfacing.context_extractor import ContextExtractor
 from memtomem_stm.surfacing.feedback import AutoTuner, FeedbackTracker
-from memtomem_stm.surfacing.relevance import RelevanceGate
+from memtomem_stm.surfacing.relevance import RateClaim, RelevanceGate
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -141,7 +141,7 @@ class TestGatingEffectiveness:
             "push_changes", "send_message", "remove_label",
         ]
         for tool in write_tools:
-            assert not gate.should_surface("any", tool, "some query here"), (
+            assert not isinstance(gate.should_surface("any", tool, "some query here"), RateClaim), (
                 f"Write tool '{tool}' should be rejected"
             )
 
@@ -153,7 +153,7 @@ class TestGatingEffectiveness:
             "search_code", "show_diff", "fetch_page",
         ]
         for tool in read_tools:
-            assert gate.should_surface("any", tool, f"query about {tool}"), (
+            assert isinstance(gate.should_surface("any", tool, f"query about {tool}"), RateClaim), (
                 f"Read tool '{tool}' should be allowed"
             )
 
@@ -166,32 +166,45 @@ class TestGatingEffectiveness:
         # First 3 should pass
         for i in range(3):
             q = f"unique query number {i} here"
-            assert gate.should_surface("s", "read_file", q)
+            assert isinstance(gate.should_surface("s", "read_file", q), RateClaim)
             gate.record_surfacing(q)
 
         # 4th should be rate-limited
-        assert not gate.should_surface("s", "read_file", "another unique query here now")
+        assert not isinstance(
+            gate.should_surface("s", "read_file", "another unique query here now"), RateClaim
+        )
 
     def test_cooldown_deduplicates_queries(self):
         """Near-identical queries within cooldown are suppressed."""
         gate = RelevanceGate(SurfacingConfig(cooldown_seconds=10.0))
-        assert gate.should_surface("s", "read_file", "kubernetes monitoring setup config")
+        assert isinstance(
+            gate.should_surface("s", "read_file", "kubernetes monitoring setup config"), RateClaim
+        )
         gate.record_surfacing("kubernetes monitoring setup config")
         # Same query immediately after → rejected
-        assert not gate.should_surface("s", "read_file", "kubernetes monitoring setup config")
+        assert not isinstance(
+            gate.should_surface("s", "read_file", "kubernetes monitoring setup config"), RateClaim
+        )
 
     def test_different_queries_not_blocked(self):
         """Sufficiently different queries pass cooldown check."""
         gate = RelevanceGate(SurfacingConfig(cooldown_seconds=10.0))
-        assert gate.should_surface("s", "read_file", "kubernetes monitoring setup config")
+        assert isinstance(
+            gate.should_surface("s", "read_file", "kubernetes monitoring setup config"), RateClaim
+        )
         gate.record_surfacing("kubernetes monitoring setup config")
         # Different enough query → allowed
-        assert gate.should_surface("s", "read_file", "redis caching eviction policy details")
+        assert isinstance(
+            gate.should_surface("s", "read_file", "redis caching eviction policy details"),
+            RateClaim,
+        )
 
     def test_explicit_exclusion_works(self):
         """Excluded tools are always rejected regardless of query."""
         gate = RelevanceGate(SurfacingConfig(exclude_tools=["llm__summarize"]))
-        assert not gate.should_surface("llm", "summarize", "important research topic query")
+        assert not isinstance(
+            gate.should_surface("llm", "summarize", "important research topic query"), RateClaim
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

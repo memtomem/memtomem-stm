@@ -7,15 +7,17 @@ import functools
 import hashlib
 import logging
 import math
+import random
 import time
 import uuid
 from concurrent.futures import Future
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from memtomem_stm.observability.tracing import traced
 from memtomem_stm.proxy.privacy import contains_sensitive_content
+from memtomem_stm.surfacing.arg_shape import arg_shape_json
 from memtomem_stm.surfacing.cache import SurfacingCache
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.context_extractor import ContextExtractor
@@ -30,6 +32,7 @@ from memtomem_stm.surfacing.feedback_store import (
     FAULT_KINDS,
     EventProvenance,
     MemoryPathInput,
+    OpportunityRow,
 )
 from memtomem_stm.surfacing.formatter import RenderManifest, SurfacingFormatter
 from memtomem_stm.surfacing.grams import eligible_source
@@ -39,8 +42,13 @@ from memtomem_stm.surfacing.mcp_client import (
     LtmTransportError,
     SearchOutcome,
 )
-from memtomem_stm.surfacing.observability import _NOOP_OBSERVABILITY, SurfacingObservability
-from memtomem_stm.surfacing.relevance import RelevanceGate
+from memtomem_stm.surfacing.observability import (
+    _NOOP_OBSERVABILITY,
+    Outcome,
+    SkipReason,
+    SurfacingObservability,
+)
+from memtomem_stm.surfacing.relevance import RateClaim, RelevanceGate
 from memtomem_stm.surfacing.rrf_profile import (
     COMPACT_SCORE_DECIMALS,
     RRF_BASELINE_CEILING,
@@ -264,6 +272,43 @@ def _memory_path_inputs(manifest: RenderManifest, results: Sequence[Any]) -> lis
     return inputs
 
 
+_OUTCOME_LABELS: dict[str, str] = {
+    "surfaced_cache_hit": "surfaced",
+    "surfaced_cache_miss": "surfaced",
+    "error_timeout": "error:timeout",
+    "error_other": "error:other",
+}
+"""``gate_decision`` for each :data:`Outcome`: a delivery is ``surfaced``
+whichever cache bucket served it."""
+
+
+def _skip_label(reason: SkipReason) -> str:
+    """``gate_decision`` for a skip. ``empty_render`` stands bare: it is not a
+    decision to decline but a render that came out empty."""
+    return "empty_render" if reason == "empty_render" else f"skip:{reason}"
+
+
+@dataclass
+class _Opportunity:
+    """What one ``surface()`` call decided, for its ``surfacing_opportunities`` row.
+
+    Filled in wherever the call's decision is made — the early exits in
+    :meth:`SurfacingEngine.surface`, the gate, and the hit and miss paths
+    below it — and read once, in ``surface()``'s ``finally``, which builds the
+    row from a snapshot. A decision recorded later (by an LTM operation
+    abandoned at timeout) lands in an object nobody reads again.
+    """
+
+    decision: str | None = None
+    surfacing_id: str | None = None
+    """The event this call minted and tried to write — set when the write is
+    queued, kept if it then fails, so a row can name an event that never
+    landed."""
+    score_scale: str | None = None
+    query_digest: str | None = None
+    query_tokens: int | None = None
+
+
 @dataclass
 class _TimerScope:
     """One surfacing call's timer: the window it armed, and whether that
@@ -306,6 +351,9 @@ class _TimerScope:
 
     past_ltm: bool = False
     ltm_attempted: bool = False
+    opportunity: _Opportunity = field(default_factory=_Opportunity)
+    """This call's decision, carried here because the scope already reaches
+    every path that makes one."""
 
 
 class _OperationalSkip(RuntimeError):
@@ -334,8 +382,11 @@ class SurfacingEngine:
         token_tracker: Any | None = None,
         observability: SurfacingObservability | None = None,
         record_feedback_events: bool = True,
+        rng: random.Random | None = None,
     ) -> None:
         self._config = config
+        # Draws the opportunity sample; injectable so a test can fix it.
+        self._rng = rng if rng is not None else random.Random()
         self._mcp_adapter = mcp_adapter
         self._webhook_manager = webhook_manager
         self._feedback_tracker = feedback_tracker
@@ -562,6 +613,72 @@ class SurfacingEngine:
         and the latter is a strict subset of surfacings that is inert once the
         result cache is empty (it only filters cache hits)."""
         return self._cache.clear()
+
+    def _skip(self, scope: _TimerScope, tool: str, reason: SkipReason) -> None:
+        """Count a skip and make it this call's opportunity decision."""
+        self._observability.record_skip(tool, reason)
+        scope.opportunity.decision = _skip_label(reason)
+
+    def _outcome(self, scope: _TimerScope, tool: str, outcome: Outcome) -> None:
+        """Count an outcome and make it this call's opportunity decision."""
+        self._observability.record_outcome(tool, outcome)
+        scope.opportunity.decision = _OUTCOME_LABELS[outcome]
+
+    def _queue_opportunity(
+        self,
+        server: str,
+        tool: str,
+        arguments: Any,
+        response_len: int,
+        session_id: str | None,
+        opportunity: _Opportunity,
+    ) -> None:
+        """Queue this call's ``surfacing_opportunities`` row, fire-and-forget.
+
+        Runs in :meth:`surface`'s ``finally``, so it must never raise: an
+        exception here would replace the call's own result or its propagating
+        exception with a telemetry failure. Engines without a feedback tracker
+        write nothing — the cold hook, and a proxy with feedback off — the same
+        engines that write no event rows. A sample rate of ``1.0`` keeps every
+        row without touching the RNG, so the draw sequence stays the caller's.
+        """
+        try:
+            tracker = self._feedback_tracker
+            if (
+                tracker is None
+                or not self._config.opportunities_enabled
+                or opportunity.decision is None
+            ):
+                return
+            rate = self._config.opportunities_sample_rate
+            if rate < 1.0 and (rate <= 0.0 or self._rng.random() >= rate):
+                self._observability.record_opportunity_sampled_out(tool)
+                return
+            row = OpportunityRow(
+                id=uuid.uuid4().hex,
+                server=server,
+                tool=tool,
+                arg_shape_json=arg_shape_json(arguments, opportunity.query_tokens),
+                response_len=response_len,
+                gate_decision=opportunity.decision,
+                host_session_id=session_id,
+                query_digest=opportunity.query_digest,
+                surfacing_id=opportunity.surfacing_id,
+                # The label comes from the LTM's response; an unknown one is
+                # stored as ``other`` rather than copied.
+                score_scale=(
+                    opportunity.score_scale
+                    if opportunity.score_scale is None
+                    or opportunity.score_scale in KNOWN_SCORE_SCALES
+                    else "other"
+                ),
+            )
+            self._submit_store_write(
+                functools.partial(tracker.record_opportunity, row),
+                what="surfacing opportunity",
+            )
+        except Exception:
+            logger.debug("Failed to queue surfacing opportunity row", exc_info=True)
 
     def _submit_store_write(
         self,
@@ -1489,22 +1606,85 @@ class SurfacingEngine:
         the surfacing event row (``host_session_id`` / ``tool_use_id`` /
         ``host_agent_id``) so the row names the host transcript the call was
         written to; none of them is logged, and ``cwd`` is never stored.
+
+        Every call past the ``disabled`` check leaves one
+        ``surfacing_opportunities`` row behind (engines with a feedback tracker
+        only, subject to ``opportunities_enabled`` / ``opportunities_sample_rate``),
+        labelled with how it ended — including a cancellation or an exception,
+        which still propagate unchanged. The row is queued fire-and-forget from
+        the ``finally`` below; nothing here waits on it.
         """
         if not self._config.enabled:
             self._observability.record_skip(tool, "disabled")
             return response_text
 
+        # The window is armed inside ``_do_surface``, once the cache lookup
+        # and the per-key lock are behind us (#998); the scope carries back
+        # what was armed so the timeout log reports the real limit, and carries
+        # this call's decision to the ``finally`` below from wherever it is made.
+        scope = _TimerScope(seconds=self._config.timeout_seconds)
+        gate_chars = len(response_text) if source_response_chars is None else source_response_chars
+        try:
+            return await self._surface_entered(
+                server,
+                tool,
+                arguments,
+                response_text,
+                gate_chars=gate_chars,
+                scope=scope,
+                trace_id=trace_id,
+                context_query=context_query,
+                deadline_monotonic=deadline_monotonic,
+                host=_HostCall(
+                    session_id=session_id,
+                    cwd=cwd,
+                    tool_use_id=tool_use_id,
+                    agent_id=agent_id,
+                ),
+            )
+        except asyncio.CancelledError:
+            if scope.opportunity.decision is None:
+                self._skip(scope, tool, "cancelled")
+            raise
+        except BaseException as exc:
+            # Only reachable from work outside ``_surface_entered``'s own
+            # handlers — query extraction, the gate, a handler that itself
+            # raised — or an interpreter-level exit. Labelled for the row, not
+            # counted: the observability counters keep their existing meaning.
+            if scope.opportunity.decision is None:
+                scope.opportunity.decision = f"error:{type(exc).__name__}"
+            raise
+        finally:
+            self._queue_opportunity(
+                server, tool, arguments, gate_chars, session_id, scope.opportunity
+            )
+
+    async def _surface_entered(
+        self,
+        server: str,
+        tool: str,
+        arguments: dict[str, Any],
+        response_text: str,
+        *,
+        gate_chars: int,
+        scope: _TimerScope,
+        trace_id: str | None,
+        context_query: str | None,
+        deadline_monotonic: float | None,
+        host: _HostCall,
+    ) -> str:
+        """:meth:`surface` past its ``disabled`` check; every exit records its
+        decision on ``scope.opportunity`` as well as on the counters."""
         self._maybe_cleanup_expired()
 
-        gate_chars = len(response_text) if source_response_chars is None else source_response_chars
         # An explicit caller query is an intentional retrieval request and may
         # override the automatic response-size heuristic.
         if gate_chars < self._config.min_response_chars and not context_query:
-            self._observability.record_skip(tool, "response_too_short")
+            self._skip(scope, tool, "response_too_short")
             return response_text
 
         if self._circuit_breaker.is_open:
-            self._observability.record_skip(tool, "circuit_open")
+            self._skip(scope, tool, "circuit_open")
             self._persist_fault(server, tool, "circuit_open")
             logger.debug("Surfacing skipped: circuit breaker open for %s/%s", server, tool)
             return response_text
@@ -1513,9 +1693,13 @@ class SurfacingEngine:
             server, tool, arguments, self._config, context_query=context_query
         )
         if query is None:
-            self._observability.record_skip(tool, "no_query")
+            self._skip(scope, tool, "no_query")
             logger.debug("Surfacing skipped: no query extracted for %s/%s", server, tool)
             return response_text
+        # Taken before the substitution below, so the digest names the query
+        # the call extracted whether or not it looked sensitive.
+        scope.opportunity.query_digest = self._hashed_query(query)
+        scope.opportunity.query_tokens = len(query.split())
         if contains_sensitive_content(query):
             # Never send raw credentials/PII to a remote LTM. A stable digest
             # preserves cache/cooldown behavior without disclosing the source.
@@ -1524,9 +1708,10 @@ class SurfacingEngine:
         # rides along so a path that ends up starting no LTM work can give
         # back exactly its own slot (``release_claim``).
         rate_claim = self._gate.should_surface(server, tool, query)
-        if rate_claim is None:
-            # Gate has already recorded the specific reason internally. Avoid
-            # double-counting by not recording at the engine level here.
+        if not isinstance(rate_claim, RateClaim):
+            # Gate has already counted the specific reason internally. Avoid
+            # double-counting by only labelling the call here.
+            scope.opportunity.decision = _skip_label(rate_claim.reason)
             logger.debug(
                 "Surfacing skipped: gate rejected %s/%s (query=%s)",
                 server,
@@ -1535,10 +1720,6 @@ class SurfacingEngine:
             )
             return response_text
 
-        # The window is armed inside ``_do_surface``, once the cache lookup
-        # and the per-key lock are behind us (#998); the scope carries back
-        # what was armed so the log below reports the real limit.
-        scope = _TimerScope(seconds=self._config.timeout_seconds)
         try:
             return await self._do_surface(
                 server,
@@ -1549,15 +1730,10 @@ class SurfacingEngine:
                 trace_id=trace_id,
                 deadline_monotonic=deadline_monotonic,
                 scope=scope,
-                host=_HostCall(
-                    session_id=session_id,
-                    cwd=cwd,
-                    tool_use_id=tool_use_id,
-                    agent_id=agent_id,
-                ),
+                host=host,
             )
         except asyncio.TimeoutError:
-            self._observability.record_outcome(tool, "error_timeout")
+            self._outcome(scope, tool, "error_timeout")
             self._persist_fault(server, tool, "error_timeout")
             logger.warning(
                 "Surfacing timed out for %s/%s (%.1fs limit)",
@@ -1580,7 +1756,7 @@ class SurfacingEngine:
         except _OperationalSkip:
             return response_text
         except Exception:
-            self._observability.record_outcome(tool, "error_other")
+            self._outcome(scope, tool, "error_other")
             self._persist_fault(server, tool, "error_other")
             logger.warning("Surfacing failed for %s/%s", server, tool, exc_info=True)
             self._circuit_breaker.record_failure()
@@ -1919,6 +2095,7 @@ class SurfacingEngine:
         server: str,
         tool: str,
         *,
+        scope: _TimerScope,
         host: _HostCall = _NO_HOST_CALL,
     ) -> str:
         """Render a cached surfacing result into the response_text, or pass
@@ -1945,6 +2122,8 @@ class SurfacingEngine:
         # ``no_results_empty_cache`` (the deliberate "no results" cache entry
         # written by ``_do_surface_miss`` when LTM returned nothing relevant).
         was_empty = not cached
+        # Entries keep the scale they were stamped with at miss time.
+        scope.opportunity.score_scale = self._result_score_scale(cached)[0]
         if cached and self._invalidated_ids:
             original_count = len(cached)
             cached = [
@@ -1986,14 +2165,14 @@ class SurfacingEngine:
                 )
         if not cached:
             if was_empty:
-                self._observability.record_skip(tool, "no_results_empty_cache")
+                self._skip(scope, tool, "no_results_empty_cache")
             elif demoted_all:
                 # Same label as the miss path's all-demoted branch: the
                 # operator sees demotion (not invalidation) suppressing the
                 # cached result.
-                self._observability.record_skip(tool, "no_results_demoted")
+                self._skip(scope, tool, "no_results_demoted")
             else:
-                self._observability.record_skip(tool, "no_results_invalidated")
+                self._skip(scope, tool, "no_results_invalidated")
             logger.debug("Surfacing cache hit (empty) for %s/%s", server, tool)
             return response_text
         logger.debug("Surfacing cache hit (%d results) for %s/%s", len(cached), server, tool)
@@ -2030,10 +2209,14 @@ class SurfacingEngine:
         # the formatter's display gate is still delivered content and must not
         # drop the whole injection (the id-less degradation contract).
         if manifest.rendered_bullets == 0:
+            self._skip(scope, tool, "empty_render")
             return response_text
         claimed = self._claim_surfaced_ids(delivered_ids)
         if surfacing_id is not None:
             assert self._feedback_tracker is not None
+            # Named on the opportunity before the write can fail: the row
+            # then points at the event this call attempted, landed or not.
+            scope.opportunity.surfacing_id = surfacing_id
             try:
                 written = await self._await_store_write(
                     functools.partial(
@@ -2083,7 +2266,7 @@ class SurfacingEngine:
         # hit whose event write was still queued when the client hung up
         # delivered nothing, and counting it there would report a surfacing
         # that never reached anyone.
-        self._observability.record_outcome(tool, "surfaced_cache_hit")
+        self._outcome(scope, tool, "surfaced_cache_hit")
         return manifest.text
 
     async def _do_surface(
@@ -2149,7 +2332,9 @@ class SurfacingEngine:
             # before it knew the cache could answer; a hit starts no LTM work,
             # so ``ltm_attempted`` stays false and ``surface()`` gives the slot
             # back (#1000).
-            return await self._render_cached(cached, response_text, query, server, tool, host=host)
+            return await self._render_cached(
+                cached, response_text, query, server, tool, scope=scope, host=host
+            )
 
         async with self._key_locks.hold(cache_key):
             # Double-check inside the lock: a coroutine that held the
@@ -2158,7 +2343,7 @@ class SurfacingEngine:
             if cached is not None:
                 self._observability.record_cache("hit")
                 return await self._render_cached(
-                    cached, response_text, query, server, tool, host=host
+                    cached, response_text, query, server, tool, scope=scope, host=host
                 )
             self._observability.record_cache("miss")
             # Recorded before the window check below: the lookup happened
@@ -2224,7 +2409,7 @@ class SurfacingEngine:
             # limiter's own definition — ``ltm_attempted`` stays false and
             # ``surface()`` gives the slot back rather than let a run of
             # refusals spend the throttle on nothing.
-            self._observability.record_skip(tool, "ltm_draining")
+            self._skip(scope, tool, "ltm_draining")
             self._persist_fault(server, tool, "ltm_draining")
             # Warn once per draining episode (see the latch's init comment):
             # refusals record nothing on the breaker, so with the reset window
@@ -2396,7 +2581,7 @@ class SurfacingEngine:
         # empty-namespace case.
         if outcome in ("daemon_starting", "daemon_busy"):
             self._reset_score_scale_streak(server, tool)
-            self._observability.record_skip(tool, outcome)
+            self._skip(scope, tool, outcome)
             raise _OperationalSkip(outcome)
         if outcome in ("no_session", "transport_error"):
             self._reset_score_scale_streak(server, tool)
@@ -2422,17 +2607,17 @@ class SurfacingEngine:
                     outcome,
                 )
                 self._warned_ltm_unavailable = True
-            self._observability.record_skip(tool, "ltm_unavailable")
+            self._skip(scope, tool, "ltm_unavailable")
             self._persist_fault(server, tool, "ltm_unavailable")
             raise _DependencyFault(outcome)
         if outcome in ("call_error", "upstream_error"):
             self._reset_score_scale_streak(server, tool)
-            self._observability.record_skip(tool, "ltm_call_failed")
+            self._skip(scope, tool, "ltm_call_failed")
             self._persist_fault(server, tool, "ltm_call_failed")
             raise _DependencyFault(outcome)
         if outcome in ("empty_content", "parse_error"):
             self._reset_score_scale_streak(server, tool)
-            self._observability.record_skip(tool, "ltm_parse_empty")
+            self._skip(scope, tool, "ltm_parse_empty")
             self._persist_fault(server, tool, "ltm_parse_empty")
             raise _DependencyFault(outcome)
 
@@ -2449,6 +2634,7 @@ class SurfacingEngine:
 
         retrieved_results = [r for r in results if not getattr(r, "pinned", False)]
         score_scale, reranker_id = self._result_score_scale(retrieved_results)
+        scope.opportunity.score_scale = score_scale
         # min_score precedence: tool_cfg override > scale gate > auto-tune >
         # global default — resolved AFTER retrieval so the gate can see the
         # batch's core-reported scale (nothing upstream consumes min_score).
@@ -2565,11 +2751,11 @@ class SurfacingEngine:
             # tell whether to lower min_score (former) or whether the dedup
             # is over-aggressive on long sessions (latter).
             if demoted_ids and all(str(r.chunk.id) in demoted_ids for r in scored):
-                self._observability.record_skip(tool, "no_results_demoted")
+                self._skip(scope, tool, "no_results_demoted")
             elif scored:
-                self._observability.record_skip(tool, "no_results_dedup")
+                self._skip(scope, tool, "no_results_dedup")
             else:
-                self._observability.record_skip(tool, "no_results_score")
+                self._skip(scope, tool, "no_results_score")
             if filter_suspended:
                 logger.debug(
                     "Surfacing: no results after dedup/demotion for %s/%s "
@@ -2651,11 +2837,14 @@ class SurfacingEngine:
         # the formatter's display gate is still delivered content and must not
         # drop the whole injection (the id-less degradation contract).
         if manifest.rendered_bullets == 0:
+            self._skip(scope, tool, "empty_render")
             return response_text
 
         self._gate.record_surfacing(query)
         if surfacing_id is not None:
             assert self._feedback_tracker is not None
+            # See the cache-hit path: the attempted event, landed or not.
+            scope.opportunity.surfacing_id = surfacing_id
             delivered_results = [
                 r
                 for r in relevant
@@ -2711,7 +2900,7 @@ class SurfacingEngine:
                         score_floor=min_score,
                     )
 
-        self._observability.record_outcome(tool, "surfaced_cache_miss")
+        self._outcome(scope, tool, "surfaced_cache_miss")
 
         # Fire webhook (fire-and-forget)
         if self._webhook_manager and self._config.fire_webhook:
