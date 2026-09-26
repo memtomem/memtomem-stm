@@ -84,7 +84,7 @@ SkipReason = Literal[
     # The render produced no bullet (every candidate failed the formatter's
     # display gate), so the response passes through unchanged. Before the
     # opportunity log this exit recorded nothing, leaving the call with no
-    # decision at all. Like ``no_results_*``, the search had completed.
+    # decision at all. Like ``no_results_*``, a result batch got this far.
     "empty_render",
     # The call was cancelled before it reached a decision — a client hanging
     # up, a caller's deadline, a shutdown. Recorded so every ``surface()``
@@ -179,8 +179,9 @@ SEARCH_COMPLETED_SKIP_REASONS: frozenset[str] = frozenset(
         "no_results_demoted",
         "no_results_invalidated",
         "no_results_empty_cache",
-        # The search completed and its results survived filtering; only the
-        # render came out empty. ``cancelled`` stays out: it decided nothing.
+        # A result batch (retrieved or pinned; this call's, or a cached one on
+        # a hit) reached the formatter, which rendered nothing. ``cancelled``
+        # stays out: it ended without a decision.
         "empty_render",
     }
 )

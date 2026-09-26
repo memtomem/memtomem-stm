@@ -870,12 +870,14 @@ hit:
 - `no_results_empty_cache` — the cache stored an empty list
   (deliberate zero-result entry from a prior LTM miss) and the
   repeat call hit it.
-- `empty_render` — results passed every filter but the formatter
-  rendered no bullet, so the response passed through unchanged.
+- `empty_render` — results reached the formatter but it rendered no
+  bullet, so the response passed through unchanged.
 - `cancelled` — the call was cancelled (a client hanging up, a
   caller's deadline, shutdown) before it reached a decision. The
   cancellation still propagates.
 
-The verdict counts `empty_render` as a completed search, like the
-`no_results_*` family: the LTM answered and only the render came out
-empty. `cancelled` is not an LTM attempt and does not move the ratio.
+The verdict puts `empty_render` in its completed set, as it does the
+`no_results_*` family, on the miss and the cache-hit path alike: a result
+batch (retrieved or pinned, this call's or a cached one) got as far as
+rendering. `cancelled` is left out of the ratio on either side, even when
+the cancellation arrived during an LTM request.
