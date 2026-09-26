@@ -571,7 +571,7 @@ Each `surfacing_events` row also records facts about the delivery that are fixed
 Every delivered, non-pinned memory also gets one `surfacing_memory_paths` row, written in the same transaction as its event and deleted with it by `stats_retention_days`. It stores no path and no text, only keyed hashes:
 
 - `eligible` — `1` when the memory's `source_file` was an absolute (or `~`) path at render time, `0` for relative paths and adapter placeholders such as `unknown`. Nothing on disk is consulted, so a file deleted later keeps its value.
-- `path_hash_lexical`, `dir_hashes`, `basename_hash` — hashes of the normalized path, of each ancestor directory, and of the file name (`NULL` when not eligible). `path_hash_resolved` hashes the symlink-resolved path, and is `NULL` when the file did not exist at write time or could not be resolved within 250 ms (a stalled mount must not hold up the store's write worker).
+- `path_hash_lexical`, `dir_hashes`, `basename_hash` — hashes of the normalized path, of each ancestor directory, and of the file name (`NULL` when not eligible). The path is keyed as written, never resolved through the filesystem: a symlinked source matches only by its own path.
 - `snippet_grams` — up to 64 hashes of the word 4-grams of the bullet's rendered preview.
 
 The hashes are HMAC-SHA256 truncated to 16 bytes, under a random per-install key created in the `stm_meta` table of the same file. The key keeps paths and text out of the tables and out of anything exported from them; it is readable by anyone who can read `stm_feedback.db`, so it is not protection against a local reader. A row takes about 1.8 KB with a full 300-character preview.

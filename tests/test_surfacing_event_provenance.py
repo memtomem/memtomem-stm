@@ -14,7 +14,6 @@ import multiprocessing
 import os
 import sqlite3
 import sys
-import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -198,7 +197,6 @@ class TestMigration:
             "memory_id",
             "eligible",
             "path_hash_lexical",
-            "path_hash_resolved",
             "dir_hashes",
             "basename_hash",
             "snippet_grams",
@@ -404,7 +402,6 @@ class TestMemoryPathRows:
             lexical = path_key(str(note))
             assert row["eligible"] == 1
             assert row["path_hash_lexical"] == keyed_hash(lexical, key)
-            assert row["path_hash_resolved"] == keyed_hash(path_key(os.path.realpath(note)), key)
             assert json.loads(row["dir_hashes"]) == [
                 keyed_hash(a, key) for a in ancestor_keys(lexical)
             ]
@@ -413,7 +410,39 @@ class TestMemoryPathRows:
         finally:
             store.close()
 
-    def test_deleted_file_stays_eligible_without_resolved_hash(self, tmp_path: Path) -> None:
+    def test_path_rows_never_touch_the_filesystem(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No lookup can stall the shared store worker: every filesystem probe
+        raises here, and the event and its path rows still land."""
+        store = FeedbackStore(tmp_path / "fb.db")
+        store.initialize()
+
+        def forbidden(*_: Any, **__: Any) -> Any:
+            raise AssertionError("filesystem lookup on the store worker")
+
+        for name in ("exists", "realpath", "lexists", "isfile", "isdir", "islink", "stat"):
+            if hasattr(os.path, name):
+                monkeypatch.setattr(os.path, name, forbidden)
+        monkeypatch.setattr(os, "stat", forbidden)
+        try:
+            assert store.record_surfacing(
+                "e1",
+                "s",
+                "t",
+                "q",
+                ["m1"],
+                [0.5],
+                memory_paths=[
+                    MemoryPathInput("m1", "/notes/a.md", "some preview words here", True)
+                ],
+            )
+            assert set(_path_rows(store.db_path, "e1")) == {"m1"}
+        finally:
+            monkeypatch.undo()
+            store.close()
+
+    def test_deleted_file_stays_eligible(self, tmp_path: Path) -> None:
         store = FeedbackStore(tmp_path / "fb.db")
         store.initialize()
         gone = tmp_path / "gone.md"  # never created: deleted before the write
@@ -429,13 +458,13 @@ class TestMemoryPathRows:
             )
             row = _path_rows(store.db_path, "e1")["m1"]
             assert row["eligible"] == 1
-            assert row["path_hash_lexical"] is not None
-            assert row["path_hash_resolved"] is None
+            assert row["path_hash_lexical"] == keyed_hash(path_key(str(gone)), _key(store.db_path))
         finally:
             store.close()
 
     @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
-    def test_symlinked_source_keeps_both_keys(self, tmp_path: Path) -> None:
+    def test_symlinked_source_is_keyed_by_its_own_path(self, tmp_path: Path) -> None:
+        """Nothing is resolved through the filesystem: a symlink keys as written."""
         target = tmp_path / "real.md"
         target.write_text("x")
         link = tmp_path / "link.md"
@@ -455,70 +484,8 @@ class TestMemoryPathRows:
             key = _key(store.db_path)
             row = _path_rows(store.db_path, "e1")["m1"]
             assert row["path_hash_lexical"] == keyed_hash(path_key(str(link)), key)
-            assert row["path_hash_resolved"] == keyed_hash(path_key(os.path.realpath(target)), key)
-            assert row["path_hash_lexical"] != row["path_hash_resolved"]
+            assert row["path_hash_lexical"] != keyed_hash(path_key(os.path.realpath(target)), key)
         finally:
-            store.close()
-
-    def test_stalled_filesystem_is_bounded_and_skipped(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A realpath that never returns (a dead network mount) costs one bounded
-        wait, then no wait at all while it stays stuck, and never the event."""
-        note = tmp_path / "a.md"
-        note.write_text("x")
-        release = threading.Event()
-        real_realpath = os.path.realpath
-
-        def stuck_realpath(path: Any, *args: Any, **kwargs: Any) -> str:
-            release.wait(30)
-            return real_realpath(path, *args, **kwargs)
-
-        monkeypatch.setattr(feedback_store_module.os.path, "realpath", stuck_realpath)
-        store = FeedbackStore(tmp_path / "fb.db")
-        store.initialize()
-
-        def write(event_id: str) -> float:
-            started = time.monotonic()
-            box: list[bool] = []
-            worker = threading.Thread(
-                target=lambda: box.append(
-                    store.record_surfacing(
-                        event_id,
-                        "s",
-                        "t",
-                        "q",
-                        ["m1"],
-                        [0.5],
-                        memory_paths=[MemoryPathInput("m1", str(note), "preview text", True)],
-                    )
-                ),
-                daemon=True,
-            )
-            worker.start()
-            worker.join(5)
-            assert not worker.is_alive(), "record_surfacing hung on a stalled filesystem"
-            assert box == [True]
-            return time.monotonic() - started
-
-        try:
-            first = write("e1")
-            second = write("e2")  # the first lookup is still stuck
-            assert first < 2.0
-            assert second < feedback_store_module._RESOLVE_TIMEOUT_SECONDS
-            for event_id in ("e1", "e2"):
-                row = _path_rows(store.db_path, event_id)["m1"]
-                assert row["path_hash_lexical"] is not None
-                assert row["path_hash_resolved"] is None
-            release.set()
-            stuck = feedback_store_module._resolve_in_flight
-            assert stuck is not None
-            stuck.join(5)
-            monkeypatch.setattr(feedback_store_module.os.path, "realpath", real_realpath)
-            write("e3")
-            assert _path_rows(store.db_path, "e3")["m1"]["path_hash_resolved"] is not None
-        finally:
-            release.set()
             store.close()
 
     def test_eligibility_from_render_time_strings(self) -> None:

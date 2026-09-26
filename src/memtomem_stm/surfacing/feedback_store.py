@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-import os
 import re
 import secrets
 import sqlite3
@@ -156,7 +155,10 @@ CREATE TABLE IF NOT EXISTS stm_meta (
 -- of its source path and of its rendered preview's word 4-grams, so a later
 -- offline reader can tell whether the agent went on to use that file or text
 -- without the path or text ever being stored. ``eligible`` is fixed from the
--- render-time path string (absolute, not an adapter sentinel). Written in the
+-- render-time path string (absolute, not an adapter sentinel). The path is
+-- keyed lexically only — never resolved through the filesystem, so a stalled
+-- mount cannot hold the store worker and a later move or delete changes
+-- nothing. Written in the
 -- same transaction as its ``surfacing_events`` row; deleted with it by the
 -- stats-retention sweep (no FK enforcement, manual cascade).
 CREATE TABLE IF NOT EXISTS surfacing_memory_paths (
@@ -164,7 +166,6 @@ CREATE TABLE IF NOT EXISTS surfacing_memory_paths (
     memory_id           TEXT    NOT NULL,
     eligible            INTEGER NOT NULL,
     path_hash_lexical   TEXT,
-    path_hash_resolved  TEXT,
     dir_hashes          TEXT,
     basename_hash       TEXT,
     snippet_grams       TEXT    NOT NULL,
@@ -405,54 +406,6 @@ class MemoryPathInput:
 
 def _opt_text(value: str | None) -> str | None:
     return None if value is None else escape_lone_surrogates(value)
-
-
-_RESOLVE_TIMEOUT_SECONDS = 0.25
-"""How long one event's path resolution may hold the store-write worker.
-
-``exists`` / ``realpath`` touch the filesystem, and a path on a stalled network
-mount can block them indefinitely. They run on a separate thread so the shared
-FIFO write worker waits at most this long per event."""
-
-_resolve_lock = threading.Lock()
-_resolve_in_flight: threading.Thread | None = None
-
-
-def _resolve_sources(sources: list[str]) -> dict[str, str | None]:
-    """Realpath each existing source, bounded; ``{}`` when it cannot finish in time.
-
-    Runs the lookups on a daemon thread and waits at most
-    :data:`_RESOLVE_TIMEOUT_SECONDS`. While an earlier lookup is still stuck,
-    no new one starts and the result is empty at once: at most one thread is
-    ever blocked on a dead mount, and later events do not each pay the timeout.
-    A daemon thread, not an executor, so a thread stuck on the filesystem cannot
-    hold up interpreter exit. The resolved hash is only an extra match key, so
-    a skipped lookup costs a ``NULL``, never the event.
-    """
-    global _resolve_in_flight
-    if not sources:
-        return {}
-    results: dict[str, str | None] = {}
-
-    def work() -> None:
-        for source in sources:
-            try:
-                expanded = os.path.expanduser(source)
-                results[source] = os.path.realpath(expanded) if os.path.exists(expanded) else None
-            except (OSError, ValueError):
-                results[source] = None
-
-    with _resolve_lock:
-        if _resolve_in_flight is not None and _resolve_in_flight.is_alive():
-            return {}
-        thread = threading.Thread(target=work, name="stm-path-resolve", daemon=True)
-        _resolve_in_flight = thread
-        thread.start()
-    thread.join(_RESOLVE_TIMEOUT_SECONDS)
-    if thread.is_alive():
-        logger.debug("Path resolution for surfaced memories timed out; storing no resolved hash")
-        return {}
-    return dict(results)
 
 
 class FeedbackDbStatus(TypedDict):
@@ -856,8 +809,8 @@ class FeedbackStore:
 
         *memory_paths* rows land in the same transaction as the event, and only
         when the event row was actually inserted (a replayed ID adds nothing).
-        Their hashes — including the ``realpath`` lookup — are computed before
-        the lock is taken, so a failure there writes nothing; a failure after
+        Their hashes are computed before the lock is taken, so a failure there
+        writes nothing; a failure after
         the INSERT rolls the event back with its paths. Either way no event can
         exist without the path rows a later reader needs to interpret it.
         """
@@ -904,8 +857,8 @@ class FeedbackStore:
                     db.executemany(
                         "INSERT OR IGNORE INTO surfacing_memory_paths "
                         "(surfacing_id, memory_id, eligible, path_hash_lexical, "
-                        "path_hash_resolved, dir_hashes, basename_hash, snippet_grams) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        "dir_hashes, basename_hash, snippet_grams) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
                         path_rows,
                     )
                 db.commit()
@@ -922,9 +875,9 @@ class FeedbackStore:
     ) -> list[tuple[object, ...]]:
         """Hash each delivered memory's path and preview into a storable row.
 
-        Runs on the store worker (never the loop). The filesystem lookups for
-        the resolved hash run beside it, bounded (:func:`_resolve_sources`).
-        Raw paths and preview text stop here; only keyed hashes are returned.
+        Pure string work on the store worker: nothing here touches the
+        filesystem, so no path on a stalled mount can hold the worker. Raw
+        paths and preview text stop here; only keyed hashes are returned.
         """
         if not memory_paths:
             return []
@@ -932,19 +885,11 @@ class FeedbackStore:
         if key is None:
             raise RuntimeError("surfacing feedback store has no HMAC key; initialize() first")
         delivered = set(memory_ids)
-        resolved_paths = _resolve_sources(
-            [
-                item.source_file
-                for item in memory_paths
-                if item.eligible and item.source_file is not None
-            ]
-        )
         rows: list[tuple[object, ...]] = []
         for item in memory_paths:
             if item.memory_id not in delivered:
                 raise ValueError(f"memory path row for undelivered memory {item.memory_id!r}")
             lexical: str | None = None
-            resolved: str | None = None
             dirs: str | None = None
             basename: str | None = None
             if item.eligible and item.source_file is not None:
@@ -952,15 +897,12 @@ class FeedbackStore:
                 lexical = keyed_hash(lexical_key, key)
                 dirs = json.dumps([keyed_hash(a, key) for a in ancestor_keys(lexical_key)])
                 basename = keyed_hash(basename_key(lexical_key), key)
-                real = resolved_paths.get(item.source_file)
-                resolved = keyed_hash(path_key(real), key) if real is not None else None
             rows.append(
                 (
                     surfacing_id,
                     item.memory_id,
                     int(item.eligible),
                     lexical,
-                    resolved,
                     dirs,
                     basename,
                     json.dumps(snippet_grams(item.preview, key)),
