@@ -1922,12 +1922,15 @@ class SurfacingEngine:
         if self._feedback_tracker is not None:
             surfacing_id = uuid.uuid4().hex[:16]
         advertised_id = surfacing_id if self._record_feedback_events else None
+        # Same floor the miss path rendered with: the tuned value capped at the
+        # cached batch's own cap (#1062), so a hit does not relabel a result.
+        score_floor = self._active_min_score(tool, self._batch_score_ceiling(cached))
         manifest = self._formatter.render(
             response_text,
             cached,
             query,
             surfacing_id=advertised_id,
-            score_floor=self._active_min_score(tool),
+            score_floor=score_floor,
         )
         delivered_ids = list(manifest.delivered_ids)
         delivered_set = set(delivered_ids)
@@ -1980,7 +1983,7 @@ class SurfacingEngine:
                         response_text,
                         cached,
                         query,
-                        score_floor=self._active_min_score(tool),
+                        score_floor=score_floor,
                     )
         # Counted once the call is past the point it can be cancelled at: a
         # hit whose event write was still queued when the client hung up

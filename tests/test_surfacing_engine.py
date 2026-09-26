@@ -5677,3 +5677,39 @@ class TestAutoTuneConcurrentCeiling:
             assert "rank first on both legs" in out
         finally:
             tracker.close()
+
+
+class TestCacheHitFloorMatchesMiss:
+    """#1062: a cache hit must render relevance labels with the same capped
+    floor the miss used, or a stored adjustment above the batch cap relabels
+    the same result on the hit."""
+
+    async def test_hit_and_miss_label_the_same_result_alike(self, tmp_path: Path):
+        from memtomem_stm.surfacing.feedback import FeedbackTracker
+
+        config = _make_config(auto_tune_enabled=True, min_score=0.017)
+        tracker = FeedbackTracker(config=config, db_path=tmp_path / "fb.db")
+        tracker.store.save_adjustment("read_file", 0.04)
+        top = FakeSearchResult(
+            # Exactly the capped floor 0.0327: bottom third of [0.0327, 2/61]
+            # (weak). Under the uncapped 0.04 the floor sits above the
+            # ceiling and every result renders strong.
+            chunk=FakeChunk(content="labelled result"),
+            score=0.0327,
+            score_scale="rrf",
+            score_ceiling=2 / 61,
+        )
+        adapter = _make_mcp_adapter([top])
+        try:
+            engine = SurfacingEngine(config=config, mcp_adapter=adapter, feedback_tracker=tracker)
+            miss = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            hit = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            assert adapter.search.call_count == 1  # the second call is a cache hit
+
+            def label(out: str) -> str:
+                line = next(ln for ln in out.splitlines() if "labelled result" in ln)
+                return line.split("]:")[0].rsplit("[", 1)[1]
+
+            assert label(miss) == label(hit) == "weak"
+        finally:
+            tracker.close()
