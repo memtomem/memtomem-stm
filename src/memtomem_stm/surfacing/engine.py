@@ -1293,6 +1293,10 @@ class SurfacingEngine:
         context_query: str | None = None,
         source_response_chars: int | None = None,
         deadline_monotonic: float | None = None,
+        session_id: str | None = None,
+        cwd: str | None = None,
+        tool_use_id: str | None = None,
+        agent_id: str | None = None,
     ) -> str:
         """Surface relevant memories and inject into response_text.
 
@@ -1329,6 +1333,12 @@ class SurfacingEngine:
         LTM. Unbooked on the breaker, that is: it still gives back the
         rate-limit slot the gate claimed for it, because a call cancelled
         before it reached the LTM path spent nothing (#1000).
+
+        ``session_id`` / ``cwd`` / ``tool_use_id`` / ``agent_id`` are the host's
+        identifiers for a native-tool hook call (``mms hook``); proxied MCP calls
+        pass none. They are accepted so the surfacing event row can record them
+        later and are currently neither persisted nor logged — ``cwd`` in
+        particular is never stored.
         """
         if not self._config.enabled:
             self._observability.record_skip(tool, "disabled")

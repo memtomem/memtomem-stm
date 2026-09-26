@@ -238,6 +238,36 @@ async def test_surface_round_trip_injects_memories(tmp_path: Path) -> None:
         await _stop(cfg, task)
 
 
+class _HostIdSpyEngine:
+    """Records the host call ids the daemon hands to the engine."""
+
+    injection_mode = "append"
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def surface(self, *args, **kwargs) -> str:
+        self.calls.append(kwargs)
+        return args[3] if len(args) > 3 else ""
+
+    async def stop(self) -> None:  # the daemon stops its engine on shutdown
+        return None
+
+
+async def test_surface_round_trip_carries_host_ids(tmp_path: Path) -> None:
+    # Over the real socket: hook-side to_wire -> daemon from_wire -> engine.
+    ids = {"session_id": "sess-1", "cwd": "/work", "tool_use_id": "toolu-1", "agent_id": "a-1"}
+    cfg = _config(tmp_path)
+    engine = _HostIdSpyEngine()
+    _, task = await _start(cfg, engine=engine)  # type: ignore[arg-type]
+    try:
+        await client.surface(cfg, _canonical({**_READ_PAYLOAD, **ids}), timeout=3.0)
+    finally:
+        await _stop(cfg, task)
+    assert len(engine.calls) == 1
+    assert {k: engine.calls[0][k] for k in ids} == ids
+
+
 async def test_surface_rejects_expired_deadline(tmp_path: Path) -> None:
     server = DaemonServer(_config(tmp_path))
     call = _canonical(_READ_PAYLOAD)

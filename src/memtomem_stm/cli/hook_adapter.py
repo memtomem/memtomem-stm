@@ -51,7 +51,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import Any, ClassVar, TypedDict
 
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 
@@ -78,6 +78,13 @@ class CanonicalHookCall:
     so the daemon needs no host knowledge. ``tool_response`` (the original
     object) is **not** transmitted — compression already ran in the hook process
     before the wire, and surfacing needs only ``tool_response_text``.
+
+    ``session_id`` / ``cwd`` / ``tool_use_id`` / ``agent_id`` are the host's own
+    identifiers for the call, read from the payload's standard keys when present
+    (``None`` otherwise — e.g. ``agent_id`` exists only inside a Claude subagent).
+    They cross the wire (``PROTOCOL_VERSION`` 8) and reach
+    :meth:`~memtomem_stm.surfacing.engine.SurfacingEngine.surface`, which does not
+    yet persist them; they are never logged.
     """
 
     event_type: str
@@ -87,6 +94,10 @@ class CanonicalHookCall:
     tool_response: Any = None
     tool_response_text: str = ""
     host_tag: str = "claude"
+    session_id: str | None = None
+    cwd: str | None = None
+    tool_use_id: str | None = None
+    agent_id: str | None = None
 
     def to_wire(self) -> dict[str, Any]:
         """Serialize for the daemon ``surface`` request (drops ``tool_response``).
@@ -101,6 +112,10 @@ class CanonicalHookCall:
             "tool_input": self.tool_input,
             "tool_response_text": self.tool_response_text,
             "host_tag": self.host_tag,
+            "session_id": self.session_id,
+            "cwd": self.cwd,
+            "tool_use_id": self.tool_use_id,
+            "agent_id": self.agent_id,
         }
 
     @classmethod
@@ -122,7 +137,36 @@ class CanonicalHookCall:
             tool_response=None,
             tool_response_text=str(data.get("tool_response_text") or ""),
             host_tag=str(data.get("host_tag") or "claude"),
+            **_host_ids(data),
         )
+
+
+def _opt_str(data: dict[str, Any], key: str) -> str | None:
+    """``data[key]`` when it is a non-empty ``str``, else ``None``.
+
+    Never ``str(value)``: a missing key must stay ``None``, not become ``"None"``."""
+    value = data.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+class _HostIds(TypedDict):
+    session_id: str | None
+    cwd: str | None
+    tool_use_id: str | None
+    agent_id: str | None
+
+
+def _host_ids(data: dict[str, Any]) -> _HostIds:
+    """The host's call identifiers under their standard payload keys.
+
+    Shared by every adapter's ``parse`` and by ``from_wire``. Host-specific
+    aliases (e.g. Cursor's ``conversation_id``) are deliberately not mapped."""
+    return _HostIds(
+        session_id=_opt_str(data, "session_id"),
+        cwd=_opt_str(data, "cwd"),
+        tool_use_id=_opt_str(data, "tool_use_id"),
+        agent_id=_opt_str(data, "agent_id"),
+    )
 
 
 class HostHookAdapter(ABC):
@@ -231,6 +275,7 @@ class ClaudeHookAdapter(HostHookAdapter):
             tool_response=tool_response,
             tool_response_text=_tool_response_to_text(tool_response),
             host_tag=self.host_tag,
+            **_host_ids(payload),
         )
 
     def render(
@@ -305,6 +350,7 @@ class CodexHookAdapter(HostHookAdapter):
             tool_response=tool_response,
             tool_response_text=_tool_response_to_text(tool_response),
             host_tag=self.host_tag,
+            **_host_ids(payload),
         )
 
     def render(
@@ -391,6 +437,7 @@ class CursorHookAdapter(HostHookAdapter):
             tool_response=tool_output,
             tool_response_text=_tool_response_to_text(tool_output),
             host_tag=self.host_tag,
+            **_host_ids(payload),
         )
 
     def render(
@@ -472,6 +519,7 @@ class KimiHookAdapter(HostHookAdapter):
             tool_response=tool_output,
             tool_response_text=_tool_response_to_text(tool_output),
             host_tag=self.host_tag,
+            **_host_ids(payload),
         )
 
     def render(
