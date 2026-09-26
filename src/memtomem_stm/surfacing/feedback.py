@@ -316,7 +316,24 @@ class AutoTuner:
                 sorted(purged),
             )
 
-    def maybe_adjust(self, tool: str) -> float | None:
+    def effective_ceiling(self, score_ceiling: float | None) -> float:
+        """Upper bound for a tool's tuned ``min_score`` against one batch.
+
+        ``score_ceiling`` is the batch's RRF reference ceiling — the score a
+        result both legs rank first — or ``None`` when the batch says nothing
+        about it. The configured ceiling (default ``0.05``) was drawn on a
+        ``[0, 1]`` scale and sits above the ``2/61`` baseline reference, so on
+        its own it lets raises cross every two-leg score and silence the tool
+        for good (#1062). The cap never drops below ``min_score``: a floor
+        that is itself unattainable is a separate misconfiguration, and
+        lowering it here would move a threshold nobody tuned.
+        """
+        ceiling = self._config.auto_tune_score_ceiling
+        if score_ceiling is None:
+            return ceiling
+        return min(ceiling, max(score_ceiling, self._config.min_score))
+
+    def maybe_adjust(self, tool: str, score_ceiling: float | None = None) -> float | None:
         """Check feedback ratios and adjust min_score for a tool.
 
         Two independent band checks (#353 part 2):
@@ -335,10 +352,20 @@ class AutoTuner:
 
         Each tool falls back to the global ratio when its own sample
         count is below ``auto_tune_min_samples`` (cold-start mitigation).
+
+        ``score_ceiling`` bounds both directions against the threshold this
+        batch applies, ``min(stored, effective_ceiling)`` (the engine caps its
+        filter read the same way): a raise stops at the cap and never moves
+        the stored value down, and a lower steps down from the applied value,
+        not from a stored one above it. A stored value above the cap is not
+        rewritten — the cap may be a guess (no profile, compact format), and
+        the read cap already keeps this batch's filter attainable (#1062).
         Returns the new min_score if adjusted, ``None`` otherwise.
         """
         if not self._config.auto_tune_enabled:
             return None
+
+        cap = self.effective_ceiling(score_ceiling)
 
         watermark = (
             self._store.get_feedback_count(tool),
@@ -365,8 +392,8 @@ class AutoTuner:
         # Raise wins over lower when both fire — defensive: negative
         # feedback is the stronger signal to suppress.
         if neg_ratio is not None and neg_ratio > 0.6:
-            new_score = min(current + increment, self._config.auto_tune_score_ceiling)
-            if new_score != current:
+            new_score = min(current + increment, cap)
+            if new_score > current:
                 self._adjustments[tool] = new_score
                 self._store.save_adjustment(tool, new_score)
                 logger.info(
@@ -378,8 +405,9 @@ class AutoTuner:
                 )
                 return new_score
         elif helpful_ratio is not None and helpful_ratio > 0.8:
-            new_score = max(current - increment, self._config.auto_tune_score_floor)
-            if new_score != current:
+            applied = min(current, cap)
+            new_score = max(applied - increment, self._config.auto_tune_score_floor)
+            if new_score < current:
                 self._adjustments[tool] = new_score
                 self._store.save_adjustment(tool, new_score)
                 logger.info(

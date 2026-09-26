@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from memtomem_stm.surfacing.rrf_profile import (
     RRF_BASELINE_CEILING,
     FusionGap,
     check_two_leg_fusion,
+    floor_to_decimals,
     read_score_ceiling_hint,
     rrf_score_ceiling,
     two_leg_fusion,
@@ -116,3 +119,22 @@ def test_ceiling_hint_accepts_finite_positive_numbers(raw):
 )
 def test_ceiling_hint_rejects_everything_else(raw):
     assert read_score_ceiling_hint(raw) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "decimals", "expected"),
+    [
+        (2 / 61, 4, 0.0327),
+        (2 / 61, 2, 0.03),
+        (1.8 / 61, 4, 0.0295),
+        (0.03, 4, 0.03),  # already exact: binary noise must not floor it
+        (0.07, 2, 0.07),
+        (1e-05, 4, 0.0),
+        (5e-324, 4, 0.0),
+        (1e29, 4, 1e29),  # beyond Decimal's default 28-digit precision
+        (sys.float_info.max, 4, sys.float_info.max),
+    ],
+)
+def test_floor_to_decimals(value, decimals, expected):
+    assert floor_to_decimals(value, decimals) == expected
+    assert floor_to_decimals(value, decimals) <= round(value, decimals)

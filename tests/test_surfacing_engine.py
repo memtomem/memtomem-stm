@@ -3995,8 +3995,18 @@ class TestPerToolMinScoreOverride:
 
             engine = SurfacingEngine(
                 config=config,
+                # Stamped ceiling 1.0 keeps the synthetic 0.6 raise legal
+                # (#1062 caps raises at the batch's RRF reference ceiling) and
+                # leaves the bucket band at [floor, 1.0].
                 mcp_adapter=_make_mcp_adapter(
-                    [FakeSearchResult(chunk=FakeChunk(content="near tuned floor"), score=0.70)]
+                    [
+                        FakeSearchResult(
+                            chunk=FakeChunk(content="near tuned floor"),
+                            score=0.70,
+                            score_scale="rrf",
+                            score_ceiling=1.0,
+                        )
+                    ]
                 ),
                 feedback_tracker=tracker,
             )
@@ -4785,7 +4795,8 @@ class TestScaleGatedMinScore:
         await engine.surface(
             "gh", "read_file", {"_context_query": "rrf control query"}, LONG_RESPONSE
         )
-        tuner.maybe_adjust.assert_called_once_with("read_file")
+        # rrf batch without a stamp → the 2/61 baseline at 4 places (#1062).
+        tuner.maybe_adjust.assert_called_once_with("read_file", score_ceiling=0.0327)
 
     async def test_suspended_batch_resets_streak_and_closes_both_kinds(self):
         tracker = MagicMock()
@@ -5497,3 +5508,208 @@ class TestRrfBucketCeiling:
             "gh", "read_file", {"_context_query": "ceiling probe query"}, LONG_RESPONSE
         )
         assert "[strong]: ceiling probe" in out
+
+
+class TestAutoTuneRrfReferenceCeiling:
+    """#1062: a tuned ``min_score`` above the highest score a batch can
+    deliver filters out every unboosted two-leg result, so the tool surfaces
+    nothing and draws no ratings to walk it back. The engine caps the filter
+    at the batch's reference, rounded down to the precision Core delivers
+    scores at; the stored value is left as learned."""
+
+    def _make_tracker(self, tmp_path: Path, config: SurfacingConfig):
+        from memtomem_stm.surfacing.feedback import FeedbackTracker
+
+        return FeedbackTracker(config=config, db_path=tmp_path / "fb.db")
+
+    async def _surface_with_stuck_tool(self, tmp_path: Path, results, stuck: float = 0.04):
+        config = _make_config(auto_tune_enabled=True, min_score=0.017)
+        tracker = self._make_tracker(tmp_path, config)
+        tracker.store.save_adjustment("read_file", stuck)
+        engine = SurfacingEngine(
+            config=config,
+            mcp_adapter=_make_mcp_adapter(results),
+            feedback_tracker=tracker,
+        )
+        out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+        return engine, tracker, out
+
+    async def test_stamped_batch_delivers_top_result(self, tmp_path: Path):
+        # Core's structured JSON rounds to 4 places: 2/61 arrives as 0.0328.
+        top = FakeSearchResult(
+            chunk=FakeChunk(content="both legs rank first"),
+            score=0.0328,
+            score_scale="rrf",
+            score_ceiling=2 / 61,
+        )
+        engine, tracker, out = await self._surface_with_stuck_tool(tmp_path, [top])
+        try:
+            assert "both legs rank first" in out
+            assert engine._active_min_score("read_file", 0.0327) == 0.0327
+            # The cap may be a guess, so the learned value is not rewritten.
+            assert tracker.store.load_adjustments()["read_file"] == 0.04
+        finally:
+            tracker.close()
+
+    async def test_rounded_down_score_still_passes_under_non_unit_weights(self, tmp_path: Path):
+        # rrf_weights [0.8, 1.0]: reference 0.029508..., delivered as 0.0295,
+        # which is BELOW the exact reference. The cap must be attainable.
+        top = FakeSearchResult(
+            chunk=FakeChunk(content="rounded down"),
+            score=0.0295,
+            score_scale="rrf",
+            score_ceiling=1.8 / 61,
+        )
+        _, tracker, out = await self._surface_with_stuck_tool(tmp_path, [top])
+        try:
+            assert "rounded down" in out
+        finally:
+            tracker.close()
+
+    async def test_unstamped_batch_delivers_compact_top_score(self, tmp_path: Path):
+        # Compact text rounds to 2 places: 2/61 arrives as 0.03, below 2/61.
+        top = FakeSearchResult(chunk=FakeChunk(content="compact top"), score=0.03)
+        _, tracker, out = await self._surface_with_stuck_tool(tmp_path, [top])
+        try:
+            assert "compact top" in out
+        finally:
+            tracker.close()
+
+    async def test_unstamped_batch_does_not_rewrite_the_stored_value(self, tmp_path: Path):
+        # The cap applies to this call's filter only; the learned value survives.
+        top = FakeSearchResult(chunk=FakeChunk(content="compact"), score=0.03)
+        engine, tracker, _ = await self._surface_with_stuck_tool(tmp_path, [top], stuck=0.045)
+        try:
+            assert engine._auto_tuner.get_effective_min_score("read_file") == 0.045
+            assert tracker.store.load_adjustments()["read_file"] == 0.045
+        finally:
+            tracker.close()
+
+    async def test_empty_batch_leaves_the_stored_value(self, tmp_path: Path):
+        engine, tracker, _ = await self._surface_with_stuck_tool(tmp_path, [])
+        try:
+            assert engine._auto_tuner.get_effective_min_score("read_file") == 0.04
+            assert tracker.store.load_adjustments()["read_file"] == 0.04
+        finally:
+            tracker.close()
+
+
+class TestBatchScoreCeiling:
+    """Which batches hand the tuner and the filter a cap, and at what
+    precision (#1062)."""
+
+    @staticmethod
+    def _r(**kw):
+        return FakeSearchResult(chunk=FakeChunk(), score=0.02, **kw)
+
+    def test_valid_rrf_stamp_is_floored_to_four_places(self):
+        batch = [self._r(score_scale="rrf", score_ceiling=1.8 / 61)]
+        assert SurfacingEngine._batch_score_ceiling(batch) == 0.0295
+
+    @pytest.mark.parametrize("stamp", [None, 0.0, -1.0, float("nan"), float("inf"), True, "0.05"])
+    def test_invalid_rrf_stamp_falls_back_to_baseline(self, stamp):
+        batch = [self._r(score_scale="rrf", score_ceiling=stamp)]
+        assert SurfacingEngine._batch_score_ceiling(batch) == 0.0327
+
+    @pytest.mark.parametrize("scale", [None, "", "some_future_scale"])
+    def test_unstamped_or_unknown_scale_gets_compact_precision(self, scale):
+        assert SurfacingEngine._batch_score_ceiling([self._r(score_scale=scale)]) == 0.03
+
+    @pytest.mark.parametrize("scale", ["rerank", "bm25", "dense", "none"])
+    def test_named_non_rrf_scale_gives_no_ceiling(self, scale):
+        assert SurfacingEngine._batch_score_ceiling([self._r(score_scale=scale)]) is None
+
+    def test_empty_and_pinned_only_give_no_ceiling(self):
+        pinned = self._r(score_scale="rrf", score_ceiling=0.05)
+        pinned.pinned = True  # type: ignore[attr-defined]
+        assert SurfacingEngine._batch_score_ceiling([]) is None
+        assert SurfacingEngine._batch_score_ceiling([pinned]) is None
+
+    def test_first_retrieved_result_decides(self):
+        pinned = self._r(score_scale="rerank")
+        pinned.pinned = True  # type: ignore[attr-defined]
+        batch = [pinned, self._r(score_scale="rrf", score_ceiling=0.04), self._r()]
+        assert SurfacingEngine._batch_score_ceiling(batch) == 0.04
+
+
+class TestAutoTuneConcurrentCeiling:
+    """#1062: the tuner's value is shared per tool, but the ceiling is per
+    batch. A concurrent call whose batch carried a higher ceiling (an
+    in-flight request across a reconnect with changed fusion settings) can
+    raise the shared value between this call's tuner pass and its filter
+    read; the filter must still respect this batch's own ceiling."""
+
+    async def test_filter_uses_this_batch_ceiling_after_a_concurrent_raise(self, tmp_path: Path):
+        from memtomem_stm.surfacing.feedback import FeedbackTracker
+
+        config = _make_config(auto_tune_enabled=True, min_score=0.017)
+        tracker = FeedbackTracker(config=config, db_path=tmp_path / "fb.db")
+        top = FakeSearchResult(
+            chunk=FakeChunk(content="rank first on both legs"),
+            score=2 / 61,
+            score_scale="rrf",
+            score_ceiling=2 / 61,
+        )
+        try:
+            engine = SurfacingEngine(
+                config=config,
+                mcp_adapter=_make_mcp_adapter([top]),
+                feedback_tracker=tracker,
+            )
+            tuner = engine._auto_tuner
+            original = tuner.maybe_adjust
+
+            peer_raised = []
+
+            def adjust_then_peer_raises(tool, *args, **kwargs):
+                result = original(tool, *args, **kwargs)
+                # A peer call under a 0.06 ceiling raised the shared value.
+                tuner._adjustments[tool] = 0.045
+                peer_raised.append(tool)
+                return result
+
+            tuner.maybe_adjust = adjust_then_peer_raises
+            out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            # The fake must actually run: a signature mismatch is swallowed by
+            # ``_maybe_auto_tune`` and would leave this test vacuous.
+            assert peer_raised == ["read_file"]
+            assert tuner.get_effective_min_score("read_file") == 0.045
+            assert "rank first on both legs" in out
+        finally:
+            tracker.close()
+
+
+class TestCacheHitFloorMatchesMiss:
+    """#1062: a cache hit must render relevance labels with the same capped
+    floor the miss used, or a stored adjustment above the batch cap relabels
+    the same result on the hit."""
+
+    async def test_hit_and_miss_label_the_same_result_alike(self, tmp_path: Path):
+        from memtomem_stm.surfacing.feedback import FeedbackTracker
+
+        config = _make_config(auto_tune_enabled=True, min_score=0.017)
+        tracker = FeedbackTracker(config=config, db_path=tmp_path / "fb.db")
+        tracker.store.save_adjustment("read_file", 0.04)
+        top = FakeSearchResult(
+            # Exactly the capped floor 0.0327: bottom third of [0.0327, 2/61]
+            # (weak). Under the uncapped 0.04 the floor sits above the
+            # ceiling and every result renders strong.
+            chunk=FakeChunk(content="labelled result"),
+            score=0.0327,
+            score_scale="rrf",
+            score_ceiling=2 / 61,
+        )
+        adapter = _make_mcp_adapter([top])
+        try:
+            engine = SurfacingEngine(config=config, mcp_adapter=adapter, feedback_tracker=tracker)
+            miss = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            hit = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            assert adapter.search.call_count == 1  # the second call is a cache hit
+
+            def label(out: str) -> str:
+                line = next(ln for ln in out.splitlines() if "labelled result" in ln)
+                return line.split("]:")[0].rsplit("[", 1)[1]
+
+            assert label(miss) == label(hit) == "weak"
+        finally:
+            tracker.close()
