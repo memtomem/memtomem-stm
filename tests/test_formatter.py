@@ -248,7 +248,8 @@ class TestFormatterInjection:
         bucket exactly as before."""
         fmt = SurfacingFormatter(SurfacingConfig())
         results = [
-            FakeResult(FakeChunk(content="rrf hit", id="k-rrf"), 0.95, score_scale="rrf"),
+            # An attainable RRF score (the 2-leg reference is 2/61 ≈ 0.0328).
+            FakeResult(FakeChunk(content="rrf hit", id="k-rrf"), 0.031, score_scale="rrf"),
             FakeResult(FakeChunk(content="unstamped hit", id="k-bare"), 0.95),
             FakeResult(
                 FakeChunk(content="future hit", id="k-future"), 0.95, score_scale="cosine9000"
@@ -258,6 +259,51 @@ class TestFormatterInjection:
         assert "`k-rrf` [strong]: rrf hit" in output
         assert "`k-bare` [strong]: unstamped hit" in output
         assert "`k-future` [strong]: future hit" in output
+
+    @pytest.mark.parametrize(
+        "score,bucket",
+        [
+            (0.0180, "weak"),  # below floor + band/3 ≈ 0.022262
+            (0.0250, "related"),  # below floor + 2·band/3 ≈ 0.027525
+            (0.0300, "strong"),
+            (2 / 61, "strong"),  # exactly the ceiling
+            (0.04, "strong"),  # above the ceiling (rescue leg / boost)
+        ],
+    )
+    def test_rrf_bucket_spans_floor_to_default_ceiling(self, score, bucket):
+        """#1034: rrf-stamped thirds span [floor, 2/61], not [floor, 1.0] —
+        under the old band every one of these rendered [weak]."""
+        fmt = SurfacingFormatter(SurfacingConfig(min_score=0.017))
+        results = [FakeResult(FakeChunk(content="hit", id="k"), score, score_scale="rrf")]
+        output = fmt.inject("response", results, "query")  # no ceiling → 2/61
+        assert f"`k` [{bucket}]: hit" in output
+
+    def test_rrf_bucket_uses_explicit_ceiling(self):
+        # Ceiling 2/11 (k=10): 0.05 sits in the bottom third, whereas the
+        # default 2/61 ceiling would call it strong.
+        fmt = SurfacingFormatter(SurfacingConfig(min_score=0.017))
+        results = [FakeResult(FakeChunk(content="hit", id="k"), 0.05, score_scale="rrf")]
+        assert "`k` [weak]: hit" in fmt.inject("response", results, "query", score_ceiling=2 / 11)
+        assert "`k` [strong]: hit" in fmt.inject("response", results, "query")
+
+    def test_rrf_ceiling_below_floor_is_strong(self):
+        # w=[0.5, 0.5] at k=60 gives 1/61 < floor 0.017: no band to split.
+        fmt = SurfacingFormatter(SurfacingConfig(min_score=0.017))
+        results = [FakeResult(FakeChunk(content="hit", id="k"), 0.017, score_scale="rrf")]
+        output = fmt.inject("response", results, "query", score_ceiling=1 / 61)
+        assert "`k` [strong]: hit" in output
+
+    def test_unstamped_bucket_keeps_legacy_unit_band(self):
+        # The ceiling only applies to rrf-stamped results; unstamped scores
+        # still split [floor, 1.0], even when a ceiling is passed.
+        fmt = SurfacingFormatter(SurfacingConfig(min_score=0.017))
+        results = [
+            FakeResult(FakeChunk(content="high", id="u-high"), 0.95),
+            FakeResult(FakeChunk(content="low", id="u-low"), 0.03),
+        ]
+        output = fmt.inject("response", results, "query", score_ceiling=2 / 61)
+        assert "`u-high` [strong]: high" in output
+        assert "`u-low` [weak]: low" in output
 
     def test_source_renders_parent_and_basename(self):
         fmt = SurfacingFormatter(SurfacingConfig())

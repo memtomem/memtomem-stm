@@ -11,6 +11,7 @@ import math
 from typing import Any
 
 from memtomem_stm.surfacing.config import SurfacingConfig
+from memtomem_stm.surfacing.rrf_profile import FusionGap, check_two_leg_fusion
 
 DoctorCheck = tuple[str, str, str, str, str | None]
 _SCOPE = (
@@ -18,26 +19,20 @@ _SCOPE = (
     "Not a live score or auto-tuned threshold check; reconnect after Core config changes."
 )
 
-
-def _positive_int(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value > 0
-
-
-def _weights(value: Any) -> tuple[float, float] | None:
-    if not isinstance(value, list) or len(value) != 2:
-        return None
-    result: list[float] = []
-    for item in value:
-        if isinstance(item, bool) or not isinstance(item, (int, float)):
-            return None
-        try:
-            weight = float(item)
-        except OverflowError:
-            return None
-        if not math.isfinite(weight) or weight < 0:
-            return None
-        result.append(weight)
-    return result[0], result[1]
+# Doctor wording for each structural gap; the checks themselves are shared with
+# surfacing's relevance buckets (``surfacing.rrf_profile``).
+_GAP_ADVICE: dict[FusionGap, tuple[str, str | None]] = {
+    FusionGap.NO_PROFILE: (
+        "RRF settings unavailable",
+        "upgrade to a Core exposing runtime_profile.search fusion settings, then reconnect",
+    ),
+    FusionGap.INCOMPLETE: (
+        "Core does not expose all four RRF settings",
+        "upgrade Core, then restart the LTM/daemon to refresh its configuration snapshot",
+    ),
+    FusionGap.INVALID: ("Core reported invalid RRF settings; no threshold recommended", None),
+    FusionGap.NOT_TWO_LEG: ("Two positive-weight, enabled retrieval legs are not reported", None),
+}
 
 
 def _recommendation(low: float, high: float) -> float | None:
@@ -74,36 +69,12 @@ def rrf_boundary_doctor_checks(
     def unavailable(reason: str, action: str | None = None) -> list[DoctorCheck]:
         return [("ltm_rrf_boundary", "ltm RRF boundary", "WARN", f"{reason}. {_SCOPE}", action)]
 
-    if (
-        not isinstance(profile, dict)
-        or type(profile.get("schema_version")) is not int
-        or profile["schema_version"] != 1
-        or profile.get("config_state") != "ok"
-        or not isinstance(profile.get("search"), dict)
-    ):
-        return unavailable(
-            "RRF settings unavailable",
-            "upgrade to a Core exposing runtime_profile.search fusion settings, then reconnect",
-        )
+    fusion = check_two_leg_fusion(profile)
+    if isinstance(fusion, FusionGap):
+        reason, action = _GAP_ADVICE[fusion]
+        return unavailable(reason, action)
+    k, weights = fusion
     search = profile["search"]
-    required = ("rrf_k", "rrf_weights", "bm25_candidates", "dense_candidates")
-    if any(key not in search for key in required):
-        return unavailable(
-            "Core does not expose all four RRF settings",
-            "upgrade Core, then restart the LTM/daemon to refresh its configuration snapshot",
-        )
-    weights = _weights(search["rrf_weights"])
-    if weights is None or not all(
-        _positive_int(search[key]) for key in ("rrf_k", "bm25_candidates", "dense_candidates")
-    ):
-        return unavailable("Core reported invalid RRF settings; no threshold recommended")
-    if (
-        min(weights) == 0
-        or search.get("effective_mode") != "hybrid"
-        or search.get("enable_bm25") is not True
-        or search.get("enable_dense") is not True
-    ):
-        return unavailable("Two positive-weight, enabled retrieval legs are not reported")
     if config.result_format != "structured" or effective_format != "structured":
         return unavailable(
             "Structured output is not confirmed; compact or unknown scores cannot support "
@@ -122,7 +93,6 @@ def rrf_boundary_doctor_checks(
             "surfacing.rerank=false alone does not prove a negotiated bypass",
         )
 
-    k = search["rrf_k"]
     # The engine uses the same top_k for compose and mem_search fallback.
     cases: list[tuple[str | None, float, int]] = [
         (None, config.min_score, config.effective_max_results())

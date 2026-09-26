@@ -10,6 +10,7 @@ from typing import Any
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.feedback import VALID_RATINGS
 from memtomem_stm.surfacing.mcp_client import KNOWN_SCORE_SCALES
+from memtomem_stm.surfacing.rrf_profile import RRF_BASELINE_CEILING
 
 # Header for the optional scratch / working-memory section. Shared between the
 # render site and the truncation orphan-trim so the two cannot drift.
@@ -101,12 +102,15 @@ class SurfacingFormatter:
             atoms.reverse()
         return "".join(atoms).strip()
 
-    def _relevance_bucket(self, score: float, score_floor: float | None = None) -> str:
+    def _relevance_bucket(
+        self, score: float, score_floor: float | None = None, score_ceiling: float = 1.0
+    ) -> str:
+        """Thirds of ``[floor, score_ceiling]``; at or above the ceiling is ``strong``."""
         floor = self._config.min_score if score_floor is None else score_floor
-        if floor >= 1.0:
+        if floor >= score_ceiling:
             return "strong"
 
-        band = 1.0 - floor
+        band = score_ceiling - floor
         related_start = floor + band / 3
         strong_start = floor + 2 * band / 3
 
@@ -141,6 +145,7 @@ class SurfacingFormatter:
         surfacing_id: str | None = None,
         scratch_items: list[dict] | None = None,
         score_floor: float | None = None,
+        score_ceiling: float | None = None,
     ) -> str:
         """Inject surfaced memories into ``response_text``.
 
@@ -157,6 +162,7 @@ class SurfacingFormatter:
             surfacing_id=surfacing_id,
             scratch_items=scratch_items,
             score_floor=score_floor,
+            score_ceiling=score_ceiling,
         ).text
 
     def render(
@@ -167,8 +173,14 @@ class SurfacingFormatter:
         surfacing_id: str | None = None,
         scratch_items: list[dict] | None = None,
         score_floor: float | None = None,
+        score_ceiling: float | None = None,
     ) -> RenderManifest:
-        """Render memories and report only IDs present in the final block."""
+        """Render memories and report only IDs present in the final block.
+
+        ``score_ceiling`` is the top of the relevance-bucket band for results
+        stamped ``rrf`` (see :func:`~memtomem_stm.surfacing.rrf_profile.rrf_score_ceiling`);
+        ``None`` means Core's default fusion, ``2/61``.
+        """
         if not results and not scratch_items:
             return RenderManifest(response_text, (), ())
 
@@ -252,21 +264,27 @@ class SurfacingFormatter:
                     snippet = self._sanitize(ctx.window_after[0].content, max_chars=budget)
                     preview = preview + " | " + snippet + "..."
 
-            # The [weak|related|strong] bucket partitions the [floor, 1.0]
-            # band, which only means anything on the RRF scale ((0, ~0.033])
-            # the floor was calibrated for. When THIS result is stamped with a
-            # core-named non-RRF scale (e.g. rerank logits — unbounded, median
-            # negative) the band math is wrong regardless of filtering policy,
-            # so the tag is suppressed. Keyed per result off the stamp — not
-            # off gate config or pins — so cache hits and pinned-min_score
-            # tools stay consistent with the scores they actually carry;
-            # unstamped (compose, compact, pre-#1781 cores) and unrecognized
-            # labels keep the bucket exactly as before.
+            # The [weak|related|strong] bucket splits [floor, top] into thirds.
+            # For a result stamped ``rrf``, top is the fusion's two-leg
+            # reference score (``score_ceiling``; 2/61 at Core's defaults), so
+            # the tags spread across the RRF range instead of all landing in
+            # the bottom third of [floor, 1.0] (#1034); rescue/decay/boost can
+            # lift a score past it, which reads as ``strong``. When THIS result
+            # is stamped with a core-named non-RRF scale (e.g. rerank logits —
+            # unbounded, median negative) no band is meaningful, so the tag is
+            # suppressed. Keyed per result off the stamp — not off gate config
+            # or pins — so cache hits and pinned-min_score tools stay
+            # consistent with the scores they actually carry. Unstamped
+            # results (compact format, pre-#1781 cores) and unrecognized labels
+            # keep the legacy [floor, 1.0] band.
             scale = getattr(r, "score_scale", None)
             if isinstance(scale, str) and scale in KNOWN_SCORE_SCALES and scale != "rrf":
                 bucket_token = ""
             else:
-                bucket = self._relevance_bucket(float(r.score), score_floor)
+                top = 1.0
+                if scale == "rrf":
+                    top = RRF_BASELINE_CEILING if score_ceiling is None else score_ceiling
+                bucket = self._relevance_bucket(float(r.score), score_floor, top)
                 bucket_token = f" [{bucket}]"
             # The backticked ``chunk.id`` is the agent-copyable ``memory_id``
             # for ``stm_surfacing_feedback(ratings=...)`` (EN-2/3). It sits
