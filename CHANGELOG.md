@@ -20,7 +20,9 @@ changes inline only. See the deprecation policy in
   Rows hold counts about the arguments, never their keys or values. The write is
   fire-and-forget and no response waits on it. Opt out with
   `MEMTOMEM_STM_SURFACING__OPPORTUNITIES_ENABLED=false`, or keep a share with
-  `opportunities_sample_rate`. `stm_surfacing_stats` gains an `Opportunities` line
+  `opportunities_sample_rate`. `stm_surfacing_stats` now reads its stored counts on a
+  worker thread, since counting the new table scans every retained row (about 0.4 s
+  per million rows, measured), and gains an `Opportunities` line
   and two healthy skip reasons, `empty_render` and `cancelled`. `empty_render` now
   counts as a completed search in the health verdict, so a process that hit it gains
   attempts it did not count before; a process whose only calls were cancelled now

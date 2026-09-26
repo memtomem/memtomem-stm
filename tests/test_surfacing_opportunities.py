@@ -867,6 +867,22 @@ class TestStatsRendering:
         )
         assert "Opportunities:   1 stored" in out.splitlines()
 
+    async def test_stats_are_read_off_the_event_loop(self) -> None:
+        import threading
+
+        seen: list[int] = []
+        ctx = self._ctx(self._stats(), {})
+        tracker = ctx.request_context.lifespan_context.feedback_tracker
+        stats = self._stats()
+
+        def record_thread(**_k: Any) -> dict[str, Any]:
+            seen.append(threading.get_ident())
+            return stats
+
+        tracker.get_stats.side_effect = record_thread
+        await stm_surfacing_stats(ctx=ctx)
+        assert seen and seen[0] != threading.get_ident()
+
     async def test_no_line_without_opportunities(self) -> None:
         out = await stm_surfacing_stats(ctx=self._ctx(self._stats(), {}))
         assert "Opportunities" not in out

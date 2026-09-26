@@ -1952,7 +1952,14 @@ async def stm_surfacing_stats(
         "stm_surfacing_stats",
         metadata={"tool": tool, "since": since, "limit": limit},
     ):
-        stats = app.feedback_tracker.get_stats(tool=tool, since=since_ts, limit=limit)
+        # Off the event loop: the opportunity aggregate scans every retained
+        # row (about 0.4 s per million, measured), and a proxy blocked here
+        # stalls every other tool call. A plain thread, not the store-write
+        # worker, so a slow read never queues ahead of a delivery's awaited
+        # event write; the store's read connection has its own lock.
+        stats = await asyncio.to_thread(
+            app.feedback_tracker.get_stats, tool=tool, since=since_ts, limit=limit
+        )
 
         # Taken once, up front: the verdict line at the top and the skip /
         # outcome / cache sections at the bottom must describe the same
