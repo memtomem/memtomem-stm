@@ -877,6 +877,7 @@ hit:
   cancellation still propagates.
 
 The verdict puts `empty_render` in its completed set, as it does the
-`no_results_*` family, on the miss and the cache-hit path alike: a search
-result (this call's or a cached one) got as far as rendering. `cancelled`
-is not an LTM attempt and does not move the ratio.
+`no_results_*` family, on the miss and the cache-hit path alike: a result
+batch (retrieved or pinned, this call's or a cached one) got as far as
+rendering. `cancelled` is left out of the ratio on either side, even when
+the cancellation arrived during an LTM request.
