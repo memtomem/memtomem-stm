@@ -31,7 +31,7 @@ changes inline only. See the deprecation policy in
   shows `insufficient data` where it showed no verdict.
   Until an upgraded process opens `stm_feedback.db`, `mms doctor` reports the new
   table as missing.
-- **RRF results now show `[related]` and `[strong]`** (#1034). The relevance bucket
+- **RRF results now show `[related]` and `[strong]`** (#1064, #1034). The relevance bucket
   split `[min_score, 1.0]` into thirds, but hybrid RRF scores cluster below the
   default two-leg reference score `2/61` (about 0.033), far under the old `[related]`
   boundary of about 0.345. For results stamped `rrf` the band now ends at
@@ -67,7 +67,7 @@ changes inline only. See the deprecation policy in
   keeps running beside it until it idles out. A daemon pinned with
   `idle_timeout_seconds=0` never idles out, so stop it with `mms daemon stop --all`; on
   Windows that command cannot terminate it, so end the process from Task Manager instead.
-- **A plain-text cut that nearly meets the retention floor is delivered as is** (#1038).
+- **A plain-text cut that nearly meets the retention floor is delivered as is** (#1044, #1038).
   Before, a truncation that fell a few characters short of the floor (a boundary cut or
   rounding) switched the response to progressive delivery: a first chunk with a
   `stm_proxy_read_more` footer. Such a response now arrives as one truncated result of
@@ -105,7 +105,7 @@ changes inline only. See the deprecation policy in
   manually entered) and by `mms project` registry import omit it as well. A newly
   added server therefore inherits the global budget — 16,000 characters by
   default, which is what those entries already resolved to in practice.
-- **`mms tune` no longer advises a budget a strategy never reads** (#1042). A tool
+- **`mms tune` no longer advises a budget a strategy never reads** (#1050, #1042). A tool
   whose resolved strategy is `none` or an explicitly configured `progressive` gets
   no `max_result_chars` recommendation, because neither path consults that budget:
   passthrough delivers the cleaned text and progressive delivers by `chunk_size`.
@@ -124,7 +124,7 @@ changes inline only. See the deprecation policy in
   where they were previously cut to the character budget. Configurations with no
   explicit floor are unaffected, and an explicit `retention_floor: 0` remains the
   opt-out at that level.
-- **`mms list` shows inherited compression strategies** (#1043). The COMPRESSION
+- **`mms list` shows inherited compression strategies** (#1052, #1043). The COMPRESSION
   column used to print the file's `compression` value, or `auto` when the server
   omitted it — so a server inheriting `default_compression: none` displayed `auto`
   while running with compression off. It now shows the resolved server default,
@@ -137,11 +137,11 @@ changes inline only. See the deprecation policy in
   `source` (`server` or `global`), and `tool_overrides`; it is `{}` for an invalid
   configuration. A script that parsed the text table's COMPRESSION column reads
   different values for servers that omit `compression`.
-- **`mms stats` counts in-pipeline failures as errors** (#1045). A `lock_timeout` or
+- **`mms stats` counts in-pipeline failures as errors** (#1053, #1045). A `lock_timeout` or
   `internal_error` row recorded by the proxy's own call path now has `is_error = 1`,
   so the error count in `mms stats` and the tuner's error totals rise for tools that
   hit these failures. Rows recorded before the upgrade are not rewritten.
-- **Responses quoting the progressive footer are cached** (#1046). An upstream
+- **Responses quoting the progressive footer are cached** (#1054, #1046). An upstream
   result that contains `\n---\n[progressive: chars=` without a
   `stm_proxy_read_more(key="…")` call used to miss the cache on every call; identical
   calls now hit it, and the row survives restarts.
@@ -320,7 +320,7 @@ changes inline only. See the deprecation policy in
   over `rrf_k`, `rrf_weights` and both formats pins that a result both legs rank
   first always passes. **Behavior change**: see the upgrade notes above.
 
-- **Relevance buckets for RRF results span the RRF score range** (#1034) — bucket
+- **Relevance buckets for RRF results span the RRF score range** (#1064, #1034) — bucket
   boundaries were thirds of `[min_score, 1.0]`, but hybrid RRF scores sit below
   `2/61` (about 0.033) with the default fusion, so every `rrf` result was labelled
   `[weak]`. The band for `rrf` results now ends at the `score_ceiling` the LTM adapter
@@ -411,7 +411,7 @@ changes inline only. See the deprecation policy in
   stopped emitting a budget the operator never stated, so honoring the field does
   not halve the budget of newly generated servers. **Behavior change**: see the
   upgrade notes above.
-- **Budget recommendations respect the strategy in force** (#1042) — H1, H2, and
+- **Budget recommendations respect the strategy in force** (#1050, #1042) — H1, H2, and
   the feedback-driven `max_result_chars` action gated only on a per-tool token
   budget, so a tool running `none` or explicit `progressive` was advised to change
   a character budget its delivery path never reads. All three now share one
@@ -431,7 +431,7 @@ changes inline only. See the deprecation policy in
   first branch inside the block, the ladder is unreachable through the new
   condition — the only inputs whose behavior changes are those with a global zero
   and an explicit floor. **Behavior change**: see the upgrade notes above.
-- **Boundary cuts no longer miss the retention floor by a few characters** (#1038) —
+- **Boundary cuts no longer miss the retention floor by a few characters** (#1044, #1038) —
   the pipeline raised the compressor's budget to `int(length × floor)` and then
   rejected any result below the unrounded floor. A sentence or word boundary, or the
   rounding itself, left results short by under a character to 30 characters in the
@@ -444,7 +444,7 @@ changes inline only. See the deprecation policy in
   that still falls short, such as a structural or tail-anomaly cut, takes its fallback
   as before, while `selective` tables of contents and store-error degradation stay
   exempt from it. **Behavior change**: see the upgrade notes above.
-- **`mms list` resolves compression through the shared resolver** (#1043) — the
+- **`mms list` resolves compression through the shared resolver** (#1052, #1043) — the
   table read `cfg.get("compression", "auto")` from the raw file, so it ignored
   `default_compression` and the environment overlay. It now validates one
   env-merged snapshot of the configuration and resolves each server through
@@ -457,7 +457,7 @@ changes inline only. See the deprecation policy in
   as valid with a resolved strategy, as `config_valid` already could before this
   change (#1051).
   **Behavior change**: see the upgrade notes above.
-- **Pipeline lock-timeout and internal-error rows count as errors** (#1045) — an
+- **Pipeline lock-timeout and internal-error rows count as errors** (#1053, #1045) — an
   exception that escaped the guarded call path without being recorded elsewhere
   (a pipeline stage, the cache lookup, or cache-hit handling) was counted by the
   in-memory tracker but persisted with `is_error = 0`, so `mms stats` and every
@@ -465,7 +465,7 @@ changes inline only. See the deprecation policy in
   `lock_timeout` and `internal_error` rows now persist `is_error = 1`. Rows recorded
   before this fix keep `is_error = 0`; they are not rewritten.
   **Behavior change**: see the upgrade notes above.
-- **Responses that quote the progressive footer are cached** (#1046) — the cache
+- **Responses that quote the progressive footer are cached** (#1054, #1046) — the cache
   store skipped any response whose text contained `\n---\n[progressive: chars=`,
   so an upstream result quoting STM's own progressive output (documentation, logs,
   earlier transcripts) was never cached. A progressive response now counts as
