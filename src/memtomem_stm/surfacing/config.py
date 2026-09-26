@@ -141,7 +141,7 @@ class SurfacingConfig(BaseModel):
     default it widens to ``max(0.05, min_score)`` so a stricter min_score
     never breaks construction; set it explicitly to cap below the default.
     ``0.05`` sits above the RRF reference score ``2/61``, so at run time the
-    tuner also caps at each batch's reference (``AutoTuner.effective_ceiling``,
+    tuner also caps at each batch's attainable reference (``AutoTuner.effective_ceiling``,
     #1062)."""
     auto_tune_score_floor: float = Field(default=0.005, ge=0.0, le=1.0)
     """Lower bound auto-tuning may lower a tool's min_score to. Left at its

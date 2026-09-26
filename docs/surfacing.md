@@ -627,15 +627,24 @@ satisfy `floor <= min_score <= ceiling`.
 
 The `0.05` ceiling is above the RRF reference score `2/61` (about 0.0328), the
 score of a result both legs rank first at Core's default fusion. A threshold above
-it filters out every two-leg result that Core's rescue leg or a boost did not lift, so the tuned value is also capped at the
-reference for each batch (#1062): the `score_ceiling` the LTM adapter stamps on an
-`rrf` result (`sum(rrf_weights) / (rrf_k + 1)`), or `2/61` when the batch carries no
-valid stamp. The effective cap is `min(auto_tune_score_ceiling, max(reference,
-min_score))`, so a top-level `min_score` you set above the reference is never lowered by the cap.
-A stored value above the cap is lowered the next time the tool's search returns
-`rrf` or unstamped results, without waiting for new feedback. An empty batch, or one
-with a named non-RRF scale, supplies no reference, so only the configured bounds
-apply to it.
+it filters out every two-leg result that Core's rescue leg or a boost did not lift,
+so raises and the threshold each search filters with are also capped per batch
+(#1062). The cap is the reference rounded down to the precision Core sends scores
+at:
+
+| Batch | Cap |
+|---|---|
+| `rrf` with a valid `score_ceiling` stamp (`sum(rrf_weights) / (rrf_k + 1)`) | the stamp, floored to 4 places |
+| `rrf` without a valid stamp | `2/61` floored to 4 places (`0.0327`) |
+| no `score_scale` (compact format, older cores) | `2/61` floored to 2 places (`0.03`) |
+| empty, or a named non-RRF scale | none; only the configured bounds apply |
+
+The effective cap is `min(auto_tune_score_ceiling, max(cap, min_score))`, so a
+top-level `min_score` above the cap is kept. A raise stops at the effective cap and
+never lowers the stored value. A stored value above the cap is lowered and saved the
+next time the tool's search returns stamped `rrf` results, without waiting for new
+feedback. Other batches cap only their own search, so `stm_surfacing_stats` can show a
+stored value above the one applied.
 
 ```mermaid
 flowchart LR
@@ -647,7 +656,7 @@ flowchart LR
     R -->|"negative > 60%"| Up["min_score += 0.002<br/>(surface less)"]
     R -->|"helpful > 80%"| Down["min_score -= 0.002<br/>(surface more)"]
     R -->|"otherwise"| Hold["no change<br/>(incl. partially_helpful)"]
-    Up --> Cap["clamp to<br/>[floor, min(ceiling,<br/>max(RRF ref, min_score)))]"]
+    Up --> Cap["clamp to<br/>[floor, min(ceiling,<br/>max(batch cap, min_score)))]"]
     Down --> Cap
     Cap --> Tool[("per-tool<br/>min_score")]
     Tool -.->|next call| Sample

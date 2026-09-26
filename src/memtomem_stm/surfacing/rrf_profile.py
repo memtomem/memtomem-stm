@@ -10,6 +10,7 @@ checked before use.
 from __future__ import annotations
 
 import math
+from decimal import ROUND_FLOOR, Decimal
 from enum import StrEnum
 from typing import Any
 
@@ -17,6 +18,25 @@ from typing import Any
 # (``k=60``, weights ``[1, 1]``). Used whenever the profile cannot describe a
 # positive-weight two-leg fusion.
 RRF_BASELINE_CEILING = 2 / 61
+
+
+# Decimal places Core rounds a score to before STM sees it: ``round(score, 4)``
+# in the structured ``mem_search`` JSON and ``f"{score:.2f}"`` in the compact
+# text format. A threshold between the rounded and the exact reference rejects
+# a result both legs rank first (#1062).
+STRUCTURED_SCORE_DECIMALS = 4
+COMPACT_SCORE_DECIMALS = 2
+
+
+def floor_to_decimals(value: float, decimals: int) -> float:
+    """*value* rounded down to *decimals* places, so it never exceeds the
+    score Core delivers for *value* at that precision.
+
+    Goes through ``repr`` so binary noise (``0.03`` stored as
+    ``0.0299999…``) does not floor a value that is already exact.
+    """
+    step = Decimal(1).scaleb(-decimals)
+    return float(Decimal(repr(value)).quantize(step, rounding=ROUND_FLOOR))
 
 
 class FusionGap(StrEnum):

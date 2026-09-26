@@ -25,16 +25,20 @@ changes inline only. See the deprecation policy in
   1,194 `[related]` and 269 `[weak]`, where all 4,708 were `[weak]` before.
   Results without a `score_scale` stamp (compact format, older cores) keep the
   `[min_score, 1.0]` band.
-- **Auto-tune no longer raises `min_score` past the RRF reference score** (#1062).
-  A raise was capped only by `auto_tune_score_ceiling` (default `0.05`), which is
-  above the default two-leg reference `2/61` (about 0.0328). Starting from the default
-  `0.017`, eight raises reached `0.033`, which filtered out every two-leg result for
-  that tool unless Core's rescue leg or a boost lifted it above the reference. The tuned value is now also capped at the reference the LTM adapter
-  stamps on each `rrf` result, or `2/61` when a batch carries no valid stamp. A
-  `min_score` you set above the reference is kept: the cap never goes below it. A stored adjustment
-  above the cap is lowered and saved the next time that tool's search returns
-  `rrf` or unstamped results, even with no new feedback. This applies to the proxy and to the daemon
-  when `hook.record_feedback_events` is on (otherwise the daemon does not tune).
+- **Auto-tune no longer raises `min_score` past the best score a batch can deliver**
+  (#1062). A raise was capped only by `auto_tune_score_ceiling` (default `0.05`),
+  which is above the default two-leg reference `2/61` (about 0.0328). Starting from
+  the default `0.017`, eight raises reached `0.033`, which filtered out every two-leg
+  result for that tool unless Core's rescue leg or a boost lifted it. Raises, and the
+  threshold each search filters with, are now also capped at the batch's reference
+  rounded down to the precision Core sends scores at: the `score_ceiling` stamped on
+  an `rrf` result at 4 places (`2/61` → `0.0327`), otherwise `2/61` at 2 places
+  (`0.03`, the top compact score). A `min_score` above that cap is kept. A stored
+  adjustment above the cap is lowered and saved the next time that tool's search
+  returns stamped `rrf` results, even with no new feedback; other batches cap only
+  their own search, so `stm_surfacing_stats` can then show a stored value above the
+  one applied. This applies to the proxy and to the daemon when
+  `hook.record_feedback_events` is on (otherwise the daemon does not tune).
 - **The hook↔daemon protocol is now v8.** The `surface` payload carries the host's
   `session_id`, `cwd`, `tool_use_id` and `agent_id` (Claude sends `agent_id` only
   inside a subagent). The surfacing engine accepts them but does not store or log them
@@ -235,20 +239,22 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
-- **Auto-tuned `min_score` stays at or below the batch's RRF reference score**
+- **Auto-tuned `min_score` stays at or below the best score a batch can deliver**
   (#1062) — `AutoTuner.maybe_adjust` capped a raise only at `auto_tune_score_ceiling`,
   a bound written for a `[0, 1]` scale, the same class as #1034. Once the tuned value
   crossed `2/61`, the filter `score >= min_score` rejected every unboosted two-leg
-  result, so the tool surfaced little or nothing and drew few ratings to walk it back. The engine now passes
-  the batch's reference ceiling to the tuner: the stamped `score_ceiling` of an `rrf`
-  batch, `2/61` for an unstamped batch or an invalid stamp, and nothing for an empty
-  batch or one with a named non-RRF scale (which reaches the tuner only when
-  `scale_gated_min_score` is off). The tuner
-  caps both directions at `min(auto_tune_score_ceiling, max(ceiling, min_score))`, and
-  clamps a stored value above that before checking for new feedback. The filter
-  also reads the tuned value capped at its own batch's reference, so a concurrent call
-  whose batch carried a higher reference cannot push this call's threshold above its own.
-  **Behavior change**: see the upgrade notes above.
+  result, so the tool surfaced little or nothing and drew few ratings to walk it back.
+  The engine now derives a cap per batch: the stamped `score_ceiling` of an `rrf`
+  batch floored to 4 places (Core's structured JSON uses `round(score, 4)`), `2/61`
+  floored to 4 places for an `rrf` batch without a valid stamp, and `2/61` floored to
+  2 places (the compact format uses `{score:.2f}`) for an unstamped batch. An empty
+  batch, or one with a named non-RRF scale (which reaches the tuner only when
+  `scale_gated_min_score` is off), has no cap. The effective cap is
+  `min(auto_tune_score_ceiling, max(cap, min_score))`. A raise stops there and never
+  lowers the stored value. Only a stamped cap clamps and saves a stored value above it,
+  before the feedback check. The filter reads the tuned value capped at its own batch,
+  which covers unstamped batches and a concurrent call whose batch carried a higher
+  reference. **Behavior change**: see the upgrade notes above.
 
 - **Embedding responses are parsed defensively, and the reason is logged**
   (#1058, #67 follow-up) — `_embed_ollama` and `_embed_openai` indexed straight into the parsed

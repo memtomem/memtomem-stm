@@ -35,7 +35,13 @@ from memtomem_stm.surfacing.mcp_client import (
 )
 from memtomem_stm.surfacing.observability import _NOOP_OBSERVABILITY, SurfacingObservability
 from memtomem_stm.surfacing.relevance import RelevanceGate
-from memtomem_stm.surfacing.rrf_profile import RRF_BASELINE_CEILING, read_score_ceiling_hint
+from memtomem_stm.surfacing.rrf_profile import (
+    COMPACT_SCORE_DECIMALS,
+    RRF_BASELINE_CEILING,
+    STRUCTURED_SCORE_DECIMALS,
+    floor_to_decimals,
+    read_score_ceiling_hint,
+)
 from memtomem_stm.surfacing.store_io import (
     StoreWriteQueueFull,
     await_store_write,
@@ -765,18 +771,31 @@ class SurfacingEngine:
         return None, None
 
     @staticmethod
-    def _batch_score_ceiling(results: list[Any]) -> float | None:
-        """Return the RRF reference ceiling the auto-tuner caps against for *results*.
+    def _batch_score_ceiling(results: list[Any]) -> tuple[float, bool] | None:
+        """Return ``(ceiling, stamped)``: the cap the auto-tuner and the filter
+        use for *results*, and whether the batch vouched for it.
+
+        The ceiling is the RRF reference (the score of a result both legs rank
+        first) rounded DOWN to the precision Core delivers scores at, because
+        a threshold between the rounded and the exact reference rejects that
+        result anyway (#1062):
+
+        - ``rrf`` with a valid ``score_ceiling`` stamp: the stamp at
+          :data:`STRUCTURED_SCORE_DECIMALS`, ``stamped=True``.
+        - ``rrf`` without a valid stamp: :data:`RRF_BASELINE_CEILING` at the
+          structured precision (stamps only exist on structured results).
+        - no scale (compact format, older cores) or an unrecognized label:
+          the baseline at :data:`COMPACT_SCORE_DECIMALS` — compact scores top
+          out at ``0.03``, and a structured one is never lower than that.
 
         ``None`` when the batch says nothing about the RRF scale: nothing was
         retrieved, or the first retrieved result carries a core-named non-RRF
         scale (such a batch reaches the tuner only with
-        ``scale_gated_min_score`` off). Otherwise the ``score_ceiling`` the
-        adapter stamped on an ``rrf`` result, else :data:`RRF_BASELINE_CEILING`.
-        An unstamped batch (compact format, older cores) gets the baseline too:
-        ``min_score`` is drawn on the RRF scale, and a cap set too low costs a
-        little noise where one set too high silences the tool for good (#1062).
-        Same first-retrieved-result rule as :meth:`_result_score_scale`.
+        ``scale_gated_min_score`` off). Only a stamped ceiling may rewrite a
+        stored threshold; the others cap this call's filter and raises. A cap
+        set too low costs a little noise where one set too high silences the
+        tool for good. Same first-retrieved-result rule as
+        :meth:`_result_score_scale`.
         """
         for r in results:
             if getattr(r, "pinned", False):
@@ -784,10 +803,12 @@ class SurfacingEngine:
             scale = getattr(r, "score_scale", None)
             if scale == "rrf":
                 stamped = read_score_ceiling_hint(getattr(r, "score_ceiling", None))
-                return RRF_BASELINE_CEILING if stamped is None else stamped
+                if stamped is not None:
+                    return floor_to_decimals(stamped, STRUCTURED_SCORE_DECIMALS), True
+                return floor_to_decimals(RRF_BASELINE_CEILING, STRUCTURED_SCORE_DECIMALS), False
             if isinstance(scale, str) and scale in KNOWN_SCORE_SCALES:
                 return None
-            return RRF_BASELINE_CEILING
+            return floor_to_decimals(RRF_BASELINE_CEILING, COMPACT_SCORE_DECIMALS), False
         return None
 
     async def _run_within(self, coro: Any, timeout: float, scope: _TimerScope) -> Any:
@@ -1194,13 +1215,15 @@ class SurfacingEngine:
         aggregates and may write one row, and that is not work to do on the
         event loop while other calls are in flight (#996).
 
-        *score_ceiling* caps the tuned value at this batch's reference
-        (:meth:`AutoTuner.effective_ceiling`). The tuner already clamped the
-        stored value for this batch, so this is normally a no-op; it covers a
-        concurrent call for the same tool whose batch carried a higher
-        ceiling (an in-flight request across a reconnect with changed fusion
-        settings) raising the shared value between this call's tuner pass and
-        this read (#1062). Pins and the configured default are never capped.
+        *score_ceiling* caps the tuned value at this batch's cap
+        (:meth:`AutoTuner.effective_ceiling`), so the stored value may be
+        higher than the one applied. That happens for a batch whose ceiling is
+        not stamped (the tuner does not rewrite a learned value on a guess),
+        and when a concurrent call for the same tool whose batch carried a
+        higher ceiling (an in-flight request across a reconnect with changed
+        fusion settings) raises the shared value between this call's tuner
+        pass and this read (#1062). Pins and the configured default are never
+        capped.
         """
         tool_cfg = self._config.context_tools.get(tool)
         if tool_cfg is not None and tool_cfg.min_score is not None:
@@ -1212,7 +1235,9 @@ class SurfacingEngine:
             return min(tuned, self._auto_tuner.effective_ceiling(score_ceiling))
         return self._config.min_score
 
-    async def _maybe_auto_tune(self, tool: str, score_ceiling: float | None = None) -> None:
+    async def _maybe_auto_tune(
+        self, tool: str, score_ceiling: float | None = None, *, stamped: bool = False
+    ) -> None:
         """Let the AutoTuner re-read feedback and move ``min_score``, off-loop.
 
         Skipped for a pinned tool: :meth:`_active_min_score` returns the pin
@@ -1221,9 +1246,9 @@ class SurfacingEngine:
         behavior, kept explicit now that the call is no longer nested inside
         the score lookup.
 
-        *score_ceiling* is the batch's RRF reference ceiling
-        (:meth:`_batch_score_ceiling`); the tuner keeps ``min_score`` at or
-        below it so a raise cannot filter out every two-leg result (#1062).
+        *score_ceiling* is the batch's cap (:meth:`_batch_score_ceiling`);
+        a raise stops at it, and a *stamped* one also clamps the stored value
+        (#1062).
 
         A failure here is not the caller's problem: the tuner reads feedback
         aggregates on a database a peer process may hold, and a locked read
@@ -1236,7 +1261,12 @@ class SurfacingEngine:
             return
         try:
             await self._await_store_write(
-                functools.partial(self._auto_tuner.maybe_adjust, tool, score_ceiling=score_ceiling)
+                functools.partial(
+                    self._auto_tuner.maybe_adjust,
+                    tool,
+                    score_ceiling=score_ceiling,
+                    persist_clamp=stamped,
+                )
             )
         except Exception:
             # Includes the queue ceiling: a tuner pass that cannot be afforded
@@ -2331,9 +2361,12 @@ class SurfacingEngine:
         # tool ``_active_min_score`` returns the pin before the tuner runs,
         # so the pre-existing "pinned tools don't learn" behavior holds.
         filter_suspended = self._scale_gate_suspends(tool, score_scale)
-        batch_ceiling = self._batch_score_ceiling(retrieved_results)
+        batch_cap = self._batch_score_ceiling(retrieved_results)
+        batch_ceiling = None if batch_cap is None else batch_cap[0]
         if not filter_suspended:
-            await self._maybe_auto_tune(tool, batch_ceiling)
+            await self._maybe_auto_tune(
+                tool, batch_ceiling, stamped=batch_cap is not None and batch_cap[1]
+            )
         min_score = self._active_min_score(tool, batch_ceiling)
         self._observe_score_scale(
             server,

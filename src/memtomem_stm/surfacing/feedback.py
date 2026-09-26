@@ -318,8 +318,9 @@ class AutoTuner:
         about it. The configured ceiling (default ``0.05``) was drawn on a
         ``[0, 1]`` scale and sits above the ``2/61`` baseline reference, so on
         its own it lets raises cross every two-leg score and silence the tool
-        for good (#1062). An operator ``min_score`` above the reference is
-        explicit intent and stays reachable: the cap never drops below it.
+        for good (#1062). The cap never drops below ``min_score``: a floor
+        that is itself unattainable is a separate misconfiguration, and
+        lowering it here would move a threshold nobody tuned.
         """
         ceiling = self._config.auto_tune_score_ceiling
         if score_ceiling is None:
@@ -332,9 +333,10 @@ class AutoTuner:
         Runs on every observed batch, not only when feedback arrives: a tool
         stuck above the reference ceiling surfaces nothing, so it draws no
         new ratings, and waiting for them would keep it silent forever.
-        Persisting keeps the stored value equal to the one the filter uses,
-        so the row is written before the map changes: a failed write leaves
-        the value above ``cap`` and the next batch retries the clamp.
+        Only for a ceiling the batch vouches for (``persist_clamp``); the
+        engine's read cap covers every other batch without rewriting what
+        was learned. The row is written before the map changes: a failed
+        write leaves the value above ``cap`` and the next batch retries.
         """
         score = self._adjustments.get(tool)
         if score is None or score <= cap:
@@ -349,7 +351,13 @@ class AutoTuner:
         )
         return cap
 
-    def maybe_adjust(self, tool: str, score_ceiling: float | None = None) -> float | None:
+    def maybe_adjust(
+        self,
+        tool: str,
+        score_ceiling: float | None = None,
+        *,
+        persist_clamp: bool = True,
+    ) -> float | None:
         """Check feedback ratios and adjust min_score for a tool.
 
         Two independent band checks (#353 part 2):
@@ -369,16 +377,17 @@ class AutoTuner:
         Each tool falls back to the global ratio when its own sample
         count is below ``auto_tune_min_samples`` (cold-start mitigation).
 
-        Both directions stay within :meth:`effective_ceiling` for
-        ``score_ceiling``; a stored value above it is clamped first, even when
-        no new feedback arrived. Returns the new min_score if adjusted,
-        ``None`` otherwise.
+        A raise stops at :meth:`effective_ceiling` for ``score_ceiling`` and
+        never moves the stored value down. With ``persist_clamp`` (a ceiling
+        the batch stamped), a stored value above the cap is first clamped and
+        saved, even when no new feedback arrived. Returns the new min_score if
+        adjusted, ``None`` otherwise.
         """
         if not self._config.auto_tune_enabled:
             return None
 
         cap = self.effective_ceiling(score_ceiling)
-        clamped = self._clamp_to_ceiling(tool, cap)
+        clamped = self._clamp_to_ceiling(tool, cap) if persist_clamp else None
 
         watermark = (
             self._store.get_feedback_count(tool),
@@ -406,7 +415,7 @@ class AutoTuner:
         # feedback is the stronger signal to suppress.
         if neg_ratio is not None and neg_ratio > 0.6:
             new_score = min(current + increment, cap)
-            if new_score != current:
+            if new_score > current:
                 self._adjustments[tool] = new_score
                 self._store.save_adjustment(tool, new_score)
                 logger.info(

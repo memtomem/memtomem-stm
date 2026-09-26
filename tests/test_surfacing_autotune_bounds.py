@@ -216,8 +216,8 @@ class TestRrfReferenceCeiling:
         assert 1 / 61 + 1 / 61 >= tuner.get_effective_min_score("read_file")
 
     def test_stamped_lower_ceiling_caps_lower(self):
-        # rrf_weights [0.5, 0.5] at k=60 → reference 1/61, below the default
-        # min_score 0.017: the cap stays at min_score, so no raise happens.
+        # rrf_weights [0.5, 0.5] at k=60 → reference 1/61 (about 0.0164).
+        # With min_score 0.015 below it, raises climb to the reference and stop.
         cfg = SurfacingConfig(auto_tune_enabled=True, min_score=0.015)
         tuner = AutoTuner(cfg, _store(neg=0.9, helpful=0.0))
         for _ in range(10):
@@ -290,3 +290,20 @@ class TestRrfReferenceCeiling:
         tuner.maybe_adjust("read_file", score_ceiling=self.BASELINE)
         assert tuner.get_effective_min_score("read_file") == self.BASELINE
         store.save_adjustment.assert_called_with("read_file", self.BASELINE)
+
+    def test_unvouched_ceiling_does_not_rewrite_the_stored_value(self):
+        # A ceiling the batch did not stamp caps raises but never lowers what
+        # was learned: the engine's read cap covers the filter instead.
+        cfg = SurfacingConfig(auto_tune_enabled=True)
+        store = _store(neg=0.9, helpful=0.0, adjustments={"read_file": 0.045})
+        tuner = AutoTuner(cfg, store)
+        assert tuner.maybe_adjust("read_file", score_ceiling=0.03, persist_clamp=False) is None
+        assert tuner.get_effective_min_score("read_file") == 0.045
+        store.save_adjustment.assert_not_called()
+
+    def test_unvouched_ceiling_still_caps_a_raise(self):
+        cfg = SurfacingConfig(auto_tune_enabled=True)
+        tuner = AutoTuner(cfg, _store(neg=0.9, helpful=0.0))
+        for _ in range(30):
+            tuner.maybe_adjust("read_file", score_ceiling=0.03, persist_clamp=False)
+        assert tuner.get_effective_min_score("read_file") == 0.03
