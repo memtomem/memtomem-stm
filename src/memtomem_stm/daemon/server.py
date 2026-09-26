@@ -52,6 +52,7 @@ from memtomem_stm.config import STMConfig, _is_loopback_host, log_stm_config_fai
 from memtomem_stm.daemon import discovery, locking
 from memtomem_stm.daemon.latency import DaemonLatencyTracker, LatencyKind, LatencyOutcome
 from memtomem_stm.surfacing.observability import CallLedger, attribute_call
+from memtomem_stm.surfacing.rrf_profile import read_score_ceiling_hint
 from memtomem_stm.surfacing.store_io import close_store_on_worker
 from memtomem_stm.utils import child_reaper
 from memtomem_stm.utils.anyio_shutdown import is_clean_cancel_scope_shutdown
@@ -552,6 +553,13 @@ class DaemonServer:
                         reranker = getattr(result, "reranker", None)
                         if isinstance(reranker, str) and reranker:
                             entry["reranker"] = reranker
+                        # The adapter's per-session bucket ceiling (#1034),
+                        # forwarded, never recomputed here: the adapter pinned
+                        # it to the session that scored the result. Same
+                        # additive, omitted-when-absent contract as the scale.
+                        ceiling = read_score_ceiling_hint(getattr(result, "score_ceiling", None))
+                        if scale == "rrf" and ceiling is not None:
+                            entry["score_ceiling"] = ceiling
                         encoded_results.append(entry)
                     return {
                         "v": PROTOCOL_VERSION,
@@ -699,6 +707,9 @@ class DaemonServer:
                         reranker = getattr(bundle, "reranker", None)
                         if isinstance(reranker, str) and reranker:
                             response["reranker"] = reranker
+                        ceiling = read_score_ceiling_hint(getattr(bundle, "score_ceiling", None))
+                        if scale == "rrf" and ceiling is not None:
+                            response["score_ceiling"] = ceiling
                     return response
 
                 return await self._run_admitted(req, compose_call, latency_kind="retrieval")

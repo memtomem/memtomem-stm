@@ -51,6 +51,8 @@ class FakeSearchResult:
     # (compact format, compose bundles, pre-#1781 cores).
     score_scale: str | None = None
     reranker: str | None = None
+    # Relevance-bucket ceiling the adapter stamps on rrf results (#1034).
+    score_ceiling: float | None = None
 
 
 def _make_config(**overrides) -> SurfacingConfig:
@@ -5455,3 +5457,43 @@ class TestFifoPruneHelper:
         # and one loop in ``_prune_score_scale_maps`` covering all five
         # score-scale tripwire maps (#880).
         assert len(re.findall(r"_fifo_prune\(", source)) == 6
+
+
+class TestRrfBucketCeiling:
+    """#1034: the bucket ceiling travels on the result, not through the engine."""
+
+    @staticmethod
+    def _engine(result):
+        adapter = _make_mcp_adapter([result])
+        config = _make_config(min_score=0.017, dedup_ttl_seconds=0, cooldown_seconds=0)
+        return SurfacingEngine(config=config, mcp_adapter=adapter)
+
+    async def test_stamped_ceiling_reaches_miss_and_cache_hit(self):
+        # 0.05 is above the default ceiling 2/61 (strong) but in the bottom
+        # third of [0.017, 2/11] (weak) — the two readings disagree.
+        result = FakeSearchResult(
+            chunk=FakeChunk(content="ceiling probe"),
+            score=0.05,
+            score_scale="rrf",
+            score_ceiling=2 / 11,
+        )
+        engine = self._engine(result)
+        # A profile on the adapter must not matter: the stamp is authoritative.
+        engine._mcp_adapter.runtime_profile = None
+        args = ("gh", "read_file", {"_context_query": "ceiling probe query"}, LONG_RESPONSE)
+        miss = await engine.surface(*args)
+        assert "[weak]: ceiling probe" in miss
+        # The cache hit re-renders the cached result, stamp included.
+        hit = await engine.surface(*args)
+        assert "[weak]: ceiling probe" in hit
+        assert engine._mcp_adapter.search.await_count == 1
+
+    async def test_unstamped_rrf_result_uses_default_ceiling(self):
+        result = FakeSearchResult(
+            chunk=FakeChunk(content="ceiling probe"), score=0.05, score_scale="rrf"
+        )
+        engine = self._engine(result)
+        out = await engine.surface(
+            "gh", "read_file", {"_context_query": "ceiling probe query"}, LONG_RESPONSE
+        )
+        assert "[strong]: ceiling probe" in out

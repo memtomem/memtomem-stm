@@ -458,3 +458,55 @@ def test_daemon_ping_profile_is_used_without_direct_probe(monkeypatch, effective
     )[0]
     assert ("0.0087" in check[3]) is (effective_format == "structured")
     assert check[2] == "WARN"
+
+
+_PINNED_SCOPE = (
+    "Configured snapshot; unmodified two-leg RRF only, before rescue/rerank/decay/boost. "
+    "Not a live score or auto-tuned threshold check; reconnect after Core config changes."
+)
+
+
+def _missing_dense_candidates() -> dict:
+    data = profile()
+    del data["search"]["dense_candidates"]
+    return data
+
+
+@pytest.mark.parametrize(
+    "data,reason,action",
+    [
+        (
+            None,
+            "RRF settings unavailable",
+            "upgrade to a Core exposing runtime_profile.search fusion settings, then reconnect",
+        ),
+        (
+            _missing_dense_candidates(),
+            "Core does not expose all four RRF settings",
+            "upgrade Core, then restart the LTM/daemon to refresh its configuration snapshot",
+        ),
+        (
+            profile(rrf_k=0),
+            "Core reported invalid RRF settings; no threshold recommended",
+            None,
+        ),
+        (
+            profile(enable_dense=False),
+            "Two positive-weight, enabled retrieval legs are not reported",
+            None,
+        ),
+        (
+            profile(rrf_k=10**400),
+            "Core RRF settings exceed the diagnostic's numeric range",
+            None,
+        ),
+    ],
+)
+def test_profile_failure_checks_are_pinned_verbatim(data, reason, action):
+    """Every structural failure branch, compared whole: the profile checks are
+    shared with surfacing (``surfacing.rrf_profile``), and a fragment assertion
+    would let a reworded doctor message through."""
+    checks = rrf_boundary_doctor_checks(data, SurfacingConfig(), effective_format="structured")
+    assert checks == [
+        ("ltm_rrf_boundary", "ltm RRF boundary", "WARN", f"{reason}. {_PINNED_SCOPE}", action)
+    ]

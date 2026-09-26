@@ -23,6 +23,7 @@ from mcp.types import CONNECTION_CLOSED, TextContent
 
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.observability import record_search_rpc
+from memtomem_stm.surfacing.rrf_profile import rrf_score_ceiling
 from memtomem_stm.utils.mcp_transport import streamable_http_transport
 from memtomem_stm.utils.json_out import (
     escape_lone_surrogates,
@@ -115,6 +116,10 @@ class ContextComposeResult:
     # stamps exactly as the ``mem_search`` path does.
     score_scale: str | None = None
     reranker: str | None = None
+    # Relevance-bucket ceiling for an ``rrf`` bundle (#1034), mirrored like
+    # ``score_scale`` so the daemon can re-encode it; see
+    # ``RemoteSearchResult.score_ceiling``.
+    score_ceiling: float | None = None
 
 
 @dataclass
@@ -149,6 +154,7 @@ class RemoteSearchResult:
         context: RemoteContextInfo | None = None,
         score_scale: str | None = None,
         reranker: str | None = None,
+        score_ceiling: float | None = None,
     ):
         self.chunk = self._FakeChunk(content, source, namespace)
         self.score = score
@@ -162,6 +168,14 @@ class RemoteSearchResult:
         # shared mutable state is needed across concurrent surfacing calls.
         self.score_scale = score_scale
         self.reranker = reranker
+        # Top of the relevance-bucket band for an ``rrf`` score (#1034):
+        # ``sum(w)/(k+1)`` from the runtime profile of the Core session that
+        # produced this score, stamped when the reply is parsed (or forwarded by
+        # the daemon); an unusable profile stamps the 2/61 fallback. ``None`` on
+        # every other scale and wherever nothing stamped it (compact format,
+        # an older daemon); the formatter then uses 2/61. Per result for the
+        # same reason as the scale.
+        self.score_ceiling = score_ceiling
 
 
 def require_context_compose_lists(
@@ -1419,6 +1433,10 @@ class McpClientSearchAdapter:
         # requested as structured be parsed as compact, or the reverse — a
         # parse error on a perfectly good answer.
         parser = self._parser
+        # Pinned with the parser for the same reason: the bucket ceiling must
+        # come from the profile of the session that scores this request, and
+        # ``_negotiate_format`` rewrites the profile on every (re)connect.
+        score_ceiling = rrf_score_ceiling(self._runtime_profile)
         if isinstance(parser, StructuredResultParser):
             args["output_format"] = "structured"
         self._refresh_rerank_arg(args)
@@ -1440,6 +1458,7 @@ class McpClientSearchAdapter:
                 # it, since a downgrade to compact must not leave the old
                 # ``output_format`` on the retried call.
                 parser = self._parser
+                score_ceiling = rrf_score_ceiling(self._runtime_profile)
                 if isinstance(parser, StructuredResultParser):
                     args["output_format"] = "structured"
                 else:
@@ -1495,6 +1514,9 @@ class McpClientSearchAdapter:
             results, hints = parser.parse(
                 text, max_content_chars=self._config.result_content_max_chars
             )
+        for r in results:
+            if r.score_scale == "rrf":
+                r.score_ceiling = score_ceiling
         outcome: SearchOutcome = "ok" if results else "empty_results"
         return results, hints, outcome
 
@@ -1585,12 +1607,22 @@ class McpClientSearchAdapter:
         }
         if agent_id:
             params["agent_id"] = agent_id
+        # ``_call_mem_do`` calls ``refresh_params`` right before each send,
+        # including the retry on a new session, so the ceiling recorded here is
+        # the one of the session that served the reply (see ``search``).
+        score_ceiling = rrf_score_ceiling(None)
+
+        def refresh(send_params: dict[str, Any]) -> None:
+            nonlocal score_ceiling
+            self._refresh_rerank_arg(send_params)
+            score_ceiling = rrf_score_ceiling(self._runtime_profile)
+
         try:
             result = await self._call_mem_do(
                 "context_compose",
                 params,
                 trace_id=trace_id,
-                refresh_params=self._refresh_rerank_arg,
+                refresh_params=refresh,
             )
         except self._TRANSPORT_ERRORS as exc:
             raise LtmTransportError("core context_compose transport unavailable") from exc
@@ -1614,6 +1646,7 @@ class McpClientSearchAdapter:
         # never emits them, matching the ``mem_search`` structured parser).
         score_scale = read_score_scale_hint(payload.get("score_scale"))
         reranker = read_score_scale_hint(payload.get("reranker"))
+        bundle_ceiling = score_ceiling if score_scale == "rrf" else None
 
         pinned: list[RemoteSearchResult] = []
         for item in raw_pinned:
@@ -1660,6 +1693,7 @@ class McpClientSearchAdapter:
                 context=context,
                 score_scale=score_scale,
                 reranker=reranker,
+                score_ceiling=bundle_ceiling,
             )
             memory_id = item.get("id") or item.get("chunk_id")
             if isinstance(memory_id, str) and memory_id:
@@ -1677,6 +1711,7 @@ class McpClientSearchAdapter:
             omitted_block_ids=omitted,
             score_scale=score_scale,
             reranker=reranker,
+            score_ceiling=bundle_ceiling,
         )
 
     async def candidate_propose(

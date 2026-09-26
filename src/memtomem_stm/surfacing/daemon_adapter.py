@@ -27,6 +27,7 @@ from memtomem_stm.surfacing.mcp_client import (
     read_score_scale_hint,
     require_context_compose_lists,
 )
+from memtomem_stm.surfacing.rrf_profile import read_score_ceiling_hint
 from memtomem_stm.utils.numeric import safe_float
 
 logger = logging.getLogger(__name__)
@@ -136,6 +137,11 @@ class DaemonLtmAdapter:
         # clamps to schema 3 and omits the keys.
         score_scale = read_score_scale_hint(resp.get("score_scale"))
         reranker = read_score_scale_hint(resp.get("reranker"))
+        # The daemon forwards its adapter's bucket ceiling for an ``rrf``
+        # bundle (#1034); an old daemon omits it and the formatter uses 2/61.
+        score_ceiling = (
+            read_score_ceiling_hint(resp.get("score_ceiling")) if score_scale == "rrf" else None
+        )
 
         def decode(item: Any, *, pinned: bool):
             if not isinstance(item, dict) or not isinstance(item.get("content"), str):
@@ -156,6 +162,7 @@ class DaemonLtmAdapter:
                 context=context,
                 score_scale=None if pinned else score_scale,
                 reranker=None if pinned else reranker,
+                score_ceiling=None if pinned else score_ceiling,
             )
             if isinstance(item.get("chunk_id"), str):
                 result.chunk.id = item["chunk_id"]
@@ -179,6 +186,7 @@ class DaemonLtmAdapter:
             ),
             score_scale=score_scale,
             reranker=reranker,
+            score_ceiling=score_ceiling,
         )
 
     async def candidate_propose(
@@ -266,13 +274,18 @@ class DaemonLtmAdapter:
             score = safe_float(item.get("score"), float("nan"))
             if not math.isfinite(score):
                 continue
+            scale = read_score_scale_hint(item.get("score_scale"))
             result = RemoteSearchResult(
                 content=item["content"],
                 score=score,
                 source=str(item.get("source") or ""),
                 namespace=str(item.get("namespace") or "default"),
-                score_scale=read_score_scale_hint(item.get("score_scale")),
+                score_scale=scale,
                 reranker=read_score_scale_hint(item.get("reranker")),
+                # Forwarded bucket ceiling (#1034); absent from an old daemon.
+                score_ceiling=(
+                    read_score_ceiling_hint(item.get("score_ceiling")) if scale == "rrf" else None
+                ),
             )
             chunk_id = item.get("chunk_id")
             if isinstance(chunk_id, str) and chunk_id:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
@@ -38,6 +40,8 @@ class FakeResult:
     # Core-reported scale stamp (#1781). Default mirrors the unstamped paths
     # (compact format, compose bundles, pre-#1781 cores).
     score_scale: str | None = None
+    # Relevance-bucket ceiling stamped by the LTM adapter on rrf results (#1034).
+    score_ceiling: Any = None
 
 
 def _preview_line_after_bucket(output: str, bucket: str = "related") -> str:
@@ -227,10 +231,9 @@ class TestFormatterInjection:
         assert "[strong]" not in output
 
     def test_bucket_suppressed_for_known_nonrrf_scale(self):
-        """The [weak|related|strong] band partitions [floor, 1.0], which only
-        holds on the RRF scale — a result stamped with a core-named non-RRF
-        scale (rerank logits can be negative, bm25 is unbounded) renders
-        without a bucket tag, keyed per result off the stamp."""
+        """No bucket band applies to a core-named non-RRF scale (rerank logits
+        can be negative, bm25 is unbounded), so such a result renders without a
+        bucket tag, keyed per result off the stamp."""
         fmt = SurfacingFormatter(SurfacingConfig())
         results = [
             FakeResult(FakeChunk(content="logit hit", id="s-rerank"), -0.17, score_scale="rerank"),
@@ -248,7 +251,8 @@ class TestFormatterInjection:
         bucket exactly as before."""
         fmt = SurfacingFormatter(SurfacingConfig())
         results = [
-            FakeResult(FakeChunk(content="rrf hit", id="k-rrf"), 0.95, score_scale="rrf"),
+            # An attainable RRF score (the 2-leg reference is 2/61 ≈ 0.0328).
+            FakeResult(FakeChunk(content="rrf hit", id="k-rrf"), 0.031, score_scale="rrf"),
             FakeResult(FakeChunk(content="unstamped hit", id="k-bare"), 0.95),
             FakeResult(
                 FakeChunk(content="future hit", id="k-future"), 0.95, score_scale="cosine9000"
@@ -258,6 +262,71 @@ class TestFormatterInjection:
         assert "`k-rrf` [strong]: rrf hit" in output
         assert "`k-bare` [strong]: unstamped hit" in output
         assert "`k-future` [strong]: future hit" in output
+
+    @pytest.mark.parametrize(
+        "score,bucket",
+        [
+            (0.0180, "weak"),  # below floor + band/3 ≈ 0.022262
+            (0.0250, "related"),  # below floor + 2·band/3 ≈ 0.027525
+            (0.0300, "strong"),
+            (2 / 61, "strong"),  # exactly the ceiling
+            (0.04, "strong"),  # above the ceiling (rescue leg / boost)
+        ],
+    )
+    def test_rrf_bucket_spans_floor_to_default_ceiling(self, score, bucket):
+        """#1034: rrf-stamped thirds span [floor, 2/61], not [floor, 1.0] —
+        under the old band every one of these rendered [weak]."""
+        fmt = SurfacingFormatter(SurfacingConfig(min_score=0.017))
+        results = [FakeResult(FakeChunk(content="hit", id="k"), score, score_scale="rrf")]
+        output = fmt.inject("response", results, "query")  # no stamp → 2/61
+        assert f"`k` [{bucket}]: hit" in output
+
+    def test_rrf_bucket_uses_stamped_ceiling(self):
+        # Ceiling 2/11 (k=10): 0.05 sits in the bottom third, whereas the
+        # default 2/61 ceiling would call it strong.
+        fmt = SurfacingFormatter(SurfacingConfig(min_score=0.017))
+        stamped = FakeResult(
+            FakeChunk(content="hit", id="k"), 0.05, score_scale="rrf", score_ceiling=2 / 11
+        )
+        bare = FakeResult(FakeChunk(content="hit", id="k"), 0.05, score_scale="rrf")
+        assert "`k` [weak]: hit" in fmt.inject("response", [stamped], "query")
+        assert "`k` [strong]: hit" in fmt.inject("response", [bare], "query")
+
+    def test_rrf_ceiling_below_floor_is_strong(self):
+        # w=[0.5, 0.5] at k=60 gives 1/61 < floor 0.017: no band to split.
+        fmt = SurfacingFormatter(SurfacingConfig(min_score=0.017))
+        results = [
+            FakeResult(
+                FakeChunk(content="hit", id="k"), 0.017, score_scale="rrf", score_ceiling=1 / 61
+            )
+        ]
+        assert "`k` [strong]: hit" in fmt.inject("response", results, "query")
+
+    @pytest.mark.parametrize(
+        "stamp", ["x", -1, 0, True, float("inf"), float("nan"), 10**400, MagicMock()]
+    )
+    def test_invalid_ceiling_stamp_falls_back_to_default(self, stamp):
+        # 0.0250 is [related] under 2/61; a stamp read as-is would move it
+        # (or raise), so every invalid stamp must land on the default.
+        fmt = SurfacingFormatter(SurfacingConfig(min_score=0.017))
+        results = [
+            FakeResult(
+                FakeChunk(content="hit", id="k"), 0.0250, score_scale="rrf", score_ceiling=stamp
+            )
+        ]
+        assert "`k` [related]: hit" in fmt.inject("response", results, "query")
+
+    def test_ceiling_stamp_ignored_off_the_rrf_scale(self):
+        # The stamp only applies to rrf results; unstamped scores still split
+        # [floor, 1.0] even when a (stray) ceiling is attached.
+        fmt = SurfacingFormatter(SurfacingConfig(min_score=0.017))
+        results = [
+            FakeResult(FakeChunk(content="high", id="u-high"), 0.95, score_ceiling=2 / 61),
+            FakeResult(FakeChunk(content="low", id="u-low"), 0.03, score_ceiling=2 / 61),
+        ]
+        output = fmt.inject("response", results, "query")
+        assert "`u-high` [strong]: high" in output
+        assert "`u-low` [weak]: low" in output
 
     def test_source_renders_parent_and_basename(self):
         fmt = SurfacingFormatter(SurfacingConfig())
