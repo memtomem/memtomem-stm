@@ -49,6 +49,7 @@ from test_surfacing_opportunities import (
     FakeResult,
     FixedRng,
     _close,
+    _adapter,
     _config,
     _engine,
     _events,
@@ -64,12 +65,32 @@ DRAWS = {"withheld": WITHHELD_DRAW, "shown": SHOWN_DRAW}
 
 
 def _holdout_engine(
-    tmp_path: Path, arm: str | None, results: list[FakeResult] | None = None, **config: Any
+    tmp_path: Path,
+    arm: str | None,
+    results: list[FakeResult] | None = None,
+    *,
+    adapter: Any = None,
+    **config: Any,
 ) -> tuple[SurfacingEngine, FeedbackTracker, FixedRng]:
     rng = FixedRng([] if arm is None else [DRAWS[arm]])
     config.setdefault("holdout_rate", 0.5)
-    engine, tracker = _engine(tmp_path, results or [_result("m1")], rng=rng, **config)
+    engine, tracker = _engine(
+        tmp_path, results or [_result("m1")], adapter=adapter, rng=rng, **config
+    )
     return engine, tracker, rng
+
+
+PINNED = FakeResult(
+    chunk=FakeChunk(id="p1", content="pinned rule: always run tests with uv"), pinned=True
+)
+SCRATCH = [{"key": "current_task", "value": "wiring the holdout draw"}]
+
+
+def _whole_block_adapter() -> Any:
+    """A retrieved memory, a pinned one and a session-context item."""
+    adapter = _adapter([_result("m1"), PINNED])
+    adapter.scratch_list = AsyncMock(return_value=list(SCRATCH))
+    return adapter
 
 
 async def _warm(engine: SurfacingEngine) -> None:
@@ -130,7 +151,13 @@ class TestParity:
         webhooks = {}
         runs: dict[str, dict[str, Any]] = {}
         for arm in ("withheld", "shown"):
-            engine, tracker, rng = _holdout_engine(tmp_path / arm, arm, fire_webhook=True)
+            engine, tracker, rng = _holdout_engine(
+                tmp_path / arm,
+                arm,
+                adapter=_whole_block_adapter(),
+                fire_webhook=True,
+                include_session_context=True,
+            )
             webhook = MagicMock()
             webhook.fire = AsyncMock()
             engine._webhook_manager = webhook
@@ -178,8 +205,15 @@ class TestParity:
                 await _close(engine, tracker)
 
         withheld, shown = runs["withheld"], runs["shown"]
+        # The treatment is the whole block: shown carries the retrieved and
+        # pinned memories (and, on the miss path, the session-context item);
+        # withheld returns the response byte for byte.
         assert withheld["out"] == RESPONSE
         assert shown["out"] != RESPONSE and "<surfaced-memories>" in shown["out"]
+        assert "flask routing uses blueprints" in shown["out"]
+        assert "always run tests with uv" in shown["out"]
+        if path_kind == "miss":
+            assert "wiring the holdout draw" in shown["out"]
         assert withheld["rng_calls"] == shown["rng_calls"] == 1
 
         ignore = ("id", "created_at", "arm", "injected_chars")
@@ -391,11 +425,16 @@ class TestWritePaths:
             assert out != RESPONSE and "<surfaced-memories>" in out
             assert surfacing_id not in out, "the dead feedback id must be withdrawn"
 
-    async def test_fails_outright(self, tmp_path: Path, arm: str, path_kind: str) -> None:
+    @pytest.mark.parametrize("how", ["raises", "store-closed"])
+    async def test_fails_outright(self, tmp_path: Path, arm: str, path_kind: str, how: str) -> None:
+        # ``store-closed``: the tracker answers False instead of raising; each
+        # path turns that into its own RuntimeError, which must count once.
         engine, tracker = await self._setup(tmp_path, arm, path_kind)
         try:
             landed = len(_events(tracker.store.db_path))
-            tracker.record_surfacing = _refuse  # type: ignore[method-assign]
+            tracker.record_surfacing = (  # type: ignore[method-assign]
+                _refuse if how == "raises" else (lambda *_a, **_k: False)
+            )
             out = await _drawn(engine)
             await _settle(engine)
             opp = _opps(tracker.store.db_path)[-1]

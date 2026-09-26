@@ -21,8 +21,8 @@ changes inline only. See the deprecation policy in
   `holdout_rate` columns. Only Claude Code hook calls through the shared daemon are drawn;
   the proxy path never is. `surfacing_stats`, `mms stats` and `mms doctor` count only
   shown events as surfacings and report withheld ones separately, and `mms stats` /
-  `mms doctor` now also show the opportunity log. With the default rate nothing changes
-  except the two added columns.
+  `mms doctor` now also show the opportunity log. With the default rate no injection is
+  withheld.
 
 ## [0.6.0] — 2026-09-26
 
