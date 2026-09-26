@@ -2205,33 +2205,54 @@ class TestRrfCeilingStamp:
         assert outcome == "ok"
         assert results[0].score_ceiling == pytest.approx(2 / 11)
 
-    @pytest.mark.asyncio
-    async def test_compose_stamps_retrieved_and_envelope_from_the_serving_session(self):
+    @staticmethod
+    def _compose_adapter(call_tool) -> McpClientSearchAdapter:
         from memtomem_stm.surfacing.mcp_client import LtmCapabilities
 
-        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="structured"))
+        adapter = TestRrfCeilingStamp._adapter(_fusion_profile(), call_tool)
         adapter._capabilities = LtmCapabilities(context_compose_schema=4)
-        adapter._runtime_profile = _fusion_profile()
-        adapter._heal_if_needed = AsyncMock(return_value=True)  # type: ignore[method-assign]
-        payload = {
-            "pinned": [{"content": "pinned block", "block_id": "pin-1"}],
-            "retrieved": [{"id": "hit", "content": "matched", "source": "a.md", "score": 0.03}],
-            "score_scale": "rrf",
-        }
+        return adapter
 
-        async def call_mem_do(_action, params, *, trace_id=None, refresh_params=None):
-            # First send, then a retry on a new session whose Core fuses at
-            # k=10: the reply belongs to the retry, so its ceiling must win.
-            refresh_params(params)
+    _COMPOSE_PAYLOAD = {
+        "pinned": [{"content": "pinned block", "block_id": "pin-1"}],
+        "retrieved": [{"id": "hit", "content": "matched", "source": "a.md", "score": 0.03}],
+        "score_scale": "rrf",
+    }
+
+    @pytest.mark.asyncio
+    async def test_compose_profile_swapped_mid_rpc_keeps_the_issuing_ceiling(self):
+        adapter: McpClientSearchAdapter
+
+        async def reply(*_args, **_kwargs):
             adapter._runtime_profile = _fusion_profile(rrf_k=10)
-            refresh_params(params)
-            adapter._runtime_profile = None  # a later reconnect must not leak in
-            return SimpleNamespace(
-                is_error=False, content=[SimpleNamespace(type="text", text=json.dumps(payload))]
-            )
+            return _result_with_text(json.dumps(self._COMPOSE_PAYLOAD))
 
-        adapter._call_mem_do = call_mem_do  # type: ignore[method-assign]
+        adapter = self._compose_adapter(AsyncMock(side_effect=reply))
         bundle = await adapter.context_compose("q")
+        assert bundle is not None
+        assert bundle.score_ceiling == pytest.approx(2 / 61)
+        assert bundle.retrieved[0].score_ceiling == pytest.approx(2 / 61)
+
+    @pytest.mark.asyncio
+    async def test_compose_stamps_retrieved_and_envelope_from_the_serving_session(self):
+        # Through the real ``_call_mem_do``: the first send fails, the reconnect
+        # lands on a Core fusing at k=10, and the retry's reply must carry that
+        # session's ceiling, not the first one's.
+        adapter = self._compose_adapter(
+            AsyncMock(
+                side_effect=[
+                    ConnectionError("transient"),
+                    _result_with_text(json.dumps(self._COMPOSE_PAYLOAD)),
+                ]
+            )
+        )
+
+        async def reconnect(*_args, **_kwargs):
+            adapter._runtime_profile = _fusion_profile(rrf_k=10)
+
+        adapter._reconnect = AsyncMock(side_effect=reconnect)  # type: ignore[method-assign]
+        bundle = await adapter.context_compose("q")
+        adapter._reconnect.assert_awaited_once()
         assert bundle is not None
         assert bundle.score_ceiling == pytest.approx(2 / 11)
         assert bundle.retrieved[0].score_ceiling == pytest.approx(2 / 11)

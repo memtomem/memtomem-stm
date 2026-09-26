@@ -23,7 +23,8 @@ changes inline only. See the deprecation policy in
   when an older daemon omits the stamp. Replaying
   4,708 recorded `rrf` scores at the default `min_score` gives 3,245 `[strong]`,
   1,194 `[related]` and 269 `[weak]`, where all 4,708 were `[weak]` before.
-  Unstamped results (compact format, older cores) keep the `[min_score, 1.0]` band.
+  Results without a `score_scale` stamp (compact format, older cores) keep the
+  `[min_score, 1.0]` band.
 - **Explicit progressive compression rows record the first delivered response**
   (#1039). `compressed_chars` used to be the whole cleaned text on this path, so
   its saved ratio was 0%. When the response is chunked, it is now the first chunk

@@ -221,8 +221,9 @@ async def test_direct_schema_two_compose_forwards_scope_fields(
         trace_id="trace-1",
         refresh_params=ANY,
     )
-    # The hook wraps ``_refresh_rerank_arg`` (it also records the bucket
-    # ceiling, #1034), so check what it does rather than which function it is.
+    # The hook wraps ``_refresh_rerank_arg`` (#1034), so check its rerank
+    # behavior rather than which function it is. The ceiling it also records
+    # is covered in ``tests/test_mcp_client_reconnect.py``.
     refresh = call.await_args.kwargs["refresh_params"]
     probe = {"rerank": "stale"}
     refresh(probe)

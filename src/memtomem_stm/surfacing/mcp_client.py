@@ -171,8 +171,10 @@ class RemoteSearchResult:
         # Top of the relevance-bucket band for an ``rrf`` score (#1034):
         # ``sum(w)/(k+1)`` from the runtime profile of the Core session that
         # produced this score, stamped when the reply is parsed (or forwarded by
-        # the daemon). ``None`` on every other scale and when unknown; the
-        # formatter then uses 2/61. Per result for the same reason as the scale.
+        # the daemon); an unusable profile stamps the 2/61 fallback. ``None`` on
+        # every other scale and wherever nothing stamped it (compact format,
+        # an older daemon); the formatter then uses 2/61. Per result for the
+        # same reason as the scale.
         self.score_ceiling = score_ceiling
 
 
