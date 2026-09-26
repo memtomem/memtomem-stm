@@ -184,6 +184,8 @@ Status meanings:
 | `MEMTOMEM_STM_SURFACING__QUERY_RETENTION_DAYS` | non-negative integer | `30` | Raw persisted query retention. | Bundled |
 | `MEMTOMEM_STM_SURFACING__STATS_RETENTION_DAYS` | non-negative integer | `90` | Surfacing event/feedback row retention. | Bundled |
 | `MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT` | boolean | `true` | Persist raw query text instead of a short digest. | Bundled |
+| `MEMTOMEM_STM_SURFACING__OPPORTUNITIES_ENABLED` | boolean | `true` | Write one opportunity row per call that entered surfacing. | Bundled |
+| `MEMTOMEM_STM_SURFACING__OPPORTUNITIES_SAMPLE_RATE` | float `0..1` | `1.0` | Share of opportunity rows kept. | Bundled |
 | `MEMTOMEM_STM_SURFACING__CONSUMER_MODEL` | string | empty | Explicit surfacing consumer model. | Bundled |
 | `MEMTOMEM_STM_SURFACING__RESULT_FORMAT` | `compact / structured` | `structured` | Legacy `mem_search` response format. | Bundled |
 | `MEMTOMEM_STM_SURFACING__RERANK` | boolean or `none` | `false` | Force, bypass, or defer Core reranking when supported. | Bundled |

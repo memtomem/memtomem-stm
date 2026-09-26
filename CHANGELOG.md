@@ -13,6 +13,22 @@ changes inline only. See the deprecation policy in
 
 ### Upgrade notes
 
+- **Surfacing now writes one opportunity row per call it considers.** Engines with a
+  feedback tracker (the shared daemon, and the proxy with `feedback_enabled`) queue
+  a `surfacing_opportunities` row for every call that entered surfacing, including
+  the ones it declined, at about 320 bytes a row, deleted with `stats_retention_days`.
+  Rows hold counts about the arguments, never their keys or values. The write is
+  fire-and-forget and no response waits on it. Opt out with
+  `MEMTOMEM_STM_SURFACING__OPPORTUNITIES_ENABLED=false`, or keep a share with
+  `opportunities_sample_rate`. `stm_surfacing_stats` now reads its stored counts on a
+  worker thread, since counting the new table scans every retained row (about 0.4 s
+  per million rows, measured), and gains an `Opportunities` line
+  and two healthy skip reasons, `empty_render` and `cancelled`. `empty_render` now
+  counts as a completed search in the health verdict, so a process that hit it gains
+  attempts it did not count before; a process whose only calls were cancelled now
+  shows `insufficient data` where it showed no verdict.
+  Until an upgraded process opens `stm_feedback.db`, `mms doctor` reports the new
+  table as missing.
 - **RRF results now show `[related]` and `[strong]`** (#1034). The relevance bucket
   split `[min_score, 1.0]` into thirds, but hybrid RRF scores cluster below the
   default two-leg reference score `2/61` (about 0.033), far under the old `[related]`
@@ -251,6 +267,26 @@ changes inline only. See the deprecation policy in
   bounded by `stats_retention_days`. Existing rows read `NULL` in the new columns.
   The migration now runs as one locked transaction, so two processes upgrading the
   same file at once no longer race each other.
+- **Surfacing logs every call it considers, not only the ones it delivers.** A new
+  `surfacing_opportunities` table records one row per call that entered surfacing,
+  labelled with how it ended: `surfaced`, `skip:<reason>`, `empty_render`, or
+  `error:<kind>`. It also holds the event id the call tried to write, the hook
+  session, the shape of the arguments and a digest of the extracted query. The
+  shape is the number of arguments, a path's depth and, for a common file type, its
+  extension. No argument key or value is stored.
+  Until now the skips existed only in in-process counters, which the daemon loses
+  when it exits. Two exits that recorded nothing now have a skip reason:
+  `empty_render` (the formatter rendered no bullet) and `cancelled` (the call was
+  cancelled before a decision; the cancellation still propagates). The health
+  verdict counts `empty_render` as a completed search, like `no_results_*`, and
+  leaves `cancelled` out. `RelevanceGate.should_surface` now returns a falsy
+  `GateRejection` carrying the rejecting `SkipReason` instead of `None`, so a
+  caller that tests the result for truth still reads a refusal as one. The
+  stats-retention sweep now rolls back as a whole when one of its deletes fails;
+  before, the deletes that had already
+  run were committed by the next unrelated write. New settings:
+  `opportunities_enabled` (default `true`) and `opportunities_sample_rate` (default
+  `1.0`). **Behavior change**: see the upgrade notes above.
 
 ### Fixed
 

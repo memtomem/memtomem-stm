@@ -221,6 +221,8 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `query_retention_days` | `30` | Days to keep the raw extracted query text in `surfacing_events.query` before the opportunistic cleanup nulls it out; `0` to disable (column keeps whatever `record_surfacing` wrote, indefinitely). This knob only clears the column — the event row itself is deleted by `stats_retention_days` (below), not here. |
 | `stats_retention_days` | `90` | Days to keep the `surfacing_events` row itself (and its `surfacing_feedback`) before the cleanup **deletes** it; `0` to disable (rows kept indefinitely — the pre-#584 behavior). Unlike `query_retention_days` (which only nulls the query column, keeping the row for aggregates), this bounds the table so the `surfacing_stats` action cannot full-scan an ever-growing history. Runs both opportunistically from `surface()` and once at startup, so a stats read right after a restart still sees a bounded table. Keep it `>= query_retention_days` if you want the nulled-query rows to survive for aggregates before deletion. |
 | `persist_query_text` | `true` | When `false`, `FeedbackStore` stores `sha256:<16-hex>` instead of the raw extracted query in `surfacing_events.query`. The in-process surfacing call (relevance cooldown, formatter, MCP search) keeps the raw text — this knob only governs what gets persisted to disk. The `surfacing_stats` action renders the hash verbatim and prints a one-line legend so the substitution is visible. |
+| `opportunities_enabled` | `true` | Write one `surfacing_opportunities` row per call that entered surfacing, labelled with how it ended (see [Opportunity log](#opportunity-log)). Only engines with a feedback tracker write rows. |
+| `opportunities_sample_rate` | `1.0` | Share of opportunity rows kept, `0.0`–`1.0`. Rows the rate drops are counted in the `surfacing_stats` action but not stored. |
 | `context_window_size` | `0` | Expand ±N adjacent chunks around search hits; `0` to disable |
 | `result_content_max_chars` | `500` | Max chars retained per LTM result before the formatter sees it |
 | `preview_max_chars` | `300` | Max chars per result preview in the injected memory block |
@@ -576,6 +578,23 @@ Every delivered, non-pinned memory also gets one `surfacing_memory_paths` row, w
 
 The hashes are HMAC-SHA256 truncated to 16 bytes, under a random per-install key created in the `stm_meta` table of the same file. The key keeps paths and text out of the tables and out of anything exported from them; it is readable by anyone who can read `stm_feedback.db`, so it is not protection against a local reader. A row takes about 1.8 KB with a full 300-character preview.
 
+### Opportunity log
+
+`surfacing_events` only holds calls that tried to deliver something. `surfacing_opportunities` holds one row per call that **entered** surfacing — past the `enabled` check — including every call that was declined, so the calls that surfaced can be read against the calls that could have. Each row is queued fire-and-forget at the end of the call; no response waits on it, and a row the write queue refuses is lost rather than retried.
+
+| Column | Meaning |
+|---|---|
+| `gate_decision` | How the call ended: `surfaced`, `skip:<reason>` (any skip reason above, including `skip:cancelled`), `empty_render`, or `error:<kind>` — `error:timeout`, `error:other`, or `error:<ExceptionType>` for an exception that escaped surfacing (it still propagates). |
+| `surfacing_id` | The event the call minted and tried to write. Set as soon as the write is queued, so it can name an event that never landed (the write failed or the queue was full). |
+| `host_session_id` | The hook host's session id; `NULL` on the proxy path. |
+| `server`, `tool` | As on `surfacing_events`. |
+| `arg_shape_json` | Counts about the call's arguments, never their keys or values: how many top-level arguments it had (`key_count`); the depth of a `file_path` / `path` argument and its extension when that is one of a fixed set of common file types (otherwise `"other"`); and the query's token count. Key names are left out because a tool that accepts arbitrary keys lets the caller choose them. |
+| `response_len` | The response size the `min_response_chars` gate judged. |
+| `query_digest` | `sha256:` + 16 hex of the extracted query, taken before a query that looks sensitive is replaced by its digest; `NULL` when the call ended before a query was extracted. For a non-sensitive query this equals the event row's `query` under `persist_query_text=false`. |
+| `score_scale` | The core-reported scale of the batch, when the call got that far; a label outside the known set (`rrf`, `bm25`, `dense`, `none`, `rerank`) is stored as `other`. |
+
+Coverage follows the feedback tracker: the shared daemon and a proxy with `feedback_enabled` write rows; the cold in-process hook and a proxy with feedback off write none, as they write no event rows either. Calls turned away before surfacing starts — hook-ineligible tools, `upstream_disabled`, `progressive_mode_conflict`, daemon load shedding — have no row. `opportunities_sample_rate` below `1.0` keeps a random share; the rest are counted, per tool, in the `surfacing_stats` action's `Opportunities` line for the current process (omitted when the action is given a `since` window, since the count is not time-stamped). Rows are deleted by their own `created_at` with `stats_retention_days`. A row takes about 320 bytes.
+
 ## Feedback & Auto-Tuning
 
 ```mermaid
@@ -851,3 +870,12 @@ hit:
 - `no_results_empty_cache` — the cache stored an empty list
   (deliberate zero-result entry from a prior LTM miss) and the
   repeat call hit it.
+- `empty_render` — results passed every filter but the formatter
+  rendered no bullet, so the response passed through unchanged.
+- `cancelled` — the call was cancelled (a client hanging up, a
+  caller's deadline, shutdown) before it reached a decision. The
+  cancellation still propagates.
+
+The verdict counts `empty_render` as a completed search, like the
+`no_results_*` family: the LTM answered and only the render came out
+empty. `cancelled` is not an LTM attempt and does not move the ratio.

@@ -1952,7 +1952,14 @@ async def stm_surfacing_stats(
         "stm_surfacing_stats",
         metadata={"tool": tool, "since": since, "limit": limit},
     ):
-        stats = app.feedback_tracker.get_stats(tool=tool, since=since_ts, limit=limit)
+        # Off the event loop: the opportunity aggregate scans every retained
+        # row (about 0.4 s per million, measured), and a proxy blocked here
+        # stalls every other tool call. A plain thread, not the store-write
+        # worker, so a slow read never queues ahead of a delivery's awaited
+        # event write; the store's read connection has its own lock.
+        stats = await asyncio.to_thread(
+            app.feedback_tracker.get_stats, tool=tool, since=since_ts, limit=limit
+        )
 
         # Taken once, up front: the verdict line at the top and the skip /
         # outcome / cache sections at the bottom must describe the same
@@ -1984,6 +1991,29 @@ async def stm_surfacing_stats(
             f"Distinct tools:  {stats['distinct_tools']}",
             f"Total feedback:  {stats['total_feedback']}",
         ]
+
+        # Opportunities: calls that entered surfacing, surfaced or not. The
+        # stored count is durable (every process writing this DB); the
+        # sampled-out count is this process's only, so it is labelled as such,
+        # and carries no timestamps, so a ``since`` window leaves it out.
+        # Both absent → no line, keeping the zero-traffic output unchanged.
+        opportunities_total = int(stats.get("opportunities_total") or 0)
+        sampled_out = 0
+        if obs_snapshot is not None and since_ts is None:
+            sampled_out = int(
+                (obs_snapshot.get("opportunities_sampled_out") or {}).get(
+                    tool if tool is not None else "__total__", 0
+                )
+            )
+        if opportunities_total or sampled_out:
+            line = f"Opportunities:   {opportunities_total} stored"
+            if sampled_out:
+                line += f" (+{sampled_out} sampled out, this process)"
+            lines.append(line)
+            decisions = stats.get("opportunity_decisions") or {}
+            if decisions:
+                ranked = sorted(decisions.items(), key=lambda kv: (-kv[1], kv[0]))
+                lines.append("  by decision:   " + ", ".join(f"{k} {v}" for k, v in ranked))
 
         dr = stats["date_range"]
         if dr["first"] is not None and dr["last"] is not None:

@@ -15,6 +15,7 @@ from memtomem_stm.surfacing.feedback_store import (
     FeedbackRejection,
     FeedbackStore,
     MemoryPathInput,
+    OpportunityRow,
     inspect_feedback_db,
 )
 from memtomem_stm.utils.json_out import require_utf8_identifier
@@ -172,6 +173,9 @@ class FeedbackTracker:
             provenance=provenance,
             memory_paths=memory_paths,
         )
+
+    def record_opportunity(self, row: OpportunityRow) -> bool:
+        return self._store.record_opportunity(row)
 
     def record_fault(self, server: str, tool: str, kind: str, *, at: float | None = None) -> None:
         self._store.record_fault(server, tool, kind, at=at)
