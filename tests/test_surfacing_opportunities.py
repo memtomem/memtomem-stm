@@ -913,8 +913,8 @@ class TestVerdictAndLedger:
             },
             tool_filter=None,
         )
-        # These calls used to record nothing. An empty render follows a
-        # completed search, so it is an attempt; a cancellation decided nothing.
+        # These calls used to record nothing. An empty render is in the
+        # completed set, as no_results_* is; a cancellation decided nothing.
         assert line is not None and "insufficient data — 3 LTM attempts" in line
 
     def test_cancelled_is_neither_a_fault_nor_a_timeout(self) -> None:
