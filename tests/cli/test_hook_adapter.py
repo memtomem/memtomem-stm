@@ -153,7 +153,15 @@ def test_to_wire_drops_tool_response_keeps_text():
 
 def test_from_wire_round_trips_surfacing_fields():
     call = _CLAUDE.parse(
-        {"tool_name": "Grep", "tool_input": {"pattern": "jwt"}, "tool_response": {"stdout": "hit"}}
+        {
+            "tool_name": "Grep",
+            "tool_input": {"pattern": "jwt"},
+            "tool_response": {"stdout": "hit"},
+            "session_id": "sess-1",
+            "cwd": "/work",
+            "tool_use_id": "toolu-1",
+            "agent_id": "agent-1",
+        }
     )
     assert call is not None
     rebuilt = CanonicalHookCall.from_wire(call.to_wire())
@@ -167,6 +175,14 @@ def test_from_wire_round_trips_surfacing_fields():
     assert rebuilt.tool_response_text == call.tool_response_text
     assert rebuilt.host_tag == call.host_tag
     assert rebuilt.tool_response is None
+    # Host call ids cross the wire (protocol v8) — compared against literals so
+    # a field dropped on both sides cannot pass as None == None.
+    assert (rebuilt.session_id, rebuilt.cwd, rebuilt.tool_use_id, rebuilt.agent_id) == (
+        "sess-1",
+        "/work",
+        "toolu-1",
+        "agent-1",
+    )
 
 
 @pytest.mark.parametrize("bad", [None, "not a dict", [1, 2], 42])
@@ -183,6 +199,87 @@ def test_from_wire_coerces_missing_and_wrong_typed_fields():
     assert rebuilt.tool_input == {}  # non-dict → {}
     assert rebuilt.tool_response_text == ""
     assert rebuilt.host_tag == "claude"
+    assert (rebuilt.session_id, rebuilt.cwd, rebuilt.tool_use_id, rebuilt.agent_id) == (
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+@pytest.mark.parametrize("bad", [None, "", 42, ["x"], {"id": "x"}, True])
+def test_from_wire_host_ids_non_string_or_empty_is_none(bad):
+    # Never ``str(value)``: a JSON null must not become the string "None", and
+    # an int id must not be stringified into something that looks real.
+    rebuilt = CanonicalHookCall.from_wire(
+        {"session_id": bad, "cwd": bad, "tool_use_id": bad, "agent_id": bad}
+    )
+    assert rebuilt is not None
+    assert (rebuilt.session_id, rebuilt.cwd, rebuilt.tool_use_id, rebuilt.agent_id) == (
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+def test_to_wire_emits_host_ids():
+    call = CanonicalHookCall(
+        event_type="PostToolUse",
+        tool_name="Read",
+        session_id="s",
+        cwd="/c",
+        tool_use_id="t",
+        agent_id="a",
+    )
+    wire = call.to_wire()
+    assert {k: wire[k] for k in ("session_id", "cwd", "tool_use_id", "agent_id")} == {
+        "session_id": "s",
+        "cwd": "/c",
+        "tool_use_id": "t",
+        "agent_id": "a",
+    }
+
+
+# ── host call ids (session_id / cwd / tool_use_id / agent_id) ──────────────────
+
+_CLAUDE_DIR = _HOOK_FIXTURES / "claude"
+
+
+def _ids(call: CanonicalHookCall | None) -> tuple[str | None, ...]:
+    assert call is not None
+    return (call.session_id, call.cwd, call.tool_use_id, call.agent_id)
+
+
+def test_claude_parse_main_thread_ids():
+    payload = json.loads((_CLAUDE_DIR / "inbound_read_posttooluse.json").read_text())
+    call = _CLAUDE.parse(payload)
+    assert _ids(call) == ("sess_demo", "/project", "toolu_demo_main", None)
+    assert call is not None and call.canonical_tool == "read"
+
+
+def test_claude_parse_subagent_ids():
+    payload = json.loads((_CLAUDE_DIR / "inbound_read_posttooluse_subagent.json").read_text())
+    call = _CLAUDE.parse(payload)
+    assert _ids(call) == ("sess_demo", "/project", "toolu_demo_sub", "agent_demo_explore")
+
+
+def test_codex_parse_ids():
+    payload = json.loads((_HOOK_FIXTURES / "codex" / "inbound_bash_posttooluse.json").read_text())
+    assert _ids(_CODEX.parse(payload)) == ("sess_demo", "/project", "call_demo", None)
+
+
+def test_kimi_parse_ids():
+    payload = json.loads((_HOOK_FIXTURES / "kimi" / "inbound_shell_posttooluse.json").read_text())
+    assert _ids(_KIMI.parse(payload)) == ("sess_demo", "/project", None, None)
+
+
+def test_cursor_parse_ids_does_not_map_conversation_id():
+    # Cursor has no ``session_id``; its ``conversation_id`` is a different
+    # identifier and is deliberately not aliased onto it.
+    payload = json.loads((_HOOK_FIXTURES / "cursor" / "inbound_shell_posttooluse.json").read_text())
+    assert payload["conversation_id"]  # the fixture does carry it
+    assert _ids(_CURSOR.parse(payload)) == (None, "/project", "abc123", None)
 
 
 # ── render (delegates to _build_hook_output — must stay byte-identical) ────────

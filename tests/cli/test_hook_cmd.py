@@ -277,6 +277,47 @@ async def test_run_hook_passes_host_native_tool_name_to_engine():
     assert args[1] == "Bash"  # NOT "shell"
 
 
+_HOST_IDS = {
+    "session_id": "sess-1",
+    "cwd": "/work",
+    "tool_use_id": "toolu-1",
+    "agent_id": "agent-1",
+}
+
+
+async def test_run_hook_passes_host_ids_to_engine():
+    # Engine path (the daemon hands its warm engine in): the host's call ids
+    # parsed off the payload reach ``surface`` as keyword arguments.
+    spy = AsyncMock()
+    spy.surface = AsyncMock(return_value="orig")
+    spy.injection_mode = "append"
+    await run_surfacing_hook(_canonical({**_READ_PAYLOAD, **_HOST_IDS}), engine=spy)
+    kwargs = spy.surface.await_args.kwargs
+    assert {k: kwargs[k] for k in _HOST_IDS} == _HOST_IDS
+
+
+async def test_cold_path_passes_host_ids_to_engine(monkeypatch: pytest.MonkeyPatch):
+    # Cold in-process path: the engine is built here, not handed in, so it is a
+    # second call site that could drop the ids.
+    built: list[AsyncMock] = []
+
+    def fake_engine(*args, **kwargs):
+        engine = AsyncMock()
+        engine.surface = AsyncMock(return_value="orig")
+        built.append(engine)
+        return engine
+
+    monkeypatch.setattr("memtomem_stm.surfacing.engine.SurfacingEngine", fake_engine)
+    monkeypatch.setattr(
+        "memtomem_stm.surfacing.mcp_client.McpClientSearchAdapter",
+        lambda *args, **kwargs: AsyncMock(),
+    )
+    await run_surfacing_hook(_canonical({**_READ_PAYLOAD, **_HOST_IDS}))
+    assert len(built) == 1
+    kwargs = built[0].surface.await_args.kwargs
+    assert {k: kwargs[k] for k in _HOST_IDS} == _HOST_IDS
+
+
 def test_surface_tools_resolves_canonical_native_and_unknown(monkeypatch: pytest.MonkeyPatch):
     from memtomem_stm.cli.hook_cmd import _surface_tools
 
