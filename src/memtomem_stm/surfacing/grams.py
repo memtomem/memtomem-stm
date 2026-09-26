@@ -123,7 +123,10 @@ def path_key(
     """The lexical key of *path*: never touches the filesystem.
 
     ``expanduser``; a relative path is joined onto *cwd* when one is given;
-    ``normpath``; lower-cased when *casefold*. Collection passes no *cwd*
+    ``normpath``; lower-cased when *casefold*. Lower-casing, not
+    ``str.casefold``: case-insensitive APFS and NTFS compare names by simple
+    per-character case mapping, under which ``Straße`` and ``STRASSE`` are two
+    files, and full case folding would give them one key. Collection passes no *cwd*
     (only absolute paths are eligible); a transcript reader passes the
     record's ``cwd`` so a relative argument keys the same as its absolute form.
     *pathmod* is injectable so the Windows rules can be tested on any OS.
@@ -156,12 +159,13 @@ def basename_key(key: str, *, pathmod: ModuleType = os.path) -> str:
 def eligible_source(source: str | None, *, pathmod: ModuleType = os.path) -> bool:
     """Whether a delivered memory's ``source_file`` can anchor a file match.
 
-    Decided from the string alone, at render time: an absolute or ``~`` path
-    that is not an adapter sentinel. A relative path is ineligible because the
+    Decided from the string alone, at render time: an absolute path, or a
+    ``~`` path that expands to one, that is not an adapter sentinel. A relative path is ineligible because the
     only anchor available later is the agent's ``cwd``, not the base the LTM
     indexed it against. Nothing is looked up, so a file deleted or moved after
     delivery cannot change the answer.
     """
     if source is None or source in _SENTINEL_SOURCES:
         return False
-    return source.startswith("~") or pathmod.isabs(source)
+    # ``~`` counts only when it expands: ``~nosuchuser/a.md`` stays relative.
+    return pathmod.isabs(pathmod.expanduser(source))

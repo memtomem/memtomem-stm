@@ -114,6 +114,12 @@ class TestPathKey:
     def test_casefold_lowercases(self) -> None:
         assert path_key("/Notes/A.md", pathmod=posixpath, casefold=True) == "/notes/a.md"
 
+    def test_case_mapping_is_simple_not_full_folding(self) -> None:
+        # The filesystems map case per character: these are two files.
+        assert path_key("/n/Straße.md", pathmod=posixpath, casefold=True) != path_key(
+            "/n/STRASSE.md", pathmod=posixpath, casefold=True
+        )
+
     def test_expanduser(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HOME", "/home/u")
         assert path_key("~/n/./a.md", pathmod=posixpath, casefold=False) == "/home/u/n/a.md"
@@ -136,8 +142,14 @@ class TestPathKey:
 
 class TestEligibleSource:
     @pytest.mark.parametrize("source", ["/notes/a.md", "~/notes/a.md"])
-    def test_absolute_or_home_is_eligible(self, source: str) -> None:
+    def test_absolute_or_home_is_eligible(
+        self, source: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HOME", "/home/u")
         assert eligible_source(source, pathmod=posixpath)
+
+    def test_tilde_that_does_not_expand_is_not(self) -> None:
+        assert not eligible_source("~no_such_user_4f2a/notes/a.md", pathmod=posixpath)
 
     @pytest.mark.parametrize(
         "source", [None, "", ".", "unknown", "pinned", "notes/a.md", "blk_0123abcd"]
