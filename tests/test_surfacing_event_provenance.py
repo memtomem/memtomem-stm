@@ -14,6 +14,7 @@ import multiprocessing
 import os
 import sqlite3
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,7 +24,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from memtomem_stm.cli.hook_adapter import get_adapter
-from memtomem_stm.cli.hook_cmd import run_surfacing_hook
+from memtomem_stm.cli.hook_cmd import _extract_surfaced_block, run_surfacing_hook
 from memtomem_stm.surfacing import feedback_store as feedback_store_module
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine, _memory_path_inputs
@@ -459,6 +460,67 @@ class TestMemoryPathRows:
         finally:
             store.close()
 
+    def test_stalled_filesystem_is_bounded_and_skipped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A realpath that never returns (a dead network mount) costs one bounded
+        wait, then no wait at all while it stays stuck, and never the event."""
+        note = tmp_path / "a.md"
+        note.write_text("x")
+        release = threading.Event()
+        real_realpath = os.path.realpath
+
+        def stuck_realpath(path: Any, *args: Any, **kwargs: Any) -> str:
+            release.wait(30)
+            return real_realpath(path, *args, **kwargs)
+
+        monkeypatch.setattr(feedback_store_module.os.path, "realpath", stuck_realpath)
+        store = FeedbackStore(tmp_path / "fb.db")
+        store.initialize()
+
+        def write(event_id: str) -> float:
+            started = time.monotonic()
+            box: list[bool] = []
+            worker = threading.Thread(
+                target=lambda: box.append(
+                    store.record_surfacing(
+                        event_id,
+                        "s",
+                        "t",
+                        "q",
+                        ["m1"],
+                        [0.5],
+                        memory_paths=[MemoryPathInput("m1", str(note), "preview text", True)],
+                    )
+                ),
+                daemon=True,
+            )
+            worker.start()
+            worker.join(5)
+            assert not worker.is_alive(), "record_surfacing hung on a stalled filesystem"
+            assert box == [True]
+            return time.monotonic() - started
+
+        try:
+            first = write("e1")
+            second = write("e2")  # the first lookup is still stuck
+            assert first < 2.0
+            assert second < feedback_store_module._RESOLVE_TIMEOUT_SECONDS
+            for event_id in ("e1", "e2"):
+                row = _path_rows(store.db_path, event_id)["m1"]
+                assert row["path_hash_lexical"] is not None
+                assert row["path_hash_resolved"] is None
+            release.set()
+            stuck = feedback_store_module._resolve_in_flight
+            assert stuck is not None
+            stuck.join(5)
+            monkeypatch.setattr(feedback_store_module.os.path, "realpath", real_realpath)
+            write("e3")
+            assert _path_rows(store.db_path, "e3")["m1"]["path_hash_resolved"] is not None
+        finally:
+            release.set()
+            store.close()
+
     def test_eligibility_from_render_time_strings(self) -> None:
         results = [
             _result("m-abs", "absolute note body", "/notes/a.md"),
@@ -528,7 +590,9 @@ class TestEngineWritesProvenance:
             for row, output in zip(rows, outputs, strict=True):
                 assert row["host_session_id"] == "sess_1"
                 assert row["host_agent_id"] == "agent_7"
-                assert row["injected_chars"] == len(output) - len(RESPONSE)
+                block = _extract_surfaced_block(RESPONSE, output, "append")
+                assert block is not None
+                assert row["injected_chars"] == len(block) == len(output) - len(RESPONSE) - 2
                 assert row["id_advertised"] == 1
                 assert row["header_digest"] == hashlib.sha256(b"## Relevant Memories").hexdigest()
                 paths = _path_rows(path, row["id"])
@@ -680,6 +744,8 @@ class TestClaudeHookPayload:
             assert out, "the hook surfaced nothing, so this test would prove nothing"
             await engine.drain_store_writes()
             (row,) = _event_rows(tracker.store.db_path)
+            # The recorded length is what the host actually received.
+            assert row["injected_chars"] == len(out["hookSpecificOutput"]["additionalContext"])
             assert row["host_session_id"] == "sess_demo"
             assert row["host_agent_id"] == agent_id
             assert row["tool_use_id"] == tool_use_id

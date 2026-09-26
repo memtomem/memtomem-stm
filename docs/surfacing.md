@@ -564,14 +564,14 @@ Each `surfacing_events` row also records facts about the delivery that are fixed
 | Column | Meaning |
 |---|---|
 | `tool_use_id`, `host_session_id`, `host_agent_id` | The host's ids for the call, its session and (inside a subagent) its agent, as sent on the hook wire. Together they name the transcript file the call was written to. `NULL` on the proxy path, which has no host session. The host's `cwd` is never stored. |
-| `injected_chars` | Characters the surfaced block added to the tool response. |
+| `injected_chars` | Length of the `<surfaced-memories>` block: exactly what the hook delivers as `additionalContext`. The proxy path adds two separator newlines on top. |
 | `id_advertised` | Whether the block showed its `_surfacing_id` (`record_feedback_events`). A later withdrawal of the id after a failed or late event write is not reflected. |
 | `header_digest` | SHA-256 of the block's first line inside `<surfaced-memories>` (the first line of `section_header`). |
 
 Every delivered, non-pinned memory also gets one `surfacing_memory_paths` row, written in the same transaction as its event and deleted with it by `stats_retention_days`. It stores no path and no text, only keyed hashes:
 
 - `eligible` — `1` when the memory's `source_file` was an absolute (or `~`) path at render time, `0` for relative paths and adapter placeholders such as `unknown`. Nothing on disk is consulted, so a file deleted later keeps its value.
-- `path_hash_lexical`, `dir_hashes`, `basename_hash` — hashes of the normalized path, of each ancestor directory, and of the file name (`NULL` when not eligible). `path_hash_resolved` hashes the symlink-resolved path, and is `NULL` when the file did not exist at write time.
+- `path_hash_lexical`, `dir_hashes`, `basename_hash` — hashes of the normalized path, of each ancestor directory, and of the file name (`NULL` when not eligible). `path_hash_resolved` hashes the symlink-resolved path, and is `NULL` when the file did not exist at write time or could not be resolved within 250 ms (a stalled mount must not hold up the store's write worker).
 - `snippet_grams` — up to 64 hashes of the word 4-grams of the bullet's rendered preview.
 
 The hashes are HMAC-SHA256 truncated to 16 bytes, under a random per-install key created in the `stm_meta` table of the same file. The key keeps paths and text out of the tables and out of anything exported from them; it is readable by anyone who can read `stm_feedback.db`, so it is not protection against a local reader. A row takes about 1.8 KB with a full 300-character preview.

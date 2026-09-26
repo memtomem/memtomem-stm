@@ -35,6 +35,12 @@ class RenderManifest:
     so callers can distinguish "nothing survived truncation" from "survivors
     have no trackable IDs".
 
+    ``block_chars`` is the length of the ``<surfaced-memories>`` …
+    ``</surfaced-memories>`` block alone, without the blank-line separator
+    ``text`` puts between it and the response: the block is what the hook
+    delivers as ``additionalContext``, while the proxy path adds the two
+    separator newlines on top.
+
     ``delivered_previews`` is parallel to ``delivered_ids``: the sanitized
     preview exactly as it appears in that bullet. ``header_line`` is the first
     line inside the ``<surfaced-memories>`` wrapper (the first line of
@@ -50,6 +56,7 @@ class RenderManifest:
     rendered_bullets: int = 0
     delivered_previews: tuple[str, ...] = ()
     header_line: str = ""
+    block_chars: int = 0
 
 
 class SurfacingFormatter:
@@ -371,15 +378,12 @@ class SurfacingFormatter:
         delivered_set = set(delivered)
         omitted = tuple(mid for mid in body_ids if mid and mid not in delivered_set)
 
+        block = f"<surfaced-memories>\n{memory_block}\n</surfaced-memories>"
         match self._config.injection_mode:
             case "prepend":
-                text = (
-                    f"<surfaced-memories>\n{memory_block}\n</surfaced-memories>\n\n{response_text}"
-                )
+                text = f"{block}\n\n{response_text}"
             case "append" | "section" | _:
-                text = (
-                    f"{response_text}\n\n<surfaced-memories>\n{memory_block}\n</surfaced-memories>"
-                )
+                text = f"{response_text}\n\n{block}"
         return RenderManifest(
             text,
             delivered,
@@ -388,4 +392,5 @@ class SurfacingFormatter:
             rendered_bullets,
             delivered_previews,
             memory_block.split("\n", 1)[0],
+            len(block),
         )

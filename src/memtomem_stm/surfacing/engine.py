@@ -200,21 +200,21 @@ _NO_HOST_CALL = _HostCall()
 
 def _event_provenance(
     manifest: RenderManifest,
-    response_text: str,
     advertised_id: str | None,
     host: _HostCall,
 ) -> EventProvenance:
     """Collection-time facts about the block as rendered when its row is queued.
 
-    ``injected_chars`` is exact because ``render`` passes ``response_text``
-    through verbatim. ``header_digest`` hashes the block's first line inside
+    ``injected_chars`` is the ``<surfaced-memories>`` block's own length —
+    exactly what the hook delivers as ``additionalContext``; the proxy path
+    adds the two separator newlines on top. ``header_digest`` hashes the block's first line inside
     the ``<surfaced-memories>`` wrapper, which is what a transcript reader sees
     first, rather than the configured ``section_header`` (which may span
     lines).
     """
     header = manifest.header_line.encode("utf-8", errors="surrogatepass")
     return EventProvenance(
-        injected_chars=len(manifest.text) - len(response_text),
+        injected_chars=manifest.block_chars,
         tool_use_id=host.tool_use_id,
         host_session_id=host.session_id,
         host_agent_id=host.agent_id,
@@ -1982,7 +1982,7 @@ class SurfacingEngine:
                         # Cached entries keep the scale they were stamped with
                         # at miss time, so the hit-path row carries it too.
                         score_scale=self._result_score_scale(cached)[0],
-                        provenance=_event_provenance(manifest, response_text, advertised_id, host),
+                        provenance=_event_provenance(manifest, advertised_id, host),
                         memory_paths=_memory_path_inputs(manifest, cached),
                     )
                 )
@@ -2600,7 +2600,7 @@ class SurfacingEngine:
                 memory_ids=delivered_ids,
                 scores=[r.score for r in delivered_results],
                 score_scale=score_scale,
-                provenance=_event_provenance(manifest, response_text, advertised_id, host),
+                provenance=_event_provenance(manifest, advertised_id, host),
                 memory_paths=_memory_path_inputs(manifest, relevant),
             )
             try:

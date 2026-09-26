@@ -407,15 +407,52 @@ def _opt_text(value: str | None) -> str | None:
     return None if value is None else escape_lone_surrogates(value)
 
 
-def _resolved_path_hash(source_file: str, key: bytes) -> str | None:
-    """Keyed hash of the file's resolved path, or ``None`` if it does not exist now."""
-    try:
-        expanded = os.path.expanduser(source_file)
-        if not os.path.exists(expanded):
-            return None
-        return keyed_hash(path_key(os.path.realpath(expanded)), key)
-    except (OSError, ValueError):
-        return None
+_RESOLVE_TIMEOUT_SECONDS = 0.25
+"""How long one event's path resolution may hold the store-write worker.
+
+``exists`` / ``realpath`` touch the filesystem, and a path on a stalled network
+mount can block them indefinitely. They run on a separate thread so the shared
+FIFO write worker waits at most this long per event."""
+
+_resolve_lock = threading.Lock()
+_resolve_in_flight: threading.Thread | None = None
+
+
+def _resolve_sources(sources: list[str]) -> dict[str, str | None]:
+    """Realpath each existing source, bounded; ``{}`` when it cannot finish in time.
+
+    Runs the lookups on a daemon thread and waits at most
+    :data:`_RESOLVE_TIMEOUT_SECONDS`. While an earlier lookup is still stuck,
+    no new one starts and the result is empty at once: at most one thread is
+    ever blocked on a dead mount, and later events do not each pay the timeout.
+    A daemon thread, not an executor, so a thread stuck on the filesystem cannot
+    hold up interpreter exit. The resolved hash is only an extra match key, so
+    a skipped lookup costs a ``NULL``, never the event.
+    """
+    global _resolve_in_flight
+    if not sources:
+        return {}
+    results: dict[str, str | None] = {}
+
+    def work() -> None:
+        for source in sources:
+            try:
+                expanded = os.path.expanduser(source)
+                results[source] = os.path.realpath(expanded) if os.path.exists(expanded) else None
+            except (OSError, ValueError):
+                results[source] = None
+
+    with _resolve_lock:
+        if _resolve_in_flight is not None and _resolve_in_flight.is_alive():
+            return {}
+        thread = threading.Thread(target=work, name="stm-path-resolve", daemon=True)
+        _resolve_in_flight = thread
+        thread.start()
+    thread.join(_RESOLVE_TIMEOUT_SECONDS)
+    if thread.is_alive():
+        logger.debug("Path resolution for surfaced memories timed out; storing no resolved hash")
+        return {}
+    return dict(results)
 
 
 class FeedbackDbStatus(TypedDict):
@@ -885,9 +922,9 @@ class FeedbackStore:
     ) -> list[tuple[object, ...]]:
         """Hash each delivered memory's path and preview into a storable row.
 
-        Runs on the store worker (never the loop): ``realpath`` touches the
-        filesystem. Raw paths and preview text stop here; only keyed hashes
-        are returned.
+        Runs on the store worker (never the loop). The filesystem lookups for
+        the resolved hash run beside it, bounded (:func:`_resolve_sources`).
+        Raw paths and preview text stop here; only keyed hashes are returned.
         """
         if not memory_paths:
             return []
@@ -895,6 +932,13 @@ class FeedbackStore:
         if key is None:
             raise RuntimeError("surfacing feedback store has no HMAC key; initialize() first")
         delivered = set(memory_ids)
+        resolved_paths = _resolve_sources(
+            [
+                item.source_file
+                for item in memory_paths
+                if item.eligible and item.source_file is not None
+            ]
+        )
         rows: list[tuple[object, ...]] = []
         for item in memory_paths:
             if item.memory_id not in delivered:
@@ -908,7 +952,8 @@ class FeedbackStore:
                 lexical = keyed_hash(lexical_key, key)
                 dirs = json.dumps([keyed_hash(a, key) for a in ancestor_keys(lexical_key)])
                 basename = keyed_hash(basename_key(lexical_key), key)
-                resolved = _resolved_path_hash(item.source_file, key)
+                real = resolved_paths.get(item.source_file)
+                resolved = keyed_hash(path_key(real), key) if real is not None else None
             rows.append(
                 (
                     surfacing_id,
