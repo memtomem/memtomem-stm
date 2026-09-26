@@ -1985,6 +1985,28 @@ async def stm_surfacing_stats(
             f"Total feedback:  {stats['total_feedback']}",
         ]
 
+        # Opportunities: calls that entered surfacing, surfaced or not. The
+        # stored count is durable (every process writing this DB); the
+        # sampled-out count is this process's only, so it is labelled as such.
+        # Both absent → no line, keeping the zero-traffic output unchanged.
+        opportunities_total = int(stats.get("opportunities_total") or 0)
+        sampled_out = 0
+        if obs_snapshot is not None:
+            sampled_out = int(
+                (obs_snapshot.get("opportunities_sampled_out") or {}).get(
+                    tool if tool is not None else "__total__", 0
+                )
+            )
+        if opportunities_total or sampled_out:
+            line = f"Opportunities:   {opportunities_total} stored"
+            if sampled_out:
+                line += f" (+{sampled_out} sampled out, this process)"
+            lines.append(line)
+            decisions = stats.get("opportunity_decisions") or {}
+            if decisions:
+                ranked = sorted(decisions.items(), key=lambda kv: (-kv[1], kv[0]))
+                lines.append("  by decision:   " + ", ".join(f"{k} {v}" for k, v in ranked))
+
         dr = stats["date_range"]
         if dr["first"] is not None and dr["last"] is not None:
             first_iso = datetime.fromtimestamp(dr["first"]).isoformat(timespec="seconds")

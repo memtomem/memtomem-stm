@@ -172,6 +172,35 @@ CREATE TABLE IF NOT EXISTS surfacing_memory_paths (
     PRIMARY KEY (surfacing_id, memory_id)
 );
 
+-- One row per call that entered surfacing, including the calls it declined:
+-- the denominator the event table cannot give. Written fire-and-forget at the
+-- end of the call, so a row can be lost to a full write queue; the durable
+-- record of a delivery is still its ``surfacing_events`` row.
+--   gate_decision  ``surfaced``, ``skip:<reason>``, ``empty_render`` or
+--                  ``error:<kind>``
+--   surfacing_id   the event this call minted and tried to write, when it got
+--                  that far; the event row can be missing (write failed)
+--   arg_shape_json argument key names and shape counts, never values
+--                  (``arg_shape``)
+--   response_len   the response size the ``min_response_chars`` gate judged
+--   query_digest   ``sha256:`` + 16 hex of the extracted query, before the
+--                  sensitive-query substitution; NULL before extraction
+-- ``host_session_id`` is the hook host's session id; NULL on the proxy path.
+-- Deleted by its own ``created_at`` in the stats-retention sweep.
+CREATE TABLE IF NOT EXISTS surfacing_opportunities (
+    id              TEXT    PRIMARY KEY,
+    host_session_id TEXT,
+    server          TEXT    NOT NULL,
+    tool            TEXT    NOT NULL,
+    arg_shape_json  TEXT    NOT NULL,
+    response_len    INTEGER NOT NULL,
+    query_digest    TEXT,
+    gate_decision   TEXT    NOT NULL,
+    surfacing_id    TEXT,
+    score_scale     TEXT,
+    created_at      REAL    NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_feedback_surfacing ON surfacing_feedback(surfacing_id);
 CREATE INDEX IF NOT EXISTS idx_feedback_memory_rating ON surfacing_feedback(memory_id, rating);
 CREATE INDEX IF NOT EXISTS idx_events_tool ON surfacing_events(tool);
@@ -179,6 +208,7 @@ CREATE INDEX IF NOT EXISTS idx_events_tool ON surfacing_events(tool);
 -- created_at; without this index each is a full scan on a large history.
 CREATE INDEX IF NOT EXISTS idx_events_created ON surfacing_events(created_at);
 CREATE INDEX IF NOT EXISTS idx_seen_last ON seen_memories(last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_opportunities_created ON surfacing_opportunities(created_at);
 """
 
 _REQUIRED_TABLES = tuple(
@@ -402,6 +432,24 @@ class MemoryPathInput:
     source_file: str | None
     preview: str
     eligible: bool
+
+
+@dataclass(frozen=True)
+class OpportunityRow:
+    """One ``surfacing_opportunities`` row, assembled by the engine at the end
+    of a call. Every field is already reduced to what may be stored — no
+    argument value, path or query text reaches it."""
+
+    id: str
+    server: str
+    tool: str
+    arg_shape_json: str
+    response_len: int
+    gate_decision: str
+    host_session_id: str | None = None
+    query_digest: str | None = None
+    surfacing_id: str | None = None
+    score_scale: str | None = None
 
 
 def _opt_text(value: str | None) -> str | None:
@@ -864,6 +912,47 @@ class FeedbackStore:
                 db.commit()
             except Exception:
                 self._abandon_transaction(db, "surfacing event")
+                raise
+        return True
+
+    def record_opportunity(self, row: OpportunityRow) -> bool:
+        """Write one opportunity row. ``False`` when the store is closed.
+
+        Queued fire-and-forget by the engine; nothing reads the result back,
+        so a closed store is just a lost row.
+        """
+        if self._db is None:
+            return False
+        require_utf8_identifier(row.id, "id")
+        require_utf8_identifier(row.server, "server")
+        require_utf8_identifier(row.tool, "tool")
+        with self._lock:
+            db = self._db
+            if db is None:
+                return False
+            try:
+                db.execute(
+                    "INSERT OR IGNORE INTO surfacing_opportunities "
+                    "(id, host_session_id, server, tool, arg_shape_json, response_len, "
+                    "query_digest, gate_decision, surfacing_id, score_scale, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        row.id,
+                        _opt_text(row.host_session_id),
+                        row.server,
+                        row.tool,
+                        row.arg_shape_json,
+                        row.response_len,
+                        row.query_digest,
+                        escape_lone_surrogates(row.gate_decision),
+                        _opt_text(row.surfacing_id),
+                        _opt_text(row.score_scale),
+                        time.time(),
+                    ),
+                )
+                db.commit()
+            except Exception:
+                self._abandon_transaction(db, "surfacing opportunity")
                 raise
         return True
 
@@ -1430,6 +1519,8 @@ class FeedbackStore:
                 "recent": [],
                 "score_distribution": {"count": 0, "min": None, "max": None},
                 "score_scale_distribution": {},
+                "opportunities_total": 0,
+                "opportunity_decisions": {},
             }
             if db is None:
                 return empty
@@ -1450,11 +1541,27 @@ class FeedbackStore:
                 f"SELECT COUNT(*) FROM surfacing_events{where_sql}", event_params
             ).fetchone()[0]
 
+            # Counted before the zero-events return below: most opportunities
+            # are calls that surfaced nothing, so a window can hold them with
+            # no event at all. Same ``tool`` / ``since`` filters as the events.
+            opportunity_decisions = {
+                str(decision): int(count)
+                for decision, count in db.execute(
+                    "SELECT gate_decision, COUNT(*) FROM surfacing_opportunities"
+                    f"{where_sql} GROUP BY gate_decision ORDER BY gate_decision",
+                    event_params,
+                ).fetchall()
+            }
+            opportunities = {
+                "opportunities_total": sum(opportunity_decisions.values()),
+                "opportunity_decisions": opportunity_decisions,
+            }
+
             if events_total == 0:
                 # Still surface feedback with zero events? No — feedback rows
                 # without their parent event in the filter range aren't
                 # meaningful here. Return empty shape.
-                return empty
+                return {**empty, **opportunities}
 
             distinct_tools = db.execute(
                 f"SELECT COUNT(DISTINCT tool) FROM surfacing_events{where_sql}", event_params
@@ -1611,6 +1718,7 @@ class FeedbackStore:
                 "recent": recent,
                 "score_distribution": {"count": score_count, "min": score_min, "max": score_max},
                 "score_scale_distribution": score_scale_distribution,
+                **opportunities,
             }
 
     # ── Cross-session dedup ────────────────────────────────────────────
@@ -1702,21 +1810,30 @@ class FeedbackStore:
             db = self._db
             if db is None:
                 return 0
-            db.execute(
-                "DELETE FROM surfacing_feedback WHERE surfacing_id IN "
-                "(SELECT id FROM surfacing_events WHERE created_at < ?)",
-                (cutoff,),
-            )
-            # Memory paths carry no timestamp of their own: they go with the
-            # event they describe, and must go first, while the subquery can
-            # still find it.
-            db.execute(
-                "DELETE FROM surfacing_memory_paths WHERE surfacing_id IN "
-                "(SELECT id FROM surfacing_events WHERE created_at < ?)",
-                (cutoff,),
-            )
-            cursor = db.execute("DELETE FROM surfacing_events WHERE created_at < ?", (cutoff,))
-            db.commit()
+            try:
+                db.execute(
+                    "DELETE FROM surfacing_feedback WHERE surfacing_id IN "
+                    "(SELECT id FROM surfacing_events WHERE created_at < ?)",
+                    (cutoff,),
+                )
+                # Memory paths carry no timestamp of their own: they go with the
+                # event they describe, and must go first, while the subquery can
+                # still find it.
+                db.execute(
+                    "DELETE FROM surfacing_memory_paths WHERE surfacing_id IN "
+                    "(SELECT id FROM surfacing_events WHERE created_at < ?)",
+                    (cutoff,),
+                )
+                # Opportunities age by their own timestamp, not their event's.
+                db.execute("DELETE FROM surfacing_opportunities WHERE created_at < ?", (cutoff,))
+                cursor = db.execute("DELETE FROM surfacing_events WHERE created_at < ?", (cutoff,))
+                db.commit()
+            except Exception:
+                # Without this a failure after the first DELETE leaves the
+                # earlier ones pending, and the next unrelated write commits a
+                # partial sweep.
+                self._abandon_transaction(db, "stats retention")
+                raise
             return cursor.rowcount
 
     def _get_tool_rating_ratio(
