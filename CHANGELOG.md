@@ -27,9 +27,9 @@ changes inline only. See the deprecation policy in
   `[min_score, 1.0]` band.
 - **The hook↔daemon protocol is now v8.** The `surface` payload carries the host's
   `session_id`, `cwd`, `tool_use_id` and `agent_id` (Claude sends `agent_id` only
-  inside a subagent). The surfacing engine accepts them but does not store or log them
-  yet. The version is part of the daemon fingerprint, so after upgrading the hook
-  starts a new v8 daemon. A running v7 daemon keeps running beside it until it idles
+  inside a subagent). The surfacing event row stores the three ids (see *Added*);
+  none is logged and `cwd` is never stored. The version is part of the daemon
+  fingerprint, so after upgrading the hook starts a new v8 daemon. A running v7 daemon keeps running beside it until it idles
   out. A daemon pinned with `idle_timeout_seconds=0` never idles out, so stop it with
   `mms daemon stop --all`; on Windows that command cannot terminate it, so end the
   process from Task Manager instead.
@@ -222,6 +222,19 @@ changes inline only. See the deprecation policy in
   additionally raised `TypeError` out of the parser, which the caller read as an
   **endpoint** failure and counted toward the circuit breaker — a model-quality
   problem booked as a provider outage.
+
+### Added
+
+- **Surfacing events record where and how they were delivered.** Each
+  `surfacing_events` row gains `tool_use_id`, `host_session_id` and `host_agent_id`
+  (the hook's ids for the call, `NULL` on the proxy path), `injected_chars`,
+  `id_advertised` and `header_digest`. A new `surfacing_memory_paths` table holds one
+  row per delivered memory with keyed hashes of its source path and preview text,
+  never the path or text itself. The hashing key is created per install in a new
+  `stm_meta` table. `stm_feedback.db` grows by about 1.8 KB per delivered memory,
+  bounded by `stats_retention_days`. Existing rows read `NULL` in the new columns.
+  The migration now runs as one locked transaction, so two processes upgrading the
+  same file at once no longer race each other.
 
 ### Fixed
 

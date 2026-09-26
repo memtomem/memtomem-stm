@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import logging
 from typing import assert_never
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.feedback_store import (
     DIAGNOSTIC_KINDS,
+    EventProvenance,
     FeedbackDbStatus,
     FeedbackRejection,
     FeedbackStore,
+    MemoryPathInput,
     inspect_feedback_db,
 )
 from memtomem_stm.utils.json_out import require_utf8_identifier
@@ -156,6 +158,8 @@ class FeedbackTracker:
         memory_ids: list[str],
         scores: list[float],
         score_scale: str | None = None,
+        provenance: EventProvenance | None = None,
+        memory_paths: Sequence[MemoryPathInput] = (),
     ) -> bool:
         return self._store.record_surfacing(
             surfacing_id,
@@ -165,6 +169,8 @@ class FeedbackTracker:
             memory_ids,
             scores,
             score_scale=score_scale,
+            provenance=provenance,
+            memory_paths=memory_paths,
         )
 
     def record_fault(self, server: str, tool: str, kind: str, *, at: float | None = None) -> None:

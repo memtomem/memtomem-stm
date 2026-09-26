@@ -5,15 +5,26 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import TypedDict
 
+from memtomem_stm.surfacing.grams import (
+    KEY_BYTES,
+    ancestor_keys,
+    basename_key,
+    keyed_hash,
+    path_key,
+    snippet_grams,
+)
 from memtomem_stm.utils.json_out import (
     escape_lone_surrogates,
     has_lone_surrogate,
@@ -132,6 +143,34 @@ CREATE TABLE IF NOT EXISTS surfacing_faults (
     PRIMARY KEY (day, server, tool, kind)
 );
 
+-- Install-scoped key/value facts. Holds the random per-install HMAC key that
+-- ``surfacing_memory_paths`` hashes under (``grams``); a private table rather
+-- than ``PRAGMA user_version`` because the compression feedback store shares
+-- this file.
+CREATE TABLE IF NOT EXISTS stm_meta (
+    name    TEXT    PRIMARY KEY,
+    value   BLOB    NOT NULL
+);
+
+-- One row per delivered, non-pinned memory of a surfacing event: keyed hashes
+-- of its source path and of its rendered preview's word 4-grams, so a later
+-- offline reader can tell whether the agent went on to use that file or text
+-- without the path or text ever being stored. ``eligible`` is fixed from the
+-- render-time path string (absolute, not an adapter sentinel). Written in the
+-- same transaction as its ``surfacing_events`` row; deleted with it by the
+-- stats-retention sweep (no FK enforcement, manual cascade).
+CREATE TABLE IF NOT EXISTS surfacing_memory_paths (
+    surfacing_id        TEXT    NOT NULL,
+    memory_id           TEXT    NOT NULL,
+    eligible            INTEGER NOT NULL,
+    path_hash_lexical   TEXT,
+    path_hash_resolved  TEXT,
+    dir_hashes          TEXT,
+    basename_hash       TEXT,
+    snippet_grams       TEXT    NOT NULL,
+    PRIMARY KEY (surfacing_id, memory_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_feedback_surfacing ON surfacing_feedback(surfacing_id);
 CREATE INDEX IF NOT EXISTS idx_feedback_memory_rating ON surfacing_feedback(memory_id, rating);
 CREATE INDEX IF NOT EXISTS idx_events_tool ON surfacing_events(tool);
@@ -196,6 +235,12 @@ def _relax_surfacing_events_query_notnull(db: sqlite3.Connection) -> None:
 
     No-op when ``surfacing_events.query`` is already nullable (fresh DBs
     created from the current ``_SCHEMA`` definition).
+
+    Runs inside the caller's transaction (:func:`_migrate`), which holds the
+    write lock across this check AND the rebuild. Checking first and locking
+    afterwards let two initializers both decide to rebuild, and the second
+    rebuild — copying only the hardcoded pre-#352 columns below — dropped
+    whatever columns the first had added since.
     """
     row = db.execute(
         "SELECT \"notnull\" FROM pragma_table_info('surfacing_events') WHERE name = 'query'"
@@ -205,9 +250,8 @@ def _relax_surfacing_events_query_notnull(db: sqlite3.Connection) -> None:
         # the table genuinely doesn't have a `query` column on some future
         # variant) — nothing to migrate.
         return
-    db.executescript(
+    for statement in (
         """
-        BEGIN IMMEDIATE;
         CREATE TABLE surfacing_events__migrate_352 (
             id          TEXT    PRIMARY KEY,
             server      TEXT    NOT NULL,
@@ -216,49 +260,162 @@ def _relax_surfacing_events_query_notnull(db: sqlite3.Connection) -> None:
             memory_ids  TEXT    NOT NULL,
             scores      TEXT    NOT NULL,
             created_at  REAL    NOT NULL
-        );
+        )
+        """,
+        """
         INSERT INTO surfacing_events__migrate_352
             (id, server, tool, query, memory_ids, scores, created_at)
         SELECT id, server, tool, query, memory_ids, scores, created_at
-        FROM surfacing_events;
-        DROP TABLE surfacing_events;
-        ALTER TABLE surfacing_events__migrate_352 RENAME TO surfacing_events;
-        CREATE INDEX IF NOT EXISTS idx_events_tool ON surfacing_events(tool);
-        -- Recreate the #584 created_at index too: DROP TABLE above dropped the
-        -- one _SCHEMA created, and initialize() does not re-run _SCHEMA after
-        -- this migration.
-        CREATE INDEX IF NOT EXISTS idx_events_created ON surfacing_events(created_at);
-        COMMIT;
-        """
-    )
+        FROM surfacing_events
+        """,
+        "DROP TABLE surfacing_events",
+        "ALTER TABLE surfacing_events__migrate_352 RENAME TO surfacing_events",
+        "CREATE INDEX IF NOT EXISTS idx_events_tool ON surfacing_events(tool)",
+        # Recreate the #584 created_at index too: DROP TABLE above dropped the
+        # one _SCHEMA created, and _SCHEMA does not run again after this.
+        "CREATE INDEX IF NOT EXISTS idx_events_created ON surfacing_events(created_at)",
+    ):
+        db.execute(statement)
     logger.info("Migrated surfacing_events: relaxed NOT NULL on query column (#352 part 2)")
 
 
-def _add_fault_recovery_column(db: sqlite3.Connection) -> None:
-    """Add the episode recovery marker to databases created by older STM versions."""
-    columns = {
-        str(row[1]) for row in db.execute("PRAGMA table_info('surfacing_faults')").fetchall()
-    }
-    if columns and "last_recovered_at" not in columns:
-        db.execute("ALTER TABLE surfacing_faults ADD COLUMN last_recovered_at REAL")
-        db.commit()
+def _add_missing_columns(
+    db: sqlite3.Connection, table: str, columns: tuple[tuple[str, str], ...]
+) -> None:
+    """Add each ``(name, type)`` column *table* lacks, inside the caller's transaction."""
+    present = {str(row[1]) for row in db.execute(f"PRAGMA table_info('{table}')").fetchall()}
+    if not present:
+        return
+    for name, sql_type in columns:
+        if name not in present:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
 
 
-def _add_events_score_scale_column(db: sqlite3.Connection) -> None:
-    """Add the core-reported score-scale label (#1781) to pre-existing databases.
+_EVENTS_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
+    # Core-reported score-scale label (#1781).
+    ("score_scale", "TEXT"),
+    # Collection-time facts about the delivery (see ``EventProvenance``).
+    ("injected_chars", "INTEGER"),
+    ("tool_use_id", "TEXT"),
+    ("host_session_id", "TEXT"),
+    ("host_agent_id", "TEXT"),
+    ("id_advertised", "INTEGER"),
+    ("header_digest", "TEXT"),
+)
+"""Columns added to ``surfacing_events`` after its first release, in order.
 
-    Ordering is load-bearing: this must run AFTER
-    :func:`_relax_surfacing_events_query_notnull` in ``initialize()`` — that
-    migration recreates ``surfacing_events`` from a hardcoded pre-#352 column
-    list, so a column added before it would be silently dropped on legacy
-    NOT-NULL databases.
+Ordering against the relax migration is load-bearing: that migration recreates
+``surfacing_events`` from a hardcoded pre-#352 column list, so these are added
+AFTER it in :func:`_migrate` — a column added before it would be silently
+dropped on legacy NOT-NULL databases."""
+
+
+def _schema_statements(script: str) -> Iterator[str]:
+    """Split a DDL script into statements that can run inside one transaction.
+
+    ``executescript`` commits any open transaction before it runs, so the
+    schema cannot go through it while :func:`_migrate` holds the write lock.
     """
-    columns = {
-        str(row[1]) for row in db.execute("PRAGMA table_info('surfacing_events')").fetchall()
-    }
-    if columns and "score_scale" not in columns:
-        db.execute("ALTER TABLE surfacing_events ADD COLUMN score_scale TEXT")
+    buffer = ""
+    for line in script.splitlines(keepends=True):
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            yield buffer
+            buffer = ""
+    if any(line.strip() and not line.strip().startswith("--") for line in buffer.splitlines()):
+        raise ValueError("unterminated statement in surfacing feedback schema")
+
+
+_HMAC_KEY_NAME = "hmac_key"
+
+
+def _migrate(db: sqlite3.Connection) -> None:
+    """Create and upgrade the schema, and mint the HMAC key, under one lock.
+
+    Everything runs in a single ``BEGIN IMMEDIATE`` transaction: the daemon and
+    the proxy server can initialize the same file at the same moment, and every
+    step here is check-then-act (is the column there? is the table legacy? is
+    there a key?). Holding the write lock across all of them is what makes the
+    checks true when the act runs; per-step locks left gaps between steps where
+    a peer could act on the same stale answer.
+    """
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        for statement in _schema_statements(_SCHEMA):
+            db.execute(statement)
+        _relax_surfacing_events_query_notnull(db)
+        _add_missing_columns(db, "surfacing_faults", (("last_recovered_at", "REAL"),))
+        # Must stay after the relax migration — see its docstring.
+        _add_missing_columns(db, "surfacing_events", _EVENTS_ADDED_COLUMNS)
+        db.execute(
+            "INSERT OR IGNORE INTO stm_meta (name, value) VALUES (?, ?)",
+            (_HMAC_KEY_NAME, secrets.token_bytes(KEY_BYTES)),
+        )
         db.commit()
+    except BaseException:
+        db.rollback()
+        raise
+
+
+def _read_hmac_key(db: sqlite3.Connection) -> bytes:
+    row = db.execute("SELECT value FROM stm_meta WHERE name = ?", (_HMAC_KEY_NAME,)).fetchone()
+    if row is None or not isinstance(row[0], bytes) or len(row[0]) != KEY_BYTES:
+        raise RuntimeError("surfacing feedback DB has no valid HMAC key in stm_meta")
+    return row[0]
+
+
+@dataclass(frozen=True)
+class EventProvenance:
+    """Collection-time facts about one delivered surfacing, stored on its event row.
+
+    ``tool_use_id`` / ``host_session_id`` / ``host_agent_id`` are the host's own
+    ids for the call, its session and (inside a subagent) its agent; together
+    they name the transcript the call was written to. The host's ``cwd`` is
+    deliberately not here: it is never stored.
+
+    ``injected_chars``, ``id_advertised`` and ``header_digest`` describe the
+    block as rendered when the row was queued. A later withdrawal of the
+    advertised id (the write failed or outran its ceiling, and the block was
+    re-rendered without it) is not reflected: a row that lands after that
+    still carries the pre-withdrawal values.
+    """
+
+    injected_chars: int | None = None
+    tool_use_id: str | None = None
+    host_session_id: str | None = None
+    host_agent_id: str | None = None
+    id_advertised: bool | None = None
+    header_digest: str | None = None
+
+
+@dataclass(frozen=True)
+class MemoryPathInput:
+    """One delivered memory as the engine saw it at render time.
+
+    Carries the raw ``source_file`` and rendered ``preview`` to the store
+    worker, which stores only their keyed hashes. ``eligible`` is decided by
+    the caller from the path string alone (``grams.eligible_source``).
+    """
+
+    memory_id: str
+    source_file: str | None
+    preview: str
+    eligible: bool
+
+
+def _opt_text(value: str | None) -> str | None:
+    return None if value is None else escape_lone_surrogates(value)
+
+
+def _resolved_path_hash(source_file: str, key: bytes) -> str | None:
+    """Keyed hash of the file's resolved path, or ``None`` if it does not exist now."""
+    try:
+        expanded = os.path.expanduser(source_file)
+        if not os.path.exists(expanded):
+            return None
+        return keyed_hash(path_key(os.path.realpath(expanded)), key)
+    except (OSError, ValueError):
+        return None
 
 
 class FeedbackDbStatus(TypedDict):
@@ -560,6 +717,9 @@ class FeedbackStore:
         self._read_db: sqlite3.Connection | None = None
         self._lock = threading.Lock()
         self._read_lock = threading.Lock()
+        # Committed by ``initialize`` before the first event can be written, so
+        # a reader that pins its fingerprint never sees the key change.
+        self._hmac_key: bytes | None = None
 
     @property
     def db_path(self) -> Path:
@@ -572,11 +732,8 @@ class FeedbackStore:
         try:
             ensure_private_db_files(self._db_path)
             tune_connection(db)
-            db.executescript(_SCHEMA)
-            _relax_surfacing_events_query_notnull(db)
-            _add_fault_recovery_column(db)
-            # Must stay after the relax migration — see its docstring.
-            _add_events_score_scale_column(db)
+            _migrate(db)
+            hmac_key = _read_hmac_key(db)
             # Opened only once the schema is final: the reader runs no DDL of
             # its own, so it must never observe a half-migrated table.
             read_db = sqlite3.connect(str(self._db_path), check_same_thread=False)
@@ -588,6 +745,7 @@ class FeedbackStore:
             raise
         self._db = db
         self._read_db = read_db
+        self._hmac_key = hmac_key
 
     @contextlib.contextmanager
     def _reading(self) -> Iterator[sqlite3.Connection | None]:
@@ -649,6 +807,8 @@ class FeedbackStore:
         memory_ids: list[str],
         scores: list[float],
         score_scale: str | None = None,
+        provenance: EventProvenance | None = None,
+        memory_paths: Sequence[MemoryPathInput] = (),
     ) -> bool:
         """Write one surfacing event row. ``False`` when the store is closed.
 
@@ -656,6 +816,13 @@ class FeedbackStore:
         be a silent success: a teardown that closes the store while a call is
         still in flight would otherwise leave the agent holding a feedback
         handle that resolves to nothing.
+
+        *memory_paths* rows land in the same transaction as the event, and only
+        when the event row was actually inserted (a replayed ID adds nothing).
+        Their hashes — including the ``realpath`` lookup — are computed before
+        the lock is taken, so a failure there writes nothing; a failure after
+        the INSERT rolls the event back with its paths. Either way no event can
+        exist without the path rows a later reader needs to interpret it.
         """
         if self._db is None:
             return False
@@ -666,27 +833,95 @@ class FeedbackStore:
             require_utf8_identifier(memory_id, f"memory_ids[{index}]")
         safe_query = escape_lone_surrogates(query)
         safe_score_scale = escape_lone_surrogates(score_scale) if score_scale is not None else None
+        prov = provenance or EventProvenance()
+        path_rows = self._memory_path_rows(surfacing_id, memory_ids, memory_paths)
         with self._lock:
             db = self._db
             if db is None:
                 return False
-            db.execute(
-                "INSERT OR IGNORE INTO surfacing_events "
-                "(id, server, tool, query, memory_ids, scores, created_at, score_scale) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            try:
+                cursor = db.execute(
+                    "INSERT OR IGNORE INTO surfacing_events "
+                    "(id, server, tool, query, memory_ids, scores, created_at, score_scale, "
+                    "injected_chars, tool_use_id, host_session_id, host_agent_id, "
+                    "id_advertised, header_digest) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        surfacing_id,
+                        server,
+                        tool,
+                        safe_query,
+                        json.dumps(memory_ids),
+                        json.dumps(scores),
+                        time.time(),
+                        safe_score_scale,
+                        prov.injected_chars,
+                        _opt_text(prov.tool_use_id),
+                        _opt_text(prov.host_session_id),
+                        _opt_text(prov.host_agent_id),
+                        None if prov.id_advertised is None else int(prov.id_advertised),
+                        prov.header_digest,
+                    ),
+                )
+                if cursor.rowcount == 1 and path_rows:
+                    db.executemany(
+                        "INSERT OR IGNORE INTO surfacing_memory_paths "
+                        "(surfacing_id, memory_id, eligible, path_hash_lexical, "
+                        "path_hash_resolved, dir_hashes, basename_hash, snippet_grams) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        path_rows,
+                    )
+                db.commit()
+            except Exception:
+                self._abandon_transaction(db, "surfacing event")
+                raise
+        return True
+
+    def _memory_path_rows(
+        self,
+        surfacing_id: str,
+        memory_ids: list[str],
+        memory_paths: Sequence[MemoryPathInput],
+    ) -> list[tuple[object, ...]]:
+        """Hash each delivered memory's path and preview into a storable row.
+
+        Runs on the store worker (never the loop): ``realpath`` touches the
+        filesystem. Raw paths and preview text stop here; only keyed hashes
+        are returned.
+        """
+        if not memory_paths:
+            return []
+        key = self._hmac_key
+        if key is None:
+            raise RuntimeError("surfacing feedback store has no HMAC key; initialize() first")
+        delivered = set(memory_ids)
+        rows: list[tuple[object, ...]] = []
+        for item in memory_paths:
+            if item.memory_id not in delivered:
+                raise ValueError(f"memory path row for undelivered memory {item.memory_id!r}")
+            lexical: str | None = None
+            resolved: str | None = None
+            dirs: str | None = None
+            basename: str | None = None
+            if item.eligible and item.source_file is not None:
+                lexical_key = path_key(item.source_file)
+                lexical = keyed_hash(lexical_key, key)
+                dirs = json.dumps([keyed_hash(a, key) for a in ancestor_keys(lexical_key)])
+                basename = keyed_hash(basename_key(lexical_key), key)
+                resolved = _resolved_path_hash(item.source_file, key)
+            rows.append(
                 (
                     surfacing_id,
-                    server,
-                    tool,
-                    safe_query,
-                    json.dumps(memory_ids),
-                    json.dumps(scores),
-                    time.time(),
-                    safe_score_scale,
-                ),
+                    item.memory_id,
+                    int(item.eligible),
+                    lexical,
+                    resolved,
+                    dirs,
+                    basename,
+                    json.dumps(snippet_grams(item.preview, key)),
+                )
             )
-            db.commit()
-        return True
+        return rows
 
     def record_fault(self, server: str, tool: str, kind: str, *, at: float | None = None) -> None:
         """Increment the durable per-day fault counter for (server, tool, kind).
@@ -1470,9 +1705,9 @@ class FeedbackStore:
         Unlike :meth:`cleanup_expired_queries`, which only nulls the query
         column and keeps the row for aggregates, this bounds the table so
         :meth:`get_stats` cannot full-scan an unbounded history on the event
-        loop. The feedback rows are removed first (they reference events by
-        ``surfacing_id``), then the events, in one transaction. ``<= 0``
-        disables deletion."""
+        loop. The rows that reference events by ``surfacing_id`` — feedback and
+        memory paths — are removed first, then the events, in one transaction.
+        ``<= 0`` disables deletion."""
         if self._db is None or retention_seconds <= 0:
             return 0
         cutoff = time.time() - retention_seconds
@@ -1482,6 +1717,14 @@ class FeedbackStore:
                 return 0
             db.execute(
                 "DELETE FROM surfacing_feedback WHERE surfacing_id IN "
+                "(SELECT id FROM surfacing_events WHERE created_at < ?)",
+                (cutoff,),
+            )
+            # Memory paths carry no timestamp of their own: they go with the
+            # event they describe, and must go first, while the subquery can
+            # still find it.
+            db.execute(
+                "DELETE FROM surfacing_memory_paths WHERE surfacing_id IN "
                 "(SELECT id FROM surfacing_events WHERE created_at < ?)",
                 (cutoff,),
             )
