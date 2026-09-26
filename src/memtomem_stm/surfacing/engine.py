@@ -35,7 +35,6 @@ from memtomem_stm.surfacing.mcp_client import (
 )
 from memtomem_stm.surfacing.observability import _NOOP_OBSERVABILITY, SurfacingObservability
 from memtomem_stm.surfacing.relevance import RelevanceGate
-from memtomem_stm.surfacing.rrf_profile import rrf_score_ceiling
 from memtomem_stm.surfacing.store_io import (
     StoreWriteQueueFull,
     await_store_write,
@@ -1160,14 +1159,6 @@ class SurfacingEngine:
         digest = hashlib.sha256(query.encode("utf-8", errors="surrogatepass")).hexdigest()[:16]
         return f"{_QUERY_HASH_PREFIX}{digest}"
 
-    def _score_ceiling(self) -> float:
-        """Top of the relevance-bucket band for ``rrf``-stamped results (#1034).
-
-        Read from the LTM adapter's connect-time ``runtime_profile``; an adapter
-        without one (the daemon-backed adapter) gets Core's default, 2/61.
-        """
-        return rrf_score_ceiling(getattr(self._mcp_adapter, "runtime_profile", None))
-
     def _active_min_score(self, tool: str) -> float:
         """Return the score floor currently used for surfacing decisions.
 
@@ -1861,7 +1852,6 @@ class SurfacingEngine:
             query,
             surfacing_id=advertised_id,
             score_floor=self._active_min_score(tool),
-            score_ceiling=self._score_ceiling(),
         )
         delivered_ids = list(manifest.delivered_ids)
         delivered_set = set(delivered_ids)
@@ -1915,7 +1905,6 @@ class SurfacingEngine:
                         cached,
                         query,
                         score_floor=self._active_min_score(tool),
-                        score_ceiling=self._score_ceiling(),
                     )
         # Counted once the call is past the point it can be cancelled at: a
         # hit whose event write was still queued when the client hung up
@@ -2469,7 +2458,6 @@ class SurfacingEngine:
             surfacing_id=advertised_id,
             scratch_items=scratch_items,
             score_floor=min_score,
-            score_ceiling=self._score_ceiling(),
         )
         delivered_ids = list(manifest.delivered_ids)
         delivered_set = set(delivered_ids)
@@ -2538,7 +2526,6 @@ class SurfacingEngine:
                         query,
                         scratch_items=scratch_items,
                         score_floor=min_score,
-                        score_ceiling=self._score_ceiling(),
                     )
 
         self._observability.record_outcome(tool, "surfaced_cache_miss")

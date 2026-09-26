@@ -10,7 +10,7 @@ from typing import Any
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.feedback import VALID_RATINGS
 from memtomem_stm.surfacing.mcp_client import KNOWN_SCORE_SCALES
-from memtomem_stm.surfacing.rrf_profile import RRF_BASELINE_CEILING
+from memtomem_stm.surfacing.rrf_profile import RRF_BASELINE_CEILING, read_score_ceiling_hint
 
 # Header for the optional scratch / working-memory section. Shared between the
 # render site and the truncation orphan-trim so the two cannot drift.
@@ -145,7 +145,6 @@ class SurfacingFormatter:
         surfacing_id: str | None = None,
         scratch_items: list[dict] | None = None,
         score_floor: float | None = None,
-        score_ceiling: float | None = None,
     ) -> str:
         """Inject surfaced memories into ``response_text``.
 
@@ -162,7 +161,6 @@ class SurfacingFormatter:
             surfacing_id=surfacing_id,
             scratch_items=scratch_items,
             score_floor=score_floor,
-            score_ceiling=score_ceiling,
         ).text
 
     def render(
@@ -173,14 +171,8 @@ class SurfacingFormatter:
         surfacing_id: str | None = None,
         scratch_items: list[dict] | None = None,
         score_floor: float | None = None,
-        score_ceiling: float | None = None,
     ) -> RenderManifest:
-        """Render memories and report only IDs present in the final block.
-
-        ``score_ceiling`` is the top of the relevance-bucket band for results
-        stamped ``rrf`` (see :func:`~memtomem_stm.surfacing.rrf_profile.rrf_score_ceiling`);
-        ``None`` means Core's default fusion, ``2/61``.
-        """
+        """Render memories and report only IDs present in the final block."""
         if not results and not scratch_items:
             return RenderManifest(response_text, (), ())
 
@@ -266,10 +258,13 @@ class SurfacingFormatter:
 
             # The [weak|related|strong] bucket splits [floor, top] into thirds.
             # For a result stamped ``rrf``, top is the fusion's two-leg
-            # reference score (``score_ceiling``; 2/61 at Core's defaults), so
-            # the tags spread across the RRF range instead of all landing in
-            # the bottom third of [floor, 1.0] (#1034); rescue/decay/boost can
-            # lift a score past it, which reads as ``strong``. When THIS result
+            # reference score, stamped on the result as ``score_ceiling`` by the
+            # adapter from the profile of the Core session that scored it (2/61
+            # when absent or invalid), so the tags spread across the RRF range
+            # instead of all landing in the bottom third of [floor, 1.0]
+            # (#1034); rescue/decay/boost can lift a score past it, which reads
+            # as ``strong``. The stamp is validated here because fakes and
+            # mocks fabricate attributes. When THIS result
             # is stamped with a core-named non-RRF scale (e.g. rerank logits —
             # unbounded, median negative) no band is meaningful, so the tag is
             # suppressed. Keyed per result off the stamp — not off gate config
@@ -283,7 +278,8 @@ class SurfacingFormatter:
             else:
                 top = 1.0
                 if scale == "rrf":
-                    top = RRF_BASELINE_CEILING if score_ceiling is None else score_ceiling
+                    stamped = read_score_ceiling_hint(getattr(r, "score_ceiling", None))
+                    top = RRF_BASELINE_CEILING if stamped is None else stamped
                 bucket = self._relevance_bucket(float(r.score), score_floor, top)
                 bucket_token = f" [{bucket}]"
             # The backticked ``chunk.id`` is the agent-copyable ``memory_id``

@@ -1081,3 +1081,167 @@ async def test_starting_and_busy_do_not_open_local_circuit(tmp_path: Path) -> No
     skips = obs.snapshot()["skip_reasons"]["read_file"]
     assert skips["daemon_starting"] == 1
     assert skips["daemon_busy"] == 2
+
+
+# ── RRF bucket ceiling over the daemon wire (#1034) ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_daemon_search_forwards_rrf_ceiling_only(tmp_path: Path) -> None:
+    """The daemon forwards its adapter's ``score_ceiling`` stamp as an additive
+    key on ``rrf`` results only, and omits it when absent or invalid."""
+    server = DaemonServer(_config(tmp_path))
+    rrf = RemoteSearchResult("a", 0.03, "/a.md", "work", score_scale="rrf", score_ceiling=2 / 11)
+    bare = RemoteSearchResult("b", 0.03, "/b.md", "work", score_scale="rrf")
+    stray = RemoteSearchResult("c", 0.5, "/c.md", "work", score_scale="bm25", score_ceiling=0.1)
+    bogus = RemoteSearchResult("d", 0.03, "/d.md", "work", score_scale="rrf")
+    bogus.score_ceiling = float("nan")  # type: ignore[assignment]
+    server._adapter = SimpleNamespace(
+        search=AsyncMock(return_value=([rrf, bare, stray, bogus], [], "ok"))
+    )
+
+    response = await server._dispatch(_request(OP_LTM_SEARCH, {"query": "jwt handler"}))
+
+    assert response is not None and response["ok"] is True
+    entries = response["results"]
+    assert entries[0]["score_ceiling"] == pytest.approx(2 / 11)
+    assert ["score_ceiling" in e for e in entries[1:]] == [False, False, False]
+
+
+@pytest.mark.asyncio
+async def test_daemon_compose_forwards_rrf_ceiling_at_schema_four(tmp_path: Path) -> None:
+    server = DaemonServer(_config(tmp_path))
+    retrieved = RemoteSearchResult(
+        "HIT", 0.03, "memory.md", "work", score_scale="rrf", score_ceiling=2 / 11
+    )
+    bundle = ContextComposeResult((), (retrieved,), (), (), "rrf", None, 2 / 11)
+    server._adapter = SimpleNamespace(
+        capabilities=LtmCapabilities(context_compose_schema=4),
+        capabilities_ready=True,
+        context_compose=AsyncMock(return_value=bundle),
+    )
+    base = {
+        "query": "q",
+        "agent_id": None,
+        "max_chars": 100,
+        "top_k": 2,
+        "namespace": "work",
+        "context_window": 1,
+    }
+
+    four = await server._dispatch(
+        _request(OP_LTM_CONTEXT_COMPOSE, {**base, "context_compose_max_schema": 4})
+    )
+    three = await server._dispatch(
+        _request(OP_LTM_CONTEXT_COMPOSE, {**base, "context_compose_max_schema": 3})
+    )
+
+    assert four is not None and four["score_ceiling"] == pytest.approx(2 / 11)
+    assert three is not None and "score_ceiling" not in three
+
+
+def _search_reply(**extra: object) -> dict:
+    return {
+        "ok": True,
+        "results": [
+            {
+                "content": "memory",
+                "score": 0.03,
+                "source": "/m.md",
+                "namespace": "default",
+                "chunk_id": "chunk-1",
+                **extra,
+            }
+        ],
+        "hints": [],
+        "outcome": "ok",
+    }
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ({"score_scale": "rrf", "score_ceiling": 2 / 11}, 2 / 11),
+        # An old daemon omits the key: the formatter falls back to 2/61.
+        ({"score_scale": "rrf"}, None),
+        ({"score_scale": "rrf", "score_ceiling": "x"}, None),
+        ({"score_scale": "rrf", "score_ceiling": -1}, None),
+        ({"score_scale": "rrf", "score_ceiling": float("inf")}, None),
+        ({"score_scale": "rrf", "score_ceiling": float("nan")}, None),
+        ({"score_scale": "rrf", "score_ceiling": True}, None),
+        # A stray ceiling on another scale is not carried.
+        ({"score_scale": "bm25", "score_ceiling": 0.1}, None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_adapter_decodes_score_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: dict, expected: float | None
+) -> None:
+    adapter = DaemonLtmAdapter(_config(tmp_path))
+
+    async def reply(*args, **kwargs):
+        return "ok", _search_reply(**extra)
+
+    monkeypatch.setattr("memtomem_stm.surfacing.daemon_adapter.client.ltm_request", reply)
+
+    results, _, outcome = await adapter.search("query")
+    assert outcome == "ok"
+    if expected is None:
+        assert results[0].score_ceiling is None
+    else:
+        assert results[0].score_ceiling == pytest.approx(expected)
+
+
+@pytest.mark.asyncio
+async def test_old_daemon_reply_renders_with_the_default_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end: a v7-era reply (no ``score_ceiling``) bands on 2/61."""
+    from memtomem_stm.surfacing.config import SurfacingConfig
+    from memtomem_stm.surfacing.formatter import SurfacingFormatter
+
+    adapter = DaemonLtmAdapter(_config(tmp_path))
+
+    async def reply(*args, **kwargs):
+        # 0.025 is [related] on [0.017, 2/61] and [weak] on [0.017, 2/11].
+        body = _search_reply(score_scale="rrf")
+        body["results"][0]["score"] = 0.025
+        return "ok", body
+
+    monkeypatch.setattr("memtomem_stm.surfacing.daemon_adapter.client.ltm_request", reply)
+
+    results, _, _ = await adapter.search("query")
+    rendered = SurfacingFormatter(SurfacingConfig(min_score=0.017)).inject("r", results, "q")
+    assert "`chunk-1` [related]: memory" in rendered
+
+
+@pytest.mark.asyncio
+async def test_adapter_decodes_compose_score_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = DaemonLtmAdapter(_config(tmp_path))
+
+    async def reply(*args, **kwargs):
+        return (
+            "ok",
+            {
+                "ok": True,
+                "selected_context_compose_schema": 4,
+                "pinned": [{"content": "pinned block", "chunk_id": "pin-1"}],
+                "retrieved": [
+                    {"content": "hit", "score": 0.03, "source": "/m.md", "chunk_id": "c1"}
+                ],
+                "warnings": [],
+                "omitted_block_ids": [],
+                "score_scale": "rrf",
+                "score_ceiling": 2 / 11,
+            },
+        )
+
+    monkeypatch.setattr("memtomem_stm.surfacing.daemon_adapter.client.ltm_request", reply)
+
+    bundle = await adapter.context_compose("q")
+    assert bundle is not None
+    assert bundle.score_ceiling == pytest.approx(2 / 11)
+    assert bundle.retrieved[0].score_ceiling == pytest.approx(2 / 11)
+    assert bundle.pinned[0].score_ceiling is None

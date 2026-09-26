@@ -2100,3 +2100,139 @@ class TestCoreSurrogateScrub:
 
         with pytest.raises(json.JSONDecodeError):
             _core_json_loads("not json")
+
+
+# ── RRF bucket ceiling stamp (#1034) ─────────────────────────────────────
+
+
+def _fusion_profile(*, rrf_k: int = 60, weights: tuple[float, float] = (1.0, 1.0)) -> dict:
+    return {
+        "schema_version": 1,
+        "config_state": "ok",
+        "search": {
+            "rrf_k": rrf_k,
+            "rrf_weights": list(weights),
+            "bm25_candidates": 50,
+            "dense_candidates": 50,
+            "enable_bm25": True,
+            "enable_dense": True,
+            "effective_mode": "hybrid",
+        },
+    }
+
+
+def _structured_reply(scale: str) -> MagicMock:
+    return _result_with_text(
+        json.dumps(
+            {
+                "score_scale": scale,
+                "results": [
+                    {"rank": 1, "score": 0.03, "source": "a.md", "chunk_id": "c1", "content": "a"},
+                    {"rank": 2, "score": 0.02, "source": "b.md", "chunk_id": "c2", "content": "b"},
+                ],
+            }
+        )
+    )
+
+
+class TestRrfCeilingStamp:
+    """The adapter stamps each ``rrf`` result with ``sum(w)/(k+1)`` from the
+    profile of the session that served the request, pinned at issue time like
+    the parser (#874), so a reconnect mid-flight cannot re-label a reply."""
+
+    @staticmethod
+    def _adapter(profile: dict | None, call_tool) -> McpClientSearchAdapter:
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="structured"))
+        adapter._parser = StructuredResultParser()
+        adapter._runtime_profile = profile
+        session = AsyncMock()
+        session.call_tool = call_tool
+        adapter._session = session
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_rrf_results_carry_the_profile_ceiling(self):
+        adapter = self._adapter(
+            _fusion_profile(weights=(0.5, 0.5)), AsyncMock(return_value=_structured_reply("rrf"))
+        )
+        results, _, outcome = await adapter.search("q")
+        assert outcome == "ok"
+        assert [r.score_ceiling for r in results] == [pytest.approx(1 / 61)] * 2
+
+    @pytest.mark.asyncio
+    async def test_non_rrf_results_carry_no_ceiling(self):
+        adapter = self._adapter(
+            _fusion_profile(), AsyncMock(return_value=_structured_reply("bm25"))
+        )
+        results, _, _ = await adapter.search("q")
+        assert [r.score_ceiling for r in results] == [None, None]
+
+    @pytest.mark.asyncio
+    async def test_invalid_profile_stamps_the_default(self):
+        adapter = self._adapter(
+            _fusion_profile(weights=(1.0, 0.0)), AsyncMock(return_value=_structured_reply("rrf"))
+        )
+        results, _, _ = await adapter.search("q")
+        assert results[0].score_ceiling == pytest.approx(2 / 61)
+
+    @pytest.mark.asyncio
+    async def test_profile_swapped_mid_rpc_keeps_the_issuing_ceiling(self):
+        adapter: McpClientSearchAdapter
+
+        async def reply(*_args, **_kwargs):
+            # A reconnect renegotiating against a different Core while this
+            # request is in flight rewrites the profile before the reply lands.
+            adapter._runtime_profile = _fusion_profile(rrf_k=10)
+            return _structured_reply("rrf")
+
+        adapter = self._adapter(_fusion_profile(), AsyncMock(side_effect=reply))
+        results, _, _ = await adapter.search("q")
+        assert results[0].score_ceiling == pytest.approx(2 / 61)
+
+    @pytest.mark.asyncio
+    async def test_retry_on_a_new_session_stamps_that_sessions_ceiling(self):
+        adapter = self._adapter(
+            _fusion_profile(),
+            AsyncMock(side_effect=[ConnectionError("transient"), _structured_reply("rrf")]),
+        )
+
+        async def reconnect(*_args, **_kwargs):
+            adapter._runtime_profile = _fusion_profile(rrf_k=10)
+
+        adapter._reconnect = AsyncMock(side_effect=reconnect)  # type: ignore[method-assign]
+        results, _, outcome = await adapter.search("q")
+        adapter._reconnect.assert_awaited_once()
+        assert outcome == "ok"
+        assert results[0].score_ceiling == pytest.approx(2 / 11)
+
+    @pytest.mark.asyncio
+    async def test_compose_stamps_retrieved_and_envelope_from_the_serving_session(self):
+        from memtomem_stm.surfacing.mcp_client import LtmCapabilities
+
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="structured"))
+        adapter._capabilities = LtmCapabilities(context_compose_schema=4)
+        adapter._runtime_profile = _fusion_profile()
+        adapter._heal_if_needed = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        payload = {
+            "pinned": [{"content": "pinned block", "block_id": "pin-1"}],
+            "retrieved": [{"id": "hit", "content": "matched", "source": "a.md", "score": 0.03}],
+            "score_scale": "rrf",
+        }
+
+        async def call_mem_do(_action, params, *, trace_id=None, refresh_params=None):
+            # First send, then a retry on a new session whose Core fuses at
+            # k=10: the reply belongs to the retry, so its ceiling must win.
+            refresh_params(params)
+            adapter._runtime_profile = _fusion_profile(rrf_k=10)
+            refresh_params(params)
+            adapter._runtime_profile = None  # a later reconnect must not leak in
+            return SimpleNamespace(
+                is_error=False, content=[SimpleNamespace(type="text", text=json.dumps(payload))]
+            )
+
+        adapter._call_mem_do = call_mem_do  # type: ignore[method-assign]
+        bundle = await adapter.context_compose("q")
+        assert bundle is not None
+        assert bundle.score_ceiling == pytest.approx(2 / 11)
+        assert bundle.retrieved[0].score_ceiling == pytest.approx(2 / 11)
+        assert bundle.pinned[0].score_ceiling is None

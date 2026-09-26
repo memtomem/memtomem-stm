@@ -8,6 +8,7 @@ from memtomem_stm.surfacing.rrf_profile import (
     RRF_BASELINE_CEILING,
     FusionGap,
     check_two_leg_fusion,
+    read_score_ceiling_hint,
     rrf_score_ceiling,
     two_leg_fusion,
 )
@@ -103,3 +104,15 @@ def test_check_names_each_gap(data, gap):
 
 def test_check_returns_k_and_weights():
     assert check_two_leg_fusion(profile(rrf_k=10, rrf_weights=[1, 2])) == (10, (1.0, 2.0))
+
+
+@pytest.mark.parametrize("raw", [2 / 61, 1 / 61, 0.5, 3])
+def test_ceiling_hint_accepts_finite_positive_numbers(raw):
+    assert read_score_ceiling_hint(raw) == float(raw)
+
+
+@pytest.mark.parametrize(
+    "raw", [None, "x", "0.03", True, False, 0, -1, -0.5, float("inf"), float("nan"), 10**400, [1]]
+)
+def test_ceiling_hint_rejects_everything_else(raw):
+    assert read_score_ceiling_hint(raw) is None

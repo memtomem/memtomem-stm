@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
@@ -38,6 +40,8 @@ class FakeResult:
     # Core-reported scale stamp (#1781). Default mirrors the unstamped paths
     # (compact format, compose bundles, pre-#1781 cores).
     score_scale: str | None = None
+    # Relevance-bucket ceiling stamped by the LTM adapter on rrf results (#1034).
+    score_ceiling: Any = None
 
 
 def _preview_line_after_bucket(output: str, bucket: str = "related") -> str:
@@ -274,33 +278,53 @@ class TestFormatterInjection:
         under the old band every one of these rendered [weak]."""
         fmt = SurfacingFormatter(SurfacingConfig(min_score=0.017))
         results = [FakeResult(FakeChunk(content="hit", id="k"), score, score_scale="rrf")]
-        output = fmt.inject("response", results, "query")  # no ceiling → 2/61
+        output = fmt.inject("response", results, "query")  # no stamp → 2/61
         assert f"`k` [{bucket}]: hit" in output
 
-    def test_rrf_bucket_uses_explicit_ceiling(self):
+    def test_rrf_bucket_uses_stamped_ceiling(self):
         # Ceiling 2/11 (k=10): 0.05 sits in the bottom third, whereas the
         # default 2/61 ceiling would call it strong.
         fmt = SurfacingFormatter(SurfacingConfig(min_score=0.017))
-        results = [FakeResult(FakeChunk(content="hit", id="k"), 0.05, score_scale="rrf")]
-        assert "`k` [weak]: hit" in fmt.inject("response", results, "query", score_ceiling=2 / 11)
-        assert "`k` [strong]: hit" in fmt.inject("response", results, "query")
+        stamped = FakeResult(
+            FakeChunk(content="hit", id="k"), 0.05, score_scale="rrf", score_ceiling=2 / 11
+        )
+        bare = FakeResult(FakeChunk(content="hit", id="k"), 0.05, score_scale="rrf")
+        assert "`k` [weak]: hit" in fmt.inject("response", [stamped], "query")
+        assert "`k` [strong]: hit" in fmt.inject("response", [bare], "query")
 
     def test_rrf_ceiling_below_floor_is_strong(self):
         # w=[0.5, 0.5] at k=60 gives 1/61 < floor 0.017: no band to split.
         fmt = SurfacingFormatter(SurfacingConfig(min_score=0.017))
-        results = [FakeResult(FakeChunk(content="hit", id="k"), 0.017, score_scale="rrf")]
-        output = fmt.inject("response", results, "query", score_ceiling=1 / 61)
-        assert "`k` [strong]: hit" in output
+        results = [
+            FakeResult(
+                FakeChunk(content="hit", id="k"), 0.017, score_scale="rrf", score_ceiling=1 / 61
+            )
+        ]
+        assert "`k` [strong]: hit" in fmt.inject("response", results, "query")
 
-    def test_unstamped_bucket_keeps_legacy_unit_band(self):
-        # The ceiling only applies to rrf-stamped results; unstamped scores
-        # still split [floor, 1.0], even when a ceiling is passed.
+    @pytest.mark.parametrize(
+        "stamp", ["x", -1, 0, True, float("inf"), float("nan"), 10**400, MagicMock()]
+    )
+    def test_invalid_ceiling_stamp_falls_back_to_default(self, stamp):
+        # 0.0250 is [related] under 2/61; a stamp read as-is would move it
+        # (or raise), so every invalid stamp must land on the default.
         fmt = SurfacingFormatter(SurfacingConfig(min_score=0.017))
         results = [
-            FakeResult(FakeChunk(content="high", id="u-high"), 0.95),
-            FakeResult(FakeChunk(content="low", id="u-low"), 0.03),
+            FakeResult(
+                FakeChunk(content="hit", id="k"), 0.0250, score_scale="rrf", score_ceiling=stamp
+            )
         ]
-        output = fmt.inject("response", results, "query", score_ceiling=2 / 61)
+        assert "`k` [related]: hit" in fmt.inject("response", results, "query")
+
+    def test_ceiling_stamp_ignored_off_the_rrf_scale(self):
+        # The stamp only applies to rrf results; unstamped scores still split
+        # [floor, 1.0] even when a (stray) ceiling is attached.
+        fmt = SurfacingFormatter(SurfacingConfig(min_score=0.017))
+        results = [
+            FakeResult(FakeChunk(content="high", id="u-high"), 0.95, score_ceiling=2 / 61),
+            FakeResult(FakeChunk(content="low", id="u-low"), 0.03, score_ceiling=2 / 61),
+        ]
+        output = fmt.inject("response", results, "query")
         assert "`u-high` [strong]: high" in output
         assert "`u-low` [weak]: low" in output
 

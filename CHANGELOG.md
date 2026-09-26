@@ -17,8 +17,10 @@ changes inline only. See the deprecation policy in
   split `[min_score, 1.0]` into thirds, but hybrid RRF scores cluster below the
   default two-leg reference score `2/61` (about 0.033), far under the old `[related]`
   boundary of about 0.345. For results stamped `rrf` the band now ends at
-  `sum(rrf_weights) / (rrf_k + 1)`, read from the
-  core's `runtime_profile`, or at `2/61` when the profile is unavailable. Replaying
+  `sum(rrf_weights) / (rrf_k + 1)`. The LTM adapter computes it from the `runtime_profile`
+  of the core session that served the search and stamps it on each result, and the
+  daemon forwards the stamp. It is `2/61` when the profile is missing or invalid, or
+  when an older daemon omits the stamp. Replaying
   4,708 recorded `rrf` scores at the default `min_score` gives 3,245 `[strong]`,
   1,194 `[related]` and 269 `[weak]`, where all 4,708 were `[weak]` before.
   Unstamped results (compact format, older cores) keep the `[min_score, 1.0]` band.

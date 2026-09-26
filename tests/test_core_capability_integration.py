@@ -6,7 +6,7 @@ import json
 import logging
 import re
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 import pytest
 
@@ -219,8 +219,18 @@ async def test_direct_schema_two_compose_forwards_scope_fields(
             "context_window": 2,
         },
         trace_id="trace-1",
-        refresh_params=adapter._refresh_rerank_arg,
+        refresh_params=ANY,
     )
+    # The hook wraps ``_refresh_rerank_arg`` (it also records the bucket
+    # ceiling, #1034), so check what it does rather than which function it is.
+    refresh = call.await_args.kwargs["refresh_params"]
+    probe = {"rerank": "stale"}
+    refresh(probe)
+    assert "rerank" not in probe
+    monkeypatch.setattr(adapter._config, "rerank", True)
+    monkeypatch.setattr(adapter, "_rerank_param_supported", True)
+    refresh(probe)
+    assert probe["rerank"] is True
 
 
 def _compose_adapter(monkeypatch: pytest.MonkeyPatch, payload: object, *, schema: int = 2):

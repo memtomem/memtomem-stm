@@ -1,9 +1,10 @@
 """Two-leg RRF settings read from Core's ``runtime_profile`` snapshot.
 
 One validator for two readers: ``mms doctor``'s RRF boundary advice
-(:mod:`memtomem_stm.cli.rrf_diagnostics`) and the surfacing formatter's
-relevance buckets (:func:`rrf_score_ceiling`). The profile is untrusted remote
-data captured at connect time, so every field is checked before use.
+(:mod:`memtomem_stm.cli.rrf_diagnostics`) and the relevance-bucket ceiling the
+LTM adapter stamps on each ``rrf`` result (:func:`rrf_score_ceiling`). The
+profile is untrusted remote data captured at connect time, so every field is
+checked before use.
 """
 
 from __future__ import annotations
@@ -104,3 +105,21 @@ def rrf_score_ceiling(profile: Any) -> float:
     if not math.isfinite(ceiling) or ceiling <= 0:
         return RRF_BASELINE_CEILING
     return ceiling
+
+
+def read_score_ceiling_hint(raw: Any) -> float | None:
+    """A result's ``score_ceiling`` stamp when it is a finite positive number, else ``None``.
+
+    The stamp crosses the daemon wire and sits on result objects that tests and
+    fakes may build loosely, so every reader validates it; ``None`` means the
+    renderer falls back to :data:`RRF_BASELINE_CEILING`.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    try:
+        value = float(raw)
+    except OverflowError:
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return value

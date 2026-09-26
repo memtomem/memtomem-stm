@@ -51,6 +51,8 @@ class FakeSearchResult:
     # (compact format, compose bundles, pre-#1781 cores).
     score_scale: str | None = None
     reranker: str | None = None
+    # Relevance-bucket ceiling the adapter stamps on rrf results (#1034).
+    score_ceiling: float | None = None
 
 
 def _make_config(**overrides) -> SurfacingConfig:
@@ -5458,49 +5460,39 @@ class TestFifoPruneHelper:
 
 
 class TestRrfBucketCeiling:
-    """#1034: the engine hands the formatter the ceiling from the adapter's profile."""
+    """#1034: the bucket ceiling travels on the result, not through the engine."""
 
     @staticmethod
-    def _profile(rrf_k: int) -> dict:
-        return {
-            "schema_version": 1,
-            "config_state": "ok",
-            "search": {
-                "rrf_k": rrf_k,
-                "rrf_weights": [1.0, 1.0],
-                "bm25_candidates": 50,
-                "dense_candidates": 50,
-                "enable_bm25": True,
-                "enable_dense": True,
-                "effective_mode": "hybrid",
-            },
-        }
-
-    @staticmethod
-    def _engine(profile):
-        # 0.05 is above the default ceiling 2/61 (strong) but in the bottom
-        # third of [0.017, 2/11] (weak) — the two readings disagree.
-        result = FakeSearchResult(
-            chunk=FakeChunk(content="ceiling probe"), score=0.05, score_scale="rrf"
-        )
+    def _engine(result):
         adapter = _make_mcp_adapter([result])
-        adapter.runtime_profile = profile
         config = _make_config(min_score=0.017, dedup_ttl_seconds=0, cooldown_seconds=0)
         return SurfacingEngine(config=config, mcp_adapter=adapter)
 
-    async def test_profile_ceiling_reaches_the_rendered_bucket(self):
-        engine = self._engine(self._profile(rrf_k=10))  # ceiling 2/11
+    async def test_stamped_ceiling_reaches_miss_and_cache_hit(self):
+        # 0.05 is above the default ceiling 2/61 (strong) but in the bottom
+        # third of [0.017, 2/11] (weak) — the two readings disagree.
+        result = FakeSearchResult(
+            chunk=FakeChunk(content="ceiling probe"),
+            score=0.05,
+            score_scale="rrf",
+            score_ceiling=2 / 11,
+        )
+        engine = self._engine(result)
+        # A profile on the adapter must not matter: the stamp is authoritative.
+        engine._mcp_adapter.runtime_profile = None
         args = ("gh", "read_file", {"_context_query": "ceiling probe query"}, LONG_RESPONSE)
         miss = await engine.surface(*args)
         assert "[weak]: ceiling probe" in miss
-        # The cache-hit render reads the same ceiling.
+        # The cache hit re-renders the cached result, stamp included.
         hit = await engine.surface(*args)
         assert "[weak]: ceiling probe" in hit
         assert engine._mcp_adapter.search.await_count == 1
 
-    @pytest.mark.parametrize("profile", [None, {"schema_version": 1}])
-    async def test_missing_or_invalid_profile_uses_default_ceiling(self, profile):
-        engine = self._engine(profile)
+    async def test_unstamped_rrf_result_uses_default_ceiling(self):
+        result = FakeSearchResult(
+            chunk=FakeChunk(content="ceiling probe"), score=0.05, score_scale="rrf"
+        )
+        engine = self._engine(result)
         out = await engine.surface(
             "gh", "read_file", {"_context_query": "ceiling probe query"}, LONG_RESPONSE
         )
