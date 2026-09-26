@@ -153,7 +153,12 @@ class TestFeedbackStore:
 
         assert status["exists"] is True
         assert status["initialized"] is False
-        assert status["missing_tables"] == ["auto_tune_adjustments", "surfacing_faults"]
+        assert status["missing_tables"] == [
+            "auto_tune_adjustments",
+            "surfacing_faults",
+            "stm_meta",
+            "surfacing_memory_paths",
+        ]
 
     def test_record_and_retrieve_surfacing(self, feedback_store: FeedbackStore):
         feedback_store.record_surfacing(

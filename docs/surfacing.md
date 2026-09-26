@@ -557,6 +557,25 @@ To keep the per-user DB from accumulating raw query text indefinitely, the oppor
 
 A second knob, `stats_retention_days` (default `90`), bounds the table itself: the same cleanup loop **deletes** `surfacing_events` rows (and their `surfacing_feedback`) older than the window, rather than just nulling the query column. Without it the table is append-only and the `surfacing_stats` action — which reads `get_stats` directly — would eventually full-scan an ever-growing history on the event loop. Because that stats tool can be called before the first `surface()` fires after a restart, the deletion also runs once at engine startup, so the first read always sees a bounded table. Set `stats_retention_days=0` to keep every row indefinitely (the pre-#584 behavior); keep it `>= query_retention_days` if you want rows to survive with nulled queries for aggregates before they are deleted. The `created_at` column is indexed so both the delete and the stats scan stay cheap.
 
+### Event provenance and memory-path rows
+
+Each `surfacing_events` row also records facts about the delivery that are fixed when the row is written:
+
+| Column | Meaning |
+|---|---|
+| `tool_use_id`, `host_session_id`, `host_agent_id` | The host's ids for the call, its session and (inside a subagent) its agent, as sent on the hook wire. Together they name the transcript file the call was written to. `NULL` on the proxy path, which has no host session. The host's `cwd` is never stored. |
+| `injected_chars` | Length of the `<surfaced-memories>` block: exactly what the hook delivers as `additionalContext`. The proxy path adds two separator newlines on top. |
+| `id_advertised` | Whether the block showed its `_surfacing_id` (`record_feedback_events`). A later withdrawal of the id after a failed or late event write is not reflected. |
+| `header_digest` | SHA-256 of the block's first line inside `<surfaced-memories>` (the first line of `section_header`). |
+
+Every delivered, non-pinned memory also gets one `surfacing_memory_paths` row, written in the same transaction as its event and deleted with it by `stats_retention_days`. It stores no path and no text, only keyed hashes:
+
+- `eligible` — `1` when the memory's `source_file` was a fully qualified path at render time (POSIX absolute; on Windows a drive with a root, or a UNC share) of at most 4,096 characters and 256 components, `0` for relative, rooted-but-driveless and `~` paths and adapter placeholders such as `unknown`. Nothing on disk is consulted, so a file deleted later keeps its value.
+- `path_hash_lexical`, `dir_hashes`, `basename_hash` — hashes of the normalized path, of each ancestor directory, and of the file name (`NULL` when not eligible). The path is keyed as written, never resolved through the filesystem: a symlinked source matches only by its own path.
+- `snippet_grams` — up to 64 hashes of the word 4-grams of the bullet's rendered preview.
+
+The hashes are HMAC-SHA256 truncated to 16 bytes, under a random per-install key created in the `stm_meta` table of the same file. The key keeps paths and text out of the tables and out of anything exported from them; it is readable by anyone who can read `stm_feedback.db`, so it is not protection against a local reader. A row takes about 1.8 KB with a full 300-character preview.
+
 ## Feedback & Auto-Tuning
 
 ```mermaid

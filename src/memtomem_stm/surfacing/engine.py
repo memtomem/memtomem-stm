@@ -25,8 +25,14 @@ from memtomem_stm.surfacing.feedback import (
     rating_error,
     record_feedback_batch,
 )
-from memtomem_stm.surfacing.feedback_store import DIAGNOSTIC_KINDS, FAULT_KINDS
-from memtomem_stm.surfacing.formatter import SurfacingFormatter
+from memtomem_stm.surfacing.feedback_store import (
+    DIAGNOSTIC_KINDS,
+    FAULT_KINDS,
+    EventProvenance,
+    MemoryPathInput,
+)
+from memtomem_stm.surfacing.formatter import RenderManifest, SurfacingFormatter
+from memtomem_stm.surfacing.grams import eligible_source
 from memtomem_stm.surfacing.mcp_client import (
     KNOWN_SCORE_SCALES,
     LtmCapabilities,
@@ -179,6 +185,83 @@ def _persist_surfacing(tracker: Any, record_event: Any, delivered_ids: list[str]
             tracker.store.mark_surfaced(delivered_ids)
         except Exception:
             logger.warning("Failed to persist seen memory IDs", exc_info=True)
+
+
+@dataclass(frozen=True)
+class _HostCall:
+    """The host's own identifiers for the call being surfaced on.
+
+    Only the hook path has them (PR #1063); the proxy path passes none. The
+    three ids are stored on the event row; ``cwd`` travels with them but is
+    never stored.
+    """
+
+    session_id: str | None = None
+    cwd: str | None = None
+    tool_use_id: str | None = None
+    agent_id: str | None = None
+
+
+_NO_HOST_CALL = _HostCall()
+
+
+def _event_provenance(
+    manifest: RenderManifest,
+    advertised_id: str | None,
+    host: _HostCall,
+) -> EventProvenance:
+    """Collection-time facts about the block as rendered when its row is queued.
+
+    ``injected_chars`` is the ``<surfaced-memories>`` block's own length —
+    exactly what the hook delivers as ``additionalContext``; the proxy path
+    adds the two separator newlines on top. ``header_digest`` hashes the block's first line inside
+    the ``<surfaced-memories>`` wrapper, which is what a transcript reader sees
+    first, rather than the configured ``section_header`` (which may span
+    lines).
+    """
+    header = manifest.header_line.encode("utf-8", errors="surrogatepass")
+    return EventProvenance(
+        injected_chars=manifest.block_chars,
+        tool_use_id=host.tool_use_id,
+        host_session_id=host.session_id,
+        host_agent_id=host.agent_id,
+        id_advertised=advertised_id is not None,
+        header_digest=hashlib.sha256(header).hexdigest(),
+    )
+
+
+def _memory_path_inputs(manifest: RenderManifest, results: Sequence[Any]) -> list[MemoryPathInput]:
+    """One input per delivered memory, with its eligibility fixed from strings.
+
+    Pinned results never carry a delivered id, so every delivered id maps to a
+    retrieved result. Eligibility is decided here, at render time, from the
+    ``source_file`` string alone; the store worker only hashes.
+    """
+    sources: dict[str, str | None] = {}
+    for r in results:
+        if getattr(r, "pinned", False):
+            continue
+        memory_id = str(r.chunk.id)
+        if memory_id in sources:
+            continue
+        source = getattr(getattr(r.chunk, "metadata", None), "source_file", None)
+        sources[memory_id] = None if source is None else str(source)
+    inputs: list[MemoryPathInput] = []
+    seen: set[str] = set()
+    for memory_id, preview in zip(manifest.delivered_ids, manifest.delivered_previews, strict=True):
+        if memory_id in seen:
+            continue
+        seen.add(memory_id)
+        source = sources.get(memory_id)
+        inputs.append(
+            MemoryPathInput(
+                memory_id=memory_id,
+                source_file=source,
+                preview=preview,
+                eligible=eligible_source(source),
+            )
+        )
+    return inputs
 
 
 @dataclass
@@ -1402,9 +1485,10 @@ class SurfacingEngine:
 
         ``session_id`` / ``cwd`` / ``tool_use_id`` / ``agent_id`` are the host's
         identifiers for a native-tool hook call (``mms hook``); proxied MCP calls
-        pass none. They are accepted so the surfacing event row can record them
-        later and are currently neither persisted nor logged — ``cwd`` in
-        particular is never stored.
+        pass none. ``session_id`` / ``tool_use_id`` / ``agent_id`` are stored on
+        the surfacing event row (``host_session_id`` / ``tool_use_id`` /
+        ``host_agent_id``) so the row names the host transcript the call was
+        written to; none of them is logged, and ``cwd`` is never stored.
         """
         if not self._config.enabled:
             self._observability.record_skip(tool, "disabled")
@@ -1465,6 +1549,12 @@ class SurfacingEngine:
                 trace_id=trace_id,
                 deadline_monotonic=deadline_monotonic,
                 scope=scope,
+                host=_HostCall(
+                    session_id=session_id,
+                    cwd=cwd,
+                    tool_use_id=tool_use_id,
+                    agent_id=agent_id,
+                ),
             )
         except asyncio.TimeoutError:
             self._observability.record_outcome(tool, "error_timeout")
@@ -1828,6 +1918,8 @@ class SurfacingEngine:
         query: str,
         server: str,
         tool: str,
+        *,
+        host: _HostCall = _NO_HOST_CALL,
     ) -> str:
         """Render a cached surfacing result into the response_text, or pass
         the response through unchanged if the cache entry is an empty list
@@ -1959,6 +2051,8 @@ class SurfacingEngine:
                         # Cached entries keep the scale they were stamped with
                         # at miss time, so the hit-path row carries it too.
                         score_scale=self._result_score_scale(cached)[0],
+                        provenance=_event_provenance(manifest, advertised_id, host),
+                        memory_paths=_memory_path_inputs(manifest, cached),
                     )
                 )
                 if written is False:
@@ -2003,6 +2097,7 @@ class SurfacingEngine:
         trace_id: str | None = None,
         deadline_monotonic: float | None = None,
         scope: _TimerScope,
+        host: _HostCall = _NO_HOST_CALL,
     ) -> str:
         """Cache lookup, per-key stampede lock, then the timed LTM window.
 
@@ -2054,7 +2149,7 @@ class SurfacingEngine:
             # before it knew the cache could answer; a hit starts no LTM work,
             # so ``ltm_attempted`` stays false and ``surface()`` gives the slot
             # back (#1000).
-            return await self._render_cached(cached, response_text, query, server, tool)
+            return await self._render_cached(cached, response_text, query, server, tool, host=host)
 
         async with self._key_locks.hold(cache_key):
             # Double-check inside the lock: a coroutine that held the
@@ -2062,7 +2157,9 @@ class SurfacingEngine:
             cached = self._cache.get(cache_key)
             if cached is not None:
                 self._observability.record_cache("hit")
-                return await self._render_cached(cached, response_text, query, server, tool)
+                return await self._render_cached(
+                    cached, response_text, query, server, tool, host=host
+                )
             self._observability.record_cache("miss")
             # Recorded before the window check below: the lookup happened
             # and missed, whatever the clock then says. (A miss already does
@@ -2097,6 +2194,7 @@ class SurfacingEngine:
                     cache_key,
                     trace_id=trace_id,
                     scope=scope,
+                    host=host,
                 ),
                 effective_timeout,
                 scope,
@@ -2113,6 +2211,7 @@ class SurfacingEngine:
         *,
         trace_id: str | None = None,
         scope: _TimerScope,
+        host: _HostCall = _NO_HOST_CALL,
     ) -> str:
         """Admission for the one path that starts LTM work, then the work.
 
@@ -2162,6 +2261,7 @@ class SurfacingEngine:
             cache_key,
             trace_id=trace_id,
             scope=scope,
+            host=host,
         )
 
     async def _do_surface_miss_admitted(
@@ -2175,6 +2275,7 @@ class SurfacingEngine:
         *,
         trace_id: str | None = None,
         scope: _TimerScope,
+        host: _HostCall = _NO_HOST_CALL,
     ) -> str:
         # Past admission, this call takes the LTM path on every branch below
         # — compose or legacy search — so its rate-limit slot is spent whatever
@@ -2569,6 +2670,8 @@ class SurfacingEngine:
                 memory_ids=delivered_ids,
                 scores=[r.score for r in delivered_results],
                 score_scale=score_scale,
+                provenance=_event_provenance(manifest, advertised_id, host),
+                memory_paths=_memory_path_inputs(manifest, relevant),
             )
             try:
                 await self._await_store_write(

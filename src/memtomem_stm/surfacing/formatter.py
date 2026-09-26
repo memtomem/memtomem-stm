@@ -34,6 +34,19 @@ class RenderManifest:
     bullets in the final block regardless of whether they have an ID at all,
     so callers can distinguish "nothing survived truncation" from "survivors
     have no trackable IDs".
+
+    ``block_chars`` is the length of the ``<surfaced-memories>`` …
+    ``</surfaced-memories>`` block alone, without the blank-line separator
+    ``text`` puts between it and the response: the block is what the hook
+    delivers as ``additionalContext``, while the proxy path adds the two
+    separator newlines on top.
+
+    ``delivered_previews`` is parallel to ``delivered_ids``: the sanitized
+    preview exactly as it appears in that bullet. ``header_line`` is the first
+    line inside the ``<surfaced-memories>`` wrapper (the first line of
+    ``section_header``), empty when nothing was rendered. Both are reported so
+    a caller can record what the agent was shown without re-parsing ``text``,
+    whose response part may itself contain wrapper-shaped text.
     """
 
     text: str
@@ -41,6 +54,9 @@ class RenderManifest:
     omitted_ids: tuple[str, ...]
     truncated: bool = False
     rendered_bullets: int = 0
+    delivered_previews: tuple[str, ...] = ()
+    header_line: str = ""
+    block_chars: int = 0
 
 
 class SurfacingFormatter:
@@ -219,6 +235,7 @@ class SurfacingFormatter:
         body_start = len(lines)
 
         body_ids: list[str | None] = []
+        body_previews: list[str] = []
         for r in results:
             chunk = r.chunk
             meta = getattr(chunk, "metadata", None)
@@ -240,6 +257,7 @@ class SurfacingFormatter:
                 # not a retrieval hit. It intentionally has no feedback ID or
                 # relevance bucket and never reaches demotion/access-boost.
                 body_ids.append(None)
+                body_previews.append(preview)
                 continue
             if ctx and ctx.window_before:
                 budget = min(150, preview_cap - len(preview) - len(" | ") - len("..."))
@@ -296,6 +314,7 @@ class SurfacingFormatter:
             id_token = f" `{cid_text}`" if _MEMORY_ID_RE.fullmatch(cid_text) else ""
             lines.append(f"- **{source}**{ns_badge}{id_token}{bucket_token}: {preview}")
             body_ids.append(cid_text or None)
+            body_previews.append(preview)
 
         if scratch_items:
             lines.append("")
@@ -349,17 +368,29 @@ class SurfacingFormatter:
         # bullets (ID fails the display gate above → no backticked token) and
         # could false-positive on an ID echoed inside another kept line (e.g.
         # a scratch key rendered in backticks).
-        delivered = tuple(mid for mid in body_ids[:rendered_bullets] if mid)
+        delivered_pairs = [
+            (mid, body_previews[index])
+            for index, mid in enumerate(body_ids[:rendered_bullets])
+            if mid
+        ]
+        delivered = tuple(mid for mid, _ in delivered_pairs)
+        delivered_previews = tuple(preview for _, preview in delivered_pairs)
         delivered_set = set(delivered)
         omitted = tuple(mid for mid in body_ids if mid and mid not in delivered_set)
 
+        block = f"<surfaced-memories>\n{memory_block}\n</surfaced-memories>"
         match self._config.injection_mode:
             case "prepend":
-                text = (
-                    f"<surfaced-memories>\n{memory_block}\n</surfaced-memories>\n\n{response_text}"
-                )
+                text = f"{block}\n\n{response_text}"
             case "append" | "section" | _:
-                text = (
-                    f"{response_text}\n\n<surfaced-memories>\n{memory_block}\n</surfaced-memories>"
-                )
-        return RenderManifest(text, delivered, omitted, truncated, rendered_bullets)
+                text = f"{response_text}\n\n{block}"
+        return RenderManifest(
+            text,
+            delivered,
+            omitted,
+            truncated,
+            rendered_bullets,
+            delivered_previews,
+            memory_block.split("\n", 1)[0],
+            len(block),
+        )
