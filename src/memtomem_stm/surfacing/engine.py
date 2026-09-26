@@ -1186,19 +1186,30 @@ class SurfacingEngine:
         digest = hashlib.sha256(query.encode("utf-8", errors="surrogatepass")).hexdigest()[:16]
         return f"{_QUERY_HASH_PREFIX}{digest}"
 
-    def _active_min_score(self, tool: str) -> float:
+    def _active_min_score(self, tool: str, score_ceiling: float | None = None) -> float:
         """Return the score floor currently used for surfacing decisions.
 
         Pure read. Moving the threshold is :meth:`_maybe_auto_tune`'s job,
         which has to await a worker thread — the tuner reads four feedback
         aggregates and may write one row, and that is not work to do on the
         event loop while other calls are in flight (#996).
+
+        *score_ceiling* caps the tuned value at this batch's reference
+        (:meth:`AutoTuner.effective_ceiling`). The tuner already clamped the
+        stored value for this batch, so this is normally a no-op; it covers a
+        concurrent call for the same tool whose batch carried a higher
+        ceiling (an in-flight request across a reconnect with changed fusion
+        settings) raising the shared value between this call's tuner pass and
+        this read (#1062). Pins and the configured default are never capped.
         """
         tool_cfg = self._config.context_tools.get(tool)
         if tool_cfg is not None and tool_cfg.min_score is not None:
             return tool_cfg.min_score
         if self._auto_tuner is not None:
-            return self._auto_tuner.get_effective_min_score(tool)
+            tuned = self._auto_tuner.get_effective_min_score(tool)
+            if score_ceiling is None:
+                return tuned
+            return min(tuned, self._auto_tuner.effective_ceiling(score_ceiling))
         return self._config.min_score
 
     async def _maybe_auto_tune(self, tool: str, score_ceiling: float | None = None) -> None:
@@ -2320,9 +2331,10 @@ class SurfacingEngine:
         # tool ``_active_min_score`` returns the pin before the tuner runs,
         # so the pre-existing "pinned tools don't learn" behavior holds.
         filter_suspended = self._scale_gate_suspends(tool, score_scale)
+        batch_ceiling = self._batch_score_ceiling(retrieved_results)
         if not filter_suspended:
-            await self._maybe_auto_tune(tool, self._batch_score_ceiling(retrieved_results))
-        min_score = self._active_min_score(tool)
+            await self._maybe_auto_tune(tool, batch_ceiling)
+        min_score = self._active_min_score(tool, batch_ceiling)
         self._observe_score_scale(
             server,
             tool,

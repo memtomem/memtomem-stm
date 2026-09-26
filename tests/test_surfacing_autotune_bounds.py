@@ -251,9 +251,13 @@ class TestRrfReferenceCeiling:
         store.get_feedback_count.side_effect = None
         store.get_feedback_count.return_value = 10
         tuner = AutoTuner(cfg, store)
-        tuner.maybe_adjust("read_file", score_ceiling=self.BASELINE)  # sets the watermark
+        # First pass sets the watermark with no ceiling, so nothing is clamped.
+        assert tuner.maybe_adjust("read_file", score_ceiling=None) is None
+        assert tuner.get_effective_min_score("read_file") == 0.04
+        # Same counts → the watermark early return fires; the clamp must run first.
+        assert tuner.maybe_adjust("read_file", score_ceiling=self.BASELINE) == self.BASELINE
         assert tuner.get_effective_min_score("read_file") == self.BASELINE
-        store.save_adjustment.assert_called_with("read_file", self.BASELINE)
+        store.save_adjustment.assert_called_once_with("read_file", self.BASELINE)
         store.save_adjustment.reset_mock()
         assert tuner.maybe_adjust("read_file", score_ceiling=self.BASELINE) is None
         store.save_adjustment.assert_not_called()

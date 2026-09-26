@@ -5617,3 +5617,43 @@ class TestBatchScoreCeiling:
         pinned.pinned = True  # type: ignore[attr-defined]
         batch = [pinned, self._r(score_scale="rrf", score_ceiling=0.04), self._r()]
         assert SurfacingEngine._batch_score_ceiling(batch) == 0.04
+
+
+class TestAutoTuneConcurrentCeiling:
+    """#1062: the tuner's value is shared per tool, but the ceiling is per
+    batch. A concurrent call whose batch carried a higher ceiling (an
+    in-flight request across a reconnect with changed fusion settings) can
+    raise the shared value between this call's tuner pass and its filter
+    read; the filter must still respect this batch's own ceiling."""
+
+    async def test_filter_uses_this_batch_ceiling_after_a_concurrent_raise(self, tmp_path: Path):
+        from memtomem_stm.surfacing.feedback import FeedbackTracker
+
+        config = _make_config(auto_tune_enabled=True, min_score=0.017)
+        tracker = FeedbackTracker(config=config, db_path=tmp_path / "fb.db")
+        top = FakeSearchResult(
+            chunk=FakeChunk(content="rank first on both legs"),
+            score=2 / 61,
+            score_scale="rrf",
+            score_ceiling=2 / 61,
+        )
+        try:
+            engine = SurfacingEngine(
+                config=config,
+                mcp_adapter=_make_mcp_adapter([top]),
+                feedback_tracker=tracker,
+            )
+            tuner = engine._auto_tuner
+            original = tuner.maybe_adjust
+
+            def adjust_then_peer_raises(tool, score_ceiling=None):
+                result = original(tool, score_ceiling=score_ceiling)
+                # A peer call under a 0.06 ceiling raised the shared value.
+                tuner._adjustments[tool] = 0.045
+                return result
+
+            tuner.maybe_adjust = adjust_then_peer_raises
+            out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            assert "rank first on both legs" in out
+        finally:
+            tracker.close()

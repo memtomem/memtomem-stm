@@ -627,7 +627,7 @@ satisfy `floor <= min_score <= ceiling`.
 
 The `0.05` ceiling is above the RRF reference score `2/61` (about 0.0328), the
 score of a result both legs rank first at Core's default fusion. A threshold above
-it filters out every two-leg result, so the tuned value is also capped at the
+it filters out every two-leg result that Core's rescue leg or a boost did not lift, so the tuned value is also capped at the
 reference for each batch (#1062): the `score_ceiling` the LTM adapter stamps on an
 `rrf` result (`sum(rrf_weights) / (rrf_k + 1)`), or `2/61` when the batch carries no
 valid stamp. The effective cap is `min(auto_tune_score_ceiling, max(reference,
