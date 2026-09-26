@@ -279,9 +279,11 @@ changes inline only. See the deprecation policy in
   `empty_render` (the formatter rendered no bullet) and `cancelled` (the call was
   cancelled before a decision; the cancellation still propagates). The health
   verdict counts `empty_render` as a completed search, like `no_results_*`, and
-  leaves `cancelled` out. `RelevanceGate.should_surface` now returns
-  the rejecting `SkipReason` instead of `None`. The stats-retention sweep now rolls
-  back as a whole when one of its deletes fails; before, the deletes that had already
+  leaves `cancelled` out. `RelevanceGate.should_surface` now returns a falsy
+  `GateRejection` carrying the rejecting `SkipReason` instead of `None`, so a
+  caller that tests the result for truth still reads a refusal as one. The
+  stats-retention sweep now rolls back as a whole when one of its deletes fails;
+  before, the deletes that had already
   run were committed by the next unrelated write. New settings:
   `opportunities_enabled` (default `true`) and `opportunities_sample_rate` (default
   `1.0`). **Behavior change**: see the upgrade notes above.

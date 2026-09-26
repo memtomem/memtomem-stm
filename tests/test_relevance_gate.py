@@ -166,46 +166,46 @@ class TestRelevanceGateObservability:
 
     def test_excluded_tool_records_gate_excluded_tool(self):
         gate, obs = self._gate_with_obs(exclude_tools=["*search*"])
-        assert gate.should_surface("s", "search_code", "query") == "gate_excluded_tool"
+        assert gate.should_surface("s", "search_code", "query").reason == "gate_excluded_tool"
         assert obs.snapshot()["skip_reasons"]["search_code"] == {"gate_excluded_tool": 1}
 
     def test_write_tool_records_gate_write_tool(self):
         gate, obs = self._gate_with_obs()
-        assert gate.should_surface("s", "write_file", "query") == "gate_write_tool"
+        assert gate.should_surface("s", "write_file", "query").reason == "gate_write_tool"
         assert obs.snapshot()["skip_reasons"]["write_file"] == {"gate_write_tool": 1}
 
     def test_per_tool_disabled_records_gate_tool_disabled(self):
         gate, obs = self._gate_with_obs(
             context_tools={"read_file": ToolSurfacingConfig(enabled=False)}
         )
-        assert gate.should_surface("s", "read_file", "query") == "gate_tool_disabled"
+        assert gate.should_surface("s", "read_file", "query").reason == "gate_tool_disabled"
         assert obs.snapshot()["skip_reasons"]["read_file"] == {"gate_tool_disabled": 1}
 
     def test_rate_limit_records_gate_rate_limit(self):
         gate, obs = self._gate_with_obs(max_surfacings_per_minute=2)
         for i in range(2):
             assert isinstance(gate.should_surface("s", f"tool_{i}", f"query {i}"), RateClaim)
-        assert gate.should_surface("s", "tool_x", "another query") == "gate_rate_limit"
+        assert gate.should_surface("s", "tool_x", "another query").reason == "gate_rate_limit"
         assert obs.snapshot()["skip_reasons"]["tool_x"] == {"gate_rate_limit": 1}
 
     def test_cooldown_records_gate_cooldown(self):
         gate, obs = self._gate_with_obs(cooldown_seconds=10.0)
         assert isinstance(gate.should_surface("s", "t1", "exact same query text"), RateClaim)
         gate.record_surfacing("exact same query text")
-        assert gate.should_surface("s", "t2", "exact same query text") == "gate_cooldown"
+        assert gate.should_surface("s", "t2", "exact same query text").reason == "gate_cooldown"
         assert obs.snapshot()["skip_reasons"]["t2"] == {"gate_cooldown": 1}
 
     def test_disabled_does_not_record_at_gate(self):
         """``disabled`` is recorded by the engine before it calls the gate.
         If the gate also recorded it, we'd double-count."""
         gate, obs = self._gate_with_obs(enabled=False)
-        assert gate.should_surface("s", "read_file", "query") == "disabled"
+        assert gate.should_surface("s", "read_file", "query").reason == "disabled"
         assert obs.snapshot()["skip_reasons"] == {}
 
     def test_query_none_does_not_record_at_gate(self):
         """Same as ``disabled`` — engine records ``no_query`` upstream."""
         gate, obs = self._gate_with_obs()
-        assert gate.should_surface("s", "read_file", None) == "no_query"
+        assert gate.should_surface("s", "read_file", None).reason == "no_query"
         assert obs.snapshot()["skip_reasons"] == {}
 
 
@@ -223,3 +223,24 @@ class TestJaccardSimilarity:
     def test_empty_string(self):
         assert RelevanceGate._jaccard_similarity("", "hello") == 0.0
         assert RelevanceGate._jaccard_similarity("hello", "") == 0.0
+
+
+class TestRejectionIsFalsy:
+    """A refusal was ``None`` before it carried a reason; a caller that tests the
+    result for truth must still read every refusal as one."""
+
+    def test_every_rejection_is_falsy_and_a_claim_is_truthy(self):
+        gate = _gate(exclude_tools=["*search*"], max_surfacings_per_minute=1)
+        rejections = [
+            gate.should_surface("s", "search_code", "query"),
+            gate.should_surface("s", "write_file", "query"),
+            gate.should_surface("s", "read_file", None),
+        ]
+        assert all(not r for r in rejections)
+        assert [r.reason for r in rejections] == [  # type: ignore[union-attr]
+            "gate_excluded_tool",
+            "gate_write_tool",
+            "no_query",
+        ]
+        assert gate.should_surface("s", "read_file", "some query here")
+        assert not gate.should_surface("s", "read_file", "another query entirely")

@@ -12,11 +12,24 @@ as ``"other"``, so a user-chosen extension cannot reach the row.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
-from pathlib import PurePath
+from pathlib import PurePath, PurePosixPath, PureWindowsPath
 from typing import Any
 
 _PATH_KEYS = ("file_path", "path")
+
+# A path in a tool argument was written on whatever machine the tool runs on,
+# not necessarily this one, so its flavour is read from the string: a drive
+# letter, a UNC prefix, or backslashes with no forward slash mean Windows.
+_WINDOWS_PATH_RE = re.compile(r"^(?:[A-Za-z]:|\\\\)|^[^/]*\\")
+
+
+def _pure_path(value: str) -> PurePath:
+    if _WINDOWS_PATH_RE.match(value):
+        return PureWindowsPath(value)
+    return PurePosixPath(value)
+
 
 _KNOWN_EXTENSIONS = frozenset(
     {
@@ -85,7 +98,7 @@ def arg_shape_json(arguments: object, query_tokens: int | None) -> str:
         key_count = len(arguments)
         path = _path_value(arguments)
         if path is not None:
-            pure = PurePath(path)
+            pure = _pure_path(path)
             path_depth = len(pure.parts)
             suffix = pure.suffix.lower()
             if suffix:

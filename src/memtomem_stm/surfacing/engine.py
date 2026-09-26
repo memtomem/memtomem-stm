@@ -1711,7 +1711,7 @@ class SurfacingEngine:
         if not isinstance(rate_claim, RateClaim):
             # Gate has already counted the specific reason internally. Avoid
             # double-counting by only labelling the call here.
-            scope.opportunity.decision = _skip_label(rate_claim)
+            scope.opportunity.decision = _skip_label(rate_claim.reason)
             logger.debug(
                 "Surfacing skipped: gate rejected %s/%s (query=%s)",
                 server,

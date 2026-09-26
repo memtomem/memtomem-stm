@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
+from dataclasses import dataclass
 from fnmatch import fnmatch
 
 from memtomem_stm.surfacing.config import SurfacingConfig
@@ -36,6 +37,21 @@ class RateClaim:
         self.ts = ts
 
 
+@dataclass(frozen=True)
+class GateRejection:
+    """A refusal from :meth:`RelevanceGate.should_surface`, carrying its reason.
+
+    Falsy, so a caller that tests the result for truth — the contract when a
+    refusal was ``None`` — still reads a refusal as one. The reason is the
+    :data:`SkipReason` the gate counted.
+    """
+
+    reason: SkipReason
+
+    def __bool__(self) -> bool:
+        return False
+
+
 class RelevanceGate:
     """Determine whether to run proactive surfacing for a given tool call."""
 
@@ -64,16 +80,17 @@ class RelevanceGate:
         server: str,
         tool: str,
         query: str | None,
-    ) -> RateClaim | SkipReason:
+    ) -> RateClaim | GateRejection:
         """Gate a prospective surfacing. On pass, eagerly claim a slot in
         ``_surfacing_timestamps`` — so concurrent callers see the budget
         consumption immediately; otherwise N coroutines all check the
         rate limit before any of them reaches ``record_surfacing`` and
         every one passes, bursting through the ``max_surfacings_per_minute``
         cap by up to the concurrency level — and return the claim as the
-        token :meth:`release_claim` takes back. A rejection returns the
-        :data:`SkipReason` it recorded, with no slot claimed, so the caller can
-        label the call without reading the counters back.
+        token :meth:`release_claim` takes back. A rejection returns a falsy
+        :class:`GateRejection` carrying the :data:`SkipReason` it recorded, with
+        no slot claimed, so the caller can label the call without reading the
+        counters back.
 
         Cooldown claim stays with ``record_surfacing`` (see that method)
         because cooldown is a "skip if we already returned similar results"
@@ -85,9 +102,9 @@ class RelevanceGate:
         # ``query is None`` is the extractor's outcome (engine-level).
         # Recording them here would double-count when the engine also bails.
         if not self._config.enabled:
-            return "disabled"
+            return GateRejection("disabled")
         if query is None:
-            return "no_query"
+            return GateRejection("no_query")
 
         full_name = f"{server}__{tool}"
 
@@ -95,7 +112,7 @@ class RelevanceGate:
         for pattern in self._config.exclude_tools:
             if fnmatch(full_name, pattern) or fnmatch(tool, pattern):
                 self._observability.record_skip(tool, "gate_excluded_tool")
-                return "gate_excluded_tool"
+                return GateRejection("gate_excluded_tool")
 
         # Write-tool heuristic. Match against both the bare tool name and the
         # ``server__tool`` full name — symmetric with ``exclude_tools`` above —
@@ -104,13 +121,13 @@ class RelevanceGate:
         for pattern in self._config.write_tool_patterns:
             if fnmatch(full_name, pattern) or fnmatch(tool, pattern):
                 self._observability.record_skip(tool, "gate_write_tool")
-                return "gate_write_tool"
+                return GateRejection("gate_write_tool")
 
         # Per-tool override
         tool_cfg = self._config.context_tools.get(tool)
         if tool_cfg is not None and not tool_cfg.enabled:
             self._observability.record_skip(tool, "gate_tool_disabled")
-            return "gate_tool_disabled"
+            return GateRejection("gate_tool_disabled")
 
         # Rate limit
         now = time.monotonic()
@@ -121,7 +138,7 @@ class RelevanceGate:
             self._surfacing_timestamps.popleft()
         if len(self._surfacing_timestamps) >= self._config.max_surfacings_per_minute:
             self._observability.record_skip(tool, "gate_rate_limit")
-            return "gate_rate_limit"
+            return GateRejection("gate_rate_limit")
 
         # Cooldown: skip if very similar query was recently surfaced
         for ts, prev_query in reversed(self._recent_queries):
@@ -129,7 +146,7 @@ class RelevanceGate:
                 break
             if self._jaccard_similarity(query, prev_query) > _SIMILARITY_THRESHOLD:
                 self._observability.record_skip(tool, "gate_cooldown")
-                return "gate_cooldown"
+                return GateRejection("gate_cooldown")
 
         # Eagerly claim the rate-limit slot. A concurrent ``should_surface``
         # for a different query will now observe this timestamp and apply

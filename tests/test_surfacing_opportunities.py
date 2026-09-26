@@ -657,6 +657,22 @@ class TestArgShape:
     def test_ext_is_a_known_type_or_other(self, value: str, ext: str | None) -> None:
         assert json.loads(arg_shape_json({"path": value}, None))["ext"] == ext
 
+    @pytest.mark.parametrize(
+        ("value", "depth", "ext"),
+        [
+            ("C:\\Users\\a\\b.py", 4, ".py"),
+            ("\\\\srv\\share\\x\\y.md", 3, ".md"),
+            ("dir\\sub\\f.py", 3, ".py"),
+            ("/home/a/b.py", 4, ".py"),
+            ("a/b.py", 2, ".py"),
+        ],
+    )
+    def test_path_flavour_comes_from_the_string_not_the_host(
+        self, value: str, depth: int, ext: str
+    ) -> None:
+        shape = json.loads(arg_shape_json({"file_path": value}, None))
+        assert (shape["path_depth"], shape["ext"]) == (depth, ext)
+
     def test_non_mapping_arguments(self) -> None:
         assert json.loads(arg_shape_json(["x"], None)) == {
             "key_count": 0,
