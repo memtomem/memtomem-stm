@@ -25,6 +25,22 @@ changes inline only. See the deprecation policy in
   1,194 `[related]` and 269 `[weak]`, where all 4,708 were `[weak]` before.
   Results without a `score_scale` stamp (compact format, older cores) keep the
   `[min_score, 1.0]` band.
+- **Auto-tune no longer raises `min_score` past the best score a batch can deliver**
+  (#1062). A raise was capped only by `auto_tune_score_ceiling` (default `0.05`),
+  which is above the default two-leg reference `2/61` (about 0.0328). Starting from
+  the default `0.017`, eight raises reached `0.033`, which filtered out every two-leg
+  result for that tool unless Core's rescue leg or a boost lifted it. Raises, and the
+  threshold each search filters with, are now also capped at the batch's reference
+  rounded down to the precision Core sends scores at: an `rrf` result's
+  `score_ceiling` stamp (or `2/61` without a valid one) at 4 places (`2/61` → `0.0327`),
+  and `2/61` at 2 places (`0.03`, the top compact score) for results without a
+  `score_scale`. A `min_score` above that cap is kept. Stored adjustments are not
+  rewritten: a tool already tuned above the cap filters at the cap from its next
+  search on, while `stm_surfacing_stats` keeps showing the stored value. This applies
+  to the proxy and to the daemon when `hook.record_feedback_events` is on (otherwise
+  the daemon does not tune). A Core with non-default fusion weights and no usable
+  `runtime_profile` is still capped at the `2/61` baseline, the assumption the default
+  `min_score` already makes; `mms doctor` reports the missing profile.
 - **The hook↔daemon protocol is now v8.** The `surface` payload carries the host's
   `session_id`, `cwd`, `tool_use_id` and `agent_id` (Claude sends `agent_id` only
   inside a subagent). The surfacing engine accepts them but does not store or log them
@@ -224,6 +240,25 @@ changes inline only. See the deprecation policy in
   problem booked as a provider outage.
 
 ### Fixed
+
+- **Auto-tuned `min_score` stays at or below the best score a batch can deliver**
+  (#1062) — `AutoTuner.maybe_adjust` capped a raise only at `auto_tune_score_ceiling`,
+  a bound written for a `[0, 1]` scale, the same class as #1034. Once the tuned value
+  crossed `2/61`, the filter `score >= min_score` rejected every unboosted two-leg
+  result, so the tool surfaced little or nothing and drew few ratings to walk it back.
+  The engine now derives a cap per batch and floors it to the precision Core delivers
+  scores at (`round(score, 4)` in the structured JSON, `{score:.2f}` in the compact
+  text): an `rrf` batch's `score_ceiling` stamp, or `2/61` without a valid stamp, to
+  4 places; `2/61` to 2 places for a batch without a `score_scale`; no cap for an
+  empty batch or one with a named non-RRF scale (which reaches the tuner only when
+  `scale_gated_min_score` is off). The effective cap is
+  `min(auto_tune_score_ceiling, max(cap, min_score))`. The filter reads the tuned value
+  capped at its own batch's cap; a raise stops there and never lowers the stored
+  value, and a lower steps down from the applied value. The stored value is never
+  rewritten to a cap, because the adapter stamps the `2/61` baseline when a session
+  has no usable profile, so a stamp alone does not prove the fusion weights. A sweep
+  over `rrf_k`, `rrf_weights` and both formats pins that a result both legs rank
+  first always passes. **Behavior change**: see the upgrade notes above.
 
 - **Embedding responses are parsed defensively, and the reason is logged**
   (#1058, #67 follow-up) — `_embed_ollama` and `_embed_openai` indexed straight into the parsed
