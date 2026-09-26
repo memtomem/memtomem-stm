@@ -227,10 +227,9 @@ class TestFormatterInjection:
         assert "[strong]" not in output
 
     def test_bucket_suppressed_for_known_nonrrf_scale(self):
-        """The [weak|related|strong] band partitions [floor, 1.0], which only
-        holds on the RRF scale — a result stamped with a core-named non-RRF
-        scale (rerank logits can be negative, bm25 is unbounded) renders
-        without a bucket tag, keyed per result off the stamp."""
+        """No bucket band applies to a core-named non-RRF scale (rerank logits
+        can be negative, bm25 is unbounded), so such a result renders without a
+        bucket tag, keyed per result off the stamp."""
         fmt = SurfacingFormatter(SurfacingConfig())
         results = [
             FakeResult(FakeChunk(content="logit hit", id="s-rerank"), -0.17, score_scale="rerank"),

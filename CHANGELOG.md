@@ -14,9 +14,10 @@ changes inline only. See the deprecation policy in
 ### Upgrade notes
 
 - **RRF results now show `[related]` and `[strong]`** (#1034). The relevance bucket
-  split `[min_score, 1.0]` into thirds, but hybrid RRF scores top out near `2/61`
-  (about 0.033), so every result stamped `rrf` was tagged `[weak]`. For those
-  results the band now ends at `sum(rrf_weights) / (rrf_k + 1)`, read from the
+  split `[min_score, 1.0]` into thirds, but hybrid RRF scores cluster below the
+  default two-leg reference score `2/61` (about 0.033), far under the old `[related]`
+  boundary of about 0.345. For results stamped `rrf` the band now ends at
+  `sum(rrf_weights) / (rrf_k + 1)`, read from the
   core's `runtime_profile`, or at `2/61` when the profile is unavailable. Replaying
   4,708 recorded `rrf` scores at the default `min_score` gives 3,245 `[strong]`,
   1,194 `[related]` and 269 `[weak]`, where all 4,708 were `[weak]` before.
