@@ -640,11 +640,13 @@ at:
 | empty, or a named non-RRF scale | none; only the configured bounds apply |
 
 The effective cap is `min(auto_tune_score_ceiling, max(cap, min_score))`, so a
-top-level `min_score` above the cap is kept. A raise stops at the effective cap and
-never lowers the stored value. A stored value above the cap is lowered and saved the
-next time the tool's search returns stamped `rrf` results, without waiting for new
-feedback. Other batches cap only their own search, so `stm_surfacing_stats` can show a
-stored value above the one applied.
+top-level `min_score` above the cap is kept. Each search filters with the tuned value
+capped at its own batch's cap. A raise stops at the cap and never lowers the stored
+value, and a lower steps down from the value the search applied. The stored value is
+never rewritten to a cap, so `stm_surfacing_stats` can show a stored value above the
+one a search applies. The adapter stamps the `2/61` baseline when a session has no
+usable `runtime_profile`, so a Core with non-default fusion weights and no profile is
+capped at the baseline, the same assumption the default `min_score` makes.
 
 ```mermaid
 flowchart LR

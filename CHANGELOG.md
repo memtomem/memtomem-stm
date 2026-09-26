@@ -31,14 +31,16 @@ changes inline only. See the deprecation policy in
   the default `0.017`, eight raises reached `0.033`, which filtered out every two-leg
   result for that tool unless Core's rescue leg or a boost lifted it. Raises, and the
   threshold each search filters with, are now also capped at the batch's reference
-  rounded down to the precision Core sends scores at: the `score_ceiling` stamped on
-  an `rrf` result at 4 places (`2/61` → `0.0327`), otherwise `2/61` at 2 places
-  (`0.03`, the top compact score). A `min_score` above that cap is kept. A stored
-  adjustment above the cap is lowered and saved the next time that tool's search
-  returns stamped `rrf` results, even with no new feedback; other batches cap only
-  their own search, so `stm_surfacing_stats` can then show a stored value above the
-  one applied. This applies to the proxy and to the daemon when
-  `hook.record_feedback_events` is on (otherwise the daemon does not tune).
+  rounded down to the precision Core sends scores at: an `rrf` result's
+  `score_ceiling` stamp (or `2/61` without a valid one) at 4 places (`2/61` → `0.0327`),
+  and `2/61` at 2 places (`0.03`, the top compact score) for results without a
+  `score_scale`. A `min_score` above that cap is kept. Stored adjustments are not
+  rewritten: a tool already tuned above the cap filters at the cap from its next
+  search on, while `stm_surfacing_stats` keeps showing the stored value. This applies
+  to the proxy and to the daemon when `hook.record_feedback_events` is on (otherwise
+  the daemon does not tune). A Core with non-default fusion weights and no usable
+  `runtime_profile` is still capped at the `2/61` baseline, the assumption the default
+  `min_score` already makes; `mms doctor` reports the missing profile.
 - **The hook↔daemon protocol is now v8.** The `surface` payload carries the host's
   `session_id`, `cwd`, `tool_use_id` and `agent_id` (Claude sends `agent_id` only
   inside a subagent). The surfacing engine accepts them but does not store or log them
@@ -244,17 +246,19 @@ changes inline only. See the deprecation policy in
   a bound written for a `[0, 1]` scale, the same class as #1034. Once the tuned value
   crossed `2/61`, the filter `score >= min_score` rejected every unboosted two-leg
   result, so the tool surfaced little or nothing and drew few ratings to walk it back.
-  The engine now derives a cap per batch: the stamped `score_ceiling` of an `rrf`
-  batch floored to 4 places (Core's structured JSON uses `round(score, 4)`), `2/61`
-  floored to 4 places for an `rrf` batch without a valid stamp, and `2/61` floored to
-  2 places (the compact format uses `{score:.2f}`) for an unstamped batch. An empty
-  batch, or one with a named non-RRF scale (which reaches the tuner only when
-  `scale_gated_min_score` is off), has no cap. The effective cap is
-  `min(auto_tune_score_ceiling, max(cap, min_score))`. A raise stops there and never
-  lowers the stored value. Only a stamped cap clamps and saves a stored value above it,
-  before the feedback check. The filter reads the tuned value capped at its own batch,
-  which covers unstamped batches and a concurrent call whose batch carried a higher
-  reference. **Behavior change**: see the upgrade notes above.
+  The engine now derives a cap per batch and floors it to the precision Core delivers
+  scores at (`round(score, 4)` in the structured JSON, `{score:.2f}` in the compact
+  text): an `rrf` batch's `score_ceiling` stamp, or `2/61` without a valid stamp, to
+  4 places; `2/61` to 2 places for a batch without a `score_scale`; no cap for an
+  empty batch or one with a named non-RRF scale (which reaches the tuner only when
+  `scale_gated_min_score` is off). The effective cap is
+  `min(auto_tune_score_ceiling, max(cap, min_score))`. The filter reads the tuned value
+  capped at its own batch's cap; a raise stops there and never lowers the stored
+  value, and a lower steps down from the applied value. The stored value is never
+  rewritten to a cap, because the adapter stamps the `2/61` baseline when a session
+  has no usable profile, so a stamp alone does not prove the fusion weights. A sweep
+  over `rrf_k`, `rrf_weights` and both formats pins that a result both legs rank
+  first always passes. **Behavior change**: see the upgrade notes above.
 
 - **Embedding responses are parsed defensively, and the reason is logged**
   (#1058, #67 follow-up) — `_embed_ollama` and `_embed_openai` indexed straight into the parsed

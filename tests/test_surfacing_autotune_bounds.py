@@ -243,23 +243,16 @@ class TestRrfReferenceCeiling:
         tuner.maybe_adjust("read_file", score_ceiling=self.BASELINE)
         assert tuner.get_effective_min_score("read_file") >= 0.04
 
-    def test_stuck_value_is_clamped_without_new_feedback(self):
-        # A tool stuck above the reference surfaces nothing and so draws no
-        # ratings; the clamp must not wait for the feedback watermark to move.
+    def test_stored_value_above_the_cap_is_not_rewritten(self):
+        # The cap may be a guess (no profile, compact format), so the tuner
+        # never saves it over a learned value; the engine's read cap keeps
+        # the filter attainable instead.
         cfg = SurfacingConfig(auto_tune_enabled=True)
-        store = _store(neg=None, helpful=None, adjustments={"read_file": 0.04})
-        store.get_feedback_count.side_effect = None
-        store.get_feedback_count.return_value = 10
+        store = _store(neg=0.9, helpful=0.0, adjustments={"read_file": 0.045})
         tuner = AutoTuner(cfg, store)
-        # First pass sets the watermark with no ceiling, so nothing is clamped.
-        assert tuner.maybe_adjust("read_file", score_ceiling=None) is None
-        assert tuner.get_effective_min_score("read_file") == 0.04
-        # Same counts → the watermark early return fires; the clamp must run first.
-        assert tuner.maybe_adjust("read_file", score_ceiling=self.BASELINE) == self.BASELINE
-        assert tuner.get_effective_min_score("read_file") == self.BASELINE
-        store.save_adjustment.assert_called_once_with("read_file", self.BASELINE)
-        store.save_adjustment.reset_mock()
-        assert tuner.maybe_adjust("read_file", score_ceiling=self.BASELINE) is None
+        for _ in range(5):
+            assert tuner.maybe_adjust("read_file", score_ceiling=0.03) is None
+        assert tuner.get_effective_min_score("read_file") == 0.045
         store.save_adjustment.assert_not_called()
 
     def test_lower_from_a_stuck_value_starts_at_the_cap(self):
@@ -275,35 +268,3 @@ class TestRrfReferenceCeiling:
         tuner = AutoTuner(cfg, store)
         tuner.maybe_adjust("read_file", score_ceiling=None)
         assert tuner.get_effective_min_score("read_file") == pytest.approx(0.042)
-
-    def test_failed_clamp_write_is_retried(self):
-        # The row is written before the map changes: a failed write leaves the
-        # stuck value in place, so the next batch clamps and saves again.
-        cfg = SurfacingConfig(auto_tune_enabled=True)
-        store = _store(neg=None, helpful=None, adjustments={"read_file": 0.04})
-        store.save_adjustment.side_effect = RuntimeError("database is locked")
-        tuner = AutoTuner(cfg, store)
-        with pytest.raises(RuntimeError):
-            tuner.maybe_adjust("read_file", score_ceiling=self.BASELINE)
-        assert tuner.get_effective_min_score("read_file") == 0.04
-        store.save_adjustment.side_effect = None
-        tuner.maybe_adjust("read_file", score_ceiling=self.BASELINE)
-        assert tuner.get_effective_min_score("read_file") == self.BASELINE
-        store.save_adjustment.assert_called_with("read_file", self.BASELINE)
-
-    def test_unvouched_ceiling_does_not_rewrite_the_stored_value(self):
-        # A ceiling the batch did not stamp caps raises but never lowers what
-        # was learned: the engine's read cap covers the filter instead.
-        cfg = SurfacingConfig(auto_tune_enabled=True)
-        store = _store(neg=0.9, helpful=0.0, adjustments={"read_file": 0.045})
-        tuner = AutoTuner(cfg, store)
-        assert tuner.maybe_adjust("read_file", score_ceiling=0.03, persist_clamp=False) is None
-        assert tuner.get_effective_min_score("read_file") == 0.045
-        store.save_adjustment.assert_not_called()
-
-    def test_unvouched_ceiling_still_caps_a_raise(self):
-        cfg = SurfacingConfig(auto_tune_enabled=True)
-        tuner = AutoTuner(cfg, _store(neg=0.9, helpful=0.0))
-        for _ in range(30):
-            tuner.maybe_adjust("read_file", score_ceiling=0.03, persist_clamp=False)
-        assert tuner.get_effective_min_score("read_file") == 0.03

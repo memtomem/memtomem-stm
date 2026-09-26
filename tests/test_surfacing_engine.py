@@ -4795,11 +4795,8 @@ class TestScaleGatedMinScore:
         await engine.surface(
             "gh", "read_file", {"_context_query": "rrf control query"}, LONG_RESPONSE
         )
-        # rrf batch without a stamp → the 2/61 baseline at 4 places, and not
-        # vouched for, so it may not rewrite the stored value (#1062).
-        tuner.maybe_adjust.assert_called_once_with(
-            "read_file", score_ceiling=0.0327, persist_clamp=False
-        )
+        # rrf batch without a stamp → the 2/61 baseline at 4 places (#1062).
+        tuner.maybe_adjust.assert_called_once_with("read_file", score_ceiling=0.0327)
 
     async def test_suspended_batch_resets_streak_and_closes_both_kinds(self):
         tracker = MagicMock()
@@ -5518,7 +5515,7 @@ class TestAutoTuneRrfReferenceCeiling:
     deliver filters out every unboosted two-leg result, so the tool surfaces
     nothing and draws no ratings to walk it back. The engine caps the filter
     at the batch's reference, rounded down to the precision Core delivers
-    scores at, and a stamped batch also clamps the stored value."""
+    scores at; the stored value is left as learned."""
 
     def _make_tracker(self, tmp_path: Path, config: SurfacingConfig):
         from memtomem_stm.surfacing.feedback import FeedbackTracker
@@ -5537,7 +5534,7 @@ class TestAutoTuneRrfReferenceCeiling:
         out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
         return engine, tracker, out
 
-    async def test_stamped_batch_delivers_top_result_and_clamps(self, tmp_path: Path):
+    async def test_stamped_batch_delivers_top_result(self, tmp_path: Path):
         # Core's structured JSON rounds to 4 places: 2/61 arrives as 0.0328.
         top = FakeSearchResult(
             chunk=FakeChunk(content="both legs rank first"),
@@ -5548,8 +5545,9 @@ class TestAutoTuneRrfReferenceCeiling:
         engine, tracker, out = await self._surface_with_stuck_tool(tmp_path, [top])
         try:
             assert "both legs rank first" in out
-            assert engine._auto_tuner.get_effective_min_score("read_file") == 0.0327
-            assert tracker.store.load_adjustments()["read_file"] == 0.0327
+            assert engine._active_min_score("read_file", 0.0327) == 0.0327
+            # The cap may be a guess, so the learned value is not rewritten.
+            assert tracker.store.load_adjustments()["read_file"] == 0.04
         finally:
             tracker.close()
 
@@ -5578,7 +5576,7 @@ class TestAutoTuneRrfReferenceCeiling:
             tracker.close()
 
     async def test_unstamped_batch_does_not_rewrite_the_stored_value(self, tmp_path: Path):
-        # A guessed ceiling caps this call only; the learned value survives.
+        # The cap applies to this call's filter only; the learned value survives.
         top = FakeSearchResult(chunk=FakeChunk(content="compact"), score=0.03)
         engine, tracker, _ = await self._surface_with_stuck_tool(tmp_path, [top], stuck=0.045)
         try:
@@ -5597,8 +5595,8 @@ class TestAutoTuneRrfReferenceCeiling:
 
 
 class TestBatchScoreCeiling:
-    """Which batches hand the tuner a ceiling, at what precision, and whether
-    it may rewrite a stored value (#1062)."""
+    """Which batches hand the tuner and the filter a cap, and at what
+    precision (#1062)."""
 
     @staticmethod
     def _r(**kw):
@@ -5606,16 +5604,16 @@ class TestBatchScoreCeiling:
 
     def test_valid_rrf_stamp_is_floored_to_four_places(self):
         batch = [self._r(score_scale="rrf", score_ceiling=1.8 / 61)]
-        assert SurfacingEngine._batch_score_ceiling(batch) == (0.0295, True)
+        assert SurfacingEngine._batch_score_ceiling(batch) == 0.0295
 
     @pytest.mark.parametrize("stamp", [None, 0.0, -1.0, float("nan"), float("inf"), True, "0.05"])
-    def test_invalid_rrf_stamp_falls_back_unstamped(self, stamp):
+    def test_invalid_rrf_stamp_falls_back_to_baseline(self, stamp):
         batch = [self._r(score_scale="rrf", score_ceiling=stamp)]
-        assert SurfacingEngine._batch_score_ceiling(batch) == (0.0327, False)
+        assert SurfacingEngine._batch_score_ceiling(batch) == 0.0327
 
     @pytest.mark.parametrize("scale", [None, "", "some_future_scale"])
     def test_unstamped_or_unknown_scale_gets_compact_precision(self, scale):
-        assert SurfacingEngine._batch_score_ceiling([self._r(score_scale=scale)]) == (0.03, False)
+        assert SurfacingEngine._batch_score_ceiling([self._r(score_scale=scale)]) == 0.03
 
     @pytest.mark.parametrize("scale", ["rerank", "bm25", "dense", "none"])
     def test_named_non_rrf_scale_gives_no_ceiling(self, scale):
@@ -5631,7 +5629,7 @@ class TestBatchScoreCeiling:
         pinned = self._r(score_scale="rerank")
         pinned.pinned = True  # type: ignore[attr-defined]
         batch = [pinned, self._r(score_scale="rrf", score_ceiling=0.04), self._r()]
-        assert SurfacingEngine._batch_score_ceiling(batch) == (0.04, True)
+        assert SurfacingEngine._batch_score_ceiling(batch) == 0.04
 
 
 class TestAutoTuneConcurrentCeiling:
@@ -5661,14 +5659,21 @@ class TestAutoTuneConcurrentCeiling:
             tuner = engine._auto_tuner
             original = tuner.maybe_adjust
 
-            def adjust_then_peer_raises(tool, score_ceiling=None):
-                result = original(tool, score_ceiling=score_ceiling)
+            peer_raised = []
+
+            def adjust_then_peer_raises(tool, *args, **kwargs):
+                result = original(tool, *args, **kwargs)
                 # A peer call under a 0.06 ceiling raised the shared value.
                 tuner._adjustments[tool] = 0.045
+                peer_raised.append(tool)
                 return result
 
             tuner.maybe_adjust = adjust_then_peer_raises
             out = await engine.surface("gh", "read_file", VALID_ARGS, LONG_RESPONSE)
+            # The fake must actually run: a signature mismatch is swallowed by
+            # ``_maybe_auto_tune`` and would leave this test vacuous.
+            assert peer_raised == ["read_file"]
+            assert tuner.get_effective_min_score("read_file") == 0.045
             assert "rank first on both legs" in out
         finally:
             tracker.close()

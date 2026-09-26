@@ -10,7 +10,7 @@ checked before use.
 from __future__ import annotations
 
 import math
-from decimal import ROUND_FLOOR, Decimal
+from decimal import ROUND_FLOOR, Decimal, localcontext
 from enum import StrEnum
 from typing import Any
 
@@ -33,10 +33,13 @@ def floor_to_decimals(value: float, decimals: int) -> float:
     score Core delivers for *value* at that precision.
 
     Goes through ``repr`` so binary noise (``0.03`` stored as
-    ``0.0299999…``) does not floor a value that is already exact.
+    ``0.0299999…``) does not floor a value that is already exact. The context
+    precision covers any finite float (up to 309 integer digits), which the
+    default 28 digits would reject for a huge stamp.
     """
     step = Decimal(1).scaleb(-decimals)
-    return float(Decimal(repr(value)).quantize(step, rounding=ROUND_FLOOR))
+    with localcontext(prec=320 + decimals):
+        return float(Decimal(repr(value)).quantize(step, rounding=ROUND_FLOOR))
 
 
 class FusionGap(StrEnum):
