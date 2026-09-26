@@ -61,5 +61,5 @@ example). Per-host caveats and the verified/unverified marks live in each `<host
 | `cursor/` | ✅ fixtured | flat `additional_context` (string) — **runtime no-op today, staff-confirmed bug** |
 | `kimi/` | ✅ fixtured | raw **stdout** text on exit 0 (not a JSON key) |
 | `codex/` | ✅ fixtured | `hookSpecificOutput.additionalContext` (same shape as Claude) |
-| **Claude Code** | not here | in-code baseline — covered by `tests/cli/test_hook_cmd.py` |
+| `claude/` | ✅ inbound only | `hookSpecificOutput.additionalContext` — render is the in-code baseline covered by `tests/cli/test_hook_cmd.py`; the inbound fixtures pin the host call ids (`session_id` / `cwd` / `tool_use_id` / `agent_id`) |
 | **Antigravity** | ❌ **deliberately absent** | unfixturable: PostToolUse tool-output stdin field is undocumented and the official docs are an unreadable SPA. Writing a fixture now would encode guesses (the exact risk B0 exists to prevent). Documented gap — see the B0 report. |

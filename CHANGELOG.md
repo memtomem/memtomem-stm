@@ -25,6 +25,14 @@ changes inline only. See the deprecation policy in
   1,194 `[related]` and 269 `[weak]`, where all 4,708 were `[weak]` before.
   Results without a `score_scale` stamp (compact format, older cores) keep the
   `[min_score, 1.0]` band.
+- **The hook↔daemon protocol is now v8.** The `surface` payload carries the host's
+  `session_id`, `cwd`, `tool_use_id` and `agent_id` (Claude sends `agent_id` only
+  inside a subagent). The surfacing engine accepts them but does not store or log them
+  yet. The version is part of the daemon fingerprint, so after upgrading the hook
+  starts a new v8 daemon. A running v7 daemon keeps running beside it until it idles
+  out. A daemon pinned with `idle_timeout_seconds=0` never idles out, so stop it with
+  `mms daemon stop --all`; on Windows that command cannot terminate it, so end the
+  process from Task Manager instead.
 - **Explicit progressive compression rows record the first delivered response**
   (#1039). `compressed_chars` used to be the whole cleaned text on this path, so
   its saved ratio was 0%. When the response is chunked, it is now the first chunk

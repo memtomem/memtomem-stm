@@ -468,7 +468,15 @@ async def _run_surfacing_hook_inner(
 
     if engine is not None:
         injected = await engine.surface(
-            "builtin", tool_name, tool_input, response_text, deadline_monotonic=deadline_monotonic
+            "builtin",
+            tool_name,
+            tool_input,
+            response_text,
+            deadline_monotonic=deadline_monotonic,
+            session_id=call.session_id,
+            cwd=call.cwd,
+            tool_use_id=call.tool_use_id,
+            agent_id=call.agent_id,
         )
         return _build_output(response_text, injected, engine.injection_mode)
 
@@ -505,7 +513,15 @@ async def _run_surfacing_hook_inner(
     )
     try:
         injected = await built.surface(
-            "builtin", tool_name, tool_input, response_text, deadline_monotonic=deadline_monotonic
+            "builtin",
+            tool_name,
+            tool_input,
+            response_text,
+            deadline_monotonic=deadline_monotonic,
+            session_id=call.session_id,
+            cwd=call.cwd,
+            tool_use_id=call.tool_use_id,
+            agent_id=call.agent_id,
         )
     finally:
         await _quiet_async(built.stop(), "surfacing engine stop")

@@ -1,0 +1,12 @@
+{
+  "session_id": "sess_demo",
+  "prompt_id": "550e8400-e29b-41d4-a716-446655440000",
+  "transcript_path": "/home/user/.claude/projects/demo/transcript.jsonl",
+  "cwd": "/project",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Read",
+  "tool_input": { "file_path": "/project/config.toml" },
+  "tool_use_id": "toolu_demo_main",
+  "tool_response": { "type": "text", "text": "[auth]\ntoken_ttl = 3600" }
+}
