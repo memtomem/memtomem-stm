@@ -190,6 +190,18 @@ class SurfacingConfig(BaseModel):
     ``query_retention_days`` is the read-side counterpart that ages
     out raw text on a TTL for operators who keep the default and want
     bounded retention rather than full opt-out."""
+    opportunities_enabled: bool = True
+    """Write one ``surfacing_opportunities`` row per call that entered
+    surfacing (past the ``enabled`` check), labelled with how it ended —
+    surfaced, skipped and why, errored, cancelled. Rows carry counts about
+    the arguments, never their keys or values. Only engines that own a
+    feedback tracker write them (the daemon, and the proxy with
+    ``feedback_enabled``); the cold in-process hook writes none. Each row is
+    a fire-and-forget write that no response waits on."""
+    opportunities_sample_rate: float = Field(default=1.0, ge=0.0, le=1.0)
+    """Share of opportunity rows kept. ``1.0`` keeps every row, ``0.0``
+    none; rows the rate drops are counted in ``stm_surfacing_stats`` but not
+    stored. Caps the write load on a busy multi-agent host."""
     consumer_model: str = ""
     result_format: Literal["compact", "structured"] = "structured"
     """Parser format for mem_search output. ``structured`` (default)
