@@ -68,6 +68,14 @@ changes inline only. See the deprecation policy in
   `--freeze` ends the burn-in with a frozen snippet stoplist and `--purge --yes` deletes
   the database. The HMAC key is read from `stm_feedback.db` (new read-only
   `load_hmac_key`) and never copied; no path, id or text is stored in the clear.
+- **Outcome resolution for the holdout trial** (`memtomem_stm.surfacing.trial.resolve`).
+  A pure function over the extractor's rows, loaded with `load_resolve_inputs` in
+  `scripts/stm_trial.py`. For every eligible memory of a drawn event it returns
+  whether the agent opened the memory's file in the next 12 calls within 600 s, whether
+  it reused the memory's text only after the injection, whether a later block showed the
+  memory again, and whether the block was delivered. It also returns missing-outcome
+  statuses and integrity flags. Reads only the transcript file the event's host ids name,
+  and nothing on the filesystem.
 
 ## [0.6.0] — 2026-09-26
 
