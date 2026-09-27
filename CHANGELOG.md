@@ -23,6 +23,12 @@ changes inline only. See the deprecation policy in
   shown events as surfacings and report withheld ones separately, and `mms stats` /
   `mms doctor` now also show the opportunity log. With the default rate no injection is
   withheld.
+- **Trial extractor for the holdout** (`scripts/stm_trial.py`, repository only). A daily
+  run copies hashed transcript ledgers, output and injection 4-grams, and every drawn
+  event into `~/.memtomem/stm_trial.db` before Claude Code prunes the transcripts;
+  `--freeze` ends the burn-in with a frozen snippet stoplist and `--purge --yes` deletes
+  the database. The HMAC key is read from `stm_feedback.db` (new read-only
+  `load_hmac_key`) and never copied; no path, id or text is stored in the clear.
 
 ## [0.6.0] — 2026-09-26
 
