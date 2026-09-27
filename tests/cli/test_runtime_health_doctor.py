@@ -6,6 +6,7 @@ remaining read-only diagnostics.
 """
 
 import json
+import logging
 
 import pytest
 from click.testing import CliRunner
@@ -211,3 +212,42 @@ def test_doctor_rechecks_the_snapshot_its_later_checks_use(tmp_path, monkeypatch
     assert check["status"] == "FAIL"
     assert check["detail"].endswith(": 1 validation error(s): value_error")
     assert "config validate" in check["next_action"]
+
+
+@pytest.mark.parametrize("command", ["health", "doctor"])
+@pytest.mark.parametrize("json_output", [False, True])
+def test_env_supplied_invalid_value_stays_out_of_every_section(
+    tmp_path, monkeypatch, caplog, command, json_output
+):
+    """The surfacing bootstrap builds the same settings; its error must be as
+    value-free as ``config_error``, not a raw pydantic message."""
+    path = tmp_path / "proxy.json"
+    path.write_text("{}")
+    monkeypatch.setenv(
+        "MEMTOMEM_STM_PROXY",
+        json.dumps(
+            {
+                "upstream_servers": {
+                    "a": {"prefix": "tok_SECRET", "command": "x"},
+                    "b": {"prefix": "tok_SECRET", "command": "x"},
+                }
+            }
+        ),
+    )
+    args = [command, "--config", str(path)]
+    if json_output:
+        args.append("--json")
+    with caplog.at_level(logging.DEBUG, logger="memtomem_stm"):
+        result = CliRunner().invoke(cli, args)
+    assert result.exit_code == (1 if command == "doctor" else 0), result.output
+    assert "tok_SECRET" not in result.output
+    assert "input_value" not in result.output
+    # DEBUG capture: the bootstrap failure is logged, but as the summary.
+    assert "Surfacing bootstrap status inspection failed" in caplog.text
+    assert "tok_SECRET" not in caplog.text
+    if command == "health" and json_output:
+        data = json.loads(result.stdout)
+        assert data["config_valid"] is False
+        # Positive control: the surfacing section did take the error path.
+        assert "MEMTOMEM_STM_PROXY" in data["surfacing"]["error"]
+        assert data["surfacing"]["error"].startswith("invalid configuration: ")

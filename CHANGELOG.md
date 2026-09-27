@@ -52,7 +52,8 @@ changes inline only. See the deprecation policy in
   from read-only diagnostics (#1051). **Behavior change**: see the upgrade
   notes above.
 - Match `mms health` and `mms doctor` config validity to startup parsing,
-  keep input values out of their validation errors, and stop `health`
+  keep input values out of their validation errors (including the surfacing
+  bootstrap section and its debug log), and stop `health`
   crashing on a `MEMTOMEM_STM_*` value settings cannot decode (#1075).
   **Behavior change**: see the upgrade notes above.
 - Keep each LLM compression fallback reason with its own result so

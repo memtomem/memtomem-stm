@@ -8486,14 +8486,52 @@ def _surfacing_bootstrap_status(
             },
         }
     except Exception as exc:
-        logger.debug("Surfacing bootstrap status inspection failed", exc_info=True)
+        error = _surfacing_bootstrap_error(exc)
+        if _is_config_construction_error(exc):
+            # The traceback would carry the same rejected values as the message.
+            logger.debug("Surfacing bootstrap status inspection failed: %s", error)
+        else:
+            logger.debug("Surfacing bootstrap status inspection failed", exc_info=exc)
         return {
             "enabled": None,
             "feedback_enabled": None,
             "feedback_db": None,
             "ltm_server": None,
-            "error": str(exc) or type(exc).__name__,
+            "error": error,
         }
+
+
+def _is_config_construction_error(exc: Exception) -> bool:
+    from pydantic import ValidationError
+    from pydantic_settings import SettingsError
+
+    return isinstance(exc, ValidationError | SettingsError)
+
+
+def _surfacing_bootstrap_error(exc: Exception) -> str:
+    """Render a bootstrap failure without the config values it may quote.
+
+    Settings construction errors reach health and doctor output; like
+    ``_runtime_proxy_read`` they name locations, error types and variables
+    only, since pydantic messages can carry the rejected input (#1075).
+    """
+    from pydantic import ValidationError
+    from pydantic_settings import SettingsError
+
+    from memtomem_stm.proxy.config import (
+        env_var_hint_for_validation_error,
+        validation_error_summary,
+    )
+
+    if isinstance(exc, ValidationError):
+        return (
+            f"invalid configuration: {exc.error_count()} validation error(s): "
+            + validation_error_summary(exc)
+            + env_var_hint_for_validation_error(exc)
+        )
+    if isinstance(exc, SettingsError):
+        return "invalid MEMTOMEM_STM_* settings"
+    return str(exc) or type(exc).__name__
 
 
 def _format_surfacing_bootstrap(status: dict[str, Any]) -> list[str]:
