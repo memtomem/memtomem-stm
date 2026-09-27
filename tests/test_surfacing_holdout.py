@@ -487,13 +487,24 @@ class TestWritePaths:
             event.set()
             await _close(engine, tracker)
 
+    @pytest.mark.parametrize("failure", ["raises", "store-closed"])
     @pytest.mark.parametrize("how", ["timeout", "cancel"])
     async def test_abandoned_then_fails(
-        self, tmp_path: Path, arm: str, path_kind: str, how: str, short_budget: None
+        self,
+        tmp_path: Path,
+        arm: str,
+        path_kind: str,
+        how: str,
+        failure: str,
+        short_budget: None,
     ) -> None:
+        # ``store-closed``: nobody is waiting any more when the tracker answers
+        # False, so only a failure raised on the worker can reach the callback.
         engine, tracker = await self._setup(tmp_path, arm, path_kind)
         landed = len(_events(tracker.store.db_path))
-        tracker.record_surfacing = _refuse  # type: ignore[method-assign]
+        tracker.record_surfacing = (  # type: ignore[method-assign]
+            _refuse if failure == "raises" else (lambda *_a, **_k: False)
+        )
         event = threading.Event()
         submit_store_write(lambda: event.wait(timeout=10.0))
         try:
@@ -548,6 +559,10 @@ class TestWritePaths:
             await _settle(engine)
             if arm == "withheld":
                 assert out == RESPONSE
+            else:
+                # Shown keeps the block, with the unrecordable feedback id withdrawn.
+                assert "<surfaced-memories>" in out
+                assert "stm_surfacing_feedback(" not in out
             assert (len(_events(path)), len(_opps(path))) == before
             assert _unrecorded(engine) == {arm: 1}
         finally:

@@ -195,6 +195,18 @@ def _persist_surfacing(tracker: Any, record_event: Any, delivered_ids: list[str]
             logger.warning("Failed to persist seen memory IDs", exc_info=True)
 
 
+def _record_or_raise(record_event: Any) -> None:
+    """Write one event row on the worker, raising if the store had closed.
+
+    The store answers ``False`` rather than raising when it closed under the
+    call. Raising here, on the worker, makes that a failure the awaiting
+    caller and an abandoned write's failure callback both see; a ``False``
+    returned to a caller that has stopped waiting would go unseen.
+    """
+    if record_event() is False:
+        raise RuntimeError("feedback store closed before the event was written")
+
+
 @dataclass(frozen=True)
 class _HostCall:
     """The host's own identifiers for the call being surfaced on.
@@ -2294,7 +2306,11 @@ class SurfacingEngine:
             scope.opportunity.arm = arm
             scope.opportunity.holdout_rate = holdout_rate
             try:
-                written = await self._await_store_write(
+                # The row does not exist when the store closed under this
+                # call; ``_record_or_raise`` turns that into a failure, so the
+                # ID is withdrawn below and a lost draw is counted.
+                await self._await_store_write(
+                    _record_or_raise,
                     functools.partial(
                         self._feedback_tracker.record_surfacing,
                         surfacing_id=surfacing_id,
@@ -2317,10 +2333,6 @@ class SurfacingEngine:
                     ),
                     on_abandoned_failure=self._holdout_write_lost(arm),
                 )
-                if written is False:
-                    # The store closed under this call; the row does not
-                    # exist, so the ID must not stay advertised.
-                    raise RuntimeError("feedback store closed before the event was written")
             except asyncio.CancelledError:
                 # Same as the miss path: an undelivered render keeps no claim.
                 self._release_surfaced_ids(claimed)
