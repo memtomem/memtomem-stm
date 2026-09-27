@@ -316,7 +316,7 @@ def test_grep_path_defaults_to_cwd_and_pattern_tokens() -> None:
 def test_casefold_is_passed_through() -> None:
     assert _paths("read", {"file_path": _n("/A/B.md")}) == {_n("/A/B.md")}
     assert st.entry_path_keys("read", {"file_path": _n("/A/B.md")}, None, casefold=True)[0] == {
-        "/a/b.md"
+        _n("/a/b.md")
     }
 
 
