@@ -79,7 +79,7 @@ def test_list_distinguishes_tool_override_and_applies_environment(tmp_path, monk
     assert data["servers"]["s"] == raw["upstream_servers"]["s"]
 
 
-def test_invalid_config_does_not_claim_a_runtime_strategy(tmp_path):
+def test_invalid_config_does_not_claim_file_server_is_effective(tmp_path):
     path = tmp_path / "proxy.json"
     path.write_text(
         json.dumps(
@@ -95,10 +95,15 @@ def test_invalid_config_does_not_claim_a_runtime_strategy(tmp_path):
     result = runner.invoke(cli, ["list", "--config", str(path)])
     assert result.exit_code == 0, result.output
     assert "fails validation" in result.output
-    row = next(line for line in result.output.splitlines() if line.startswith("s "))
-    assert row.split()[3] == "unknown"
+    assert (
+        "No upstream servers effective (1 in the file; the file fails validation)." in result.output
+    )
+    assert not any(line.startswith("s ") for line in result.output.splitlines())
     result = runner.invoke(cli, ["list", "--config", str(path), "--json"])
-    assert json.loads(result.output)["effective_compression"] == {}
+    data = json.loads(result.output)
+    assert set(data["servers"]) == {"s"}
+    assert data["effective_servers"] == {}
+    assert data["effective_compression"] == {}
 
 
 def test_server_level_environment_override_is_a_server_source(tmp_path, monkeypatch):

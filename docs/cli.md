@@ -328,19 +328,27 @@ The import→prune transition is reversible: every import records an `origin` pr
 
 The COMPRESSION column shows the resolved server default, including global
 inheritance and proxy environment overrides. Explicit tool compression overrides
-are listed below the table because their strategy can differ. `--json` retains
-the raw redacted `servers` map and adds `effective_compression`, with each server's
+are listed below the table because their strategy can differ. The SOURCE column
+shows whether each upstream comes from the file, environment, or both; env-only
+upstreams appear in the table when startup can parse the environment. If the
+file fails validation, the table shows the env/default fallback that the server
+uses and keeps the file error warning. The table removes URL userinfo, query strings,
+and fragments, and hides arguments on rows supplied by the environment.
+`--json` retains the raw redacted `servers` file
+map and adds `effective_servers` (a safe summary of the runtime upstreams),
+`server_sources`, and `effective_compression`. The latter reports each server's
 resolved strategy, its `global`/`server` source, and explicit tool overrides.
 `server` means the server level supplied `compression`, from the file or from an
 environment variable addressing that server. Override lines quote both names as
 JSON strings (`"server"/"tool": strategy (tool override)`), so a `/` inside a name
-stays unambiguous. An invalid configuration reports the strategy as unknown and
-leaves `effective_compression` empty. Like `config_valid`, the column does not
-reliably detect an environment the server refuses at startup. Both validate the
-collected environment fragment, which drops a `MEMTOMEM_STM_PROXY` payload that is
-not a JSON object, and an undecodable variable whose path a later variable covers;
-startup rejects both, so such an environment lists as valid with a resolved
-strategy (#1051).
+stays unambiguous. A startup-invalid environment reports the strategy as unknown
+and leaves `effective_servers` and `effective_compression` empty. A file error
+leaves `config_valid` false but reports the env/default fallback in those fields.
+`config_valid` uses
+the same environment parsing and file loading as server startup; errors identify
+candidate variables and validation locations/types without printing their values.
+For a file validation error, the text warning points to `mms config validate`
+for details; JSON `config_error` keeps only the safe location/type summary (#1051).
 
 ```
 Usage: mms list [OPTIONS]
@@ -350,9 +358,12 @@ Options:
   --json         Output as JSON for scripting.
 ```
 
-Prints the configured upstream servers in a table — name, prefix, transport, compression strategy, surfacing toggle, origin, and the command (stdio) or URL (SSE / HTTP). This is the per-server view; [`mms status`](#status) is the config summary (#614). The SURFACING column is the visible home of the per-server [`mms surfacing`](#surfacing) toggle. `max_result_chars` deliberately has no column — the effective value is per-tool once [`mms tune --apply`](#tune) writes `tool_overrides`, so read it via `--json` or the config file. Reads the config only; does not probe connectivity (use `mms health` for that). With `--json` the output becomes `{"config_path": ..., "config_valid": ..., "config_error": ..., "servers": {...}, "effective_compression": {...}}` for scripting; a missing config file returns `{"error": "config_not_found", "path": ...}` instead of a text fallthrough so callers can branch on shape. `config_valid` / `config_error` mirror [`mms status --json`](#status), including the env overlay — a file that only validates once `MEMTOMEM_STM_PROXY__*` vars are applied reports valid here, because the warning is about what a running server does.
+Prints the configured upstream servers in a table — name, prefix, transport, compression strategy, surfacing toggle, origin, config source, and the command (stdio) or URL (SSE / HTTP). This is the per-server view; [`mms status`](#status) is the config summary (#614). The SURFACING column is the visible home of the per-server [`mms surfacing`](#surfacing) toggle. `max_result_chars` deliberately has no column — the effective value is per-tool once [`mms tune --apply`](#tune) writes `tool_overrides`, so read it via `--json` or the config file. Reads the config only; does not probe connectivity (use `mms health` for that). With `--json` the output becomes `{"config_path": ..., "config_valid": ..., "config_error": ..., "servers": {...}, "effective_servers": {...}, "server_sources": {...}, "effective_compression": {...}}` for scripting; a missing config file returns `{"error": "config_not_found", "path": ...}` instead of a text fallthrough so callers can branch on shape. `config_valid` / `config_error` mirror [`mms status --json`](#status), including the env overlay — a file that only validates once `MEMTOMEM_STM_PROXY__*` vars are applied reports valid here, because the warning is about what a running server does.
 
 The ORIGIN column summarizes import provenance: `-` for entries added manually (or imported before provenance capture), `invalid` for an entry whose `origin` block is present but unreadable, otherwise the recorded source kind (`claude-user`, `claude-project`, `mcp-json`, `claude-desktop`, `cursor-user`, `cursor-project`). `invalid` is worth acting on: identity treats a broken claim as incomparable, so `mms prune` skips that entry and an import declines a same-command candidate against it. A trailing `*` marks an entry whose recorded host sources — the primary origin **and** any duplicate registrations — were all pruned: it now exists only behind STM, and [`mms eject`](#eject) can restore it. A `cursor-*` origin never reaches that state on its own, because nothing here prunes one; eject refuses those targets for the same reason. The same condition drives the [`mms remove`](#remove) hint, so the two surfaces never disagree about which entries removal would orphan. In `--json` output the `origin` block appears with `origin.original` redacted (`has_original` tells you whether one was captured) because the verbatim host entry may carry secrets. Every server's own active `env` and `headers` values are also masked (`<REDACTED>`, keys preserved) in `--json` output, since that output is routinely piped to scripts, CI logs, or issue comments.
+
+The JSON `servers` map preserves file URL and argument values for compatibility;
+treat that raw map as sensitive when writing logs or sharing output.
 
 ### `remove`
 
@@ -631,9 +642,9 @@ Options:
 
 Shows a config summary: the configuration file path, enabled flag, schema-validation warning, and the server count (with a host-pruned count when any entry exists only behind STM). Per-server detail — prefix, transport, command/URL, compression, surfacing — lives in [`mms list`](#list); `status` answers "is the proxy set up and pointed at the right config", `list` answers "what servers are behind it". (#614 — the two commands used to print near-identical output.)
 
-`status --json` is unchanged by that split: it still carries the full redacted `servers` map (plus additive `server_count` / `pruned_count` keys), so scripted consumers keep working. Every server's `env` and `headers` values are masked (`<REDACTED>`, keys preserved); the human output never prints those fields at all, so read the on-disk config directly when a value is genuinely needed.
+`status --json` is unchanged by that split: it still carries the full redacted file `servers` map (plus `server_count`, `pruned_count`, and additive `effective_server_count` keys), so scripted consumers keep working. `enabled` reports the runtime value after environment overrides whenever startup parsing succeeds, even for a valid file. On a file error, `effective_server_count` and `enabled` describe the env/default fallback that the server uses, while `server_count` describes the file; the text output labels the fallback. If environment parsing prevents startup, `effective_server_count` is `null`, and `enabled` describes the raw file value; the text output labels a non-boolean value as invalid. Every server's `env` and `headers` values are masked (`<REDACTED>`, keys preserved); the human output never prints those fields at all, so read the on-disk config directly when a value is genuinely needed.
 
-When the file is valid JSON but fails schema validation (the state a running server silently degrades to env/defaults on), `status`, `list`, and `health` print a warning naming the first error — exit code unchanged. All three validate the file *with* the `MEMTOMEM_STM_PROXY__*` env overlay applied, so the warning matches what a running server would actually do rather than firing on a file an env var already repairs. Use `mms config validate` for the strict check.
+When the file is valid JSON but fails schema validation (the state a running server silently degrades to env/defaults on), `status` and `list` print a value-free validation location/type summary and a hint to run `mms config validate`; `health` and `doctor` still name the first schema error. Exit codes stay unchanged. `status` and `list` additionally check the server's own environment parsing before loading the file, so they also flag malformed variables the merged overlay could hide. A `SettingsError` lists candidate variable names, since the exception does not identify one reliably. `health` and `doctor` still validate the file with the environment overlay; their diagnostics can disagree with `status`/`list` when startup rejects a malformed whole proxy environment block.
 
 ### `config validate`
 

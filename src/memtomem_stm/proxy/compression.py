@@ -2355,6 +2355,14 @@ class SkeletonCompressor(_PlainTextRetention):
         return (headings[0] if headings else "")[: max(0, max_chars)]
 
 
+@dataclass(frozen=True)
+class LLMCompressionResult:
+    """Text and fallback reason belonging to one LLM compression call."""
+
+    text: str
+    fallback_reason: str | None = None
+
+
 class LLMCompressor:
     """Compress by asking an LLM to summarize the text.
 
@@ -2385,7 +2393,6 @@ class LLMCompressor:
             max_failures=3, reset_timeout=60.0, name=f"llm-{config.provider.value}"
         )
         self._client: httpx.AsyncClient | None = httpx.AsyncClient(timeout=30) if httpx else None
-        self.last_fallback: str | None = None
         # Shutdown gate: close() must wait for in-flight compress() calls to
         # drain before aclose()ing the httpx client. Otherwise a config swap
         # or stop() can tear the client down mid-request. Sister pattern to
@@ -2405,10 +2412,9 @@ class LLMCompressor:
 
     async def compress(
         self, text: str, *, max_chars: int, privacy_patterns: list[str] | None = None
-    ) -> str:
-        self.last_fallback = None
+    ) -> LLMCompressionResult:
         if not text or len(text) <= max_chars:
-            return text
+            return LLMCompressionResult(text)
         if privacy_patterns:
             from memtomem_stm.proxy.privacy import contains_sensitive_content
 
@@ -2417,11 +2423,11 @@ class LLMCompressor:
                     "Sensitive content detected, skipping LLM compression (strategy=llm/%s)",
                     self._cfg.provider.value,
                 )
-                self.last_fallback = "privacy"
-                return _plain_truncate(text, max_chars=max_chars)
+                return LLMCompressionResult(_plain_truncate(text, max_chars=max_chars), "privacy")
         if self._cb.is_open:
-            self.last_fallback = "circuit_breaker"
-            return _plain_truncate(text, max_chars=max_chars)
+            return LLMCompressionResult(
+                _plain_truncate(text, max_chars=max_chars), "circuit_breaker"
+            )
         # Read the timeout ONCE: the gate turns it into a deadline, and the
         # same value bounds our own call, so close() drains against what this
         # caller actually committed to rather than a later config edit.
@@ -2433,8 +2439,7 @@ class LLMCompressor:
         # keeps ``_client`` alive across the await below.
         gate_token = self._gate.try_enter(call_timeout)
         if gate_token is None:
-            self.last_fallback = "closed"
-            return _plain_truncate(text, max_chars=max_chars)
+            return LLMCompressionResult(_plain_truncate(text, max_chars=max_chars), "closed")
         try:
             result = await asyncio.wait_for(
                 self._call_api(text, max_chars=max_chars),
@@ -2455,8 +2460,7 @@ class LLMCompressor:
                     "LLM returned an empty summary (strategy=llm/%s), falling back to truncate",
                     self._cfg.provider.value,
                 )
-                self.last_fallback = "llm_empty"
-                return _plain_truncate(text, max_chars=max_chars)
+                return LLMCompressionResult(_plain_truncate(text, max_chars=max_chars), "llm_empty")
             if len(result) > max_chars:
                 # The system prompt only ASKS the model to honor max_chars;
                 # models routinely overshoot length constraints, and nothing
@@ -2472,9 +2476,10 @@ class LLMCompressor:
                     max_chars,
                     self._cfg.provider.value,
                 )
-                self.last_fallback = "llm_overlength"
-                return _plain_truncate(result, max_chars=max_chars)
-            return result
+                return LLMCompressionResult(
+                    _plain_truncate(result, max_chars=max_chars), "llm_overlength"
+                )
+            return LLMCompressionResult(result)
         except asyncio.TimeoutError:
             self._cb.failure()
             logger.warning(
@@ -2482,8 +2487,7 @@ class LLMCompressor:
                 call_timeout,
                 self._cfg.provider.value,
             )
-            self.last_fallback = "timeout"
-            return _plain_truncate(text, max_chars=max_chars)
+            return LLMCompressionResult(_plain_truncate(text, max_chars=max_chars), "timeout")
         except Exception as exc:
             self._cb.failure()
             logger.warning(
@@ -2492,8 +2496,7 @@ class LLMCompressor:
                 type(exc).__name__,
                 exc,
             )
-            self.last_fallback = "llm_error"
-            return _plain_truncate(text, max_chars=max_chars)
+            return LLMCompressionResult(_plain_truncate(text, max_chars=max_chars), "llm_error")
         finally:
             self._gate.leave(gate_token)
 

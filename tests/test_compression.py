@@ -319,7 +319,7 @@ class TestHybridCompressor:
 
 
 # ---------------------------------------------------------------------------
-# LLMCompressor — last_fallback attribute
+# LLMCompressor — per-call fallback result
 # ---------------------------------------------------------------------------
 
 
@@ -333,8 +333,8 @@ class TestLLMCompressorFallback:
     async def test_no_fallback_when_text_fits(self):
         comp = _make_llm_compressor()
         result = await comp.compress("short", max_chars=1000)
-        assert result == "short"
-        assert comp.last_fallback is None
+        assert result.text == "short"
+        assert result.fallback_reason is None
 
     @pytest.mark.asyncio
     async def test_privacy_fallback(self):
@@ -342,8 +342,8 @@ class TestLLMCompressorFallback:
         text = "API_KEY=sk-secret-1234567890 " * 50
         with patch("memtomem_stm.proxy.privacy.contains_sensitive_content", return_value=True):
             result = await comp.compress(text, max_chars=100, privacy_patterns=["API_KEY"])
-        assert comp.last_fallback == "privacy"
-        assert len(result) < len(text)
+        assert result.fallback_reason == "privacy"
+        assert len(result.text) < len(text)
 
     @pytest.mark.asyncio
     async def test_privacy_fallback_scans_full_payload_before_provider_call(self):
@@ -355,8 +355,8 @@ class TestLLMCompressorFallback:
             result = await comp.compress(text, max_chars=100, privacy_patterns=[r"password\s*:"])
 
         call_api.assert_not_called()
-        assert comp.last_fallback == "privacy"
-        assert len(result) < len(text)
+        assert result.fallback_reason == "privacy"
+        assert len(result.text) < len(text)
 
     @pytest.mark.asyncio
     async def test_circuit_breaker_fallback(self):
@@ -368,8 +368,8 @@ class TestLLMCompressorFallback:
 
         text = "Long document content. " * 50
         result = await comp.compress(text, max_chars=200)
-        assert comp.last_fallback == "circuit_breaker"
-        assert len(result) < len(text)
+        assert result.fallback_reason == "circuit_breaker"
+        assert len(result.text) < len(text)
 
     @pytest.mark.asyncio
     async def test_llm_error_fallback(self):
@@ -379,8 +379,8 @@ class TestLLMCompressorFallback:
             comp, "_call_api", new_callable=AsyncMock, side_effect=RuntimeError("API down")
         ):
             result = await comp.compress(text, max_chars=200)
-        assert comp.last_fallback == "llm_error"
-        assert len(result) < len(text)
+        assert result.fallback_reason == "llm_error"
+        assert len(result.text) < len(text)
 
     @pytest.mark.asyncio
     async def test_fallback_resets_on_each_call(self):
@@ -389,12 +389,12 @@ class TestLLMCompressorFallback:
         for _ in range(3):
             comp._cb.failure()
         text = "Long document content. " * 50
-        await comp.compress(text, max_chars=200)
-        assert comp.last_fallback == "circuit_breaker"
+        result = await comp.compress(text, max_chars=200)
+        assert result.fallback_reason == "circuit_breaker"
 
         # Second call: text fits budget — no compression needed
-        await comp.compress("short", max_chars=1000)
-        assert comp.last_fallback is None
+        result = await comp.compress("short", max_chars=1000)
+        assert result.fallback_reason is None
 
     @pytest.mark.asyncio
     async def test_overlength_llm_output_is_bounded(self):
@@ -408,8 +408,8 @@ class TestLLMCompressorFallback:
         text = "Long document content. " * 50
         with patch.object(comp, "_call_api", new=AsyncMock(return_value="X" * 1000)):
             result = await comp.compress(text, max_chars=200)
-        assert len(result) <= 200
-        assert comp.last_fallback == "llm_overlength"
+        assert len(result.text) <= 200
+        assert result.fallback_reason == "llm_overlength"
 
     @pytest.mark.asyncio
     async def test_overlength_does_not_count_as_breaker_failure(self):
@@ -431,8 +431,8 @@ class TestLLMCompressorFallback:
         text = "Long document content. " * 50
         with patch.object(comp, "_call_api", new=AsyncMock(return_value="ok summary")):
             result = await comp.compress(text, max_chars=200)
-        assert result == "ok summary"
-        assert comp.last_fallback is None
+        assert result.text == "ok summary"
+        assert result.fallback_reason is None
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +452,7 @@ def _make_llm_compressor_with_timeout(timeout: float) -> LLMCompressor:
 class TestLLMCompressorTimeout:
     """`llm_timeout_seconds` must fire when the LLM hangs past the budget,
     sending compression through the truncate fallback with
-    ``last_fallback == "timeout"`` and a circuit-breaker failure recorded
+    ``fallback_reason == "timeout"`` and a circuit-breaker failure recorded
     (so a persistently slow endpoint eventually trips CB)."""
 
     @pytest.mark.asyncio
@@ -466,10 +466,10 @@ class TestLLMCompressorTimeout:
 
         with patch.object(comp, "_call_api", new=AsyncMock(side_effect=_hang)):
             result = await comp.compress(text, max_chars=200)
-        assert comp.last_fallback == "timeout"
-        assert len(result) < len(text)
+        assert result.fallback_reason == "timeout"
+        assert len(result.text) < len(text)
         # Truncate marker
-        assert "truncated" in result or "original:" in result
+        assert "truncated" in result.text or "original:" in result.text
 
     @pytest.mark.asyncio
     async def test_timeout_counts_as_circuit_breaker_failure(self):
@@ -498,8 +498,8 @@ class TestLLMCompressorTimeout:
 
         with patch.object(comp, "_call_api", new=AsyncMock(side_effect=_fast)):
             result = await comp.compress(text, max_chars=200)
-        assert result == "compressed summary"
-        assert comp.last_fallback is None
+        assert result.text == "compressed summary"
+        assert result.fallback_reason is None
 
     def test_config_rejects_non_positive_timeout(self):
         from pydantic import ValidationError
@@ -625,8 +625,8 @@ class TestLLMCompressorEmptyResponseGuard:
         _patch_post(comp, {"choices": []})
         text = "Long document content. " * 50
         result = await comp.compress(text, max_chars=200)
-        assert comp.last_fallback == "llm_error"
-        assert len(result) < len(text)
+        assert result.fallback_reason == "llm_error"
+        assert len(result.text) < len(text)
 
 
 # ---------------------------------------------------------------------------
@@ -653,7 +653,7 @@ class TestLLMCompressorEmptyCompletion:
     """A provider that answers 200 OK with an empty (or whitespace-only)
     completion passes every guard #67 added: ``isinstance(content, str)``
     is True for ``""``, so ``compress()`` returned that empty string as a
-    SUCCESS. A 5,000-char response became 0 chars with ``last_fallback``
+    SUCCESS. A 5,000-char response became 0 chars with ``fallback_reason``
     still ``None`` — the payload was silently destroyed AND the call was
     booked as a successful LLM compression (``compression_strategy`` never
     records a ``→*_fallback`` suffix).
@@ -674,10 +674,10 @@ class TestLLMCompressorEmptyCompletion:
         _patch_post(comp, _EMPTY_COMPLETION_PAYLOADS[provider](body))
         result = await comp.compress(self.TEXT, max_chars=200)
         # The payload survives: truncated, not annihilated.
-        assert result.strip()
-        assert len(result) <= 200
+        assert result.text.strip()
+        assert len(result.text) <= 200
         # And the call is booked as a fallback, not as a success.
-        assert comp.last_fallback == "llm_empty"
+        assert result.fallback_reason == "llm_empty"
 
     @pytest.mark.parametrize("provider", list(_EMPTY_COMPLETION_PAYLOADS))
     @pytest.mark.asyncio
@@ -685,7 +685,7 @@ class TestLLMCompressorEmptyCompletion:
         """Also pins the choice of guard: raising from the provider methods
         instead would take the ``except Exception`` arm, and four empty
         completions would open the breaker (measured: opens on the 3rd, and
-        ``last_fallback`` then reports ``circuit_breaker`` — the wrong cause).
+        ``fallback_reason`` then reports ``circuit_breaker`` — the wrong cause).
         """
         comp = _comp_for(provider)
         _patch_post(comp, _EMPTY_COMPLETION_PAYLOADS[provider](""))
@@ -694,8 +694,8 @@ class TestLLMCompressorEmptyCompletion:
             # Assert the outcome every round, not just at the end: the breaker
             # check alone passes against the pre-fix code (which recorded no
             # failure either, because it called nothing a failure).
-            assert result.strip()
-            assert comp.last_fallback == "llm_empty"
+            assert result.text.strip()
+            assert result.fallback_reason == "llm_empty"
         assert not comp._cb.is_open
 
     @pytest.mark.parametrize("provider", list(_EMPTY_COMPLETION_PAYLOADS))
@@ -706,8 +706,8 @@ class TestLLMCompressorEmptyCompletion:
         comp = _comp_for(provider)
         _patch_post(comp, _EMPTY_COMPLETION_PAYLOADS[provider]("real summary"))
         result = await comp.compress(self.TEXT, max_chars=200)
-        assert result == "real summary"
-        assert comp.last_fallback is None
+        assert result.text == "real summary"
+        assert result.fallback_reason is None
 
 
 # ---------------------------------------------------------------------------
@@ -878,9 +878,9 @@ class TestLLMCompressorShutdown:
             result = await compress_task
             await close_task
 
-            assert result == "summary"
+            assert result.text == "summary"
             assert comp._client is None
-            assert comp.last_fallback is None  # success path
+            assert result.fallback_reason is None  # success path
 
     @pytest.mark.asyncio
     async def test_compress_after_close_falls_back_to_truncate(self):
@@ -892,8 +892,8 @@ class TestLLMCompressorShutdown:
 
         text = "x" * 500
         result = await comp.compress(text, max_chars=100)
-        assert len(result) <= len(text)
-        assert comp.last_fallback == "closed"
+        assert len(result.text) <= len(text)
+        assert result.fallback_reason == "closed"
 
     @pytest.mark.asyncio
     async def test_concurrent_compresses_drain_before_close(self):
@@ -928,7 +928,7 @@ class TestLLMCompressorShutdown:
             results = await asyncio.gather(*tasks)
             await close_task
 
-            assert all(r == "summary" for r in results)
+            assert all(r.text == "summary" for r in results)
             assert comp._client is None
 
     @pytest.mark.asyncio
@@ -1001,3 +1001,42 @@ class TestLLMCompressorShutdown:
 
         assert any("did not drain" in r.getMessage() for r in caplog.records), caplog.text
         assert comp._client is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slow_fails", [False, True])
+async def test_overlapping_llm_calls_keep_their_own_fallback_reason(slow_fails):
+    """A completed call cannot inherit a shared compressor's other result (#1055)."""
+    comp = _make_llm_compressor()
+    slow_started = asyncio.Event()
+    release_slow = asyncio.Event()
+
+    async def call_api(text: str, *, max_chars: int) -> str:
+        if text.startswith("slow"):
+            slow_started.set()
+            await release_slow.wait()
+            if slow_fails:
+                raise RuntimeError("provider failed")
+            return "slow summary"
+        if not slow_fails:
+            raise RuntimeError("provider failed")
+        return "fast summary"
+
+    with patch.object(comp, "_call_api", new=call_api):
+        slow_task = asyncio.create_task(comp.compress("slow" * 150, max_chars=100))
+        await slow_started.wait()
+        fast = await comp.compress("fast" * 150, max_chars=100)
+        release_slow.set()
+        slow = await slow_task
+    await comp.close()
+
+    if slow_fails:
+        assert len(slow.text) <= 100
+        assert slow.fallback_reason == "llm_error"
+        assert fast.text == "fast summary"
+        assert fast.fallback_reason is None
+    else:
+        assert slow.text == "slow summary"
+        assert slow.fallback_reason is None
+        assert len(fast.text) <= 100
+        assert fast.fallback_reason == "llm_error"
