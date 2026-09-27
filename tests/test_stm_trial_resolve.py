@@ -462,6 +462,13 @@ def test_output_in_another_stream_is_not_this_streams_reuse() -> None:
     assert _y2((_out(1, T0 + 10, ("g1",), stream="stream-sub"),)) is False
 
 
+def test_outputs_are_placed_by_their_own_timestamps_not_file_position() -> None:
+    # a copied record keeps the time it was first written: one that sits after s in
+    # the file but is dated before s is prior output, never reuse
+    assert _y2((_out(9, T0 - 10, ("g1",)),)) is False
+    assert _y2((_out(9, T0 - 10, ("g1",)), _out(10, T0 + 10, ("g1",)))) is False
+
+
 # ── 6. crossover ────────────────────────────────────────────────────────
 
 
@@ -529,6 +536,16 @@ def test_a_block_before_the_anchor_in_the_stream_is_never_reexposure() -> None:
     assert (outcome.window_len, outcome.reexposed) == (2, False)
     later = (_inj(8, "cX", T0 + 10, grams=("g1",)),)
     assert _one([_asg()], [_mem(grams=("g1",))], entries, injections=later).reexposed is True
+
+
+def test_an_undated_block_counts_only_when_its_call_places_it() -> None:
+    entries = [_anchor(), _other(1, T0 + 5)]
+    on_call = InjectionRecord(S, 2, "c1", None, None, "P", True, frozenset({"g1"}))
+    outcome = _one([_asg()], [_mem(grams=("g1",))], entries, injections=(on_call,))
+    assert (outcome.reexposed, outcome.null_ts) == (True, True)
+    off_call = InjectionRecord(S, 2, "cX", None, None, "P", True, frozenset({"g1"}))
+    outcome = _one([_asg()], [_mem(grams=("g1",))], entries, injections=(off_call,))
+    assert (outcome.reexposed, outcome.null_ts) == (False, True)
 
 
 # ── end to end: extractor rows → loader → resolve ───────────────────────

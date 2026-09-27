@@ -161,7 +161,11 @@ class Outcome:
     stale_entry: bool
     clock_anomaly: bool
     null_ts: bool
-    """An entry, output or block of the stream had no timestamp to place it by."""
+    """An entry, output or block of the stream had no timestamp.
+
+    Undated entries and outputs are skipped. An undated block still counts for
+    re-exposure when it is on a window call, since the call places it.
+    """
     shared_ordinal: bool
     """Two window entries share one transcript record, so their order is by call key."""
 
@@ -369,8 +373,11 @@ def _after_only(
 ) -> bool:
     """A gram in the output within ``t`` after *s* that was not there within ``t`` before.
 
-    The anchor's own record sits at ``ts(s)`` and counts as before: it was
-    written before the injection could be read.
+    Records are placed by their own timestamps, not by their position in the
+    file: a copied record keeps the time it was first written, so it lands
+    where it happened, never after *s*. The anchor's own record sits at
+    ``ts(s)`` and counts as before: it was written before the injection could
+    be read.
     """
     if not grams:
         return False
@@ -396,8 +403,9 @@ def _reexposed(
 
     Later means after the anchor in transcript order, whatever its timestamp.
     Within means on one of the window's calls — a hook's block is written after
-    its call, so it can postdate the window's last timestamp — or dated inside
-    the window's time span. The anchor's own block is the exposure itself.
+    its call, so it can postdate the window's last timestamp, and the call
+    places it even when it is undated — or dated inside the window's time span.
+    The anchor's own block is the exposure itself.
     """
     assert anchor.ts is not None
     anchor_ts, span_end = anchor.ts, window.span_end
