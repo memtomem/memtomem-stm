@@ -1902,28 +1902,35 @@ class TestTuningRecommendations:
         store = MetricsStore(tmp_path / "metrics.db")
         store.initialize()
         try:
-            for _ in range(6):
-                store.record(
-                    CallMetrics(
-                        server="srv",
-                        tool="big_tool",
-                        original_chars=30000,
-                        compressed_chars=8000,
-                        cleaned_chars=30000,
-                        compression_strategy="truncate",
-                        ratio_violation=True,
+            for tool in ("big_tool", "other_tool"):
+                for _ in range(6):
+                    store.record(
+                        CallMetrics(
+                            server="srv",
+                            tool=tool,
+                            original_chars=30000,
+                            compressed_chars=8000,
+                            cleaned_chars=30000,
+                            compression_strategy="truncate",
+                            ratio_violation=True,
+                        )
                     )
-                )
             ctx = _make_ctx(tracker=TokenTracker(metrics_store=store))
             unfiltered = await stm_tuning_recommendations(ctx=ctx)
             filtered = await stm_tuning_recommendations(tool="", ctx=ctx)
+            selected = await stm_tuning_recommendations(tool="big_tool", ctx=ctx)
         finally:
             store.close()
 
         assert "srv/big_tool" in unfiltered
+        assert "srv/other_tool" in unfiltered
+        assert "12 calls, 2 tools analyzed" in unfiltered
         assert "0 calls, 0 tools analyzed" in filtered
         assert "No recommendations" in filtered
         assert "srv/big_tool" not in filtered
+        assert "6 calls, 1 tools analyzed" in selected
+        assert "srv/big_tool" in selected
+        assert "srv/other_tool" not in selected
 
 
 # ── app_lifespan ──────────────────────────────────────────────────────────

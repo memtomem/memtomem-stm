@@ -131,7 +131,9 @@ class CompressionTuner:
 
     # -- public API -------------------------------------------------------
 
-    def get_profiles(self, since_seconds: float = 86400.0) -> list[ToolProfile]:
+    def get_profiles(
+        self, since_seconds: float = 86400.0, tool_filter: str | None = None
+    ) -> list[ToolProfile]:
         raw = self._metrics.get_tool_profiles(since_seconds=since_seconds)
         feedback = (
             self._feedback.get_tool_feedback_summary(since_seconds=since_seconds)
@@ -165,6 +167,8 @@ class CompressionTuner:
                     feedback_dominant_kind=fb_dominant,
                 )
             )
+        if tool_filter is not None:
+            profiles = [profile for profile in profiles if profile.tool == tool_filter]
         return profiles
 
     def analyze(
@@ -172,9 +176,7 @@ class CompressionTuner:
         since_seconds: float = 86400.0,
         tool_filter: str | None = None,
     ) -> list[TuningRecommendation]:
-        profiles = self.get_profiles(since_seconds=since_seconds)
-        if tool_filter is not None:
-            profiles = [p for p in profiles if p.tool == tool_filter]
+        profiles = self.get_profiles(since_seconds=since_seconds, tool_filter=tool_filter)
 
         recommendations: list[TuningRecommendation] = []
         for p in profiles:

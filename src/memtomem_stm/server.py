@@ -2811,9 +2811,7 @@ async def stm_tuning_recommendations(
         config=app.proxy_manager._config,
     )
     since = since_hours * 3600.0
-    profiles = tuner.get_profiles(since_seconds=since)
-    if tool is not None:
-        profiles = [profile for profile in profiles if profile.tool == tool]
+    profiles = tuner.get_profiles(since_seconds=since, tool_filter=tool)
     recs = tuner.analyze(since_seconds=since, tool_filter=tool)
     return format_recommendations(recs, profiles, since_hours)
 
