@@ -18618,6 +18618,24 @@ class TestTune:
         assert change["recommended"] == "24000"
         assert change["confidence"] == "low"
 
+    @pytest.mark.parametrize("tool_filter", ["", "missing_tool"])
+    def test_unmatched_tool_filter_does_not_apply_other_tools(
+        self, runner, config, tmp_path, tool_filter
+    ):
+        metrics_db = tmp_path / "metrics.db"
+        self._seed_config(config, metrics_db)
+        self._seed_metrics(metrics_db)
+        before = config.read_bytes()
+
+        result = runner.invoke(
+            cli, ["tune", "--apply", "--yes", "--tool", tool_filter, *_cfg_args(config)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert result.output.splitlines()[-1] == "No recommendations."
+        assert config.read_bytes() == before
+        assert not list(config.parent.glob("stm_proxy.json.bak-*"))
+
     def test_json_with_apply_is_a_usage_error(self, runner, config, tmp_path):
         self._seed_config(config, tmp_path / "metrics.db")
         result = runner.invoke(cli, ["tune", "--json", "--apply", "--yes", *_cfg_args(config)])
