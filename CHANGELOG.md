@@ -34,6 +34,13 @@ changes inline only. See the deprecation policy in
   environments invalid and report value-free `config_error` locations and type codes in
   place of the previous value-bearing messages. For file errors, run
   `mms config validate` locally for details.
+- **`mms health` and `mms doctor` follow startup validation** (#1075). Their
+  `config_error` / `config schema` detail is now the value-free location and
+  type summary `status` and `list` print, instead of the first schema error's
+  message. An environment that startup rejects, such as
+  `MEMTOMEM_STM_PROXY='[1]'`, now reports `config_valid: false` in `health` and
+  FAILs `doctor`'s `config schema` check, so `mms doctor` exits 1 where it used
+  to pass.
 - An empty tool filter now matches no tools in `mms tune` and
   `stm_tuning_recommendations`; omit the filter to analyze all tools. In particular,
   `mms tune --apply --yes --tool ""` no longer writes overrides for other tools (#1036).
@@ -44,6 +51,10 @@ changes inline only. See the deprecation policy in
   rejected environment variables, without logging raw validation values
   from read-only diagnostics (#1051). **Behavior change**: see the upgrade
   notes above.
+- Match `mms health` and `mms doctor` config validity to startup parsing,
+  keep input values out of their validation errors, and stop `health`
+  crashing on a `MEMTOMEM_STM_*` value settings cannot decode (#1075).
+  **Behavior change**: see the upgrade notes above.
 - Keep each LLM compression fallback reason with its own result so
   overlapping calls cannot mislabel proxy metrics (#1055).
   **Behavior change**: see the upgrade notes above.

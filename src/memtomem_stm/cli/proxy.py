@@ -429,38 +429,26 @@ def _load(config_path: Path) -> dict[str, Any]:
     return data
 
 
-def _schema_validation_error(
-    data: dict[str, Any], *, env_overrides: dict[str, Any] | None = None
-) -> str | None:
-    """First schema-validation error for a config dict, or ``None``.
+def _schema_validation_error(data: dict[str, Any]) -> str | None:
+    """First schema-validation error for a config file *as written*, or ``None``.
 
     ``_load`` only guards JSON syntax and coarse shape; valid-JSON-but-
     invalid-schema is exactly the case a running server silently degrades to
-    env/defaults on (#611). When supplied, ``env_overrides`` is deep-merged
-    with the file data before validation, matching the server's documented
-    env > file precedence. Callers that inspect or mutate the file *as
-    written* deliberately omit it.
+    env/defaults on (#611). Only callers that inspect or mutate the file
+    itself use this; runtime diagnostics go through ``_runtime_proxy_read``,
+    which matches startup and keeps input values out of its errors.
     """
     from pydantic import ValidationError
 
-    from memtomem_stm.proxy.config import ProxyConfig, _deep_merge
-
-    effective_data = _deep_merge(data, env_overrides) if env_overrides else data
+    from memtomem_stm.proxy.config import ProxyConfig
 
     try:
-        ProxyConfig.model_validate(effective_data)
+        ProxyConfig.model_validate(data)
     except ValidationError as exc:
         first = exc.errors()[0]
         loc = ".".join(str(part) for part in first["loc"])
         return f"{loc}: {first['msg']}" if loc else first["msg"]
     return None
-
-
-def _runtime_schema_validation_error(data: dict[str, Any]) -> str | None:
-    """Validate file data with the same proxy env overlay as the server."""
-    from memtomem_stm.proxy.config import collect_proxy_env_overrides
-
-    return _schema_validation_error(data, env_overrides=collect_proxy_env_overrides().fragment)
 
 
 @dataclass(frozen=True)
@@ -608,9 +596,10 @@ def _explicit_config_path(config_path: str) -> str | None:
 def _logging_destination_status(config_path: str | None = None) -> dict[str, Any]:
     """Active log destination for ``mms health`` (#612) — the point of the
     opt-in file log is diagnosability, so health says where to look.
-    ValidationError-guarded: a bad ``MEMTOMEM_STM_*`` env value must not
-    break a diagnostics command."""
+    ValidationError- and SettingsError-guarded: a bad ``MEMTOMEM_STM_*`` env
+    value must not break a diagnostics command."""
     from pydantic import ValidationError
+    from pydantic_settings import SettingsError
 
     from memtomem_stm.config import stm_config_for_cli
     from memtomem_stm.logging_setup import describe_log_destination
@@ -619,6 +608,9 @@ def _logging_destination_status(config_path: str | None = None) -> dict[str, Any
         return describe_log_destination(stm_config_for_cli(config_path))
     except ValidationError as exc:
         return {"error": f"invalid MEMTOMEM_STM_* environment ({exc.error_count()} error(s))"}
+    except SettingsError:
+        # The exception chain can carry the raw env value; never render it.
+        return {"error": "invalid MEMTOMEM_STM_* environment"}
 
 
 def _format_logging_destination(status: dict[str, Any]) -> str:
@@ -8650,12 +8642,11 @@ def health(
     servers: dict[str, Any] = data.get("upstream_servers", {})
     explicit_config = _explicit_config_path(config_path)
     surfacing_status = _surfacing_bootstrap_status(float(timeout), config_path=explicit_config)
-    config_error = _runtime_schema_validation_error(data)
-    if config_error:
-        # A schema error can echo the rejected input_value (or a validator
-        # message quoting it), so scrub it against configured server secrets
-        # before it lands in text/--json output.
-        config_error = sanitize_secrets(config_error, _all_config_secret_values(data))
+    # Same startup-aware read as ``status`` / ``list``: a rejected whole
+    # proxy env block counts as invalid, and the error names locations and
+    # error types only, never input values.
+    runtime = _runtime_proxy_read(path, config_path)
+    config_error = runtime.error
     logging_status = _logging_destination_status(explicit_config)
     obs_tools_hint = _hidden_obs_tools_hint()
 
@@ -8681,7 +8672,8 @@ def health(
             )
         else:
             if config_error:
-                click.echo(f"{_warn('Warning:')} {_CONFIG_INVALID_WARNING}: {_disp(config_error)}")
+                warning = _runtime_config_warning(runtime)
+                click.echo(f"{_warn('Warning:')} {warning}: {_disp(config_error)}")
             click.echo("No upstream servers configured.")
             click.echo("")
             for line in _format_surfacing_bootstrap(surfacing_status):
@@ -8715,7 +8707,8 @@ def health(
         return
 
     if config_error:
-        click.echo(f"{_warn('Warning:')} {_CONFIG_INVALID_WARNING}: {_disp(config_error)}")
+        warning = _runtime_config_warning(runtime)
+        click.echo(f"{_warn('Warning:')} {warning}: {_disp(config_error)}")
     click.echo(_hdr("Upstream Server Health"))
     click.echo("=" * 30)
     for name, info in results.items():
@@ -9349,42 +9342,66 @@ def doctor(
             )
 
         if data is not None:
-            # 3. schema validation — same lazy-pydantic path `status`/`health`
-            # warn through; here it FAILs (a running server would silently
-            # fall back to env/defaults) but does NOT short-circuit: the
-            # transport/prefix/probe checks operate on the raw dicts and
-            # stay meaningful.
-            schema_error = _runtime_schema_validation_error(data)
+            # 3. schema validation — the same startup-aware read `status`,
+            # `list` and `health` warn through, so a rejected whole proxy env
+            # block FAILs here too. Its error names locations and error types
+            # only, never input values. Here it FAILs (the server falls back
+            # to env/defaults or cannot start) but does NOT short-circuit: the
+            # transport/prefix/probe checks operate on the raw dicts and stay
+            # meaningful.
+            runtime = _runtime_proxy_read(path, config_path)
             effective_config: Any | None = None
             effective_data: dict[str, Any] = {}
-            if schema_error:
-                # A pydantic error can echo the rejected input_value (or a
-                # validator message quoting it), so scrub it against every
-                # configured server's secrets before it reaches the report.
-                schema_error = sanitize_secrets(schema_error, _all_config_secret_values(data))
+            if runtime.error:
+                # A startup-rejected environment leaves the file itself
+                # valid, so `config validate` would pass; point at the
+                # variables instead.
+                schema_next = (
+                    "unset or fix the MEMTOMEM_STM_* variable(s) named above"
+                    if runtime.startup_error
+                    else f"mms config validate {cfg_arg}"
+                )
                 check(
                     "config_schema",
                     "config schema",
                     "FAIL",
-                    f"{_CONFIG_INVALID_WARNING}: {schema_error}",
-                    f"mms config validate {cfg_arg}",
+                    f"{_runtime_config_warning(runtime)}: {runtime.error}",
+                    schema_next,
                 )
             else:
-                check("config_schema", "config schema", "PASS", "valid")
                 # Build the same env-overlaid typed snapshot the running
                 # server consumes. Provider diagnostics must reflect env >
                 # file precedence and model defaults, not the raw JSON alone.
+                from pydantic import ValidationError
+
                 from memtomem_stm.proxy.config import (
                     ProxyConfig,
                     _deep_merge,
                     collect_proxy_env_overrides,
+                    validation_error_summary,
                 )
 
                 # One merged dict for both the model and the inert-state
                 # predicate below: they must judge the same document, or
                 # doctor could report an `enabled` the model never saw.
                 effective_data = _deep_merge(data, collect_proxy_env_overrides().fragment)
-                effective_config = ProxyConfig.model_validate(effective_data)
+                try:
+                    effective_config = ProxyConfig.model_validate(effective_data)
+                except ValidationError as exc:
+                    # `data` was read before the runtime read, so a file
+                    # edited in between can validate there and fail here.
+                    # Judge the snapshot the later checks actually use.
+                    effective_data = {}
+                    check(
+                        "config_schema",
+                        "config schema",
+                        "FAIL",
+                        f"{_CONFIG_INVALID_WARNING}: {exc.error_count()} validation error(s): "
+                        f"{validation_error_summary(exc)}",
+                        f"mms config validate {cfg_arg}",
+                    )
+                else:
+                    check("config_schema", "config schema", "PASS", "valid")
 
             # Every server-shaped check below reads the EFFECTIVE map, not the
             # file's: MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__* can add or
