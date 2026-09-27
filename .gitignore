@@ -44,6 +44,7 @@ scripts/
 scripts/*
 !scripts/audit-dependencies.sh
 !scripts/core_compat_smoke.py
+!scripts/stm_trial.py
 CLAUDE.local.md
 # Internal review/audit reports — kept local; promoted docs live in the
 # private memtomem-docs repo, never committed to this public repo.

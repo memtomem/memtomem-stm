@@ -530,6 +530,29 @@ def inspect_feedback_db(db_path: Path) -> FeedbackDbStatus:
     return status
 
 
+def load_hmac_key(db_path: Path) -> bytes:
+    """Read the per-install HMAC key from an existing feedback DB, read-only.
+
+    For offline readers that must hash exactly as collection does. The DB is
+    opened ``mode=ro``, so a missing key is never minted here: it raises
+    ``RuntimeError`` (as does a DB that cannot be opened), and only the store
+    itself creates the key, on its first migration.
+    """
+    resolved = db_path.expanduser().resolve()
+    if not resolved.exists():
+        raise RuntimeError(f"surfacing feedback DB not found: {resolved}")
+    try:
+        db = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"cannot open surfacing feedback DB: {exc}") from exc
+    try:
+        return _read_hmac_key(db)
+    except sqlite3.Error as exc:
+        raise RuntimeError("surfacing feedback DB has no valid HMAC key in stm_meta") from exc
+    finally:
+        db.close()
+
+
 def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, object]:
     """Read surfacing event + feedback aggregates read-only from disk.
 
