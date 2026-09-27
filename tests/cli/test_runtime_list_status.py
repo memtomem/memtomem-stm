@@ -212,7 +212,7 @@ def test_file_origin_marker_agrees_with_status_for_coerced_pruned_flag(tmp_path)
     assert "host-pruned" not in status.stdout
 
 
-def test_invalid_status_labels_file_values_when_runtime_is_unavailable(tmp_path, monkeypatch):
+def test_invalid_file_shows_runtime_env_fallback_and_keeps_raw_file_map(tmp_path, monkeypatch):
     path = tmp_path / "proxy.json"
     path.write_text(
         json.dumps(
@@ -228,11 +228,58 @@ def test_invalid_status_labels_file_values_when_runtime_is_unavailable(tmp_path,
         json.dumps({"b": {"prefix": "b", "command": "echo"}}),
     )
     runner = CliRunner()
+    listed = runner.invoke(cli, ["list", "--config", str(path), "--json"])
+    assert listed.exit_code == 0, listed.output
+    detail = json.loads(listed.stdout)
+    assert detail["config_valid"] is False
+    assert set(detail["servers"]) == {"a"}
+    assert set(detail["effective_servers"]) == {"b"}
+    assert detail["server_sources"] == {"b": "env"}
+    human_list = runner.invoke(cli, ["list", "--config", str(path)])
+    assert human_list.exit_code == 0, human_list.output
+    assert any(line.startswith("b ") and " env " in line for line in human_list.stdout.splitlines())
+    assert not any(line.startswith("a ") for line in human_list.stdout.splitlines())
+
     human = runner.invoke(cli, ["status", "--config", str(path)])
     assert human.exit_code == 0, human.stdout
-    assert "Enabled: yes (file value; runtime unavailable)" in human.stdout
-    assert "Servers: 1 (file value; runtime unavailable)" in human.stdout
+    assert "Enabled: no (env/default fallback)" in human.stdout
+    assert "Servers: 1 env/default fallback (1 file)" in human.stdout
     data = json.loads(runner.invoke(cli, ["status", "--config", str(path), "--json"]).stdout)
     assert data["config_valid"] is False
     assert data["server_count"] == 1
-    assert data["effective_server_count"] is None
+    assert data["effective_server_count"] == 1
+    assert data["enabled"] is False
+
+
+def test_invalid_file_keeps_startup_completed_env_server(tmp_path, monkeypatch):
+    path = tmp_path / "proxy.json"
+    path.write_text(
+        json.dumps(
+            {
+                "default_compression": "invalid",
+                "upstream_servers": {
+                    "same": {
+                        "prefix": "file",
+                        "command": "file-command",
+                        "origin": {"source": {"kind": "claude-user", "pruned": True}},
+                    }
+                },
+            }
+        )
+    )
+    monkeypatch.setenv(
+        "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS",
+        json.dumps({"same": {"prefix": "env", "command": "env-command"}}),
+    )
+    runner = CliRunner()
+    detail = json.loads(runner.invoke(cli, ["list", "--config", str(path), "--json"]).stdout)
+    assert detail["config_valid"] is False
+    assert detail["servers"]["same"]["command"] == "file-command"
+    assert detail["effective_servers"]["same"]["prefix"] == "env"
+    assert detail["server_sources"] == {"same": "file+env"}
+    human = runner.invoke(cli, ["list", "--config", str(path)])
+    assert human.exit_code == 0, human.output
+    row = next(line for line in human.stdout.splitlines() if line.startswith("same "))
+    assert "env-command" in row
+    assert "file-command" not in row
+    assert "claude-user*" in row

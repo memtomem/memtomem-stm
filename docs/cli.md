@@ -330,7 +330,9 @@ The COMPRESSION column shows the resolved server default, including global
 inheritance and proxy environment overrides. Explicit tool compression overrides
 are listed below the table because their strategy can differ. The SOURCE column
 shows whether each upstream comes from the file, environment, or both; env-only
-upstreams appear in the table. The table removes URL userinfo, query strings,
+upstreams appear in the table when startup can parse the environment. If the
+file fails validation, the table shows the env/default fallback that the server
+uses and keeps the file error warning. The table removes URL userinfo, query strings,
 and fragments, and hides arguments on rows supplied by the environment.
 `--json` retains the raw redacted `servers` file
 map and adds `effective_servers` (a safe summary of the runtime upstreams),
@@ -339,8 +341,10 @@ resolved strategy, its `global`/`server` source, and explicit tool overrides.
 `server` means the server level supplied `compression`, from the file or from an
 environment variable addressing that server. Override lines quote both names as
 JSON strings (`"server"/"tool": strategy (tool override)`), so a `/` inside a name
-stays unambiguous. An invalid configuration reports the strategy as unknown and
-leaves `effective_servers` and `effective_compression` empty. `config_valid` uses
+stays unambiguous. A startup-invalid environment reports the strategy as unknown
+and leaves `effective_servers` and `effective_compression` empty. A file error
+leaves `config_valid` false but reports the env/default fallback in those fields.
+`config_valid` uses
 the same environment parsing and file loading as server startup; errors identify
 candidate variables and validation locations/types without printing their values.
 For a file validation error, the text warning points to `mms config validate`
@@ -638,7 +642,7 @@ Options:
 
 Shows a config summary: the configuration file path, enabled flag, schema-validation warning, and the server count (with a host-pruned count when any entry exists only behind STM). Per-server detail — prefix, transport, command/URL, compression, surfacing — lives in [`mms list`](#list); `status` answers "is the proxy set up and pointed at the right config", `list` answers "what servers are behind it". (#614 — the two commands used to print near-identical output.)
 
-`status --json` is unchanged by that split: it still carries the full redacted file `servers` map (plus `server_count`, `pruned_count`, and additive `effective_server_count` keys), so scripted consumers keep working. `effective_server_count` is `null` when runtime validation fails; `enabled` and `server_count` then describe the file, and the text output labels them as file values. Every server's `env` and `headers` values are masked (`<REDACTED>`, keys preserved); the human output never prints those fields at all, so read the on-disk config directly when a value is genuinely needed.
+`status --json` is unchanged by that split: it still carries the full redacted file `servers` map (plus `server_count`, `pruned_count`, and additive `effective_server_count` keys), so scripted consumers keep working. On a file error, `effective_server_count` and `enabled` describe the env/default fallback that the server uses, while `server_count` describes the file; the text output labels the fallback. If environment parsing prevents startup, `effective_server_count` is `null`, and `enabled` describes the file. Every server's `env` and `headers` values are masked (`<REDACTED>`, keys preserved); the human output never prints those fields at all, so read the on-disk config directly when a value is genuinely needed.
 
 When the file is valid JSON but fails schema validation (the state a running server silently degrades to env/defaults on), `status` and `list` print a value-free validation location/type summary and a hint to run `mms config validate`; `health` still names the first schema error. Exit codes stay unchanged. `status` and `list` additionally check the server's own environment parsing before loading the file, so they also flag malformed variables the merged overlay could hide. A `SettingsError` lists candidate variable names, since the exception does not identify one reliably. `health` still validates the file with the environment overlay.
 

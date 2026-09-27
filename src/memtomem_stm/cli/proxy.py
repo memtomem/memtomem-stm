@@ -469,6 +469,7 @@ class _RuntimeProxyRead:
     error: str | None
     env_server_names: frozenset[str]
     startup_error: bool = False
+    file_fallback: bool = False
 
 
 def _runtime_proxy_read(path: Path, config_path: str) -> _RuntimeProxyRead:
@@ -488,7 +489,7 @@ def _runtime_proxy_read(path: Path, config_path: str) -> _RuntimeProxyRead:
     env_servers = overlay.fragment.get("upstream_servers", {})
     env_names = frozenset(env_servers) if isinstance(env_servers, dict) else frozenset()
     try:
-        stm_config_for_cli(_explicit_config_path(config_path))
+        settings = stm_config_for_cli(_explicit_config_path(config_path))
     except ValidationError as exc:
         return _RuntimeProxyRead(
             None,
@@ -508,6 +509,10 @@ def _runtime_proxy_read(path: Path, config_path: str) -> _RuntimeProxyRead:
         path, env_overrides=overlay, missing_ok=False, log_warnings=False, log_errors=False
     )
     error = loaded.error or loaded.env_error
+    if loaded.error is not None:
+        # Server startup keeps the settings-built proxy when the file cannot
+        # load. Show that same env/default view while retaining the file error.
+        return _RuntimeProxyRead(settings.proxy, loaded.error, env_names, file_fallback=True)
     if loaded.config is None or error is not None:
         return _RuntimeProxyRead(
             None, error or "proxy config unavailable", env_names, loaded.env_error is not None
@@ -2020,9 +2025,12 @@ def status(config_path: str | None, *, as_json: bool = False) -> None:
         click.echo(f"{_warn('Warning:')} {warning}: {_disp(config_error)}")
     click.echo(f"Config : {resolved}")
     file_note = " (file value; runtime unavailable)" if runtime.config is None else ""
-    click.echo(f"Enabled: {'yes' if enabled else 'no'}{file_note}")
+    fallback_note = " (env/default fallback)" if runtime.file_fallback else ""
+    click.echo(f"Enabled: {'yes' if enabled else 'no'}{file_note}{fallback_note}")
     pruned_suffix = f" ({pruned_count} host-pruned)" if pruned_count else ""
-    if effective_count is not None and effective_count != len(servers):
+    if runtime.file_fallback:
+        click.echo(f"Servers: {effective_count} env/default fallback ({len(servers)} file)")
+    elif effective_count is not None and effective_count != len(servers):
         click.echo(f"Servers: {effective_count} effective ({len(servers)} file){pruned_suffix}")
     else:
         click.echo(f"Servers: {len(servers)}{pruned_suffix}{file_note}")
@@ -2079,13 +2087,10 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
             for name, server in typed_config.upstream_servers.items()
         }
         for name, server in typed_config.upstream_servers.items():
-            server_sources[name] = (
-                "file+env"
-                if name in servers and name in runtime.env_server_names
-                else "file"
-                if name in servers
-                else "env"
-            )
+            if name in servers:
+                server_sources[name] = "file+env" if name in runtime.env_server_names else "file"
+            else:
+                server_sources[name] = "env"
             effective_servers[name] = {
                 "prefix": server.prefix,
                 "transport": server.transport.value,
@@ -2155,7 +2160,7 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
         # Keep provenance strict for file entries: model parsing coerces a
         # hand-edited "pruned": "true" to bool, but status/remove inspect the
         # raw flag and must agree on whether the host original was pruned.
-        origin_cell = _origin_cell(servers.get(name, cfg))
+        origin_cell = _origin_cell(cfg if runtime.file_fallback else servers.get(name, cfg))
         any_pruned = any_pruned or origin_cell.endswith("*")
         if transport == "stdio":
             cmd = cfg.get("command", "")

@@ -24,9 +24,10 @@ changes inline only. See the deprecation policy in
   `effective_servers` and `server_sources` describe the runtime view.
   The text table masks URL credentials/query values and arguments on rows
   supplied by the environment; the raw JSON `servers` map retains file values.
-  `mms status --json` adds `effective_server_count` (`null` if runtime
-  validation fails); its text output labels `Enabled` and `Servers` as file
-  values in that state. `list`/`status` now mark startup-rejected environments
+  `mms status --json` adds `effective_server_count` (`null` if environment
+  parsing prevents startup). When a file fails validation, `list` and `status`
+  show the env/default fallback the server actually uses, while retaining the
+  file error and raw file counts. `list`/`status` now mark startup-rejected environments
   invalid and report value-free `config_error` locations and type codes in
   place of the previous value-bearing messages. For file errors, run
   `mms config validate` locally for details.
