@@ -2096,7 +2096,7 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
             for name, server in typed_config.upstream_servers.items()
         }
         for name, server in typed_config.upstream_servers.items():
-            if name in servers:
+            if isinstance(servers.get(name), dict):
                 server_sources[name] = "file+env" if name in runtime.env_server_names else "file"
             else:
                 server_sources[name] = "env"

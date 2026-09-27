@@ -90,6 +90,25 @@ def test_env_only_and_mixed_upstreams_are_listed_without_changing_raw_map(tmp_pa
     assert "2 effective (1 file)" in runner.invoke(cli, ["status", "--config", str(path)]).output
 
 
+def test_nonmapping_file_entry_replaced_by_environment_is_env_sourced(tmp_path, monkeypatch):
+    path = tmp_path / "proxy.json"
+    path.write_text('{"upstream_servers": {"gh": "not-a-server"}}')
+    monkeypatch.setenv(
+        "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS",
+        json.dumps({"gh": {"prefix": "gh", "command": "echo", "args": ["secret-arg"]}}),
+    )
+    runner = CliRunner()
+    data = json.loads(runner.invoke(cli, ["list", "--config", str(path), "--json"]).stdout)
+    assert data["config_valid"] is True
+    assert data["servers"]["gh"] == "not-a-server"
+    assert data["server_sources"] == {"gh": "env"}
+    table = runner.invoke(cli, ["list", "--config", str(path)])
+    row = next(line for line in table.stdout.splitlines() if line.startswith("gh "))
+    assert " env " in row
+    assert "[args hidden]" in row
+    assert "secret-arg" not in row
+
+
 def test_effective_server_summary_does_not_print_env_secrets(tmp_path, monkeypatch):
     path = tmp_path / "proxy.json"
     path.write_text('{"enabled": true, "upstream_servers": {}}')

@@ -30,8 +30,8 @@ changes inline only. See the deprecation policy in
   after environment overrides whenever startup parsing succeeds, including
   when the file is valid. When a file fails validation, `list` and `status`
   show the env/default fallback the server actually uses, while retaining the
-  file error and raw file counts. `list`/`status` now mark startup-rejected environments
-  invalid and report value-free `config_error` locations and type codes in
+  file error and raw file counts. `list`/`status` now mark startup-rejected
+  environments invalid and report value-free `config_error` locations and type codes in
   place of the previous value-bearing messages. For file errors, run
   `mms config validate` locally for details.
 - An empty tool filter now matches no tools in `mms tune` and
