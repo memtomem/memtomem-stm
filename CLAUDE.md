@@ -35,8 +35,9 @@ transport / dead ports only (#637).
   `src/memtomem_stm/proxy/` — authoritative, don't restate them here.
 - **Line length 100**, target `py312`.
 - **`.claude/` and `scripts/` are gitignored** except the tracked
-  `scripts/audit-dependencies.sh` (release/CI gate) and
-  `scripts/core_compat_smoke.py` (advisory compat check). Don't commit other
+  `scripts/audit-dependencies.sh` (release/CI gate),
+  `scripts/core_compat_smoke.py` (advisory compat check) and
+  `scripts/stm_trial.py` (holdout-trial extractor). Don't commit other
   files under them, and don't assume contributors share your local contents.
 - **One focused change per PR**, branched from `main`, with tests for new
   behavior and a commit message explaining the "why". Full checklist:

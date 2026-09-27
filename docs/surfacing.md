@@ -616,6 +616,21 @@ The arm is fixed before the event write, so it holds however the write ends: if 
 - The `surfacing_stats` action's `Holdout unrecorded` line counts drawn calls whose event row is known lost, by arm. It covers this process only and is a lower bound.
 - The call's opportunity row, which carries the arm, is the other durable trace of a draw. A drawn call cancelled during its write keeps `skip:cancelled` there, with its arm.
 
+#### Trial extractor
+
+Whether a withheld block changed what the agent did next can only be read from the host's transcripts, and Claude Code deletes those after `cleanupPeriodDays` (default 30). `scripts/stm_trial.py` (in the repository, not the package) copies what a trial analysis needs into `~/.memtomem/stm_trial.db` (mode `0600`) while the transcripts still exist. It reads `~/.claude/projects` and `stm_feedback.db` and never writes to either. Every identifier, path and 4-gram it stores is keyed with the HMAC key in `stm_feedback.db`, which it does not copy (timestamps, counts, arms and the header digest are stored as they are): the transcript's tool calls with their order, timestamps and the hashed paths they touched; hashed word 4-grams of the agent's own output and of every hook-injected context; every drawn event with its memory rows and drawn opportunity rows.
+
+Run it daily from the repository checkout, for example with cron:
+
+```bash
+17 9 * * * cd /path/to/memtomem-stm && uv run python scripts/stm_trial.py
+```
+
+- Each run reads only what was appended since the last run. A transcript that shrank or whose first line changed is left alone from then on, and its rows are kept. The run prints a warning when the previous run is more than 7 days old.
+- A missing transcript directory is refused rather than recorded as an empty run. The first run pins the key's fingerprint. Later runs refuse to run against a different key.
+- Keep `holdout_rate` at `0.0` for a burn-in of at least 7 days and 500 events, then run `--freeze --holdout-rate R --target N` once. Only hook-path events that carry both host ids count toward the 500 and the stoplist, since only those can ever be drawn. It writes the trial record (the frozen snippet stoplist, `R` and `N`). It refuses while any event already has an arm, when no transcript has been extracted yet, and when the burn-in has outlived `stats_retention_days`. Set `holdout_rate` to `R` only after the freeze.
+- `--purge --yes` deletes the trial database once the analysis is done. Without `--yes` it only lists the files.
+
 ## Feedback & Auto-Tuning
 
 ```mermaid
