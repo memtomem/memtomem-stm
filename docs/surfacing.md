@@ -627,8 +627,8 @@ Run it daily from the repository checkout, for example with cron:
 ```
 
 - Each run reads only what was appended since the last run. A transcript that shrank or whose first line changed is left alone from then on, and its rows are kept. The run prints a warning when the previous run is more than 7 days old.
-- The first run pins the key's fingerprint. Later runs refuse to run against a different key.
-- Keep `holdout_rate` at `0.0` for a burn-in of at least 7 days and 500 events, then run `--freeze --holdout-rate R --target N` once. It writes the trial record (the frozen snippet stoplist, `R` and `N`). It refuses while any event already has an arm, and when the burn-in has outlived `stats_retention_days`. Set `holdout_rate` to `R` only after the freeze.
+- A missing transcript directory is refused rather than recorded as an empty run. The first run pins the key's fingerprint. Later runs refuse to run against a different key.
+- Keep `holdout_rate` at `0.0` for a burn-in of at least 7 days and 500 events, then run `--freeze --holdout-rate R --target N` once. Only hook-path events that carry both host ids count toward the 500 and the stoplist, since only those can ever be drawn. It writes the trial record (the frozen snippet stoplist, `R` and `N`). It refuses while any event already has an arm, when no transcript has been extracted yet, and when the burn-in has outlived `stats_retention_days`. Set `holdout_rate` to `R` only after the freeze.
 - `--purge --yes` deletes the trial database once the analysis is done. Without `--yes` it only lists the files.
 
 ## Feedback & Auto-Tuning

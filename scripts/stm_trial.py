@@ -78,6 +78,8 @@ _LINE_SUFFIX_RE = re.compile(r":\d+(?::\d+)?$")
 _PATTERN_SPLIT_RE = re.compile(r"[/\s*?\[\]{}()|^$+,!]+")
 _LABEL_RE = re.compile(r"^[A-Za-z0-9_:]{1,64}$")
 _SUBAGENT_RE = re.compile(r"^agent-(.+)\.jsonl$")
+BATCH_BYTES = 16 << 20
+"""Bytes of complete lines parsed and committed at a time per transcript."""
 _HEAD_LINE_LIMIT = 1 << 20
 """The first line is the rewrite tripwire; a longer one is only hashed up to this."""
 _SIDECARS = ("-journal", "-wal", "-shm")
@@ -545,51 +547,43 @@ def _stats_retention_days() -> int:
         return DEFAULT_STATS_RETENTION_DAYS
 
 
-def _read_new_lines(handle: Any, start: int, size: int) -> tuple[list[bytes], int]:
-    handle.seek(start)
-    chunk = handle.read(size - start)
+def _next_lines(handle: Any, limit: int) -> tuple[list[bytes], int]:
+    """The complete lines in the next *limit* bytes (or the one longer line there).
+
+    Returns the lines and the bytes they span; ``([], 0)`` when only a partial
+    line (one still being written) remains.
+    """
+    chunk = handle.read(limit)
     end = chunk.rfind(b"\n")
+    if end == -1 and len(chunk) == limit:
+        chunk += handle.readline()  # one line longer than the batch: take it whole
+        end = chunk.rfind(b"\n")
     if end == -1:
         return [], 0
     return chunk[:end].split(b"\n"), end + 1
 
 
-def _extract_file(
+def _head_mac(handle: Any, key: bytes) -> str | None:
+    """MAC of the first line, or of its first ``_HEAD_LINE_LIMIT`` bytes when longer.
+
+    ``None`` only while that first line is shorter and still unterminated, since
+    its bytes can still grow; once written, an append-only file never changes them.
+    """
+    head = handle.readline(_HEAD_LINE_LIMIT)
+    if head.endswith(b"\n") or len(head) == _HEAD_LINE_LIMIT:
+        return _bytes_mac(head, key)
+    return None
+
+
+def _commit_batch(
     db: sqlite3.Connection,
     transcript: Transcript,
+    skey: str,
     run_id: int,
-    key: bytes,
-    casefold: bool,
-) -> str:
-    """Extract one file's new complete lines. Returns ``read``, ``halted`` or ``unchanged``."""
-    skey = stream_key(transcript.session_id, transcript.agent_id, key)
-    row = db.execute(
-        "SELECT bytes_read, lines_read, head_mac, halted FROM streams WHERE stream_key = ?",
-        (skey,),
-    ).fetchone()
-    bytes_read, lines_read, head_mac, halted = row if row is not None else (0, 0, None, 0)
-    if halted:
-        return "halted"
-    try:
-        with open(transcript.path, "rb") as handle:
-            size = os.fstat(handle.fileno()).st_size
-            head = handle.readline(_HEAD_LINE_LIMIT)
-            current_head = _bytes_mac(head, key) if head.endswith(b"\n") else None
-            if size < bytes_read or (head_mac is not None and current_head != head_mac):
-                _warn(f"transcript rewritten, halting its stream: {transcript.path.name}")
-                db.execute("UPDATE streams SET halted = 1 WHERE stream_key = ?", (skey,))
-                return "halted"
-            if size == bytes_read:
-                return "unchanged"
-            lines, consumed = _read_new_lines(handle, bytes_read, size)
-    except OSError as exc:
-        _warn(f"cannot read {transcript.path.name}: {exc}")
-        return "unchanged"
-    if not lines:
-        return "unchanged"
-    batch = _FileBatch()
-    for offset, line in enumerate(lines):
-        _parse_line(line, lines_read + offset, skey, key, casefold, batch)
+    batch: _FileBatch,
+    position: tuple[int, int],
+    head_mac: str | None,
+) -> None:
     db.execute("BEGIN IMMEDIATE")
     try:
         db.executemany(
@@ -626,9 +620,9 @@ def _extract_file(
                 int(transcript.agent_id is not None),
                 batch.first_ts,
                 batch.newest_ts,
-                bytes_read + consumed,
-                lines_read + len(lines),
-                current_head,
+                position[0],
+                position[1],
+                head_mac,
             ),
         )
         db.execute(
@@ -640,7 +634,56 @@ def _extract_file(
     except BaseException:
         db.execute("ROLLBACK")
         raise
-    return "read"
+
+
+def _extract_file(
+    db: sqlite3.Connection,
+    transcript: Transcript,
+    run_id: int,
+    key: bytes,
+    casefold: bool,
+    batch_bytes: int | None = None,
+) -> str:
+    """Extract one file's new complete lines. Returns ``read``, ``halted`` or ``unchanged``.
+
+    Lines are parsed and committed in batches of about *batch_bytes*, each with
+    its resume offset, so memory stays bounded however much the file grew.
+    """
+    skey = stream_key(transcript.session_id, transcript.agent_id, key)
+    row = db.execute(
+        "SELECT bytes_read, lines_read, head_mac, halted FROM streams WHERE stream_key = ?",
+        (skey,),
+    ).fetchone()
+    bytes_read, lines_read, head_mac, halted = row if row is not None else (0, 0, None, 0)
+    if halted:
+        return "halted"
+    read_any = False
+    try:
+        with open(transcript.path, "rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            current_head = _head_mac(handle, key)
+            if size < bytes_read or (head_mac is not None and current_head != head_mac):
+                _warn(f"transcript rewritten, halting its stream: {transcript.path.name}")
+                db.execute("UPDATE streams SET halted = 1 WHERE stream_key = ?", (skey,))
+                return "halted"
+            handle.seek(bytes_read)
+            while bytes_read < size:
+                lines, consumed = _next_lines(handle, batch_bytes or BATCH_BYTES)
+                if not lines:
+                    break
+                batch = _FileBatch()
+                for offset, line in enumerate(lines):
+                    _parse_line(line, lines_read + offset, skey, key, casefold, batch)
+                bytes_read += consumed
+                lines_read += len(lines)
+                handle.seek(bytes_read)
+                _commit_batch(
+                    db, transcript, skey, run_id, batch, (bytes_read, lines_read), current_head
+                )
+                read_any = True
+    except OSError as exc:
+        _warn(f"cannot read {transcript.path.name}: {exc}")
+    return "read" if read_any else "unchanged"
 
 
 def _opt_key(value: object, key: bytes) -> str | None:
@@ -781,6 +824,8 @@ def extract(
 ) -> ExtractSummary:
     """One daily run: pin/check the key, extract new transcript lines, copy assignments."""
     key = load_hmac_key(feedback_db)
+    if not projects_dir.expanduser().is_dir():
+        raise TrialError(f"transcript directory not found: {projects_dir}")
     with closing(open_trial_db(trial_db)) as db:
         fingerprint = pin_key(db, key)
         started = now()
@@ -868,6 +913,8 @@ def freeze(
         fingerprint = pin_key(db, key)
         if db.execute("SELECT 1 FROM trial_record").fetchone() is not None:
             raise TrialError("the trial record is already frozen")
+        if db.execute("SELECT 1 FROM streams LIMIT 1").fetchone() is None:
+            raise TrialError("no transcript has been extracted yet; check --projects-dir")
         # the shortest retention any run recorded: a setting raised later cannot
         # bring back rows an earlier, shorter one already deleted
         shortest = db.execute(
@@ -903,14 +950,24 @@ def freeze(
                 raise TrialError(
                     "drawn events already exist; holdout_rate must stay 0 until after the freeze"
                 )
+            # the population a draw can reach: hook calls carrying both host ids
+            # (proxy events and events from before the ids existed never are)
+            events_columns = {
+                str(r[1]) for r in src.execute("PRAGMA table_info('surfacing_events')")
+            }
+            if not {"tool_use_id", "host_session_id"} <= events_columns:
+                src.execute("COMMIT")
+                raise TrialError("stm_feedback.db predates hook provenance; upgrade STM first")
+            window = (
+                "e.created_at >= ? AND e.created_at < ? "
+                "AND e.tool_use_id IS NOT NULL AND e.host_session_id IS NOT NULL"
+            )
             events = src.execute(
-                "SELECT COUNT(*) FROM surfacing_events WHERE created_at >= ? AND created_at < ?",
-                (start, frozen_at),
+                f"SELECT COUNT(*) FROM surfacing_events e WHERE {window}", (start, frozen_at)
             ).fetchone()[0]
             rows = src.execute(
                 "SELECT p.memory_id, p.snippet_grams FROM surfacing_memory_paths p "
-                "JOIN surfacing_events e ON e.id = p.surfacing_id "
-                "WHERE e.created_at >= ? AND e.created_at < ?",
+                f"JOIN surfacing_events e ON e.id = p.surfacing_id WHERE {window}",
                 (start, frozen_at),
             ).fetchall()
             src.execute("COMMIT")

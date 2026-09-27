@@ -222,6 +222,7 @@ def _record_event(
     preview: str = PREVIEW,
     created_at: float | None = None,
     tool_use_id: str = "toolu_A",
+    hook: bool = True,
 ) -> None:
     store = FeedbackStore(env["feedback"])
     store.initialize()
@@ -234,8 +235,8 @@ def _record_event(
             [memory_id],
             [0.5],
             provenance=EventProvenance(
-                tool_use_id=tool_use_id,
-                host_session_id=SESSION,
+                tool_use_id=tool_use_id if hook else None,
+                host_session_id=SESSION if hook else None,
                 id_advertised=True,
                 header_digest=hashlib.sha256(b"## Relevant Memories").hexdigest(),
                 arm=arm,
@@ -443,6 +444,30 @@ def test_appending_in_steps_equals_one_pass(env: dict[str, Path], tmp_path: Path
     oneshot = dict(env, trial=tmp_path / "oneshot.db")
     _extract(oneshot)
     assert stepped == _dump(oneshot["trial"])
+
+
+def test_small_batches_equal_one_pass(
+    env: dict[str, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    oneshot = dict(env, trial=tmp_path / "oneshot.db")
+    _extract(oneshot)
+    monkeypatch.setattr(st, "BATCH_BYTES", 64)  # smaller than every line
+    _extract(env)
+    assert _dump(env["trial"]) == _dump(oneshot["trial"])
+    runs = _rows(env["trial"], "SELECT lines_read FROM streams ORDER BY is_subagent")
+    assert runs == [(len(_main_records()),), (len(_sub_records()),)]
+
+
+def test_long_first_line_still_arms_the_tripwire(
+    env: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(st, "_HEAD_LINE_LIMIT", 16)  # the mode record is longer
+    _extract(env)
+    assert _rows(env["trial"], "SELECT COUNT(*) FROM streams WHERE head_mac IS NULL") == [(0,)]
+    records = _main_records()
+    records[0] = {"mode": "rewritten", "type": "mode"}  # differs inside the hashed prefix
+    _write(env["main"], records + records)
+    assert _extract(env).files_halted == 1
 
 
 def test_result_arriving_in_a_later_run_sets_ok(env: dict[str, Path]) -> None:
@@ -774,6 +799,57 @@ def test_freeze_without_a_run_leaves_no_state(env: dict[str, Path]) -> None:
     with pytest.raises(st.TrialError, match="no extractor run"):
         _freeze(env, 1.0)
     assert not env["trial"].exists()
+
+
+def test_freeze_counts_only_drawable_hook_events(env: dict[str, Path]) -> None:
+    start = 7_000_000.0
+    _burn_in(env, start)
+    for n in range(3):  # proxy-path events: no host ids, never drawable
+        _record_event(
+            env,
+            f"cc{n:014x}",
+            arm=None,
+            memory_id=f"proxy{n}",
+            preview="proxy only words appear here",
+            created_at=start + 200 + n,
+            hook=False,
+        )
+    with pytest.raises(st.TrialError, match="burn-in has 3 events; needs 4"):
+        _freeze(env, start + 8 * DAY, min_events=4)  # 3 hook + 3 proxy would pass
+
+
+def test_freeze_stoplist_ignores_proxy_events(env: dict[str, Path]) -> None:
+    start = 7_500_000.0
+    _burn_in(env, start)
+    for n in range(3):
+        _record_event(
+            env,
+            f"cd{n:014x}",
+            arm=None,
+            memory_id=f"proxy{n}",
+            preview="proxy only words appear here",
+            created_at=start + 200 + n,
+            hook=False,
+        )
+    result = _freeze(env, start + 8 * DAY)
+    (stoplist,) = _rows(env["trial"], "SELECT stoplist FROM trial_record")[0]
+    assert result["burnin_events"] == 3
+    assert not gram_hashes("proxy only words appear", _key(env)) & set(st.unpack_grams(stoplist))
+
+
+def test_missing_projects_dir_is_refused(env: dict[str, Path], tmp_path: Path) -> None:
+    with pytest.raises(st.TrialError, match="transcript directory not found"):
+        _extract(dict(env, projects=tmp_path / "nowhere"))
+    assert not env["trial"].exists()
+
+
+def test_freeze_needs_extracted_transcripts(env: dict[str, Path], tmp_path: Path) -> None:
+    empty = tmp_path / "empty-projects"
+    empty.mkdir()
+    start = 8_000_000.0
+    _burn_in(dict(env, projects=empty), start)
+    with pytest.raises(st.TrialError, match="no transcript has been extracted"):
+        _freeze(env, start + 8 * DAY)
 
 
 def test_burn_in_stoplist_counts_distinct_memories() -> None:
