@@ -305,6 +305,42 @@ def test_invalid_file_keeps_startup_completed_env_server(tmp_path, monkeypatch, 
     assert ("claude-user*" in row) is has_marker
 
 
+def test_file_fallback_ignores_rejected_completion_for_source_and_origin(tmp_path, monkeypatch):
+    path = tmp_path / "proxy.json"
+    path.write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "upstream_servers": {
+                    "gh": {
+                        "prefix": "gh",
+                        "command": "gh-file",
+                        "args": ["--tok", "FILESECRET"],
+                        "origin": {"kind": "claude-user", "pruned": True},
+                    },
+                    "x": {"prefix": 5, "command": "x"},
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__PREFIX", "gh")
+    monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND", "envcmd")
+    runner = CliRunner()
+    listed = runner.invoke(cli, ["list", "--config", str(path), "--json"])
+    assert listed.exit_code == 0, listed.output
+    detail = json.loads(listed.stdout)
+    assert detail["config_valid"] is False
+    assert set(detail["effective_servers"]) == {"gh"}
+    assert detail["server_sources"] == {"gh": "env"}
+    human = runner.invoke(cli, ["list", "--config", str(path)])
+    assert human.exit_code == 0, human.output
+    row = next(line for line in human.stdout.splitlines() if line.startswith("gh "))
+    assert row.split()[5:7] == ["-", "env"]
+    assert "envcmd" in row
+    assert "gh-file" not in row
+    assert "FILESECRET" not in human.stdout
+
+
 def test_file_disappearing_after_read_uses_startup_fallback_without_false_warning(
     tmp_path, monkeypatch
 ):

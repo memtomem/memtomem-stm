@@ -470,9 +470,12 @@ class _RuntimeProxyRead:
     env_server_names: frozenset[str]
     startup_error: bool = False
     file_fallback: bool = False
+    completed_file_server_names: frozenset[str] = frozenset()
 
 
-def _runtime_proxy_read(path: Path, config_path: str) -> _RuntimeProxyRead:
+def _runtime_proxy_read(
+    path: Path, config_path: str, file_servers: dict[str, Any] | None = None
+) -> _RuntimeProxyRead:
     """Read a proxy as startup does, without accepting a lossy env fragment."""
     from pydantic import ValidationError
     from pydantic_settings import SettingsError
@@ -480,6 +483,7 @@ def _runtime_proxy_read(path: Path, config_path: str) -> _RuntimeProxyRead:
     from memtomem_stm.config import stm_config_for_cli
     from memtomem_stm.proxy.config import (
         ProxyConfig,
+        _completed_entry_validates,
         _rejected_env_error,
         collect_proxy_env_overrides,
         env_var_hint_for_validation_error,
@@ -494,7 +498,9 @@ def _runtime_proxy_read(path: Path, config_path: str) -> _RuntimeProxyRead:
     except ValidationError as exc:
         return _RuntimeProxyRead(
             None,
-            validation_error_summary(exc) + env_var_hint_for_validation_error(exc),
+            f"{exc.error_count()} validation error(s): "
+            + validation_error_summary(exc)
+            + env_var_hint_for_validation_error(exc),
             env_names,
             True,
         )
@@ -515,14 +521,28 @@ def _runtime_proxy_read(path: Path, config_path: str) -> _RuntimeProxyRead:
     loaded = ProxyConfig.load_from_file_with_status(
         path, env_overrides=overlay, missing_ok=False, log_warnings=False, log_errors=False
     )
-    if loaded.error is not None:
-        # Server startup keeps the settings-built proxy when the file cannot
-        # load. Show that same env/default view while retaining the file error.
-        return _RuntimeProxyRead(settings.proxy, loaded.error, env_names, file_fallback=True)
     if loaded.config is None:
-        # The file vanished after the caller read it. Startup keeps the
-        # settings-built proxy without reporting a file-validation error.
-        return _RuntimeProxyRead(settings.proxy, None, env_names, file_fallback=True)
+        # Startup keeps the settings-built proxy after a file error or a
+        # missing-file race. Only file entries emitted by the settings
+        # completion source can contribute to this fallback view.
+        completed: set[str] = set()
+        if isinstance(env_servers, dict):
+            for name, env_entry in env_servers.items():
+                file_entry = (file_servers or {}).get(name)
+                if (
+                    isinstance(name, str)
+                    and isinstance(file_entry, dict)
+                    and isinstance(env_entry, dict)
+                    and _completed_entry_validates(file_entry, env_entry)
+                ):
+                    completed.add(name)
+        return _RuntimeProxyRead(
+            settings.proxy,
+            loaded.error,
+            env_names,
+            file_fallback=True,
+            completed_file_server_names=frozenset(completed),
+        )
     return _RuntimeProxyRead(loaded.config, None, env_names)
 
 
@@ -2083,7 +2103,7 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
         effective_compression_pair,
     )
 
-    runtime = _runtime_proxy_read(path, config_path)
+    runtime = _runtime_proxy_read(path, config_path, servers)
     config_error = runtime.error
     compression_info: dict[str, Any] = {}
     effective_servers: dict[str, Any] = {}
@@ -2096,7 +2116,11 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
             for name, server in typed_config.upstream_servers.items()
         }
         for name, server in typed_config.upstream_servers.items():
-            if isinstance(servers.get(name), dict):
+            file_entry = servers.get(name)
+            file_contributed = isinstance(file_entry, dict) and (
+                not runtime.file_fallback or name in runtime.completed_file_server_names
+            )
+            if file_contributed:
                 server_sources[name] = "file+env" if name in runtime.env_server_names else "file"
             else:
                 server_sources[name] = "env"
@@ -2175,7 +2199,8 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
         # Keep provenance strict for file entries: model parsing coerces a
         # hand-edited "pruned": "true" to bool, but status/remove inspect the
         # raw flag and must agree on whether the host original was pruned.
-        origin_cell = _origin_cell(servers.get(name, cfg))
+        origin_cfg = cfg if server_sources.get(name) == "env" else servers.get(name, cfg)
+        origin_cell = _origin_cell(origin_cfg)
         any_pruned = any_pruned or origin_cell.endswith("*")
         if transport == "stdio":
             cmd = cfg.get("command", "")
