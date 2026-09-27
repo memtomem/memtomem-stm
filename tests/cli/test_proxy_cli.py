@@ -14243,7 +14243,9 @@ class TestHealth:
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["config_valid"] is False
-        assert "Duplicate upstream prefixes" in data["config_error"]
+        # #1075: value-free, like ``status`` — location and error type only.
+        assert data["config_error"] == "1 validation error(s): value_error"
+        assert "dup" not in data["config_error"]
 
     def test_health_warns_on_invalid_schema_text(self, runner, config):
         config.write_text(
