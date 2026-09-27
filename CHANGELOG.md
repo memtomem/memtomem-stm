@@ -22,8 +22,9 @@ changes inline only. See the deprecation policy in
   SOURCE column and env-only upstream rows; text table parsers should use
   `--json`. The existing JSON `servers` map still describes the file, while
   `effective_servers` and `server_sources` describe the runtime view.
-  The text table masks URL credentials/query values and arguments on rows
-  supplied by the environment; the raw JSON `servers` map retains file values.
+  The text table removes URL userinfo, query strings, and fragments on every
+  row and hides arguments on rows supplied by the environment; the raw JSON
+  `servers` map retains file values.
   `mms status --json` adds `effective_server_count` (`null` if environment
   parsing prevents startup). Its `enabled` field now reports the runtime value
   after environment overrides whenever startup parsing succeeds, including

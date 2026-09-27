@@ -314,6 +314,33 @@ def test_file_disappearing_after_read_uses_startup_fallback_without_false_warnin
     assert "Servers: 1 env/default fallback (1 file)" in human.stdout
 
 
+def test_invalid_file_with_no_effective_servers_points_to_file_repair(tmp_path):
+    path = tmp_path / "proxy.json"
+    path.write_text(
+        json.dumps(
+            {
+                "enabled": "invalid",
+                "upstream_servers": {
+                    "a": {"prefix": "a", "command": "echo"},
+                    "b": {"prefix": "b", "command": "echo"},
+                },
+            }
+        )
+    )
+    runner = CliRunner()
+    status = runner.invoke(cli, ["status", "--config", str(path)])
+    assert status.exit_code == 0, status.output
+    assert "Servers: 0 env/default fallback (2 file)" in status.stdout
+    assert "Run `mms config validate` to fix the proxy file." in status.stdout
+    assert "Run `mms add`" not in status.stdout
+    listed = runner.invoke(cli, ["list", "--config", str(path)])
+    assert listed.exit_code == 0, listed.output
+    assert (
+        "No upstream servers effective (2 in the file; the file fails validation)." in listed.stdout
+    )
+    assert "No upstream servers configured." not in listed.stdout
+
+
 def test_status_labels_nonboolean_file_enabled_when_startup_is_invalid(tmp_path, monkeypatch):
     path = tmp_path / "proxy.json"
     path.write_text('{"enabled": "nope", "upstream_servers": {}}')

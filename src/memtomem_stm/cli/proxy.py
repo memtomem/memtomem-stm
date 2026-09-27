@@ -2048,7 +2048,9 @@ def status(config_path: str | None, *, as_json: bool = False) -> None:
         )
     click.echo("")
     display_count = effective_count if effective_count is not None else len(servers)
-    if display_count:
+    if runtime.file_fallback and config_error:
+        click.echo("Run `mms config validate` to fix the proxy file.")
+    elif display_count:
         click.echo("Run `mms list` for per-server detail; `mms health` to probe connectivity.")
     else:
         click.echo("Run `mms add` (or `mms init`) to register an upstream.")
@@ -2136,7 +2138,13 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
         warning = _runtime_config_warning(runtime)
         click.echo(f"{_warn('Warning:')} {warning}: {_disp(config_error)}")
     if not display_servers:
-        click.echo("No upstream servers configured.")
+        if runtime.file_fallback and config_error and servers:
+            click.echo(
+                f"No upstream servers effective ({len(servers)} in the file; "
+                "the file fails validation)."
+            )
+        else:
+            click.echo("No upstream servers configured.")
         return
 
     # ``streamable_http`` is 15 chars — wider than the prior ``<12``
