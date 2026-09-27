@@ -294,10 +294,11 @@ class TestApplyCompression:
 
 def _make_llm_instance_mock() -> MagicMock:
     """Return a MagicMock that stands in for an LLMCompressor instance."""
+    from memtomem_stm.proxy.compression import LLMCompressionResult
+
     inst = MagicMock()
-    inst.compress = AsyncMock(return_value="compressed")
+    inst.compress = AsyncMock(return_value=LLMCompressionResult("compressed"))
     inst.close = AsyncMock()
-    inst.last_fallback = None
     return inst
 
 
@@ -1087,3 +1088,48 @@ class TestGetUpstreamHealth:
         assert "srv" in health
         assert health["srv"]["connected"] is True
         assert health["srv"]["tools"] == 0
+
+
+async def test_llm_manager_uses_each_call_result_not_shared_state(tmp_path):
+    """Overlapping manager calls must feed the right reason into metrics (#1055)."""
+    import asyncio
+
+    from memtomem_stm.proxy.compression import LLMCompressionResult
+
+    mgr = _make_manager(tmp_path=tmp_path)
+    cfg = LLMCompressorConfig(provider=LLMProvider.OPENAI, api_key="k")
+    started = asyncio.Event()
+    release = asyncio.Event()
+    instance = _make_llm_instance_mock()
+    instance.last_fallback = "wrong-shared-reason"
+
+    async def compress(text: str, **kwargs: object) -> LLMCompressionResult:
+        if text.startswith("slow"):
+            started.set()
+            await release.wait()
+            return LLMCompressionResult("summary")
+        return LLMCompressionResult("truncated", "llm_error")
+
+    instance.compress = AsyncMock(side_effect=compress)
+
+    async def apply(text: str) -> tuple[str, str | None]:
+        return await mgr._apply_compression(
+            text,
+            CompressionStrategy.LLM_SUMMARY,
+            max_chars=100,
+            sel_cfg=None,
+            llm_cfg=cfg,
+            hybrid_cfg=None,
+            server="srv",
+            tool="t",
+            cfg_snap=mgr._config,
+        )
+
+    with patch("memtomem_stm.proxy.manager.LLMCompressor", return_value=instance):
+        slow_task = asyncio.create_task(apply("slow" * 150))
+        await started.wait()
+        fast = await apply("fast" * 150)
+        release.set()
+        slow = await slow_task
+    assert fast == ("truncated", "llm_error")
+    assert slow == ("summary", None)

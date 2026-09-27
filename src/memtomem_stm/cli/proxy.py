@@ -32,6 +32,7 @@ from click.core import ParameterSource
 if TYPE_CHECKING:
     import httpx
 
+    from memtomem_stm.proxy.config import ProxyConfig
     from memtomem_stm.proxy.tuner import TuningRecommendation
 
 from memtomem_stm.cli._defaults import (
@@ -462,9 +463,65 @@ def _runtime_schema_validation_error(data: dict[str, Any]) -> str | None:
     return _schema_validation_error(data, env_overrides=collect_proxy_env_overrides().fragment)
 
 
+@dataclass(frozen=True)
+class _RuntimeProxyRead:
+    config: ProxyConfig | None
+    error: str | None
+    env_server_names: frozenset[str]
+    startup_error: bool = False
+
+
+def _runtime_proxy_read(path: Path, config_path: str) -> _RuntimeProxyRead:
+    """Read a proxy as startup does, without accepting a lossy env fragment."""
+    from pydantic import ValidationError
+    from pydantic_settings import SettingsError
+
+    from memtomem_stm.config import stm_config_for_cli
+    from memtomem_stm.proxy.config import (
+        ProxyConfig,
+        collect_proxy_env_overrides,
+        env_var_hint_for_validation_error,
+        validation_error_summary,
+    )
+
+    overlay = collect_proxy_env_overrides()
+    env_servers = overlay.fragment.get("upstream_servers", {})
+    env_names = frozenset(env_servers) if isinstance(env_servers, dict) else frozenset()
+    try:
+        stm_config_for_cli(_explicit_config_path(config_path))
+    except ValidationError as exc:
+        return _RuntimeProxyRead(
+            None,
+            f"runtime configuration invalid: {validation_error_summary(exc)}"
+            + env_var_hint_for_validation_error(exc),
+            env_names,
+            True,
+        )
+    except SettingsError:
+        # SettingsError can carry the raw value in its exception chain. Name
+        # variables from the environment, never render the exception itself.
+        names = {
+            overlay.names.get(name.lower(), name)
+            for name in set(overlay.malformed) | set(overlay.rejected)
+        }
+        if not names:
+            names = {name for name in os.environ if name.lower().startswith("memtomem_stm_")}
+        suffix = ": " + ", ".join(sorted(names)) if names else ""
+        return _RuntimeProxyRead(None, "invalid MEMTOMEM_STM_* settings" + suffix, env_names, True)
+
+    loaded = ProxyConfig.load_from_file_with_status(
+        path, env_overrides=overlay, missing_ok=False, log_warnings=False
+    )
+    error = loaded.error or loaded.env_error
+    if loaded.config is None or error is not None:
+        return _RuntimeProxyRead(None, error or "proxy config unavailable", env_names)
+    return _RuntimeProxyRead(loaded.config, None, env_names)
+
+
 _CONFIG_INVALID_WARNING = (
     "config file present but fails validation — a running server falls back to env/defaults"
 )
+_STARTUP_INVALID_WARNING = "runtime configuration invalid — the server cannot start"
 
 
 def _transport_field_error(transport: str, command: str, url: str) -> str | None:
@@ -1899,9 +1956,11 @@ def status(config_path: str | None, *, as_json: bool = False) -> None:
         return
 
     data = _load(path)
-    enabled = data.get("enabled", False)
+    runtime = _runtime_proxy_read(path, config_path)
+    enabled = runtime.config.enabled if runtime.config is not None else data.get("enabled", False)
     servers: dict[str, Any] = data.get("upstream_servers", {})
-    config_error = _runtime_schema_validation_error(data)
+    config_error = runtime.error
+    effective_count = len(runtime.config.upstream_servers) if runtime.config is not None else None
     tuning = _tuning_readiness(data)
     # Same predicate as the `mms list` pruned marker (via _origin_cell), so
     # this count and list's `*` rows can never disagree on what "pruned" means.
@@ -1926,6 +1985,7 @@ def status(config_path: str | None, *, as_json: bool = False) -> None:
                     "config_valid": config_error is None,
                     "config_error": config_error,
                     "server_count": len(servers),
+                    "effective_server_count": effective_count,
                     "pruned_count": pruned_count,
                     "tuning": tuning,
                     "servers": _redacted_servers_json(servers),
@@ -1941,18 +2001,23 @@ def status(config_path: str | None, *, as_json: bool = False) -> None:
     # output; status now answers "is the proxy set up and pointed at the
     # right config", list answers "what servers are behind it").
     if config_error:
-        click.echo(f"{_warn('Warning:')} {_CONFIG_INVALID_WARNING}: {_disp(config_error)}")
+        warning = _STARTUP_INVALID_WARNING if runtime.startup_error else _CONFIG_INVALID_WARNING
+        click.echo(f"{_warn('Warning:')} {warning}: {_disp(config_error)}")
     click.echo(f"Config : {resolved}")
     click.echo(f"Enabled: {'yes' if enabled else 'no'}")
     pruned_suffix = f" ({pruned_count} host-pruned)" if pruned_count else ""
-    click.echo(f"Servers: {len(servers)}{pruned_suffix}")
+    if effective_count is not None and effective_count != len(servers):
+        click.echo(f"Servers: {effective_count} effective ({len(servers)} file){pruned_suffix}")
+    else:
+        click.echo(f"Servers: {len(servers)}{pruned_suffix}")
     if tuning["ready"]:
         click.echo(
             f"Tuning : ready for {len(tuning['tools'])} tool(s); "
             "run `mms tune` to preview recommendations"
         )
     click.echo("")
-    if servers:
+    display_count = effective_count if effective_count is not None else len(servers)
+    if display_count:
         click.echo("Run `mms list` for per-server detail; `mms health` to probe connectivity.")
     else:
         click.echo("Run `mms add` (or `mms init`) to register an upstream.")
@@ -1980,32 +2045,36 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
 
     data = _load(path)
     servers: dict[str, Any] = data.get("upstream_servers", {})
-    # Same lenient warning as ``status`` (#611): on a schema-invalid config a
-    # running server ignores the whole file, so this table shows servers that
-    # are NOT being proxied. The env-overlaid validator, not the file-only
-    # one: the warning claims what a *running server* would do, and an env
-    # var can make a malformed subtree irrelevant — validating the file
-    # alone would warn here while `status` and `health` stay silent on the
-    # very same config.
     from memtomem_stm.proxy.config import (
-        ProxyConfig,
-        _deep_merge,
-        collect_proxy_env_overrides,
         compression_source,
         effective_compression_pair,
     )
 
-    # Validate and describe one captured input set, including the environment.
-    # Keep the existing raw/redacted JSON map for configuration-file consumers.
-    effective_data = _deep_merge(data, collect_proxy_env_overrides().fragment)
-    config_error = _schema_validation_error(effective_data)
+    runtime = _runtime_proxy_read(path, config_path)
+    config_error = runtime.error
     compression_info: dict[str, Any] = {}
-    if config_error is None:
-        typed_config = ProxyConfig.model_validate(effective_data)
-        for name in servers:
-            server = typed_config.upstream_servers.get(name)
-            if server is None:
-                continue
+    effective_servers: dict[str, Any] = {}
+    server_sources: dict[str, str] = {}
+    display_servers = servers
+    if runtime.config is not None:
+        typed_config = runtime.config
+        display_servers = {
+            name: server.model_dump(mode="json", exclude_none=True)
+            for name, server in typed_config.upstream_servers.items()
+        }
+        for name, server in typed_config.upstream_servers.items():
+            server_sources[name] = (
+                "file+env"
+                if name in servers and name in runtime.env_server_names
+                else "file"
+                if name in servers
+                else "env"
+            )
+            effective_servers[name] = {
+                "prefix": server.prefix,
+                "transport": server.transport.value,
+                "surfacing_enabled": server.surfacing_enabled,
+            }
             strategy, _ = effective_compression_pair(server, None, typed_config)
             compression_info[name] = {
                 "strategy": strategy.value,
@@ -2025,6 +2094,8 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
                     "config_valid": config_error is None,
                     "config_error": config_error,
                     "servers": _redacted_servers_json(servers),
+                    "effective_servers": effective_servers,
+                    "server_sources": server_sources,
                     "effective_compression": compression_info,
                 },
                 indent=2,
@@ -2034,8 +2105,9 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
         return
 
     if config_error:
-        click.echo(f"{_warn('Warning:')} {_CONFIG_INVALID_WARNING}: {_disp(config_error)}")
-    if not servers:
+        warning = _STARTUP_INVALID_WARNING if runtime.startup_error else _CONFIG_INVALID_WARNING
+        click.echo(f"{_warn('Warning:')} {warning}: {_disp(config_error)}")
+    if not display_servers:
         click.echo("No upstream servers configured.")
         return
 
@@ -2054,12 +2126,12 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
     # read it via ``--json`` or the config file.
     header = (
         f"{'NAME':<20} {'PREFIX':<10} {'TRANSPORT':<16} {'COMPRESSION':<12} "
-        f"{'SURFACING':<10} {'ORIGIN':<16} COMMAND / URL"
+        f"{'SURFACING':<10} {'ORIGIN':<16} {'SOURCE':<10} COMMAND / URL"
     )
     click.echo(_hdr(header))
     click.echo("-" * len(header))
     any_pruned = False
-    for name, cfg in servers.items():
+    for name, cfg in display_servers.items():
         transport = cfg.get("transport", "stdio")
         prefix = cfg.get("prefix", "")
         compression = compression_info.get(name, {}).get("strategy", "unknown")
@@ -2078,9 +2150,10 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
         # here, so only the config-derived cells need it.
         click.echo(
             f"{_disp(name):<20} {_disp(prefix):<10} {_disp(transport):<16} "
-            f"{_disp(compression):<12} {surfacing:<10} {_disp(origin_cell):<16} {_disp(detail)}"
+            f"{_disp(compression):<12} {surfacing:<10} {_disp(origin_cell):<16} "
+            f"{_disp(server_sources.get(name, 'file')):<10} {_disp(detail)}"
         )
-    click.echo(f"\n{len(servers)} server(s) configured.")
+    click.echo(f"\n{len(display_servers)} server(s) configured.")
     click.echo("COMPRESSION shows the resolved server default; tool overrides may differ.")
     for name, info in compression_info.items():
         for tool, strategy in info["tool_overrides"].items():

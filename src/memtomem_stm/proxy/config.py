@@ -1218,7 +1218,7 @@ class LLMCompressorConfig(BaseModel):
     llm_timeout_seconds: float = Field(default=60.0, gt=0.0)
     # When true, scan the upstream response for API keys / passwords / JWT /
     # private keys before sending it to the LLM provider; on a hit, skip the
-    # outbound call and fall back to TruncateCompressor (last_fallback="privacy").
+    # outbound call and fall back to TruncateCompressor (fallback_reason="privacy").
     # Default-on: an operator who flips ``compression: llm_summary`` should not
     # have to remember a second knob to avoid leaking credentials to OpenAI /
     # Anthropic / a custom ``base_url``. Set to false only when the response

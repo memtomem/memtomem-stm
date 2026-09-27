@@ -1191,7 +1191,8 @@ class TestStatus:
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["config_valid"] is False
-        assert "Duplicate upstream prefixes" in data["config_error"]
+        assert "value_error" in data["config_error"]
+        assert "dup" not in data["config_error"]
 
     def test_valid_config_marked_valid_in_json(self, runner, config):
         config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
