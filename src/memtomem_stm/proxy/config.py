@@ -2406,6 +2406,7 @@ class ProxyConfig(BaseModel):
         *,
         missing_ok: bool = True,
         log_warnings: bool = True,
+        log_errors: bool = True,
     ) -> ConfigLoadResult:
         """``load_from_file`` with the failure mode preserved in the result.
 
@@ -2417,7 +2418,7 @@ class ProxyConfig(BaseModel):
         the raw file dict *before* the env merge so an env-injected key can
         never be misattributed as a file typo.
 
-        ``error`` is sanitized (location + message, never ``input_value``):
+        ``error`` is sanitized (location + type, never ``input_value``):
         it flows to the MCP client via ``stm_proxy_health``, and a mistyped
         secret-bearing field would otherwise embed the secret itself.
 
@@ -2425,8 +2426,10 @@ class ProxyConfig(BaseModel):
         mode, unknown keys, missing ``cache.tool_annotation_policy``) for
         re-loads of a file some earlier load already warned about — e.g. ``ProxyManager.start()``'s empty-upstreams
         fallback, which would otherwise duplicate them at startup. Parse
-        *failures* are always logged: a silent ``None`` is the dark-failure
-        mode this module exists to prevent.
+        failures are logged by default: a silent ``None`` is the dark-failure
+        mode this module exists to prevent. Read-only diagnostics that surface
+        the returned ``error`` can use ``log_errors=False`` to avoid printing
+        raw values from a pydantic exception to stderr.
         """
         resolved = path.expanduser().resolve()
         overlay = _as_overlay(env_overrides)
@@ -2456,11 +2459,12 @@ class ProxyConfig(BaseModel):
                         )
                     return ConfigLoadResult(config=env_config, error=None, env_error=env_rejected)
                 except Exception as exc:
-                    logger.warning(
-                        "Env-only proxy config failed validation: %s%s — using defaults",
-                        exc,
-                        _env_override_hint(exc, overlay),
-                    )
+                    if log_errors:
+                        logger.warning(
+                            "Env-only proxy config failed validation: %s%s — using defaults",
+                            exc,
+                            _env_override_hint(exc, overlay),
+                        )
                     # Reported, not raised: the defaults rebuild stays the
                     # result so every existing caller behaves as before, while
                     # a caller that cannot safely accept "some other config"
@@ -2531,12 +2535,13 @@ class ProxyConfig(BaseModel):
             # The parse-failure warning dominates; the unknown-keys warning is
             # suppressed here but the paths stay in the result for `mms
             # config validate` to report alongside the errors.
-            logger.warning(
-                "Failed to parse proxy config %s: %s%s",
-                resolved,
-                exc,
-                _env_override_hint(exc, overlay, file_data),
-            )
+            if log_errors:
+                logger.warning(
+                    "Failed to parse proxy config %s: %s%s",
+                    resolved,
+                    exc,
+                    _env_override_hint(exc, overlay, file_data),
+                )
             return ConfigLoadResult(
                 config=None, error=_sanitized_load_error(exc), unknown_keys=unknown_keys
             )

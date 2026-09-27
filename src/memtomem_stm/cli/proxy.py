@@ -499,18 +499,14 @@ def _runtime_proxy_read(path: Path, config_path: str) -> _RuntimeProxyRead:
         )
     except SettingsError:
         # SettingsError can carry the raw value in its exception chain. Name
-        # variables from the environment, never render the exception itself.
-        names = {
-            overlay.names.get(name.lower(), name)
-            for name in set(overlay.malformed) | set(overlay.rejected)
-        }
-        if not names:
-            names = {name for name in os.environ if name.lower().startswith("memtomem_stm_")}
-        suffix = ": " + ", ".join(sorted(names)) if names else ""
+        # candidate variables from the whole STM environment, since the
+        # failing field may be outside proxy. Never render the exception.
+        names = {name for name in os.environ if name.lower().startswith("memtomem_stm_")}
+        suffix = " (check one of: " + ", ".join(sorted(names)) + ")" if names else ""
         return _RuntimeProxyRead(None, "invalid MEMTOMEM_STM_* settings" + suffix, env_names, True)
 
     loaded = ProxyConfig.load_from_file_with_status(
-        path, env_overrides=overlay, missing_ok=False, log_warnings=False
+        path, env_overrides=overlay, missing_ok=False, log_warnings=False, log_errors=False
     )
     error = loaded.error or loaded.env_error
     if loaded.config is None or error is not None:
@@ -522,6 +518,13 @@ _CONFIG_INVALID_WARNING = (
     "config file present but fails validation — a running server falls back to env/defaults"
 )
 _STARTUP_INVALID_WARNING = "runtime configuration invalid — the server cannot start"
+
+
+def _runtime_config_warning(runtime: _RuntimeProxyRead) -> str:
+    """Human guidance for a value-free runtime diagnostic."""
+    if runtime.startup_error:
+        return _STARTUP_INVALID_WARNING
+    return _CONFIG_INVALID_WARNING + "; run `mms config validate` for details"
 
 
 def _transport_field_error(transport: str, command: str, url: str) -> str | None:
@@ -2001,7 +2004,7 @@ def status(config_path: str | None, *, as_json: bool = False) -> None:
     # output; status now answers "is the proxy set up and pointed at the
     # right config", list answers "what servers are behind it").
     if config_error:
-        warning = _STARTUP_INVALID_WARNING if runtime.startup_error else _CONFIG_INVALID_WARNING
+        warning = _runtime_config_warning(runtime)
         click.echo(f"{_warn('Warning:')} {warning}: {_disp(config_error)}")
     click.echo(f"Config : {resolved}")
     click.echo(f"Enabled: {'yes' if enabled else 'no'}")
@@ -2105,7 +2108,7 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
         return
 
     if config_error:
-        warning = _STARTUP_INVALID_WARNING if runtime.startup_error else _CONFIG_INVALID_WARNING
+        warning = _runtime_config_warning(runtime)
         click.echo(f"{_warn('Warning:')} {warning}: {_disp(config_error)}")
     if not display_servers:
         click.echo("No upstream servers configured.")

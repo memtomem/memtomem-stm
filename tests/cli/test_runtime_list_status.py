@@ -97,3 +97,50 @@ def test_effective_server_summary_does_not_print_env_secrets(tmp_path, monkeypat
     assert result.exit_code == 0, result.output
     assert "secret-value" not in result.output
     assert set(json.loads(result.output)["effective_servers"]) == {"e"}
+
+
+@pytest.mark.parametrize("command", ["list", "status"])
+@pytest.mark.parametrize("json_output", [False, True])
+def test_invalid_file_does_not_log_values(tmp_path, caplog, command, json_output):
+    path = tmp_path / "proxy.json"
+    path.write_text(
+        json.dumps(
+            {
+                "upstream_servers": {
+                    "a": {"prefix": "tok_SECRET", "command": "echo"},
+                    "b": {"prefix": "tok_SECRET", "command": "echo"},
+                }
+            }
+        )
+    )
+    args = [command, "--config", str(path)]
+    if json_output:
+        args.append("--json")
+    result = CliRunner().invoke(cli, args)
+    assert result.exit_code == 0, result.output
+    assert "tok_SECRET" not in result.stderr
+    assert "input_value" not in result.stderr
+    assert "tok_SECRET" not in caplog.text
+    assert "input_value" not in caplog.text
+    if json_output:
+        data = json.loads(result.stdout)
+        assert data["config_valid"] is False
+        assert data["config_error"] == "1 validation error(s): value_error"
+    else:
+        warning = result.stdout.splitlines()[0]
+        assert "tok_SECRET" not in warning
+        assert "mms config validate" in warning
+
+
+def test_settings_error_names_candidates_across_config_sections(tmp_path, monkeypatch):
+    path = tmp_path / "proxy.json"
+    path.write_text('{"upstream_servers": {}}')
+    monkeypatch.setenv("MEMTOMEM_STM_PROXY__TOOLGRAPH__ARGS", "secret-bad-args")
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__EXCLUDE_TOOLS", "secret-[bad-json")
+    result = CliRunner().invoke(cli, ["status", "--config", str(path), "--json"])
+    assert result.exit_code == 0, result.output
+    error = json.loads(result.stdout)["config_error"]
+    assert "check one of:" in error
+    assert "MEMTOMEM_STM_PROXY__TOOLGRAPH__ARGS" in error
+    assert "MEMTOMEM_STM_SURFACING__EXCLUDE_TOOLS" in error
+    assert "secret-" not in error

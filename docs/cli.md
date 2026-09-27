@@ -340,7 +340,9 @@ JSON strings (`"server"/"tool": strategy (tool override)`), so a `/` inside a na
 stays unambiguous. An invalid configuration reports the strategy as unknown and
 leaves `effective_servers` and `effective_compression` empty. `config_valid` uses
 the same environment parsing and file loading as server startup; errors identify
-variables and validation locations without printing values (#1051).
+candidate variables and validation locations/types without printing their values.
+For a file validation error, the text warning points to `mms config validate`
+for details; JSON `config_error` keeps only the safe location/type summary (#1051).
 
 ```
 Usage: mms list [OPTIONS]
@@ -631,9 +633,9 @@ Options:
 
 Shows a config summary: the configuration file path, enabled flag, schema-validation warning, and the server count (with a host-pruned count when any entry exists only behind STM). Per-server detail — prefix, transport, command/URL, compression, surfacing — lives in [`mms list`](#list); `status` answers "is the proxy set up and pointed at the right config", `list` answers "what servers are behind it". (#614 — the two commands used to print near-identical output.)
 
-`status --json` is unchanged by that split: it still carries the full redacted file `servers` map (plus `server_count`, `pruned_count`, and additive `effective_server_count` keys), so scripted consumers keep working. Every server's `env` and `headers` values are masked (`<REDACTED>`, keys preserved); the human output never prints those fields at all, so read the on-disk config directly when a value is genuinely needed.
+`status --json` is unchanged by that split: it still carries the full redacted file `servers` map (plus `server_count`, `pruned_count`, and additive `effective_server_count` keys), so scripted consumers keep working. `effective_server_count` is `null` when runtime validation fails. Every server's `env` and `headers` values are masked (`<REDACTED>`, keys preserved); the human output never prints those fields at all, so read the on-disk config directly when a value is genuinely needed.
 
-When the file is valid JSON but fails schema validation (the state a running server silently degrades to env/defaults on), `status`, `list`, and `health` print a warning naming the first error — exit code unchanged. `status` and `list` additionally check the server's own environment parsing before loading the file, so they also flag malformed variables the merged overlay could hide. `health` still validates the file with the environment overlay. Use `mms config validate` for the strict check.
+When the file is valid JSON but fails schema validation (the state a running server silently degrades to env/defaults on), `status` and `list` print a value-free validation location/type summary and a hint to run `mms config validate`; `health` still names the first schema error. Exit codes stay unchanged. `status` and `list` additionally check the server's own environment parsing before loading the file, so they also flag malformed variables the merged overlay could hide. A `SettingsError` lists candidate variable names, since the exception does not identify one reliably. `health` still validates the file with the environment overlay.
 
 ### `config validate`
 
