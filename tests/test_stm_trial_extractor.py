@@ -152,7 +152,7 @@ def _main_records(cwd: str = "/Users/tester/repo") -> list[dict[str, Any]]:
 
 
 def _sub_records() -> list[dict[str, Any]]:
-    record = _tool_use("s1", "msg_S", "toolu_S", "Read", {"file_path": NOTE}, 3, "/w")
+    record = _tool_use("s1", "msg_S", "toolu_S", "Read", {"file_path": NOTE}, 3, "/sub-cwd-sentinel")
     record["agentId"] = "someone-else"  # the path decides the stream, not this field
     return [record, _result("s2", "toolu_S", 4)]
 
@@ -393,6 +393,31 @@ def test_extraction_rows_and_keys(env: dict[str, Path]) -> None:
     assert gram_hashes("reuse alpha beta gamma", key) <= set(st.unpack_grams(text_grams))
 
 
+def test_stream_times_are_recorded(env: dict[str, Path]) -> None:
+    _extract(env)
+    key = _key(env)
+    main_key = st.stream_key(SESSION, None, key)
+    first, newest = _rows(
+        env["trial"], "SELECT first_ts, newest_ts FROM streams WHERE stream_key = ?", (main_key,)
+    )[0]
+    assert (first, newest) == (st._parse_ts(_ts(0)), st._parse_ts(_ts(9)))
+    assert _rows(
+        env["trial"], "SELECT newest_ts FROM coverage_streams WHERE stream_key = ?", (main_key,)
+    ) == [(newest,)]
+
+
+def test_output_grams_never_span_two_blocks(env: dict[str, Path]) -> None:
+    record = _text("u9", "msg_E", "one two alpha beta", 10, "/r")
+    record["message"]["content"].append({"type": "text", "text": "gamma delta three four"})
+    _write(env["main"], [record], mode="a")
+    _extract(env)
+    key = _key(env)
+    (grams,) = _rows(env["trial"], "SELECT grams FROM output_grams WHERE ordinal = 9")[0]
+    stored = set(st.unpack_grams(grams))
+    assert gram_hashes("one two alpha beta", key) <= stored
+    assert not gram_hashes("alpha beta gamma delta", key) & stored
+
+
 def test_second_run_changes_nothing(env: dict[str, Path]) -> None:
     _extract(env)
     first = _dump(env["trial"])
@@ -508,6 +533,8 @@ def test_no_raw_identifier_or_text_reaches_the_trial_db(env: dict[str, Path]) ->
         "reuse",
         "Relevant Memories",
         "cat",
+        "epsilon",  # snippet text
+        "sub-cwd-sentinel",
     ]
     cells: list[str] = []
     with sqlite3.connect(env["trial"]) as db:
@@ -768,6 +795,7 @@ def test_burn_in_stoplist_counts_distinct_memories() -> None:
         ("burn", 3, {}, "needs 7"),
         ("burn", 8, {"min_events": 500}, "needs 500"),
         ("drawn", 8, {}, "drawn events already exist"),
+        ("drawn_opportunity", 8, {}, "drawn events already exist"),
         ("short_retention", 8, {}, "longer than stats_retention_days"),
     ],
 )
@@ -784,6 +812,23 @@ def test_freeze_refusals(
             _burn_in(env, start)
         if setup == "drawn":
             _record_event(env, "d" * 16, arm="shown", created_at=start + 10)
+        if setup == "drawn_opportunity":  # its event write was lost; the opportunity row remains
+            store = FeedbackStore(env["feedback"])
+            store.initialize()
+            store.record_opportunity(
+                OpportunityRow(
+                    id="o-lost",
+                    server="builtin",
+                    tool="Bash",
+                    arg_shape_json="{}",
+                    response_len=1,
+                    gate_decision="surfaced",
+                    surfacing_id="e" * 16,
+                    arm="shown",
+                    holdout_rate=0.2,
+                )
+            )
+            store.close()
     with pytest.raises(st.TrialError, match=message):
         _freeze(env, start + now_days * DAY, **kwargs)
     if setup != "none":  # "none" leaves no DB at all (test_freeze_without_a_run_leaves_no_state)

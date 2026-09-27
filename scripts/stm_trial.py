@@ -72,7 +72,7 @@ CANONICAL_TOOLS = {"Read": "read", "Grep": "grep", "Glob": "glob", "Bash": "shel
 SURFACED_OPEN = "<surfaced-memories>"
 SURFACED_CLOSE = "</surfaced-memories>"
 _SURFACING_ID_RE = re.compile(r"_surfacing_id: ([0-9a-f]{16})_")
-_TIMESTAMP_RE = re.compile(rb'"timestamp":"([^"]+)"')
+_TIMESTAMP_RE = re.compile(rb'"timestamp"\s*:\s*"([^"]+)"')
 _REDIRECT_CHARS = "<>|&;()"
 _LINE_SUFFIX_RE = re.compile(r":\d+(?::\d+)?$")
 _PATTERN_SPLIT_RE = re.compile(r"[/\s*?\[\]{}()|^$+,!]+")
@@ -210,6 +210,8 @@ def _bash_paths(command: str, cwd: str | None, casefold: bool) -> set[str]:
         tokens = shlex.split(command, posix=True)
     except ValueError:
         tokens = command.split()
+    # Known limit: `cd` options (`cd -P dir`) are not parsed; 0 of 51,687
+    # cd-bearing Bash commands in the transcripts measured here used one.
     # A token resolves against cwd and every cd target *earlier* in the command
     # (cumulative, as the shell applies them); a cd after it cannot have moved it,
     # and a cd's own target resolves against the directories before that cd.
@@ -465,7 +467,14 @@ def _parse_line(
                 )
     if parts:
         batch.output_grams.append(
-            (skey, ordinal, record_key, ts, pack_grams(gram_hashes("\n".join(parts), key)))
+            # per block: a 4-gram never spans two blocks (or a text and a tool input)
+            (
+                skey,
+                ordinal,
+                record_key,
+                ts,
+                pack_grams(g for p in parts for g in gram_hashes(p, key)),
+            )
         )
 
 
@@ -875,17 +884,25 @@ def freeze(
             )
         resolved = feedback_db.expanduser().resolve()
         with closing(sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True)) as src:
-            columns = {str(r[1]) for r in src.execute("PRAGMA table_info('surfacing_events')")}
-            if (
-                "arm" in columns
-                and (
-                    src.execute("SELECT 1 FROM surfacing_events WHERE arm IS NOT NULL LIMIT 1")
-                ).fetchone()
-            ):
+            # one read snapshot for the arm check and the burn-in reads, so a draw
+            # committed between them cannot slip into the frozen stoplist unseen
+            src.execute("BEGIN")
+            src.execute("SELECT 1 FROM sqlite_master LIMIT 1")  # starts the snapshot
+            drawn = False
+            for table in ("surfacing_events", "surfacing_opportunities"):
+                columns = {str(r[1]) for r in src.execute(f"PRAGMA table_info('{table}')")}
+                if (
+                    "arm" in columns
+                    and src.execute(
+                        f"SELECT 1 FROM {table} WHERE arm IS NOT NULL LIMIT 1"
+                    ).fetchone()
+                ):
+                    drawn = True
+            if drawn:
+                src.execute("COMMIT")
                 raise TrialError(
                     "drawn events already exist; holdout_rate must stay 0 until after the freeze"
                 )
-            src.execute("BEGIN")
             events = src.execute(
                 "SELECT COUNT(*) FROM surfacing_events WHERE created_at >= ? AND created_at < ?",
                 (start, frozen_at),
