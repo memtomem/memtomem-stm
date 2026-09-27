@@ -251,7 +251,8 @@ def test_invalid_file_shows_runtime_env_fallback_and_keeps_raw_file_map(tmp_path
     assert data["enabled"] is False
 
 
-def test_invalid_file_keeps_startup_completed_env_server(tmp_path, monkeypatch):
+@pytest.mark.parametrize("pruned,has_marker", [(True, True), ("true", False)])
+def test_invalid_file_keeps_startup_completed_env_server(tmp_path, monkeypatch, pruned, has_marker):
     path = tmp_path / "proxy.json"
     path.write_text(
         json.dumps(
@@ -261,7 +262,7 @@ def test_invalid_file_keeps_startup_completed_env_server(tmp_path, monkeypatch):
                     "same": {
                         "prefix": "file",
                         "command": "file-command",
-                        "origin": {"source": {"kind": "claude-user", "pruned": True}},
+                        "origin": {"source": {"kind": "claude-user", "pruned": pruned}},
                     }
                 },
             }
@@ -282,7 +283,35 @@ def test_invalid_file_keeps_startup_completed_env_server(tmp_path, monkeypatch):
     row = next(line for line in human.stdout.splitlines() if line.startswith("same "))
     assert "env-command" in row
     assert "file-command" not in row
-    assert "claude-user*" in row
+    assert ("claude-user*" in row) is has_marker
+
+
+def test_file_disappearing_after_read_uses_startup_fallback_without_false_warning(
+    tmp_path, monkeypatch
+):
+    from memtomem_stm.proxy.config import ConfigLoadResult, ProxyConfig
+
+    path = tmp_path / "proxy.json"
+    path.write_text('{"upstream_servers": {"file": {"prefix": "file", "command": "echo"}}}')
+    monkeypatch.setenv(
+        "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS",
+        json.dumps({"env": {"prefix": "env", "command": "echo"}}),
+    )
+    monkeypatch.setattr(
+        ProxyConfig,
+        "load_from_file_with_status",
+        staticmethod(lambda *args, **kwargs: ConfigLoadResult(config=None, error=None)),
+    )
+    runner = CliRunner()
+    listed = runner.invoke(cli, ["list", "--config", str(path), "--json"])
+    assert listed.exit_code == 0, listed.output
+    detail = json.loads(listed.stdout)
+    assert detail["config_valid"] is True
+    assert set(detail["effective_servers"]) == {"env"}
+    human = runner.invoke(cli, ["status", "--config", str(path)])
+    assert human.exit_code == 0, human.output
+    assert "fails validation" not in human.stdout
+    assert "Servers: 1 env/default fallback (1 file)" in human.stdout
 
 
 def test_status_labels_nonboolean_file_enabled_when_startup_is_invalid(tmp_path, monkeypatch):

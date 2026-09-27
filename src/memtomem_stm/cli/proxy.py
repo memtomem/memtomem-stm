@@ -515,15 +515,14 @@ def _runtime_proxy_read(path: Path, config_path: str) -> _RuntimeProxyRead:
     loaded = ProxyConfig.load_from_file_with_status(
         path, env_overrides=overlay, missing_ok=False, log_warnings=False, log_errors=False
     )
-    error = loaded.error or loaded.env_error
     if loaded.error is not None:
         # Server startup keeps the settings-built proxy when the file cannot
         # load. Show that same env/default view while retaining the file error.
         return _RuntimeProxyRead(settings.proxy, loaded.error, env_names, file_fallback=True)
-    if loaded.config is None or error is not None:
-        return _RuntimeProxyRead(
-            None, error or "proxy config unavailable", env_names, loaded.env_error is not None
-        )
+    if loaded.config is None:
+        # The file vanished after the caller read it. Startup keeps the
+        # settings-built proxy without reporting a file-validation error.
+        return _RuntimeProxyRead(settings.proxy, None, env_names, file_fallback=True)
     return _RuntimeProxyRead(loaded.config, None, env_names)
 
 
@@ -2168,7 +2167,7 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
         # Keep provenance strict for file entries: model parsing coerces a
         # hand-edited "pruned": "true" to bool, but status/remove inspect the
         # raw flag and must agree on whether the host original was pruned.
-        origin_cell = _origin_cell(cfg if runtime.file_fallback else servers.get(name, cfg))
+        origin_cell = _origin_cell(servers.get(name, cfg))
         any_pruned = any_pruned or origin_cell.endswith("*")
         if transport == "stdio":
             cmd = cfg.get("command", "")
