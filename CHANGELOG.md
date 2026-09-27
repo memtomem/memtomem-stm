@@ -13,12 +13,40 @@ changes inline only. See the deprecation policy in
 
 ### Upgrade notes
 
+- **LLM compression callers must read a result object** (#1055).
+  `await LLMCompressor.compress(...)` now returns
+  `LLMCompressionResult(text, fallback_reason)` instead of `str`; the shared
+  `last_fallback` attribute is removed. Read `.text` and `.fallback_reason`
+  from each call's result.
+- **Proxy CLI diagnostics and listing changed** (#1051). `mms list` adds a
+  SOURCE column and env-only upstream rows; text table parsers should use
+  `--json`. The existing JSON `servers` map still describes the file, while
+  `effective_servers` and `server_sources` describe the runtime view.
+  The text table removes URL userinfo, query strings, and fragments on every
+  row and hides arguments on rows supplied by the environment; the raw JSON
+  `servers` map retains file values.
+  `mms status --json` adds `effective_server_count` (`null` if environment
+  parsing prevents startup). Its `enabled` field now reports the runtime value
+  after environment overrides whenever startup parsing succeeds, including
+  when the file is valid. When a file fails validation, `list` and `status`
+  show the env/default fallback the server actually uses, while retaining the
+  file error and raw file counts. `list`/`status` now mark startup-rejected
+  environments invalid and report value-free `config_error` locations and type codes in
+  place of the previous value-bearing messages. For file errors, run
+  `mms config validate` locally for details.
 - An empty tool filter now matches no tools in `mms tune` and
   `stm_tuning_recommendations`; omit the filter to analyze all tools. In particular,
   `mms tune --apply --yes --tool ""` no longer writes overrides for other tools (#1036).
 
 ### Fixed
 
+- Match `mms list` and `mms status` validity to startup parsing, including
+  rejected environment variables, without logging raw validation values
+  from read-only diagnostics (#1051). **Behavior change**: see the upgrade
+  notes above.
+- Keep each LLM compression fallback reason with its own result so
+  overlapping calls cannot mislabel proxy metrics (#1055).
+  **Behavior change**: see the upgrade notes above.
 - Honor empty tool filters in compression tuning recommendations and report counts.
   **Behavior change**: see the upgrade notes above (#1036).
 

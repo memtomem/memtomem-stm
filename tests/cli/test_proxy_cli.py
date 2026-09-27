@@ -1191,7 +1191,8 @@ class TestStatus:
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["config_valid"] is False
-        assert "Duplicate upstream prefixes" in data["config_error"]
+        assert "value_error" in data["config_error"]
+        assert "dup" not in data["config_error"]
 
     def test_valid_config_marked_valid_in_json(self, runner, config):
         config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
@@ -1347,12 +1348,12 @@ class TestStatus:
         the ``mms list`` ``*`` marker: fully-pruned entries count, an
         entry with an un-pruned duplicate does not."""
 
-        def _entry(*, source_pruned: bool, dup_pruned: bool | None = None) -> dict:
+        def _entry(prefix: str, *, source_pruned: bool, dup_pruned: bool | None = None) -> dict:
             duplicates = (
                 [] if dup_pruned is None else [{"kind": "claude-desktop", "pruned": dup_pruned}]
             )
             return {
-                "prefix": "xx",
+                "prefix": prefix,
                 "transport": "stdio",
                 "command": "npx",
                 "origin": {
@@ -1369,8 +1370,8 @@ class TestStatus:
                 {
                     "enabled": True,
                     "upstream_servers": {
-                        "gone": _entry(source_pruned=True),
-                        "partial": _entry(source_pruned=True, dup_pruned=False),
+                        "gone": _entry("go", source_pruned=True),
+                        "partial": _entry("pt", source_pruned=True, dup_pruned=False),
                         "manual": {"prefix": "mn", "command": "npx"},
                     },
                 }
@@ -1556,9 +1557,9 @@ class TestListServers:
         entries without provenance (#475 PR4). The pruned legend points
         at ``mms eject``."""
 
-        def _entry(kind: str, pruned: bool) -> dict:
+        def _entry(prefix: str, kind: str, pruned: bool) -> dict:
             return {
-                "prefix": "xx",
+                "prefix": prefix,
                 "transport": "stdio",
                 "command": "npx",
                 "origin": {
@@ -1576,8 +1577,8 @@ class TestListServers:
                     "enabled": True,
                     "upstream_servers": {
                         "manual": {"prefix": "mn", "command": "npx"},
-                        "stm-only": _entry("claude-user", pruned=True),
-                        "dual": _entry("claude-desktop", pruned=False),
+                        "stm-only": _entry("so", "claude-user", pruned=True),
+                        "dual": _entry("du", "claude-desktop", pruned=False),
                     },
                 }
             ),

@@ -4094,8 +4094,7 @@ class ProxyManager:
                         self._llm_compressor = LLMCompressor(llm_cfg)
                         self._llm_compressor_cfg = llm_cfg
                     # Capture the current instance under the lock so a later
-                    # concurrent config swap can't re-bind ``self._llm_compressor``
-                    # before we read ``.last_fallback`` below.
+                    # concurrent config swap cannot re-bind it during this call.
                     compressor = self._llm_compressor
                 # #289: scan for API keys / JWT / private keys before sending
                 # the response to the LLM provider. Default-on; operators
@@ -4108,10 +4107,10 @@ class ProxyManager:
                 privacy_patterns = (
                     PRIVACY_CREDENTIAL_PATTERNS if llm_cfg.privacy_scan_enabled else None
                 )
-                result = await compressor.compress(
+                llm_result = await compressor.compress(
                     text, max_chars=max_chars, privacy_patterns=privacy_patterns
                 )
-                return result, compressor.last_fallback
+                return llm_result.text, llm_result.fallback_reason
             logger.warning(
                 "LLM_SUMMARY requested for %s/%s but no llm config found; falling back to truncate",
                 server,
