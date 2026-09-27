@@ -31,7 +31,7 @@ from memtomem_stm.surfacing.feedback_store import (
     OpportunityRow,
     load_hmac_key,
 )
-from memtomem_stm.surfacing.grams import gram_hashes, keyed_hash, path_key
+from memtomem_stm.surfacing.grams import _PLATFORM_CASEFOLD, gram_hashes, keyed_hash, path_key
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DAY = 86400.0
@@ -152,7 +152,9 @@ def _main_records(cwd: str = "/Users/tester/repo") -> list[dict[str, Any]]:
 
 
 def _sub_records() -> list[dict[str, Any]]:
-    record = _tool_use("s1", "msg_S", "toolu_S", "Read", {"file_path": NOTE}, 3, "/sub-cwd-sentinel")
+    record = _tool_use(
+        "s1", "msg_S", "toolu_S", "Read", {"file_path": NOTE}, 3, "/sub-cwd-sentinel"
+    )
     record["agentId"] = "someone-else"  # the path decides the stream, not this field
     return [record, _result("s2", "toolu_S", 4)]
 
@@ -248,7 +250,9 @@ def _record_event(
         store.close()
     if created_at is not None:
         with sqlite3.connect(env["feedback"]) as db:
-            db.execute("UPDATE surfacing_events SET created_at = ? WHERE id = ?", (created_at, event_id))
+            db.execute(
+                "UPDATE surfacing_events SET created_at = ? WHERE id = ?", (created_at, event_id)
+            )
 
 
 # ── contract constants ─────────────────────────────────────────────────
@@ -262,51 +266,56 @@ def test_wrapper_and_tool_names_match_the_hook() -> None:
 # ── entry paths ────────────────────────────────────────────────────────
 
 
+def _n(path: str) -> str:
+    """A POSIX-literal expectation in this platform's lexical form (``\\`` on Windows)."""
+    return os.path.normpath(path)
+
+
 def _paths(tool: str, tool_input: dict[str, Any], cwd: str | None = "/r") -> set[str]:
     return st.entry_path_keys(tool, tool_input, cwd, casefold=False)[0]
 
 
 def test_read_path_absolute_and_relative() -> None:
-    assert _paths("read", {"file_path": "/a/B.md"}) == {"/a/B.md"}
-    assert _paths("read", {"file_path": "sub/../B.md"}) == {"/r/B.md"}
+    assert _paths("read", {"file_path": _n("/a/B.md")}) == {_n("/a/B.md")}
+    assert _paths("read", {"file_path": "sub/../B.md"}) == {_n("/r/B.md")}
     assert _paths("read", {"file_path": "B.md"}, cwd=None) == set()
 
 
 def test_bash_cumulative_cd_and_token_shapes() -> None:
     keys = _paths("shell", {"command": "cd sub && cd child && cat ../x.md"})
-    assert "/r/sub/x.md" in keys  # the cumulative directory, as the shell resolves it
-    assert "/r/x.md" in keys  # against cwd too (a cd can fail)
+    assert _n("/r/sub/x.md") in keys  # the cumulative directory, as the shell resolves it
+    assert _n("/r/x.md") in keys  # against cwd too (a cd can fail)
     keys = _paths("shell", {"command": "grep -n foo --file=/a/y.md /a/z.py:12:3 >/a/out.md"})
-    assert {"/a/y.md", "/a/z.py", "/a/out.md"} <= keys
+    assert {_n("/a/y.md"), _n("/a/z.py"), _n("/a/out.md")} <= keys
 
 
 def test_bash_cd_applies_only_to_later_tokens() -> None:
     keys = _paths("shell", {"command": "cat x.md && cd sub"})
-    assert "/r/x.md" in keys
-    assert "/r/sub/x.md" not in keys  # the read happened before the cd
-    assert "/r/sub/sub" not in keys  # a cd's target resolves against the dirs before it
+    assert _n("/r/x.md") in keys
+    assert _n("/r/sub/x.md") not in keys  # the read happened before the cd
+    assert _n("/r/sub/sub") not in keys  # a cd's target resolves against the dirs before it
 
 
 def test_bash_expands_only_a_bare_home(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOME", "/home/me")
     keys = _paths("shell", {"command": "cat ~/n.md ~other/n.md"})
-    assert "/home/me/n.md" in keys
-    assert not any(k.startswith("/home/other") for k in keys)
-    assert "/r/~other/n.md" in keys
+    assert _n("/home/me/n.md") in keys
+    assert not any(k.startswith(_n("/home/other")) for k in keys)
+    assert _n("/r/~other/n.md") in keys
 
 
 def test_grep_path_defaults_to_cwd_and_pattern_tokens() -> None:
     paths, patterns = st.entry_path_keys(
         "grep", {"pattern": r"notfoo\.py|Bar", "glob": "**/*.md"}, "/R", casefold=True
     )
-    assert paths == {"/r"}
+    assert paths == {_n("/r")}
     assert "notfoo.py" in patterns and "bar" in patterns
     assert "foo.py" not in patterns  # a substring never matches
 
 
 def test_casefold_is_passed_through() -> None:
-    assert _paths("read", {"file_path": "/A/B.md"}) == {"/A/B.md"}
-    assert st.entry_path_keys("read", {"file_path": "/A/B.md"}, None, casefold=True)[0] == {
+    assert _paths("read", {"file_path": _n("/A/B.md")}) == {_n("/A/B.md")}
+    assert st.entry_path_keys("read", {"file_path": _n("/A/B.md")}, None, casefold=True)[0] == {
         "/a/b.md"
     }
 
@@ -314,26 +323,33 @@ def test_casefold_is_passed_through() -> None:
 def test_entry_hashes_join_with_collection_hashes(env: dict[str, Path]) -> None:
     _record_event(env, EVENT_ID, arm="withheld")
     key = _key(env)
-    (_, _, _, lexical, dirs, basename, _), = _rows(env["feedback"], "SELECT * FROM surfacing_memory_paths")
-    read = st.entry_path_keys("read", {"file_path": NOTE}, None, casefold=True)[0]
+    ((_, _, _, lexical, dirs, basename, _),) = _rows(
+        env["feedback"], "SELECT * FROM surfacing_memory_paths"
+    )
+    read = st.entry_path_keys("read", {"file_path": NOTE}, None, casefold=_PLATFORM_CASEFOLD)[0]
     bash = st.entry_path_keys(
-        "shell", {"command": "cd notes && cat Alpha.md"}, "/Users/tester", casefold=True
+        "shell",
+        {"command": "cd notes && cat Alpha.md"},
+        "/Users/tester",
+        casefold=_PLATFORM_CASEFOLD,
     )[0]
     grep_paths, grep_tokens = st.entry_path_keys(
-        "grep", {"pattern": "Alpha.md", "path": "/Users/tester"}, None, casefold=True
+        "grep", {"pattern": "Alpha.md", "path": "/Users/tester"}, None, casefold=_PLATFORM_CASEFOLD
     )
     assert {keyed_hash(k, key) for k in read} == {lexical}
     assert lexical in {keyed_hash(k, key) for k in bash}
     assert {keyed_hash(k, key) for k in grep_paths} <= set(json.loads(dirs))
     assert basename in {keyed_hash(t, key) for t in grep_tokens}
-    assert path_key(NOTE, casefold=True) in read
+    assert path_key(NOTE) in read
 
 
 # ── injections ─────────────────────────────────────────────────────────
 
 
 def test_parse_injection_stm_block() -> None:
-    parsed = st.parse_injection([_block(EVENT_ID, r"- **n/a.md**: snake\_case word\_two three four")])
+    parsed = st.parse_injection(
+        [_block(EVENT_ID, r"- **n/a.md**: snake\_case word\_two three four")]
+    )
     assert parsed.event_id == EVENT_ID
     assert parsed.stm_wrapped is True
     assert parsed.header_sha256 == hashlib.sha256(b"## Relevant Memories").hexdigest()
@@ -374,11 +390,18 @@ def test_extraction_rows_and_keys(env: dict[str, Path]) -> None:
             "SELECT call_key, stream_key, ordinal, tool, eligible, ok, message_key FROM ledger",
         )
     }
-    assert ledger[keyed_hash("toolu_A", key)] == (main_key, 1, "shell", 1, 1, keyed_hash("msg_A", key))
+    assert ledger[keyed_hash("toolu_A", key)] == (
+        main_key,
+        1,
+        "shell",
+        1,
+        1,
+        keyed_hash("msg_A", key),
+    )
     assert ledger[keyed_hash("toolu_B", key)][2:4] == ("read", 1)
     assert ledger[keyed_hash("toolu_C", key)][2:5] == ("other", 0, 0)  # indexed, not an entry
     assert ledger[keyed_hash("toolu_S", key)][:2] == (sub_key, 0)
-    (event_key, call_key, stream, wrapped, grams), = _rows(
+    ((event_key, call_key, stream, wrapped, grams),) = _rows(
         env["trial"],
         "SELECT event_key, call_key, stream_key, stm_wrapped, grams FROM injection_grams",
     )
@@ -389,7 +412,9 @@ def test_extraction_rows_and_keys(env: dict[str, Path]) -> None:
         1,
     )
     assert gram_hashes("alpha beta gamma delta", key) <= set(st.unpack_grams(grams))
-    outputs = _rows(env["trial"], "SELECT ordinal, grams FROM output_grams WHERE stream_key = ?", (main_key,))
+    outputs = _rows(
+        env["trial"], "SELECT ordinal, grams FROM output_grams WHERE stream_key = ?", (main_key,)
+    )
     text_grams = dict(outputs)[8]
     assert gram_hashes("reuse alpha beta gamma", key) <= set(st.unpack_grams(text_grams))
 
@@ -497,7 +522,9 @@ def test_shared_records_extracted_in_any_order(
     assert _dump(env["trial"]) == _dump(together["trial"])
     key = _key(env)
     streams = _rows(
-        env["trial"], "SELECT stream_key FROM ledger WHERE call_key = ?", (keyed_hash("toolu_A", key),)
+        env["trial"],
+        "SELECT stream_key FROM ledger WHERE call_key = ?",
+        (keyed_hash("toolu_A", key),),
     )
     assert len(streams) == 2  # each file keeps its own copy; nothing is deduplicated
 
@@ -697,7 +724,7 @@ def test_only_drawn_rows_are_copied_and_keys_join(env: dict[str, Path]) -> None:
     summary = _extract(env)
     key = _key(env)
     assert summary.assignments_added == 1
-    (event_key, stream, call, arm, rate, memory_keys), = _rows(
+    ((event_key, stream, call, arm, rate, memory_keys),) = _rows(
         env["trial"],
         "SELECT event_key, stream_key, call_key, arm, holdout_rate, memory_keys FROM assignments",
     )
@@ -709,9 +736,14 @@ def test_only_drawn_rows_are_copied_and_keys_join(env: dict[str, Path]) -> None:
         (stream, call),
     ) == [(1,)]
     assert _rows(env["trial"], "SELECT event_key FROM injection_grams") == [(event_key,)]
-    memories = _rows(env["trial"], "SELECT event_key, memory_key, eligible FROM assignment_memories")
+    memories = _rows(
+        env["trial"], "SELECT event_key, memory_key, eligible FROM assignment_memories"
+    )
     assert memories == [(event_key, keyed_hash(MEMORY_ID, key), 1)]
-    opps = _rows(env["trial"], "SELECT opportunity_key, event_key, gate_decision FROM assignment_opportunities")
+    opps = _rows(
+        env["trial"],
+        "SELECT opportunity_key, event_key, gate_decision FROM assignment_opportunities",
+    )
     assert opps == [(keyed_hash("o1", key), event_key, "held_out")]
     assert _extract(env).assignments_added == 0
 
@@ -734,7 +766,9 @@ def _burn_in(env: dict[str, Path], start: float, events: int = 3) -> None:
 
 def _freeze(env: dict[str, Path], now: float, **kwargs: Any) -> dict[str, object]:
     kwargs.setdefault("min_events", 3)
-    return st.freeze(env["trial"], env["feedback"], holdout_rate=0.2, target=100, now=lambda: now, **kwargs)
+    return st.freeze(
+        env["trial"], env["feedback"], holdout_rate=0.2, target=100, now=lambda: now, **kwargs
+    )
 
 
 def test_freeze_writes_the_trial_record(env: dict[str, Path]) -> None:
@@ -752,7 +786,7 @@ def test_freeze_writes_the_trial_record(env: dict[str, Path]) -> None:
         )
     result = _freeze(env, start + 8 * DAY)
     key = _key(env)
-    (stoplist, digest, size, b_start, b_end, events, n, t, rate, target, fp, frozen), = _rows(
+    ((stoplist, digest, size, b_start, b_end, events, n, t, rate, target, fp, frozen),) = _rows(
         env["trial"],
         "SELECT stoplist, stoplist_sha256, stoplist_size, burnin_start, burnin_end, burnin_events, "
         "n, t, holdout_rate, target_count, key_fingerprint, frozen_at FROM trial_record",
@@ -761,7 +795,15 @@ def test_freeze_writes_the_trial_record(env: dict[str, Path]) -> None:
     assert set(st.unpack_grams(stoplist)) == expected
     assert not gram_hashes("solo only words appear", key) & set(st.unpack_grams(stoplist))
     assert digest == hashlib.sha256(stoplist).hexdigest() == result["stoplist_sha256"]
-    assert (size, b_start, events, n, t, rate, target) == (len(expected), start, 6, 12, 600, 0.2, 100)
+    assert (size, b_start, events, n, t, rate, target) == (
+        len(expected),
+        start,
+        6,
+        12,
+        600,
+        0.2,
+        100,
+    )
     assert b_end == frozen == start + 8 * DAY
     assert fp == st.key_fingerprint(key)
     with pytest.raises(st.TrialError, match="already frozen"):
