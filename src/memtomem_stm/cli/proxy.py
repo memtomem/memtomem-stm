@@ -2007,12 +2007,13 @@ def status(config_path: str | None, *, as_json: bool = False) -> None:
         warning = _runtime_config_warning(runtime)
         click.echo(f"{_warn('Warning:')} {warning}: {_disp(config_error)}")
     click.echo(f"Config : {resolved}")
-    click.echo(f"Enabled: {'yes' if enabled else 'no'}")
+    file_note = " (file value; runtime unavailable)" if runtime.config is None else ""
+    click.echo(f"Enabled: {'yes' if enabled else 'no'}{file_note}")
     pruned_suffix = f" ({pruned_count} host-pruned)" if pruned_count else ""
     if effective_count is not None and effective_count != len(servers):
         click.echo(f"Servers: {effective_count} effective ({len(servers)} file){pruned_suffix}")
     else:
-        click.echo(f"Servers: {len(servers)}{pruned_suffix}")
+        click.echo(f"Servers: {len(servers)}{pruned_suffix}{file_note}")
     if tuning["ready"]:
         click.echo(
             f"Tuning : ready for {len(tuning['tools'])} tool(s); "
@@ -2139,7 +2140,10 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
         prefix = cfg.get("prefix", "")
         compression = compression_info.get(name, {}).get("strategy", "unknown")
         surfacing = "on" if cfg.get("surfacing_enabled", True) else "off"
-        origin_cell = _origin_cell(cfg)
+        # Keep provenance strict for file entries: model parsing coerces a
+        # hand-edited "pruned": "true" to bool, but status/remove inspect the
+        # raw flag and must agree on whether the host original was pruned.
+        origin_cell = _origin_cell(servers.get(name, cfg))
         any_pruned = any_pruned or origin_cell.endswith("*")
         if transport == "stdio":
             cmd = cfg.get("command", "")

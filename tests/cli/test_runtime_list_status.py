@@ -144,3 +144,59 @@ def test_settings_error_names_candidates_across_config_sections(tmp_path, monkey
     assert "MEMTOMEM_STM_PROXY__TOOLGRAPH__ARGS" in error
     assert "MEMTOMEM_STM_SURFACING__EXCLUDE_TOOLS" in error
     assert "secret-" not in error
+
+
+def test_file_origin_marker_agrees_with_status_for_coerced_pruned_flag(tmp_path):
+    path = tmp_path / "proxy.json"
+    path.write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "upstream_servers": {
+                    "s": {
+                        "prefix": "s",
+                        "command": "echo",
+                        "origin": {
+                            "source": {"kind": "claude-user", "pruned": "true"},
+                            "original": {"command": "echo"},
+                        },
+                    }
+                },
+            }
+        )
+    )
+    runner = CliRunner()
+    listed = runner.invoke(cli, ["list", "--config", str(path)])
+    status = runner.invoke(cli, ["status", "--config", str(path)])
+    assert listed.exit_code == status.exit_code == 0
+    row = next(line for line in listed.stdout.splitlines() if line.startswith("s "))
+    assert "claude-user" in row
+    assert "claude-user*" not in row
+    assert "host original pruned" not in listed.stdout
+    assert "host-pruned" not in status.stdout
+
+
+def test_invalid_status_labels_file_values_when_runtime_is_unavailable(tmp_path, monkeypatch):
+    path = tmp_path / "proxy.json"
+    path.write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "default_compression": "invalid",
+                "upstream_servers": {"a": {"prefix": "a", "command": "echo"}},
+            }
+        )
+    )
+    monkeypatch.setenv(
+        "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS",
+        json.dumps({"b": {"prefix": "b", "command": "echo"}}),
+    )
+    runner = CliRunner()
+    human = runner.invoke(cli, ["status", "--config", str(path)])
+    assert human.exit_code == 0, human.stdout
+    assert "Enabled: yes (file value; runtime unavailable)" in human.stdout
+    assert "Servers: 1 (file value; runtime unavailable)" in human.stdout
+    data = json.loads(runner.invoke(cli, ["status", "--config", str(path), "--json"]).stdout)
+    assert data["config_valid"] is False
+    assert data["server_count"] == 1
+    assert data["effective_server_count"] is None

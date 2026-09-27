@@ -23,7 +23,8 @@ changes inline only. See the deprecation policy in
   `--json`. The existing JSON `servers` map still describes the file, while
   `effective_servers` and `server_sources` describe the runtime view.
   `mms status --json` adds `effective_server_count` (`null` if runtime
-  validation fails). `list`/`status` now mark startup-rejected environments
+  validation fails); its text output labels `Enabled` and `Servers` as file
+  values in that state. `list`/`status` now mark startup-rejected environments
   invalid and report value-free `config_error` locations and type codes in
   place of the previous value-bearing messages. For file errors, run
   `mms config validate` locally for details.
