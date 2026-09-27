@@ -283,3 +283,29 @@ def test_invalid_file_keeps_startup_completed_env_server(tmp_path, monkeypatch):
     assert "env-command" in row
     assert "file-command" not in row
     assert "claude-user*" in row
+
+
+def test_status_labels_nonboolean_file_enabled_when_startup_is_invalid(tmp_path, monkeypatch):
+    path = tmp_path / "proxy.json"
+    path.write_text('{"enabled": "nope", "upstream_servers": {}}')
+    monkeypatch.setenv("MEMTOMEM_STM_PROXY", "[1]")
+    human = CliRunner().invoke(cli, ["status", "--config", str(path)])
+    assert human.exit_code == 0, human.output
+    assert "server cannot start" in human.stdout
+    assert "Enabled: invalid (file value; runtime unavailable)" in human.stdout
+    data = json.loads(CliRunner().invoke(cli, ["status", "--config", str(path), "--json"]).stdout)
+    assert data["config_valid"] is False
+    assert data["enabled"] == "nope"
+    assert data["effective_server_count"] is None
+
+
+def test_status_enabled_uses_environment_override_on_valid_file(tmp_path, monkeypatch):
+    path = tmp_path / "proxy.json"
+    path.write_text('{"enabled": false, "upstream_servers": {}}')
+    monkeypatch.setenv("MEMTOMEM_STM_PROXY__ENABLED", "true")
+    runner = CliRunner()
+    data = json.loads(runner.invoke(cli, ["status", "--config", str(path), "--json"]).stdout)
+    assert data["config_valid"] is True
+    assert data["enabled"] is True
+    human = runner.invoke(cli, ["status", "--config", str(path)])
+    assert "Enabled: yes" in human.stdout

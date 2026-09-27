@@ -480,6 +480,7 @@ def _runtime_proxy_read(path: Path, config_path: str) -> _RuntimeProxyRead:
     from memtomem_stm.config import stm_config_for_cli
     from memtomem_stm.proxy.config import (
         ProxyConfig,
+        _rejected_env_error,
         collect_proxy_env_overrides,
         env_var_hint_for_validation_error,
         validation_error_summary,
@@ -504,6 +505,12 @@ def _runtime_proxy_read(path: Path, config_path: str) -> _RuntimeProxyRead:
         names = {name for name in os.environ if name.lower().startswith("memtomem_stm_")}
         suffix = " (check one of: " + ", ".join(sorted(names)) + ")" if names else ""
         return _RuntimeProxyRead(None, "invalid MEMTOMEM_STM_* settings" + suffix, env_names, True)
+
+    rejected_env_error = _rejected_env_error(overlay)
+    if rejected_env_error is not None:
+        # An explicit --config init value can mask a rejected bare proxy env
+        # block during settings construction, but bare server startup fails.
+        return _RuntimeProxyRead(None, rejected_env_error, env_names, True)
 
     loaded = ProxyConfig.load_from_file_with_status(
         path, env_overrides=overlay, missing_ok=False, log_warnings=False, log_errors=False
@@ -2026,7 +2033,8 @@ def status(config_path: str | None, *, as_json: bool = False) -> None:
     click.echo(f"Config : {resolved}")
     file_note = " (file value; runtime unavailable)" if runtime.config is None else ""
     fallback_note = " (env/default fallback)" if runtime.file_fallback else ""
-    click.echo(f"Enabled: {'yes' if enabled else 'no'}{file_note}{fallback_note}")
+    enabled_label = ("yes" if enabled else "no") if isinstance(enabled, bool) else "invalid"
+    click.echo(f"Enabled: {enabled_label}{file_note}{fallback_note}")
     pruned_suffix = f" ({pruned_count} host-pruned)" if pruned_count else ""
     if runtime.file_fallback:
         click.echo(f"Servers: {effective_count} env/default fallback ({len(servers)} file)")
