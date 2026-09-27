@@ -279,6 +279,13 @@ def test_bash_cumulative_cd_and_token_shapes() -> None:
     assert {"/a/y.md", "/a/z.py", "/a/out.md"} <= keys
 
 
+def test_bash_cd_applies_only_to_later_tokens() -> None:
+    keys = _paths("shell", {"command": "cat x.md && cd sub"})
+    assert "/r/x.md" in keys
+    assert "/r/sub/x.md" not in keys  # the read happened before the cd
+    assert "/r/sub/sub" not in keys  # a cd's target resolves against the dirs before it
+
+
 def test_bash_expands_only_a_bare_home(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOME", "/home/me")
     keys = _paths("shell", {"command": "cat ~/n.md ~other/n.md"})
@@ -331,6 +338,13 @@ def test_parse_injection_stm_block() -> None:
     assert parsed.header_sha256 == hashlib.sha256(b"## Relevant Memories").hexdigest()
     assert "snake_case word_two" in parsed.text  # formatter escapes undone
     assert _SURFACED_CLOSE not in parsed.text
+
+
+@pytest.mark.parametrize("header", ["", "\n## Two-line header"])
+def test_parse_injection_keeps_an_empty_first_header_line(header: str) -> None:
+    block = f"{_SURFACED_OPEN}\n{header}\n> preamble\n- bullet\n{_SURFACED_CLOSE}"
+    parsed = st.parse_injection([block])
+    assert parsed.header_sha256 == hashlib.sha256(b"").hexdigest()
 
 
 def test_parse_injection_foreign_record() -> None:
@@ -416,13 +430,18 @@ def test_result_arriving_in_a_later_run_sets_ok(env: dict[str, Path]) -> None:
     assert _rows(env["trial"], "SELECT ok FROM ledger WHERE call_key = ?", (call,)) == [(1,)]
 
 
-def test_shared_records_extracted_in_any_order(env: dict[str, Path], tmp_path: Path) -> None:
+@pytest.mark.parametrize("first", ["fork", "main"])
+def test_shared_records_extracted_in_any_order(
+    env: dict[str, Path], tmp_path: Path, first: str
+) -> None:
     fork = env["main"].with_name("99999999-2222-3333-4444-555555555555.jsonl")
-    _write(fork, _main_records()[:4])  # a fork copies the same uuids and call ids
-    env["main"].unlink()
-    _extract(env)  # fork first
-    _write(env["main"], _main_records())
-    _extract(env)
+    held = {"fork": env["main"], "main": fork}[first]
+    records = {env["main"]: _main_records(), fork: _main_records()[:4]}
+    _write(fork, records[fork])  # a fork copies the same uuids and call ids
+    held.unlink()
+    _extract(env)  # one file on the first day
+    _write(held, records[held])
+    _extract(env)  # the other on the next
     together = dict(env, trial=tmp_path / "together.db")
     _extract(together)
     assert _dump(env["trial"]) == _dump(together["trial"])
@@ -697,6 +716,39 @@ def test_freeze_writes_the_trial_record(env: dict[str, Path]) -> None:
         _freeze(env, start + 9 * DAY)
 
 
+def test_freeze_ignores_events_after_frozen_at(env: dict[str, Path]) -> None:
+    start = 5_000_000.0
+    _burn_in(env, start)
+    frozen = start + 8 * DAY
+    for n in range(3):  # written "during" the freeze, dated at or after its end
+        _record_event(
+            env,
+            f"ee{n:014x}",
+            arm=None,
+            memory_id=f"late{n}",
+            preview="late words only here now",
+            created_at=frozen + n,
+        )
+    result = _freeze(env, frozen)
+    (stoplist,) = _rows(env["trial"], "SELECT stoplist FROM trial_record")[0]
+    assert result["burnin_events"] == 3
+    assert not gram_hashes("late words only here", _key(env)) & set(st.unpack_grams(stoplist))
+
+
+def test_freeze_checks_the_shortest_retention_any_run_recorded(env: dict[str, Path]) -> None:
+    start = 6_000_000.0
+    _extract(env, now=lambda: start, stats_retention_days=5)
+    _burn_in(env, start + 1)  # a later run with the default 90
+    with pytest.raises(st.TrialError, match="longer than stats_retention_days"):
+        _freeze(env, start + 8 * DAY)
+
+
+def test_freeze_without_a_run_leaves_no_state(env: dict[str, Path]) -> None:
+    with pytest.raises(st.TrialError, match="no extractor run"):
+        _freeze(env, 1.0)
+    assert not env["trial"].exists()
+
+
 def test_burn_in_stoplist_counts_distinct_memories() -> None:
     # g1: memories a and b (a has two differing rows) -> 2, kept; g3: a, c, d -> 3, stoplisted
     rows = [
@@ -734,7 +786,8 @@ def test_freeze_refusals(
             _record_event(env, "d" * 16, arm="shown", created_at=start + 10)
     with pytest.raises(st.TrialError, match=message):
         _freeze(env, start + now_days * DAY, **kwargs)
-    assert _rows(env["trial"], "SELECT COUNT(*) FROM trial_record") == [(0,)]
+    if setup != "none":  # "none" leaves no DB at all (test_freeze_without_a_run_leaves_no_state)
+        assert _rows(env["trial"], "SELECT COUNT(*) FROM trial_record") == [(0,)]
 
 
 @pytest.mark.parametrize("rate", [0.0, 0.6])

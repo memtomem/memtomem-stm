@@ -210,23 +210,13 @@ def _bash_paths(command: str, cwd: str | None, casefold: bool) -> set[str]:
         tokens = shlex.split(command, posix=True)
     except ValueError:
         tokens = command.split()
+    # A token resolves against cwd and every cd target *earlier* in the command
+    # (cumulative, as the shell applies them); a cd after it cannot have moved it,
+    # and a cd's own target resolves against the directories before that cd.
     bases: list[str | None] = [cwd]
     current = cwd
-    for index, token in enumerate(tokens[:-1]):
-        if token != "cd":
-            continue
-        target = _expand_home(tokens[index + 1].strip(_REDIRECT_CHARS))
-        if not target or target == "-":
-            continue
-        if os.path.isabs(target):
-            current = os.path.normpath(target)
-        elif current is not None:
-            current = os.path.normpath(os.path.join(current, target))
-        else:
-            continue
-        bases.append(current)
     out: set[str] = set()
-    for token in tokens:
+    for index, token in enumerate(tokens):
         pieces = {token}
         for piece in token.split("="):
             piece = piece.strip(_REDIRECT_CHARS)
@@ -236,6 +226,17 @@ def _bash_paths(command: str, cwd: str | None, casefold: bool) -> set[str]:
                 lexical = _lexical(piece, base, casefold)
                 if lexical is not None:
                     out.add(lexical)
+        if index == 0 or tokens[index - 1] != "cd":
+            continue
+        target = _expand_home(token.strip(_REDIRECT_CHARS))
+        if not target or target == "-":
+            continue
+        if os.path.isabs(target):
+            current = os.path.normpath(target)
+        elif current is not None:
+            current = os.path.normpath(os.path.join(current, target))
+        if current is not None and current not in bases:
+            bases.append(current)
     return out
 
 
@@ -299,7 +300,10 @@ def parse_injection(content: Any) -> Injection:
     wrapped = text.startswith(SURFACED_OPEN)
     inner = text
     if wrapped:
-        inner = text[len(SURFACED_OPEN) :].lstrip("\n")
+        inner = text[len(SURFACED_OPEN) :]
+        # exactly the wrapper's own separator: an empty section_header is a
+        # real (empty) first line, and collection hashed it as one
+        inner = inner[1:] if inner.startswith("\n") else inner
         close = inner.rfind(SURFACED_CLOSE)
         if close != -1:
             inner = inner[:close].rstrip("\n")
@@ -846,26 +850,28 @@ def freeze(
     if target <= 0:
         raise TrialError("--target must be positive")
     key = load_hmac_key(feedback_db)
+    if not trial_db.expanduser().exists():
+        raise TrialError("no extractor run yet; the burn-in starts at the first run")
     with closing(open_trial_db(trial_db)) as db:
+        start = db.execute("SELECT MIN(started_at) FROM coverage").fetchone()[0]
+        if start is None:
+            raise TrialError("no extractor run yet; the burn-in starts at the first run")
         fingerprint = pin_key(db, key)
         if db.execute("SELECT 1 FROM trial_record").fetchone() is not None:
             raise TrialError("the trial record is already frozen")
-        start, retention = db.execute(
-            "SELECT started_at, stats_retention_days FROM coverage ORDER BY run_id LIMIT 1"
-        ).fetchone() or (None, None)
-        if start is None:
-            raise TrialError("no extractor run yet; the burn-in starts at the first run")
-        latest_retention = db.execute(
-            "SELECT stats_retention_days FROM coverage ORDER BY run_id DESC LIMIT 1"
+        # the shortest retention any run recorded: a setting raised later cannot
+        # bring back rows an earlier, shorter one already deleted
+        shortest = db.execute(
+            "SELECT MIN(stats_retention_days) FROM coverage WHERE stats_retention_days > 0"
         ).fetchone()[0]
         frozen_at = now()
         elapsed_days = (frozen_at - start) / 86400
         if elapsed_days < min_days:
             raise TrialError(f"burn-in has run {elapsed_days:.1f} days; needs {min_days}")
-        if latest_retention and elapsed_days > latest_retention:
+        if shortest is not None and elapsed_days > shortest:
             raise TrialError(
                 f"burn-in ({elapsed_days:.1f} days) is longer than stats_retention_days "
-                f"({latest_retention}); its earliest snippets may be gone"
+                f"({shortest}); its earliest snippets may be gone"
             )
         resolved = feedback_db.expanduser().resolve()
         with closing(sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True)) as src:
@@ -881,12 +887,14 @@ def freeze(
                 )
             src.execute("BEGIN")
             events = src.execute(
-                "SELECT COUNT(*) FROM surfacing_events WHERE created_at >= ?", (start,)
+                "SELECT COUNT(*) FROM surfacing_events WHERE created_at >= ? AND created_at < ?",
+                (start, frozen_at),
             ).fetchone()[0]
             rows = src.execute(
                 "SELECT p.memory_id, p.snippet_grams FROM surfacing_memory_paths p "
-                "JOIN surfacing_events e ON e.id = p.surfacing_id WHERE e.created_at >= ?",
-                (start,),
+                "JOIN surfacing_events e ON e.id = p.surfacing_id "
+                "WHERE e.created_at >= ? AND e.created_at < ?",
+                (start, frozen_at),
             ).fetchall()
             src.execute("COMMIT")
         if events < min_events:
