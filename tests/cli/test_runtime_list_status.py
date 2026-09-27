@@ -12,6 +12,7 @@ from memtomem_stm.cli.proxy import cli
     "env_items,expected_var",
     [
         ([("MEMTOMEM_STM_PROXY", "[]")], "MEMTOMEM_STM_PROXY"),
+        ([("MEMTOMEM_STM_PROXY", "[1]")], "MEMTOMEM_STM_PROXY"),
         (
             [
                 ("MEMTOMEM_STM_PROXY__TOOLGRAPH__ARGS", "secret-not-a-list"),
@@ -50,6 +51,9 @@ def test_invalid_environment_agrees_with_startup(tmp_path, monkeypatch, env_item
         assert human.exit_code == 0, human.output
         assert expected_var in human.output
         assert "secret-not-a-list" not in human.output
+        assert "server cannot start" in human.output
+        assert "config file present but fails validation" not in human.output
+        assert human.output.count("runtime configuration invalid") == 1
         if command == "list":
             row = next(line for line in human.output.splitlines() if line.startswith("s "))
             assert row.split()[3] == "unknown"
@@ -97,6 +101,38 @@ def test_effective_server_summary_does_not_print_env_secrets(tmp_path, monkeypat
     assert result.exit_code == 0, result.output
     assert "secret-value" not in result.output
     assert set(json.loads(result.output)["effective_servers"]) == {"e"}
+
+
+def test_list_masks_environment_url_credentials_and_args(tmp_path, monkeypatch):
+    path = tmp_path / "proxy.json"
+    path.write_text('{"enabled": true, "upstream_servers": {}}')
+    monkeypatch.setenv(
+        "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS",
+        json.dumps(
+            {
+                "remote": {
+                    "prefix": "r",
+                    "transport": "streamable_http",
+                    "url": "https://user:tok123@h.example/mcp?api_key=zzz#fragsecret",
+                },
+                "local": {
+                    "prefix": "l",
+                    "command": "echo",
+                    "args": ["--token", "secret-arg"],
+                },
+            }
+        ),
+    )
+    result = CliRunner().invoke(cli, ["list", "--config", str(path)])
+    assert result.exit_code == 0, result.output
+    remote = next(line for line in result.stdout.splitlines() if line.startswith("remote "))
+    local = next(line for line in result.stdout.splitlines() if line.startswith("local "))
+    assert "https://h.example/mcp" in remote
+    assert "tok123" not in result.stdout
+    assert "api_key=zzz" not in result.stdout
+    assert "fragsecret" not in result.stdout
+    assert "[args hidden]" in local
+    assert "secret-arg" not in result.stdout
 
 
 @pytest.mark.parametrize("command", ["list", "status"])

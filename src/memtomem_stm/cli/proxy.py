@@ -492,8 +492,7 @@ def _runtime_proxy_read(path: Path, config_path: str) -> _RuntimeProxyRead:
     except ValidationError as exc:
         return _RuntimeProxyRead(
             None,
-            f"runtime configuration invalid: {validation_error_summary(exc)}"
-            + env_var_hint_for_validation_error(exc),
+            validation_error_summary(exc) + env_var_hint_for_validation_error(exc),
             env_names,
             True,
         )
@@ -510,7 +509,9 @@ def _runtime_proxy_read(path: Path, config_path: str) -> _RuntimeProxyRead:
     )
     error = loaded.error or loaded.env_error
     if loaded.config is None or error is not None:
-        return _RuntimeProxyRead(None, error or "proxy config unavailable", env_names)
+        return _RuntimeProxyRead(
+            None, error or "proxy config unavailable", env_names, loaded.env_error is not None
+        )
     return _RuntimeProxyRead(loaded.config, None, env_names)
 
 
@@ -525,6 +526,17 @@ def _runtime_config_warning(runtime: _RuntimeProxyRead) -> str:
     if runtime.startup_error:
         return _STARTUP_INVALID_WARNING
     return _CONFIG_INVALID_WARNING + "; run `mms config validate` for details"
+
+
+def _list_display_url(value: Any) -> str:
+    """Show an upstream URL without credentials or query/fragment values."""
+    if not isinstance(value, str):
+        return "(invalid URL)"
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return "(invalid URL)"
+    return urlunsplit(parts._replace(netloc=parts.netloc.rpartition("@")[2], query="", fragment=""))
 
 
 def _transport_field_error(transport: str, command: str, url: str) -> str | None:
@@ -2147,10 +2159,15 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
         any_pruned = any_pruned or origin_cell.endswith("*")
         if transport == "stdio":
             cmd = cfg.get("command", "")
-            args_str = " ".join(cfg.get("args", []))
+            args = cfg.get("args", [])
+            args_str = (
+                "[args hidden]"
+                if server_sources.get(name) in ("env", "file+env") and args
+                else " ".join(args)
+            )
             detail = f"{cmd} {args_str}".strip()
         else:
-            detail = cfg.get("url", "")
+            detail = _list_display_url(cfg.get("url", ""))
         # Escaped per cell, inside the pad: a CR in any of them would
         # otherwise redraw this row over the previous one and take the
         # whole table's alignment with it (#755). ``surfacing`` is computed
