@@ -972,8 +972,9 @@ class TestAnalyze:
         _seed_metrics(metrics_store, "srv", "t1", 10, violation=True)
         _seed_metrics(metrics_store, "srv", "t2", 10, violation=True)
         tuner = CompressionTuner(metrics_store)
-        recs = tuner.analyze(tool_filter="t1")
-        assert all(r.tool == "t1" for r in recs)
+        assert {r.tool for r in tuner.analyze(tool_filter=None)} == {"t1", "t2"}
+        assert [r.tool for r in tuner.analyze(tool_filter="t1")] == ["t1"]
+        assert tuner.analyze(tool_filter="") == []
 
 
 # ── formatting ──────────────────────────────────────────────────────────

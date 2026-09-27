@@ -1895,6 +1895,36 @@ class TestTuningRecommendations:
         result = await stm_tuning_recommendations(ctx=ctx)
         assert "not enabled" in result.lower()
 
+    async def test_empty_tool_filter_reports_no_tools_or_recommendations(self, tmp_path):
+        from memtomem_stm.proxy.metrics import CallMetrics
+        from memtomem_stm.proxy.metrics_store import MetricsStore
+
+        store = MetricsStore(tmp_path / "metrics.db")
+        store.initialize()
+        try:
+            for _ in range(6):
+                store.record(
+                    CallMetrics(
+                        server="srv",
+                        tool="big_tool",
+                        original_chars=30000,
+                        compressed_chars=8000,
+                        cleaned_chars=30000,
+                        compression_strategy="truncate",
+                        ratio_violation=True,
+                    )
+                )
+            ctx = _make_ctx(tracker=TokenTracker(metrics_store=store))
+            unfiltered = await stm_tuning_recommendations(ctx=ctx)
+            filtered = await stm_tuning_recommendations(tool="", ctx=ctx)
+        finally:
+            store.close()
+
+        assert "srv/big_tool" in unfiltered
+        assert "0 calls, 0 tools analyzed" in filtered
+        assert "No recommendations" in filtered
+        assert "srv/big_tool" not in filtered
+
 
 # ── app_lifespan ──────────────────────────────────────────────────────────
 

@@ -173,7 +173,7 @@ class CompressionTuner:
         tool_filter: str | None = None,
     ) -> list[TuningRecommendation]:
         profiles = self.get_profiles(since_seconds=since_seconds)
-        if tool_filter:
+        if tool_filter is not None:
             profiles = [p for p in profiles if p.tool == tool_filter]
 
         recommendations: list[TuningRecommendation] = []
@@ -444,7 +444,7 @@ def format_recommendations(
     ]
 
     if not recs:
-        lines.append("\nNo recommendations — all tools within healthy parameters.")
+        lines.append("\nNo recommendations.")
         return "\n".join(lines)
 
     for rec in recs:
