@@ -11,6 +11,19 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Added
+
+- **Randomized surfacing holdout, off by default.** `MEMTOMEM_STM_SURFACING__HOLDOUT_RATE`
+  (default `0.0`, clamped to `0.0`–`0.5`) withholds a random share of eligible hook-path
+  injections so a trial can measure whether surfacing changes what the agent does next.
+  A withheld call returns the tool response unchanged but writes the same rows a shown
+  call does; `surfacing_events` and `surfacing_opportunities` gain `arm` and
+  `holdout_rate` columns. Only Claude Code hook calls through the shared daemon are drawn;
+  the proxy path never is. `surfacing_stats`, `mms stats` and `mms doctor` count only
+  shown events as surfacings and report withheld ones separately, and `mms stats` /
+  `mms doctor` now also show the opportunity log. With the default rate no injection is
+  withheld.
+
 ## [0.6.0] — 2026-09-26
 
 ### Upgrade notes

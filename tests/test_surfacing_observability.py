@@ -17,6 +17,7 @@ from memtomem_stm.server import (
     _surfacing_verdict_line,
 )
 from memtomem_stm.surfacing.observability import (
+    COMPLETED_OUTCOMES,
     FAULT_OUTCOMES,
     FAULT_SKIP_REASONS,
     HEALTHY_SKIP_REASONS,
@@ -237,10 +238,13 @@ class TestSkipReasonCategorization:
         assert SEARCH_COMPLETED_SKIP_REASONS <= HEALTHY_SKIP_REASONS
         assert SEARCH_COMPLETED_SKIP_REASONS & FAULT_SKIP_REASONS == set()
         all_outcomes = set(get_args(Outcome))
-        assert SURFACED_OUTCOMES | FAULT_OUTCOMES == all_outcomes, (
-            f"unclassified Outcome values: {all_outcomes - (SURFACED_OUTCOMES | FAULT_OUTCOMES)}"
+        assert COMPLETED_OUTCOMES | FAULT_OUTCOMES == all_outcomes, (
+            f"unclassified Outcome values: {all_outcomes - (COMPLETED_OUTCOMES | FAULT_OUTCOMES)}"
         )
-        assert SURFACED_OUTCOMES & FAULT_OUTCOMES == set()
+        assert COMPLETED_OUTCOMES & FAULT_OUTCOMES == set()
+        # A withheld holdout call completed its search but surfaced nothing.
+        assert SURFACED_OUTCOMES < COMPLETED_OUTCOMES
+        assert COMPLETED_OUTCOMES - SURFACED_OUTCOMES == {"held_out"}
 
     def test_fault_skips_render_under_fault_subsection(self):
         """A snapshot with only LTM / circuit reasons renders the Fault

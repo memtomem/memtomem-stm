@@ -176,8 +176,8 @@ CREATE TABLE IF NOT EXISTS surfacing_memory_paths (
 -- the denominator the event table cannot give. Written fire-and-forget at the
 -- end of the call, so a row can be lost to a full write queue; the durable
 -- record of a delivery is still its ``surfacing_events`` row.
---   gate_decision  ``surfaced``, ``skip:<reason>``, ``empty_render`` or
---                  ``error:<kind>``
+--   gate_decision  ``surfaced``, ``held_out``, ``skip:<reason>``,
+--                  ``empty_render`` or ``error:<kind>``
 --   surfacing_id   the event this call minted and tried to write, when it got
 --                  that far; the event row can be missing (write failed)
 --   arg_shape_json counts about the arguments, never keys or values
@@ -186,6 +186,9 @@ CREATE TABLE IF NOT EXISTS surfacing_memory_paths (
 --   query_digest   ``sha256:`` + 16 hex of the extracted query, before the
 --                  sensitive-query substitution; NULL before extraction
 -- ``host_session_id`` is the hook host's session id; NULL on the proxy path.
+-- ``arm`` / ``holdout_rate`` (added columns, ``_OPPORTUNITIES_ADDED_COLUMNS``)
+-- are set only on a call where a holdout draw happened; such a row is never
+-- sampled out.
 -- Deleted by its own ``created_at`` in the stats-retention sweep.
 CREATE TABLE IF NOT EXISTS surfacing_opportunities (
     id              TEXT    PRIMARY KEY,
@@ -332,6 +335,10 @@ _EVENTS_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("host_agent_id", "TEXT"),
     ("id_advertised", "INTEGER"),
     ("header_digest", "TEXT"),
+    # Holdout assignment: ``shown`` / ``withheld``, NULL when no draw happened,
+    # and the (clamped) rate the draw used.
+    ("arm", "TEXT"),
+    ("holdout_rate", "REAL"),
 )
 """Columns added to ``surfacing_events`` after its first release, in order.
 
@@ -339,6 +346,15 @@ Ordering against the relax migration is load-bearing: that migration recreates
 ``surfacing_events`` from a hardcoded pre-#352 column list, so these are added
 AFTER it in :func:`_migrate` — a column added before it would be silently
 dropped on legacy NOT-NULL databases."""
+
+_OPPORTUNITIES_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("arm", "TEXT"),
+    ("holdout_rate", "REAL"),
+)
+"""Columns added to ``surfacing_opportunities`` after its first release."""
+
+_SHOWN_EVENT = "(arm IS NULL OR arm = 'shown')"
+"""Events that count as surfacings: a ``withheld`` row reached no one."""
 
 
 def _schema_statements(script: str) -> Iterator[str]:
@@ -378,6 +394,7 @@ def _migrate(db: sqlite3.Connection) -> None:
         _add_missing_columns(db, "surfacing_faults", (("last_recovered_at", "REAL"),))
         # Must stay after the relax migration — see its docstring.
         _add_missing_columns(db, "surfacing_events", _EVENTS_ADDED_COLUMNS)
+        _add_missing_columns(db, "surfacing_opportunities", _OPPORTUNITIES_ADDED_COLUMNS)
         db.execute(
             "INSERT OR IGNORE INTO stm_meta (name, value) VALUES (?, ?)",
             (_HMAC_KEY_NAME, secrets.token_bytes(KEY_BYTES)),
@@ -409,6 +426,11 @@ class EventProvenance:
     advertised id (the write failed or outran its ceiling, and the block was
     re-rendered without it) is not reflected: a row that lands after that
     still carries the pre-withdrawal values.
+
+    ``arm`` is ``shown`` or ``withheld`` when a holdout draw happened (else
+    ``None``), and ``holdout_rate`` the rate that draw used. A ``withheld``
+    row carries ``injected_chars = 0``; every other field matches what the
+    same call would have written as ``shown``.
     """
 
     injected_chars: int | None = None
@@ -417,6 +439,8 @@ class EventProvenance:
     host_agent_id: str | None = None
     id_advertised: bool | None = None
     header_digest: str | None = None
+    arm: str | None = None
+    holdout_rate: float | None = None
 
 
 @dataclass(frozen=True)
@@ -450,6 +474,8 @@ class OpportunityRow:
     query_digest: str | None = None
     surfacing_id: str | None = None
     score_scale: str | None = None
+    arm: str | None = None
+    holdout_rate: float | None = None
 
 
 def _opt_text(value: str | None) -> str | None:
@@ -516,13 +542,22 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
     ``available`` is ``False`` when the file is missing or has no
     ``surfacing_events`` table. The optional ``tool`` filter matches the raw
     tool name.
+
+    ``events_total`` counts surfacings, so a ``withheld`` holdout row is left
+    out of it and counted in ``withheld_total``. A file written before the
+    ``arm`` column existed is probed first and every row counts as shown.
+    ``opportunities_total`` / ``opportunity_decisions`` read the opportunity
+    log when the file has one.
     """
     resolved = db_path.expanduser().resolve()
     summary: dict[str, object] = {
         "path": str(resolved),
         "available": False,
         "events_total": 0,
+        "withheld_total": 0,
         "distinct_tools": 0,
+        "opportunities_total": 0,
+        "opportunity_decisions": {},
         "total_feedback": 0,
         "rating_distribution": {},
         "faults": {},
@@ -581,12 +616,34 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
         if tool is not None:
             where = " WHERE tool = ?"
             params.append(tool)
+        # Read-only opener, so a DB the running version has not migrated yet
+        # may lack the ``arm`` column; without it no row was ever withheld.
+        event_columns = {
+            str(row[1]) for row in db.execute("PRAGMA table_info('surfacing_events')").fetchall()
+        }
+        shown_where = where
+        if "arm" in event_columns:
+            shown_where = f"{where} AND {_SHOWN_EVENT}" if where else f" WHERE {_SHOWN_EVENT}"
+            withheld_where = f"{where} AND arm = 'withheld'" if where else " WHERE arm = 'withheld'"
+            summary["withheld_total"] = db.execute(
+                f"SELECT COUNT(*) FROM surfacing_events{withheld_where}", params
+            ).fetchone()[0]
         summary["events_total"] = db.execute(
-            f"SELECT COUNT(*) FROM surfacing_events{where}", params
+            f"SELECT COUNT(*) FROM surfacing_events{shown_where}", params
         ).fetchone()[0]
         summary["distinct_tools"] = db.execute(
-            f"SELECT COUNT(DISTINCT tool) FROM surfacing_events{where}", params
+            f"SELECT COUNT(DISTINCT tool) FROM surfacing_events{shown_where}", params
         ).fetchone()[0]
+
+        if "surfacing_opportunities" in tables:
+            decision_rows = db.execute(
+                "SELECT gate_decision, COUNT(*) FROM surfacing_opportunities"
+                f"{where} GROUP BY gate_decision",
+                params,
+            ).fetchall()
+            decisions = {row[0]: row[1] for row in decision_rows}
+            summary["opportunity_decisions"] = decisions
+            summary["opportunities_total"] = sum(decisions.values())
 
         if "surfacing_feedback" in tables:
             if tool is not None:
@@ -882,8 +939,8 @@ class FeedbackStore:
                     "INSERT OR IGNORE INTO surfacing_events "
                     "(id, server, tool, query, memory_ids, scores, created_at, score_scale, "
                     "injected_chars, tool_use_id, host_session_id, host_agent_id, "
-                    "id_advertised, header_digest) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "id_advertised, header_digest, arm, holdout_rate) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         surfacing_id,
                         server,
@@ -899,6 +956,8 @@ class FeedbackStore:
                         _opt_text(prov.host_agent_id),
                         None if prov.id_advertised is None else int(prov.id_advertised),
                         prov.header_digest,
+                        prov.arm,
+                        prov.holdout_rate,
                     ),
                 )
                 if cursor.rowcount == 1 and path_rows:
@@ -934,8 +993,9 @@ class FeedbackStore:
                 db.execute(
                     "INSERT OR IGNORE INTO surfacing_opportunities "
                     "(id, host_session_id, server, tool, arg_shape_json, response_len, "
-                    "query_digest, gate_decision, surfacing_id, score_scale, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "query_digest, gate_decision, surfacing_id, score_scale, created_at, "
+                    "arm, holdout_rate) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         row.id,
                         _opt_text(row.host_session_id),
@@ -948,6 +1008,8 @@ class FeedbackStore:
                         _opt_text(row.surfacing_id),
                         _opt_text(row.score_scale),
                         time.time(),
+                        row.arm,
+                        row.holdout_rate,
                     ),
                 )
                 db.commit()
@@ -1466,7 +1528,8 @@ class FeedbackStore:
 
             if tool:
                 total_surfacings = db.execute(
-                    "SELECT COUNT(*) FROM surfacing_events WHERE tool = ?", (tool,)
+                    f"SELECT COUNT(*) FROM surfacing_events WHERE tool = ? AND {_SHOWN_EVENT}",
+                    (tool,),
                 ).fetchone()[0]
                 rows = db.execute(
                     "SELECT f.rating, COUNT(*) FROM surfacing_feedback f "
@@ -1475,7 +1538,9 @@ class FeedbackStore:
                     (tool,),
                 ).fetchall()
             else:
-                total_surfacings = db.execute("SELECT COUNT(*) FROM surfacing_events").fetchone()[0]
+                total_surfacings = db.execute(
+                    f"SELECT COUNT(*) FROM surfacing_events WHERE {_SHOWN_EVENT}"
+                ).fetchone()[0]
                 rows = db.execute(
                     "SELECT rating, COUNT(*) FROM surfacing_feedback GROUP BY rating"
                 ).fetchall()
@@ -1507,10 +1572,15 @@ class FeedbackStore:
             tool: If set, restrict to one upstream tool.
             since: Unix timestamp lower bound for ``created_at``.
             limit: Max rows in the ``recent`` tail (``<=0`` disables).
+
+        Every event aggregate counts surfacings only: a holdout ``withheld``
+        row reached no one, so it is left out and counted in
+        ``withheld_total`` instead.
         """
         with self._reading() as db:
             empty = {
                 "events_total": 0,
+                "withheld_total": 0,
                 "distinct_tools": 0,
                 "date_range": {"first": None, "last": None},
                 "per_tool_breakdown": [],
@@ -1536,9 +1606,10 @@ class FeedbackStore:
                 event_filters.append("created_at >= ?")
                 event_params.append(since)
             where_sql = (" WHERE " + " AND ".join(event_filters)) if event_filters else ""
+            shown_sql = " WHERE " + " AND ".join([*event_filters, _SHOWN_EVENT])
 
             events_total = db.execute(
-                f"SELECT COUNT(*) FROM surfacing_events{where_sql}", event_params
+                f"SELECT COUNT(*) FROM surfacing_events{shown_sql}", event_params
             ).fetchone()[0]
 
             # Counted before the zero-events return below: most opportunities
@@ -1552,9 +1623,16 @@ class FeedbackStore:
                     event_params,
                 ).fetchall()
             }
+            # Also before the return: a window can hold only withheld events.
+            withheld_total = db.execute(
+                "SELECT COUNT(*) FROM surfacing_events WHERE "
+                + " AND ".join([*event_filters, "arm = 'withheld'"]),
+                event_params,
+            ).fetchone()[0]
             opportunities = {
                 "opportunities_total": sum(opportunity_decisions.values()),
                 "opportunity_decisions": opportunity_decisions,
+                "withheld_total": withheld_total,
             }
 
             if events_total == 0:
@@ -1564,11 +1642,11 @@ class FeedbackStore:
                 return {**empty, **opportunities}
 
             distinct_tools = db.execute(
-                f"SELECT COUNT(DISTINCT tool) FROM surfacing_events{where_sql}", event_params
+                f"SELECT COUNT(DISTINCT tool) FROM surfacing_events{shown_sql}", event_params
             ).fetchone()[0]
 
             first, last = db.execute(
-                f"SELECT MIN(created_at), MAX(created_at) FROM surfacing_events{where_sql}",
+                f"SELECT MIN(created_at), MAX(created_at) FROM surfacing_events{shown_sql}",
                 event_params,
             ).fetchone()
 
@@ -1581,7 +1659,7 @@ class FeedbackStore:
             # ranking information. min/max is O(1) memory and is exactly the
             # "all scores equal" predicate — no need to hold the value set.
             rows = db.execute(
-                f"SELECT tool, memory_ids, scores, score_scale FROM surfacing_events{where_sql}",
+                f"SELECT tool, memory_ids, scores, score_scale FROM surfacing_events{shown_sql}",
                 event_params,
             ).fetchall()
             per_tool: dict[str, dict[str, float]] = {}
@@ -1664,7 +1742,7 @@ class FeedbackStore:
             if limit > 0:
                 recent_rows = db.execute(
                     f"SELECT created_at, tool, query, memory_ids, scores, score_scale "
-                    f"FROM surfacing_events{where_sql} "
+                    f"FROM surfacing_events{shown_sql} "
                     "ORDER BY created_at DESC, rowid DESC LIMIT ?",
                     [*event_params, limit],
                 ).fetchall()

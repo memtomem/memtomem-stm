@@ -29,6 +29,7 @@ process that never surfaces never starts it.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import threading
 from collections.abc import Callable
@@ -214,7 +215,13 @@ async def run_off_loop(fn: Callable[..., T], /, *args: Any) -> T:
     return await asyncio.get_running_loop().run_in_executor(feedback_io_executor(), fn, *args)
 
 
-async def await_store_write(fn: Callable[..., T], /, *args: Any, timeout: float | None = None) -> T:
+async def await_store_write(
+    fn: Callable[..., T],
+    /,
+    *args: Any,
+    timeout: float | None = None,
+    on_abandoned_failure: Callable[[], None] | None = None,
+) -> T:
     """Run *fn* on the worker, keeping it once queued and bounding the wait.
 
     The shield is what keeps the write: by the time these run the caller's
@@ -232,6 +239,12 @@ async def await_store_write(fn: Callable[..., T], /, *args: Any, timeout: float 
     Raises :class:`StoreWriteQueueFull` rather than joining a queue already at
     its ceiling — the caller degrades as it would for a write that failed.
     *timeout* defaults to :data:`STORE_WRITE_BUDGET_SECONDS`.
+
+    *on_abandoned_failure* runs, on the loop, when a write this call stopped
+    waiting for (timeout or cancellation) later raises. It does not run for a
+    write that lands, nor for one ``shutdown_worker`` cancels before it
+    starts, nor when the loop closes first — so a count kept with it is a
+    lower bound.
     """
     # Read at call time, not bound as a default, so a test can shrink the
     # budget without every caller having to pass one.
@@ -242,13 +255,22 @@ async def await_store_write(fn: Callable[..., T], /, *args: Any, timeout: float 
     except (asyncio.CancelledError, asyncio.TimeoutError):
         # Consume whatever it ends up doing so asyncio does not report an
         # orphaned exception from a write nobody is waiting for any more.
-        future.add_done_callback(_consume_abandoned_write)
+        future.add_done_callback(
+            functools.partial(_consume_abandoned_write, on_failure=on_abandoned_failure)
+        )
         raise
 
 
-def _consume_abandoned_write(future: "asyncio.Future[Any]") -> None:
+def _consume_abandoned_write(
+    future: "asyncio.Future[Any]", *, on_failure: Callable[[], None] | None = None
+) -> None:
     if future.cancelled():
         return
     exc = future.exception()
     if exc is not None:
         logger.debug("Abandoned feedback-store write failed: %s", exc)
+        if on_failure is not None:
+            try:
+                on_failure()
+            except Exception:
+                logger.debug("Abandoned-write failure callback raised", exc_info=True)

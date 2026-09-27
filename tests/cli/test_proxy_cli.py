@@ -17713,6 +17713,48 @@ class TestDoctor:
         assert "check surfacing.rerank" in result.output
         assert "upgrade memtomem past v0.3.11" not in result.output
 
+    def _doctor_with_summary(self, runner, config, monkeypatch, summary, *, json_out=False):
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        self._healthy_config(config)
+
+        async def fake_probe_servers(servers, timeout):
+            return {n: _probe_ok(tools=2) for n in servers}
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        monkeypatch.setattr(
+            proxy_mod,
+            "_surfacing_bootstrap_status",
+            lambda _timeout, *, measure_ltm=False, prefer_hook_daemon=False, config_path=None: {
+                "enabled": True,
+                "feedback_enabled": False,
+                "feedback_db": None,
+                "ltm_server": {"connected": True, "display": "mms daemon"},
+                "feedback_summary": summary,
+            },
+        )
+        args = ["doctor", *_cfg_args(config)] + (["--json"] if json_out else [])
+        return runner.invoke(cli, args)
+
+    def test_opportunities_and_withheld_are_reported(self, runner, config, monkeypatch):
+        summary = {"opportunities_total": 12, "events_total": 5, "withheld_total": 2}
+        result = self._doctor_with_summary(runner, config, monkeypatch, summary)
+        line = next(
+            line for line in result.output.splitlines() if "surfacing opportunities" in line
+        )
+        assert "PASS" in line
+        assert "12 opportunities logged, 5 surfaced, 2 withheld (holdout)" in result.output
+        payload = json.loads(
+            self._doctor_with_summary(runner, config, monkeypatch, summary, json_out=True).output
+        )
+        (check,) = [c for c in payload["checks"] if c["id"] == "surfacing_opportunities"]
+        assert check["status"] == "PASS"
+        assert check["detail"] == "12 opportunities logged, 5 surfaced, 2 withheld (holdout)"
+
+    def test_no_opportunity_check_without_rows(self, runner, config, monkeypatch):
+        result = self._doctor_with_summary(runner, config, monkeypatch, {"events_total": 3})
+        assert "surfacing opportunities" not in result.output
+
     def test_measure_ltm_is_explicitly_forwarded_but_default_is_passive(
         self, runner, config, monkeypatch
     ):

@@ -477,6 +477,7 @@ async def _run_surfacing_hook_inner(
             cwd=call.cwd,
             tool_use_id=call.tool_use_id,
             agent_id=call.agent_id,
+            host=call.host_tag,
         )
         return _build_output(response_text, injected, engine.injection_mode)
 
@@ -522,6 +523,7 @@ async def _run_surfacing_hook_inner(
             cwd=call.cwd,
             tool_use_id=call.tool_use_id,
             agent_id=call.agent_id,
+            host=call.host_tag,
         )
     finally:
         await _quiet_async(built.stop(), "surfacing engine stop")

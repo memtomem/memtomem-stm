@@ -223,6 +223,7 @@ The injection mode is configurable: `append` (default), `prepend`, or `section`.
 | `persist_query_text` | `true` | When `false`, `FeedbackStore` stores `sha256:<16-hex>` instead of the raw extracted query in `surfacing_events.query`. The in-process surfacing call (relevance cooldown, formatter, MCP search) keeps the raw text — this knob only governs what gets persisted to disk. The `surfacing_stats` action renders the hash verbatim and prints a one-line legend so the substitution is visible. |
 | `opportunities_enabled` | `true` | Write one `surfacing_opportunities` row per call that entered surfacing, labelled with how it ended (see [Opportunity log](#opportunity-log)). Only engines with a feedback tracker write rows. |
 | `opportunities_sample_rate` | `1.0` | Share of opportunity rows kept, `0.0`–`1.0`. Rows the rate drops are counted in the `surfacing_stats` action but not stored. |
+| `holdout_rate` | `0.0` | Share of eligible hook-path injections withheld at random, for measuring whether surfacing changes what the agent does (see [Holdout](#holdout-opt-in)). Clamped to `0.0`–`0.5`; `0.0` never draws. |
 | `context_window_size` | `0` | Expand ±N adjacent chunks around search hits; `0` to disable |
 | `result_content_max_chars` | `500` | Max chars retained per LTM result before the formatter sees it |
 | `preview_max_chars` | `300` | Max chars per result preview in the injected memory block |
@@ -584,7 +585,7 @@ The hashes are HMAC-SHA256 truncated to 16 bytes, under a random per-install key
 
 | Column | Meaning |
 |---|---|
-| `gate_decision` | How the call ended: `surfaced`, `skip:<reason>` (any skip reason above, including `skip:cancelled`), `empty_render`, or `error:<kind>` — `error:timeout`, `error:other`, or `error:<ExceptionType>` for an exception that escaped surfacing (it still propagates). |
+| `gate_decision` | How the call ended: `surfaced`, `held_out` (a holdout draw withheld it), `skip:<reason>` (any skip reason above, including `skip:cancelled`), `empty_render`, or `error:<kind>` — `error:timeout`, `error:other`, or `error:<ExceptionType>` for an exception that escaped surfacing (it still propagates). |
 | `surfacing_id` | The event the call minted and tried to write. Set as soon as the write is queued, so it can name an event that never landed (the write failed or the queue was full). |
 | `host_session_id` | The hook host's session id; `NULL` on the proxy path. |
 | `server`, `tool` | As on `surfacing_events`. |
@@ -592,8 +593,28 @@ The hashes are HMAC-SHA256 truncated to 16 bytes, under a random per-install key
 | `response_len` | The response size the `min_response_chars` gate judged. |
 | `query_digest` | `sha256:` + 16 hex of the extracted query, taken before a query that looks sensitive is replaced by its digest; `NULL` when the call ended before a query was extracted. For a non-sensitive query this equals the event row's `query` under `persist_query_text=false`. |
 | `score_scale` | The core-reported scale of the batch, when the call got that far; a label outside the known set (`rrf`, `bm25`, `dense`, `none`, `rerank`) is stored as `other`. |
+| `arm`, `holdout_rate` | `shown` or `withheld` and the rate used, when a [holdout](#holdout-opt-in) draw happened on this call; `NULL` otherwise. |
 
-Coverage follows the feedback tracker: the shared daemon and a proxy with `feedback_enabled` write rows; the cold in-process hook and a proxy with feedback off write none, as they write no event rows either. Calls turned away before surfacing starts — hook-ineligible tools, `upstream_disabled`, `progressive_mode_conflict`, daemon load shedding — have no row. `opportunities_sample_rate` below `1.0` keeps a random share; the rest are counted, per tool, in the `surfacing_stats` action's `Opportunities` line for the current process (omitted when the action is given a `since` window, since the count is not time-stamped). Rows are deleted by their own `created_at` with `stats_retention_days`. A row takes about 320 bytes.
+Coverage follows the feedback tracker: the shared daemon and a proxy with `feedback_enabled` write rows; the cold in-process hook and a proxy with feedback off write none, as they write no event rows either. Calls turned away before surfacing starts — hook-ineligible tools, `upstream_disabled`, `progressive_mode_conflict`, daemon load shedding — have no row. `opportunities_sample_rate` below `1.0` keeps a random share; the rest are counted, per tool, in the `surfacing_stats` action's `Opportunities` line for the current process (omitted when the action is given a `since` window, since the count is not time-stamped). Rows are deleted by their own `created_at` with `stats_retention_days`. A row takes about 320 bytes. A call on which a holdout draw happened is never sampled out.
+
+### Holdout (opt-in)
+
+`holdout_rate` (default `0.0`, off) turns on a randomized holdout for collecting trial data. On a call that is about to inject, one random draw assigns an arm: `withheld` with probability `holdout_rate`, else `shown`. A `withheld` call returns the tool response unchanged, so the hook adds no `additionalContext`; the whole block (retrieved memories, pinned memories and session-context items) is left out. Everything the call writes is the same as for a `shown` call: the session dedup claim, the cooldown, the `surfacing_events` row, its `seen_memories` and `surfacing_memory_paths` rows. The event row records `arm` and `holdout_rate`, and `injected_chars` is `0` for a `withheld` row. No webhook fires for a withheld call.
+
+A draw happens only when all of these hold:
+
+- the call comes through the Claude Code hook (`mms hook --host claude`), not the proxy — **the proxy path never draws**;
+- it carries both the host's `tool_use_id` and `session_id`;
+- the engine has a feedback tracker, i.e. the shared daemon with dedup or feedback events on (the cold in-process hook has none);
+- at least one delivered memory is `eligible` in `surfacing_memory_paths` (a fully qualified `source_file`).
+
+Values outside `0.0`–`0.5` are clamped, not rejected. The daemon and the proxy each log one warning at startup when they clamp the value, when the proxy has a non-zero rate it will never use, or when the daemon has no tracker to record a draw on.
+
+The arm is fixed before the event write, so it holds however the write ends: if the write fails, a `withheld` call still returns the response unchanged, and a `shown` call keeps the usual degraded render without a feedback id. Counting:
+
+- `surfacing_stats`, `mms stats` and `mms doctor` count only `shown` events (and events from before the holdout existed) as surfacings, and report `withheld` separately.
+- The `surfacing_stats` action's `Holdout unrecorded` line counts drawn calls whose event row is known lost, by arm. It covers this process only and is a lower bound.
+- The call's opportunity row, which carries the arm, is the other durable trace of a draw. A drawn call cancelled during its write keeps `skip:cancelled` there, with its arm.
 
 ## Feedback & Auto-Tuning
 

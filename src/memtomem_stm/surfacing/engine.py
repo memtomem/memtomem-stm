@@ -11,7 +11,7 @@ import random
 import time
 import uuid
 from concurrent.futures import Future
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -195,28 +195,51 @@ def _persist_surfacing(tracker: Any, record_event: Any, delivered_ids: list[str]
             logger.warning("Failed to persist seen memory IDs", exc_info=True)
 
 
+def _record_or_raise(record_event: Any) -> None:
+    """Write one event row on the worker, raising if the store had closed.
+
+    The store answers ``False`` rather than raising when it closed under the
+    call. Raising here, on the worker, makes that a failure the awaiting
+    caller and an abandoned write's failure callback both see; a ``False``
+    returned to a caller that has stopped waiting would go unseen.
+    """
+    if record_event() is False:
+        raise RuntimeError("feedback store closed before the event was written")
+
+
 @dataclass(frozen=True)
 class _HostCall:
     """The host's own identifiers for the call being surfaced on.
 
     Only the hook path has them (PR #1063); the proxy path passes none. The
     three ids are stored on the event row; ``cwd`` travels with them but is
-    never stored.
+    never stored. ``host_tag`` names the hook host (``claude``, ``codex``, ...);
+    only it decides whether a holdout draw can happen, and it is not stored.
     """
 
     session_id: str | None = None
     cwd: str | None = None
     tool_use_id: str | None = None
     agent_id: str | None = None
+    host_tag: str | None = None
 
 
 _NO_HOST_CALL = _HostCall()
+
+
+_HOLDOUT_HOST = "claude"
+"""The only host whose transcripts the holdout trial can read."""
+
+_WITHHELD = "withheld"
+_SHOWN = "shown"
 
 
 def _event_provenance(
     manifest: RenderManifest,
     advertised_id: str | None,
     host: _HostCall,
+    arm: str | None = None,
+    holdout_rate: float | None = None,
 ) -> EventProvenance:
     """Collection-time facts about the block as rendered when its row is queued.
 
@@ -226,15 +249,20 @@ def _event_provenance(
     the ``<surfaced-memories>`` wrapper, which is what a transcript reader sees
     first, rather than the configured ``section_header`` (which may span
     lines).
+
+    A ``withheld`` call injects nothing, so its ``injected_chars`` is 0; every
+    other field is what the same call would record as ``shown``.
     """
     header = manifest.header_line.encode("utf-8", errors="surrogatepass")
     return EventProvenance(
-        injected_chars=manifest.block_chars,
+        injected_chars=0 if arm == _WITHHELD else manifest.block_chars,
         tool_use_id=host.tool_use_id,
         host_session_id=host.session_id,
         host_agent_id=host.agent_id,
         id_advertised=advertised_id is not None,
         header_digest=hashlib.sha256(header).hexdigest(),
+        arm=arm,
+        holdout_rate=holdout_rate,
     )
 
 
@@ -277,6 +305,7 @@ _OUTCOME_LABELS: dict[str, str] = {
     "surfaced_cache_miss": "surfaced",
     "error_timeout": "error:timeout",
     "error_other": "error:other",
+    "held_out": "held_out",
 }
 """``gate_decision`` for each :data:`Outcome`: a delivery is ``surfaced``
 whichever cache bucket served it."""
@@ -307,6 +336,11 @@ class _Opportunity:
     score_scale: str | None = None
     query_digest: str | None = None
     query_tokens: int | None = None
+    arm: str | None = None
+    """``shown`` / ``withheld`` once a holdout draw happened. Set at the draw,
+    so it survives whatever ends the call after it (a cancelled write leaves
+    ``skip:cancelled`` with the arm), and exempts the row from sampling."""
+    holdout_rate: float | None = None
 
 
 @dataclass
@@ -385,7 +419,8 @@ class SurfacingEngine:
         rng: random.Random | None = None,
     ) -> None:
         self._config = config
-        # Draws the opportunity sample; injectable so a test can fix it.
+        # Draws the opportunity sample and the holdout arm; injectable so a
+        # test can fix it.
         self._rng = rng if rng is not None else random.Random()
         self._mcp_adapter = mcp_adapter
         self._webhook_manager = webhook_manager
@@ -641,6 +676,8 @@ class SurfacingEngine:
         write nothing — the cold hook, and a proxy with feedback off — the same
         engines that write no event rows. A sample rate of ``1.0`` keeps every
         row without touching the RNG, so the draw sequence stays the caller's.
+        A call where a holdout draw happened is never sampled out: its row is
+        the second, best-effort record of that draw.
         """
         try:
             tracker = self._feedback_tracker
@@ -651,7 +688,11 @@ class SurfacingEngine:
             ):
                 return
             rate = self._config.opportunities_sample_rate
-            if rate < 1.0 and (rate <= 0.0 or self._rng.random() >= rate):
+            if (
+                opportunity.arm is None
+                and rate < 1.0
+                and (rate <= 0.0 or self._rng.random() >= rate)
+            ):
                 self._observability.record_opportunity_sampled_out(tool)
                 return
             row = OpportunityRow(
@@ -672,6 +713,8 @@ class SurfacingEngine:
                     or opportunity.score_scale in KNOWN_SCORE_SCALES
                     else "other"
                 ),
+                arm=opportunity.arm,
+                holdout_rate=opportunity.holdout_rate,
             )
             self._submit_store_write(
                 functools.partial(tracker.record_opportunity, row),
@@ -745,7 +788,9 @@ class SurfacingEngine:
 
         future.add_done_callback(_done)
 
-    async def _await_store_write(self, fn: Any, *args: Any) -> Any:
+    async def _await_store_write(
+        self, fn: Any, *args: Any, on_abandoned_failure: Callable[[], None] | None = None
+    ) -> Any:
         """Await one store write on the worker under the store's own ceiling.
 
         Every such write — the surfacing event row whose ID the caller may
@@ -758,8 +803,40 @@ class SurfacingEngine:
         budget for an LTM round trip, and an operator tightening it should not
         start seeing "store busy" answers from a healthy database a neighbour
         happens to be writing.
+
+        *on_abandoned_failure* is forwarded to :func:`await_store_write`.
         """
-        return await await_store_write(fn, *args)
+        return await await_store_write(fn, *args, on_abandoned_failure=on_abandoned_failure)
+
+    def _draw_arm(
+        self, host: _HostCall, memory_paths: Sequence[MemoryPathInput]
+    ) -> tuple[str | None, float | None]:
+        """The holdout arm for one delivery about to be recorded, or ``(None, None)``.
+
+        A draw needs everything the trial needs to resolve the unit later: a
+        feedback tracker (the event row is the assignment record), a Claude
+        Code hook call carrying both its ``tool_use_id`` and ``session_id``,
+        and at least one eligible delivered memory. Every condition is fixed
+        before the draw, and a rate of 0 never touches the RNG. The rate
+        returned is the clamped one the draw used.
+        """
+        rate = self._config.holdout_rate
+        if (
+            rate <= 0.0
+            or self._feedback_tracker is None
+            or host.host_tag != _HOLDOUT_HOST
+            or not host.tool_use_id
+            or not host.session_id
+            or not any(path.eligible for path in memory_paths)
+        ):
+            return None, None
+        return (_WITHHELD if self._rng.random() < rate else _SHOWN), rate
+
+    def _holdout_write_lost(self, arm: str | None) -> Callable[[], None] | None:
+        """Counter hook for a drawn call's event write that is known lost."""
+        if arm is None:
+            return None
+        return functools.partial(self._observability.record_holdout_unrecorded, arm)
 
     async def drain_store_writes(self) -> None:
         """Wait for every feedback-store write queued so far to finish.
@@ -1563,6 +1640,7 @@ class SurfacingEngine:
         cwd: str | None = None,
         tool_use_id: str | None = None,
         agent_id: str | None = None,
+        host: str | None = None,
     ) -> str:
         """Surface relevant memories and inject into response_text.
 
@@ -1606,6 +1684,8 @@ class SurfacingEngine:
         the surfacing event row (``host_session_id`` / ``tool_use_id`` /
         ``host_agent_id``) so the row names the host transcript the call was
         written to; none of them is logged, and ``cwd`` is never stored.
+        ``host`` is the hook host's tag; only a ``claude`` call can be drawn
+        for the holdout (``holdout_rate``), which the proxy path never is.
 
         Every call past the ``disabled`` check leaves one
         ``surfacing_opportunities`` row behind (engines with a feedback tracker
@@ -1640,6 +1720,7 @@ class SurfacingEngine:
                     cwd=cwd,
                     tool_use_id=tool_use_id,
                     agent_id=agent_id,
+                    host_tag=host,
                 ),
             )
         except asyncio.CancelledError:
@@ -2212,13 +2293,24 @@ class SurfacingEngine:
             self._skip(scope, tool, "empty_render")
             return response_text
         claimed = self._claim_surfaced_ids(delivered_ids)
+        arm: str | None = None
         if surfacing_id is not None:
             assert self._feedback_tracker is not None
             # Named on the opportunity before the write can fail: the row
             # then points at the event this call attempted, landed or not.
             scope.opportunity.surfacing_id = surfacing_id
+            memory_paths = _memory_path_inputs(manifest, cached)
+            # Same draw as the miss path. The daemon runs with the cache off,
+            # but a zero TTL still lets a lookup on the same clock tick hit.
+            arm, holdout_rate = self._draw_arm(host, memory_paths)
+            scope.opportunity.arm = arm
+            scope.opportunity.holdout_rate = holdout_rate
             try:
-                written = await self._await_store_write(
+                # The row does not exist when the store closed under this
+                # call; ``_record_or_raise`` turns that into a failure, so the
+                # ID is withdrawn below and a lost draw is counted.
+                await self._await_store_write(
+                    _record_or_raise,
                     functools.partial(
                         self._feedback_tracker.record_surfacing,
                         surfacing_id=surfacing_id,
@@ -2234,25 +2326,26 @@ class SurfacingEngine:
                         # Cached entries keep the scale they were stamped with
                         # at miss time, so the hit-path row carries it too.
                         score_scale=self._result_score_scale(cached)[0],
-                        provenance=_event_provenance(manifest, advertised_id, host),
-                        memory_paths=_memory_path_inputs(manifest, cached),
-                    )
+                        provenance=_event_provenance(
+                            manifest, advertised_id, host, arm, holdout_rate
+                        ),
+                        memory_paths=memory_paths,
+                    ),
+                    on_abandoned_failure=self._holdout_write_lost(arm),
                 )
-                if written is False:
-                    # The store closed under this call; the row does not
-                    # exist, so the ID must not stay advertised.
-                    raise RuntimeError("feedback store closed before the event was written")
             except asyncio.CancelledError:
                 # Same as the miss path: an undelivered render keeps no claim.
                 self._release_surfaced_ids(claimed)
                 raise
-            except Exception:
+            except Exception as exc:
                 logger.warning("Failed to record cached surfacing event", exc_info=True)
+                if arm is not None and not isinstance(exc, TimeoutError):
+                    self._observability.record_holdout_unrecorded(arm)
                 # Kept symmetric with the miss path; the cached path fires no
                 # webhook, so this reset has no consumer here — it just states
                 # "no row was written" for the next reader.
                 surfacing_id = None
-                if advertised_id is not None:
+                if advertised_id is not None and arm != _WITHHELD:
                     # Same contract as the miss path: withdraw the dead
                     # feedback handle; a prompt-free render stands as-is.
                     advertised_id = None
@@ -2266,6 +2359,9 @@ class SurfacingEngine:
         # hit whose event write was still queued when the client hung up
         # delivered nothing, and counting it there would report a surfacing
         # that never reached anyone.
+        if arm == _WITHHELD:
+            self._outcome(scope, tool, "held_out")
+            return response_text
         self._outcome(scope, tool, "surfaced_cache_hit")
         return manifest.text
 
@@ -2841,10 +2937,18 @@ class SurfacingEngine:
             return response_text
 
         self._gate.record_surfacing(query)
+        arm: str | None = None
         if surfacing_id is not None:
             assert self._feedback_tracker is not None
             # See the cache-hit path: the attempted event, landed or not.
             scope.opportunity.surfacing_id = surfacing_id
+            memory_paths = _memory_path_inputs(manifest, relevant)
+            # The holdout draw: everything above and the durable write below
+            # are identical in both arms (claim, cooldown, event row, dedup
+            # rows, memory paths); only what reaches the agent differs.
+            arm, holdout_rate = self._draw_arm(host, memory_paths)
+            scope.opportunity.arm = arm
+            scope.opportunity.holdout_rate = holdout_rate
             delivered_results = [
                 r
                 for r in relevant
@@ -2859,12 +2963,16 @@ class SurfacingEngine:
                 memory_ids=delivered_ids,
                 scores=[r.score for r in delivered_results],
                 score_scale=score_scale,
-                provenance=_event_provenance(manifest, advertised_id, host),
-                memory_paths=_memory_path_inputs(manifest, relevant),
+                provenance=_event_provenance(manifest, advertised_id, host, arm, holdout_rate),
+                memory_paths=memory_paths,
             )
             try:
                 await self._await_store_write(
-                    _persist_surfacing, self._feedback_tracker, record_event, delivered_ids
+                    _persist_surfacing,
+                    self._feedback_tracker,
+                    record_event,
+                    delivered_ids,
+                    on_abandoned_failure=self._holdout_write_lost(arm),
                 )
             except asyncio.CancelledError:
                 # Nothing about this call reaches the client — not the
@@ -2877,15 +2985,20 @@ class SurfacingEngine:
                 # up mid-write already costs.
                 self._release_surfaced_ids([mid for mid in claimed if mid in delivered_set])
                 raise
-            except Exception:
+            except Exception as exc:
                 logger.warning("Failed to record surfacing event", exc_info=True)
+                if arm is not None and not isinstance(exc, TimeoutError):
+                    # Failed outright (queue full, store error or closed). A
+                    # timed-out write can still land, so it is counted only if
+                    # it then fails, by the callback passed above.
+                    self._observability.record_holdout_unrecorded(arm)
                 # This call cannot resolve the ID it advertised — the write
                 # failed outright, or outran its ceiling and is still queued —
                 # so the webhook payload carries None and the prompt is
                 # withdrawn. A write that lands later leaves a row nobody was
                 # told about, which is the same orphan a cancelled call makes.
                 surfacing_id = None
-                if advertised_id is not None:
+                if advertised_id is not None and arm != _WITHHELD:
                     # The rendered prompt references an unresolvable event ID.
                     # Re-render without it instead of handing the agent a dead
                     # feedback handle. When nothing was advertised (feedback
@@ -2899,6 +3012,12 @@ class SurfacingEngine:
                         scratch_items=scratch_items,
                         score_floor=min_score,
                     )
+
+        if arm == _WITHHELD:
+            # Nothing reaches the agent, so no webhook either: a subscriber
+            # would count a surfacing that never happened.
+            self._outcome(scope, tool, "held_out")
+            return response_text
 
         self._outcome(scope, tool, "surfaced_cache_miss")
 

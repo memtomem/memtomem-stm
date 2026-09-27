@@ -146,6 +146,9 @@ Outcome = Literal[
     "surfaced_cache_miss",
     "error_timeout",
     "error_other",
+    # A holdout draw assigned ``withheld``: the search completed and the block
+    # was rendered and recorded, but the response went back unchanged.
+    "held_out",
 ]
 
 # Inputs to the ``stm_surfacing_stats`` top-line verdict (#363, #351 part 1).
@@ -157,7 +160,7 @@ Outcome = Literal[
 #
 #   attempts = faults + completed
 #   faults    = FAULT_SKIP_REASONS skips + FAULT_OUTCOMES
-#   completed = SURFACED_OUTCOMES + SEARCH_COMPLETED_SKIP_REASONS
+#   completed = COMPLETED_OUTCOMES + SEARCH_COMPLETED_SKIP_REASONS
 #
 # Pre-LTM healthy skips (``response_too_short``, ``gate_*``, ``no_query``,
 # ``daemon_*``, ``disabled``, ``upstream_disabled``, ``progressive_mode_conflict``)
@@ -192,6 +195,10 @@ SURFACED_OUTCOMES: frozenset[str] = frozenset(
         "surfaced_cache_miss",
     }
 )
+
+COMPLETED_OUTCOMES: frozenset[str] = SURFACED_OUTCOMES | {"held_out"}
+"""Outcomes the verdict counts as completed LTM attempts. ``held_out`` is one
+(the search answered) but is not a surfacing: nothing reached the agent."""
 
 FAULT_OUTCOMES: frozenset[str] = frozenset(
     {
@@ -371,6 +378,9 @@ class SurfacingObservability:
         # the ``__total__`` aggregate, like the skip counters, so a
         # ``tool=``-filtered report names only that tool's calls.
         self._opportunities_sampled_out: dict[str, int] = defaultdict(int)
+        # Holdout draws whose event row is known not to have landed, by arm.
+        # A lower bound: a write lost to shutdown or a closed loop is missed.
+        self._holdout_unrecorded: dict[str, int] = defaultdict(int)
         # Tracks whether ``surface()`` has been called at least once. Used by
         # ``stm_surfacing_stats`` to suppress the new sections entirely when
         # the engine is wired but never invoked, keeping the legacy output
@@ -416,6 +426,11 @@ class SurfacingObservability:
             self._opportunities_sampled_out[tool] += 1
             self._opportunities_sampled_out[_TOTAL_KEY] += 1
 
+    def record_holdout_unrecorded(self, arm: str) -> None:
+        """Count a drawn call whose event write failed, by the arm it got."""
+        with self._lock:
+            self._holdout_unrecorded[arm] += 1
+
     def snapshot(self) -> dict:
         """Return a deep-copied point-in-time view of all counters.
 
@@ -432,6 +447,7 @@ class SurfacingObservability:
                 "outcomes": {tool: dict(outcomes) for tool, outcomes in self._outcomes.items()},
                 "cache": dict(self._cache),
                 "opportunities_sampled_out": dict(self._opportunities_sampled_out),
+                "holdout_unrecorded": dict(self._holdout_unrecorded),
             }
 
 
@@ -464,6 +480,9 @@ class _NoOpObservability:
         return None
 
     def record_opportunity_sampled_out(self, tool: str) -> None:
+        return None
+
+    def record_holdout_unrecorded(self, arm: str) -> None:
         return None
 
 
