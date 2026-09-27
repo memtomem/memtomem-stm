@@ -6348,7 +6348,7 @@ def tune(
     if not changes:
         for entry in skipped:
             click.echo(f"{_warn('Skipped:')} {_disp(entry)}")
-        click.echo("No recommendations — all observed tools are within healthy parameters.")
+        click.echo("No recommendations.")
         return
 
     _render_tune_preview(changes, skipped, since_hours=since_hours, apply_hint=not do_apply)

@@ -11,6 +11,17 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- An empty tool filter now matches no tools in `mms tune` and
+  `stm_tuning_recommendations`; omit the filter to analyze all tools. In particular,
+  `mms tune --apply --yes --tool ""` no longer writes overrides for other tools (#1036).
+
+### Fixed
+
+- Honor empty tool filters in compression tuning recommendations and report counts.
+  **Behavior change**: see the upgrade notes above (#1036).
+
 ### Added
 
 - **Randomized surfacing holdout, off by default.** `MEMTOMEM_STM_SURFACING__HOLDOUT_RATE`
