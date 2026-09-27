@@ -31,6 +31,7 @@ from stm_trial_fixtures import (
     st,
 )
 
+from memtomem_stm.surfacing.grams import _PLATFORM_CASEFOLD
 from memtomem_stm.surfacing.trial import (
     Assignment,
     InjectionRecord,
@@ -557,7 +558,9 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Path]:
 
 
 def _resolve_env(env: dict[str, Path]) -> tuple[Outcome, ...]:
-    _extract(env)
+    # collection hashes with the platform's casefold; the join only holds if extraction
+    # does too (the shared fixture defaults to casefold=True, which is macOS-only)
+    _extract(env, casefold=_PLATFORM_CASEFOLD)
     with closing(sqlite3.connect(env["trial"])) as db:
         assignments, memories, ledger, stoplist = st.load_resolve_inputs(db)
     return resolve(assignments, memories, ledger, stoplist)
