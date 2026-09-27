@@ -48,6 +48,14 @@ from memtomem_stm.surfacing.grams import (
     path_key,
     unsanitize,
 )
+from memtomem_stm.surfacing.trial import (
+    Assignment,
+    InjectionRecord,
+    Ledger,
+    LedgerEntry,
+    MemoryRow,
+    OutputRecord,
+)
 
 WINDOW_ENTRIES = 12
 """``n``: the Y1 window length in ledger entries, frozen into the trial record."""
@@ -1000,6 +1008,100 @@ def freeze(
         "burnin_days": round(elapsed_days, 2),
         "key_fingerprint": fingerprint,
     }
+
+
+def _hex_set(blob: bytes | None) -> frozenset[str]:
+    return frozenset(unpack_grams(blob)) if blob else frozenset()
+
+
+def _json_set(text: str | None) -> frozenset[str]:
+    return frozenset(json.loads(text)) if text else frozenset()
+
+
+def load_resolve_inputs(
+    db: sqlite3.Connection,
+) -> tuple[list[Assignment], list[MemoryRow], Ledger, frozenset[str]]:
+    """Decode the trial DB into :func:`memtomem_stm.surfacing.trial.resolve`'s inputs.
+
+    Hash sets are stored two ways — BLOBs of packed digests for what the
+    extractor took from transcripts, JSON lists for what it copied from
+    ``stm_feedback.db`` — and both come back as sets of hex keys. The stoplist is
+    empty until ``--freeze`` wrote the trial record.
+    """
+    assignments = [
+        Assignment(
+            event_key=row[0],
+            created_at=row[1],
+            stream_key=row[2],
+            call_key=row[3],
+            id_advertised=bool(row[4]),
+            header_digest=row[5],
+            arm=row[6],
+            holdout_rate=row[7],
+        )
+        for row in db.execute(
+            "SELECT event_key, created_at, stream_key, call_key, id_advertised,"
+            " header_digest, arm, holdout_rate FROM assignments"
+        )
+    ]
+    memory_rows = [
+        MemoryRow(
+            event_key=row[0],
+            memory_key=row[1],
+            eligible=bool(row[2]),
+            path_hash_lexical=row[3],
+            dir_hashes=_json_set(row[4]),
+            basename_hash=row[5],
+            snippet_grams=_json_set(row[6]),
+        )
+        for row in db.execute(
+            "SELECT event_key, memory_key, eligible, path_hash_lexical, dir_hashes,"
+            " basename_hash, snippet_grams FROM assignment_memories"
+        )
+    ]
+    entries = tuple(
+        LedgerEntry(
+            stream_key=row[0],
+            ordinal=row[1],
+            call_key=row[2],
+            message_key=row[3],
+            eligible=bool(row[4]),
+            ok=None if row[5] is None else bool(row[5]),
+            ts=row[6],
+            paths=_hex_set(row[7]),
+            patterns=_hex_set(row[8]),
+        )
+        for row in db.execute(
+            "SELECT l.stream_key, l.ordinal, l.call_key, l.message_key, l.eligible, l.ok, l.ts,"
+            " p.paths, p.patterns FROM ledger l LEFT JOIN entry_paths p"
+            " ON p.stream_key = l.stream_key AND p.call_key = l.call_key"
+            " AND p.ordinal = l.ordinal"
+        )
+    )
+    outputs = tuple(
+        OutputRecord(stream_key=row[0], ordinal=row[1], ts=row[2], grams=_hex_set(row[3]))
+        for row in db.execute("SELECT stream_key, ordinal, ts, grams FROM output_grams")
+    )
+    injections = tuple(
+        InjectionRecord(
+            stream_key=row[0],
+            ordinal=row[1],
+            call_key=row[2],
+            ts=row[3],
+            event_key=row[4],
+            header_sha256=row[5],
+            stm_wrapped=bool(row[6]),
+            grams=_hex_set(row[7]),
+        )
+        for row in db.execute(
+            "SELECT stream_key, ordinal, call_key, ts, event_key, header_sha256, stm_wrapped,"
+            " grams FROM injection_grams"
+        )
+    )
+    streams = frozenset(row[0] for row in db.execute("SELECT stream_key FROM streams"))
+    record = db.execute("SELECT stoplist FROM trial_record WHERE id = 1").fetchone()
+    stoplist = _hex_set(record[0]) if record else frozenset()
+    return assignments, memory_rows, Ledger(streams, entries, outputs, injections), stoplist
 
 
 def purge_targets(trial_db: Path) -> list[Path]:
