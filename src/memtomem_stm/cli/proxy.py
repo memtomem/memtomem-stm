@@ -7974,6 +7974,8 @@ def _core_version(value: Any) -> str | None:
 
 
 def _ltm_metadata_from_tool_result(result: Any) -> dict[str, Any]:
+    from memtomem_stm.surfacing.rrf_profile import is_schema_one
+
     text_parts = _text_parts_from_tool_result(result)
     if not text_parts:
         return {"version": None, "runtime_profile": None}
@@ -7984,7 +7986,7 @@ def _ltm_metadata_from_tool_result(result: Any) -> dict[str, Any]:
     if not isinstance(data, dict):
         return {"version": None, "runtime_profile": None}
     profile = data.get("runtime_profile")
-    if not isinstance(profile, dict) or profile.get("schema_version") != 1:
+    if not is_schema_one(profile):
         profile = None
     caps = data.get("capabilities")
     formats = caps.get("search_formats") if isinstance(caps, dict) else None
@@ -8350,12 +8352,14 @@ def _ltm_daemon_status(config: Any, timeout: float, *, measure_ltm: bool = False
         status["latency"] = hs["latency"]
     core = hs.get("core")
     if isinstance(core, dict):
+        from memtomem_stm.surfacing.rrf_profile import is_schema_one
+
         result_format = core.get("effective_result_format")
         status["effective_result_format"] = (
             result_format if result_format in ("structured", "compact") else None
         )
         profile = core.get("runtime_profile")
-        if isinstance(profile, dict) and profile.get("schema_version") == 1:
+        if is_schema_one(profile):
             # Raw, projected before rendering (see the direct route).
             status["runtime_profile"] = profile
     if measure_ltm:

@@ -1072,3 +1072,46 @@ def test_unhashable_mode_does_not_break_the_report(tmp_path, monkeypatch, comman
     if command == "doctor" and not as_json:
         assert "did not report a recognized retrieval mode" in output
     _assert_clean(output, _CORE_CANARIES, as_json=as_json)
+
+
+@pytest.mark.parametrize("schema_version", [True, 1.0], ids=["bool", "float"])
+@pytest.mark.parametrize("route", ["direct", "daemon"])
+def test_non_integer_schema_version_is_not_schema_one(tmp_path, monkeypatch, schema_version, route):
+    """JSON ``true`` and ``1.0`` equal ``1`` in Python. The ingest check and the
+    projection must agree on what schema 1 is, or doctor judges a profile the
+    report then shows as ``null`` (PR #1094 review)."""
+    from mcp.types import CallToolResult, TextContent
+
+    from memtomem_stm.cli import proxy
+    from memtomem_stm.daemon import client
+
+    profile = _hostile_profile()
+    profile["schema_version"] = schema_version
+    profile["search"]["configured_mode"] = "hybrid"
+    profile["search"]["effective_mode"] = "hybrid"
+    _ltm_stdio_env(monkeypatch)
+    if route == "direct":
+        payload = {"version": "0.3.0", "runtime_profile": profile}
+
+        async def _probe(*_a: Any, **_kw: Any) -> dict[str, Any]:
+            reply = CallToolResult(content=[TextContent(type="text", text=json.dumps(payload))])
+            return {"connected": True, "error": None, **proxy._ltm_metadata_from_tool_result(reply)}
+
+        monkeypatch.setattr(proxy, "_probe_ltm_mcp_server", _probe)
+        monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "false")
+    else:
+
+        async def _ping(*_a: Any, **_kw: Any) -> dict[str, Any]:
+            return {"ltm": "warm", "core": {"runtime_profile": profile}}
+
+        monkeypatch.setattr(client, "ping", _ping)
+    config = tmp_path / "stm_proxy.json"
+    config.write_text(json.dumps({"upstream_servers": {}}))
+    output = _run(["doctor", "--config", str(config), "--timeout", "3", "--json"])
+
+    data = json.loads(output)
+    assert data["surfacing"]["ltm_server"]["route"] == route
+    assert data["surfacing"]["ltm_server"]["runtime_profile"] is None
+    checks = {c["id"]: c for c in data["checks"]}
+    assert checks["ltm_runtime_profile"]["status"] == "WARN"
+    assert "ltm_retrieval_mode" not in checks

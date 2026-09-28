@@ -112,7 +112,9 @@ changes inline only. See the deprecation policy in
   list keeps only its known members, and `embedding`, `search.tokenizer`,
   `rerank.provider` and dependency versions are no longer included — read
   `mm status` in the LTM environment for them. Doctor still judges the
-  profile as Core sent it; only what is printed changes. `mms health --json`
+  profile as Core sent it; only what is printed changes. A profile whose
+  `schema_version` is JSON `true` or `1.0` is no longer taken for schema 1, so
+  doctor WARNs that the Core does not expose it and the report shows `null`. `mms health --json`
   and `mms doctor --json` gain `surfacing.runtime_profile_checks`, the same
   rows doctor prints.
   Core's search hints and compose warnings are logged and shown in

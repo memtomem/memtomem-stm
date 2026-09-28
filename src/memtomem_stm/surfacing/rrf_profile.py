@@ -72,12 +72,24 @@ def _weights(value: Any) -> tuple[float, float] | None:
     return result[0], result[1]
 
 
+def is_schema_one(profile: Any) -> bool:
+    """Whether *profile* is a schema-1 ``runtime_profile`` dict.
+
+    Strict: JSON ``true`` and ``1.0`` compare equal to ``1`` in Python, and
+    every reader must agree on what schema 1 is, or a profile is judged by one
+    and rendered as absent by another (PR #1094 review).
+    """
+    return (
+        isinstance(profile, dict)
+        and type(profile.get("schema_version")) is int
+        and profile["schema_version"] == 1
+    )
+
+
 def check_two_leg_fusion(profile: Any) -> tuple[int, tuple[float, float]] | FusionGap:
     """``(rrf_k, weights)`` for a positive-weight two-leg hybrid, else the gap."""
     if (
-        not isinstance(profile, dict)
-        or type(profile.get("schema_version")) is not int
-        or profile["schema_version"] != 1
+        not is_schema_one(profile)
         or profile.get("config_state") != "ok"
         or not isinstance(profile.get("search"), dict)
     ):
@@ -191,11 +203,7 @@ def project_runtime_profile(profile: Any) -> dict[str, Any] | None:
     versions, unknown keys) is dropped, and an absent key stays absent.
     ``None`` for anything that is not a schema-1 profile.
     """
-    if (
-        not isinstance(profile, dict)
-        or type(profile.get("schema_version")) is not int
-        or profile["schema_version"] != 1
-    ):
+    if not is_schema_one(profile):
         return None
     projected: dict[str, Any] = {"schema_version": 1}
     if "config_state" in profile:

@@ -23,7 +23,7 @@ from mcp.types import CONNECTION_CLOSED, TextContent
 
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.observability import record_search_rpc
-from memtomem_stm.surfacing.rrf_profile import rrf_score_ceiling
+from memtomem_stm.surfacing.rrf_profile import is_schema_one, rrf_score_ceiling
 from memtomem_stm.utils.mcp_transport import streamable_http_transport
 from memtomem_stm.utils.json_out import (
     escape_lone_surrogates,
@@ -842,7 +842,7 @@ class McpClientSearchAdapter:
         raw_caps = data.get("capabilities", {})
         caps = raw_caps if isinstance(raw_caps, dict) else {}
         profile = data.get("runtime_profile")
-        if isinstance(profile, dict) and profile.get("schema_version") == 1:
+        if is_schema_one(profile):
             self._runtime_profile = profile
 
         def schema_version(name: str) -> int:
