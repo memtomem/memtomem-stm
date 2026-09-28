@@ -189,9 +189,7 @@ from memtomem_stm.utils.mcp_transport import (
 from memtomem_stm.utils.json_size import json_utf8_size_async
 from memtomem_stm.utils.redact import (
     exception_summary,
-    redact_exception_text,
     root_cause_exc,
-    sanitize_secrets,
 )
 
 # JSON-RPC error codes that indicate bad input, not connection problems.
@@ -622,20 +620,17 @@ def _mark_recorded(exc: BaseException) -> None:
 
 
 def _mark_safe_upstream_error(exc: BaseException, message: str) -> None:
-    """Pin final client-facing text that carries no configured credentials.
+    """Pin the text of a failure STM composed itself, to be shown verbatim.
 
-    Only for messages STM composes itself (no upstream string interpolated).
-    ``safe_upstream_error`` returns these verbatim: running the sanitizer over
-    already-safe text is what lets a short secret from another generation
-    rewrite a placeholder. To pin an upstream exception whose config may be
-    retired before the boundary renders it, use ``_pin_safe_upstream_scrub``.
+    Only for messages that interpolate no upstream string. ``_safe_error_text``
+    returns the pinned text instead of reducing the exception to its type, so
+    the detail STM wrote (a deadline, a server name) survives.
     """
     try:
         exc._stm_safe_upstream_error = message  # type: ignore[attr-defined]
     except (AttributeError, TypeError):
-        # Most Python exceptions carry ``__dict__``. The fallback for unusual
-        # slotted exceptions is ``safe_upstream_error`` scanning the active,
-        # live, and still-retired configurations.
+        # Most Python exceptions carry ``__dict__``. An unusual slotted one
+        # falls back to ``exception_summary`` — its type name, nothing leaked.
         pass
 
 
@@ -670,24 +665,6 @@ def _safe_error_text(exc: BaseException) -> str:
     """
     text = _stm_composed_text(exc) or exception_summary(exc)
     return text[:MAX_ERROR_MESSAGE_CHARS]
-
-
-def _pin_safe_upstream_scrub(exc: BaseException, cfg: UpstreamServerConfig) -> None:
-    """Pin one config's scrub INPUTS (url + secret values) to ``exc``.
-
-    A concurrent hot reload can retire and close the generation whose
-    credentials the exception text may echo, leaving nothing for
-    ``safe_upstream_error`` to scrub against. Capturing the inputs — rather
-    than pre-scrubbing the text — keeps every secret in the SINGLE sanitizer
-    pass at the boundary, which is what makes the placeholder safe.
-    """
-    try:
-        exc._stm_safe_upstream_scrub = (  # type: ignore[attr-defined]
-            cfg.url,
-            [*(cfg.headers or {}).values(), *(cfg.env or {}).values()],
-        )
-    except (AttributeError, TypeError):
-        pass
 
 
 def _mark_cache_invalidated(exc: BaseException) -> None:
@@ -2098,60 +2075,14 @@ class ProxyManager:
     def safe_upstream_error(self, server: str, exc: BaseException) -> str:
         """Credential-safe error text for the client-facing MCP boundary.
 
-        ``_safe_error_text`` everywhere except one case: an ``MCPError`` keeps
-        its message, as an upstream ``isError`` result keeps its text. That
-        message is the upstream's JSON-RPC error, or the SDK quoting the
-        upstream's response body or ``Content-Type``, or fixed SDK text — none
-        of it is built from STM's request (#1082). It is still scrubbed for
-        whole configured values and URL userinfo; a partial echo the upstream
-        chooses to send passes, as it would in an ``isError`` result.
+        The same rendering as every other surface (``_safe_error_text``),
+        including for an upstream JSON-RPC error: its message can quote STM's
+        request back — a URL query, an argument, part of a header — and no scrub
+        list catches every form of that echo (#1082). *server* is kept for the
+        call site's signature.
         """
-        from mcp.shared.exceptions import MCPError
-
-        composed = _stm_composed_text(exc)
-        if composed is not None:
-            # Already credential-free. Sanitizing it again is exactly the
-            # double pass that corrupts the placeholder.
-            return composed[:MAX_ERROR_MESSAGE_CHARS]
-        root = root_cause_exc(exc)
-        if not isinstance(root, MCPError):
-            return exception_summary(root)[:MAX_ERROR_MESSAGE_CHARS]
-
-        configs: list[UpstreamServerConfig] = []
-        conn = self._connections.get(server)
-        if conn is not None:
-            configs.append(conn.config)
-            # A call can fail after a hot reconnect published new credentials
-            # but while it still leases the retired generation. Retain every
-            # old generation's scrub inputs until its owner is drained.
-            configs.extend(resources.config for resources in conn.retired_resources.values())
-        try:
-            live = self._config.upstream_servers.get(server)
-        except Exception:
-            live = None
-        if live is not None and all(live is not cfg for cfg in configs):
-            configs.append(live)
-
-        text = f"{type(root).__name__}: {root}"
-        # ``sanitize_secrets`` must see every secret in ONE pass: it documents
-        # that a second pass can rewrite a placeholder the first just inserted
-        # (a short secret like ``RED`` corrupting ``<REDACTED>``). Redaction of
-        # each generation's url is idempotent and stays in the loop; the secret
-        # values are collected and scrubbed once.
-        secret_values: list[str] = []
-        pinned_scrub = getattr(exc, "_stm_safe_upstream_scrub", None)
-        if isinstance(pinned_scrub, tuple) and len(pinned_scrub) == 2:
-            # A generation retired and closed since the failure contributes no
-            # config above; its pinned inputs join the same single pass.
-            pinned_url, pinned_secrets = pinned_scrub
-            text = redact_exception_text(text, pinned_url)
-            secret_values.extend(pinned_secrets)
-        for cfg in configs:
-            text = redact_exception_text(text, cfg.url)
-            secret_values.extend((cfg.headers or {}).values())
-            secret_values.extend((cfg.env or {}).values())
-        text = sanitize_secrets(text, secret_values)
-        return text[:MAX_ERROR_MESSAGE_CHARS]
+        del server
+        return _safe_error_text(exc)
 
     async def _run_connection_owner(
         self,
@@ -5312,15 +5243,6 @@ class ProxyManager:
                             pipeline_category.value,
                             exc_info=True,
                         )
-                # Pin the client-facing text against THIS call's config
-                # snapshot before a concurrent hot reload can retire and close
-                # the generation whose exception may contain its old URL,
-                # header, or environment credentials.
-                try:
-                    pinned_cfg = self._server_cfg(self._connections[server], cfg_snap)
-                    _pin_safe_upstream_scrub(exc, pinned_cfg)
-                except Exception:
-                    logger.debug("Failed to pin credential-safe upstream error")
                 self._log_execution(
                     selection_id,
                     server,

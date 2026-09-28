@@ -130,20 +130,39 @@ def http_status_code(exc: BaseException) -> int | None:
     return code if type(code) is int else None
 
 
+# The JSON-RPC 2.0 reserved codes. Any other code is upstream-chosen and could
+# itself carry a value, so it is not shown (#1082).
+# The rendered text comes from this table, never from the code value itself.
+_JSONRPC_STANDARD_ERRORS: dict[int, str] = {
+    -32700: "-32700 (Parse error)",
+    -32600: "-32600 (Invalid Request)",
+    -32601: "-32601 (Method not found)",
+    -32602: "-32602 (Invalid params)",
+    -32603: "-32603 (Internal error)",
+}
+
+
 def exception_summary(exc: BaseException) -> str:
     """An exception as the fixed vocabulary shared by every error surface.
 
     Never the exception's message: servers and SDKs quote the request URL
     (query included), an argument, or part of a header back in it, in forms no
     value list can anticipate (#1079, #1082). What is left is the root cause's
-    type name, the status code of an HTTP error, and — for a pydantic
-    ``ValidationError`` — its error types. Not its locations: a location can be
-    a key of the data that failed, and nothing marks which parts the schema
-    owns.
+    type name, the status code of an HTTP error, a JSON-RPC error's code when
+    it is one of the reserved ones, and — for a pydantic ``ValidationError`` —
+    its error types. Not its locations: a location can be a key of the data that
+    failed, and nothing marks which parts the schema owns. Not a JSON-RPC
+    error's message either: an upstream can quote STM's request in it.
     """
+    from mcp.shared.exceptions import MCPError
     from pydantic import ValidationError
 
     root = root_cause_exc(exc)
+    if isinstance(root, MCPError):
+        reserved = _JSONRPC_STANDARD_ERRORS.get(root.error.code)
+        if reserved is not None:
+            return f"{type(root).__name__} {reserved}"
+        return type(root).__name__
     if isinstance(root, ValidationError):
         kinds = dict.fromkeys(
             err["type"] for err in root.errors(include_url=False, include_input=False)

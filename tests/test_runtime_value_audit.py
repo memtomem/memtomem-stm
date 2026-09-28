@@ -108,12 +108,17 @@ def _echo(kind: str) -> BaseException:
         return _http_status_error(httpx2)
     if kind == "validation":
         return _validation_error()
+    if kind == "jsonrpc":
+        from mcp.shared.exceptions import MCPError
+
+        # An upstream JSON-RPC error quoting the request back.
+        return MCPError(-32602, f"invalid params for {_URL}: {_ARG}, auth {_HEADER}")
     if kind == "group":
         return ExceptionGroup("unhandled errors in a TaskGroup", [_http_status_error(httpx2)])
     raise AssertionError(kind)
 
 
-_KINDS = ["whole", "partial", "httpx", "httpx2", "validation", "group"]
+_KINDS = ["whole", "partial", "httpx", "httpx2", "validation", "jsonrpc", "group"]
 
 # What each surface may say instead: the type name, the HTTP status, or the
 # ValidationError's locations and error types.
@@ -123,6 +128,7 @@ _EXPECTED = {
     "httpx": "HTTP 401 (HTTPStatusError)",
     "httpx2": "HTTP 401 (HTTPStatusError)",
     "validation": "ValidationError: int_parsing",
+    "jsonrpc": "MCPError -32602 (Invalid params)",
     "group": "HTTP 401 (HTTPStatusError)",
 }
 
@@ -347,44 +353,36 @@ async def test_stage_error_columns_carry_no_config_values(tmp_path, kind):
 # ── what the vocabulary deliberately keeps ────────────────────────────────
 
 
-def _mcp_error(message: str) -> BaseException:
+def _mcp_error(code: int, message: str) -> Any:
     from mcp.shared.exceptions import MCPError
 
-    return MCPError(code=-32602, message=message)
+    return MCPError(code=code, message=message)
 
 
 @pytest.mark.parametrize("grouped", [False, True], ids=["bare", "grouped"])
-def test_upstream_json_rpc_error_keeps_its_message_for_the_client(tmp_path, grouped):
-    """An ``MCPError`` is the upstream's reply, relayed like an ``isError``
-    result: the client sees its message, scrubbed of whole configured values
-    and URL userinfo. A group wrapping it is unwrapped first, so the branch
-    does not depend on how anyio delivered the error."""
-    exc = _mcp_error(f"invalid params: field 'path' missing; auth {_HEADER} via {_URL}")
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        (-32602, "MCPError -32602 (Invalid params)"),
+        (-32601, "MCPError -32601 (Method not found)"),
+        # Not a reserved code: the upstream chose it, so it is not shown.
+        (-31337, "MCPError"),
+        (40123, "MCPError"),
+    ],
+)
+def test_json_rpc_error_shows_only_a_reserved_code(tmp_path, grouped, code, expected):
+    """An upstream JSON-RPC error's message can quote STM's request back — a
+    URL query, an argument, one token of a header — so it is rendered like any
+    other exception, on every surface. A reserved code is kept; any other code
+    is upstream-chosen and dropped. A group is unwrapped first."""
+    from memtomem_stm.proxy.manager import _safe_error_text
+
+    exc: BaseException = _mcp_error(code, f"bad query token cnryQueryTok via {_URL} {_ARG}")
     if grouped:
         exc = ExceptionGroup("unhandled errors in a TaskGroup", [exc])
 
-    text = _manager(tmp_path).safe_upstream_error("srv", exc)
-
-    assert text.startswith("MCPError: invalid params: field 'path' missing"), text
-    for whole in ("cnryHdrVal", "cnryUrlUser", "cnryUrlPass"):
-        assert whole not in text, text
-
-
-def test_upstream_json_rpc_error_partial_echo_passes_by_decision(tmp_path):
-    """The retained risk, pinned so a change to it is deliberate: a token the
-    upstream chooses to quote from STM's request is its reply, and passes as
-    it would in an ``isError`` result. Only whole configured values are
-    scrubbed on this branch (#1082 decision 1)."""
-    text = _manager(tmp_path).safe_upstream_error("srv", _mcp_error("bad query token cnryQueryTok"))
-    assert text == "MCPError: bad query token cnryQueryTok"
-
-
-def test_json_rpc_error_is_summarized_everywhere_but_the_client(tmp_path):
-    """Logs, health and metrics rows get no carve-out: there the upstream's
-    message has no reader that needs it."""
-    from memtomem_stm.proxy.manager import _safe_error_text
-
-    assert _safe_error_text(_mcp_error(f"echo {_HEADER}")) == "MCPError"
+    assert _manager(tmp_path).safe_upstream_error("srv", exc) == expected
+    assert _safe_error_text(exc) == expected
 
 
 def _stm_composed() -> list[tuple[BaseException, str]]:

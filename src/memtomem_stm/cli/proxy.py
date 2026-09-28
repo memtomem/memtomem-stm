@@ -8380,8 +8380,9 @@ def _probe_failure_message(root: BaseException, stage: ProbeStage | None) -> str
     Never the exception's message: servers and SDKs quote the request URL
     (query included), an argument, or part of a header back in it, in forms no
     value list can anticipate (#1079). What is left is the type name, the
-    status code of an HTTP error, and — for a pydantic ``ValidationError`` —
-    locations and error types. Before the transport connects that error is the
+    status code of an HTTP error, a reserved JSON-RPC error code
+    (``MCPError -32602 (Invalid params)``, #1082), and — for a pydantic
+    ``ValidationError`` — locations and error types. Before the transport connects that error is the
     SDK rejecting the raw server entry (a non-string ``args`` item, say);
     after, the server's reply failed validation (#1077). *stage* is ``None``
     for probes without stages (the LTM server, Ollama endpoints).

@@ -1957,41 +1957,9 @@ async def test_timeout_does_not_gate_other_tools_behind_recovery():
     assert mgr._connections["srv"].unavailable_generation is not None
 
 
-def test_safe_upstream_error_scrubs_every_generation_in_one_pass():
-    """Per-config ``sanitize_secrets`` passes corrupt each other.
-
-    A short secret from a retired generation would rewrite the ``<REDACTED>``
-    placeholder a previous config's pass just inserted, mangling the message
-    (``<R<REDACTED>ACTED>``) — the exact hazard the sanitizer documents.
-    """
-    from memtomem_stm.proxy.manager import _RetiredConnectionResources
-
-    mgr = _make_manager()
-    conn = mgr._connections["srv"]
-    conn.config = conn.config.model_copy(update={"env": {"TOKEN": "LONGSECRETVALUE"}})
-    conn.retired_resources[0] = _RetiredConnectionResources(
-        owner=None,
-        stack=None,
-        config=conn.config.model_copy(update={"env": {"OLD": "RED"}}),
-    )
-
-    from mcp.shared.exceptions import MCPError
-
-    # Only an upstream JSON-RPC error keeps its message, so it is the branch
-    # the single pass protects (#1082).
-    text = mgr.safe_upstream_error("srv", MCPError(-32602, "auth LONGSECRETVALUE failed"))
-
-    # A second pass for the retired ``RED`` value would rewrite the placeholder
-    # into ``<<REDACTED>ACTED>``.
-    assert text == "MCPError: auth <REDACTED> failed"
-
-
 def test_safe_upstream_error_returns_pinned_text_verbatim():
-    """Pinned text is STM-composed and already credential-free.
-
-    Re-running the sanitizer over it is the second pass that lets another
-    generation's short secret rewrite the placeholder it already contains.
-    """
+    """Pinned text is STM-composed and already credential-free, so it is shown
+    verbatim instead of being reduced to the exception's type (#1082)."""
     from memtomem_stm.proxy.manager import _mark_safe_upstream_error
 
     mgr = _make_manager()
@@ -2005,25 +1973,6 @@ def test_safe_upstream_error_returns_pinned_text_verbatim():
         mgr.safe_upstream_error("srv", exc)
         == "ConnectionError: recovery failed; <REDACTED> stays intact"
     )
-
-
-def test_safe_upstream_error_scrubs_pinned_inputs_of_a_closed_generation():
-    """A generation retired and closed since the failure leaves no config to
-    scrub against, so its url/secrets are pinned to the exception and join the
-    same single sanitizer pass."""
-    from memtomem_stm.proxy.manager import _pin_safe_upstream_scrub
-
-    mgr = _make_manager()
-    conn = mgr._connections["srv"]
-    conn.config = conn.config.model_copy(update={"env": {"NEW": "RED"}})
-    gone = conn.config.model_copy(update={"env": {"GONE": "RETIREDSECRET"}})
-
-    from mcp.shared.exceptions import MCPError
-
-    exc = MCPError(-32603, "spawn failed: RETIREDSECRET")
-    _pin_safe_upstream_scrub(exc, gone)
-
-    assert mgr.safe_upstream_error("srv", exc) == "MCPError: spawn failed: <REDACTED>"
 
 
 async def test_oversize_response_closes_the_circuit_breaker():
