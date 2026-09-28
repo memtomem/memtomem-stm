@@ -20,6 +20,7 @@ from memtomem_stm.proxy.index_observability import (
 )
 from memtomem_stm.proxy.privacy import contains_sensitive_content
 from memtomem_stm.utils.fileio import atomic_write_text
+from memtomem_stm.utils.redact import exception_summary
 
 logger = logging.getLogger(__name__)
 
@@ -243,7 +244,7 @@ async def auto_index_response(
         )
         chunks = 0
         ok = False
-        error = f"{type(exc).__name__}: {exc}"
+        error = exception_summary(exc)
         observability.record_outcome(tool, "error")
 
     summary = compose_index_footer(
@@ -381,7 +382,7 @@ async def extract_and_store(
         return ExtractOutcome(
             ok=False,
             facts_stored=indexed_count,
-            error=f"{type(exc).__name__}: {exc}",
+            error=exception_summary(exc),
         )
 
 

@@ -1975,11 +1975,15 @@ def test_safe_upstream_error_scrubs_every_generation_in_one_pass():
         config=conn.config.model_copy(update={"env": {"OLD": "RED"}}),
     )
 
-    text = mgr.safe_upstream_error("srv", RuntimeError("auth LONGSECRETVALUE failed"))
+    from mcp.shared.exceptions import MCPError
+
+    # Only an upstream JSON-RPC error keeps its message, so it is the branch
+    # the single pass protects (#1082).
+    text = mgr.safe_upstream_error("srv", MCPError(-32602, "auth LONGSECRETVALUE failed"))
 
     # A second pass for the retired ``RED`` value would rewrite the placeholder
     # into ``<<REDACTED>ACTED>``.
-    assert text == "RuntimeError: auth <REDACTED> failed"
+    assert text == "MCPError: auth <REDACTED> failed"
 
 
 def test_safe_upstream_error_returns_pinned_text_verbatim():
@@ -2014,10 +2018,12 @@ def test_safe_upstream_error_scrubs_pinned_inputs_of_a_closed_generation():
     conn.config = conn.config.model_copy(update={"env": {"NEW": "RED"}})
     gone = conn.config.model_copy(update={"env": {"GONE": "RETIREDSECRET"}})
 
-    exc = RuntimeError("spawn failed: RETIREDSECRET")
+    from mcp.shared.exceptions import MCPError
+
+    exc = MCPError(-32603, "spawn failed: RETIREDSECRET")
     _pin_safe_upstream_scrub(exc, gone)
 
-    assert mgr.safe_upstream_error("srv", exc) == "RuntimeError: spawn failed: <REDACTED>"
+    assert mgr.safe_upstream_error("srv", exc) == "MCPError: spawn failed: <REDACTED>"
 
 
 async def test_oversize_response_closes_the_circuit_breaker():

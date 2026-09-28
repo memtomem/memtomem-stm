@@ -99,3 +99,85 @@ def sanitize_secrets(
     # matching secret win, matching the rule above.
     pattern = re.compile("|".join(re.escape(v) for v in values))
     return pattern.sub(lambda _m: placeholder, text)
+
+
+def root_cause_exc(exc: BaseException) -> BaseException:
+    """Walk into ``BaseExceptionGroup`` (anyio TaskGroup wraps probe failures
+    as ``unhandled errors in a TaskGroup (N sub-exception)``) to surface the
+    first non-group leaf so callers can dispatch on the real cause's type
+    or message instead of the wrapper.
+    """
+    seen: set[int] = set()
+    cur: BaseException = exc
+    while isinstance(cur, BaseExceptionGroup) and cur.exceptions and id(cur) not in seen:
+        seen.add(id(cur))
+        cur = cur.exceptions[0]
+    return cur
+
+
+def http_status_code(exc: BaseException) -> int | None:
+    """The status code of an httpx/httpx2 ``HTTPStatusError``, else ``None``.
+
+    Only those two classes are trusted: another exception's ``response``
+    attribute could carry anything into the rendered error.
+    """
+    import httpx
+    import httpx2
+
+    if not isinstance(exc, httpx.HTTPStatusError | httpx2.HTTPStatusError):
+        return None
+    code = exc.response.status_code
+    return code if type(code) is int else None
+
+
+def exception_summary(exc: BaseException) -> str:
+    """An exception as the fixed vocabulary shared by every error surface.
+
+    Never the exception's message: servers and SDKs quote the request URL
+    (query included), an argument, or part of a header back in it, in forms no
+    value list can anticipate (#1079, #1082). What is left is the root cause's
+    type name, the status code of an HTTP error, and — for a pydantic
+    ``ValidationError`` — its error types. Not its locations: a location can be
+    a key of the data that failed, and nothing marks which parts the schema
+    owns.
+    """
+    from pydantic import ValidationError
+
+    root = root_cause_exc(exc)
+    if isinstance(root, ValidationError):
+        kinds = dict.fromkeys(
+            err["type"] for err in root.errors(include_url=False, include_input=False)
+        )
+        return f"ValidationError: {'; '.join(kinds)}"
+    code = http_status_code(root)
+    if code is not None:
+        return f"HTTP {code} ({type(root).__name__})"
+    return type(root).__name__
+
+
+def diagnostic_url(url: str) -> str:
+    """A configured URL as diagnostics show it: scheme, host, path.
+
+    Userinfo becomes ``***@`` (``redact_url_userinfo``), and the query and
+    fragment are dropped, since tokens are passed there too (#1079). Any
+    ``@`` the parsed netloc does not hold fails closed as
+    ``<unparseable url>``: a ``?``, ``#`` or ``/`` inside the userinfo
+    (``http://u:p?x@host``, ``http://u/p@host``) makes the parser read part of
+    it as the host or path, and no rule on the URL's shape can tell such a
+    value from a legitimate ``@`` in a path or query, which fails closed too.
+    An encoded ``@`` in the netloc and an unreadable port are treated the same
+    way.
+    """
+    if not url:
+        return url
+    try:
+        parts = urlsplit(url)
+        parts.port
+    except ValueError:
+        return "<unparseable url>"
+    if url.count("@") > parts.netloc.count("@") or "%40" in parts.netloc.lower():
+        return "<unparseable url>"
+    shown = redact_url_userinfo(url)
+    if shown == "<unparseable url>":
+        return shown
+    return urlunsplit(urlsplit(shown)._replace(query="", fragment=""))

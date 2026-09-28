@@ -130,7 +130,7 @@ class TestStart:
         # #580: the failed server is recorded so it stays visible in health,
         # instead of vanishing (no _connections entry is created on failure).
         assert "bad" in mgr._failed_servers
-        assert "unreachable" in mgr._failed_servers["bad"]
+        assert mgr._failed_servers["bad"] == "ConnectionError"
 
     async def test_startup_failed_server_appears_in_health(self):
         """#580: a configured-but-unconnected server surfaces in
@@ -156,7 +156,7 @@ class TestStart:
 
         health = mgr.get_upstream_health()
         assert health["bad"]["connected"] is False
-        assert "unreachable" in health["bad"]["error"]
+        assert health["bad"]["error"] == "ConnectionError"
         assert health["ok"]["connected"] is True
         assert "error" not in health["ok"]
 
@@ -199,14 +199,12 @@ class TestStart:
         for blob in (recorded, health_error):
             assert "s3cr3t-token" not in blob
             assert "alice:s3cr3t-token" not in blob
-            assert "***@ltm.example.com" in blob
+            assert blob == "ConnectionError"
 
     async def test_startup_failure_redacts_long_credential_past_cap(self):
-        """#580: redaction runs on the FULL message before the 500-char cap, so
-        a credential long enough that ``@host`` falls past the cap is still
-        scrubbed. Capping first (as format_error_message_from_exc does) would
-        truncate the token mid-string, leaving a partial that redact can no
-        longer match against the configured URL."""
+        """#580: a credential long enough to straddle the 500-char cap must not
+        survive as a truncated prefix. Since #1082 the message is not rendered
+        at all, which this still pins."""
         from memtomem_stm.proxy.metrics import MAX_ERROR_MESSAGE_CHARS
 
         token = "t" * (MAX_ERROR_MESSAGE_CHARS + 300)  # pushes @host past the cap
@@ -229,7 +227,7 @@ class TestStart:
             # Not even a long partial run of the token may survive the cap.
             assert token not in blob
             assert "t" * 100 not in blob
-            assert "***@ltm.example.com" in blob
+            assert blob == "ConnectionError"
 
     async def test_startup_failure_log_line_redacts_credential(self, caplog):
         """#580: the operator LOG for a failed credentialed connect must also be
@@ -254,9 +252,8 @@ class TestStart:
         # code regresses to logger.exception.
         assert "s3cr3t-token" not in caplog.text
         assert "alice:s3cr3t-token" not in caplog.text
-        # The failure is still logged, redacted.
-        assert "Failed to connect to upstream server 'web'" in caplog.text
-        assert "***@ltm.example.com" in caplog.text
+        # The failure is still logged, as its type (#1082).
+        assert "Failed to connect to upstream server 'web': ConnectionError" in caplog.text
 
     async def test_url_less_network_upstream_recorded_in_health(self):
         """#580: a non-stdio upstream configured without a url is skipped by
@@ -1224,7 +1221,7 @@ class TestConnectDeadlineEndToEnd:
         assert "Error during connection cleanup for 'bad'" in caplog.text
         assert "s3cr3t-token" not in caplog.text
         assert "alice:s3cr3t-token" not in caplog.text
-        assert "***@ltm.example.com" in caplog.text
+        assert "ltm.example.com" not in caplog.text
 
 
 class TestConcurrentReconnect:
@@ -1783,7 +1780,7 @@ class TestConnectionGenerationLeases:
         rendered = mgr.safe_upstream_error("docs", raised.value)
         for secret in (old_url_token, old_header_token, old_env_token):
             assert secret not in rendered
-        assert "***@old.example.test" in rendered
+        assert rendered == "ConnectionError"
         await asyncio.gather(*list(mgr._background_tasks), return_exceptions=True)
 
     async def test_next_dispatch_waits_for_failed_generation_recovery(self):
@@ -1876,8 +1873,9 @@ class TestCleanupLogCredentialRedaction:
     credentialed ``cfg.url``. httpx transport exceptions embed the request
     URL, so a close/reconnect failure routed through ``logger.debug(...,
     exc_info=True)`` would repeat the token in the traceback tail. Every such
-    site must instead render the exception through ``_redacted_error`` with no
-    ``exc_info`` — the same guarantee #593 gave the startup connect path.
+    site must instead render the exception through ``_safe_error_text`` with no
+    ``exc_info`` — the same guarantee #593 gave the startup connect path. Since
+    #1082 that rendering is the exception's type, so not even the host appears.
 
     One regression per in-scope site: the two ``_reconnect_server`` closes, the
     ``stop()`` and double-start-guard connection-stack closes, and the three
@@ -1890,8 +1888,8 @@ class TestCleanupLogCredentialRedaction:
         assert expect_msg in caplog.text
         assert "s3cr3t-token" not in caplog.text
         assert "alice:s3cr3t-token" not in caplog.text
-        # The redacted rendering still identifies the host for operators.
-        assert "***@ltm.example.com" in caplog.text
+        # The rendering is the exception type; the URL does not appear (#1082).
+        assert "ltm.example.com" not in caplog.text
 
     def _cfg(self, **overrides) -> UpstreamServerConfig:
         return UpstreamServerConfig(
@@ -2184,7 +2182,7 @@ class TestCleanupLogCredentialRedaction:
         assert "Tool call bad/t failed" in caplog.text
         for secret in ("s3cr3t-token", header_token, env_token):
             assert secret not in caplog.text
-        assert "***@ltm.example.com" in caplog.text
+        assert "Tool call bad/t failed (attempt 1/1): ConnectionError" in caplog.text
 
 
 # ── _open_transport ──────────────────────────────────────────────────────

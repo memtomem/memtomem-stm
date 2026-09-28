@@ -65,8 +65,10 @@ from memtomem_stm.proxy import prefixes, tool_name_budget
 from memtomem_stm.proxy.staged_status import ProbeStage, StagedProbeResult
 from memtomem_stm.utils.fileio import atomic_write_text
 from memtomem_stm.utils.redact import (
+    diagnostic_url as _diagnostic_url,
+    exception_summary,
     redact_exception_text,
-    redact_url_userinfo,
+    root_cause_exc as _root_cause_exc,
     sanitize_secrets,
 )
 
@@ -8367,20 +8369,6 @@ def _ltm_status(
     return _ltm_mcp_status(config.surfacing, timeout)
 
 
-def _root_cause_exc(exc: BaseException) -> BaseException:
-    """Walk into ``BaseExceptionGroup`` (anyio TaskGroup wraps probe failures
-    as ``unhandled errors in a TaskGroup (N sub-exception)``) to surface the
-    first non-group leaf so callers can dispatch on the real cause's type
-    or message instead of the wrapper.
-    """
-    seen: set[int] = set()
-    cur: BaseException = exc
-    while isinstance(cur, BaseExceptionGroup) and cur.exceptions and id(cur) not in seen:
-        seen.add(id(cur))
-        cur = cur.exceptions[0]
-    return cur
-
-
 def _root_cause_message(exc: BaseException) -> str:
     cur = _root_cause_exc(exc)
     return str(cur) or type(cur).__name__
@@ -8405,53 +8393,7 @@ def _probe_failure_message(root: BaseException, stage: ProbeStage | None) -> str
 
         subject = "server entry" if stage is ProbeStage.CONFIGURED else "server response"
         return f"invalid {subject}: {validation_error_summary(root)}"
-    code = _http_status_code(root)
-    if code is not None:
-        return f"HTTP {code} ({type(root).__name__})"
-    return type(root).__name__
-
-
-def _http_status_code(exc: BaseException) -> int | None:
-    """The status code of an httpx/httpx2 ``HTTPStatusError``, else ``None``.
-
-    Only those two classes are trusted: another exception's ``response``
-    attribute could carry anything into the rendered error.
-    """
-    import httpx
-    import httpx2
-
-    if not isinstance(exc, httpx.HTTPStatusError | httpx2.HTTPStatusError):
-        return None
-    code = exc.response.status_code
-    return code if type(code) is int else None
-
-
-def _diagnostic_url(url: str) -> str:
-    """A configured URL as ``health``/``doctor`` show it: scheme, host, path.
-
-    Userinfo becomes ``***@`` (``redact_url_userinfo``), and the query and
-    fragment are dropped, since tokens are passed there too (#1079). Any
-    ``@`` the parsed netloc does not hold fails closed as
-    ``<unparseable url>``: a ``?``, ``#`` or ``/`` inside the userinfo
-    (``http://u:p?x@host``, ``http://u/p@host``) makes the parser read part of
-    it as the host or path, and no rule on the URL's shape can tell such a
-    value from a legitimate ``@`` in a path or query, which fails closed too.
-    An encoded ``@`` in the netloc and an unreadable port are treated the same
-    way.
-    """
-    if not url:
-        return url
-    try:
-        parts = urlsplit(url)
-        parts.port
-    except ValueError:
-        return "<unparseable url>"
-    if url.count("@") > parts.netloc.count("@") or "%40" in parts.netloc.lower():
-        return "<unparseable url>"
-    shown = redact_url_userinfo(url)
-    if shown == "<unparseable url>":
-        return shown
-    return urlunsplit(urlsplit(shown)._replace(query="", fragment=""))
+    return exception_summary(root)
 
 
 # Values shorter than this are not treated as redactable secrets: a 1-3 char

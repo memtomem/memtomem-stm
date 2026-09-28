@@ -29,10 +29,12 @@ MAX_ERROR_MESSAGE_CHARS = 500
 def format_error_message_from_exc(exc: BaseException) -> str:
     """Format an exception for ``CallMetrics.error_message`` (capped).
 
-    Used at every exception-driven capture site in ``ProxyManager.call_tool``
-    (PROGRAMMING / PROTOCOL / TRANSPORT / TIMEOUT / LOCK_TIMEOUT /
-    INTERNAL_ERROR). UPSTREAM_ERROR uses ``original_text`` directly because
-    its source is the upstream tool's text payload, not a Python exception.
+    Only for exceptions whose text STM composed (the overall-deadline
+    ``TimeoutError``): the message is kept verbatim. An exception from an
+    upstream or its transport goes through ``proxy/manager.py:_safe_error_text``
+    instead, which drops the message (#1082). UPSTREAM_ERROR uses
+    ``original_text`` directly because its source is the upstream tool's text
+    payload, not a Python exception.
     """
     return f"{type(exc).__name__}: {exc}"[:MAX_ERROR_MESSAGE_CHARS]
 
