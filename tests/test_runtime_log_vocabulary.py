@@ -587,3 +587,29 @@ def test_embedding_shape_error_counts_unknown_reply_keys():
     assert str(raised.value) == (
         "ollama embedding response has no 'embeddings' field; it holds: error (+1 other)"
     )
+
+
+def test_rendering_imports_nothing():
+    """These helpers run in ``except`` blocks, often on the event loop. A cold
+    ``mcp.shared.exceptions`` import there cost ~240 ms and stalled the daemon's
+    loop on Windows CI (#1082); an unimportable library raised anew. They look
+    the classes up in ``sys.modules`` instead — an exception can only be an
+    instance of a loaded class. A fresh interpreter, so other tests' imports
+    cannot hide a regression."""
+    import subprocess
+
+    code = (
+        "import sys\n"
+        "import memtomem_stm.utils.redact as r\n"
+        "before = set(sys.modules)\n"
+        "r.exception_summary(RuntimeError('x'))\n"
+        "r.exception_summary(ExceptionGroup('g', [ValueError('y')]))\n"
+        "r.http_status_code(RuntimeError('x'))\n"
+        "new = sorted(m for m in set(sys.modules) - before"
+        " if m.split('.')[0] in {'mcp', 'httpx', 'httpx2'})\n"
+        "print(new)\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    assert out == "[]", out

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from collections.abc import Iterable
 from urllib.parse import urlsplit, urlunsplit
 
@@ -115,28 +116,34 @@ def root_cause_exc(exc: BaseException) -> BaseException:
     return cur
 
 
+def _loaded_class(module: str, name: str) -> type[BaseException] | None:
+    """*name* from *module* if that module is already imported, else ``None``.
+
+    These helpers run inside ``except`` blocks, often on the event loop, so
+    they never import. Nothing is lost: an exception can only be an instance of
+    a class whose module is loaded. Importing here instead cost a cold
+    ``mcp.shared.exceptions`` import (~240 ms) on the loop, and raised anew
+    when the library could not be imported (#1082).
+    """
+    cls = getattr(sys.modules.get(module), name, None)
+    return cls if isinstance(cls, type) and issubclass(cls, BaseException) else None
+
+
 def http_status_code(exc: BaseException) -> int | None:
     """The status code of an httpx/httpx2 ``HTTPStatusError``, else ``None``.
 
     Only those two classes are trusted: another exception's ``response``
     attribute could carry anything into the rendered error.
     """
-    trusted: list[type[BaseException]] = []
-    # Called from ``except`` blocks: an unimportable client library must not
-    # turn a handled failure into a new one.
-    try:
-        import httpx
-
-        trusted.append(httpx.HTTPStatusError)
-    except ImportError:
-        pass
-    try:
-        import httpx2
-
-        trusted.append(httpx2.HTTPStatusError)
-    except ImportError:
-        pass
-    if not isinstance(exc, tuple(trusted)):
+    trusted = tuple(
+        cls
+        for cls in (
+            _loaded_class("httpx", "HTTPStatusError"),
+            _loaded_class("httpx2", "HTTPStatusError"),
+        )
+        if cls is not None
+    )
+    if not trusted or not isinstance(exc, trusted):
         return None
     code = exc.response.status_code  # type: ignore[attr-defined]
     return code if type(code) is int else None
@@ -181,16 +188,13 @@ def exception_summary(exc: BaseException) -> str:
     """
     from pydantic import ValidationError
 
-    try:
-        from mcp.shared.exceptions import MCPError
-    except ImportError:  # same reason as in ``http_status_code``
-        MCPError = None  # type: ignore[assignment,misc]
-
+    mcp_error = _loaded_class("mcp.shared.exceptions", "MCPError")
     root = root_cause_exc(exc)
     if isinstance(root, ResponseShapeError):
         return f"{type(root).__name__}: {root}"
-    if MCPError is not None and isinstance(root, MCPError):
-        reserved = _JSONRPC_STANDARD_ERRORS.get(root.error.code)
+    if mcp_error is not None and isinstance(root, mcp_error):
+        code = getattr(getattr(root, "error", None), "code", None)
+        reserved = _JSONRPC_STANDARD_ERRORS.get(code) if type(code) is int else None
         if reserved is not None:
             return f"{type(root).__name__} {reserved}"
         return type(root).__name__
