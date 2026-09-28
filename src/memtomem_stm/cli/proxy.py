@@ -8400,7 +8400,6 @@ def _probe_failure_message(root: BaseException, stage: ProbeStage | None) -> str
     """
     from pydantic import ValidationError
 
-    logger.debug("probe failure (%s): %s", type(root).__name__, root)
     if isinstance(root, ValidationError):
         from memtomem_stm.proxy.config import validation_error_summary
 
@@ -8606,11 +8605,10 @@ def _surfacing_bootstrap_status(
         }
     except Exception as exc:
         error = _surfacing_bootstrap_error(exc)
-        if _is_config_construction_error(exc):
-            # The traceback would carry the same rejected values as the message.
-            logger.debug("Surfacing bootstrap status inspection failed: %s", error)
-        else:
-            logger.debug("Surfacing bootstrap status inspection failed", exc_info=exc)
+        # The rendered error only: a traceback repeats the exception's message,
+        # which can carry configured values (#1075) or anything the failing
+        # code quoted (#1079).
+        logger.debug("Surfacing bootstrap status inspection failed: %s", error)
         return {
             "enabled": None,
             "feedback_enabled": None,
@@ -8618,13 +8616,6 @@ def _surfacing_bootstrap_status(
             "ltm_server": None,
             "error": error,
         }
-
-
-def _is_config_construction_error(exc: Exception) -> bool:
-    from pydantic import ValidationError
-    from pydantic_settings import SettingsError
-
-    return isinstance(exc, ValidationError | SettingsError)
 
 
 def _surfacing_bootstrap_error(exc: Exception) -> str:

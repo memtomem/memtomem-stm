@@ -716,3 +716,34 @@ def test_doctor_reports_an_unknown_daemon_state(tmp_path, monkeypatch, as_json):
         assert block["ltm_state"] == "unknown"
     assert "shared daemon is reachable but LTM is unknown" in output
     _assert_clean(output, ("cnryState",), as_json=as_json)
+
+
+def test_probe_failure_message_is_not_logged(caplog):
+    """A dropped message must not reappear in a DEBUG log (the #1075 rule)."""
+    import logging
+
+    from memtomem_stm.cli.proxy import _probe_failure_message
+
+    with caplog.at_level(logging.DEBUG):
+        assert _probe_failure_message(RuntimeError("cnryLogged"), None) == "RuntimeError"
+    assert "cnryLogged" not in caplog.text
+
+
+def test_bootstrap_failure_log_carries_no_exception_text(monkeypatch, caplog):
+    """An unexpected bootstrap failure logs its rendered type, not a
+    traceback that would repeat the message."""
+    import logging
+
+    import memtomem_stm.config as config_mod
+    from memtomem_stm.cli import proxy as proxy_mod
+
+    def failing_config(*args, **kwargs):
+        raise RuntimeError("cnryBootstrapLog")
+
+    monkeypatch.setattr(config_mod, "stm_config_for_cli", failing_config)
+    with caplog.at_level(logging.DEBUG):
+        status = proxy_mod._surfacing_bootstrap_status(3.0)
+    # Positive control: the failure path ran and was logged.
+    assert status["error"] == "RuntimeError"
+    assert "Surfacing bootstrap status inspection failed: RuntimeError" in caplog.text
+    assert "cnryBootstrapLog" not in caplog.text
