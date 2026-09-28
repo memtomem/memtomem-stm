@@ -23,7 +23,7 @@ from helpers import set_home
 from memtomem_stm.cli.proxy import cli
 
 # Port 9 (discard) is closed on test hosts: connecting fails fast.
-_DEAD_URL = "http://cnryUrlUser:cnryUrlPass@127.0.0.1:9/mcp"
+_DEAD_URL = "http://cnryUrlUser:cnryUrlPass@127.0.0.1:9/mcp?token=cnryQueryTok#cnryFrag"
 
 _UPSTREAM_CANARIES = (
     "cnryArgStr",
@@ -33,8 +33,17 @@ _UPSTREAM_CANARIES = (
     "cnryHdrVal",
     "cnryUrlUser",
     "cnryUrlPass",
+    "cnryQueryTok",
+    "cnryFrag",
 )
-_LTM_CANARIES = ("cnryLtmArg", "cnryLtmHdr", "cnryLtmUser", "cnryLtmPass")
+_LTM_CANARIES = (
+    "cnryLtmArg",
+    "cnryLtmHdr",
+    "cnryLtmUser",
+    "cnryLtmPass",
+    "cnryLtmQuery",
+    "cnryLtmFrag",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -134,7 +143,7 @@ def _ltm_network_env(monkeypatch) -> None:
     monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_TRANSPORT", "streamable_http")
     monkeypatch.setenv(
         "MEMTOMEM_STM_SURFACING__LTM_MCP_URL",
-        "http://cnryLtmUser:cnryLtmPass@127.0.0.1:9/mcp",
+        "http://cnryLtmUser:cnryLtmPass@127.0.0.1:9/mcp?token=cnryLtmQuery#cnryLtmFrag",
     )
     monkeypatch.setenv(
         "MEMTOMEM_STM_SURFACING__LTM_MCP_HEADERS",
@@ -298,8 +307,8 @@ def test_ltm_probe_error_that_echoes_an_arg_is_scrubbed(monkeypatch):
         ltm_mcp_headers=None,
     )
     status = proxy_mod._ltm_mcp_status(surfacing, 3.0)
-    # Positive control: the failure text reached the status.
-    assert "launch failed" in status["error"]
+    # Positive control: the failure reached the status, by type (#1079).
+    assert status["error"].endswith(": RuntimeError")
     assert "cnryLtmArg" not in status["error"]
 
 
@@ -357,8 +366,9 @@ def test_probe_error_that_echoes_configured_values_is_scrubbed(
     )
     extra = ["--json"] if as_json else []
     output = _run([command, "--config", str(config), "--timeout", "3", *extra])
-    # Positive control: the injected failure text reached both rows.
-    assert output.count("boom: ") >= 2
+    # Positive control: the injected failure reached both rows (by type,
+    # since #1079 renders no exception message).
+    assert output.count("RuntimeError") >= 2
     _assert_clean(output, _ECHO_CANARIES, as_json=as_json)
 
 
@@ -413,5 +423,343 @@ def test_ltm_probe_error_that_echoes_url_credentials_is_scrubbed(monkeypatch):
         ltm_mcp_headers={"Authorization": "cnryLtmHdr"},
     )
     status = proxy_mod._ltm_mcp_status(surfacing, 3.0)
-    assert "auth rejected" in status["error"]
+    assert status["error"] == "http://***@127.0.0.1:9/mcp: RuntimeError"
     assert [c for c in _LTM_CANARIES if c in status["error"]] == []
+
+
+# --- #1079: free-form exception text, URL query/fragment, malformed authority
+
+
+_PARTIAL_CANARIES = ("cnryPartQuery", "cnryPartFrag", "cnryKvArg", "cnryBearerTok")
+_PARTIAL_URL = "http://127.0.0.1:9/mcp?token=cnryPartQuery#cnryPartFrag"
+
+
+def _patch_partial_echoes(monkeypatch) -> None:
+    """Transports fail quoting only *parts* of their configured values — the
+    shape a server error takes that whole-value scrubbing cannot catch."""
+    import mcp.client.stdio
+
+    import memtomem_stm.utils.mcp_transport as transport_mod
+
+    def failing(echoed: str):
+        def transport(*args, **kwargs):
+            raise RuntimeError(f"boom: {echoed}")
+
+        return transport
+
+    monkeypatch.setattr(mcp.client.stdio, "stdio_client", failing("invalid key cnryKvArg"))
+    monkeypatch.setattr(
+        transport_mod,
+        "streamable_http_transport",
+        failing(
+            "Client error '401 Unauthorized' for url "
+            "'http://127.0.0.1:9/mcp?token=cnryPartQuery#cnryPartFrag'; "
+            "token cnryPartQuery / cnryPartFrag rejected; bearer cnryBearerTok"
+        ),
+    )
+
+
+@pytest.mark.parametrize("command", ["health", "doctor"])
+@pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+def test_probe_error_is_rendered_without_its_message(tmp_path, monkeypatch, command, as_json):
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "false")
+    _patch_partial_echoes(monkeypatch)
+    config = tmp_path / "stm_proxy.json"
+    config.write_text(
+        json.dumps(
+            {
+                "upstream_servers": {
+                    "local": {
+                        "prefix": "local",
+                        "command": "echo",
+                        "args": ["--api-key=cnryKvArg"],
+                    },
+                    "remote": {
+                        "prefix": "remote",
+                        "transport": "streamable_http",
+                        "url": _PARTIAL_URL,
+                        "headers": {"Authorization": "Bearer cnryBearerTok"},
+                    },
+                }
+            }
+        )
+    )
+    extra = ["--json"] if as_json else []
+    output = _run([command, "--config", str(config), "--timeout", "3", *extra])
+    # Positive control: each probe's failure reached the report, by type name.
+    if as_json:
+        servers = json.loads(output)["servers"]
+        assert servers["local"]["error"] == "RuntimeError"
+        assert servers["remote"]["error"] == "RuntimeError"
+    else:
+        lines = output.splitlines()
+        for name in ("local", "remote"):
+            assert any(name in line and "RuntimeError" in line for line in lines), name
+    assert "boom" not in output
+    _assert_clean(output, _PARTIAL_CANARIES, as_json=as_json)
+
+
+def _http_status_error(module_name: str, url: str) -> Exception:
+    import importlib
+
+    httpx_mod = importlib.import_module(module_name)
+    request = httpx_mod.Request("POST", url)
+    response = httpx_mod.Response(401, request=request, text="bad token cnryBody")
+    return httpx_mod.HTTPStatusError(
+        f"Client error '401 Unauthorized' for url '{url}'", request=request, response=response
+    )
+
+
+@pytest.mark.parametrize("module_name", ["httpx", "httpx2"])
+def test_probe_renders_an_http_status_error_as_its_code(monkeypatch, module_name):
+    import asyncio
+
+    import memtomem_stm.utils.mcp_transport as transport_mod
+    from memtomem_stm.cli.proxy import _probe_one
+
+    def failing_transport(url, *args, **kwargs):
+        raise _http_status_error(module_name, url)
+
+    monkeypatch.setattr(transport_mod, "streamable_http_transport", failing_transport)
+    result = asyncio.run(_probe_one({"transport": "streamable_http", "url": _PARTIAL_URL}, 3.0))
+    assert result.error == "HTTP 401 (HTTPStatusError)"
+
+
+def test_status_code_is_only_read_from_http_status_errors():
+    """Any other exception with a ``response`` attribute is rendered by type:
+    its attributes are not trusted to be an integer status code."""
+    from types import SimpleNamespace
+
+    from memtomem_stm.cli.proxy import _probe_failure_message
+    from memtomem_stm.proxy.staged_status import ProbeStage
+
+    class LooksLikeHttp(Exception):
+        response = SimpleNamespace(status_code="cnryStatus")
+
+    message = _probe_failure_message(LooksLikeHttp("cnryMessage"), ProbeStage.CONFIGURED)
+    assert message == "LooksLikeHttp"
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("http://127.0.0.1:9/mcp?token=cnryQ#cnryF", "http://127.0.0.1:9/mcp"),
+        ("https://u:cnryPw@host.test/mcp?k=v", "https://***@host.test/mcp"),
+        # An '@' outside the netloc cannot be told apart from a split
+        # userinfo, so even a legitimate one fails closed.
+        ("http://host.test/users/@me", "<unparseable url>"),
+        ("http://host.test/mcp?email=a@b", "<unparseable url>"),
+        ("http://alice/cnryPw@host.test/mcp", "<unparseable url>"),
+        ("http://alice/cnryPw?x@host.test/mcp", "<unparseable url>"),
+        # ``?``/``#`` split the userinfo: the parser reads ``alice:cnryPw`` as
+        # the authority, so the only safe rendering is none at all.
+        ("http://alice:cnryPw?x@host.test/mcp", "<unparseable url>"),
+        ("http://alice:cnryPw#x@host.test/mcp", "<unparseable url>"),
+        # Without a ``:`` the port reads fine, so only the ``@`` count
+        # catches a token-only userinfo split by ``?``.
+        ("http://cnryTok?x@host.test/mcp", "<unparseable url>"),
+        # A '/' after the '?'/'#' changes nothing: the '@' is still outside.
+        ("http://cnryTok?x/y@host.test/mcp", "<unparseable url>"),
+        ("http://cnryTok#x/y@host.test/mcp", "<unparseable url>"),
+        # Without a path, likewise.
+        ("http://host.test?email=a@b", "<unparseable url>"),
+        # An encoded ``@`` leaves a netloc whose port cannot be read ...
+        ("http://alice:cnryPw%40host.test/mcp", "<unparseable url>"),
+        # ... and without a port it still hides what precedes it.
+        ("http://cnryPw%40host.test/mcp", "<unparseable url>"),
+        ("alice:cnryPw@host.test/mcp", "<unparseable url>"),
+        ("", ""),
+    ],
+)
+def test_diagnostic_url_shape(url, expected):
+    from memtomem_stm.cli.proxy import _diagnostic_url
+
+    assert _diagnostic_url(url) == expected
+
+
+def test_ltm_status_url_fields_drop_query_and_malformed_authority():
+    from types import SimpleNamespace
+
+    from memtomem_stm.cli import proxy as proxy_mod
+
+    def status_for(url: str) -> dict[str, Any]:
+        surfacing = SimpleNamespace(
+            enabled=False,
+            ltm_mcp_transport="streamable_http",
+            ltm_mcp_command="",
+            ltm_mcp_args=[],
+            ltm_mcp_url=url,
+            ltm_mcp_headers=None,
+        )
+        return proxy_mod._ltm_mcp_status(surfacing, 3.0)
+
+    status = status_for("http://h.test/mcp?token=cnryQ#cnryF")
+    assert status["url"] == status["display"] == "http://h.test/mcp"
+    status = status_for("http://alice:cnryPw?x@h.test/mcp")
+    assert status["url"] == status["display"] == "<unparseable url>"
+
+
+def test_ltm_daemon_state_outside_the_known_set_is_not_echoed(monkeypatch):
+    from memtomem_stm.cli import proxy as proxy_mod
+    from memtomem_stm.config import STMConfig
+    from memtomem_stm.daemon import client as daemon_client
+
+    config = STMConfig()
+    config.surfacing.enabled = True
+    config.surfacing.ltm_mcp_url = "http://h.test/mcp?token=cnryDaemonQuery"
+
+    def status_with(state: object) -> dict[str, Any]:
+        async def fake_ping(*args, **kwargs):
+            return {"ltm": state}
+
+        monkeypatch.setattr(daemon_client, "ping", fake_ping)
+        return proxy_mod._ltm_daemon_status(config, 3.0)
+
+    for known in ("warming", "down", "cold"):
+        status = status_with(known)
+        assert status["ltm_state"] == known
+        assert status["error"] == f"shared daemon is reachable but LTM is {known}"
+    assert status_with("warm")["connected"] is True
+
+    for invalid in ("", None, 0):
+        assert status_with(invalid)["ltm_state"] == "unknown"
+
+    status = status_with("cnryState")
+    assert status["ltm_state"] == "unknown"
+    assert status["error"] == "shared daemon is reachable but LTM is unknown"
+    assert status["url"] == "http://h.test/mcp"
+    assert "cnry" not in json.dumps(status)
+
+
+def test_surfacing_bootstrap_error_names_only_the_type():
+    from memtomem_stm.cli.proxy import _surfacing_bootstrap_error
+
+    assert _surfacing_bootstrap_error(RuntimeError("cnryBootstrap")) == "RuntimeError"
+
+
+def test_ollama_probe_failure_is_rendered_by_type(monkeypatch):
+    import asyncio
+
+    import httpx
+
+    from memtomem_stm.cli import proxy as proxy_mod
+
+    base_url = "http://alice:cnryOllamaPw@ollama.test:11434"
+    dependency = proxy_mod._OllamaDependency(base_url, (("nomic-embed-text", ("scorer",)),))
+    real_async_client = httpx.AsyncClient
+
+    def handler(request):
+        raise httpx.ConnectError(
+            f"could not connect to {request.url} cnryOllamaPw", request=request
+        )
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kwargs: real_async_client(transport=transport, **kwargs)
+    )
+    result = asyncio.run(proxy_mod._probe_ollama_dependencies([dependency], 3))[0]
+    assert result.error == "ConnectError"
+
+
+@pytest.mark.parametrize(
+    "first,second",
+    [
+        ("http://alice:cnryPw1?x@ollama.test:11434", "http://alice:cnryPw2?x@ollama.test:11434"),
+        ("http://alice:cnryPw1%40ollama.test:11434", "http://alice:cnryPw2%40ollama.test:11434"),
+        ("http://cnryPw1%40ollama.test", "http://cnryPw2%40ollama.test"),
+        ("http://cnryPw1?x/y@ollama.test", "http://cnryPw2?x/y@ollama.test"),
+        ("http://alice/cnryPw1@ollama.test", "http://alice/cnryPw2@ollama.test"),
+        ("http://ollama.test:11434?token=cnryQ1", "http://ollama.test:11434?token=cnryQ2"),
+    ],
+)
+def test_ollama_check_id_does_not_depend_on_credential_parts(first, second):
+    from memtomem_stm.cli.proxy import _ollama_check_id
+
+    assert _ollama_check_id(first) == _ollama_check_id(second)
+    assert "cnry" not in _ollama_check_id(first)
+
+
+def test_refreshed_daemon_state_that_is_invalid_is_unknown(monkeypatch):
+    """An invalid refreshed value must not keep the earlier "warm" state."""
+    from memtomem_stm.cli import proxy as proxy_mod
+    from memtomem_stm.config import STMConfig
+    from memtomem_stm.daemon import client as daemon_client
+
+    config = STMConfig()
+    config.surfacing.enabled = True
+
+    async def fake_ping(*args, **kwargs):
+        return {"ltm": "warm"}
+
+    async def fake_measure(config, *, initial_state, timeout):
+        return {}, {"ltm": ""}
+
+    monkeypatch.setattr(daemon_client, "ping", fake_ping)
+    monkeypatch.setattr(proxy_mod, "_measure_warm_daemon_ltm", fake_measure)
+    status = proxy_mod._ltm_daemon_status(config, 3.0, measure_ltm=True)
+    assert status["ltm_state"] == "unknown"
+    assert status["connected"] is False
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+def test_doctor_reports_an_unknown_daemon_state(tmp_path, monkeypatch, as_json):
+    from memtomem_stm.daemon import client as daemon_client
+
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "true")
+
+    async def fake_ping(*args, **kwargs):
+        return {"ltm": "cnryState"}
+
+    monkeypatch.setattr(daemon_client, "ping", fake_ping)
+    config = tmp_path / "stm_proxy.json"
+    config.write_text(json.dumps({"upstream_servers": {}}))
+    extra = ["--json"] if as_json else []
+    output = _run(["doctor", "--config", str(config), "--timeout", "3", *extra])
+    if as_json:
+        block = _ltm_block(output)
+        assert block["route"] == "daemon"
+        assert block["ltm_state"] == "unknown"
+    assert "shared daemon is reachable but LTM is unknown" in output
+    _assert_clean(output, ("cnryState",), as_json=as_json)
+
+
+def test_probe_failure_message_is_not_logged(caplog):
+    """A dropped message must not reappear in a DEBUG log (the #1075 rule)."""
+    import logging
+
+    from memtomem_stm.cli.proxy import _probe_failure_message
+
+    with caplog.at_level(logging.DEBUG):
+        assert _probe_failure_message(RuntimeError("cnryLogged"), None) == "RuntimeError"
+    assert "cnryLogged" not in caplog.text
+
+
+def test_bootstrap_failure_log_carries_no_exception_text(monkeypatch, caplog):
+    """An unexpected bootstrap failure logs its rendered type, not a
+    traceback that would repeat the message."""
+    import logging
+
+    import memtomem_stm.config as config_mod
+    from memtomem_stm.cli import proxy as proxy_mod
+
+    def failing_config(*args, **kwargs):
+        raise RuntimeError("cnryBootstrapLog")
+
+    monkeypatch.setattr(config_mod, "stm_config_for_cli", failing_config)
+    with caplog.at_level(logging.DEBUG):
+        status = proxy_mod._surfacing_bootstrap_status(3.0)
+    # Positive control: the failure path ran and was logged.
+    assert status["error"] == "RuntimeError"
+    assert "Surfacing bootstrap status inspection failed: RuntimeError" in caplog.text
+    assert "cnryBootstrapLog" not in caplog.text
+
+
+def test_ollama_local_hint_uses_the_diagnostic_url():
+    """The local-Ollama hint is reached by a valid loopback URL, so an '@'
+    in its path must fail closed here as it does in the check detail."""
+    from memtomem_stm.cli.proxy import _ollama_next_action
+
+    hint = _ollama_next_action("http://localhost/cnryPw@host.test/mcp", ["qwen3:4b"])
+    # Positive control: the local branch that renders the URL ran.
+    assert hint.startswith("verify the local Ollama at <unparseable url>")
+    assert "cnryPw" not in hint

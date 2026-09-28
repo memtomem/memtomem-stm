@@ -15308,7 +15308,8 @@ asyncio.run(main())
         result = asyncio.run(proxy_mod._probe_one(cfg, 2))
         assert result.stage is ProbeStage.TRANSPORT_CONNECTED
         assert result.failed_stage is ProbeStage.MCP_INITIALIZED
-        assert result.error == "bad handshake"
+        # By type, never the message (#1079).
+        assert result.error == "RuntimeError"
 
         # list_tools() fails → MCP_INITIALIZED reached.
         monkeypatch.setattr(
@@ -15368,33 +15369,22 @@ asyncio.run(main())
         assert result.failed_stage is ProbeStage.TOOLS_DISCOVERED
         assert result.error
 
-    def test_short_secret_values_do_not_corrupt_error_text(self, monkeypatch):
+    def test_short_secret_values_do_not_corrupt_error_text(self):
         """A trivially short header/env value ("k") must not be redacted —
         redacting it globally would mangle ordinary words ("link") in the
-        error. Only meaningfully long secrets are scrubbed."""
+        error. Only meaningfully long secrets are scrubbed. Probe errors no
+        longer carry messages (#1079), so this pins the backstop sanitizer
+        directly."""
         from memtomem_stm.cli import proxy as proxy_mod
 
-        class FakeTransport:
-            async def __aenter__(self):
-                return (object(), object())
-
-            async def __aexit__(self, *_args):
-                return None
-
-        monkeypatch.setattr("mcp.client.sse.sse_client", lambda url, **_kw: FakeTransport())
-        monkeypatch.setattr(
-            "mcp.ClientSession",
-            self._fake_session_cls(init_exc=RuntimeError("network link down")),
-        )
         cfg = {
             "transport": "sse",
             "url": "https://up.example/sse",
             "prefix": "up",
             "headers": {"X-Api-Key": "k"},
         }
-        result = asyncio.run(proxy_mod._probe_one(cfg, 2))
         # "k" (< 4 chars) is not treated as a secret, so "link" stays intact.
-        assert result.error == "network link down"
+        assert proxy_mod._sanitize_probe_error("network link down", cfg) == "network link down"
 
     def test_teardown_error_after_discovery_reports_success(self, monkeypatch):
         """A failure raised while *leaving* the transport/session context —
@@ -15424,11 +15414,10 @@ asyncio.run(main())
         assert result.error is None
         assert result.tools == 1
 
-    def test_probe_error_sanitizes_header_and_env_values(self, monkeypatch):
-        """A probe exception that echoes a configured header/env value (401
-        bodies do) must reach ``health`` output sanitized — free-form
-        strings bypass the mapping redactors, so ``_probe_one`` scrubs them
-        against the server's own config before storing (⑧)."""
+    def test_probe_error_that_echoes_a_header_value_is_not_rendered(self, monkeypatch):
+        """A probe exception that echoes a configured header value (401
+        bodies do) must not reach ``health`` output: since #1079 the probe
+        stores the exception's type, never its message."""
         from memtomem_stm.cli import proxy as proxy_mod
 
         class FakeTransport:
@@ -15452,9 +15441,9 @@ asyncio.run(main())
             "headers": {"Authorization": "Bearer sekrit-token-123"},
         }
         result = asyncio.run(proxy_mod._probe_one(cfg, 2))
-        assert result.error is not None
-        assert "sekrit-token-123" not in result.error
-        assert "<REDACTED>" in result.error
+        # The message is not rendered at all (#1079), so nothing it quotes can
+        # reach health output.
+        assert result.error == "RuntimeError"
 
     def test_health_output_sanitizes_probe_error_text_and_json(self, runner, config, monkeypatch):
         """End-to-end: the sanitized probe error is what ``mms health``
@@ -16607,7 +16596,7 @@ class TestDoctor:
             == "registry.test:5000/ns/gemma3:latest"
         )
 
-    def test_ollama_probe_error_redacts_url_credentials(self, monkeypatch):
+    def test_ollama_probe_error_omits_the_request_url(self, monkeypatch):
         import httpx
 
         from memtomem_stm.cli import proxy as proxy_mod
@@ -16637,9 +16626,9 @@ class TestDoctor:
 
         result = asyncio.run(proxy_mod._probe_ollama_dependencies([dependency], 3))[0]
         assert result.error is not None
-        assert "super secret" not in result.error
-        assert "super%20secret" not in result.error
-        assert "***@ollama.test" in result.error
+        # By type, never the message: the normalized URL it embeds cannot
+        # reach the report (#1079).
+        assert result.error == "ConnectError"
 
     def test_ollama_client_setup_failure_renders_fail_not_crash(self, monkeypatch):
         import httpx
@@ -17077,17 +17066,36 @@ class TestDoctor:
         assert mixed["one"] == plain_solo["one"]
         assert mixed["two"] != mixed["one"]
 
-        # Two uncredentialed URLs that normalize to one stripped identity (an
-        # empty query marker survives the raw grouping key but not
-        # urlunsplit) exercise the uncredentialed collision fallback: both
-        # must come back suffixed and distinct.
+        # Two uncredentialed URLs that normalize to one stripped identity
+        # (urlsplit lowercases the scheme) exercise the uncredentialed
+        # collision fallback: both must come back suffixed and distinct.
         uncred_twins = site_ids(
             ("one", "p1", "http://ollama.test:11434"),
-            ("two", "p2", "http://ollama.test:11434?"),
+            ("two", "p2", "HTTP://ollama.test:11434"),
         )
         assert len(set(uncred_twins.values())) == 2
         for check_id in uncred_twins.values():
             assert "-" in check_id.split(":", 1)[1]
+
+        # A query or fragment is a credential part like userinfo (#1079): the
+        # twin carries its suffix from first publication, the bare endpoint
+        # keeps its bare ID through bare -> mixed -> bare, and no query value
+        # enters any ID. (Before #1079 an empty "?" twin counted as
+        # uncredentialed and pushed BOTH IDs onto the collision fallback.)
+        query_mixed = site_ids(
+            ("one", "p1", "http://ollama.test:11434"),
+            ("two", "p2", "http://ollama.test:11434?token=cnryQuery"),
+        )
+        assert query_mixed["one"] == plain_solo["one"]
+        assert "-" in query_mixed["two"].split(":", 1)[1]
+        assert "cnryQuery" not in query_mixed["two"]
+        assert site_ids(("one", "p1", "http://ollama.test:11434"))["one"] == plain_solo["one"]
+        empty_query = site_ids(
+            ("one", "p1", "http://ollama.test:11434"),
+            ("two", "p2", "http://ollama.test:11434?"),
+        )
+        assert empty_query["one"] == plain_solo["one"]
+        assert empty_query["two"] != empty_query["one"]
 
         # Real 8-hex sha256 prefix collision: the use sites "server '39153'"
         # and "server '74347'" share the prefix 1597babb. The full-length

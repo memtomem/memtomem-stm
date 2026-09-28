@@ -8123,14 +8123,14 @@ def _ltm_mcp_status(surfacing: Any, timeout: float) -> dict[str, Any]:
     display = (
         _ltm_command_display(command, args)
         if transport == "stdio" and command
-        else redact_url_userinfo(url) or "(empty url)"
+        else _diagnostic_url(url) or "(empty url)"
     )
     status: dict[str, Any] = {
         "route": "direct",
         "transport": transport,
         "command": command,
         "args": _hidden_ltm_args(args),
-        "url": redact_url_userinfo(url),
+        "url": _diagnostic_url(url),
         "display": display,
         "connected": None,
         "version": None,
@@ -8190,7 +8190,7 @@ def _ltm_mcp_status(surfacing: Any, timeout: float) -> dict[str, Any]:
             # Authorization header, and the launch args are hidden everywhere
             # else in the status.
             message = _sanitize_probe_error(
-                str(root) or type(root).__name__,
+                _probe_failure_message(root, None),
                 {"url": url, "headers": headers, "args": args},
             )
             status["error"] = f"{display}: {message}"
@@ -8280,6 +8280,18 @@ async def _measure_warm_daemon_ltm(
     )
 
 
+_KNOWN_LTM_STATES = frozenset({"warm", "warming", "down", "cold"})
+
+
+def _known_ltm_state(value: object) -> str:
+    """The daemon's reported LTM state, or ``unknown`` outside the known set.
+
+    The value is printed in the report and its error text, so only the states
+    the daemon defines pass through (#1079).
+    """
+    return value if isinstance(value, str) and value in _KNOWN_LTM_STATES else "unknown"
+
+
 def _ltm_daemon_status(config: Any, timeout: float, *, measure_ltm: bool = False) -> dict[str, Any]:
     """Shared-daemon readiness and telemetry; active only with ``measure_ltm``."""
     from memtomem_stm.daemon import client as daemon_client
@@ -8290,7 +8302,7 @@ def _ltm_daemon_status(config: Any, timeout: float, *, measure_ltm: bool = False
         "transport": surfacing.ltm_mcp_transport,
         "command": surfacing.ltm_mcp_command,
         "args": _hidden_ltm_args(surfacing.ltm_mcp_args),
-        "url": redact_url_userinfo(surfacing.ltm_mcp_url),
+        "url": _diagnostic_url(surfacing.ltm_mcp_url),
         "display": "mms daemon",
         "connected": False,
         "version": None,
@@ -8308,7 +8320,9 @@ def _ltm_daemon_status(config: Any, timeout: float, *, measure_ltm: bool = False
     if hs is None:
         status["error"] = "shared daemon is not reachable; run `mms daemon status`"
         return status
-    state = str(hs.get("ltm") or "cold")
+    # A missing field keeps the old "cold" default; a present value outside
+    # the known set is "unknown", whatever it is.
+    state = _known_ltm_state(hs["ltm"]) if "ltm" in hs else "cold"
     if isinstance(hs.get("latency"), dict):
         status["latency"] = hs["latency"]
     core = hs.get("core")
@@ -8323,7 +8337,10 @@ def _ltm_daemon_status(config: Any, timeout: float, *, measure_ltm: bool = False
         )
         status["measurement"] = measurement
         if isinstance(refreshed, dict):
-            state = str(refreshed.get("ltm") or state)
+            if "ltm" in refreshed:
+                # Present but invalid is "unknown", not the earlier state: an
+                # empty value must not keep an initial "warm" connected.
+                state = _known_ltm_state(refreshed["ltm"])
             if isinstance(refreshed.get("latency"), dict):
                 status["latency"] = refreshed["latency"]
     status["daemon_reachable"] = True
@@ -8369,14 +8386,17 @@ def _root_cause_message(exc: BaseException) -> str:
     return str(cur) or type(cur).__name__
 
 
-def _probe_failure_message(root: BaseException, stage: ProbeStage) -> str:
+def _probe_failure_message(root: BaseException, stage: ProbeStage | None) -> str:
     """Render a probe failure's root cause for ``health``/``doctor``.
 
-    A pydantic ``ValidationError`` names locations and error types only:
-    ``str(exc)`` embeds the rejected ``input_value``, and ``msg`` can quote it
-    too. Before the transport connects it is the SDK rejecting the raw server
-    entry (a non-string ``args`` item, say); after, the server's reply failed
-    validation (#1077).
+    Never the exception's message: servers and SDKs quote the request URL
+    (query included), an argument, or part of a header back in it, in forms no
+    value list can anticipate (#1079). What is left is the type name, the
+    status code of an HTTP error, and — for a pydantic ``ValidationError`` —
+    locations and error types. Before the transport connects that error is the
+    SDK rejecting the raw server entry (a non-string ``args`` item, say);
+    after, the server's reply failed validation (#1077). *stage* is ``None``
+    for probes without stages (the LTM server, Ollama endpoints).
     """
     from pydantic import ValidationError
 
@@ -8385,7 +8405,53 @@ def _probe_failure_message(root: BaseException, stage: ProbeStage) -> str:
 
         subject = "server entry" if stage is ProbeStage.CONFIGURED else "server response"
         return f"invalid {subject}: {validation_error_summary(root)}"
-    return _root_cause_message(root)
+    code = _http_status_code(root)
+    if code is not None:
+        return f"HTTP {code} ({type(root).__name__})"
+    return type(root).__name__
+
+
+def _http_status_code(exc: BaseException) -> int | None:
+    """The status code of an httpx/httpx2 ``HTTPStatusError``, else ``None``.
+
+    Only those two classes are trusted: another exception's ``response``
+    attribute could carry anything into the rendered error.
+    """
+    import httpx
+    import httpx2
+
+    if not isinstance(exc, httpx.HTTPStatusError | httpx2.HTTPStatusError):
+        return None
+    code = exc.response.status_code
+    return code if type(code) is int else None
+
+
+def _diagnostic_url(url: str) -> str:
+    """A configured URL as ``health``/``doctor`` show it: scheme, host, path.
+
+    Userinfo becomes ``***@`` (``redact_url_userinfo``), and the query and
+    fragment are dropped, since tokens are passed there too (#1079). Any
+    ``@`` the parsed netloc does not hold fails closed as
+    ``<unparseable url>``: a ``?``, ``#`` or ``/`` inside the userinfo
+    (``http://u:p?x@host``, ``http://u/p@host``) makes the parser read part of
+    it as the host or path, and no rule on the URL's shape can tell such a
+    value from a legitimate ``@`` in a path or query, which fails closed too.
+    An encoded ``@`` in the netloc and an unreadable port are treated the same
+    way.
+    """
+    if not url:
+        return url
+    try:
+        parts = urlsplit(url)
+        parts.port
+    except ValueError:
+        return "<unparseable url>"
+    if url.count("@") > parts.netloc.count("@") or "%40" in parts.netloc.lower():
+        return "<unparseable url>"
+    shown = redact_url_userinfo(url)
+    if shown == "<unparseable url>":
+        return shown
+    return urlunsplit(urlsplit(shown)._replace(query="", fragment=""))
 
 
 # Values shorter than this are not treated as redactable secrets: a 1-3 char
@@ -8528,11 +8594,10 @@ def _surfacing_bootstrap_status(
         }
     except Exception as exc:
         error = _surfacing_bootstrap_error(exc)
-        if _is_config_construction_error(exc):
-            # The traceback would carry the same rejected values as the message.
-            logger.debug("Surfacing bootstrap status inspection failed: %s", error)
-        else:
-            logger.debug("Surfacing bootstrap status inspection failed", exc_info=exc)
+        # The rendered error only: a traceback repeats the exception's message,
+        # which can carry configured values (#1075) or anything the failing
+        # code quoted (#1079).
+        logger.debug("Surfacing bootstrap status inspection failed: %s", error)
         return {
             "enabled": None,
             "feedback_enabled": None,
@@ -8540,13 +8605,6 @@ def _surfacing_bootstrap_status(
             "ltm_server": None,
             "error": error,
         }
-
-
-def _is_config_construction_error(exc: Exception) -> bool:
-    from pydantic import ValidationError
-    from pydantic_settings import SettingsError
-
-    return isinstance(exc, ValidationError | SettingsError)
 
 
 def _surfacing_bootstrap_error(exc: Exception) -> str:
@@ -8572,7 +8630,8 @@ def _surfacing_bootstrap_error(exc: Exception) -> str:
         )
     if isinstance(exc, SettingsError):
         return "invalid MEMTOMEM_STM_* settings"
-    return str(exc) or type(exc).__name__
+    # Not the message: it can quote anything the failing code touched (#1079).
+    return type(exc).__name__
 
 
 def _format_surfacing_bootstrap(status: dict[str, Any]) -> list[str]:
@@ -8858,6 +8917,10 @@ class _OllamaEndpoint:
     # a discriminating suffix from the endpoint's FIRST publication, so the
     # ID cannot flip when a credential-only twin later appears or disappears.
     has_userinfo: bool
+    # Userinfo, a query or fragment, or an authority the parser may have split
+    # wrongly (#1079): any part a credential can hide in. Like userinfo
+    # presence, it is visible without the secret and decides the suffix.
+    has_credential_part: bool
     # Whether plain `ollama serve` / `ollama pull` would act on THIS endpoint:
     # the CLI targets http://127.0.0.1:11434 by default, so any other scheme,
     # host, port, path, or a credentialed URL must not get those commands —
@@ -8873,11 +8936,17 @@ class _OllamaEndpoint:
         except ValueError:
             parts, hostname = None, None
         has_userinfo = True
-        if parts is not None and parts.netloc:
-            stripped = urlunsplit(parts._replace(netloc=parts.netloc.rpartition("@")[2]))
+        if _diagnostic_url(base_url) == "<unparseable url>":
+            # The parser may have put credentials in the authority (a '?'/'#'
+            # inside the userinfo, an encoded '@'): hash nothing of it.
+            stripped = "<unparseable url>"
+        elif parts is not None and parts.netloc:
+            stripped = urlunsplit(
+                parts._replace(netloc=parts.netloc.rpartition("@")[2], query="", fragment="")
+            )
             has_userinfo = "@" in parts.netloc
         elif parts is not None and "@" not in base_url:
-            stripped = base_url
+            stripped = base_url.split("#", 1)[0].split("?", 1)[0]
             has_userinfo = False
         else:
             # No parseable authority: a scheme-less or single-slash form
@@ -8922,6 +8991,12 @@ class _OllamaEndpoint:
             hostname=hostname,
             valid=valid,
             has_userinfo=has_userinfo,
+            has_credential_part=(
+                has_userinfo
+                or stripped == "<unparseable url>"
+                or "?" in base_url
+                or "#" in base_url
+            ),
             default_local=default_local,
         )
 
@@ -9060,21 +9135,11 @@ async def _probe_ollama_dependencies(
     # the CLI's own load path must not require one.
     import httpx
 
-    def redact(text: str, base_url: str) -> str:
-        # httpx normalizes userinfo (e.g. percent-encodes a password), so the
-        # configured URL alone can miss the variant its errors embed.
-        out = redact_exception_text(text, base_url)
-        try:
-            normalized = str(httpx.URL(base_url))
-        except Exception:
-            return out
-        return redact_exception_text(out, normalized)
-
     def failure(dependency: _OllamaDependency, exc: Exception) -> _OllamaProbeResult:
-        detail = redact(str(exc), dependency.base_url)
+        # By type, never the message: httpx errors embed the normalized request
+        # URL, userinfo and query included (#1079).
         return _OllamaProbeResult(
-            dependency,
-            error=f"{type(exc).__name__}: {detail or 'request failed'}",
+            dependency, error=_probe_failure_message(_root_cause_exc(exc), None)
         )
 
     async def probe(client: httpx.AsyncClient, dependency: _OllamaDependency) -> _OllamaProbeResult:
@@ -9165,7 +9230,7 @@ def _ollama_next_action(base_url: str, missing_models: list[str]) -> str:
     if not endpoint.default_local:
         # Plain `ollama serve` / `ollama pull` target the CLI default
         # (http://127.0.0.1:11434), not this endpoint.
-        display = _disp(redact_url_userinfo(endpoint.raw))
+        display = _disp(_diagnostic_url(endpoint.raw))
         return f"verify the local Ollama at {display}{target}; see {_OLLAMA_SETUP_DOC}"
     return (
         _shell_join(["ollama", "pull", missing_models[0]])
@@ -9704,14 +9769,15 @@ def doctor(
                     )
                     uncredentialed_id_counts: dict[str, int] = {}
                     for ollama_probe in ollama_probes:
-                        if not _OllamaEndpoint.parse(ollama_probe.dependency.base_url).has_userinfo:
+                        endpoint = _OllamaEndpoint.parse(ollama_probe.dependency.base_url)
+                        if not endpoint.has_credential_part:
                             base_id = _ollama_check_id(ollama_probe.dependency.base_url)
                             uncredentialed_id_counts[base_id] = (
                                 uncredentialed_id_counts.get(base_id, 0) + 1
                             )
                     for probe in ollama_probes:
                         dependency = probe.dependency
-                        display_url = redact_url_userinfo(dependency.base_url)
+                        display_url = _diagnostic_url(dependency.base_url)
                         usages = ", ".join(dependency.usages)
                         check_id = _ollama_check_id(dependency.base_url)
                         # A credentialed endpoint carries its use-site suffix
@@ -9728,7 +9794,7 @@ def doctor(
                         # provably collide (e.g. the sites "server '39153'" /
                         # "server '74347'").
                         if (
-                            _OllamaEndpoint.parse(dependency.base_url).has_userinfo
+                            _OllamaEndpoint.parse(dependency.base_url).has_credential_part
                             or uncredentialed_id_counts.get(check_id, 0) > 1
                         ):
                             site_digest = hashlib.sha256(
