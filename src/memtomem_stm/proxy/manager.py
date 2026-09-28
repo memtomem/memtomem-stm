@@ -187,7 +187,10 @@ from memtomem_stm.utils.mcp_transport import (
     streamable_http_transport,
 )
 from memtomem_stm.utils.json_size import json_utf8_size_async
-from memtomem_stm.utils.redact import redact_exception_text, sanitize_secrets
+from memtomem_stm.utils.redact import (
+    exception_summary,
+    root_cause_exc,
+)
 
 # JSON-RPC error codes that indicate bad input, not connection problems.
 # Retrying these wastes time and can damage the connection.
@@ -617,39 +620,51 @@ def _mark_recorded(exc: BaseException) -> None:
 
 
 def _mark_safe_upstream_error(exc: BaseException, message: str) -> None:
-    """Pin final client-facing text that carries no configured credentials.
+    """Pin the text of a failure STM composed itself, to be shown verbatim.
 
-    Only for messages STM composes itself (no upstream string interpolated).
-    ``safe_upstream_error`` returns these verbatim: running the sanitizer over
-    already-safe text is what lets a short secret from another generation
-    rewrite a placeholder. To pin an upstream exception whose config may be
-    retired before the boundary renders it, use ``_pin_safe_upstream_scrub``.
+    Only for messages that interpolate no upstream string. ``_safe_error_text``
+    returns the pinned text instead of reducing the exception to its type, so
+    the detail STM wrote (a deadline, a server name) survives.
     """
     try:
         exc._stm_safe_upstream_error = message  # type: ignore[attr-defined]
     except (AttributeError, TypeError):
-        # Most Python exceptions carry ``__dict__``. The fallback for unusual
-        # slotted exceptions is ``safe_upstream_error`` scanning the active,
-        # live, and still-retired configurations.
+        # Most Python exceptions carry ``__dict__``. An unusual slotted one
+        # falls back to ``exception_summary`` — its type name, nothing leaked.
         pass
 
 
-def _pin_safe_upstream_scrub(exc: BaseException, cfg: UpstreamServerConfig) -> None:
-    """Pin one config's scrub INPUTS (url + secret values) to ``exc``.
+def _stm_composed_text(exc: BaseException) -> str | None:
+    """The text of a failure STM composed itself, else ``None``.
 
-    A concurrent hot reload can retire and close the generation whose
-    credentials the exception text may echo, leaving nothing for
-    ``safe_upstream_error`` to scrub against. Capturing the inputs — rather
-    than pre-scrubbing the text — keeps every secret in the SINGLE sanitizer
-    pass at the boundary, which is what makes the placeholder safe.
+    Pinned text first (``_mark_safe_upstream_error``); then the classes only
+    STM raises, whose messages interpolate no upstream exception text: the
+    server-side ``ToolError`` (the MCP client never raises it — policy denial,
+    open circuit, oversize), ``LockTimeoutError`` and ``ManagerStoppingError``.
+    Upstream-supplied names such as a tool's are already published to the same
+    client by ``tools/list``.
     """
-    try:
-        exc._stm_safe_upstream_scrub = (  # type: ignore[attr-defined]
-            cfg.url,
-            [*(cfg.headers or {}).values(), *(cfg.env or {}).values()],
-        )
-    except (AttributeError, TypeError):
-        pass
+    pinned = getattr(exc, "_stm_safe_upstream_error", None)
+    if isinstance(pinned, str):
+        return pinned
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    root = root_cause_exc(exc)
+    if isinstance(root, ToolError | LockTimeoutError | ManagerStoppingError):
+        return f"{type(root).__name__}: {root}"
+    return None
+
+
+def _safe_error_text(exc: BaseException) -> str:
+    """An upstream or pipeline failure as logs, health and metrics rows show it.
+
+    STM-composed text is kept (``_stm_composed_text``); anything else is the
+    fixed vocabulary of ``exception_summary`` — never the exception's message,
+    which can quote a URL query, an argument, or part of a header in forms no
+    list of configured values anticipates (#1082).
+    """
+    text = _stm_composed_text(exc) or exception_summary(exc)
+    return text[:MAX_ERROR_MESSAGE_CHARS]
 
 
 def _mark_cache_invalidated(exc: BaseException) -> None:
@@ -918,7 +933,7 @@ class ProxyManager:
                         logger.debug(
                             "Failed to close connection stack for '%s' in double-start guard: %s",
                             conn.name,
-                            self._safe_error_for_config(cleanup_exc, conn.config),
+                            _safe_error_text(cleanup_exc),
                         )
             try:
                 await self._stack.aclose()
@@ -1087,7 +1102,7 @@ class ProxyManager:
                 # path would leak the token — via ``stm_proxy_health`` to the MCP
                 # client/model, or via the log. Do NOT use ``logger.exception``:
                 # its traceback tail repeats the raw, unredacted exception string.
-                redacted = self._safe_error_for_config(exc, cfg)
+                redacted = _safe_error_text(exc)
                 logger.error("Failed to connect to upstream server '%s': %s", name, redacted)
                 # Record the failure so ``get_upstream_health`` can report the
                 # configured-but-dead server — otherwise it is absent from
@@ -2057,66 +2072,17 @@ class ProxyManager:
                     )
                 )
 
-    @staticmethod
-    def _safe_error_for_config(exc: BaseException, cfg: UpstreamServerConfig) -> str:
-        """Render an upstream exception without configured credentials.
-
-        Network exceptions can echo URL userinfo while SDK validation and
-        subprocess errors can echo HTTP header or environment values. Scrub
-        the complete string before applying the persistence/log cap so a long
-        token cannot survive as a truncated prefix.
-        """
-        text = redact_exception_text(f"{type(exc).__name__}: {exc}", cfg.url)
-        text = sanitize_secrets(
-            text,
-            [*(cfg.headers or {}).values(), *(cfg.env or {}).values()],
-        )
-        return text[:MAX_ERROR_MESSAGE_CHARS]
-
     def safe_upstream_error(self, server: str, exc: BaseException) -> str:
-        """Credential-safe error text for the client-facing MCP boundary."""
-        configs: list[UpstreamServerConfig] = []
-        conn = self._connections.get(server)
-        if conn is not None:
-            configs.append(conn.config)
-            # A call can fail after a hot reconnect published new credentials
-            # but while it still leases the retired generation. Retain every
-            # old generation's scrub inputs until its owner is drained.
-            configs.extend(resources.config for resources in conn.retired_resources.values())
-        try:
-            live = self._config.upstream_servers.get(server)
-        except Exception:
-            live = None
-        if live is not None and all(live is not cfg for cfg in configs):
-            configs.append(live)
+        """Credential-safe error text for the client-facing MCP boundary.
 
-        pinned = getattr(exc, "_stm_safe_upstream_error", None)
-        if isinstance(pinned, str):
-            # STM composed this text and it interpolates no upstream string, so
-            # it is already credential-free. Sanitizing it again is exactly the
-            # double pass that corrupts the placeholder.
-            return pinned[:MAX_ERROR_MESSAGE_CHARS]
-
-        text = f"{type(exc).__name__}: {exc}"
-        # ``sanitize_secrets`` must see every secret in ONE pass: it documents
-        # that a second pass can rewrite a placeholder the first just inserted
-        # (a short secret like ``RED`` corrupting ``<REDACTED>``). Redaction of
-        # each generation's url is idempotent and stays in the loop; the secret
-        # values are collected and scrubbed once.
-        secret_values: list[str] = []
-        pinned_scrub = getattr(exc, "_stm_safe_upstream_scrub", None)
-        if isinstance(pinned_scrub, tuple) and len(pinned_scrub) == 2:
-            # A generation retired and closed since the failure contributes no
-            # config above; its pinned inputs join the same single pass.
-            pinned_url, pinned_secrets = pinned_scrub
-            text = redact_exception_text(text, pinned_url)
-            secret_values.extend(pinned_secrets)
-        for cfg in configs:
-            text = redact_exception_text(text, cfg.url)
-            secret_values.extend((cfg.headers or {}).values())
-            secret_values.extend((cfg.env or {}).values())
-        text = sanitize_secrets(text, secret_values)
-        return text[:MAX_ERROR_MESSAGE_CHARS]
+        The same rendering as every other surface (``_safe_error_text``),
+        including for an upstream JSON-RPC error: its message can quote STM's
+        request back — a URL query, an argument, part of a header — and no scrub
+        list catches every form of that echo (#1082). *server* is kept for the
+        call site's signature.
+        """
+        del server
+        return _safe_error_text(exc)
 
     async def _run_connection_owner(
         self,
@@ -2211,7 +2177,7 @@ class ProxyManager:
                 logger.debug(
                     "Error during connection cleanup for '%s': %s",
                     name,
-                    self._safe_error_for_config(owner.cleanup_error, cfg),
+                    _safe_error_text(owner.cleanup_error),
                 )
             raise
         except BaseException:
@@ -2223,7 +2189,7 @@ class ProxyManager:
                 logger.debug(
                     "Error during connection cleanup for '%s': %s",
                     name,
-                    self._safe_error_for_config(owner.cleanup_error, cfg),
+                    _safe_error_text(owner.cleanup_error),
                 )
             raise
         return session, owner, tools
@@ -2375,7 +2341,7 @@ class ProxyManager:
                 "Failed to close retired generation %d for '%s': %s",
                 generation,
                 conn.name,
-                self._safe_error_for_config(exc, resources.config),
+                _safe_error_text(exc),
             )
         else:
             conn.retired_resources.pop(generation, None)
@@ -2400,7 +2366,7 @@ class ProxyManager:
                 "Background reconnect after %s failed for '%s': %s",
                 reason,
                 server,
-                self._safe_error_for_config(exc, cfg),
+                _safe_error_text(exc),
             )
             return False
         return conn.reconnect_generation != failed_generation
@@ -2601,7 +2567,7 @@ class ProxyManager:
                         logger.debug(
                             "Failed to close previous stack for '%s': %s",
                             name,
-                            self._safe_error_for_config(cleanup_exc, old_cfg),
+                            _safe_error_text(cleanup_exc),
                         )
             logger.info("Reconnected to '%s' (%s tools discovered)", name, len(conn.tools))
             # The reconnect replaced the catalogue this upstream advertises, so
@@ -3022,7 +2988,7 @@ class ProxyManager:
                         "Failed to close retired generation %d for '%s' during stop: %s",
                         generation,
                         conn.name,
-                        self._safe_error_for_config(cleanup_exc, resources.config),
+                        _safe_error_text(cleanup_exc),
                     )
                 else:
                     conn.retired_resources.pop(generation, None)
@@ -3037,7 +3003,7 @@ class ProxyManager:
                     logger.debug(
                         "Failed to close connection stack for '%s': %s",
                         conn.name,
-                        self._safe_error_for_config(cleanup_exc, conn.config),
+                        _safe_error_text(cleanup_exc),
                     )
         if self._stack:
             await self._stack.aclose()
@@ -4694,7 +4660,7 @@ class ProxyManager:
             )
             self.index_observability.record_attempt(tool, "extract")
             self.index_observability.record_outcome(tool, "error")
-            return ExtractOutcome(ok=False, facts_stored=0, error=f"{type(exc).__name__}: {exc}")
+            return ExtractOutcome(ok=False, facts_stored=0, error=_safe_error_text(exc))
         return await extract_and_store(
             index_engine=self._index_engine,
             extractor=extractor,
@@ -5192,7 +5158,9 @@ class ProxyManager:
         enabling determinism diffs across runs.
         """
         if server not in self._connections:
-            raise KeyError(f"Unknown upstream server: '{server}'")
+            unknown = KeyError(f"Unknown upstream server: '{server}'")
+            _mark_safe_upstream_error(unknown, f"KeyError: Unknown upstream server: '{server}'")
+            raise unknown
         # ONE config snapshot for the whole request PIPELINE (#871).
         # ``self._config`` is a property over the hot-reload loader, so each
         # textual read is a ``stat()`` — and worse, two reads can land on
@@ -5266,10 +5234,7 @@ class ProxyManager:
                                 # get populated, so without this the row is
                                 # all-NULL across diagnostic text — same gap
                                 # the rest of #253 closes for upstream errors.
-                                error_message=self._safe_error_for_config(
-                                    exc,
-                                    self._server_cfg(self._connections[server], cfg_snap),
-                                ),
+                                error_message=_safe_error_text(exc),
                             )
                         )
                     except Exception:
@@ -5278,15 +5243,6 @@ class ProxyManager:
                             pipeline_category.value,
                             exc_info=True,
                         )
-                # Pin the client-facing text against THIS call's config
-                # snapshot before a concurrent hot reload can retire and close
-                # the generation whose exception may contain its old URL,
-                # header, or environment credentials.
-                try:
-                    pinned_cfg = self._server_cfg(self._connections[server], cfg_snap)
-                    _pin_safe_upstream_scrub(exc, pinned_cfg)
-                except Exception:
-                    logger.debug("Failed to pin credential-safe upstream error")
                 self._log_execution(
                     selection_id,
                     server,
@@ -5632,7 +5588,7 @@ class ProxyManager:
                 "existing connection (won't retry until the config changes "
                 "again): %s",
                 conn.name,
-                self._safe_error_for_config(exc, fresh_cfg),
+                _safe_error_text(exc),
             )
         else:
             # A successful initialize + tools/list is a completed round-trip:
@@ -5692,6 +5648,7 @@ class ProxyManager:
                 )
             )
             _mark_recorded(exc)
+            _mark_safe_upstream_error(exc, format_error_message_from_exc(exc))
             failed_generation = last_failed_generation
             if failed_generation is None:
                 failed_generation = conn.unavailable_generation
@@ -5913,7 +5870,7 @@ class ProxyManager:
                             is_error=True,
                             error_category=ErrorCategory.OVERSIZE,
                             error_code=err_code,
-                            error_message=self._safe_error_for_config(exc, cfg),
+                            error_message=_safe_error_text(exc),
                             trace_id=trace_id,
                         )
                     )
@@ -5941,7 +5898,7 @@ class ProxyManager:
                             compressed_chars=0,
                             is_error=True,
                             error_category=ErrorCategory.PROGRAMMING,
-                            error_message=self._safe_error_for_config(exc, cfg),
+                            error_message=_safe_error_text(exc),
                             trace_id=trace_id,
                         )
                     )
@@ -5971,7 +5928,7 @@ class ProxyManager:
                             is_error=True,
                             error_category=ErrorCategory.PROTOCOL,
                             error_code=err_code,
-                            error_message=self._safe_error_for_config(exc, cfg),
+                            error_message=_safe_error_text(exc),
                             trace_id=trace_id,
                         )
                     )
@@ -6008,7 +5965,7 @@ class ProxyManager:
                             compressed_chars=0,
                             is_error=True,
                             error_category=cat,
-                            error_message=self._safe_error_for_config(exc, cfg),
+                            error_message=_safe_error_text(exc),
                             trace_id=trace_id,
                         )
                     )
@@ -6043,7 +6000,7 @@ class ProxyManager:
                     tool,
                     attempt + 1,
                     cfg.max_retries,
-                    self._safe_error_for_config(exc, cfg),
+                    _safe_error_text(exc),
                 )
                 await await_before_deadline(asyncio.sleep(delay), attempt + 1)
                 delay = min(max(delay * 2, 0.1), cfg.max_reconnect_delay_seconds)
@@ -6061,7 +6018,7 @@ class ProxyManager:
                     logger.error(
                         "Reconnect to '%s' failed: %s",
                         server,
-                        self._safe_error_for_config(reconnect_exc, cfg),
+                        _safe_error_text(reconnect_exc),
                     )
                     # Third terminal exit (#608): a mid-loop reconnect failure
                     # means the upstream is unreachable — count it, or a dead
@@ -6800,7 +6757,7 @@ class ProxyManager:
                         )
                         final_result = surfaced
                         index_ok = False
-                        index_error = f"{type(exc).__name__}: {exc}"
+                        index_error = _safe_error_text(exc)
         else:
             final_result = surfaced
 

@@ -43,7 +43,7 @@ changes inline only. See the deprecation policy in
   to pass.
 - **Probe errors name the exception type, not its message** (#1079). In
   `mms health`, `mms doctor`, `mms add --validate` and import validation, a
-  failed probe now reads e.g. `ConnectError`, `McpError` or
+  failed probe now reads e.g. `ConnectError`, `MCPError` or
   `HTTP 401 (HTTPStatusError)` instead of the exception text, which could
   quote the request URL, an argument or part of a header back. Run the server
   command or reach the endpoint directly for the underlying message. In
@@ -60,6 +60,20 @@ changes inline only. See the deprecation policy in
   `MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS` setting directly when you need the
   values. This is stricter than `mms list`, which hides only env-supplied
   upstream args and only in its text table.
+- **Proxied tool errors and stored failure text name the exception type, not its
+  message** (#1082). When a proxied call fails, the error the MCP client receives,
+  the `proxy_metrics.error_message` row, the `startup connect failed` line in
+  `stm_proxy_health`, and the `extract_error` / `index_error` columns now read e.g.
+  `ConnectError`, `HTTP 401 (HTTPStatusError)` or `ValidationError: int_parsing`
+  instead of the exception text, which could quote the upstream URL's query string,
+  an argument or part of a header. Log lines about upstream connect, reconnect and
+  cleanup failures change the same way. A JSON-RPC error the upstream returns
+  reads `MCPError -32602 (Invalid params)` for the five reserved codes and
+  `MCPError` otherwise; its message, which could quote the request back, is not
+  shown. Failures STM composes itself — open circuit breaker, oversize response,
+  overall deadline, lock timeout, policy denial, unknown server — keep their
+  message. An upstream tool's `isError` result is unchanged and still reaches the
+  client as the upstream wrote it.
 - An empty tool filter now matches no tools in `mms tune` and
   `stm_tuning_recommendations`; omit the filter to analyze all tools. In particular,
   `mms tune --apply --yes --tool ""` no longer writes overrides for other tools (#1036).

@@ -564,7 +564,9 @@ class TestErrorMessagePersistence:
 
     Without this, post-mortem inspection cannot distinguish (e.g.) a wrong
     argument name from a rate-limit hit when both surface as ``upstream_error``
-    or ``protocol`` rows. See issue #253.
+    or ``protocol`` rows. See issue #253. For exception-driven rows the text is
+    the exception type or HTTP status, not its message (#1082); upstream
+    ``isError`` text and STM-composed messages are kept.
     """
 
     async def test_programming_persists_message(self, tmp_path):
@@ -575,7 +577,7 @@ class TestErrorMessagePersistence:
         cat, code, msg = _read_error_row(mgr)
         assert cat == "programming"
         assert code is None
-        assert msg == "TypeError: bad arg"
+        assert msg == "TypeError"
 
     async def test_protocol_persists_message_with_code(self, tmp_path):
         mgr = _make_manager_with_store(tmp_path)
@@ -588,7 +590,9 @@ class TestErrorMessagePersistence:
         cat, code, msg = _read_error_row(mgr)
         assert cat == "protocol"
         assert code == -32602
-        assert msg is not None and "Invalid params: page_path" in msg
+        # The upstream's message is not persisted (#1082); the code column is
+        # what tells a bad argument from other protocol errors.
+        assert msg == "Exception"
 
     async def test_transport_persists_message(self, tmp_path):
         mgr = _make_manager_with_store(tmp_path, max_retries=0)
@@ -598,7 +602,7 @@ class TestErrorMessagePersistence:
                 await mgr.call_tool("srv", "tool", {})
         cat, _code, msg = _read_error_row(mgr)
         assert cat == "transport"
-        assert msg == "ConnectionError: down"
+        assert msg == "ConnectionError"
 
     async def test_transport_message_redacts_url_header_and_env_secrets(self, tmp_path):
         url_token = "url-secret-token"
@@ -636,8 +640,7 @@ class TestErrorMessagePersistence:
         msg = store._db.execute("SELECT error_message FROM proxy_metrics").fetchone()[0]
         for secret in (url_token, header_token, env_token):
             assert secret not in msg
-        assert "***@example.test" in msg
-        assert "<REDACTED>" in msg
+        assert msg == "ConnectionError"
         store.close()
 
     async def test_timeout_persists_message(self, tmp_path):
@@ -696,7 +699,7 @@ class TestErrorMessagePersistence:
                 await mgr.call_tool("srv", "tool", {})
         cat, _code, msg = _read_error_row(mgr)
         assert cat == "internal_error"
-        assert msg == "RuntimeError: boom"
+        assert msg == "RuntimeError"
         _assert_persisted_as_error(mgr, tmp_path, "internal_error")
 
     async def test_lock_timeout_persists_message(self, tmp_path):

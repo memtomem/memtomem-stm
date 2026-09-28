@@ -9,10 +9,9 @@ the file is the only crash trace, #581).
 
 Hardening matches the data-at-rest convention (``utils/fileio.py``,
 ``proxy/selection_log.py``): file ``0o600``, parent directory created
-``0o700`` (a pre-existing directory keeps its mode). Credential redaction
-needs no handler-level hook — it happens at message-construction time
-(``proxy/manager.py:_redacted_error``), so every handler receives already-
-redacted records.
+``0o700`` (a pre-existing directory keeps its mode). There is no
+handler-level redaction hook: call sites render error text before logging it,
+e.g. ``proxy/manager.py:_safe_error_text`` for upstream failures (#1082).
 """
 
 from __future__ import annotations

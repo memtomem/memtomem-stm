@@ -239,6 +239,25 @@ def _build_ltm_adapter(config: STMConfig, daemon_config: STMConfig) -> Any:
     return McpClientSearchAdapter(config.surfacing)
 
 
+def _make_proxy_handler(pm: ProxyManager, server_name: str, tool_name: str):  # noqa: ANN202
+    from memtomem_stm.proxy._fastmcp_compat import to_call_tool_result
+
+    # The bare ``-> CallToolResult`` annotation matters: the SDK's
+    # ``func_metadata`` special-cases it (return without output
+    # validation) but REJECTS a Union containing it, and the
+    # returned envelope passes through ``convert_result`` and the
+    # lowlevel handler verbatim — preserving structuredContent,
+    # result-level _meta, isError, and content order end to end.
+    async def proxy_tool(**kwargs: object) -> CallToolResult:
+        try:
+            result = await pm.call_tool(server_name, tool_name, dict(kwargs))
+        except Exception as exc:
+            raise ToolError(pm.safe_upstream_error(server_name, exc)) from None
+        return to_call_tool_result(result)
+
+    return proxy_tool
+
+
 @asynccontextmanager
 async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
     # Children that predate us are somebody else's — this lifespan does not
@@ -559,28 +578,7 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
             await proxy_manager.start()
 
             # Register proxy tools with upstream schema + annotations
-            from memtomem_stm.proxy._fastmcp_compat import (
-                register_proxy_tool,
-                to_call_tool_result,
-            )
-
-            def _make_proxy_handler(pm: ProxyManager, server_name: str, tool_name: str):  # noqa: ANN202
-                # The bare ``-> CallToolResult`` annotation matters: the SDK's
-                # ``func_metadata`` special-cases it (return without output
-                # validation) but REJECTS a Union containing it, and the
-                # returned envelope passes through ``convert_result`` and the
-                # lowlevel handler verbatim — preserving structuredContent,
-                # result-level _meta, isError, and content order end to end.
-                async def proxy_tool(**kwargs: object) -> CallToolResult:
-                    try:
-                        result = await pm.call_tool(server_name, tool_name, dict(kwargs))
-                    except Exception as exc:
-                        from mcp.server.mcpserver.exceptions import ToolError
-
-                        raise ToolError(pm.safe_upstream_error(server_name, exc)) from None
-                    return to_call_tool_result(result)
-
-                return proxy_tool
+            from memtomem_stm.proxy._fastmcp_compat import register_proxy_tool
 
             manager = proxy_manager
 

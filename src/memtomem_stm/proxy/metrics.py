@@ -29,10 +29,12 @@ MAX_ERROR_MESSAGE_CHARS = 500
 def format_error_message_from_exc(exc: BaseException) -> str:
     """Format an exception for ``CallMetrics.error_message`` (capped).
 
-    Used at every exception-driven capture site in ``ProxyManager.call_tool``
-    (PROGRAMMING / PROTOCOL / TRANSPORT / TIMEOUT / LOCK_TIMEOUT /
-    INTERNAL_ERROR). UPSTREAM_ERROR uses ``original_text`` directly because
-    its source is the upstream tool's text payload, not a Python exception.
+    Only for exceptions whose text STM composed (the overall-deadline
+    ``TimeoutError``): the message is kept verbatim. An exception from an
+    upstream or its transport goes through ``proxy/manager.py:_safe_error_text``
+    instead, which drops the message (#1082). UPSTREAM_ERROR uses
+    ``original_text`` directly because its source is the upstream tool's text
+    payload, not a Python exception.
     """
     return f"{type(exc).__name__}: {exc}"[:MAX_ERROR_MESSAGE_CHARS]
 
@@ -156,19 +158,14 @@ class CallMetrics:
     is_error: bool = False
     error_category: ErrorCategory | None = None
     error_code: int | None = None
-    # Free-form error text from the failing source. Populated by ProxyManager
-    # at the same call sites that set ``error_category`` so post-mortem
-    # inspection of ``proxy_metrics.db`` can distinguish *why* a call failed
-    # without re-running it (e.g. JSON-RPC -32602 with "Invalid params: foo"
-    # vs. an upstream tool returning ``isError=True`` with a slug-not-found
-    # message). Truncated by callers to ``MAX_ERROR_MESSAGE_CHARS``.
-    #
-    # Privacy posture: this is operator-local (lives only in the on-disk
-    # ``proxy_metrics.db``, never returned over MCP) and the cap limits
-    # worst-case leakage size, but content is *not* sanitized — same risk
-    # class as the existing ``index_error`` / ``extract_error`` /
-    # ``surface_error`` columns. Don't add a redactor here without reviewing
-    # all four sites together.
+    # Why a call failed, populated by ProxyManager at the same call sites that
+    # set ``error_category`` so post-mortem inspection of ``proxy_metrics.db``
+    # can tell failures apart without re-running them. For an exception it is
+    # the fixed vocabulary of ``proxy/manager.py:_safe_error_text`` — type name,
+    # ``HTTP <code>``, a reserved JSON-RPC code, or STM-composed text — never
+    # the exception's message (#1082). For an upstream ``isError=True`` result
+    # it is the upstream's own text, unsanitized (#1084). Truncated by callers
+    # to ``MAX_ERROR_MESSAGE_CHARS``.
     error_message: str | None = None
     # Compression fidelity tracking
     #

@@ -177,10 +177,9 @@ class TestAutoIndexResponse:
         assert outcome.ok is False
         assert outcome.chunks_indexed == 0
         assert outcome.error is not None
-        # Error string carries the exception class + message so dashboards
-        # can distinguish categories (Timeout vs Permission vs …).
-        assert "RuntimeError" in outcome.error
-        assert "simulated indexing failure" in outcome.error
+        # The exception class distinguishes categories (Timeout vs Permission
+        # vs …); its message is not stored (#1082).
+        assert outcome.error == "RuntimeError"
         assert any("Auto-index failed" in r.message for r in caplog.records)
         rec = next(r for r in caplog.records if "Auto-index failed" in r.message)
         assert rec.exc_info is not None, "exc_info required for traceback diagnosis"
@@ -598,9 +597,8 @@ class TestExtractOutcome:
         assert outcome.ok is False
         assert outcome.facts_stored == 0
         assert outcome.error is not None
-        # Error string carries class + message for dashboard categorization.
-        assert "RuntimeError" in outcome.error
-        assert "simulated extraction failure" in outcome.error
+        # The exception class, not its message (#1082).
+        assert outcome.error == "RuntimeError"
 
     async def test_partial_indexing_failure_stays_ok(self, config):
         """Per-fact indexing failures reduce ``facts_stored`` but don't

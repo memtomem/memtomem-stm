@@ -459,8 +459,8 @@ class TestConfigChangeDetection:
         assert conn.last_failed_connection_fp == _connection_fingerprint(cfg_b)
         all_text = "\n".join(r.getMessage() for r in records)
         assert "tok-c" not in all_text  # C never attempted, never logged
-        assert "tok-b" not in all_text  # B attempted but redacted
-        assert "***@b.example" in all_text
+        assert "tok-b" not in all_text  # B attempted, rendered as its type (#1082)
+        assert "keeping the existing connection (won't retry until the config changes again): ConnectionError" in all_text
 
     async def test_generation_skip_does_not_damp_and_redetects_next_call(self, tmp_path):
         """When a config-change reconnect is skipped because another reconnect
