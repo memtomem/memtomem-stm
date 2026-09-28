@@ -9230,7 +9230,7 @@ def _ollama_next_action(base_url: str, missing_models: list[str]) -> str:
     if not endpoint.default_local:
         # Plain `ollama serve` / `ollama pull` target the CLI default
         # (http://127.0.0.1:11434), not this endpoint.
-        display = _disp(redact_url_userinfo(endpoint.raw))
+        display = _disp(_diagnostic_url(endpoint.raw))
         return f"verify the local Ollama at {display}{target}; see {_OLLAMA_SETUP_DOC}"
     return (
         _shell_join(["ollama", "pull", missing_models[0]])

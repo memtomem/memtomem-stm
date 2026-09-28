@@ -752,3 +752,14 @@ def test_bootstrap_failure_log_carries_no_exception_text(monkeypatch, caplog):
     assert status["error"] == "RuntimeError"
     assert "Surfacing bootstrap status inspection failed: RuntimeError" in caplog.text
     assert "cnryBootstrapLog" not in caplog.text
+
+
+def test_ollama_local_hint_uses_the_diagnostic_url():
+    """The local-Ollama hint is reached by a valid loopback URL, so an '@'
+    in its path must fail closed here as it does in the check detail."""
+    from memtomem_stm.cli.proxy import _ollama_next_action
+
+    hint = _ollama_next_action("http://localhost/cnryPw@host.test/mcp", ["qwen3:4b"])
+    # Positive control: the local branch that renders the URL ran.
+    assert hint.startswith("verify the local Ollama at <unparseable url>")
+    assert "cnryPw" not in hint
