@@ -7916,7 +7916,7 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
         if isinstance(root, TimeoutError):
             error = f"timeout ({timeout}s)"
         else:
-            error = _sanitize_probe_error(_root_cause_message(exc), cfg)
+            error = _sanitize_probe_error(_probe_failure_message(root, stage), cfg)
         return StagedProbeResult(stage=stage, transport=transport, error=error)
     return StagedProbeResult(
         stage=stage,
@@ -7928,8 +7928,19 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
     )
 
 
-def _format_command_for_display(command: str, args: list[str]) -> str:
-    return shlex.join([command, *args]) if args else command
+def _hidden_ltm_args(args: list[str]) -> list[str]:
+    """The LTM ``args`` as ``health``/``doctor`` report them: one mask each.
+
+    Launch arguments routinely carry tokens (``--api-key …``), and these
+    reports are pasted into issues and CI logs. The list keeps its length so
+    scripts can still tell whether args are configured (#1077).
+    """
+    return [REDACTED_DISPLAY] * len(args)
+
+
+def _ltm_command_display(command: str, args: list[str]) -> str:
+    """The LTM launch command for display, with its arguments hidden."""
+    return f"{command} [args hidden]" if args else command
 
 
 def _text_parts_from_tool_result(result: Any) -> list[str]:
@@ -8107,10 +8118,10 @@ def _ltm_mcp_status(surfacing: Any, timeout: float) -> dict[str, Any]:
     if not isinstance(headers, dict):
         headers = None
     # ``status`` is the operator-facing payload (text lines AND ``--json``
-    # dump), so the URL fields are userinfo-redacted; only the local ``url``
-    # stays raw for the probe's actual connection below.
+    # dump), so the URL fields are userinfo-redacted and the args are hidden;
+    # only the local ``url`` and ``args`` stay raw for the probe below.
     display = (
-        _format_command_for_display(command, args)
+        _ltm_command_display(command, args)
         if transport == "stdio" and command
         else redact_url_userinfo(url) or "(empty url)"
     )
@@ -8118,7 +8129,7 @@ def _ltm_mcp_status(surfacing: Any, timeout: float) -> dict[str, Any]:
         "route": "direct",
         "transport": transport,
         "command": command,
-        "args": args,
+        "args": _hidden_ltm_args(args),
         "url": redact_url_userinfo(url),
         "display": display,
         "connected": None,
@@ -8174,12 +8185,14 @@ def _ltm_mcp_status(surfacing: Any, timeout: float) -> dict[str, Any]:
         if isinstance(root, TimeoutError):
             status["error"] = f"{display}: timeout ({probe_timeout:g}s)"
         else:
-            # httpx exceptions embed the full request URL — userinfo included
-            # — so the rendered message is scrubbed against the raw url, then
-            # against the configured header values (a 401 body can echo the
-            # Authorization header back into the exception text).
-            message = redact_exception_text(str(root), url) or type(root).__name__
-            message = sanitize_secrets(message, list((headers or {}).values()))
+            # Same scrub as an upstream probe error: httpx exceptions embed the
+            # full request URL (userinfo included), a 401 body can echo the
+            # Authorization header, and the launch args are hidden everywhere
+            # else in the status.
+            message = _sanitize_probe_error(
+                str(root) or type(root).__name__,
+                {"url": url, "headers": headers, "args": args},
+            )
             status["error"] = f"{display}: {message}"
     else:
         status.update(probe)
@@ -8276,7 +8289,7 @@ def _ltm_daemon_status(config: Any, timeout: float, *, measure_ltm: bool = False
         "route": "daemon",
         "transport": surfacing.ltm_mcp_transport,
         "command": surfacing.ltm_mcp_command,
-        "args": list(surfacing.ltm_mcp_args),
+        "args": _hidden_ltm_args(surfacing.ltm_mcp_args),
         "url": redact_url_userinfo(surfacing.ltm_mcp_url),
         "display": "mms daemon",
         "connected": False,
@@ -8356,6 +8369,25 @@ def _root_cause_message(exc: BaseException) -> str:
     return str(cur) or type(cur).__name__
 
 
+def _probe_failure_message(root: BaseException, stage: ProbeStage) -> str:
+    """Render a probe failure's root cause for ``health``/``doctor``.
+
+    A pydantic ``ValidationError`` names locations and error types only:
+    ``str(exc)`` embeds the rejected ``input_value``, and ``msg`` can quote it
+    too. Before the transport connects it is the SDK rejecting the raw server
+    entry (a non-string ``args`` item, say); after, the server's reply failed
+    validation (#1077).
+    """
+    from pydantic import ValidationError
+
+    if isinstance(root, ValidationError):
+        from memtomem_stm.proxy.config import validation_error_summary
+
+        subject = "server entry" if stage is ProbeStage.CONFIGURED else "server response"
+        return f"invalid {subject}: {validation_error_summary(root)}"
+    return _root_cause_message(root)
+
+
 # Values shorter than this are not treated as redactable secrets: a 1-3 char
 # token like "k", "1", or "on" occurs incidentally all over ordinary
 # diagnostic text, so redacting it globally corrupts the message far more than
@@ -8405,12 +8437,21 @@ def _sanitize_probe_error(text: str, cfg: dict[str, Any]) -> str:
 
     ``redact_exception_text`` first (it rewrites full-URL forms httpx embeds,
     keeping the host readable), then ``sanitize_secrets`` for the raw
-    env/header values themselves.
+    env/header values and string ``args`` themselves.
     """
     url = cfg.get("url", "")
     if isinstance(url, str) and url:
         text = redact_exception_text(text, url)
-    return sanitize_secrets(text, _probe_secret_values(cfg))
+    # Launch args carry tokens too (``--api-key …``) and health/doctor never
+    # show them, so an exception echoing one is scrubbed as well (#1077).
+    # Probe-only: ``_all_config_secret_values`` keeps its env/headers scope.
+    raw_args = cfg.get("args")
+    args = [
+        arg
+        for arg in (raw_args if isinstance(raw_args, list) else [])
+        if isinstance(arg, str) and len(arg) >= _MIN_REDACTABLE_SECRET_LEN
+    ]
+    return sanitize_secrets(text, [*_probe_secret_values(cfg), *args])
 
 
 def _all_config_secret_values(data: dict[str, Any]) -> list[str]:
@@ -8606,7 +8647,9 @@ async def _probe_servers(servers: dict[str, Any], timeout: float) -> dict[str, S
             result = StagedProbeResult(
                 stage=ProbeStage.CONFIGURED,
                 transport=str(cfg.get("transport", "stdio")),
-                error=_sanitize_probe_error(_root_cause_message(exc), cfg),
+                error=_sanitize_probe_error(
+                    _probe_failure_message(_root_cause_exc(exc), ProbeStage.CONFIGURED), cfg
+                ),
             )
         return name, result
 
