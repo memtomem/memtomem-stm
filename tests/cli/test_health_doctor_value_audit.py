@@ -1,0 +1,417 @@
+"""Health and doctor never print credential-bearing configuration values (#1077).
+
+``args``, ``env`` and ``headers`` values and URL userinfo are the parts of a
+server entry that commonly carry credentials. Each case below plants a distinct
+canary in every such leaf, runs the *real* probes (no fake ``_probe_servers``,
+unlike ``test_runtime_health_doctor.py``), and scans the text output and every
+decoded string of the ``--json`` document. A positive control per case proves
+the path that could leak actually ran, so a silent pass means clean output,
+not an unreached branch.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from collections.abc import Iterator
+from typing import Any
+
+import pytest
+from click.testing import CliRunner
+
+from helpers import set_home
+from memtomem_stm.cli.proxy import cli
+
+# Port 9 (discard) is closed on test hosts: connecting fails fast.
+_DEAD_URL = "http://cnryUrlUser:cnryUrlPass@127.0.0.1:9/mcp"
+
+_UPSTREAM_CANARIES = (
+    "cnryArgStr",
+    "cnryArgKey",
+    "cnryArgVal",
+    "cnryEnvVal",
+    "cnryHdrVal",
+    "cnryUrlUser",
+    "cnryUrlPass",
+)
+_LTM_CANARIES = ("cnryLtmArg", "cnryLtmHdr", "cnryLtmUser", "cnryLtmPass")
+
+
+@pytest.fixture(autouse=True)
+def _isolated(monkeypatch, tmp_path):
+    set_home(monkeypatch, tmp_path / "home")
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+
+
+def _write_upstreams(path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "cache": {"tool_annotation_policy": "strict"},
+                "upstream_servers": {
+                    # A non-string ``args`` item: the SDK's parameter model
+                    # rejects it before any process is spawned.
+                    "badargs": {
+                        "prefix": "badargs",
+                        "command": sys.executable,
+                        "args": ["cnryArgStr", {"cnryArgKey": "cnryArgVal"}],
+                        "env": {"TOKEN": "cnryEnvVal"},
+                    },
+                    "remote": {
+                        "prefix": "remote",
+                        "transport": "streamable_http",
+                        "url": _DEAD_URL,
+                        "headers": {"Authorization": "Bearer cnryHdrVal"},
+                    },
+                },
+            }
+        )
+    )
+
+
+def _string_leaves(value: Any) -> Iterator[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield str(key)
+            yield from _string_leaves(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _string_leaves(item)
+
+
+def _assert_clean(output: str, canaries: tuple[str, ...], *, as_json: bool) -> None:
+    leaked = [c for c in canaries if c in output]
+    assert leaked == [], f"canaries in output: {leaked}\n{output}"
+    if as_json:
+        decoded = [c for leaf in _string_leaves(json.loads(output)) for c in canaries if c in leaf]
+        assert decoded == [], f"canaries in decoded JSON: {decoded}"
+
+
+def _run(args: list[str]) -> str:
+    result = CliRunner().invoke(cli, args)
+    assert result.exception is None or isinstance(result.exception, SystemExit), result.output
+    return result.output
+
+
+@pytest.mark.parametrize("command", ["health", "doctor"])
+@pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+def test_upstream_probe_output_has_no_credential_values(tmp_path, monkeypatch, command, as_json):
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "false")
+    config = tmp_path / "stm_proxy.json"
+    _write_upstreams(config)
+    extra = ["--json"] if as_json else []
+    output = _run([command, "--config", str(config), "--timeout", "3", *extra])
+
+    if as_json:
+        servers = json.loads(output)["servers"]
+        # Positive controls: both probes ran and failed at connect time.
+        bad = servers["badargs"]
+        assert bad["stage"] == "configured"
+        assert bad["error"] == "invalid server entry: args.1 (string_type)"
+        assert servers["remote"]["error"]
+    else:
+        assert "badargs" in output and "remote" in output
+    _assert_clean(output, _UPSTREAM_CANARIES, as_json=as_json)
+
+
+def _ltm_stdio_env(monkeypatch) -> None:
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "true")
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND", sys.executable)
+    # The child exits at once, so the probe fails after spawning it.
+    monkeypatch.setenv(
+        "MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS",
+        json.dumps(["-c", "pass", "--token", "cnryLtmArg"]),
+    )
+
+
+def _ltm_network_env(monkeypatch) -> None:
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "true")
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_TRANSPORT", "streamable_http")
+    monkeypatch.setenv(
+        "MEMTOMEM_STM_SURFACING__LTM_MCP_URL",
+        "http://cnryLtmUser:cnryLtmPass@127.0.0.1:9/mcp",
+    )
+    monkeypatch.setenv(
+        "MEMTOMEM_STM_SURFACING__LTM_MCP_HEADERS",
+        json.dumps({"Authorization": "Bearer cnryLtmHdr"}),
+    )
+    # Present on the network route too: the status block reports it.
+    monkeypatch.setenv(
+        "MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS", json.dumps(["--token", "cnryLtmArg"])
+    )
+
+
+def _ltm_block(output: str) -> dict[str, Any]:
+    block = json.loads(output)["surfacing"]["ltm_server"]
+    assert isinstance(block, dict)
+    return block
+
+
+@pytest.mark.parametrize("ltm_env", [_ltm_stdio_env, _ltm_network_env], ids=["stdio", "network"])
+@pytest.mark.parametrize("command", ["health", "doctor"])
+@pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+def test_ltm_direct_route_has_no_credential_values(
+    tmp_path, monkeypatch, ltm_env, command, as_json
+):
+    ltm_env(monkeypatch)
+    # ``doctor`` otherwise follows the hook daemon (``hook.use_daemon``
+    # defaults true); ``health`` takes the direct route by default.
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "false")
+    config = tmp_path / "stm_proxy.json"
+    config.write_text(json.dumps({"upstream_servers": {}}))
+    extra = ["--json"] if as_json else []
+    output = _run([command, "--config", str(config), "--timeout", "3", *extra])
+
+    if as_json:
+        block = _ltm_block(output)
+        # Positive control: the direct probe ran and failed.
+        assert block["route"] == "direct"
+        assert "skipped" not in block
+        assert block["connected"] is False and block["error"]
+    else:
+        # Positive control: the failed direct probe's line names its target
+        # (the hidden-args display for stdio, the redacted URL for network).
+        marker = "[args hidden]" if ltm_env is _ltm_stdio_env else "***@127.0.0.1:9"
+        assert marker in output
+    _assert_clean(output, _LTM_CANARIES, as_json=as_json)
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+def test_ltm_daemon_route_has_no_credential_values(tmp_path, monkeypatch, as_json):
+    _ltm_stdio_env(monkeypatch)
+    config = tmp_path / "stm_proxy.json"
+    config.write_text(json.dumps({"upstream_servers": {}}))
+    extra = ["--json"] if as_json else []
+    output = _run(["doctor", "--config", str(config), "--timeout", "3", *extra])
+
+    if as_json:
+        # Positive control: doctor followed the hook daemon, which is not
+        # running; the status block is filled from config before the ping.
+        block = _ltm_block(output)
+        assert block["route"] == "daemon"
+        assert block["error"]
+    else:
+        assert "shared daemon is not reachable" in output
+    _assert_clean(output, _LTM_CANARIES, as_json=as_json)
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+def test_doctor_still_names_colliding_prefixes(tmp_path, monkeypatch, as_json):
+    """Prefixes are shown deliberately: the operator has to edit them."""
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "false")
+    config = tmp_path / "stm_proxy.json"
+    config.write_text(
+        json.dumps(
+            {
+                "upstream_servers": {
+                    "one": {"prefix": "sharedpfx", "command": "echo"},
+                    "two": {"prefix": "sharedpfx", "command": "echo"},
+                }
+            }
+        )
+    )
+    extra = ["--json"] if as_json else []
+    output = _run(["doctor", "--config", str(config), "--timeout", "3", *extra])
+    assert "sharedpfx" in output
+
+
+def _validation_error() -> Exception:
+    from pydantic import TypeAdapter, ValidationError
+
+    try:
+        TypeAdapter(int).validate_python("cnryRejected")
+    except ValidationError as exc:
+        return exc
+    raise AssertionError("expected a ValidationError")
+
+
+def test_probe_labels_a_response_validation_error_by_stage(monkeypatch):
+    """A reply that fails validation after connect is a server fault, not a
+    config one, and is rendered by location and type like the entry case."""
+    import asyncio
+    from contextlib import asynccontextmanager
+
+    import mcp
+    import mcp.client.stdio
+
+    from memtomem_stm.cli.proxy import _probe_one
+
+    @asynccontextmanager
+    async def fake_stdio_client(params):
+        yield (object(), object())
+
+    class FakeSession:
+        def __init__(self, *streams):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return None
+
+        async def initialize(self):
+            return None
+
+        async def list_tools(self):
+            raise _validation_error()
+
+    monkeypatch.setattr(mcp.client.stdio, "stdio_client", fake_stdio_client)
+    monkeypatch.setattr(mcp, "ClientSession", FakeSession)
+
+    result = asyncio.run(_probe_one({"command": "echo"}, 3.0))
+    assert result.stage.value == "mcp_initialized"
+    assert result.error == "invalid server response: int_parsing"
+    assert "cnryRejected" not in result.error
+
+
+def test_probe_labels_an_entry_validation_error():
+    from memtomem_stm.cli.proxy import _probe_failure_message
+    from memtomem_stm.proxy.staged_status import ProbeStage
+
+    message = _probe_failure_message(_validation_error(), ProbeStage.CONFIGURED)
+    assert message == "invalid server entry: int_parsing"
+
+
+def test_ltm_probe_error_that_echoes_an_arg_is_scrubbed(monkeypatch):
+    """The status hides the args, so an exception quoting one must not
+    bring it back through the error text."""
+    from types import SimpleNamespace
+
+    from memtomem_stm.cli import proxy as proxy_mod
+
+    async def failing_probe(*args, **kwargs):
+        raise RuntimeError("launch failed: --token cnryLtmArg rejected")
+
+    monkeypatch.setattr(proxy_mod, "_probe_ltm_mcp_server", failing_probe)
+    surfacing = SimpleNamespace(
+        enabled=True,
+        ltm_mcp_transport="stdio",
+        ltm_mcp_command=sys.executable,
+        ltm_mcp_args=["--token", "cnryLtmArg"],
+        ltm_mcp_url="",
+        ltm_mcp_headers=None,
+    )
+    status = proxy_mod._ltm_mcp_status(surfacing, 3.0)
+    # Positive control: the failure text reached the status.
+    assert "launch failed" in status["error"]
+    assert "cnryLtmArg" not in status["error"]
+
+
+_ECHO_CANARIES = ("cnryEchoArg", "cnryEchoEnv", "cnryEchoHdr", "cnryEchoUser", "cnryEchoPass")
+
+
+def _patch_echoing_transports(monkeypatch) -> None:
+    """Each transport fails with a message quoting its own server's
+    configured values, as an SDK or a server's error reply can."""
+    import mcp.client.stdio
+
+    import memtomem_stm.utils.mcp_transport as transport_mod
+
+    def failing(echoed: str):
+        def transport(*args, **kwargs):
+            raise RuntimeError(f"boom: {echoed}")
+
+        return transport
+
+    monkeypatch.setattr(mcp.client.stdio, "stdio_client", failing("cnryEchoArg cnryEchoEnv"))
+    monkeypatch.setattr(
+        transport_mod,
+        "streamable_http_transport",
+        failing("http://cnryEchoUser:cnryEchoPass@127.0.0.1:9/mcp cnryEchoHdr cnryEchoPass"),
+    )
+
+
+@pytest.mark.parametrize("command", ["health", "doctor"])
+@pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+def test_probe_error_that_echoes_configured_values_is_scrubbed(
+    tmp_path, monkeypatch, command, as_json
+):
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "false")
+    _patch_echoing_transports(monkeypatch)
+    config = tmp_path / "stm_proxy.json"
+    config.write_text(
+        json.dumps(
+            {
+                "upstream_servers": {
+                    "local": {
+                        "prefix": "local",
+                        "command": "echo",
+                        "args": ["--token", "cnryEchoArg"],
+                        "env": {"TOKEN": "cnryEchoEnv"},
+                    },
+                    "remote": {
+                        "prefix": "remote",
+                        "transport": "streamable_http",
+                        "url": "http://cnryEchoUser:cnryEchoPass@127.0.0.1:9/mcp",
+                        "headers": {"Authorization": "cnryEchoHdr"},
+                    },
+                }
+            }
+        )
+    )
+    extra = ["--json"] if as_json else []
+    output = _run([command, "--config", str(config), "--timeout", "3", *extra])
+    # Positive control: the injected failure text reached both rows.
+    assert output.count("boom: ") >= 2
+    _assert_clean(output, _ECHO_CANARIES, as_json=as_json)
+
+
+def test_probe_unwraps_a_grouped_entry_validation_error(monkeypatch):
+    """anyio task groups wrap transport failures; the label and the
+    value-free rendering apply to the leaf."""
+    import asyncio
+
+    import mcp.client.stdio
+
+    from memtomem_stm.cli.proxy import _probe_one
+
+    def grouped_failure(*args, **kwargs):
+        raise ExceptionGroup("unhandled errors in a TaskGroup", [_validation_error()])
+
+    monkeypatch.setattr(mcp.client.stdio, "stdio_client", grouped_failure)
+    result = asyncio.run(_probe_one({"command": "echo"}, 3.0))
+    assert result.stage.value == "configured"
+    assert result.error == "invalid server entry: int_parsing"
+
+
+def test_last_resort_probe_guard_renders_validation_errors_value_free(monkeypatch):
+    import asyncio
+
+    from memtomem_stm.cli import proxy as proxy_mod
+
+    async def escaping_probe(cfg, timeout):
+        raise _validation_error()
+
+    monkeypatch.setattr(proxy_mod, "_probe_one", escaping_probe)
+    results = asyncio.run(proxy_mod._probe_servers({"s": {"command": "echo"}}, 3.0))
+    assert results["s"].error == "invalid server entry: int_parsing"
+
+
+def test_ltm_probe_error_that_echoes_url_credentials_is_scrubbed(monkeypatch):
+    """A message quoting only the username or password, or the header value,
+    is scrubbed like an upstream probe error."""
+    from types import SimpleNamespace
+
+    from memtomem_stm.cli import proxy as proxy_mod
+
+    async def failing_probe(*args, **kwargs):
+        raise RuntimeError("auth rejected for cnryLtmUser / cnryLtmPass with cnryLtmHdr")
+
+    monkeypatch.setattr(proxy_mod, "_probe_ltm_mcp_server", failing_probe)
+    surfacing = SimpleNamespace(
+        enabled=True,
+        ltm_mcp_transport="streamable_http",
+        ltm_mcp_command="",
+        ltm_mcp_args=[],
+        ltm_mcp_url="http://cnryLtmUser:cnryLtmPass@127.0.0.1:9/mcp",
+        ltm_mcp_headers={"Authorization": "cnryLtmHdr"},
+    )
+    status = proxy_mod._ltm_mcp_status(surfacing, 3.0)
+    assert "auth rejected" in status["error"]
+    assert [c for c in _LTM_CANARIES if c in status["error"]] == []

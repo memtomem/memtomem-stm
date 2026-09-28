@@ -41,6 +41,13 @@ changes inline only. See the deprecation policy in
   `MEMTOMEM_STM_PROXY='[1]'`, now reports `config_valid: false` in `health` and
   FAILs `doctor`'s `config schema` check, so `mms doctor` exits 1 where it used
   to pass.
+- **`mms health` and `mms doctor` hide the LTM server's launch arguments**
+  (#1077). On the direct route to a stdio LTM server, the Surfacing
+  Bootstrap line and the `doctor` `ltm` check show `<command> [args hidden]`, and `surfacing.ltm_server.args` in `--json` is
+  one `<REDACTED>` per argument, so scripts can still count them. Read the
+  `MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS` setting directly when you need the
+  values. This is stricter than `mms list`, which hides only env-supplied
+  upstream args and only in its text table.
 - An empty tool filter now matches no tools in `mms tune` and
   `stm_tuning_recommendations`; omit the filter to analyze all tools. In particular,
   `mms tune --apply --yes --tool ""` no longer writes overrides for other tools (#1036).
@@ -55,6 +62,15 @@ changes inline only. See the deprecation policy in
   keep input values out of their validation errors (including the surfacing
   bootstrap section and its debug log), and stop `health`
   crashing on a `MEMTOMEM_STM_*` value settings cannot decode (#1075).
+  **Behavior change**: see the upgrade notes above.
+- Keep configured values out of the rest of `mms health` and `mms doctor`
+  (#1077): an upstream probe that the SDK rejects as invalid now reports the
+  field location and error type (`invalid server entry: args.1 (string_type)`)
+  instead of the pydantic message that quoted the rejected value, and a server
+  reply that fails validation reads `invalid server response: …` the same way.
+  Probe errors from upstream and LTM servers also scrub the configured
+  launch arguments the way they already scrubbed `env` / `headers` values
+  (values of four or more characters).
   **Behavior change**: see the upgrade notes above.
 - Keep each LLM compression fallback reason with its own result so
   overlapping calls cannot mislabel proxy metrics (#1055).
