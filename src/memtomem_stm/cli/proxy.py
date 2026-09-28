@@ -7953,6 +7953,26 @@ def _text_parts_from_tool_result(result: Any) -> list[str]:
     ]
 
 
+# The versions Core reports: its distribution version from package metadata. A
+# supported subset of PEP 440 (no epoch, at most four release components) that
+# covers every memtomem release; a ``+local`` label is matched but not kept,
+# since it is free text (a VCS hash, or anything a build chose) (#1082).
+_CORE_VERSION_RE = re.compile(
+    r"([0-9]{1,4}(?:\.[0-9]{1,4}){0,3}(?:(?:a|b|rc)[0-9]{1,4})?(?:\.post[0-9]{1,4})?"
+    r"(?:\.dev[0-9]{1,6})?)"
+    r"(?:\+[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*)?"
+)
+
+
+def _core_version(value: Any) -> str | None:
+    """The public part of a version Core reported, or ``None`` when *value* is
+    not one: the report shows a version number, never a string Core chose."""
+    if not isinstance(value, str):
+        return None
+    match = _CORE_VERSION_RE.fullmatch(value)
+    return match.group(1) if match else None
+
+
 def _ltm_metadata_from_tool_result(result: Any) -> dict[str, Any]:
     text_parts = _text_parts_from_tool_result(result)
     if not text_parts:
@@ -7963,14 +7983,15 @@ def _ltm_metadata_from_tool_result(result: Any) -> dict[str, Any]:
         return {"version": None, "runtime_profile": None}
     if not isinstance(data, dict):
         return {"version": None, "runtime_profile": None}
-    version = data.get("version")
     profile = data.get("runtime_profile")
     if not isinstance(profile, dict) or profile.get("schema_version") != 1:
         profile = None
     caps = data.get("capabilities")
     formats = caps.get("search_formats") if isinstance(caps, dict) else None
     return {
-        "version": str(version) if version else None,
+        "version": _core_version(data.get("version")),
+        # Raw: the diagnostics judge it as sent. ``_surfacing_bootstrap_status``
+        # replaces it with its projection before anything is rendered.
         "runtime_profile": profile,
         "effective_result_format": (
             "structured" if isinstance(formats, list) and "structured" in formats else "compact"
@@ -8329,9 +8350,13 @@ def _ltm_daemon_status(config: Any, timeout: float, *, measure_ltm: bool = False
         status["latency"] = hs["latency"]
     core = hs.get("core")
     if isinstance(core, dict):
-        status["effective_result_format"] = core.get("effective_result_format")
+        result_format = core.get("effective_result_format")
+        status["effective_result_format"] = (
+            result_format if result_format in ("structured", "compact") else None
+        )
         profile = core.get("runtime_profile")
         if isinstance(profile, dict) and profile.get("schema_version") == 1:
+            # Raw, projected before rendering (see the direct route).
             status["runtime_profile"] = profile
     if measure_ltm:
         measurement, refreshed = asyncio.run(
@@ -8502,6 +8527,7 @@ def _surfacing_bootstrap_status(
             inspect_feedback_db,
             read_surfacing_summary,
         )
+        from memtomem_stm.surfacing.rrf_profile import project_runtime_profile
 
         config = stm_config_for_cli(config_path)
         surfacing = config.surfacing
@@ -8512,24 +8538,31 @@ def _surfacing_bootstrap_status(
             measure_ltm=measure_ltm,
             prefer_hook_daemon=prefer_hook_daemon,
         )
+        # Judge Core's profile as it was sent, then render only its projection
+        # (#1082): the checks below read the raw snapshot, so a value the
+        # projection cannot represent never changes a verdict.
+        profile = ltm_status.get("runtime_profile")
+        connected = bool(ltm_status.get("connected"))
+        profile_checks = _runtime_profile_doctor_checks(profile) if connected else []
+        rrf_checks = (
+            rrf_boundary_doctor_checks(
+                profile, surfacing, effective_format=ltm_status.get("effective_result_format")
+            )
+            if connected
+            else []
+        )
+        ltm_status["runtime_profile"] = project_runtime_profile(profile)
+        fields = ("id", "label", "status", "detail", "next_action")
         return {
             "enabled": surfacing.enabled,
             "feedback_enabled": surfacing.feedback_enabled,
             "feedback_db": db_status,
             "feedback_summary": read_surfacing_summary(surfacing.feedback_db_path),
             "ltm_server": ltm_status,
-            "rrf_boundary_checks": (
-                [
-                    dict(zip(("id", "label", "status", "detail", "next_action"), row, strict=True))
-                    for row in rrf_boundary_doctor_checks(
-                        ltm_status.get("runtime_profile"),
-                        surfacing,
-                        effective_format=ltm_status.get("effective_result_format"),
-                    )
-                ]
-                if ltm_status.get("connected")
-                else []
-            ),
+            "runtime_profile_checks": [
+                dict(zip(fields, row, strict=True)) for row in profile_checks
+            ],
+            "rrf_boundary_checks": [dict(zip(fields, row, strict=True)) for row in rrf_checks],
             "timeouts": {
                 "surfacing_seconds": float(surfacing.timeout_seconds),
                 "hook_daemon_seconds": float(config.hook.daemon_timeout_seconds),
@@ -9182,6 +9215,12 @@ def _ollama_next_action(base_url: str, missing_models: list[str]) -> str:
     )
 
 
+def _known_retrieval_mode(value: Any) -> str:
+    from memtomem_stm.surfacing.rrf_profile import RETRIEVAL_MODES
+
+    return value if isinstance(value, str) and value in RETRIEVAL_MODES else "unrecognized"
+
+
 def _runtime_profile_doctor_checks(profile: Any) -> list[tuple[str, str, str, str, str | None]]:
     """Translate the additive core runtime profile into stable doctor checks."""
     if not isinstance(profile, dict):
@@ -9264,7 +9303,10 @@ def _runtime_profile_doctor_checks(profile: Any) -> list[tuple[str, str, str, st
                 "ltm_retrieval_mode",
                 "ltm retrieval mode",
                 "FAIL",
-                f"configured mode {configured_mode} degraded to effective mode bm25_only",
+                # The mode Core named only when it is one it can name: the
+                # profile is judged raw, so the value itself is untrusted (#1082).
+                f"configured mode {_known_retrieval_mode(configured_mode)} degraded to "
+                "effective mode bm25_only",
                 "restore the configured dense embedding provider, then re-index vectors",
             )
         )
@@ -9278,7 +9320,9 @@ def _runtime_profile_doctor_checks(profile: Any) -> list[tuple[str, str, str, st
                 "enable a dense embedding provider and re-index vectors for semantic retrieval",
             )
         )
-    elif effective_mode in {"hybrid", "dense_only"}:
+    # A tuple, not a set: the raw profile is judged, and an unhashable mode
+    # (a JSON list) must fall through to "not recognized", not raise.
+    elif effective_mode in ("hybrid", "dense_only"):
         checks.append(
             ("ltm_retrieval_mode", "ltm retrieval mode", "PASS", str(effective_mode), None)
         )
@@ -9879,8 +9923,14 @@ def doctor(
                 if ltm.get("version"):
                     detail = f"{detail}, version {ltm['version']}"
                 check("ltm", "ltm server", "PASS", f"connectable ({detail})")
-                for runtime_check in _runtime_profile_doctor_checks(ltm.get("runtime_profile")):
-                    check(*runtime_check)
+                for runtime_check in surfacing_status.get("runtime_profile_checks", []):
+                    check(
+                        runtime_check["id"],
+                        runtime_check["label"],
+                        runtime_check["status"],
+                        runtime_check["detail"],
+                        runtime_check["next_action"],
+                    )
 
                 for rrf_check in surfacing_status.get("rrf_boundary_checks", []):
                     check(

@@ -146,3 +146,98 @@ def read_score_ceiling_hint(raw: Any) -> float | None:
     if not math.isfinite(value) or value <= 0:
         return None
     return value
+
+
+# The closed sets Core's ``collect_runtime_profile`` draws these fields from.
+_CONFIG_STATES = frozenset({"ok", "error"})
+RETRIEVAL_MODES = frozenset({"hybrid", "bm25_only", "dense_only", "disabled"})
+_DEPENDENCIES = ("fastembed", "kiwipiepy")
+_REQUIRED_FOR = frozenset({"embedding", "rerank", "tokenizer"})
+_MISSING_EXTRAS = frozenset({"onnx", "korean"})
+_UNRECOGNIZED = "unrecognized"
+
+
+def _known(value: Any, allowed: frozenset[str]) -> str:
+    return value if isinstance(value, str) and value in allowed else _UNRECOGNIZED
+
+
+def _setting(value: Any) -> int | None:
+    # No upper bound: Core accepts any positive int, and the digits are
+    # already capped by JSON parsing.
+    return value if _positive_int(value) else None
+
+
+def _strict_bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _members(value: Any, allowed: frozenset[str]) -> list[str] | None:
+    if not isinstance(value, list):
+        return None
+    return list(dict.fromkeys(item for item in value if isinstance(item, str) and item in allowed))
+
+
+def project_runtime_profile(profile: Any) -> dict[str, Any] | None:
+    """Core's ``runtime_profile`` as a report shows it: the fields STM reads,
+    each rendered from a closed set.
+
+    For display only (#1082). The diagnostics judge the raw snapshot, so this
+    never decides a verdict; it decides what a health or doctor report prints.
+    A string is kept only when it is one of the values Core draws that field
+    from (``"unrecognized"`` otherwise), a number only when it is a strict
+    positive int, a flag only when it is a bool, a list only with its known
+    members, each once (``None`` when it is not a list). A field STM does not
+    read (the embedding model, the tokenizer, provider names, dependency
+    versions, unknown keys) is dropped, and an absent key stays absent.
+    ``None`` for anything that is not a schema-1 profile.
+    """
+    if (
+        not isinstance(profile, dict)
+        or type(profile.get("schema_version")) is not int
+        or profile["schema_version"] != 1
+    ):
+        return None
+    projected: dict[str, Any] = {"schema_version": 1}
+    if "config_state" in profile:
+        projected["config_state"] = _known(profile["config_state"], _CONFIG_STATES)
+
+    search = profile.get("search")
+    if isinstance(search, dict):
+        out: dict[str, Any] = {}
+        for key in ("rrf_k", "bm25_candidates", "dense_candidates"):
+            if key in search:
+                out[key] = _setting(search[key])
+        if "rrf_weights" in search:
+            weights = search["rrf_weights"]
+            out["rrf_weights"] = list(weights) if _weights(weights) is not None else None
+        for key in ("enable_bm25", "enable_dense"):
+            if key in search:
+                out[key] = _strict_bool(search[key])
+        for key in ("configured_mode", "effective_mode"):
+            if key in search:
+                out[key] = _known(search[key], RETRIEVAL_MODES)
+        projected["search"] = out
+
+    rerank = profile.get("rerank")
+    if isinstance(rerank, dict):
+        projected["rerank"] = (
+            {"enabled": _strict_bool(rerank["enabled"])} if "enabled" in rerank else {}
+        )
+
+    dependencies = profile.get("dependencies")
+    if isinstance(dependencies, dict):
+        deps: dict[str, Any] = {}
+        for name in _DEPENDENCIES:
+            entry = dependencies.get(name)
+            if isinstance(entry, dict):
+                dep: dict[str, Any] = {}
+                if "available" in entry:
+                    dep["available"] = _strict_bool(entry["available"])
+                if "required_for" in entry:
+                    dep["required_for"] = _members(entry["required_for"], _REQUIRED_FOR)
+                deps[name] = dep
+        projected["dependencies"] = deps
+
+    if "missing_extras" in profile:
+        projected["missing_extras"] = _members(profile["missing_extras"], _MISSING_EXTRAS)
+    return projected

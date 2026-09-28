@@ -763,3 +763,312 @@ def test_ollama_local_hint_uses_the_diagnostic_url():
     # Positive control: the local branch that renders the URL ran.
     assert hint.startswith("verify the local Ollama at <unparseable url>")
     assert "cnryPw" not in hint
+
+
+# ── Server- and DB-supplied text (#1082 part 3) ──────────────────────────
+#
+# The cases above plant canaries in configuration. These plant them in what a
+# store or the LTM server hands back: a SQLite diagnostic that quotes a table
+# name out of the schema, and Core's ``version`` / ``runtime_profile``. What
+# is left is a type, a result-code name, a version number, or a value from the
+# closed sets STM reads.
+
+_DB_CANARIES = ("cnryDbTable",)
+
+
+def _malformed_db(path) -> None:
+    """A real SQLite file whose schema no longer parses.
+
+    Reading it raises ``DatabaseError: malformed database schema
+    (cnryDbTable) - ...``: SQLite quotes the stored table name back, so the
+    canary reaches the message the way any schema text would.
+    """
+    import sqlite3
+
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE cnryDbTable (x)")
+    db.commit()
+    db.execute("PRAGMA writable_schema=ON")
+    db.execute("UPDATE sqlite_master SET sql = 'CREATE TABLE cnryDbTable (x' WHERE type='table'")
+    db.commit()
+    db.close()
+
+
+@pytest.mark.parametrize(
+    ("command", "as_json"),
+    [("health", False), ("health", True), ("doctor", True)],
+    ids=["health-text", "health-json", "doctor-json"],
+)
+def test_feedback_db_error_names_only_type_and_code(tmp_path, monkeypatch, command, as_json):
+    # Doctor text renders no feedback-DB error, so it has no arm here.
+    db = tmp_path / "feedback.db"
+    _malformed_db(db)
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "false")
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH", str(db))
+    config = tmp_path / "stm_proxy.json"
+    config.write_text(json.dumps({"upstream_servers": {}}))
+    extra = ["--json"] if as_json else []
+    output = _run([command, "--config", str(config), "--timeout", "3", *extra])
+
+    # Positive control: both readers hit the malformed schema.
+    expected = "DatabaseError (SQLITE_CORRUPT)"
+    if as_json:
+        surfacing = json.loads(output)["surfacing"]
+        assert surfacing["feedback_db"]["error"] == expected
+        assert surfacing["feedback_summary"]["error"] == expected
+    else:
+        assert f"feedback tables: error — {expected}" in output
+    _assert_clean(output, _DB_CANARIES, as_json=as_json)
+
+
+def test_stats_db_errors_name_only_type_and_code(tmp_path, monkeypatch):
+    metrics = tmp_path / "metrics.db"
+    feedback = tmp_path / "feedback.db"
+    _malformed_db(metrics)
+    _malformed_db(feedback)
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH", str(feedback))
+    config = tmp_path / "stm_proxy.json"
+    config.write_text(json.dumps({"upstream_servers": {}, "metrics": {"db_path": str(metrics)}}))
+    output = _run(["stats", "--config", str(config), "--json"])
+
+    data = json.loads(output)
+    assert data["compression"]["error"] == "DatabaseError (SQLITE_CORRUPT)"
+    assert data["surfacing"]["error"] == "DatabaseError (SQLITE_CORRUPT)"
+    _assert_clean(output, _DB_CANARIES, as_json=True)
+
+
+@pytest.mark.parametrize(
+    ("module", "reader"),
+    [
+        ("memtomem_stm.surfacing.feedback_store", "inspect_feedback_db"),
+        ("memtomem_stm.surfacing.feedback_store", "read_surfacing_summary"),
+        ("memtomem_stm.proxy.metrics_store", "read_compression_summary"),
+    ],
+)
+def test_db_reader_open_failure_names_only_type_and_code(tmp_path, monkeypatch, module, reader):
+    """The open itself failing: a malformed file only fails at the first query,
+    so the ``connect`` branch needs its own error. Its message carries the
+    canary the way a path or VFS diagnostic would."""
+    import importlib
+    import sqlite3
+
+    mod = importlib.import_module(module)
+
+    def _connect(*_a: Any, **_kw: Any) -> Any:
+        exc = sqlite3.OperationalError("unable to open cnryDbTable")
+        exc.sqlite_errorcode = 14
+        raise exc
+
+    monkeypatch.setattr(mod.sqlite3, "connect", _connect)
+    db = tmp_path / "store.db"
+    db.write_bytes(b"")
+    result = getattr(mod, reader)(db)
+    assert result["error"] == "OperationalError (SQLITE_CANTOPEN)"
+
+
+_CORE_CANARIES = (
+    "cnryVersionTok",
+    "cnryLocal",
+    "cnryAnsi",
+    "cnryModel",
+    "cnryTokenizer",
+    "cnryProvider",
+    "cnryMode",
+    "cnryExtra",
+    "cnryRequiredFor",
+    "cnryDepVersion",
+    "cnryKey",
+    "cnryVal",
+    "cnryFormat",
+)
+
+
+def _hostile_profile() -> dict[str, Any]:
+    """Core's schema-1 shape with a canary in every free-text slot.
+
+    ``configured_mode`` is a canary while ``effective_mode`` is ``bm25_only``:
+    that is the combination doctor words as "configured mode X degraded".
+    """
+    return {
+        "schema_version": 1,
+        "config_state": "ok",
+        "embedding": {"provider": "cnryProvider", "model": "cnryModel", "dimension": 384},
+        "search": {
+            "rrf_k": 10**12,
+            "rrf_weights": [1.0, 1.0],
+            "bm25_candidates": 50,
+            "dense_candidates": 50,
+            "enable_bm25": True,
+            "enable_dense": True,
+            "tokenizer": "cnryTokenizer",
+            "configured_mode": "cnryMode",
+            "effective_mode": "bm25_only",
+        },
+        "rerank": {"enabled": False, "provider": "cnryProvider"},
+        "dependencies": {
+            "fastembed": {
+                "available": True,
+                "version": "cnryDepVersion",
+                "required_for": ["embedding", "cnryRequiredFor"],
+            },
+            "kiwipiepy": {"available": False, "version": None, "required_for": []},
+        },
+        "missing_extras": ["cnryExtra"],
+        "cnryKey": "cnryVal",
+    }
+
+
+@pytest.mark.parametrize(
+    ("version", "shown"),
+    [
+        ("0.3.0+cnryLocal", "0.3.0"),
+        ("0.1.0.post1", "0.1.0.post1"),
+        ("1.2.0rc1.dev3", "1.2.0rc1.dev3"),
+        ("cnryVersionTok", None),
+        ("\u0661.\u0662.\u0663", None),
+        ("0.3.0\x1b[31mcnryAnsi\n", None),
+    ],
+    ids=["local-label", "post", "pre-dev", "bare-token", "unicode-digits", "control-chars"],
+)
+@pytest.mark.parametrize("command", ["health", "doctor"])
+@pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+def test_ltm_core_metadata_is_rendered_from_known_values(
+    tmp_path, monkeypatch, version, shown, command, as_json
+):
+    """Core's ``mem_do(version)`` reply crosses the real parser; only the MCP
+    session is replaced (``CliRunner`` has no stderr fd for a stdio child —
+    ``test_proxy_cli.py`` covers the real subprocess)."""
+    from mcp.types import CallToolResult, TextContent
+
+    from memtomem_stm.cli import proxy
+
+    payload = {"version": version, "runtime_profile": _hostile_profile()}
+
+    async def _probe(*_a: Any, **_kw: Any) -> dict[str, Any]:
+        reply = CallToolResult(content=[TextContent(type="text", text=json.dumps(payload))])
+        return {"connected": True, "error": None, **proxy._ltm_metadata_from_tool_result(reply)}
+
+    monkeypatch.setattr(proxy, "_probe_ltm_mcp_server", _probe)
+    _ltm_stdio_env(monkeypatch)
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "false")
+    config = tmp_path / "stm_proxy.json"
+    config.write_text(json.dumps({"upstream_servers": {}}))
+    extra = ["--json"] if as_json else []
+    output = _run([command, "--config", str(config), "--timeout", "3", *extra])
+
+    # Positive controls, one per renderer that could echo the reply.
+    if as_json:
+        block = _ltm_block(output)
+        assert block["connected"] is True
+        assert block["version"] == shown
+        assert block["runtime_profile"]["search"]["effective_mode"] == "bm25_only"
+    elif command == "health":
+        line = next(ln for ln in output.splitlines() if "ltm server:" in ln)
+        assert "connectable" in line
+        assert line.endswith(f", version {shown})") if shown else "version" not in line
+    else:
+        assert "degraded to effective mode bm25_only" in output
+    _assert_clean(output, _CORE_CANARIES, as_json=as_json)
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+def test_ltm_daemon_core_metadata_is_rendered_from_known_values(tmp_path, monkeypatch, as_json):
+    from memtomem_stm.daemon import client
+
+    async def _ping(*_a: Any, **_kw: Any) -> dict[str, Any]:
+        return {
+            "ltm": "warm",
+            "core": {
+                "runtime_profile": _hostile_profile(),
+                "effective_result_format": "cnryFormat",
+            },
+        }
+
+    monkeypatch.setattr(client, "ping", _ping)
+    _ltm_stdio_env(monkeypatch)
+    config = tmp_path / "stm_proxy.json"
+    config.write_text(json.dumps({"upstream_servers": {}}))
+    extra = ["--json"] if as_json else []
+    output = _run(["doctor", "--config", str(config), "--timeout", "3", *extra])
+
+    # Positive control: doctor followed the daemon and read its profile.
+    if as_json:
+        block = _ltm_block(output)
+        assert block["route"] == "daemon"
+        assert block["runtime_profile"]["search"]["effective_mode"] == "bm25_only"
+        assert block["effective_result_format"] is None
+    else:
+        assert "degraded to effective mode bm25_only" in output
+    _assert_clean(output, _CORE_CANARIES, as_json=as_json)
+
+
+@pytest.mark.parametrize(
+    ("fastembed", "status"),
+    [
+        # A use Core may add later: still "required", so still FAIL.
+        ({"available": False, "required_for": ["cnryNewUse"]}, "FAIL"),
+        # Truthy but not a bool: judged as sent, not as the projection's null.
+        ({"available": "yes", "required_for": ["embedding"]}, "PASS"),
+    ],
+    ids=["unknown-required-for", "non-bool-available"],
+)
+def test_doctor_judges_the_raw_profile_and_renders_the_projection(
+    tmp_path, monkeypatch, fastembed, status
+):
+    """The projection is for display: a value it cannot represent must not
+    change a verdict (#1082 review)."""
+    from memtomem_stm.daemon import client
+
+    profile = _hostile_profile()
+    profile["missing_extras"] = []
+    profile["dependencies"]["fastembed"] = fastembed
+
+    async def _ping(*_a: Any, **_kw: Any) -> dict[str, Any]:
+        return {"ltm": "warm", "core": {"runtime_profile": profile}}
+
+    monkeypatch.setattr(client, "ping", _ping)
+    _ltm_stdio_env(monkeypatch)
+    config = tmp_path / "stm_proxy.json"
+    config.write_text(json.dumps({"upstream_servers": {}}))
+    output = _run(["doctor", "--config", str(config), "--timeout", "3", "--json"])
+
+    data = json.loads(output)
+    checks = {c["id"]: c for c in data["checks"]}
+    assert checks["ltm_dependencies"]["status"] == status
+    shown = data["surfacing"]["ltm_server"]["runtime_profile"]["dependencies"]["fastembed"]
+    assert shown["required_for"] == [r for r in fastembed["required_for"] if r == "embedding"]
+    _assert_clean(output, _CORE_CANARIES + ("cnryNewUse",), as_json=True)
+
+
+@pytest.mark.parametrize("command", ["health", "doctor"])
+@pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+def test_unhashable_mode_does_not_break_the_report(tmp_path, monkeypatch, command, as_json):
+    """The raw profile is judged in the bootstrap status that ``health`` shares:
+    a JSON list where a mode string belongs must not collapse it (#1082 review)."""
+    from memtomem_stm.daemon import client
+
+    profile = _hostile_profile()
+    profile["search"]["effective_mode"] = ["cnryMode"]
+
+    async def _ping(*_a: Any, **_kw: Any) -> dict[str, Any]:
+        return {"ltm": "warm", "core": {"runtime_profile": profile}}
+
+    monkeypatch.setattr(client, "ping", _ping)
+    _ltm_stdio_env(monkeypatch)
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__USE_DAEMON", "true")
+    config = tmp_path / "stm_proxy.json"
+    config.write_text(json.dumps({"upstream_servers": {}}))
+    extra = ["--json"] if as_json else []
+    output = _run([command, "--config", str(config), "--timeout", "3", *extra])
+
+    if as_json:
+        surfacing = json.loads(output)["surfacing"]
+        assert "error" not in surfacing
+        assert surfacing["ltm_server"]["runtime_profile"]["search"]["effective_mode"] == (
+            "unrecognized"
+        )
+    else:
+        assert "TypeError" not in output
+    if command == "doctor" and not as_json:
+        assert "did not report a recognized retrieval mode" in output
+    _assert_clean(output, _CORE_CANARIES, as_json=as_json)

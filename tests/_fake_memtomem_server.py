@@ -65,6 +65,10 @@ _RERANKER_ID: str | None = None
 _COMPOSE_SCHEMA: int | None = None
 _RUNTIME_PROFILE: dict | None = None
 
+# What ``mem_do(version)`` reports. A valid PEP 440 version with a local label:
+# STM shows only the public part (#1082).
+_VERSION: str = "0.3.0+fake"
+
 _SEARCH_DELAY: float = 0.0
 """Seconds each ``mem_search`` takes, standing in for a real core's latency.
 
@@ -326,7 +330,7 @@ async def mem_do(action: str, params: dict | None = None) -> str:
         capabilities: dict = {"search_formats": ["compact", "structured"]}
         if _COMPOSE_SCHEMA is not None:
             capabilities["context_compose"] = {"schema_version": _COMPOSE_SCHEMA}
-        payload = {"version": "0.3.0-fake", "capabilities": capabilities}
+        payload = {"version": _VERSION, "capabilities": capabilities}
         if _RUNTIME_PROFILE is not None:
             capabilities["runtime_profile"] = {"schema_version": 1}
             payload["runtime_profile"] = _RUNTIME_PROFILE
@@ -337,6 +341,12 @@ async def mem_do(action: str, params: dict | None = None) -> str:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fake memtomem MCP server.")
     parser.add_argument("--runtime-profile", help="Optional runtime-profile JSON fixture")
+    parser.add_argument(
+        "--version",
+        dest="core_version",
+        default=_VERSION,
+        help="The version string mem_do(version) reports.",
+    )
     parser.add_argument(
         "--seeds",
         metavar="PATH",
@@ -410,6 +420,7 @@ if __name__ == "__main__":
     _SCORE_SCALE = args.score_scale
     _RERANKER_ID = args.reranker_id
     _COMPOSE_SCHEMA = args.compose_schema
+    _VERSION = args.core_version
     if args.runtime_profile:
         with open(args.runtime_profile, encoding="utf-8") as profile_file:
             _RUNTIME_PROFILE = json.load(profile_file)

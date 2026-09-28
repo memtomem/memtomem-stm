@@ -89,6 +89,36 @@ changes inline only. See the deprecation policy in
   and fragment, and the LLM destination masks userinfo, which it used to print
   raw. Tracebacks logged with these lines are unchanged (#1086). Config-load
   validation messages (#1087) and policy-bundle errors keep their text.
+- **Text from the stores and from Core is shown by type, version or known
+  value** (#1082). A SQLite error in the feedback or metrics DB — the
+  `feedback tables: error` line and `surfacing.feedback_db.error` /
+  `feedback_summary.error` in `mms health` and `mms doctor --json`, the
+  `stm_proxy_health` feedback line, and `compression.error` / `surfacing.error`
+  in `mms stats --json` — now reads e.g. `DatabaseError (SQLITE_CORRUPT)`
+  instead of SQLite's message, which can quote a table name out of the schema
+  or part of the statement. Every other place that renders an exception this
+  way (proxied call errors, log lines) gains the same result-code suffix for a
+  SQLite error that carries a result code; one without (constructed by hand)
+  reads as its type alone. The LTM server's `version` shows only a version number: a
+  `+local` label is dropped (`0.3.0.dev5+gabc` reads `0.3.0.dev5`), and
+  anything that is not a version is not shown. `surfacing.ltm_server.runtime_profile`
+  in `--json` keeps only the fields STM reads: `schema_version`,
+  `config_state`, `search.rrf_k` / `rrf_weights` / `bm25_candidates` /
+  `dense_candidates` / `enable_bm25` / `enable_dense` / `configured_mode` /
+  `effective_mode`, `rerank.enabled`, `available` / `required_for` of the
+  `fastembed` and `kiwipiepy` dependencies, and `missing_extras`. A string
+  outside the set Core draws it from reads `unrecognized` (also in doctor's
+  `ltm retrieval mode` detail), a malformed number or flag reads `null`, a
+  list keeps only its known members, and `embedding`, `search.tokenizer`,
+  `rerank.provider` and dependency versions are no longer included — read
+  `mm status` in the LTM environment for them. Doctor still judges the
+  profile as Core sent it; only what is printed changes. `mms health --json`
+  and `mms doctor --json` gain `surfacing.runtime_profile_checks`, the same
+  rows doctor prints.
+  Core's search hints and compose warnings are logged and shown in
+  `stm_proxy_stats` as a count (`last: 2 hint(s)`), not their text, and
+  `TokenTracker.get_summary()` replaces `last_hints` with `last_hint_count`.
+  Tracebacks are unchanged (#1086).
 - An empty tool filter now matches no tools in `mms tune` and
   `stm_tuning_recommendations`; omit the filter to analyze all tools. In particular,
   `mms tune --apply --yes --tool ""` no longer writes overrides for other tools (#1036).
@@ -118,6 +148,10 @@ changes inline only. See the deprecation policy in
   launch arguments the way they already scrubbed `env` / `headers` values
   (values of four or more characters).
   **Behavior change**: see the upgrade notes above.
+- Keep SQLite error messages, the LTM server's free-form `version` and
+  `runtime_profile` fields, and Core's hint text out of `mms health`,
+  `mms doctor`, `mms stats`, `stm_proxy_health`, `stm_proxy_stats` and the
+  hint log line (#1082). **Behavior change**: see the upgrade notes above.
 - Keep each LLM compression fallback reason with its own result so
   overlapping calls cannot mislabel proxy metrics (#1055).
   **Behavior change**: see the upgrade notes above.

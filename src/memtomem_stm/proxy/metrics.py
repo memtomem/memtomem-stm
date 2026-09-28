@@ -326,10 +326,10 @@ class TokenTracker:
         self._progressive_continuations = 0
         # LTM hints from parent trust-UX channel (parent PR #231). Count is a
         # per-surfacing-call event count (not a per-hint count) to keep the
-        # units intuitive for operators reading ``stm_proxy_stats``; the
-        # snapshot is the most recent non-empty hints list.
+        # units intuitive for operators reading ``stm_proxy_stats``; the last
+        # count is how many hints the most recent non-empty list carried.
         self._total_hint_events = 0
-        self._last_hints: list[str] = []
+        self._last_hint_count = 0
         # Per-call latencies for percentile computation (bounded rolling window)
         _LATENCY_WINDOW = 10000
         self._clean_latencies: deque[float] = deque(maxlen=_LATENCY_WINDOW)
@@ -425,14 +425,16 @@ class TokenTracker:
     def record_hints(self, hints: list[str]) -> None:
         """Record a non-empty list of LTM hints from a surfacing call.
 
-        Operators read ``stm_proxy_stats`` to see the most recent hints;
-        the event counter answers "did parent send any notices during
-        this run?". Empty lists are no-ops.
+        Operators read ``stm_proxy_stats`` to see how many hints the most
+        recent call carried; the event counter answers "did parent send any
+        notices during this run?". The hint text is not kept: it is Core's
+        own, and the stats output is read by the agent (#1082). Empty lists
+        are no-ops.
         """
         if not hints:
             return
         self._total_hint_events += 1
-        self._last_hints = list(hints)
+        self._last_hint_count = len(hints)
 
     def record_error(self, metrics: CallMetrics) -> None:
         """Record a failed tool call for error tracking."""
@@ -521,6 +523,6 @@ class TokenTracker:
             "progressive_first_chunks": self._progressive_first_chunks,
             "progressive_continuations": self._progressive_continuations,
             "total_hint_events": self._total_hint_events,
-            "last_hints": list(self._last_hints),
+            "last_hint_count": self._last_hint_count,
             "by_server": by_server,
         }

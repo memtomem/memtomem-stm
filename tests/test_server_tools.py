@@ -131,14 +131,16 @@ class TestProxyStats:
     async def test_hints_section_appears_when_events_recorded(self):
         """B3 — when parent emitted trust-UX hints during the run, the
         stats output shows an ``LTM hints`` section with the latest
-        snapshot. Quiet when zero events."""
+        snapshot. Quiet when zero events. The hints are Core's own text, so
+        only their number is shown (#1082)."""
         tracker = TokenTracker()
-        tracker.record_hints(["2 results filtered by namespace"])
+        tracker.record_hints(["cnryHintA filtered by namespace", "cnryHintB"])
         ctx = _make_ctx(tracker=tracker)
         result = await stm_proxy_stats(ctx=ctx)
         assert "LTM hints:" in result
         assert "1 event(s)" in result
-        assert "2 results filtered by namespace" in result
+        assert "last: 2 hint(s)" in result
+        assert "cnryHint" not in result
 
     async def test_hints_section_omitted_when_no_events(self):
         tracker = TokenTracker()
@@ -532,6 +534,31 @@ class TestHealth:
         ctx = _make_ctx(feedback_tracker=tracker, config=self._proxy_enabled_config())
         result = await stm_proxy_health(ctx=ctx)
         assert "feedback tables: missing (auto_tune_adjustments)" in result
+
+    async def test_bootstrap_block_feedback_db_error_names_only_type_and_code(self, tmp_path):
+        """The agent reads this section: a SQLite message that quotes schema
+        text back must not reach it (#1082). The real reader, on a real file
+        whose schema no longer parses."""
+        import sqlite3
+
+        from memtomem_stm.surfacing.feedback_store import inspect_feedback_db
+
+        db_path = tmp_path / "feedback.db"
+        db = sqlite3.connect(db_path)
+        db.execute("CREATE TABLE cnryDbTable (x)")
+        db.commit()
+        db.execute("PRAGMA writable_schema=ON")
+        db.execute(
+            "UPDATE sqlite_master SET sql = 'CREATE TABLE cnryDbTable (x' WHERE type='table'"
+        )
+        db.commit()
+        db.close()
+        tracker = MagicMock()
+        tracker.bootstrap_status.side_effect = lambda: inspect_feedback_db(db_path)
+        ctx = _make_ctx(feedback_tracker=tracker, config=self._proxy_enabled_config())
+        result = await stm_proxy_health(ctx=ctx)
+        assert "feedback tables: error — DatabaseError (SQLITE_CORRUPT)" in result
+        assert "cnryDbTable" not in result
 
     async def test_bootstrap_block_init_failed(self):
         """When proxy is up + feedback_enabled but tracker is None, surface runtime-init failure."""

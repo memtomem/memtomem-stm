@@ -3771,7 +3771,8 @@ class TestLtmHintsObservability:
         matching = [r for r in caplog.records if "LTM hints for" in r.message]
         assert len(matching) == 1
         assert matching[0].levelname == "INFO"
-        assert "2 results filtered" in matching[0].message
+        # A count, not Core's text (#1082).
+        assert matching[0].message == "LTM hints for s/read_file: 1 hint(s)"
 
     async def test_no_log_when_hints_empty(self, caplog):
         engine = SurfacingEngine(
@@ -3800,9 +3801,7 @@ class TestLtmHintsObservability:
             out = await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
         # Prepend body unchanged — hints are not forwarded to downstream.
         assert out == LONG_RESPONSE
-        assert any(
-            "LTM hints for" in r.message and "below min_score" in r.message for r in caplog.records
-        )
+        assert any(r.message == "LTM hints for s/read_file: 1 hint(s)" for r in caplog.records)
 
     async def test_hints_forwarded_to_token_tracker_when_provided(self):
         tracker = MagicMock()

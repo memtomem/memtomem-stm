@@ -1249,10 +1249,8 @@ async def stm_proxy_stats(
     # LTM trust-UX hints (parent PR #231). Quiet when the parent never sent any.
     hint_events = summary.get("total_hint_events", 0)
     if hint_events > 0:
-        last_hints = summary.get("last_hints", [])
         lines.append(f"\nLTM hints:       {hint_events} event(s)")
-        for h in last_hints:
-            lines.append(f"  last: {h}")
+        lines.append(f"  last: {summary.get('last_hint_count', 0)} hint(s)")
 
     if summary["by_server"]:
         lines.append("\nBy server:")

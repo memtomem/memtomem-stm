@@ -30,6 +30,7 @@ from memtomem_stm.utils.json_out import (
     require_utf8_identifier,
 )
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
+from memtomem_stm.utils.redact import exception_summary
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
 logger = logging.getLogger(__name__)
@@ -508,7 +509,7 @@ def inspect_feedback_db(db_path: Path) -> FeedbackDbStatus:
     try:
         db = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True)
     except sqlite3.Error as exc:
-        status["error"] = str(exc)
+        status["error"] = exception_summary(exc)
         return status
 
     try:
@@ -518,7 +519,7 @@ def inspect_feedback_db(db_path: Path) -> FeedbackDbStatus:
             _REQUIRED_TABLES,
         ).fetchall()
     except sqlite3.Error as exc:
-        status["error"] = str(exc)
+        status["error"] = exception_summary(exc)
         return status
     finally:
         db.close()
@@ -601,7 +602,7 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
     try:
         db = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True)
     except sqlite3.Error as exc:
-        summary["error"] = str(exc)
+        summary["error"] = exception_summary(exc)
         return summary
 
     try:
@@ -749,7 +750,7 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
 
         summary["available"] = True
     except sqlite3.Error as exc:
-        summary["error"] = str(exc)
+        summary["error"] = exception_summary(exc)
         return summary
     finally:
         db.close()
