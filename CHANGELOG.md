@@ -41,6 +41,17 @@ changes inline only. See the deprecation policy in
   `MEMTOMEM_STM_PROXY='[1]'`, now reports `config_valid: false` in `health` and
   FAILs `doctor`'s `config schema` check, so `mms doctor` exits 1 where it used
   to pass.
+- **Probe errors name the exception type, not its message** (#1079). In
+  `mms health`, `mms doctor`, `mms add --validate` and import validation, a
+  failed probe now reads e.g. `ConnectError`, `McpError` or
+  `HTTP 401 (HTTPStatusError)` instead of the exception text, which could
+  quote the request URL, an argument or part of a header back. Run the server
+  command or reach the endpoint directly for the underlying message. In
+  `health`/`doctor`, URLs drop their query string and fragment, and a URL the
+  parser may have split wrongly shows as `<unparseable url>`. Doctor's
+  `ollama_endpoint:<digest>` ID changes for a base URL with a query string or
+  fragment: the digest no longer covers them, and the ID gains the use-site
+  suffix that credentialed endpoints carry.
 - **`mms health` and `mms doctor` hide the LTM server's launch arguments**
   (#1077). On the direct route to a stdio LTM server, the Surfacing
   Bootstrap line and the `doctor` `ltm` check show `<command> [args hidden]`, and `surfacing.ltm_server.args` in `--json` is
@@ -62,6 +73,11 @@ changes inline only. See the deprecation policy in
   keep input values out of their validation errors (including the surfacing
   bootstrap section and its debug log), and stop `health`
   crashing on a `MEMTOMEM_STM_*` value settings cannot decode (#1075).
+  **Behavior change**: see the upgrade notes above.
+- Keep URL query strings and fragments, and free-form exception text, out of
+  `mms health` and `mms doctor`. That covers probe errors from upstream, LTM
+  and Ollama endpoints, the surfacing bootstrap error, and an unrecognized LTM
+  state reported by the daemon (shown as `unknown`) (#1079).
   **Behavior change**: see the upgrade notes above.
 - Keep configured values out of the rest of `mms health` and `mms doctor`
   (#1077): an upstream probe that the SDK rejects as invalid now reports the
