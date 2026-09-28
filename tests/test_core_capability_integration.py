@@ -654,7 +654,13 @@ async def test_compose_contract_break_warns_once_per_engine(
             self.search = AsyncMock(side_effect=AssertionError("must not retry legacy search"))
 
         async def context_compose(self, *args, **kwargs):
-            raise ValueError("core context_compose (schema 3) is missing required key(s): pinned")
+            # What the real adapter's shape check raises (#1082): STM-written,
+            # so the operator warning may show it.
+            from memtomem_stm.utils.redact import ResponseShapeError
+
+            raise ResponseShapeError(
+                "core context_compose (schema 3) is missing required key(s): pinned"
+            )
 
         async def scratch_list(self, **kwargs):
             return []

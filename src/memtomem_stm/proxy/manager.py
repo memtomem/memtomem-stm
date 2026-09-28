@@ -188,6 +188,7 @@ from memtomem_stm.utils.mcp_transport import (
 )
 from memtomem_stm.utils.json_size import json_utf8_size_async
 from memtomem_stm.utils.redact import (
+    diagnostic_url,
     exception_summary,
     root_cause_exc,
 )
@@ -209,7 +210,7 @@ logger = logging.getLogger(__name__)
 def _describe_llm_destination(llm: LLMCompressorConfig) -> str:
     """Human-readable provider + endpoint for the #610 startup warning."""
     if llm.base_url:
-        return f"{llm.provider.value} ({llm.base_url})"
+        return f"{llm.provider.value} ({diagnostic_url(llm.base_url)})"
     return llm.provider.value
 
 
@@ -1684,10 +1685,14 @@ class ProxyManager:
                 except Exception:
                     logger.debug("Tool-graph adapter stop() failed", exc_info=True)
         except _TOOLGRAPH_UNREACHABLE_ERRORS as exc:
-            self._tg_whole_call(cfg.on_unreachable, REASON_TOOLGRAPH_UNREACHABLE, str(exc))
+            self._tg_whole_call(
+                cfg.on_unreachable, REASON_TOOLGRAPH_UNREACHABLE, exception_summary(exc)
+            )
             return
         except ToolgraphProtocolError as exc:
-            self._tg_whole_call(cfg.on_protocol_error, REASON_TOOLGRAPH_PROTOCOL_ERROR, str(exc))
+            self._tg_whole_call(
+                cfg.on_protocol_error, REASON_TOOLGRAPH_PROTOCOL_ERROR, exception_summary(exc)
+            )
             return
 
         # Reachable + well-formed. Pin the generation even on an abort — the
@@ -1952,7 +1957,7 @@ class ProxyManager:
                 "Tool-graph risk enrichment (rank_features) failed (%s) — ranking "
                 "proceeds without graph risk penalties or candidate facts this "
                 "session.",
-                exc,
+                exception_summary(exc),
             )
             return {}, {}, False
         # A non-error response whose ``features`` is not a list is a *malformed*
@@ -2848,7 +2853,7 @@ class ProxyManager:
                 stage,
                 server,
                 tool,
-                exc,
+                exception_summary(exc),
                 exc_info=exc,
             )
 
@@ -4652,11 +4657,10 @@ class ProxyManager:
             raise
         except Exception as exc:
             logger.warning(
-                "Extraction unavailable for %s/%s (%s): %s",
+                "Extraction unavailable for %s/%s: %s",
                 server,
                 tool,
-                type(exc).__name__,
-                exc,
+                exception_summary(exc),
             )
             self.index_observability.record_attempt(tool, "extract")
             self.index_observability.record_outcome(tool, "error")

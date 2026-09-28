@@ -31,7 +31,7 @@ from memtomem_stm.utils.json_out import (
     scrub_content_preserving_identity,
 )
 from memtomem_stm.utils.numeric import safe_float
-from memtomem_stm.utils.redact import redact_exception_text, redact_url_userinfo
+from memtomem_stm.utils.redact import ResponseShapeError, diagnostic_url, exception_summary
 
 logger = logging.getLogger(__name__)
 # Match core's protocol ceiling while retaining the negotiated context for
@@ -194,12 +194,12 @@ def require_context_compose_lists(
     """
     missing = [key for key in _REQUIRED_COMPOSE_KEYS if key not in payload]
     if missing:
-        raise ValueError(
+        raise ResponseShapeError(
             f"{origin} (schema {schema}) is missing required key(s): {', '.join(missing)}"
         )
     for key in _REQUIRED_COMPOSE_KEYS:
         if not isinstance(payload[key], list):
-            raise ValueError(f"{origin} (schema {schema}) key {key!r} is not an array")
+            raise ResponseShapeError(f"{origin} (schema {schema}) key {key!r} is not an array")
     return payload["pinned"], payload["retrieved"]
 
 
@@ -211,11 +211,11 @@ def decode_context_compose_context(
 ) -> RemoteContextInfo:
     """Strictly decode the bounded portion of a schema-3 context object."""
     if not isinstance(raw, dict):
-        raise ValueError("context compose context must be an object")
+        raise ResponseShapeError("context compose context must be an object")
     before = raw.get("before", [])
     after = raw.get("after", [])
     if not isinstance(before, list) or not isinstance(after, list):
-        raise ValueError("context compose context windows must be arrays")
+        raise ResponseShapeError("context compose context windows must be arrays")
 
     limit = (
         _MAX_CONTEXT_WINDOW_CHUNKS
@@ -230,12 +230,12 @@ def decode_context_compose_context(
 
     def decode_chunk(item: Any) -> RemoteContextChunk:
         if not isinstance(item, dict):
-            raise ValueError("context compose adjacent chunk must be an object")
+            raise ResponseShapeError("context compose adjacent chunk must be an object")
         if not all(isinstance(item.get(field), str) for field in ("id", "content", "source")):
-            raise ValueError("context compose adjacent chunk has invalid shape")
+            raise ResponseShapeError("context compose adjacent chunk has invalid shape")
         namespace = item.get("namespace", "default")
         if not isinstance(namespace, str):
-            raise ValueError("context compose adjacent chunk namespace must be a string")
+            raise ResponseShapeError("context compose adjacent chunk namespace must be a string")
         return RemoteContextChunk(
             # Escaped, not refused, unlike the retrieved/pinned ids above: an
             # adjacent chunk's id is never exact-matched — the formatter reads
@@ -259,7 +259,7 @@ def decode_context_compose_context(
         or not isinstance(total_chunks, int)
         or total_chunks < 0
     ):
-        raise ValueError("context compose chunk positions must be non-negative integers")
+        raise ResponseShapeError("context compose chunk positions must be non-negative integers")
     return RemoteContextInfo(
         window_before=tuple(decode_chunk(item) for item in bounded_before),
         window_after=tuple(decode_chunk(item) for item in bounded_after),
@@ -784,25 +784,28 @@ class McpClientSearchAdapter:
                 return stdio_client(params)
 
     def _target_display(self) -> str:
-        """Loggable connection target — URL userinfo is redacted.
+        """Loggable connection target: the stdio command, or ``diagnostic_url``.
 
         ``ltm_mcp_url`` may carry ``user:password@`` credentials (basic-auth
-        proxies in front of a network LTM, #398), and this string goes to
-        INFO logs in ``start()`` and ``_reconnect()``. Only the display is
-        redacted; the transport itself receives the configured URL verbatim.
+        proxies in front of a network LTM, #398) or a token in its query, and
+        this string goes to INFO logs in ``start()`` and ``_reconnect()``.
+        ``diagnostic_url`` masks the userinfo and drops query and fragment
+        (#1082); stdio ``args`` are never shown. The transport itself receives
+        the configured values verbatim.
         """
         if self._config.ltm_mcp_transport == "stdio":
             return self._config.ltm_mcp_command
-        return redact_url_userinfo(self._config.ltm_mcp_url)
+        return diagnostic_url(self._config.ltm_mcp_url)
 
     def _scrub_exc(self, exc: BaseException) -> str:
-        """Render *exc* for logging with URL userinfo scrubbed.
+        """Render *exc* for logging as ``exception_summary``, never its message.
 
-        httpx exceptions embed the full request URL (credentials included),
-        so every log line in this module that interpolates an exception must
-        go through here rather than passing ``exc`` to the logger raw.
+        httpx exceptions embed the full request URL, query included, and the
+        server's errors can quote an argument or header back (#1082), so every
+        log line in this module that interpolates an exception goes through
+        here rather than passing ``exc`` to the logger raw.
         """
-        return redact_exception_text(str(exc), self._config.ltm_mcp_url)
+        return exception_summary(exc)
 
     async def _negotiate_format(self, session: ClientSession | None = None) -> None:
         """Negotiate additive core capabilities and the search result format.
@@ -1631,9 +1634,9 @@ class McpClientSearchAdapter:
         try:
             payload = _core_json_loads(self._result_text(result))
         except (json.JSONDecodeError, TypeError) as exc:
-            raise ValueError("core context_compose returned malformed JSON") from exc
+            raise ResponseShapeError("core context_compose returned malformed JSON") from exc
         if not isinstance(payload, dict):
-            raise ValueError("core context_compose result is not an object")
+            raise ResponseShapeError("core context_compose result is not an object")
         raw_pinned, raw_retrieved = require_context_compose_lists(
             payload,
             origin="core context_compose",
@@ -1651,7 +1654,7 @@ class McpClientSearchAdapter:
         pinned: list[RemoteSearchResult] = []
         for item in raw_pinned:
             if not isinstance(item, dict) or not isinstance(item.get("content"), str):
-                raise ValueError("core context_compose pinned item has invalid shape")
+                raise ResponseShapeError("core context_compose pinned item has invalid shape")
             if _has_unencodable_identity(item, "block_id", "id"):
                 logger.warning(
                     "Dropping a core context_compose pinned item whose id is not UTF-8-encodable"
@@ -1672,7 +1675,7 @@ class McpClientSearchAdapter:
         retrieved: list[RemoteSearchResult] = []
         for item in raw_retrieved:
             if not isinstance(item, dict) or not isinstance(item.get("content"), str):
-                raise ValueError("core context_compose retrieved item has invalid shape")
+                raise ResponseShapeError("core context_compose retrieved item has invalid shape")
             if _has_unencodable_identity(item, "id", "chunk_id"):
                 logger.warning(
                     "Dropping a core context_compose retrieved item whose id is not UTF-8-encodable"
@@ -1743,9 +1746,9 @@ class McpClientSearchAdapter:
         try:
             payload = _core_json_loads(self._result_text(result))
         except (json.JSONDecodeError, TypeError) as exc:
-            raise ValueError("core candidate_propose returned malformed JSON") from exc
+            raise ResponseShapeError("core candidate_propose returned malformed JSON") from exc
         if not isinstance(payload, dict):
-            raise ValueError("core candidate_propose result is not an object")
+            raise ResponseShapeError("core candidate_propose result is not an object")
         return payload
 
     async def increment_access(self, chunk_ids: list[str], *, trace_id: str | None = None) -> None:

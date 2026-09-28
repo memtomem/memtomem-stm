@@ -121,13 +121,37 @@ def http_status_code(exc: BaseException) -> int | None:
     Only those two classes are trusted: another exception's ``response``
     attribute could carry anything into the rendered error.
     """
-    import httpx
-    import httpx2
+    trusted: list[type[BaseException]] = []
+    # Called from ``except`` blocks: an unimportable client library must not
+    # turn a handled failure into a new one.
+    try:
+        import httpx
 
-    if not isinstance(exc, httpx.HTTPStatusError | httpx2.HTTPStatusError):
+        trusted.append(httpx.HTTPStatusError)
+    except ImportError:
+        pass
+    try:
+        import httpx2
+
+        trusted.append(httpx2.HTTPStatusError)
+    except ImportError:
+        pass
+    if not isinstance(exc, tuple(trusted)):
         return None
-    code = exc.response.status_code
+    code = exc.response.status_code  # type: ignore[attr-defined]
     return code if type(code) is int else None
+
+
+class ResponseShapeError(ValueError):
+    """A reply failed STM's own shape check, described by STM.
+
+    Raised where STM validates what a core, embedding provider or LLM sent back
+    and writes the reason itself: which key is missing, what type a field has,
+    a count or a dimension. The message never quotes STM's request, so
+    ``exception_summary`` shows it — it is the only way an operator learns which
+    side drifted (#1082). Anything that would interpolate request data, a URL
+    or an upstream's free text must raise something else.
+    """
 
 
 # The JSON-RPC 2.0 reserved codes. Any other code is upstream-chosen and could
@@ -148,17 +172,24 @@ def exception_summary(exc: BaseException) -> str:
     Never the exception's message: servers and SDKs quote the request URL
     (query included), an argument, or part of a header back in it, in forms no
     value list can anticipate (#1079, #1082). What is left is the root cause's
-    type name, the status code of an HTTP error, a JSON-RPC error's code when
+    type name, the status code of an HTTP error, a ``ResponseShapeError``'s
+    STM-written message, a JSON-RPC error's code when
     it is one of the reserved ones, and — for a pydantic ``ValidationError`` —
     its error types. Not its locations: a location can be a key of the data that
     failed, and nothing marks which parts the schema owns. Not a JSON-RPC
     error's message either: an upstream can quote STM's request in it.
     """
-    from mcp.shared.exceptions import MCPError
     from pydantic import ValidationError
 
+    try:
+        from mcp.shared.exceptions import MCPError
+    except ImportError:  # same reason as in ``http_status_code``
+        MCPError = None  # type: ignore[assignment,misc]
+
     root = root_cause_exc(exc)
-    if isinstance(root, MCPError):
+    if isinstance(root, ResponseShapeError):
+        return f"{type(root).__name__}: {root}"
+    if MCPError is not None and isinstance(root, MCPError):
         reserved = _JSONRPC_STANDARD_ERRORS.get(root.error.code)
         if reserved is not None:
             return f"{type(root).__name__} {reserved}"

@@ -239,7 +239,9 @@ class TestTargetDisplayRedaction:
         joined = " ".join(r.getMessage() for r in caplog.records)
         assert "surfacing disabled" in joined
         assert "s3cret" not in joined
-        assert "***@ltm.example" in joined
+        # The exception renders as its type; the URL does not appear (#1082).
+        assert "ltm.example" not in joined
+        assert "surfacing disabled: RuntimeError" in joined
 
 
 class TestReconnectRetrySuccess:

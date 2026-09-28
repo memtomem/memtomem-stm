@@ -74,6 +74,21 @@ changes inline only. See the deprecation policy in
   overall deadline, lock timeout, policy denial, unknown server — keep their
   message. An upstream tool's `isError` result is unchanged and still reaches the
   client as the upstream wrote it.
+- **Runtime log lines name the exception type, not its message** (#1082). Several
+  warnings used to print the exception's message verbatim. This covers the LTM
+  client's connect, search and reconnect lines, the "Surfacing degraded", webhook,
+  LLM compression and extraction, auto-index, fact indexing and embedding-fallback
+  warnings, background task failures, and tool-graph consult failures. They now
+  read e.g. `RuntimeError` or `HTTP 401 (HTTPStatusError)`. The
+  `ToolgraphStartupError` raised when a tool-graph failure hits a `fail_start`
+  knob names the exception type the same way. STM's own description of a malformed
+  core or embedding-provider reply keeps its text, e.g.
+  `ResponseShapeError: core context_compose (schema 3) is missing required key(s): pinned`,
+  because it names which side drifted and quotes no request data. Configured URLs in log lines (the LTM target, the
+  LLM destination in the unscanned-compression warning) drop their query string
+  and fragment, and the LLM destination masks userinfo, which it used to print
+  raw. Tracebacks logged with these lines are unchanged (#1086). Config-load
+  validation messages (#1087) and policy-bundle errors keep their text.
 - An empty tool filter now matches no tools in `mms tune` and
   `stm_tuning_recommendations`; omit the filter to analyze all tools. In particular,
   `mms tune --apply --yes --tool ""` no longer writes overrides for other tools (#1036).
