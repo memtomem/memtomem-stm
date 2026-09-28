@@ -545,19 +545,23 @@ def test_status_code_is_only_read_from_http_status_errors():
     [
         ("http://127.0.0.1:9/mcp?token=cnryQ#cnryF", "http://127.0.0.1:9/mcp"),
         ("https://u:cnryPw@host.test/mcp?k=v", "https://***@host.test/mcp"),
-        ("http://host.test/users/@me", "http://host.test/users/@me"),
-        ("http://host.test/mcp?email=a@b", "http://host.test/mcp"),
+        # An '@' outside the netloc cannot be told apart from a split
+        # userinfo, so even a legitimate one fails closed.
+        ("http://host.test/users/@me", "<unparseable url>"),
+        ("http://host.test/mcp?email=a@b", "<unparseable url>"),
+        ("http://alice/cnryPw@host.test/mcp", "<unparseable url>"),
+        ("http://alice/cnryPw?x@host.test/mcp", "<unparseable url>"),
         # ``?``/``#`` split the userinfo: the parser reads ``alice:cnryPw`` as
         # the authority, so the only safe rendering is none at all.
         ("http://alice:cnryPw?x@host.test/mcp", "<unparseable url>"),
         ("http://alice:cnryPw#x@host.test/mcp", "<unparseable url>"),
-        # Without a ``:`` the port reads fine, so only the authority check
+        # Without a ``:`` the port reads fine, so only the ``@`` count
         # catches a token-only userinfo split by ``?``.
         ("http://cnryTok?x@host.test/mcp", "<unparseable url>"),
-        # A '/' after the '?'/'#' does not end the ambiguous authority.
+        # A '/' after the '?'/'#' changes nothing: the '@' is still outside.
         ("http://cnryTok?x/y@host.test/mcp", "<unparseable url>"),
         ("http://cnryTok#x/y@host.test/mcp", "<unparseable url>"),
-        # Ambiguous without a path: fails closed.
+        # Without a path, likewise.
         ("http://host.test?email=a@b", "<unparseable url>"),
         # An encoded ``@`` leaves a netloc whose port cannot be read ...
         ("http://alice:cnryPw%40host.test/mcp", "<unparseable url>"),
@@ -664,6 +668,7 @@ def test_ollama_probe_failure_is_rendered_by_type(monkeypatch):
         ("http://alice:cnryPw1%40ollama.test:11434", "http://alice:cnryPw2%40ollama.test:11434"),
         ("http://cnryPw1%40ollama.test", "http://cnryPw2%40ollama.test"),
         ("http://cnryPw1?x/y@ollama.test", "http://cnryPw2?x/y@ollama.test"),
+        ("http://alice/cnryPw1@ollama.test", "http://alice/cnryPw2@ollama.test"),
         ("http://ollama.test:11434?token=cnryQ1", "http://ollama.test:11434?token=cnryQ2"),
     ],
 )

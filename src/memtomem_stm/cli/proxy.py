@@ -8430,14 +8430,14 @@ def _diagnostic_url(url: str) -> str:
     """A configured URL as ``health``/``doctor`` show it: scheme, host, path.
 
     Userinfo becomes ``***@`` (``redact_url_userinfo``), and the query and
-    fragment are dropped, since tokens are passed there too (#1079). Anything
-    the parser may have split wrongly fails closed as ``<unparseable url>``: a
-    ``?`` or ``#`` inside the userinfo (``http://u:p?x@host``) makes it read
-    ``u:p`` as the authority, and an encoded ``@`` (``u:p%40host``) leaves a
-    netloc whose port cannot be read, and any encoded ``@`` in the netloc is
-    treated as hiding one. An ``@`` before the first ``/`` that the
-    parsed netloc lacks is treated the same way, so the no-path form
-    ``http://host?email=a@b`` fails closed too.
+    fragment are dropped, since tokens are passed there too (#1079). Any
+    ``@`` the parsed netloc does not hold fails closed as
+    ``<unparseable url>``: a ``?``, ``#`` or ``/`` inside the userinfo
+    (``http://u:p?x@host``, ``http://u/p@host``) makes the parser read part of
+    it as the host or path, and no rule on the URL's shape can tell such a
+    value from a legitimate ``@`` in a path or query, which fails closed too.
+    An encoded ``@`` in the netloc and an unreadable port are treated the same
+    way.
     """
     if not url:
         return url
@@ -8446,19 +8446,8 @@ def _diagnostic_url(url: str) -> str:
         parts.port
     except ValueError:
         return "<unparseable url>"
-    if "%40" in parts.netloc.lower():
-        # An encoded '@' in the authority: whatever precedes it may be a
-        # credential the parser took for a host name.
+    if url.count("@") > parts.netloc.count("@") or "%40" in parts.netloc.lower():
         return "<unparseable url>"
-    if parts.netloc and "://" in url:
-        rest = url.split("://", 1)[1]
-        head = rest.split("/", 1)[0]
-        # A '?' or '#' before the first '/' may have cut the userinfo short,
-        # so everything after it is still ambiguous authority text
-        # (``http://tok?x/y@host`` parses ``tok`` as the host).
-        region = rest if "?" in head or "#" in head else head
-        if "@" in region and "@" not in parts.netloc:
-            return "<unparseable url>"
     shown = redact_url_userinfo(url)
     if shown == "<unparseable url>":
         return shown

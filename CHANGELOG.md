@@ -48,7 +48,8 @@ changes inline only. See the deprecation policy in
   quote the request URL, an argument or part of a header back. Run the server
   command or reach the endpoint directly for the underlying message. In
   `health`/`doctor`, URLs drop their query string and fragment, and a URL the
-  parser may have split wrongly shows as `<unparseable url>`. Doctor's
+  parser may have split wrongly shows as `<unparseable url>`, as does any URL with an `@`
+  in its path or query. Doctor's
   `ollama_endpoint:<digest>` ID changes for a base URL with a query string or
   fragment: the digest no longer covers them, and the ID gains the use-site
   suffix that credentialed endpoints carry.
