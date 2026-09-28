@@ -5354,7 +5354,7 @@ class TestSurfacingLtmOutcomeDispatch:
 
     async def test_unavailable_warning_redacts_url_credentials(self, caplog):
         """The one-time unreachable-LTM WARNING renders a network target
-        through redact_url_userinfo — a basic-auth ``ltm_mcp_url`` must not
+        through diagnostic_url — a basic-auth ``ltm_mcp_url`` must not
         leak credentials into operator logs."""
         from memtomem_stm.surfacing.observability import SurfacingObservability
 

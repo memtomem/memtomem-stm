@@ -15,6 +15,7 @@ import threading
 from typing import Any, Protocol
 
 from memtomem_stm.utils.digest import framed_digest
+from memtomem_stm.utils.redact import ResponseShapeError, exception_summary
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +164,13 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+# Top-level keys the supported embedding APIs (Ollama, OpenAI) are documented
+# to return, successful or not. Only these are named in a shape error.
+_KNOWN_RESPONSE_KEYS = frozenset(
+    {"data", "done", "embedding", "embeddings", "error", "message", "model", "object", "usage"}
+)
+
+
 def _payload_list(payload: object, *, key: str, provider: str) -> list[Any]:
     """Return ``payload[key]`` as a list, or raise saying what was wrong.
 
@@ -179,15 +187,25 @@ def _payload_list(payload: object, *, key: str, provider: str) -> list[Any]:
     turn a failed request into a silent all-zero ranking.
     """
     if not isinstance(payload, dict):
-        raise ValueError(
+        raise ResponseShapeError(
             f"{provider} embedding response is not a JSON object (got {type(payload).__name__})"
         )
     if key not in payload:
-        present = ", ".join(sorted(str(k) for k in payload)) or "(no keys)"
-        raise ValueError(f"{provider} embedding response has no '{key}' field; it holds: {present}")
+        # Say what the body DID hold — that separates "the provider errored"
+        # from "we parsed it wrong" — but only by names STM knows. Any other
+        # key is the provider's own text, and this message reaches the log
+        # verbatim (#1082), so it is counted, not shown.
+        known = sorted(str(k) for k in payload if k in _KNOWN_RESPONSE_KEYS)
+        other = len(payload) - len(known)
+        held = ", ".join(known) or "(no known keys)"
+        if other:
+            held += f" (+{other} other)"
+        raise ResponseShapeError(
+            f"{provider} embedding response has no '{key}' field; it holds: {held}"
+        )
     value = payload[key]
     if not isinstance(value, list):
-        raise ValueError(
+        raise ResponseShapeError(
             f"{provider} embedding response field '{key}' is {type(value).__name__}, not a list"
         )
     return value
@@ -207,17 +225,19 @@ def _require_vector(value: object, *, provider: str, where: str) -> list[float]:
     never a component of an embedding.
     """
     if not isinstance(value, list):
-        raise ValueError(
+        raise ResponseShapeError(
             f"{provider} embedding response: '{where}' is {type(value).__name__}, not a list"
         )
     for i, component in enumerate(value):
         if isinstance(component, bool) or not isinstance(component, (int, float)):
-            raise ValueError(
+            raise ResponseShapeError(
                 f"{provider} embedding response: '{where}[{i}]' is "
                 f"{type(component).__name__}, not a number"
             )
         if not math.isfinite(component):
-            raise ValueError(f"{provider} embedding response: '{where}[{i}]' is {component}")
+            raise ResponseShapeError(
+                f"{provider} embedding response: '{where}[{i}]' is {component}"
+            )
     return value
 
 
@@ -236,9 +256,9 @@ def _require_uniform_dimensions(vectors: list[list[float]], *, provider: str) ->
     """
     dimensions = {len(vector) for vector in vectors}
     if 0 in dimensions:
-        raise ValueError(f"{provider} embedding response contains an empty vector")
+        raise ResponseShapeError(f"{provider} embedding response contains an empty vector")
     if len(dimensions) > 1:
-        raise ValueError(
+        raise ResponseShapeError(
             f"{provider} embeddings have differing dimensions ({sorted(dimensions)}); "
             "a similarity across them is silently wrong"
         )
@@ -320,10 +340,13 @@ class EmbeddingScorer:
             # Expected fallback path (Ollama offline, network hiccup, timeout):
             # we already have a working BM25 scorer and fallback_count surfaces
             # the rate. Full stack on every hit buries real errors in log-
-            # aggregation pipelines, so log the exception message only.
+            # aggregation pipelines, so log the exception's type only — its
+            # message quotes the endpoint URL, query included (#1082).
             with self._fallback_lock:
                 self.fallback_count += 1
-            logger.warning("EmbeddingScorer failed, falling back to BM25: %s", exc)
+            logger.warning(
+                "EmbeddingScorer failed, falling back to BM25: %s", exception_summary(exc)
+            )
             return self._fallback.score_sections(query, sections)
 
     def _score_via_embedding(self, query: str, sections: list[tuple[str, str]]) -> list[float]:
@@ -355,9 +378,9 @@ class EmbeddingScorer:
                 return
             self._cache.clear()
             self._dimension = None
-        raise ValueError(
+        raise ResponseShapeError(
             f"{self._provider} embedding dimension changed from {established} to "
-            f"{dimension} for model {self._model!r}; the cached vectors came from a "
+            f"{dimension} for the configured model; the cached vectors came from a "
             "different model and have been discarded"
         )
 
@@ -441,7 +464,7 @@ class EmbeddingScorer:
         """
         embeddings = self._embed_batch(texts)
         if len(embeddings) != len(texts):
-            raise ValueError(
+            raise ResponseShapeError(
                 f"embedding provider returned {len(embeddings)} vectors for {len(texts)} inputs"
             )
         # The count is not the whole contract. Two batch-level shapes passed it
@@ -513,11 +536,11 @@ class EmbeddingScorer:
             # state it completely.
             indices = [entry["index"] for entry in data]
             if not all(isinstance(i, int) and not isinstance(i, bool) for i in indices):
-                raise ValueError(
+                raise ResponseShapeError(
                     "openai embedding response: every 'data[].index' must be an integer"
                 )
             if sorted(indices) != list(range(len(data))):
-                raise ValueError(
+                raise ResponseShapeError(
                     f"openai embedding response: 'data[].index' is {sorted(indices)}, "
                     f"not a permutation of 0..{len(data) - 1}"
                 )
@@ -525,7 +548,9 @@ class EmbeddingScorer:
         vectors: list[list[float]] = []
         for i, item in enumerate(data):
             if not isinstance(item, dict) or "embedding" not in item:
-                raise ValueError(f"openai embedding response: 'data[{i}].embedding' is missing")
+                raise ResponseShapeError(
+                    f"openai embedding response: 'data[{i}].embedding' is missing"
+                )
             vectors.append(
                 _require_vector(item["embedding"], provider="openai", where=f"data[{i}].embedding")
             )

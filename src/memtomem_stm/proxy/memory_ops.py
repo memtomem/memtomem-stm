@@ -239,7 +239,7 @@ async def auto_index_response(
             "Auto-index failed for %s/%s: %s",
             server,
             tool,
-            exc,
+            exception_summary(exc),
             exc_info=True,
         )
         chunks = 0
@@ -364,7 +364,7 @@ async def extract_and_store(
                 indexed_count += 1
                 observability.record_outcome(tool, "stored")
             except Exception as exc:
-                logger.warning("Fact indexing failed: %s", exc, exc_info=True)
+                logger.warning("Fact indexing failed: %s", exception_summary(exc), exc_info=True)
                 observability.record_outcome(tool, "error")
 
         if indexed_count:

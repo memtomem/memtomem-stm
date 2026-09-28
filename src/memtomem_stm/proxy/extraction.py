@@ -28,6 +28,7 @@ from memtomem_stm.utils.anyio_shutdown import (
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 from memtomem_stm.utils.json_out import scrub_lone_surrogates
 from memtomem_stm.utils.numeric import safe_float
+from memtomem_stm.utils.redact import exception_summary
 
 logger = logging.getLogger(__name__)
 
@@ -364,11 +365,10 @@ class FactExtractor:
         except Exception as exc:
             self._cb.record_failure()
             logger.warning(
-                "LLM extraction failed (%s) for %s/%s, falling back to heuristic: %s",
-                type(exc).__name__,
+                "LLM extraction failed for %s/%s, falling back to heuristic: %s",
                 server,
                 tool,
-                exc,
+                exception_summary(exc),
             )
             return _extract_heuristic(text, max_facts=self._cfg.max_facts)
         finally:

@@ -281,7 +281,8 @@ class TestBackgroundAutoIndex:
                 if "Background auto_index task failed for srv/some_tool" in r.getMessage()
             ]
             assert matching, "escaped background exception was not logged"
-            assert "escaped past inner handler" in matching[0].getMessage()
+            # The exception renders as its type, never its message (#1082).
+            assert matching[0].getMessage().endswith(": RuntimeError")
             assert matching[0].exc_info is not None
         finally:
             await mgr.stop()

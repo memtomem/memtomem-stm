@@ -66,7 +66,7 @@ from memtomem_stm.surfacing.store_io import (
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 from memtomem_stm.utils.digest import framed_digest
 from memtomem_stm.utils.keyed_locks import KeyedLocks
-from memtomem_stm.utils.redact import redact_exception_text, redact_url_userinfo
+from memtomem_stm.utils.redact import diagnostic_url, exception_summary
 
 logger = logging.getLogger(__name__)
 
@@ -1173,7 +1173,9 @@ class SurfacingEngine:
             return
         exc = task.exception()
         if exc is not None:
-            logger.debug("Abandoned surfacing operation failed while unwinding: %s", exc)
+            logger.debug(
+                "Abandoned surfacing operation failed while unwinding: %s", exception_summary(exc)
+            )
 
     def _effective_timeout(self, deadline_monotonic: float | None) -> float:
         """This call's LTM window: the configured ceiling, lowered to what is
@@ -2629,7 +2631,7 @@ class SurfacingEngine:
                             "failures counted as 'ltm_call_failed' in "
                             "stm_admin(action='surfacing_stats').",
                             capabilities.context_compose_schema,
-                            redact_exception_text(str(exc), self._config.ltm_mcp_url or ""),
+                            exception_summary(exc),
                         )
                         self._warned_compose_failed = True
                     compose_failed = True
@@ -2692,7 +2694,7 @@ class SurfacingEngine:
                     ltm_transport = self._config.ltm_mcp_transport
                     # Display-only: a network URL may carry basic-auth
                     # credentials that must not reach the WARNING line.
-                    ltm_target = redact_url_userinfo(self._config.ltm_mcp_url)
+                    ltm_target = diagnostic_url(self._config.ltm_mcp_url)
                 logger.warning(
                     "Surfacing skipped: LTM MCP %s target %r is not reachable "
                     "(outcome=%s). Subsequent skips counted as 'ltm_unavailable' "
@@ -3049,7 +3051,7 @@ class SurfacingEngine:
             return
         exc = task.exception()
         if exc is not None:
-            logger.warning("Webhook fire-and-forget task failed: %s", exc)
+            logger.warning("Webhook fire-and-forget task failed: %s", exception_summary(exc))
 
     async def stop(self) -> None:
         """Cancel and drain pending background tasks (webhooks), then give

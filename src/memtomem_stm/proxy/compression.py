@@ -37,6 +37,7 @@ from memtomem_stm.utils.anyio_shutdown import (
 )
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker as _CircuitBreaker
 from memtomem_stm.utils.json_out import escape_lone_surrogates
+from memtomem_stm.utils.redact import exception_summary
 
 logger = logging.getLogger(__name__)
 
@@ -2491,10 +2492,9 @@ class LLMCompressor:
         except Exception as exc:
             self._cb.failure()
             logger.warning(
-                "LLM compression failed (strategy=llm/%s, %s), falling back to truncate: %s",
+                "LLM compression failed (strategy=llm/%s), falling back to truncate: %s",
                 self._cfg.provider.value,
-                type(exc).__name__,
-                exc,
+                exception_summary(exc),
             )
             return LLMCompressionResult(_plain_truncate(text, max_chars=max_chars), "llm_error")
         finally:
