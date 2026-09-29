@@ -77,12 +77,19 @@ are metrics-only by design.
 
 ## Recovering from a broken config file
 
-`~/.memtomem/stm_proxy.json` is plain JSON, and hand edits break it in three
-ways with sharply different symptoms — the third one is silent:
+`~/.memtomem/stm_proxy.json` is plain JSON, and hand edits break it in four
+ways with sharply different symptoms — the fourth one is silent:
 
 - **Invalid JSON** (truncated file, stray comma): `status`, `list`, and most
   commands fail with the parse position; `doctor` FAILs at the `config JSON`
   check. Nothing else is damaged — fix or restore the file.
+- **Unreadable or not UTF-8** (wrong permissions, a file saved in another
+  encoding): `status` and `list` exit with the exception type only —
+  `Failed to read <path>: PermissionError` or
+  `Failed to parse <path>: UnicodeDecodeError`; `doctor` FAILs at `config JSON`
+  with `cannot read file: PermissionError` or `not valid UTF-8`. Only
+  `mms config validate` prints the full error text, including the byte offset
+  of a bad encoding.
 - **Valid JSON, invalid schema** (a wrong *type* — `"enabled": "yes"`): the
   running server silently falls back to env/defaults, and `status`, `list`,
   and `health` print a `fails validation` warning.
@@ -96,8 +103,10 @@ Recovery order:
 
 1. `mms config validate` — lists *every* error, one line each (line/column for
    JSON errors, `key: message` — dotted for nested sections — for schema
-   errors), plus every unknown key. This is the only command that reports
-   them all; `status` and `list` name just the first.
+   errors), plus every unknown key. It is the only command that shows each
+   schema error's message and reports unknown keys; `status` and `list` also
+   count every schema error, but name each by location and error type only
+   (`2 validation error(s): upstream_servers.a.prefix (string_type); …`).
 2. Fix the named line, or restore a backup. Backups that may already exist:
    - `stm_proxy.json.bak-<UTC>` next to the config — written by every
      `mms tune --apply`. This is the one you can restore from directly

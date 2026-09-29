@@ -20,8 +20,8 @@ Run this from a Git project root. Project-local memory is gitignored and does
 not leave the current checkout.
 
 ```bash
-uv tool install 'memtomem[all]>=0.4,<0.6'
-uv tool install 'memtomem-stm>=0.2,<0.4'
+uv tool install 'memtomem[all]>=0.4,<0.7'
+uv tool install 'memtomem-stm>=0.2,<0.7'
 
 mm status
 mm mem init
@@ -35,15 +35,17 @@ mm pinned compose "blue-green rollback checklist"
 ```
 
 Both pins sit on the `mcp` 2.x SDK: every core and memtomem-stm release the
-ranges above admit — core 0.4.0 and 0.5.0, memtomem-stm 0.2.x and 0.3.x —
-declares `mcp[cli]>=2,<3` itself, so neither needs a `--with` constraint the
-way the 0.3.x/0.1.x stack did. They are still two separate `uv tool install`
+ranges above admit declares `mcp[cli]>=2,<3` itself, so neither needs a
+`--with` constraint the way the 0.3.x/0.1.x stack did. The ranges are what the
+recipe admits, not a claim that every release in them was run: this walkthrough
+was exercised with core 0.4.0 and 0.5.0 alongside memtomem-stm 0.2.x and
+0.3.x, and again with core 0.6.5 and memtomem-stm 0.6.1. They are still two separate `uv tool install`
 environments — the SDK major matters per environment, not across the MCP
 connection between them. Upgrading an existing tool from the older stack takes
 a reinstall:
 
 ```bash
-uv tool install --reinstall 'memtomem[all]>=0.4,<0.6'
+uv tool install --reinstall 'memtomem[all]>=0.4,<0.7'
 ```
 
 Do not run `mm init` as part of this scenario: it rewrites the user-level Core
@@ -87,15 +89,20 @@ mm index .memtomem/memories.local/resume-demo.md --namespace resume-demo --force
 
 These are environment settings, not keys in `stm_proxy.json`. The zero score
 floor and one-token query threshold are deterministic demo settings; restore
-your normal thresholds afterwards.
+your normal thresholds afterwards. The larger preview cap is what makes the
+adjacent context visible: the matched chunk is rendered first, and neighbouring
+snippets only fill what is left of `preview_max_chars`. Each section of the demo
+note is longer than the default cap of 300 characters, so with the default the
+block shows the match alone.
 
 ```bash
 export MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND=uvx
-export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS='["--from","memtomem>=0.4,<0.6","memtomem-server"]'
+export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS='["--from","memtomem>=0.4,<0.7","memtomem-server"]'
 export MEMTOMEM_STM_SURFACING__DEFAULT_NAMESPACE=resume-demo
 export MEMTOMEM_STM_SURFACING__CONTEXT_WINDOW_SIZE=1
 export MEMTOMEM_STM_SURFACING__MIN_SCORE=0
 export MEMTOMEM_STM_SURFACING__MIN_QUERY_TOKENS=1
+export MEMTOMEM_STM_SURFACING__PREVIEW_MAX_CHARS=1200
 
 mms add resume_fs \
   --command npx \
@@ -209,6 +216,7 @@ unset MEMTOMEM_STM_SURFACING__DEFAULT_NAMESPACE
 unset MEMTOMEM_STM_SURFACING__CONTEXT_WINDOW_SIZE
 unset MEMTOMEM_STM_SURFACING__MIN_SCORE
 unset MEMTOMEM_STM_SURFACING__MIN_QUERY_TOKENS
+unset MEMTOMEM_STM_SURFACING__PREVIEW_MAX_CHARS
 unset MEMTOMEM_STM_FORMATION__ENABLED
 ```
 

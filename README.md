@@ -72,7 +72,7 @@ Core 0.3.8 is the tested legacy baseline, 0.3.9 first advertises schema 2,
 Core 0.3.10 first advertises schema 3, and Core 0.3.12 first advertises schema
 4. Runtime behavior always follows the connected server's advertised
 capability, not its package version. The released-Core compatibility smoke also
-covers Core 0.3.13, 0.3.14, 0.4.0 and the current Core 0.5.0 release.
+covers Core 0.3.13, 0.3.14, 0.4.0, 0.5.0 and the current Core 0.6.5 release.
 
 ## Upgrade
 
@@ -203,6 +203,9 @@ selected stdio definitions into the proxy with provenance and conflict checks. S
 | [Use cases](https://github.com/memtomem/memtomem-stm/blob/main/docs/use-cases.md) | Reproducible scenarios and honest measurement boundaries |
 | [Reviewed project resume](https://github.com/memtomem/memtomem-stm/blob/main/docs/guides/reviewed-memory-resume.md) | Project-local Pinned Context, visible adjacent context, and optional review-first memory |
 | [CLI](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) | Command-family and MCP-tool reference map |
+| [MCP tools](https://github.com/memtomem/memtomem-stm/blob/main/docs/reference/mcp-tools.md) | Default, operator, and review-first tool arguments and metadata |
+| [Proxy JSON](https://github.com/memtomem/memtomem-stm/blob/main/docs/reference/proxy-config.md) | File-backed upstream, compression, and cache configuration |
+| [Selection evaluation](https://github.com/memtomem/memtomem-stm/blob/main/docs/selection-evaluation.md) | Offline replay of selection telemetry against a labelled corpus |
 | [Environment variables](https://github.com/memtomem/memtomem-stm/blob/main/docs/reference/environment-variables.md) | Complete startup/runtime variable inventory and precedence |
 | [Architecture decisions](https://github.com/memtomem/memtomem-stm/blob/main/docs/adr/README.md) | Accepted contracts, status, and deferral gates |
 
@@ -210,7 +213,17 @@ STM advertises five model-facing MCP tools by default. Eight observability and
 admin actions (`proxy_stats`, `surfacing_stats`, etc.) sit behind one
 `stm_admin` tool, which is advertised only when
 `MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS=true` is set. Eager-loading
-clients that turn it on pay for one tool schema, not eight.
+clients that turn it on pay for one tool schema, not eight. A second opt-in
+tool, `stm_memory_propose`, appears only with
+`MEMTOMEM_STM_FORMATION__ENABLED=true` and submits review-first candidates.
+
+**Command map.** Setup: `mms init`, `mms add`, `mms remove`, `mms register`,
+`mms import`, `mms eject`, `mms prune`. Inspection: `mms status`, `mms list`,
+`mms health`, `mms doctor`, `mms config`, `mms stats`, `mms version`.
+Tuning and runtime: `mms tune`, `mms surfacing`, `mms daemon`, `mms hook`.
+Projects and hosts: `mms project`, `mms host`. Policy and telemetry:
+`mms gateway`, `mms selection`. Each is documented in the
+[CLI reference](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md).
 
 ## Compatibility & deprecation policy
 

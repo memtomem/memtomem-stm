@@ -81,7 +81,7 @@ When set to `true`, advertises the `stm_admin` tool, which dispatches STM's
 eight observability / admin actions (`proxy_stats`, `proxy_health`,
 `proxy_cache_clear`, `surfacing_stats`, `selection_stats`,
 `compression_stats`, `progressive_stats`, `tuning_recommendations`) behind
-one schema — see [MCP Tools](cli.md#mcp-tools-5-default--1-opt-in--proxied).
+one schema — see [MCP Tools](cli.md#mcp-tools-5-default--2-opt-in--proxied).
 When unset or `false`, `stm_admin` is not registered with the MCP server, so
 eager-loading clients (e.g. OpenAI Codex CLI) pay nothing for it.  The five model-facing tools
 (`stm_proxy_describe_tool`, `stm_proxy_read_more`, `stm_proxy_select_chunks`,

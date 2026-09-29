@@ -81,9 +81,9 @@ windows retain the original request budget.
 
 Core 0.3.8 is the tested legacy baseline, 0.3.9 carries schema 2, and 0.3.10 is
 the first release to carry schema 3. Core 0.3.12 is the first release to carry
-schema 4, and the released-Core smoke also covers Core 0.3.13, 0.3.14, 0.4.0
-and the current Core 0.5.0 release, each of which still advertises schema 4. The intermediate
-schema 1 contract was never included in a tagged PyPI release, although
+schema 4, and the released-Core smoke also covers Core 0.3.13, 0.3.14, 0.4.0,
+0.5.0 and the current Core 0.6.5 release, each of which still advertises
+schema 4. The intermediate schema 1 contract was never included in a tagged PyPI release, although
 source-installed builds may exist. Capability negotiation, not these version
 labels, controls runtime behavior; a Core that does not advertise schema 4
 keeps STM on the schema 3-or-older path.
@@ -618,7 +618,7 @@ The arm is fixed before the event write, so it holds however the write ends: if 
 
 #### Trial extractor
 
-Whether a withheld block changed what the agent did next can only be read from the host's transcripts, and Claude Code deletes those after `cleanupPeriodDays` (default 30). `scripts/stm_trial.py` (in the repository, not the package) copies what a trial analysis needs into `~/.memtomem/stm_trial.db` (mode `0600`) while the transcripts still exist. It reads `~/.claude/projects` and `stm_feedback.db` and never writes to either. Every identifier, path and 4-gram it stores is keyed with the HMAC key in `stm_feedback.db`, which it does not copy (timestamps, counts, arms and the header digest are stored as they are): the transcript's tool calls with their order, timestamps and the hashed paths they touched; hashed word 4-grams of the agent's own output and of every hook-injected context; every drawn event with its memory rows and drawn opportunity rows.
+Whether a withheld block changed what the agent did next can only be read from the host's transcripts, and Claude Code deletes those after `cleanupPeriodDays` (default 30). `scripts/stm_trial.py` (in the repository, not the package) copies what a trial analysis needs into `~/.memtomem/stm_trial.db` (mode `0600`) while the transcripts still exist. It reads `~/.claude/projects`, `stm_feedback.db` and the `cleanupPeriodDays` value in `~/.claude/settings.json`, and never writes to any of them. Every identifier, path and 4-gram it stores is keyed with the HMAC key in `stm_feedback.db`, which it does not copy (timestamps, counts, arms and the header digest are stored as they are): the transcript's tool calls with their order, timestamps and the hashed paths they touched; hashed word 4-grams of the agent's own output and of every hook-injected context; every drawn event with its memory rows and drawn opportunity rows.
 
 Run it daily from the repository checkout, for example with cron:
 
@@ -630,6 +630,11 @@ Run it daily from the repository checkout, for example with cron:
 - A missing transcript directory is refused rather than recorded as an empty run. The first run pins the key's fingerprint. Later runs refuse to run against a different key.
 - Keep `holdout_rate` at `0.0` for a burn-in of at least 7 days and 500 events, then run `--freeze --holdout-rate R --target N` once. Only hook-path events that carry both host ids count toward the 500 and the stoplist, since only those can ever be drawn. It writes the trial record (the frozen snippet stoplist, `R` and `N`). It refuses while any event already has an arm, when no transcript has been extracted yet, and when the burn-in has outlived `stats_retention_days`. Set `holdout_rate` to `R` only after the freeze.
 - `--purge --yes` deletes the trial database once the analysis is done. Without `--yes` it only lists the files.
+- Every path has an override: `--trial-db` (default `~/.memtomem/stm_trial.db`), `--feedback-db` (default `~/.memtomem/stm_feedback.db`), `--projects-dir` (default `~/.claude/projects`) and `--claude-settings` (default `~/.claude/settings.json`). `--stats-retention-days` overrides the retention an extraction run records, and `--freeze` checks the burn-in against the shortest value any run recorded; without the flag a run reads the effective STM `surfacing.stats_retention_days` (normally 90), and falls back to 90 with a warning when the local STM configuration cannot be read.
+
+#### Outcome resolution
+
+Turning the extracted rows into trial outcomes is a separate library step, not something the extractor runs. `memtomem_stm.surfacing.trial.resolve` is a pure function, with no I/O, database or clock, that returns one outcome per eligible surfaced memory of every event with a drawn arm: did the agent open the memory's file soon after (Y1), reuse its text (Y2), see it again in a later block (re-exposure), and was the block delivered at all. The script's `load_resolve_inputs` only decodes the trial database into `resolve`'s inputs; neither writes the outcomes anywhere. The windows and matching rules are documented in the module docstring.
 
 ## Feedback & Auto-Tuning
 
@@ -717,8 +722,8 @@ The effective cap is `min(auto_tune_score_ceiling, max(cap, min_score))`, so a
 top-level `min_score` above the cap is kept. Each search filters with the tuned value
 capped at its own batch's cap. A raise stops at the cap and never lowers the stored
 value, and a lower steps down from the value the search applied. The stored value is
-never rewritten to a cap, so `stm_surfacing_stats` can show a stored value above the
-one a search applies. The adapter stamps the `2/61` baseline when a session has no
+never rewritten to a cap, so `stm_admin(action="surfacing_stats")` can show a stored
+value above the one a search applies. The adapter stamps the `2/61` baseline when a session has no
 usable `runtime_profile`, so a Core with non-default fusion weights and no profile is
 capped at the baseline, the same assumption the default `min_score` makes.
 

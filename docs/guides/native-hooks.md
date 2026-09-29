@@ -44,7 +44,8 @@ mms hook install --host claude --inherit-runtime-env --apply
 
 Reinstalling recognizes and migrates older POSIX commands that began with
 `env MEMTOMEM_STM_...`; the replacement uses cross-platform runtime flags and
-retains the existing managed timeout. Unknown host-specific fields on the hook
+retains the existing managed timeout. The flags are listed in the
+[hook CLI reference](../reference/cli-hooks.md#mms-hook). Unknown host-specific fields on the hook
 entry are preserved.
 
 | Host | Config file |

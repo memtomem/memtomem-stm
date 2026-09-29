@@ -10,6 +10,25 @@ Bare `mms hook` is the runtime PostToolUse bridge. `--host TEXT` defaults to
 `auto`; unknown or value-less input warns and falls back to auto-detection so a
 host action is never blocked by a usage error.
 
+Bare `mms hook` also takes the runtime flags that `mms hook install` writes
+into the host command. Each one overrides the environment setting in its row
+for that invocation only, and `--surfacing-timeout-seconds` also sets the
+daemon deadline:
+
+| Flag | Overrides | Meaning |
+|---|---|---|
+| `--use-daemon` / `--no-daemon` | `MEMTOMEM_STM_HOOK__USE_DAEMON` | Surface through the shared warm daemon, or run in-process |
+| `--surfacing-timeout-seconds SECONDS` | `MEMTOMEM_STM_SURFACING__TIMEOUT_SECONDS` | LTM search deadline |
+| `--daemon-timeout-seconds SECONDS` | `MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS` | Hook-to-daemon deadline; raised to at least one second above `--surfacing-timeout-seconds` whenever that flag is given |
+| `--persist-query-text` / `--no-persist-query-text` | `MEMTOMEM_STM_SURFACING__PERSIST_QUERY_TEXT` | Store surfacing query text, or only its hash |
+
+The values arrive as plain strings, so a hand-edited invalid value (a
+non-number or a non-positive deadline) is dropped instead of Click exiting 2
+inside a host hook. The dropped setting then keeps its ambient or default
+value, with one exception: a valid `--surfacing-timeout-seconds` still sets the
+daemon deadline to one second above it when `--daemon-timeout-seconds` is
+invalid or missing.
+
 ```text
 mms hook install --host [claude|codex|cursor|kimi]
   [--surfacing-timeout SECONDS] [--daemon|--no-daemon]

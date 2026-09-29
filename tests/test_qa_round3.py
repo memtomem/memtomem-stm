@@ -180,7 +180,7 @@ class TestDocsToolCount:
     def test_cli_md_has_current_tool_counts(self):
         cli_md = Path(__file__).parent.parent / "docs" / "cli.md"
         content = cli_md.read_text(encoding="utf-8")
-        assert "5 default + 1 opt-in + proxied" in content
+        assert "5 default + 2 opt-in + proxied" in content
         assert "`stm_admin(action, params?)`" in content
         assert "stm_compression_feedback" in content
         assert "| `proxy_health` |" in content

@@ -2041,11 +2041,16 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     # has been edited out from under it, so substrings alone would keep
     # passing over a recipe that no longer installs anything.
     for command in (
-        "uv tool install 'memtomem[all]>=0.4,<0.6'",
-        "uv tool install 'memtomem-stm>=0.2,<0.4'",
-        "uv tool install --reinstall 'memtomem[all]>=0.4,<0.6'",
+        "uv tool install 'memtomem[all]>=0.4,<0.7'",
+        "uv tool install 'memtomem-stm>=0.2,<0.7'",
+        "uv tool install --reinstall 'memtomem[all]>=0.4,<0.7'",
         "export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS="
-        '\'["--from","memtomem>=0.4,<0.6","memtomem-server"]\'',
+        '\'["--from","memtomem>=0.4,<0.7","memtomem-server"]\'',
+        # The step-3 block promises adjacent snippets, which only render when
+        # the preview cap leaves room after the matched chunk; every demo
+        # section is longer than the default cap of 300.
+        "export MEMTOMEM_STM_SURFACING__PREVIEW_MAX_CHARS=1200",
+        "unset MEMTOMEM_STM_SURFACING__PREVIEW_MAX_CHARS",
     ):
         assert command in guide, f"reviewed-memory-resume guide lost {command!r}"
 
@@ -2072,22 +2077,35 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     # below passes whether or not this row exists at all — deleting it outright
     # is exactly the regression that check cannot see.
     #
-    # Match inside the matrix block rather than the whole file: row-shaped text
-    # is legal in a `run: |` script, so a file-wide search proves the shape
-    # exists somewhere, not that the workflow runs it.
-    matrix = _matrix_block(_read(".github/workflows/core-compat-advisory.yml"))
-    newest = re.search(
-        r"^\s*- core:\s*[\"']?0\.5\.0[\"']?\n\s+expected:\s*(\w+)\n\s+mcp_pin:\s*[\"']([^\"']*)[\"']\s*$",
-        matrix,
-        re.MULTILINE,
+    # Read the rows the matrix block declares rather than the whole file:
+    # row-shaped text is legal in a `run: |` script, so a file-wide search
+    # proves the shape exists somewhere, not that the workflow runs it. The
+    # newest row is derived, not named, so adding a Core does not need a test
+    # edit — and the guide's upper bound below is checked against it.
+    newest_version = max(
+        _core_compat_versions(), key=lambda version: tuple(int(p) for p in version.split("."))
     )
-    assert newest is not None, (
-        "core-compat matrix lost its Core 0.5.0 row; a released Core that no "
-        "row covers is a Core nothing verifies"
+    newest_rows = [
+        row for row in _core_compat_rows() if _row_values(row, "core") == [newest_version]
+    ]
+    assert len(newest_rows) == 1, (
+        f"core-compat matrix declares Core {newest_version} in {len(newest_rows)} rows; "
+        "the newest released Core must be exactly one row"
     )
-    assert newest.group(1) == "schema4", "Core 0.5.0 advertises context_compose schema 4"
-    assert newest.group(2) == "", (
-        "Core 0.5.0 declares mcp[cli]>=2.0.0,<3 itself; a pin it never asked for would hold it back"
+    assert _row_values(newest_rows[0], "expected") == ["schema4"], (
+        f"Core {newest_version} advertises context_compose schema 4"
+    )
+    assert _row_values(newest_rows[0], "mcp_pin") == [""], (
+        f"Core {newest_version} declares mcp[cli]>=2.0.0,<3 itself; a pin it never "
+        "asked for would hold it back"
+    )
+    # The guide's install ranges must admit the newest verified Core, or the
+    # recipe installs an older one than the matrix proves works.
+    newest_minor = tuple(int(p) for p in newest_version.split(".")[:2])
+    bound = re.search(r"uv tool install 'memtomem\[all\]>=0\.4,<0\.(\d+)'", guide)
+    assert bound is not None and (0, int(bound.group(1))) > newest_minor, (
+        f"reviewed-memory-resume guide's Core range does not admit Core {newest_version}, "
+        "the newest row of .github/workflows/core-compat-advisory.yml"
     )
     # The pin is per matrix row, so a newly added Core does not inherit it, and
     # it announces its own expiry rather than outliving the Core gap. Pin every
@@ -2840,3 +2858,227 @@ def test_release_creates_the_github_release_in_a_least_privilege_job() -> None:
         "the job must skip an existing Release rather than overwrite notes a "
         "human enriched after the fact"
     )
+
+
+# ---------------------------------------------------------------------------
+# 0.6.1 docs refresh: statements the code now contradicted, and surfaces no
+# document mentioned. Each check is scoped to the paragraph that makes the
+# claim, so the same words elsewhere in the file cannot satisfy it.
+# ---------------------------------------------------------------------------
+
+
+def _paragraph(body: str, marker: str, source: str) -> str:
+    """The one blank-line-separated block of ``body`` that contains ``marker``."""
+    hits = [block for block in re.split(r"\n\s*\n", body) if marker in block]
+    if len(hits) != 1:
+        pytest.fail(
+            f"{source}: expected exactly one paragraph containing {marker!r}, found {len(hits)}"
+        )
+    return hits[0]
+
+
+def _code_span_tokens(text: str) -> set[str]:
+    """Whitespace-separated tokens of every inline code span outside fenced blocks.
+
+    Exact tokens, so a documented ``--persist-query-text-typo`` does not count as
+    ``--persist-query-text``, and a spelled-out invocation such as
+    ``--freeze --holdout-rate R --target N`` covers each of its options.
+    """
+    prose = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    return set(" ".join(re.findall(r"`([^`\n]+)`", prose)).split())
+
+
+def _heading_section(body: str, heading: str, source: str) -> str:
+    """The text under ``heading`` up to the next heading of the same or higher level."""
+    match = re.search(rf"^(#+) {re.escape(heading)}\s*$", body, re.MULTILINE)
+    if match is None:
+        pytest.fail(f"{source}: heading {heading!r} is gone")
+    level = len(match.group(1))
+    rest = body[match.end() :]
+    end = re.search(rf"^#{{1,{level}}} ", rest, re.MULTILINE)
+    return rest[: end.start()] if end else rest
+
+
+def test_operations_recovery_says_status_and_list_count_every_schema_error() -> None:
+    """#1051/#1087: status/list render every error by location and type."""
+    ops = _read("docs/guides/operations.md")
+    step = _paragraph(ops, "1. `mms config validate`", "docs/guides/operations.md")
+    if "just the first" in step:
+        pytest.fail(
+            "docs/guides/operations.md says status/list name only the first schema error; "
+            "src/memtomem_stm/cli/proxy.py renders every error as `loc (type)`"
+        )
+    for needed in ("every schema error", "location and error type only", "validation error(s)"):
+        if needed not in step:
+            pytest.fail(f"docs/guides/operations.md recovery step 1 lost {needed!r}")
+
+
+def test_unreadable_config_contracts_are_documented_per_command() -> None:
+    """#1095: each command renders an unreadable or non-UTF-8 file its own way.
+
+    ``config validate`` keeps the full local error text; ``doctor``, ``status``
+    and ``list`` name only the exception type. One phrase check over the whole
+    file could not tell those contracts apart.
+    """
+    cli = _read("docs/cli.md")
+    doctor_row = next(
+        (line for line in cli.splitlines() if line.startswith("| `config JSON` |")), ""
+    )
+    if "`not valid UTF-8`" not in doctor_row or "`cannot read file: <Type>`" not in doctor_row:
+        pytest.fail("docs/cli.md doctor `config JSON` row must name both #1095 FAIL forms")
+    if "cannot read file: [Errno" in doctor_row or "codec can't decode" in doctor_row:
+        pytest.fail("docs/cli.md doctor row shows validator-style detail doctor never prints")
+    validate = _paragraph(cli, "- JSON parse errors and non-object roots,", "docs/cli.md")
+    for needed in ("`cannot read file: …`", "`not valid UTF-8: …`", "full error text"):
+        if needed not in validate:
+            pytest.fail(f"docs/cli.md `config validate` list lost {needed!r}")
+    ops = _read("docs/guides/operations.md")
+    bullet = _paragraph(ops, "**Unreadable or not UTF-8**", "docs/guides/operations.md")
+    for needed in (
+        "`Failed to read <path>: PermissionError`",
+        "`Failed to parse <path>: UnicodeDecodeError`",
+        "`cannot read file: PermissionError`",
+        "`not valid UTF-8`",
+    ):
+        if needed not in bullet:
+            pytest.fail(f"docs/guides/operations.md unreadable-config bullet lost {needed!r}")
+
+
+def test_cli_docs_count_both_opt_in_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``stm_memory_propose`` is the second independently gated opt-in tool."""
+    from memtomem_stm import server
+
+    # The documented variable is the gate: off when unset or false, on when true.
+    monkeypatch.delenv("MEMTOMEM_STM_FORMATION__ENABLED", raising=False)
+    assert not server._should_advertise_formation_tool()
+    monkeypatch.setenv("MEMTOMEM_STM_FORMATION__ENABLED", "false")
+    assert not server._should_advertise_formation_tool()
+    monkeypatch.setenv("MEMTOMEM_STM_FORMATION__ENABLED", "true")
+    assert server._should_advertise_formation_tool()
+    cli = _read("docs/cli.md")
+    section = _heading_section(cli, "MCP Tools (5 default + 2 opt-in + proxied)", "docs/cli.md")
+    if (
+        "`stm_memory_propose`" not in section
+        or "MEMTOMEM_STM_FORMATION__ENABLED=true" not in section
+    ):
+        pytest.fail("docs/cli.md MCP Tools section must name stm_memory_propose and its gate")
+
+
+def test_surfacing_names_the_admin_action_not_the_retired_tool() -> None:
+    """``stm_surfacing_stats`` is an implementing function, not an MCP tool.
+
+    Only the tuned-min-score paragraph is checked: the MCP tool reference and
+    the OTLP span table name the function on purpose.
+    """
+    surfacing = _read("docs/surfacing.md")
+    block = _paragraph(surfacing, "never rewritten to a cap", "docs/surfacing.md")
+    if "stm_surfacing_stats" in block or 'stm_admin(action="surfacing_stats")' not in block:
+        pytest.fail(
+            'docs/surfacing.md must point readers at stm_admin(action="surfacing_stats"); '
+            "server.py only registers stm_surfacing_stats behind the stm_admin dispatcher"
+        )
+
+
+def test_hook_reference_lists_every_runtime_flag() -> None:
+    """Every spelling of the bare hook's runtime flags, read from Click."""
+    import click
+
+    from memtomem_stm.cli import hook_cmd
+
+    spellings = {
+        spelling
+        for param in hook_cmd.hook_command.params
+        if isinstance(param, click.Option) and param.name != "host"
+        for spelling in (*param.opts, *param.secondary_opts)
+        if spelling.startswith("--")
+    }
+    assert len(spellings) >= 6, spellings  # positive control: the options were found
+    reference = _heading_section(_read("docs/reference/cli-hooks.md"), "`mms hook`", "cli-hooks.md")
+    documented = _code_span_tokens(reference)
+    missing = sorted(s for s in spellings if s not in documented)
+    if missing:
+        pytest.fail(f"docs/reference/cli-hooks.md `mms hook` omits runtime flags {missing}")
+
+
+def test_gateway_reference_lists_every_selection_subcommand() -> None:
+    import click
+
+    from memtomem_stm.cli.proxy import cli as mms_cli
+
+    ctx = click.Context(mms_cli)
+    group = mms_cli.get_command(ctx, "selection")
+    assert isinstance(group, click.Group)
+    names = group.list_commands(click.Context(group))
+    assert names, "positive control: the selection group has subcommands"
+    table = _heading_section(
+        _read("docs/reference/cli-gateway.md"), "Diagnostics and control", "cli-gateway.md"
+    )
+    missing = [name for name in names if f"| `mms selection {name}` |" not in table]
+    if missing:
+        pytest.fail(
+            f"docs/reference/cli-gateway.md diagnostics table omits mms selection {missing}"
+        )
+
+
+def test_cli_docs_name_every_mms_state_file() -> None:
+    from memtomem_stm.mms import state
+
+    cli = _read("docs/cli.md")
+    for path in (state.import_state_path(), state.write_lock_path()):
+        row = f"| `~/.mms/{path.name}` |"
+        if row not in cli:
+            pytest.fail(
+                f"docs/cli.md mms state table lacks {row}; see src/memtomem_stm/mms/state.py"
+            )
+
+
+def test_trial_docs_name_every_extractor_option_and_the_resolve_split() -> None:
+    """Options come from the script's AST: ``--freeze`` sits on the line after its call."""
+    tree = ast.parse(_read("scripts/stm_trial.py"))
+    options = {
+        node.args[0].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "add_argument"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and str(node.args[0].value).startswith("--")
+    }
+    assert "--freeze" in options and len(options) >= 10, options  # positive control
+    surfacing = _read("docs/surfacing.md")
+    extractor = _heading_section(surfacing, "Trial extractor", "docs/surfacing.md")
+    spans = _code_span_tokens(extractor)
+    missing = sorted(option for option in options if option not in spans)
+    if missing:
+        pytest.fail(
+            f"docs/surfacing.md Trial extractor omits scripts/stm_trial.py options {missing}"
+        )
+
+    from memtomem_stm.surfacing import trial
+
+    doc = trial.__doc__ or ""
+    resolution = _heading_section(surfacing, "Outcome resolution", "docs/surfacing.md")
+    for concept in ("Y1", "Y2", "re-exposure", "delivered"):
+        assert concept in doc, f"surfacing/trial.py docstring no longer defines {concept}"
+        if concept not in resolution:
+            pytest.fail(f"docs/surfacing.md Outcome resolution lost {concept!r}")
+    for needed in ("`load_resolve_inputs`", "`memtomem_stm.surfacing.trial.resolve`", "no I/O"):
+        if needed not in resolution:
+            pytest.fail(f"docs/surfacing.md Outcome resolution lost {needed!r}")
+
+
+def test_readme_command_map_matches_the_click_group() -> None:
+    import click
+
+    from memtomem_stm.cli.proxy import cli as mms_cli
+
+    ctx = click.Context(mms_cli)
+    registered = set(mms_cli.list_commands(ctx))
+    block = _paragraph(_read("README.md"), "**Command map.**", "README.md")
+    documented = set(re.findall(r"`mms ([a-z-]+)`", block))
+    if documented != registered:
+        pytest.fail(
+            "README.md command map is out of sync with the `mms` click group: "
+            f"missing {sorted(registered - documented)}, stale {sorted(documented - registered)}"
+        )
