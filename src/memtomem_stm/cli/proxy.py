@@ -9461,12 +9461,23 @@ def doctor(
                     f"root must be a JSON object, got {type(loaded).__name__}",
                     f"mms config validate {cfg_arg}",
                 )
+        # Rendered from known values (#1089): a JSON error's ``msg`` can quote
+        # the offending character, and an OS or decode error's text carries
+        # the path or the bytes. `config validate` shows the full detail.
         except json.JSONDecodeError as exc:
             check(
                 "config_json",
                 "config JSON",
                 "FAIL",
-                f"invalid JSON: {exc}",
+                f"invalid JSON at line {exc.lineno} column {exc.colno}",
+                f"mms config validate {cfg_arg}",
+            )
+        except UnicodeDecodeError:
+            check(
+                "config_json",
+                "config JSON",
+                "FAIL",
+                "not valid UTF-8",
                 f"mms config validate {cfg_arg}",
             )
         except OSError as exc:
@@ -9474,7 +9485,7 @@ def doctor(
                 "config_json",
                 "config JSON",
                 "FAIL",
-                f"cannot read file: {exc}",
+                f"cannot read file: {exception_summary(exc)}",
                 f"mms config validate {cfg_arg}",
             )
 

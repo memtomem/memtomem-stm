@@ -87,8 +87,9 @@ changes inline only. See the deprecation policy in
   because it names which side drifted and quotes no request data. Configured URLs in log lines (the LTM target, the
   LLM destination in the unscanned-compression warning) drop their query string
   and fragment, and the LLM destination masks userinfo, which it used to print
-  raw. Tracebacks logged with these lines are unchanged (#1086). Config-load
-  validation messages (#1087) and policy-bundle errors keep their text.
+  raw. Tracebacks logged with these lines are unchanged (#1086). Policy-bundle
+  errors keep their text; config-load failures are covered by the #1087 note
+  below.
 - **Text from the stores and from Core is shown by type, version or known
   value** (#1082). A SQLite error in the feedback or metrics DB — the
   `feedback tables: error` line and `surfacing.feedback_db.error` /
@@ -121,6 +122,18 @@ changes inline only. See the deprecation policy in
   `stm_proxy_stats` as a count (`last: 2 hint(s)`), not their text, and
   `TokenTracker.get_summary()` replaces `last_hints` with `last_hint_count`.
   Tracebacks are unchanged (#1086).
+- **Config-load failures are shown by location, type or position**
+  (#1087, #1089). The proxy config loader's warning lines, at startup and on
+  every hot reload, now show the location and error type summary that
+  `status`, `list`, `health`, `doctor` and `stm_proxy_health` already print,
+  instead of pydantic's full message with `input_value=…`. Everywhere the
+  loader's result appears (`config_error`, `proxy_config_error`, `config
+  schema`), a read or decode error renders as its type name
+  (`PermissionError`, `UnicodeDecodeError`) and a JSON syntax error as
+  `JSONDecodeError (line L column C)`. `mms doctor`'s `config JSON` check
+  reads `invalid JSON at line L column C`, `cannot read file: PermissionError`,
+  or `not valid UTF-8`, where an undecodable file used to crash it. Run
+  `mms config validate` for the full validation and JSON syntax messages.
 - An empty tool filter now matches no tools in `mms tune` and
   `stm_tuning_recommendations`; omit the filter to analyze all tools. In particular,
   `mms tune --apply --yes --tool ""` no longer writes overrides for other tools (#1036).
@@ -154,6 +167,10 @@ changes inline only. See the deprecation policy in
   `runtime_profile` fields, and Core's hint text out of `mms health`,
   `mms doctor`, `mms stats`, `stm_proxy_health`, `stm_proxy_stats` and the
   hint log line (#1082). **Behavior change**: see the upgrade notes above.
+- Keep rejected config values, and the paths and bytes quoted in read or
+  decode errors, out of config-load failures, and stop `mms doctor` crashing on a config file that
+  is not valid UTF-8 (#1087, #1089). **Behavior change**: see the upgrade
+  notes above.
 - Keep each LLM compression fallback reason with its own result so
   overlapping calls cannot mislabel proxy metrics (#1055).
   **Behavior change**: see the upgrade notes above.
