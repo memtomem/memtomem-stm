@@ -28,6 +28,7 @@ from pydantic_settings import (
 )
 
 from memtomem_stm.proxy import prefixes
+from memtomem_stm.utils.redact import exception_summary
 
 logger = logging.getLogger(__name__)
 
@@ -490,27 +491,46 @@ def validation_error_summary(exc: ValidationError) -> str:
     return "; ".join(parts)
 
 
-def _sanitized_load_error(exc: Exception) -> str:
-    """Error summary safe to surface beyond the local process log.
+class _ConfigRootTypeError(ValueError):
+    """The config file parsed, but its root is not a JSON object.
 
-    ``ConfigLoadResult.error`` flows to the MCP client via
-    ``stm_proxy_health``, so it must not echo config *values*. Pydantic
-    smuggles them in two ways: ``input_value=...`` (dropped via
-    ``include_input=False``) and the rendered ``msg`` of a custom
+    Raised by the loader itself, so its text is STM's and names only the type.
+    """
+
+    def __init__(self, root: object) -> None:
+        super().__init__(f"config root must be a JSON object, got {type(root).__name__}")
+
+
+def _sanitized_load_error(exc: Exception) -> str:
+    """A config-load failure rendered from known values only.
+
+    The one renderer for every reader of a failed load: ``ConfigLoadResult``
+    (``error`` / ``env_error``, which reach ``status`` / ``list`` / ``health``
+    / ``doctor`` and the MCP client via ``stm_proxy_health``) and the
+    loader's own warning lines (#1087, #1089). None of them may echo config
+    *values*, and pydantic smuggles them in two ways: ``input_value=...``
+    (dropped via ``include_input=False``) and the rendered ``msg`` of a custom
     model-validator — e.g. the duplicate-prefix check embeds the prefix
     string, which is the secret itself if someone typos a token into a
-    ``prefix`` field. So the summary uses ``loc`` + the machine-readable
-    ``type`` code (``dict_type`` / ``value_error`` / ``missing`` …) only,
-    never ``msg``. Full messages stay in the local stderr log and in
-    ``mms config validate``, which reads the raw errors directly.
+    ``prefix`` field. So a ``ValidationError`` renders as ``loc`` + the
+    machine-readable ``type`` code (``dict_type`` / ``value_error`` /
+    ``missing`` …), never ``msg``.
 
-    Non-pydantic errors (``json.JSONDecodeError``, the non-object-root
-    ``ValueError``) describe positions/types, not config values.
+    The rest render from fields STM knows the shape of: a
+    ``json.JSONDecodeError`` as its position only (the pure-Python scanner
+    quotes the offending character into ``msg``), the non-object root as
+    STM's own text, and anything else (``OSError``, ``UnicodeDecodeError``,
+    …) as its type name, since their messages carry a path or the offending
+    bytes. The full detail is ``mms config validate``'s job.
     """
     if isinstance(exc, ValidationError):
         summary = validation_error_summary(exc)
         return f"{exc.error_count()} validation error(s): {summary}"
-    return str(exc)
+    if isinstance(exc, json.JSONDecodeError):
+        return f"JSONDecodeError (line {exc.lineno} column {exc.colno})"
+    if isinstance(exc, _ConfigRootTypeError):
+        return str(exc)
+    return exception_summary(exc)
 
 
 _AMBIENT_VALIDATION_VARS = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
@@ -2418,9 +2438,11 @@ class ProxyConfig(BaseModel):
         the raw file dict *before* the env merge so an env-injected key can
         never be misattributed as a file typo.
 
-        ``error`` is sanitized (location + type, never ``input_value``):
-        it flows to the MCP client via ``stm_proxy_health``, and a mistyped
-        secret-bearing field would otherwise embed the secret itself.
+        ``error`` and the failure log lines come from ``_sanitized_load_error``
+        (location + type for a validation error, position for a JSON error,
+        type name otherwise; never ``input_value``): ``error`` flows to the
+        MCP client via ``stm_proxy_health``, and a mistyped secret-bearing
+        field would otherwise embed the secret itself.
 
         ``log_warnings=False`` suppresses the advisory warnings (permissive
         mode, unknown keys, missing ``cache.tool_annotation_policy``) for
@@ -2428,8 +2450,8 @@ class ProxyConfig(BaseModel):
         fallback, which would otherwise duplicate them at startup. Parse
         failures are logged by default: a silent ``None`` is the dark-failure
         mode this module exists to prevent. Read-only diagnostics that surface
-        the returned ``error`` can use ``log_errors=False`` to avoid printing
-        raw values from a pydantic exception to stderr.
+        the returned ``error`` themselves pass ``log_errors=False`` so the same
+        failure is not reported twice.
         """
         resolved = path.expanduser().resolve()
         overlay = _as_overlay(env_overrides)
@@ -2462,7 +2484,7 @@ class ProxyConfig(BaseModel):
                     if log_errors:
                         logger.warning(
                             "Env-only proxy config failed validation: %s%s — using defaults",
-                            exc,
+                            _sanitized_load_error(exc),
                             _env_override_hint(exc, overlay),
                         )
                     # Reported, not raised: the defaults rebuild stays the
@@ -2490,7 +2512,7 @@ class ProxyConfig(BaseModel):
                 # otherwise slip through ``_deep_merge`` (``dict([])`` is
                 # ``{}``) and an env override on top would validate cleanly,
                 # silently accepting an invalid config file.
-                raise ValueError(f"config root must be a JSON object, got {type(loaded).__name__}")
+                raise _ConfigRootTypeError(loaded)
             file_data = loaded
             unknown_keys = tuple(find_unknown_keys(ProxyConfig, file_data))
             data = _deep_merge(file_data, env_data) if env_data else file_data
@@ -2539,7 +2561,7 @@ class ProxyConfig(BaseModel):
                 logger.warning(
                     "Failed to parse proxy config %s: %s%s",
                     resolved,
-                    exc,
+                    _sanitized_load_error(exc),
                     _env_override_hint(exc, overlay, file_data),
                 )
             return ConfigLoadResult(
