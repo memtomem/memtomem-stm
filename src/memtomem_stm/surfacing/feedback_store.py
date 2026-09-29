@@ -493,17 +493,43 @@ class FeedbackDbStatus(TypedDict):
     error: str | None
 
 
+def _locate_db(db_path: Path) -> tuple[Path, bool]:
+    """Resolve *db_path* and report whether it exists, for the read-only readers.
+
+    Only a missing file or a non-directory parent means "does not exist". Any
+    other lookup failure is raised, not folded into ``False``: ``stat()``
+    raises ``PermissionError`` when a parent directory cannot be searched, and
+    ``expanduser()`` raises ``RuntimeError`` when no home directory can be
+    determined. ``Path.exists()`` cannot tell these apart — on Python 3.14 it
+    returns ``False`` for the unreadable directory too. The readers report what
+    is raised as their ``error`` field, like a DB that cannot be opened,
+    rather than let it escape into a health report (#1092).
+    """
+    resolved = db_path.expanduser().resolve()
+    try:
+        resolved.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return resolved, False
+    return resolved, True
+
+
 def inspect_feedback_db(db_path: Path) -> FeedbackDbStatus:
     """Inspect surfacing feedback DB schema without creating or migrating it."""
-    resolved = db_path.expanduser().resolve()
     status: FeedbackDbStatus = {
-        "path": str(resolved),
-        "exists": resolved.exists(),
+        "path": str(db_path),
+        "exists": False,
         "initialized": False,
         "missing_tables": list(_REQUIRED_TABLES),
         "error": None,
     }
-    if not resolved.exists():
+    try:
+        resolved, exists = _locate_db(db_path)
+    except (OSError, RuntimeError) as exc:
+        status["error"] = exception_summary(exc)
+        return status
+    status["path"] = str(resolved)
+    status["exists"] = exists
+    if not exists:
         return status
 
     try:
@@ -573,9 +599,8 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
     ``opportunities_total`` / ``opportunity_decisions`` read the opportunity
     log when the file has one.
     """
-    resolved = db_path.expanduser().resolve()
     summary: dict[str, object] = {
-        "path": str(resolved),
+        "path": str(db_path),
         "available": False,
         "events_total": 0,
         "withheld_total": 0,
@@ -596,7 +621,13 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
         "diagnostics_window_days": _FAULT_SUMMARY_WINDOW_DAYS,
         "error": None,
     }
-    if not resolved.exists():
+    try:
+        resolved, exists = _locate_db(db_path)
+    except (OSError, RuntimeError) as exc:
+        summary["error"] = exception_summary(exc)
+        return summary
+    summary["path"] = str(resolved)
+    if not exists:
         return summary
 
     try:
