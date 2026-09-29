@@ -31,13 +31,14 @@ changes inline only. See the deprecation policy in
   when the file is valid. When a file fails validation, `list` and `status`
   show the env/default fallback the server actually uses, while retaining the
   file error and raw file counts. `list`/`status` now mark startup-rejected
-  environments invalid and report value-free `config_error` locations and type codes in
+  environments invalid and report `config_error` locations and type codes, without values, in
   place of the previous value-bearing messages. For file errors, run
   `mms config validate` locally for details.
 - **`mms health` and `mms doctor` follow startup validation** (#1075). Their
-  `config_error` / `config schema` detail is now the value-free location and
-  type summary `status` and `list` print, instead of the first schema error's
-  message. An environment that startup rejects, such as
+  `config_error` / `config schema` detail is now the location and type summary
+  `status` and `list` print, instead of the first schema error's message. A
+  location can name a key, such as an env or header name, but never a value
+  (#1085). An environment that startup rejects, such as
   `MEMTOMEM_STM_PROXY='[1]'`, now reports `config_valid: false` in `health` and
   FAILs `doctor`'s `config schema` check, so `mms doctor` exits 1 where it used
   to pass.

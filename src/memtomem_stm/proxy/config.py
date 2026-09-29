@@ -480,9 +480,18 @@ def validation_error_summary(exc: ValidationError) -> str:
     """``loc (type)`` for each error, joined — never the offending value.
 
     Both ``input_value=`` (what ``str(exc)`` embeds) and the rendered ``msg``
-    can carry the value that failed validation, so neither is used. Shared by
-    the config-load path below and ``stm_admin``'s parameter errors, which both
-    reach an MCP client.
+    can carry the value that failed validation, so neither is used. Callers:
+    the config-load path below and ``stm_admin``'s action-parameter errors, which
+    reach an MCP client, and the CLI's config reads and upstream probes
+    (``health``, ``doctor``, ``add --validate``, ``init``).
+
+    A location is not only schema: pydantic puts the dict key of the failing
+    entry in it. For these callers the keys are config key names (such as
+    server, env variable, header or tool names), the MCP client's own
+    parameter keys, or, on the probe's ``invalid server response`` line, keys
+    the upstream wrote. None of them is a configured value (#1085). A caller
+    that validates data keyed by secrets must not use this helper;
+    ``utils/redact.py:exception_summary`` renders error types only.
     """
     parts = []
     for err in exc.errors(include_url=False, include_input=False):
