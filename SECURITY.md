@@ -42,9 +42,10 @@ memtomem-stm is an MCP proxy gateway. Its threat surface differs from a server-f
   oversized response, keep their text. An upstream tool result with
   `isError: true` is different: it is the channel the model uses to correct
   its call, so the client gets its text, `structuredContent`, `_meta` and
-  non-text blocks as the upstream wrote them. The shared limits still apply:
-  an envelope over `max_upstream_bytes` is rejected, and lone surrogates in
-  text blocks, `structuredContent` and `_meta` are escaped. What the upstream echoes there falls under the trust boundary
+  non-text blocks as the upstream wrote them. The shared ingest handling
+  still applies: an envelope over `max_upstream_bytes` is rejected, and the
+  lone-surrogate scrub escapes the fields it covers (its coverage gaps are
+  #1101). What the upstream echoes there falls under the trust boundary
   above. The metrics DB keeps only `upstream isError (<n> chars)`, or a fixed
   placeholder when the result has no text.
 - **Write-tool skip**: Memory surfacing is automatically disabled for upstream tools that mutate state, reducing the risk of injecting stale context into destructive operations.

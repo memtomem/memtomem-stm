@@ -17,8 +17,7 @@ Surfaces, by audience:
 
 The one deliberate exception is the ``isError`` tool result itself, which
 reaches the client as the upstream wrote it, within the shared byte limit and
-the surrogate escaping of text blocks, ``structuredContent`` and ``_meta``
-(#1084); its test pins that too.
+the lone-surrogate scrub (#1084); its test pins that too.
 
 Each case asserts a positive control proving the path ran, so a pass means a
 clean surface and not an unreached branch.
@@ -363,9 +362,8 @@ async def test_upstream_is_error_reaches_the_client_and_not_the_db(tmp_path):
     """An upstream ``isError`` result is the tool-result channel: the model
     reads it to correct its call, and the upstream is trusted with what it
     echoes there, so its text, ``structuredContent``, ``_meta`` and non-text
-    blocks reach the client as written (within the shared byte limit and the
-    surrogate escaping of text, ``structuredContent`` and ``_meta``, which
-    this ASCII, in-limit result does not trip). The
+    blocks reach the client as written (within the shared byte limit and
+    lone-surrogate scrub, which this ASCII, in-limit result does not trip). The
     persisted row, which outlives the conversation, keeps only the length
     (#1084). The canaries stand in for a request the upstream quoted back."""
     from mcp import ClientSession

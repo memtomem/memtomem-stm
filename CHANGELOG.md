@@ -148,8 +148,8 @@ changes inline only. See the deprecation policy in
   which can quote the request back: a URL query, an argument, part of a
   header. What the client receives does not change: the text,
   `structuredContent`, `_meta` and non-text blocks, within the existing
-  `max_upstream_bytes` limit and the lone-surrogate escaping of text blocks,
-  `structuredContent` and `_meta`. Read the upstream's message there.
+  `max_upstream_bytes` limit and lone-surrogate scrub. Read the upstream's
+  message there.
 - An empty tool filter now matches no tools in `mms tune` and
   `stm_tuning_recommendations`; omit the filter to analyze all tools. In particular,
   `mms tune --apply --yes --tool ""` no longer writes overrides for other tools (#1036).
