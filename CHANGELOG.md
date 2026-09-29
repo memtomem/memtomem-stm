@@ -23,9 +23,11 @@ changes inline only. See the deprecation policy in
   document mentioned are added: the bare `mms hook` runtime flags, `mms
   selection feedback` in the gateway reference, every `scripts/stm_trial.py`
   option, outcome resolution as a separate library step, and the
-  `~/.mms/import_state.toml` sidecar and lock file. README gains a command map
-  and links to the MCP tool, proxy JSON and selection-evaluation references,
-  each pinned by a test. **Behavior change**: none external.
+  `~/.mms/import_state.toml` sidecar and lock file. Each correction and new
+  surface above is pinned by a test. README gains a command map, checked
+  against the `mms` click group, and links to the MCP tool, proxy JSON and
+  selection-evaluation references, which no test requires (#1106).
+  **Behavior change**: none external.
 - docs: the reviewed-resume guide's install pins widen to `<0.7`, after the
   walkthrough was rerun with core 0.6.5 and memtomem-stm 0.6.1. The guide now
   names the pairs it was exercised with instead of implying every release in
@@ -34,7 +36,7 @@ changes inline only. See the deprecation policy in
   and the adjacent snippets it promises did not render. The weekly
   compatibility advisory gains a core 0.6.5 row, verified locally first: the
   smoke passes with `--expect schema4`. README and `docs/surfacing.md` call
-  0.6.5 the current Core. **Behavior change**: none external.
+  0.6.5 the current Core (#1106). **Behavior change**: none external.
 
 ## [0.6.1] — 2026-09-29
 
