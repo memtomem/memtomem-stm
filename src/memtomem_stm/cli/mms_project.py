@@ -455,6 +455,7 @@ def route_cmd(
     from memtomem_stm.cli.proxy import (
         _backup_config_snapshot,
         _load,
+        _read_config_text,
         _save,
         _schema_validation_error,
     )
@@ -535,7 +536,8 @@ def route_cmd(
             )
         backup: Path | None = None
         if path.exists():
-            backup = _backup_config_snapshot(path, path.read_text(encoding="utf-8"))
+            # Guarded like the first read in `_load` (#1095).
+            backup = _backup_config_snapshot(path, _read_config_text(path))
         _save(path, data)
         payload["applied"] = list(planned)
         if backup is not None:

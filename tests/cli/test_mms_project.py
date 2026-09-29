@@ -411,6 +411,33 @@ def test_route_no_flag_honors_env_config_path(runner, sandbox, monkeypatch):
     assert config.exists()
 
 
+def test_route_apply_guards_its_backup_read(runner, sandbox, monkeypatch):
+    """The backup snapshot re-reads the file after ``_load``; a failure there
+    exits cleanly instead of escaping as a traceback (#1095)."""
+    _seed_routable_project(runner)
+    config = sandbox["home"] / "proxy.json"
+    config.write_text("{}", encoding="utf-8")
+    real_read_text = Path.read_text
+    reads = []
+
+    def fail_second_read(self, *args, **kwargs):
+        if self == config.resolve():
+            reads.append(self)
+            if len(reads) == 2:
+                raise PermissionError(13, "Permission denied", "/cnry-dir/cnry-file")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fail_second_read)
+    res = runner.invoke(project_group, ["route", "--config", str(config), "--apply"])
+
+    assert len(reads) == 2
+    assert res.exit_code == 1, res.output
+    assert isinstance(res.exception, SystemExit)
+    assert "PermissionError" in res.output
+    assert "cnry" not in res.output
+    assert config.read_text(encoding="utf-8") == "{}"  # nothing written
+
+
 def test_route_apply_writes_valid_additive_config_and_is_idempotent(runner, sandbox):
     from memtomem_stm.proxy.config import ProxyConfig
 

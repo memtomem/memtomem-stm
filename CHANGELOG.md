@@ -132,8 +132,14 @@ changes inline only. See the deprecation policy in
   (`PermissionError`, `UnicodeDecodeError`) and a JSON syntax error as
   `JSONDecodeError (line L column C)`. `mms doctor`'s `config JSON` check
   reads `invalid JSON at line L column C`, `cannot read file: PermissionError`,
-  or `not valid UTF-8`, where an undecodable file used to crash it. Run
-  `mms config validate` for the full validation and JSON syntax messages.
+  or `not valid UTF-8`, where an undecodable file used to crash it. The
+  commands that read the file directly first (`status`, `list`, `health` and
+  the writers such as `add` and `remove`) print `Failed to parse <path>:
+  JSONDecodeError (line L column C)` or `… UnicodeDecodeError`, and
+  `Failed to read <path>: PermissionError` where an unreadable file used to
+  end in a traceback (#1095). Run `mms config validate` for the full
+  messages; it now reports an undecodable file as `not valid UTF-8: …`
+  instead of crashing.
 - An empty tool filter now matches no tools in `mms tune` and
   `stm_tuning_recommendations`; omit the filter to analyze all tools. In particular,
   `mms tune --apply --yes --tool ""` no longer writes overrides for other tools (#1036).
@@ -170,6 +176,10 @@ changes inline only. See the deprecation policy in
 - Keep rejected config values, and the paths and bytes quoted in read or
   decode errors, out of config-load failures, and stop `mms doctor` crashing on a config file that
   is not valid UTF-8 (#1087, #1089). **Behavior change**: see the upgrade
+  notes above.
+- Stop the proxy CLI crashing on a config file it cannot read, and
+  `mms config validate` on one that is not valid UTF-8; render the CLI's own
+  parse errors the same way (#1095). **Behavior change**: see the upgrade
   notes above.
 - Keep each LLM compression fallback reason with its own result so
   overlapping calls cannot mislabel proxy metrics (#1055).
