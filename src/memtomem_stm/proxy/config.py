@@ -501,7 +501,7 @@ class _ConfigRootTypeError(ValueError):
         super().__init__(f"config root must be a JSON object, got {type(root).__name__}")
 
 
-def _sanitized_load_error(exc: Exception) -> str:
+def config_load_error_summary(exc: Exception) -> str:
     """A config-load failure rendered from known values only.
 
     The one renderer for every reader of a failed load: ``ConfigLoadResult``
@@ -2438,7 +2438,7 @@ class ProxyConfig(BaseModel):
         the raw file dict *before* the env merge so an env-injected key can
         never be misattributed as a file typo.
 
-        ``error`` and the failure log lines come from ``_sanitized_load_error``
+        ``error`` and the failure log lines come from ``config_load_error_summary``
         (location + type for a validation error, position for a JSON error,
         type name otherwise; never ``input_value``): ``error`` flows to the
         MCP client via ``stm_proxy_health``, and a mistyped secret-bearing
@@ -2484,7 +2484,7 @@ class ProxyConfig(BaseModel):
                     if log_errors:
                         logger.warning(
                             "Env-only proxy config failed validation: %s%s — using defaults",
-                            _sanitized_load_error(exc),
+                            config_load_error_summary(exc),
                             _env_override_hint(exc, overlay),
                         )
                     # Reported, not raised: the defaults rebuild stays the
@@ -2492,7 +2492,7 @@ class ProxyConfig(BaseModel):
                     # a caller that cannot safely accept "some other config"
                     # can see that this one is not the operator's.
                     return ConfigLoadResult(
-                        config=ProxyConfig(), error=None, env_error=_sanitized_load_error(exc)
+                        config=ProxyConfig(), error=None, env_error=config_load_error_summary(exc)
                     )
             return ConfigLoadResult(config=ProxyConfig(), error=None, env_error=env_rejected)
         # Warn if config is group/world-readable (may contain API keys)
@@ -2561,11 +2561,11 @@ class ProxyConfig(BaseModel):
                 logger.warning(
                     "Failed to parse proxy config %s: %s%s",
                     resolved,
-                    _sanitized_load_error(exc),
+                    config_load_error_summary(exc),
                     _env_override_hint(exc, overlay, file_data),
                 )
             return ConfigLoadResult(
-                config=None, error=_sanitized_load_error(exc), unknown_keys=unknown_keys
+                config=None, error=config_load_error_summary(exc), unknown_keys=unknown_keys
             )
 
 

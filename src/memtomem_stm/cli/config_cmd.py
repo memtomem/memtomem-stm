@@ -98,6 +98,10 @@ def validate_command(config_path: str | None, as_json: bool) -> None:
                 data = None
         except json.JSONDecodeError as exc:
             errors.append(f"invalid JSON: {exc}")
+        except UnicodeDecodeError as exc:
+            # A ValueError, not an OSError: without this it escaped as a
+            # traceback (#1095). This command keeps full local detail.
+            errors.append(f"not valid UTF-8: {exc}")
         except OSError as exc:
             errors.append(f"cannot read file: {exc}")
         if data is not None:

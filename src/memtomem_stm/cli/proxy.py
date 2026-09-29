@@ -400,15 +400,44 @@ def _new_config_cache_block() -> dict[str, Any]:
     return {"tool_annotation_policy": "strict"}
 
 
+def _config_file_failure(resolved: Path, exc: Exception) -> NoReturn:
+    """Exit on a config file the CLI cannot read, decode or parse.
+
+    The same rendering as every other config-load reader (#1095): an OS or
+    decode error's text carries the path or the bytes, and a JSON error's
+    ``msg`` can quote the offending character. ``mms config validate`` shows
+    the full detail.
+    """
+    from memtomem_stm.proxy.config import config_load_error_summary
+
+    verb = "read" if isinstance(exc, OSError) else "parse"
+    click.echo(
+        f"{_err('Error:')} Failed to {verb} {_disp(str(resolved))}: "
+        f"{config_load_error_summary(exc)}",
+        err=True,
+    )
+    validate = _shell_join(["mms", "config", "validate", "--config", str(resolved)])
+    click.echo(f"  Run `{validate}` for details.", err=True)
+    raise SystemExit(1) from exc
+
+
+def _read_config_text(resolved: Path) -> str:
+    """The config file's text, or a clean exit when it cannot be read or decoded."""
+    try:
+        return resolved.read_text(encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        _config_file_failure(resolved, exc)
+
+
 def _load(config_path: Path) -> dict[str, Any]:
     resolved = config_path.expanduser().resolve()
     if not resolved.exists():
         return {"enabled": True, "cache": _new_config_cache_block(), "upstream_servers": {}}
+    text = _read_config_text(resolved)
     try:
-        data = json.loads(resolved.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, ValueError) as exc:
-        click.echo(f"{_err('Error:')} Failed to parse {resolved}: {exc}", err=True)
-        raise SystemExit(1) from exc
+        data = json.loads(text)
+    except ValueError as exc:
+        _config_file_failure(resolved, exc)
     # Structural guard: the rest of the CLI assumes top-level dict with a dict
     # `upstream_servers`. Without this, a valid-but-wrong-shape JSON (e.g. a
     # list or a string, or `upstream_servers: "oops"`) crashes downstream with
@@ -6394,7 +6423,9 @@ def tune(
         click.echo("  Run `mms init` first.", err=True)
         sys.exit(1)
 
-    original_text = resolved.read_text(encoding="utf-8")
+    # Both reads are guarded: a bare `read_text` ended in a traceback on an
+    # unreadable or undecodable file (#1095).
+    original_text = _read_config_text(resolved)
     data = _load(resolved)
 
     # Typed load with the env overlay: the tuner resolves *effective* current
