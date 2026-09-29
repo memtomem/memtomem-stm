@@ -83,6 +83,7 @@ from memtomem_stm.utils.signal_shutdown import (
 )
 from memtomem_stm.utils.teardown_watchdog import TeardownWatchdog
 from memtomem_stm.utils.json_out import escape_lone_surrogates, require_utf8_identifier
+from memtomem_stm.utils.redact import exception_summary
 
 logger = logging.getLogger(__name__)
 
@@ -1659,8 +1660,15 @@ def _surfacing_bootstrap_lines(app: STMContext) -> list[str]:
             lines.append("  feedback tracking: disabled")
         return lines
 
-    db = tracker.bootstrap_status()
     lines.append("  feedback tracking: enabled")
+    try:
+        db = tracker.bootstrap_status()
+    except Exception as exc:
+        # The reader reports path and SQLite failures itself; this keeps
+        # anything else to one line of the report, as ``mms health`` does,
+        # instead of failing the whole tool call (#1092).
+        lines.append(f"  feedback tables: error — {exception_summary(exc)}")
+        return lines
     lines.append(f"  feedback db: {db['path']}")
     if db.get("error"):
         lines.append(f"  feedback tables: error — {db['error']}")

@@ -560,6 +560,34 @@ class TestHealth:
         assert "feedback tables: error — DatabaseError (SQLITE_CORRUPT)" in result
         assert "cnryDbTable" not in result
 
+    async def test_bootstrap_block_feedback_db_path_error_is_one_line(self, tmp_path, monkeypatch):
+        """An unreadable parent directory makes the DB path lookup raise; the
+        real reader reports it, so the rest of the health report still renders
+        (#1092)."""
+        from memtomem_stm.surfacing.feedback_store import inspect_feedback_db
+
+        def denied(self, *args, **kwargs):
+            raise PermissionError(13, "Permission denied", "/cnryPath/f.db")
+
+        monkeypatch.setattr(Path, "stat", denied)
+        tracker = MagicMock()
+        tracker.bootstrap_status.side_effect = lambda: inspect_feedback_db(tmp_path / "f.db")
+        ctx = _make_ctx(feedback_tracker=tracker, config=self._proxy_enabled_config())
+        result = await stm_proxy_health(ctx=ctx)
+        assert "feedback tables: error — PermissionError" in result
+        assert "cnryPath" not in result
+
+    async def test_bootstrap_block_unexpected_error_is_one_line(self):
+        """Anything the reader does not handle is one line of the report by
+        type, as ``mms health`` renders it, not a failed tool call (#1092)."""
+        tracker = MagicMock()
+        tracker.bootstrap_status.side_effect = ValueError("cnryReaderMsg")
+        ctx = _make_ctx(feedback_tracker=tracker, config=self._proxy_enabled_config())
+        result = await stm_proxy_health(ctx=ctx)
+        assert "feedback tracking: enabled" in result
+        assert "feedback tables: error — ValueError" in result
+        assert "cnryReaderMsg" not in result
+
     async def test_bootstrap_block_init_failed(self):
         """When proxy is up + feedback_enabled but tracker is None, surface runtime-init failure."""
         ctx = _make_ctx(feedback_tracker=None, config=self._proxy_enabled_config())
