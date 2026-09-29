@@ -204,6 +204,30 @@ _NO_RETRY_CODES = {-32600, -32601, -32602, -32603}  # INVALID_REQUEST/METHOD/PAR
 # propagation is deferred with structured-result caching).
 _NON_TEXT_ERROR_TEXT = "[upstream error: non-text error content]"
 
+
+def _upstream_error_row_text(result: Any) -> str:
+    """The ``proxy_metrics.error_message`` text for an upstream ``isError`` result.
+
+    The upstream wrote that text and it can quote STM's request back — a URL
+    query token, an ``args`` value, part of a header. What the client receives
+    is unchanged by this (the MCP channel for correcting a call); the persisted
+    copy, which outlives the conversation, keeps only its length, or the
+    non-text placeholder when there is no text (#1084).
+
+    The count is over the result's own text blocks, which is what the client
+    receives — not the shaped ``original_text``, which the ``max_upstream_chars``
+    guard may cut and extend with its notice.
+    """
+    chars = sum(
+        len(getattr(block, "text", None) or "")
+        for block in result.content or []
+        if getattr(block, "type", None) == "text"
+    )
+    if not chars:
+        return _NON_TEXT_ERROR_TEXT
+    return f"upstream isError ({chars} chars)"
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -7372,7 +7396,6 @@ class ProxyManager:
         # a non-text-only (or empty-content) error must surface as an error,
         # not as a passthrough success (previously it leaked as one).
         if result.is_error:
-            error_text = original_text or _NON_TEXT_ERROR_TEXT
             self.tracker.record_error(
                 CallMetrics(
                     server=server,
@@ -7381,7 +7404,7 @@ class ProxyManager:
                     compressed_chars=len(original_text),
                     is_error=True,
                     error_category=ErrorCategory.UPSTREAM_ERROR,
-                    error_message=error_text[:MAX_ERROR_MESSAGE_CHARS],
+                    error_message=_upstream_error_row_text(result),
                     trace_id=trace_id,
                 )
             )

@@ -145,9 +145,9 @@ Never exported, by policy:
 - **Error messages.** A failed span's only error detail is `error.type` —
   the exception class name, itself privacy-screened and replaced with
   `redacted` if it trips. `record_exception()` is never called and the span
-  status carries no description, because both would embed the message, and
+  status carries no description, because both would embed the message.
   STM's `error_message` / `index_error` / `extract_error` / `surface_error`
-  fields are documented as unsanitized.
+  fields hold failure text for local post-mortems and are not exported either.
 - **Tool arguments**, in any form.
 - **OTLP header values, the endpoint, and any other credential-bearing
   exporter configuration** — never as a span attribute, a resource attribute,

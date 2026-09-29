@@ -74,8 +74,9 @@ _emitter: OtlpEmitter | None = None
 # call-graph consumer wants from it.
 #
 # Also absent by policy: the progressive-read handle (``key``), an opaque
-# retrieval token; and every ``*_error`` field, since
-# ``CallMetrics.error_message`` and its siblings are documented as unsanitized.
+# retrieval token; and every ``*_error`` field. ``CallMetrics.error_message``
+# and its siblings hold failure text for local post-mortems; a span's only
+# error detail is ``error.type``.
 _SERVER_TOOL: dict[str, tuple[str, type | tuple[type, ...]]] = {
     "server": ("stm.server", str),
     "tool": ("stm.tool", str),
@@ -445,8 +446,8 @@ class OtlpEmitter:
         """Mark the span failed by exception *class* only.
 
         Never ``record_exception()`` and never a status description: both
-        would carry the exception message, and STM's error messages are
-        documented as unsanitized (``proxy/metrics.py``).
+        would carry the exception message, which can quote STM's request back
+        to it — a URL query, an argument, part of a header (#1082).
 
         The class name is screened like any other exported string. A class
         name is usually a literal in source, but it need not be — a

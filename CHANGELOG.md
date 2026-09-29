@@ -72,8 +72,8 @@ changes inline only. See the deprecation policy in
   `MCPError` otherwise; its message, which could quote the request back, is not
   shown. Failures STM composes itself — open circuit breaker, oversize response,
   overall deadline, lock timeout, policy denial, unknown server — keep their
-  message. An upstream tool's `isError` result is unchanged and still reaches the
-  client as the upstream wrote it.
+  message. What the client receives for an upstream tool's `isError` result
+  is unchanged; see #1084 below for its stored row.
 - **Runtime log lines name the exception type, not its message** (#1082). Several
   warnings used to print the exception's message verbatim. This covers the LTM
   client's connect, search and reconnect lines, the "Surfacing degraded", webhook,
@@ -140,6 +140,15 @@ changes inline only. See the deprecation policy in
   end in a traceback (#1095). Run `mms config validate` for the full
   messages; it now reports an undecodable file as `not valid UTF-8: …`
   instead of crashing.
+- **Upstream `isError` rows store a length, not the text** (#1084). When an
+  upstream tool returns `isError: true`, the `proxy_metrics.error_message` row
+  now reads `upstream isError (<n> chars)`, or
+  `[upstream error: non-text error content]` when the result has no text. It
+  used to hold the first 500 characters of the upstream's text, which can quote
+  the request back: a URL query, an argument, part of a header. What the
+  client receives does not change: the text, `structuredContent`, `_meta` and
+  non-text blocks, within the existing `max_upstream_bytes` limit and
+  surrogate escaping. Read the upstream's message there.
 - An empty tool filter now matches no tools in `mms tune` and
   `stm_tuning_recommendations`; omit the filter to analyze all tools. In particular,
   `mms tune --apply --yes --tool ""` no longer writes overrides for other tools (#1036).
@@ -180,6 +189,9 @@ changes inline only. See the deprecation policy in
 - Stop the proxy CLI crashing on a config file it cannot read, and
   `mms config validate` on one that is not valid UTF-8; render the CLI's own
   parse errors the same way (#1095). **Behavior change**: see the upgrade
+  notes above.
+- Store a fixed summary instead of an upstream `isError` result's text in
+  `proxy_metrics.error_message` (#1084). **Behavior change**: see the upgrade
   notes above.
 - Keep each LLM compression fallback reason with its own result so
   overlapping calls cannot mislabel proxy metrics (#1055).

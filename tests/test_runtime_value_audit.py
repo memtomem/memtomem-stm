@@ -10,9 +10,14 @@ Surfaces, by audience:
 
 * the ``ToolError`` an MCP client and its model receive (``server.py``
   ``_make_proxy_handler`` → ``ProxyManager.safe_upstream_error``);
-* ``proxy_metrics.error_message`` rows (persisted);
+* ``proxy_metrics.error_message`` rows (persisted), including the fixed
+  summary an upstream ``isError`` result stores (#1084);
 * the startup-failure record that ``stm_proxy_health`` shows the client;
 * the ``extract_error`` / ``index_error`` columns (persisted).
+
+The one deliberate exception is the ``isError`` tool result itself, which
+reaches the client as the upstream wrote it, within the shared byte limit and
+surrogate escaping (#1084); its test pins that too.
 
 Each case asserts a positive control proving the path ran, so a pass means a
 clean surface and not an unreached branch.
@@ -348,6 +353,63 @@ async def test_stage_error_columns_carry_no_config_values(tmp_path, kind):
     assert leaked == {name: [] for name in surfaces}, f"canaries in output: {leaked}"
     for text in surfaces.values():
         _assert_vocabulary(kind, text)
+
+
+# ── upstream isError results: verbatim to the client, summary on disk ─────
+
+
+async def test_upstream_is_error_reaches_the_client_and_not_the_db(tmp_path):
+    """An upstream ``isError`` result is the tool-result channel: the model
+    reads it to correct its call, and the upstream is trusted with what it
+    echoes there, so its text, ``structuredContent``, ``_meta`` and non-text
+    blocks reach the client as written (within the shared byte limit and
+    surrogate escaping, which this ASCII, in-limit result does not trip). The
+    persisted row, which outlives the conversation, keeps only the length
+    (#1084). The canaries stand in for a request the upstream quoted back."""
+    from mcp import ClientSession
+    from mcp import types as mcp_types
+    from mcp.client._memory import InMemoryTransport
+    from mcp.server.mcpserver import MCPServer
+
+    from memtomem_stm.proxy._fastmcp_compat import register_proxy_tool
+    from memtomem_stm.server import _make_proxy_handler
+
+    echo = " ".join(_CANARIES)
+    image = mcp_types.ImageContent(type="image", data="aW1n", mimeType="image/png")
+    upstream = mcp_types.CallToolResult(
+        content=[mcp_types.TextContent(type="text", text=f"bad request: {echo}"), image],
+        structured_content={"echo": echo},
+        _meta={"echo": echo},
+        is_error=True,
+    )
+
+    store = MetricsStore(tmp_path / "metrics.db")
+    store.initialize()
+    mgr = _manager(tmp_path, store=store)
+    session = mgr._connections["srv"].session
+    session.call_tool.return_value = upstream
+
+    server = MCPServer("value-audit")
+    (info,) = mgr.get_proxy_tools()
+    register_proxy_tool(server, _make_proxy_handler(mgr, info.server, info.original_name), info)
+
+    async with InMemoryTransport(server) as streams:
+        async with ClientSession(streams[0], streams[1]) as client:
+            await client.initialize()
+            result = await client.call_tool(info.prefixed_name, {})
+
+    store.close()
+    with sqlite3.connect(tmp_path / "metrics.db") as db:
+        rows = db.execute("SELECT error_category, error_message FROM proxy_metrics").fetchall()
+
+    assert session.call_tool.await_count == 1
+    assert result.is_error is True
+    assert result.content[0].text == f"bad request: {echo}"
+    assert result.content[1].data == image.data
+    assert result.structured_content == {"echo": echo}
+    assert result.meta == {"echo": echo}
+    text_chars = len(f"bad request: {echo}")
+    assert rows == [("upstream_error", f"upstream isError ({text_chars} chars)")]
 
 
 # ── what the vocabulary deliberately keeps ────────────────────────────────
