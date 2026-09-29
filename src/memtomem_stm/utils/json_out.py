@@ -109,7 +109,9 @@ def escape_lone_surrogates(text: str) -> str:
     escapes (#761).
 
     Returns the input object UNCHANGED (same identity) when there is nothing to
-    escape, so the overwhelmingly common case allocates nothing.
+    escape, so the overwhelmingly common case allocates nothing. An ASCII
+    string cannot hold a surrogate, and ``str.isascii()`` is a flag read in
+    CPython, so base64 payloads and other ASCII text skip the scan (#1101).
 
     Lowercase to match :func:`dumps` and ``json.dumps``'s own
     ``ensure_ascii=True`` style. Like the display escaping in ``cli/_display``
@@ -117,7 +119,7 @@ def escape_lone_surrogates(text: str) -> str:
     ``\\ud800`` is indistinguishable from text that held the code unit — which
     is the accepted trade for a value that otherwise cannot be delivered at all.
     """
-    if _LONE_SURROGATE.search(text) is None:
+    if text.isascii() or _LONE_SURROGATE.search(text) is None:
         return text
     return _LONE_SURROGATE.sub(lambda m: f"\\u{ord(m.group()):04x}", text)
 
@@ -280,7 +282,7 @@ def has_lone_surrogate(value: str) -> bool:
     rather than raising as of #759, which closed the prose sites #756
     deferred; a test pins all three.
     """
-    return _LONE_SURROGATE.search(value) is not None
+    return not value.isascii() and _LONE_SURROGATE.search(value) is not None
 
 
 def require_utf8_identifier(value: str | None, field: str) -> None:

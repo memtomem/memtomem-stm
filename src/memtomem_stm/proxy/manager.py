@@ -39,6 +39,7 @@ from mcp import ClientSession
 from mcp import types as mcp_types
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
+from pydantic import BaseModel
 
 from memtomem_stm.proxy import tool_name_budget
 from memtomem_stm.proxy.cache import _make_key as _cache_key
@@ -594,22 +595,87 @@ def _connection_fingerprint(cfg: UpstreamServerConfig) -> tuple[Any, ...]:
     )
 
 
+def _scrub_surrogates_in(value: Any) -> Any:
+    """``value`` with lone surrogates escaped, or ``value`` itself if it has none.
+
+    A pydantic model is scrubbed in place and returned as is; a list is copied
+    only when an item changed; anything else goes to ``scrub_lone_surrogates``,
+    which handles the JSON the SDK decoded into ``Any``-typed fields (dicts,
+    keys included, lists, strings). A model or tuple nested *inside* such a
+    JSON subtree is not walked: none can arrive from an upstream's wire JSON.
+
+    ``issubclass(type(...))`` rather than ``isinstance``: a
+    ``MagicMock(spec=SomeModel)`` passes ``isinstance`` but its class has no
+    ``model_fields``.
+    """
+    if issubclass(type(value), BaseModel):
+        _scrub_model_surrogates(value)
+        return value
+    if isinstance(value, list):
+        replaced: list[Any] | None = None
+        for index, item in enumerate(value):
+            new_item = _scrub_surrogates_in(item)
+            if new_item is not item:
+                if replaced is None:
+                    replaced = list(value)
+                replaced[index] = new_item
+        return replaced if replaced is not None else value
+    return scrub_lone_surrogates(value)
+
+
+def _scrub_model_surrogates(model: BaseModel) -> None:
+    """Escape lone surrogates in every field of ``model``, recursively, in place.
+
+    Walks the fields pydantic itself declares, so a new field or block kind is
+    covered without being named here. A field is reassigned only when its value
+    changed, so a clean model is not written to, and a dirty field was already
+    in ``model_fields_set`` (a surrogate cannot be a default).
+    """
+    for name in type(model).model_fields:
+        current = getattr(model, name, None)
+        scrubbed = _scrub_surrogates_in(current)
+        if scrubbed is not current:
+            try:
+                setattr(model, name, scrubbed)
+            except (AttributeError, TypeError, ValueError):
+                # A frozen or read-only model: leave it. The response is then
+                # no worse off than before this scrub existed.
+                logger.debug("Could not scrub %s.%s", type(model).__name__, name, exc_info=True)
+
+
 def _scrub_result_surrogates(result: Any) -> None:
-    """Escape lone surrogates in an upstream ``CallToolResult``, in place (#761).
+    """Escape lone surrogates in an upstream ``CallToolResult``, in place (#761, #1101).
+
+    Every string the result serializes is escaped, dict keys included: each
+    content block of every kind with its ``_meta`` and ``annotations``,
+    ``structuredContent`` of any JSON type, the result's ``_meta`` and
+    ``resultType``. A surrogate left anywhere makes the whole response fail to
+    serialize, and one in a dict key is silently written as U+FFFD instead. An
+    earlier version covered only text, dict ``structuredContent`` and dict
+    ``_meta``, on the premise that non-text blocks cannot hold a surrogate; it
+    was false for every string field of those blocks (#1101). Keys follow
+    ``scrub_lone_surrogates``: a rewritten key that collides with one already
+    holding the same literal text merges with it, last one winning.
 
     In place rather than rebuilt, because the caller holds this object and
-    several later stages read attributes off it directly; and because upstream
-    results are duck-typed here (tests and spec-noncompliant servers pass
-    objects modelling only ``content``), so reconstructing the model would be
-    the fragile half of the change rather than the safe one. Every write is
-    guarded and skipped when the value is unchanged, so a clean response — the
-    overwhelming majority — is not touched at all.
+    several later stages read attributes off it directly; and because
+    re-validating a rebuilt model is not faithful — an ``AudioContent`` whose
+    ``type`` was never set comes back as ``ImageContent``, the two being the
+    same shape. Every write is skipped when the value is unchanged, so a clean
+    response — the overwhelming majority — is not touched at all.
 
-    Covers the three fields that reach a client: the text of each content
-    block, ``structuredContent`` and ``_meta``. Non-text blocks (image, audio,
-    resource) carry base64 or a URI and cannot hold a surrogate.
+    Upstream results are duck-typed here (tests and spec-noncompliant servers
+    pass objects modelling only ``content``). Anything that is not a pydantic
+    model gets the narrower walk: each block's ``text``, or the whole block if
+    it is a model, plus ``structured_content`` and ``meta``.
     """
+    if issubclass(type(result), BaseModel):
+        _scrub_model_surrogates(result)
+        return
     for block in getattr(result, "content", None) or ():
+        if issubclass(type(block), BaseModel):
+            _scrub_model_surrogates(block)
+            continue
         text = getattr(block, "text", None)
         if isinstance(text, str):
             escaped = escape_lone_surrogates(text)
@@ -617,18 +683,15 @@ def _scrub_result_surrogates(result: Any) -> None:
                 try:
                     block.text = escaped
                 except (AttributeError, TypeError, ValueError):
-                    # A frozen or read-only block: leave it. The response is
-                    # then no worse off than before this scrub existed.
                     logger.debug("Could not scrub a read-only content block", exc_info=True)
     for envelope_field in ("structured_content", "meta"):
         value = getattr(result, envelope_field, None)
-        if isinstance(value, dict):
-            scrubbed = scrub_lone_surrogates(value)
-            if scrubbed is not value:
-                try:
-                    setattr(result, envelope_field, scrubbed)
-                except (AttributeError, TypeError, ValueError):
-                    logger.debug("Could not scrub result.%s", envelope_field, exc_info=True)
+        scrubbed = scrub_lone_surrogates(value)
+        if scrubbed is not value:
+            try:
+                setattr(result, envelope_field, scrubbed)
+            except (AttributeError, TypeError, ValueError):
+                logger.debug("Could not scrub result.%s", envelope_field, exc_info=True)
 
 
 def _mark_recorded(exc: BaseException) -> None:
@@ -7359,13 +7422,16 @@ class ProxyManager:
         # ── Stage 2: INGEST SCRUB (lone surrogates) ──
         # Escape here, once, rather than at each place the text is later
         # serialized. The MCP SDK decodes a legal ``"\ud800"`` escape out of the
-        # upstream's wire JSON into a raw code unit, which
-        # ``TextContent(...).model_dump_json()`` then refuses to serialize —
-        # so the alternative to escaping is discarding a successful response.
-        # Placed BEFORE ``_shape_response`` because several consumers never go
-        # through it: the ``isError`` branch re-reads ``result.content`` itself,
-        # and ``structuredContent``/``meta`` bypass shaping entirely on their
-        # way to the client and to the cache envelope (#761).
+        # upstream's wire JSON into a raw code unit, in whichever string field
+        # it appears, and the model's ``model_dump_json()`` then refuses to
+        # serialize it — so the alternative to escaping is discarding a
+        # successful response. Placed BEFORE ``_shape_response`` because several
+        # consumers never go through it: the ``isError`` branch returns the
+        # upstream object itself, non-text blocks pass through verbatim, the
+        # first text block's ``_meta``/``annotations`` survive via
+        # ``model_copy``, and ``structuredContent``/``meta`` bypass shaping
+        # entirely on their way to the client and to the cache envelope
+        # (#761, #1101).
         _scrub_result_surrogates(result)
 
         # ── Stage 3: SHAPE (text/non-text split + max_upstream_chars guard) ──

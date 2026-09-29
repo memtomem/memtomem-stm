@@ -195,6 +195,16 @@ changes inline only. See the deprecation policy in
 - Store a fixed summary instead of an upstream `isError` result's text in
   `proxy_metrics.error_message` (#1084). **Behavior change**: see the upgrade
   notes above.
+- Deliver an upstream tool result that carries a lone surrogate outside a text
+  block's `text` (#1101). The ingest scrub escaped only that text,
+  `structuredContent` when it is an object, and the result's `_meta`. A
+  surrogate in any other string failed the whole response when it was
+  serialized: in a block's `_meta` or `annotations`, in any string of an image,
+  audio, resource link or embedded resource block, in a non-object
+  `structuredContent`, or in `resultType`. It is now delivered as its escaped
+  `\udxxx` literal, as block text has been since #773. A surrogate in a block's
+  `_meta` key used to reach the client as U+FFFD replacement characters and is
+  now escaped the same way. Responses with no surrogate are unchanged.
 - Keep each LLM compression fallback reason with its own result so
   overlapping calls cannot mislabel proxy metrics (#1055).
   **Behavior change**: see the upgrade notes above.
