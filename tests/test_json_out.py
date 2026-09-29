@@ -222,6 +222,25 @@ class TestEscapeLoneSurrogates:
         assert out == "ok\\ud83d\\ude80"
         out.encode("utf-8")
 
+    def test_ascii_text_skips_the_scan(self, monkeypatch):
+        """An ASCII string cannot hold a surrogate, so the regex is never run
+        on one: the whole-result scrub now visits every base64 ``data`` and
+        ``blob`` field, and scanning those doubled the scrub's cost (#1101)."""
+        import memtomem_stm.utils.json_out as json_out
+
+        class _NoScan:
+            def search(self, text):
+                raise AssertionError("scanned an ASCII string")
+
+            def sub(self, repl, text):
+                raise AssertionError("scanned an ASCII string")
+
+        monkeypatch.setattr(json_out, "_LONE_SURROGATE", _NoScan())
+        blob = "QUFB" * 1000
+
+        assert escape_lone_surrogates(blob) is blob
+        assert has_lone_surrogate(blob) is False
+
 
 class TestScrubLoneSurrogates:
     def test_identity_on_a_clean_tree(self):

@@ -659,3 +659,225 @@ class TestUpstreamSurrogateScrub:
 
         tree = {"a": ["x", {"b": "서버 🚀"}], "n": 1}
         assert _sanitize_nonfinite(tree) is tree
+
+
+# ── #1101: lone surrogates outside block text ────────────────────────────
+
+_BAD = "bad\ud800"
+_BAD_ESCAPED = "bad\\ud800"
+
+
+def _wire_result(payload: dict):
+    """A ``CallToolResult`` built the way the SDK builds one: validated from the
+    decoded wire JSON, so every field the upstream sent is in ``model_fields_set``."""
+    from mcp.types import CallToolResult
+
+    return CallToolResult.model_validate(payload)
+
+
+def _assert_delivered(result) -> str:
+    """Serialize the way the client-facing layer does, and check the escape
+    landed in the output rather than a U+FFFD replacement."""
+    dumped = result.model_dump_json(by_alias=True, exclude_none=True)
+    assert _BAD_ESCAPED.replace("\\", "\\\\") in dumped
+    assert "�" not in dumped
+    return dumped
+
+
+# One representative per block variant and envelope field. Each of these raised
+# ``PydanticSerializationError`` after the text-only scrub (#1101).
+_EVERY_STRING_CASES = {
+    "text _meta value": {"content": [{"type": "text", "text": "x", "_meta": {"k": _BAD}}]},
+    "text annotations": {
+        "content": [{"type": "text", "text": "x", "annotations": {"lastModified": _BAD}}]
+    },
+    "image mimeType": {"content": [{"type": "image", "data": "AA==", "mimeType": _BAD}]},
+    "audio data": {"content": [{"type": "audio", "data": _BAD, "mimeType": "audio/wav"}]},
+    "resource_link description": {
+        "content": [{"type": "resource_link", "name": "n", "uri": "u", "description": _BAD}]
+    },
+    "resource_link icon src": {
+        "content": [{"type": "resource_link", "name": "n", "uri": "u", "icons": [{"src": _BAD}]}]
+    },
+    "embedded text resource": {
+        "content": [{"type": "resource", "resource": {"uri": "u", "text": _BAD}}]
+    },
+    "embedded blob resource": {
+        "content": [{"type": "resource", "resource": {"uri": "u", "blob": _BAD}}]
+    },
+    "structuredContent string": {"content": [], "structuredContent": _BAD},
+    "structuredContent list": {"content": [], "structuredContent": [_BAD]},
+    "resultType": {"content": [], "resultType": _BAD},
+}
+
+
+class TestWholeResultSurrogateScrub:
+    """#1101: the scrub covers every string the result serializes, not a list
+    of fields. The earlier docstring's premise — non-text blocks carry base64
+    or a URI and cannot hold a surrogate — was false for every string field
+    of those blocks, and for the text block's own ``_meta``/``annotations``."""
+
+    @pytest.mark.parametrize("payload", _EVERY_STRING_CASES.values(), ids=_EVERY_STRING_CASES)
+    def test_every_string_field_is_escaped(self, payload):
+        from memtomem_stm.proxy.manager import _scrub_result_surrogates
+
+        result = _wire_result(payload)
+        _scrub_result_surrogates(result)
+
+        _assert_delivered(result)
+
+    def test_a_dict_key_is_escaped_not_replaced(self):
+        """Pydantic does not raise on a surrogate in a key: it writes U+FFFD,
+        silently corrupting the key. The escape keeps it recognisable."""
+        from memtomem_stm.proxy.manager import _scrub_result_surrogates
+
+        result = _wire_result({"content": [{"type": "text", "text": "x", "_meta": {_BAD: "v"}}]})
+        _scrub_result_surrogates(result)
+
+        assert result.content[0].meta == {_BAD_ESCAPED: "v"}
+        _assert_delivered(result)
+
+    def test_blocks_keep_their_class_and_identity(self):
+        """Rebuilding the model is the rejected design: an ``AudioContent``
+        whose ``type`` was never set (in-process construction) re-validates as
+        ``ImageContent``, the two having the same shape."""
+        from mcp.types import AudioContent, CallToolResult
+
+        from memtomem_stm.proxy.manager import _scrub_result_surrogates
+
+        block = AudioContent(data=_BAD, mimeType="audio/wav")
+        assert "type" not in block.model_fields_set
+        result = CallToolResult(content=[block])
+        _scrub_result_surrogates(result)
+
+        assert result.content[0] is block
+        assert block.data == _BAD_ESCAPED
+
+    def test_a_clean_result_is_not_written_to(self):
+        from memtomem_stm.proxy.manager import _scrub_result_surrogates
+
+        result = _wire_result(
+            {
+                "content": [
+                    {"type": "text", "text": "서버 🚀", "_meta": {"k": "v"}},
+                    {"type": "image", "data": "AA==", "mimeType": "image/png"},
+                ],
+                "structuredContent": {"rows": [{"a": "b"}]},
+                "_meta": {"m": "n"},
+            }
+        )
+        content, blocks = result.content, list(result.content)
+        structured, meta = result.structured_content, result.meta
+        block_meta = result.content[0].meta
+        fields_set = set(result.model_fields_set)
+
+        _scrub_result_surrogates(result)
+
+        assert result.content is content
+        assert all(a is b for a, b in zip(result.content, blocks))
+        assert result.structured_content is structured
+        assert result.meta is meta
+        assert result.content[0].meta is block_meta
+        assert result.model_fields_set == fields_set
+
+    def test_only_the_dirty_field_is_reassigned(self):
+        from memtomem_stm.proxy.manager import _scrub_result_surrogates
+
+        result = _wire_result({"content": [{"type": "text", "text": "ok"}], "_meta": {"k": _BAD}})
+        content = result.content
+        fields_set = set(result.model_fields_set)
+
+        _scrub_result_surrogates(result)
+
+        assert result.content is content
+        assert result.meta == {"k": _BAD_ESCAPED}
+        assert result.model_fields_set == fields_set
+
+    def test_a_magicmock_result_is_left_alone(self):
+        """``MagicMock`` fabricates every attribute; the duck-typed fallback
+        must neither raise on it nor write fabricated values back."""
+        from unittest.mock import MagicMock
+
+        from memtomem_stm.proxy.manager import _scrub_result_surrogates
+
+        result = MagicMock()
+        result.content = []
+        structured = result.structured_content
+        _scrub_result_surrogates(result)
+
+        assert result.structured_content is structured
+
+    def test_a_duck_typed_result_with_model_blocks(self):
+        """A fake result can still carry real blocks: those get the full walk,
+        and a spec-backed mock block (``isinstance`` says model, its class has
+        no ``model_fields``) must not raise."""
+        from unittest.mock import MagicMock
+
+        from mcp.types import ImageContent, TextContent
+
+        from memtomem_stm.proxy.manager import _scrub_result_surrogates
+
+        image = ImageContent(type="image", data="AA==", mimeType=_BAD)
+        spec_block = MagicMock(spec=TextContent)
+        spec_block.text = _BAD
+        result = SimpleNamespace(
+            content=[image, spec_block], is_error=False, structured_content=None, meta=None
+        )
+        _scrub_result_surrogates(result)
+
+        assert image.mime_type == _BAD_ESCAPED
+        image.model_dump_json()
+        assert spec_block.text == _BAD_ESCAPED
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("with_envelope", [False, True], ids=["bare", "envelope"])
+    async def test_success_path_through_the_pipeline(self, make_mgr, with_envelope):
+        """Non-text blocks pass through shaping verbatim and the first text
+        block keeps its ``_meta`` through ``model_copy``, so both reach the
+        client on a SUCCESS, not only on ``isError``. Without a result-level
+        envelope the manager returns a bare block list; with one, a
+        ``CallToolResult``."""
+        mgr, _, _ = make_mgr(compression=CompressionStrategy.NONE)
+        payload: dict = {
+            "content": [
+                {"type": "text", "text": "plain", "_meta": {"k": _BAD}},
+                {"type": "resource_link", "name": "n", "uri": "u", "description": _BAD},
+                {"type": "image", "data": "AA==", "mimeType": _BAD},
+            ]
+        }
+        if with_envelope:
+            payload["_meta"] = {"note": "clean"}
+        mgr._connections["srv"].session.call_tool.return_value = _wire_result(payload)
+
+        returned = await mgr.call_tool("srv", "tool", {})
+
+        blocks = returned.content if with_envelope else returned
+        assert isinstance(blocks, list) and len(blocks) == 3
+        dumped = [block.model_dump_json(by_alias=True) for block in blocks]
+        assert all("�" not in d for d in dumped)
+        assert sum(_BAD_ESCAPED.replace("\\", "\\\\") in d for d in dumped) == 3
+        if with_envelope:
+            _assert_delivered(returned)
+
+    @pytest.mark.asyncio
+    async def test_error_path_returns_a_serializable_upstream_object(self, make_mgr):
+        """The ``isError`` branch returns the upstream ``CallToolResult``
+        itself, so every field of it reaches the client — including the
+        non-dict ``structuredContent`` and ``resultType`` the success path's
+        reconstruction does not carry."""
+        mgr, _, _ = make_mgr(compression=CompressionStrategy.NONE)
+        upstream = _wire_result(
+            {
+                "content": [{"type": "resource", "resource": {"uri": _BAD, "text": "t"}}],
+                "structuredContent": [_BAD],
+                "resultType": _BAD,
+                "isError": True,
+            }
+        )
+        mgr._connections["srv"].session.call_tool.return_value = upstream
+
+        returned = await mgr.call_tool("srv", "tool", {})
+
+        assert returned is upstream
+        dumped = _assert_delivered(returned)
+        assert dumped.count(_BAD_ESCAPED.replace("\\", "\\\\")) == 3
