@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -22,7 +23,64 @@ from memtomem_stm.surfacing.feedback_store import (
     FeedbackStore,
     _REQUIRED_TABLES,
     inspect_feedback_db,
+    read_surfacing_summary,
 )
+
+
+@pytest.mark.parametrize("reader", [inspect_feedback_db, read_surfacing_summary])
+@pytest.mark.parametrize(
+    ("method", "exc"),
+    [
+        # An unreadable parent directory: ``stat()`` raises (#1092).
+        ("stat", PermissionError(13, "Permission denied", "/cnryPath/f.db")),
+        # No home directory to expand ``~`` against.
+        ("expanduser", RuntimeError("Could not determine home directory (cnryHome)")),
+        # Python 3.12's ``resolve()`` raises for a symlink loop.
+        ("resolve", RuntimeError("Symlink loop from '/cnryLoop'")),
+    ],
+    ids=["stat", "expanduser", "resolve"],
+)
+def test_read_only_readers_report_path_lookup_errors_by_type(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reader, method: str, exc: Exception
+) -> None:
+    """A failing path lookup is the reader's ``error``, not an exception that
+    escapes into ``stm_proxy_health`` or ``mms health`` (#1092)."""
+
+    def raise_(self: Path, *args: object, **kwargs: object) -> object:
+        raise exc
+
+    db_path = tmp_path / "f.db"
+    monkeypatch.setattr(Path, method, raise_)
+    status = reader(db_path)
+
+    assert status["error"] == type(exc).__name__
+    assert status["path"] == str(db_path)
+    assert "cnry" not in repr(status)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+@pytest.mark.parametrize("reader", [inspect_feedback_db, read_surfacing_summary])
+def test_read_only_readers_report_a_symlink_loop(tmp_path: Path, reader) -> None:
+    """A real loop, unmocked: Python 3.12 raises ``RuntimeError`` from
+    ``resolve()``, 3.13+ ``OSError`` from ``stat()``. Either way it is the
+    reader's ``error``, not "missing" and not an escaping exception."""
+    link = tmp_path / "loop.db"
+    link.symlink_to(link)
+    status = reader(link)
+
+    assert status["error"] in {"RuntimeError", "OSError"}
+
+
+@pytest.mark.parametrize("reader", [inspect_feedback_db, read_surfacing_summary])
+def test_read_only_readers_treat_a_non_directory_parent_as_missing(tmp_path: Path, reader) -> None:
+    """A regular file where a parent directory should be is "not created
+    yet", as it was with ``Path.exists()``, not an error."""
+    parent = tmp_path / "not-a-dir"
+    parent.write_text("")
+    status = reader(parent / "f.db")
+
+    assert status["error"] is None
+    assert "exists" not in status or status["exists"] is False
 
 
 # ---------------------------------------------------------------------------

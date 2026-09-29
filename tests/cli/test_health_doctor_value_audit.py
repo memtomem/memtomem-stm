@@ -821,6 +821,44 @@ def test_feedback_db_error_names_only_type_and_code(tmp_path, monkeypatch, comma
     _assert_clean(output, _DB_CANARIES, as_json=as_json)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX directory permissions")
+@pytest.mark.parametrize(
+    ("command", "as_json"),
+    [("health", False), ("health", True), ("doctor", True)],
+    ids=["health-text", "health-json", "doctor-json"],
+)
+def test_feedback_db_under_unreadable_directory(tmp_path, monkeypatch, command, as_json):
+    """A DB under a directory the process cannot search. Both readers report
+    ``PermissionError`` by type, so the surfacing block keeps its other fields
+    instead of collapsing into one bootstrap error (#1092) — and it is not
+    reported as a missing DB, which ``Path.exists()`` does on Python 3.14."""
+    import os
+
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    locked = tmp_path / "cnryLockedDir"
+    locked.mkdir()
+    db = locked / "sub" / "feedback.db"
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "false")
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH", str(db))
+    config = tmp_path / "stm_proxy.json"
+    config.write_text(json.dumps({"upstream_servers": {}}))
+    extra = ["--json"] if as_json else []
+    locked.chmod(0)
+    try:
+        output = _run([command, "--config", str(config), "--timeout", "3", *extra])
+    finally:
+        locked.chmod(0o755)
+
+    if as_json:
+        surfacing = json.loads(output)["surfacing"]
+        assert "error" not in surfacing
+        assert surfacing["feedback_db"]["error"] == "PermissionError"
+        assert surfacing["feedback_summary"]["error"] == "PermissionError"
+    else:
+        assert "feedback tables: error — PermissionError" in output
+
+
 def test_stats_db_errors_name_only_type_and_code(tmp_path, monkeypatch):
     metrics = tmp_path / "metrics.db"
     feedback = tmp_path / "feedback.db"
