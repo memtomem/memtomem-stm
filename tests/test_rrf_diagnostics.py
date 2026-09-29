@@ -510,3 +510,145 @@ def test_profile_failure_checks_are_pinned_verbatim(data, reason, action):
     assert checks == [
         ("ltm_rrf_boundary", "ltm RRF boundary", "WARN", f"{reason}. {_PINNED_SCOPE}", action)
     ]
+
+
+# ── Runtime-profile projection (#1082 part 3) ────────────────────────────
+
+
+def _core_profile() -> dict:
+    """The shape core's ``collect_runtime_profile`` emits, dropped fields included."""
+    data = profile()
+    data["embedding"] = {"provider": "onnx", "model": "some/model", "dimension": 384}
+    data["search"]["tokenizer"] = "unicode61"
+    data["rerank"]["provider"] = "fastembed"
+    data["dependencies"] = {
+        "fastembed": {"available": True, "version": "0.4.0", "required_for": ["embedding"]},
+        "kiwipiepy": {"available": False, "version": None, "required_for": []},
+    }
+    return data
+
+
+def test_projection_keeps_exactly_the_fields_stm_reads():
+    from memtomem_stm.surfacing.rrf_profile import project_runtime_profile
+
+    expected = profile()
+    expected["dependencies"] = {
+        "fastembed": {"available": True, "required_for": ["embedding"]},
+        "kiwipiepy": {"available": False, "required_for": []},
+    }
+    assert project_runtime_profile(_core_profile()) == expected
+
+
+@pytest.mark.parametrize("schema_version", [True, 1.0, 2, "1", None])
+def test_projection_requires_integer_schema_one(schema_version):
+    from memtomem_stm.surfacing.rrf_profile import project_runtime_profile
+
+    data = profile()
+    data["schema_version"] = schema_version
+    assert project_runtime_profile(data) is None
+
+
+@pytest.mark.parametrize("value", [None, [], "profile", 1])
+def test_projection_of_a_non_profile_is_none(value):
+    from memtomem_stm.surfacing.rrf_profile import project_runtime_profile
+
+    assert project_runtime_profile(value) is None
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "projected"),
+    [
+        ("rrf_k", True, None),
+        ("rrf_k", "60", None),
+        ("bm25_candidates", -1, None),
+        ("rrf_weights", [1.0, "x"], None),
+        ("rrf_weights", [1.0, 1.0, 1.0], None),
+        ("enable_bm25", 1, None),
+        ("configured_mode", "cnryMode", "unrecognized"),
+        ("effective_mode", ["hybrid"], "unrecognized"),
+    ],
+)
+def test_projection_replaces_present_invalid_values(key, value, projected):
+    from memtomem_stm.surfacing.rrf_profile import project_runtime_profile
+
+    result = project_runtime_profile(profile(**{key: value}))
+    assert result is not None
+    assert result["search"][key] == projected
+
+
+def test_projection_keeps_absent_keys_absent():
+    from memtomem_stm.surfacing.rrf_profile import project_runtime_profile
+
+    data = profile()
+    del data["search"]["rrf_weights"]
+    del data["search"]["effective_mode"]
+    del data["rerank"]
+    result = project_runtime_profile(data)
+    assert result is not None
+    assert "rrf_weights" not in result["search"]
+    assert "effective_mode" not in result["search"]
+    assert "rerank" not in result
+
+
+def test_projection_filters_closed_sets():
+    from memtomem_stm.surfacing.rrf_profile import project_runtime_profile
+
+    data = _core_profile()
+    data["config_state"] = "cnryState"
+    data["missing_extras"] = ["onnx", "cnryExtra", 3, "onnx"]
+    data["dependencies"]["fastembed"]["required_for"] = ["rerank", "cnryFor"]
+    data["dependencies"]["cnryDep"] = {"available": True}
+    data["dependencies"]["kiwipiepy"]["available"] = "yes"
+    result = project_runtime_profile(data)
+    assert result is not None
+    assert result["config_state"] == "unrecognized"
+    assert result["missing_extras"] == ["onnx"]
+    assert result["dependencies"] == {
+        "fastembed": {"available": True, "required_for": ["rerank"]},
+        "kiwipiepy": {"available": None, "required_for": []},
+    }
+    assert "cnry" not in json.dumps(result)
+
+
+def test_projection_list_fields_keep_absence_and_mark_invalid():
+    from memtomem_stm.surfacing.rrf_profile import project_runtime_profile
+
+    data = _core_profile()
+    data["missing_extras"] = "onnx"
+    del data["dependencies"]["kiwipiepy"]["required_for"]
+    del data["dependencies"]["fastembed"]["available"]
+    result = project_runtime_profile(data)
+    assert result is not None
+    assert result["missing_extras"] is None
+    assert result["dependencies"] == {
+        "fastembed": {"required_for": ["embedding"]},
+        "kiwipiepy": {"available": False},
+    }
+    del data["missing_extras"]
+    assert "missing_extras" not in project_runtime_profile(data)
+
+
+@pytest.mark.asyncio
+async def test_core_version_and_profile_cross_real_mcp(tmp_path):
+    from memtomem_stm.cli.proxy import _probe_ltm_mcp_server
+    from memtomem_stm.surfacing.rrf_profile import project_runtime_profile
+
+    path = tmp_path / "profile.json"
+    data = _core_profile()
+    data["embedding"]["model"] = "cnryModel"
+    path.write_text(json.dumps(data))
+    args = [
+        str(Path(__file__).with_name("_fake_memtomem_server.py")),
+        "--runtime-profile",
+        str(path),
+        "--version",
+        "0.3.0.dev5+gcnryLocal",
+    ]
+    with (tmp_path / "stderr.log").open("w+") as errlog:
+        result = await _probe_ltm_mcp_server("stdio", sys.executable, args, "", None, 15, errlog)
+    assert result["connected"] is True
+    assert result["version"] == "0.3.0.dev5"
+    # The probe keeps the snapshot raw for the diagnostics; the bootstrap
+    # status projects it before rendering (``test_health_doctor_value_audit``).
+    assert result["runtime_profile"] == data
+    assert "cnry" not in json.dumps(project_runtime_profile(result["runtime_profile"]))

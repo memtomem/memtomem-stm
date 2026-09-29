@@ -275,6 +275,44 @@ async def test_engine_abandoned_op_line(caplog):
     _assert_clean(_messages(caplog), "failed while unwinding: RuntimeError")
 
 
+_HINT_CANARIES = ("cnryWarnA", "cnryWarnB", "cnryBlock")
+
+
+async def test_engine_compose_hints_line_counts_only(caplog):
+    """Core's compose ``warnings`` and omitted block ids are its own text (#1082)."""
+    from memtomem_stm.surfacing.mcp_client import ContextComposeResult, LtmCapabilities
+
+    adapter = AsyncMock()
+    adapter.capabilities = LtmCapabilities(context_compose_schema=4)
+    adapter.context_compose = AsyncMock(
+        return_value=ContextComposeResult(
+            pinned=(),
+            retrieved=(),
+            warnings=("cnryWarnA quoted", "cnryWarnB"),
+            omitted_block_ids=("cnryBlock",),
+        )
+    )
+    engine = _engine(adapter)
+    with caplog.at_level(logging.DEBUG, logger="memtomem_stm.surfacing.engine"):
+        await engine.surface("s", "read_file", _ARGS, _RESPONSE)
+    text = _messages(caplog)
+    leaked = [c for c in _HINT_CANARIES if c in text]
+    assert leaked == [], text
+    assert "LTM hints for s/read_file: 3 hint(s)" in text, text
+
+
+async def test_engine_search_hints_line_counts_only(caplog):
+    adapter = AsyncMock()
+    adapter.search = AsyncMock(return_value=([], ["cnryWarnA", "cnryWarnB"], "ok"))
+    engine = _engine(adapter)
+    with caplog.at_level(logging.DEBUG, logger="memtomem_stm.surfacing.engine"):
+        await engine.surface("s", "read_file", _ARGS, _RESPONSE)
+    text = _messages(caplog)
+    leaked = [c for c in _HINT_CANARIES if c in text]
+    assert leaked == [], text
+    assert "LTM hints for s/read_file: 2 hint(s)" in text, text
+
+
 # ── proxy manager ─────────────────────────────────────────────────────────
 
 
@@ -589,6 +627,63 @@ def test_embedding_shape_error_counts_unknown_reply_keys():
     )
 
 
+def _sqlite_error(tmp_path: Path, kind: str) -> Exception:
+    """A real SQLite exception; ``sqlite_errorcode`` is set by SQLite itself."""
+    import sqlite3
+
+    target = tmp_path / kind
+    try:
+        if kind == "missing":
+            sqlite3.connect(f"{target.as_uri()}?mode=ro", uri=True)
+        elif kind == "notadb":
+            target.write_bytes(b"cnryNotDb " * 200)
+            sqlite3.connect(target).execute("SELECT name FROM sqlite_master").fetchall()
+        elif kind == "syntax":
+            sqlite3.connect(":memory:").execute("SELECT * FROM cnrySql")
+    except sqlite3.Error as exc:
+        return exc
+    raise AssertionError(f"no sqlite error for {kind}")
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        ("missing", "OperationalError (SQLITE_CANTOPEN)"),
+        ("notadb", "DatabaseError (SQLITE_NOTADB)"),
+        ("syntax", "OperationalError (SQLITE_ERROR)"),
+    ],
+)
+def test_sqlite_error_is_its_type_and_primary_code(tmp_path, kind, expected):
+    from memtomem_stm.utils.redact import exception_summary
+
+    exc = _sqlite_error(tmp_path, kind)
+    if kind == "syntax":
+        assert "cnrySql" in str(exc)  # the message echoes the statement
+    assert exception_summary(exc) == expected
+
+
+def test_sqlite_extended_code_maps_to_its_primary_name():
+    import sqlite3
+
+    from memtomem_stm.utils.redact import exception_summary
+
+    exc = sqlite3.OperationalError("disk I/O error cnryPath")
+    exc.sqlite_errorcode = 266  # SQLITE_IOERR_READ
+    assert exception_summary(exc) == "OperationalError (SQLITE_IOERR)"
+
+
+@pytest.mark.parametrize("code", [None, 999, "14", True])
+def test_sqlite_error_without_a_known_code_is_its_type(code):
+    import sqlite3
+
+    from memtomem_stm.utils.redact import exception_summary
+
+    exc = sqlite3.OperationalError("cnryMessage")
+    if code is not None:
+        exc.sqlite_errorcode = code
+    assert exception_summary(exc) == "OperationalError"
+
+
 def test_rendering_imports_nothing():
     """These helpers run in ``except`` blocks, often on the event loop. A cold
     ``mcp.shared.exceptions`` import there cost ~240 ms and stalled the daemon's
@@ -606,7 +701,7 @@ def test_rendering_imports_nothing():
         "r.exception_summary(ExceptionGroup('g', [ValueError('y')]))\n"
         "r.http_status_code(RuntimeError('x'))\n"
         "new = sorted(m for m in set(sys.modules) - before"
-        " if m.split('.')[0] in {'mcp', 'httpx', 'httpx2'})\n"
+        " if m.split('.')[0] in {'mcp', 'httpx', 'httpx2', 'sqlite3', '_sqlite3'})\n"
         "print(new)\n"
     )
     out = subprocess.run(

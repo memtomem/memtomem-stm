@@ -2763,9 +2763,10 @@ class SurfacingEngine:
         # see "3 results found before filtering" notices regardless of whether
         # SURFACE ultimately injects anything. Hints are NOT forwarded to the
         # downstream agent — that is a prepend-body policy change, out of
-        # scope here. See B3 plan § "forward hints to downstream".
+        # scope here. See B3 plan § "forward hints to downstream". Only their
+        # number is logged or recorded: they are Core's own text (#1082).
         if hints:
-            logger.info("LTM hints for %s/%s: %s", server, tool, "; ".join(hints))
+            logger.info("LTM hints for %s/%s: %d hint(s)", server, tool, len(hints))
             if self._token_tracker is not None:
                 try:
                     self._token_tracker.record_hints(hints)

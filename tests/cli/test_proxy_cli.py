@@ -14705,7 +14705,9 @@ asyncio.run(main())
         )
         assert proc.returncode == 0, f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
         assert "ltm server: connectable" in proc.stdout
-        assert "version 0.3.0-fake" in proc.stdout
+        line = next(ln for ln in proc.stdout.splitlines() if "ltm server:" in ln)
+        # The fake reports ``0.3.0+fake``; the local label is not shown (#1082).
+        assert line.endswith(", version 0.3.0)"), line
 
     def test_health_flags_ltm_server_missing_mem_search(self, config, monkeypatch, tmp_path):
         """An MCP server that initializes but doesn't expose ``mem_search``

@@ -15,6 +15,7 @@ from memtomem_stm.utils.json_out import (
     require_utf8_identifier,
 )
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
+from memtomem_stm.utils.redact import exception_summary
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
 logger = logging.getLogger(__name__)
@@ -241,7 +242,7 @@ def read_compression_summary(
     try:
         db = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True)
     except sqlite3.Error as exc:
-        summary["error"] = str(exc)
+        summary["error"] = exception_summary(exc)
         return summary
 
     try:
@@ -318,7 +319,7 @@ def read_compression_summary(
             params,
         ).fetchall()
     except sqlite3.Error as exc:
-        summary["error"] = str(exc)
+        summary["error"] = exception_summary(exc)
         return summary
     finally:
         db.close()

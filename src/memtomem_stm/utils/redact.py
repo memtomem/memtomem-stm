@@ -173,13 +173,51 @@ _JSONRPC_STANDARD_ERRORS: dict[int, str] = {
 }
 
 
+# SQLite's primary result codes (the low byte of an extended code). The
+# message of a SQLite error can quote a table name out of the schema or part of
+# the statement, so it is never shown; the code names the failure class
+# instead, and the rendered name comes from this table, not from the exception
+# (#1082).
+_SQLITE_PRIMARY_CODES: dict[int, str] = {
+    1: "SQLITE_ERROR",
+    2: "SQLITE_INTERNAL",
+    3: "SQLITE_PERM",
+    4: "SQLITE_ABORT",
+    5: "SQLITE_BUSY",
+    6: "SQLITE_LOCKED",
+    7: "SQLITE_NOMEM",
+    8: "SQLITE_READONLY",
+    9: "SQLITE_INTERRUPT",
+    10: "SQLITE_IOERR",
+    11: "SQLITE_CORRUPT",
+    12: "SQLITE_NOTFOUND",
+    13: "SQLITE_FULL",
+    14: "SQLITE_CANTOPEN",
+    15: "SQLITE_PROTOCOL",
+    16: "SQLITE_EMPTY",
+    17: "SQLITE_SCHEMA",
+    18: "SQLITE_TOOBIG",
+    19: "SQLITE_CONSTRAINT",
+    20: "SQLITE_MISMATCH",
+    21: "SQLITE_MISUSE",
+    22: "SQLITE_NOLFS",
+    23: "SQLITE_AUTH",
+    24: "SQLITE_FORMAT",
+    25: "SQLITE_RANGE",
+    26: "SQLITE_NOTADB",
+    27: "SQLITE_NOTICE",
+    28: "SQLITE_WARNING",
+}
+
+
 def exception_summary(exc: BaseException) -> str:
     """An exception as the fixed vocabulary shared by every error surface.
 
     Never the exception's message: servers and SDKs quote the request URL
     (query included), an argument, or part of a header back in it, in forms no
     value list can anticipate (#1079, #1082). What is left is the root cause's
-    type name, the status code of an HTTP error, a ``ResponseShapeError``'s
+    type name, the status code of an HTTP error, a SQLite error's primary
+    result-code name, a ``ResponseShapeError``'s
     STM-written message, a JSON-RPC error's code when
     it is one of the reserved ones, and — for a pydantic ``ValidationError`` —
     its error types. Not its locations: a location can be a key of the data that
@@ -206,6 +244,12 @@ def exception_summary(exc: BaseException) -> str:
     code = http_status_code(root)
     if code is not None:
         return f"HTTP {code} ({type(root).__name__})"
+    sqlite_error = _loaded_class("sqlite3", "Error")
+    if sqlite_error is not None and isinstance(root, sqlite_error):
+        result = getattr(root, "sqlite_errorcode", None)
+        name = _SQLITE_PRIMARY_CODES.get(result & 0xFF) if type(result) is int else None
+        if name is not None:
+            return f"{type(root).__name__} ({name})"
     return type(root).__name__
 
 

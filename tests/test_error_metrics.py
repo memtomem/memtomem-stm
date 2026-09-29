@@ -166,45 +166,39 @@ class TestTokenTrackerRecordError:
 
 
 class TestTokenTrackerRecordHints:
-    def test_record_hints_increments_events_and_snapshots(self):
+    def test_record_hints_increments_events_and_counts(self):
         tracker = TokenTracker()
         tracker.record_hints(["first notice", "second notice"])
         assert tracker._total_hint_events == 1
-        assert tracker._last_hints == ["first notice", "second notice"]
+        assert tracker._last_hint_count == 2
 
     def test_record_hints_empty_is_noop(self):
         tracker = TokenTracker()
         tracker.record_hints([])
         assert tracker._total_hint_events == 0
-        assert tracker._last_hints == []
+        assert tracker._last_hint_count == 0
 
-    def test_record_hints_overwrites_snapshot(self):
+    def test_record_hints_overwrites_count(self):
         tracker = TokenTracker()
         tracker.record_hints(["call 1 hint"])
         tracker.record_hints(["call 2 hint A", "call 2 hint B"])
         assert tracker._total_hint_events == 2
-        assert tracker._last_hints == ["call 2 hint A", "call 2 hint B"]
+        assert tracker._last_hint_count == 2
 
-    def test_record_hints_stores_defensive_copy(self):
-        """Caller-owned list mutations must not bleed into the snapshot."""
+    def test_get_summary_exposes_hint_count_not_text(self):
+        """Hints are Core's own text; the summary feeds agent-read stats (#1082)."""
         tracker = TokenTracker()
-        hints = ["only hint"]
-        tracker.record_hints(hints)
-        hints.append("mutated after call")
-        assert tracker._last_hints == ["only hint"]
-
-    def test_get_summary_exposes_hints(self):
-        tracker = TokenTracker()
-        tracker.record_hints(["visible"])
+        tracker.record_hints(["cnryHintText"])
         summary = tracker.get_summary()
         assert summary["total_hint_events"] == 1
-        assert summary["last_hints"] == ["visible"]
+        assert summary["last_hint_count"] == 1
+        assert "cnryHintText" not in repr(summary)
 
     def test_get_summary_hints_defaults_when_none(self):
         tracker = TokenTracker()
         summary = tracker.get_summary()
         assert summary["total_hint_events"] == 0
-        assert summary["last_hints"] == []
+        assert summary["last_hint_count"] == 0
 
 
 # ── get_summary error fields ─────────────────────────────────────────────
