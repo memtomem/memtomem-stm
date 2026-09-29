@@ -11,14 +11,16 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-09-29
+
 ### Upgrade notes
 
-- **LLM compression callers must read a result object** (#1055).
+- **LLM compression callers must read a result object** (#1074, #1055).
   `await LLMCompressor.compress(...)` now returns
   `LLMCompressionResult(text, fallback_reason)` instead of `str`; the shared
   `last_fallback` attribute is removed. Read `.text` and `.fallback_reason`
   from each call's result.
-- **Proxy CLI diagnostics and listing changed** (#1051). `mms list` adds a
+- **Proxy CLI diagnostics and listing changed** (#1074, #1051). `mms list` adds a
   SOURCE column and env-only upstream rows; text table parsers should use
   `--json`. The existing JSON `servers` map still describes the file, while
   `effective_servers` and `server_sources` describe the runtime view.
@@ -34,17 +36,18 @@ changes inline only. See the deprecation policy in
   environments invalid and report `config_error` locations and type codes, without values, in
   place of the previous value-bearing messages. For file errors, run
   `mms config validate` locally for details.
-- **`mms health` and `mms doctor` follow startup validation** (#1075). Their
+- **`mms health` and `mms doctor` follow startup validation** (#1078, #1075). Their
   `config_error` / `config schema` detail is now the location and type summary
   `status` and `list` print, instead of the first schema error's message. A
   location can name a key, such as an env or header name, but never a value
-  (#1085). An environment that startup rejects, such as
+  (#1102, #1085). An environment that startup rejects, such as
   `MEMTOMEM_STM_PROXY='[1]'`, now reports `config_valid: false` in `health` and
   FAILs `doctor`'s `config schema` check, so `mms doctor` exits 1 where it used
   to pass.
-- **Probe errors name the exception type, not its message** (#1079). In
+- **Probe errors name the exception type, not its message** (#1081, #1079). In
   `mms health`, `mms doctor`, `mms add --validate` and import validation, a
-  failed probe now reads e.g. `ConnectError`, `MCPError` or
+  failed probe now reads e.g. `ConnectError`, `MCPError` (`MCPError -32602 (Invalid params)` for
+  a reserved JSON-RPC code, #1083) or
   `HTTP 401 (HTTPStatusError)` instead of the exception text, which could
   quote the request URL, an argument or part of a header back. Run the server
   command or reach the endpoint directly for the underlying message. In
@@ -55,14 +58,14 @@ changes inline only. See the deprecation policy in
   fragment: the digest no longer covers them, and the ID gains the use-site
   suffix that credentialed endpoints carry.
 - **`mms health` and `mms doctor` hide the LTM server's launch arguments**
-  (#1077). On the direct route to a stdio LTM server, the Surfacing
+  (#1080, #1077). On the direct route to a stdio LTM server, the Surfacing
   Bootstrap line and the `doctor` `ltm` check show `<command> [args hidden]`, and `surfacing.ltm_server.args` in `--json` is
   one `<REDACTED>` per argument, so scripts can still count them. Read the
   `MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS` setting directly when you need the
   values. This is stricter than `mms list`, which hides only env-supplied
   upstream args and only in its text table.
 - **Proxied tool errors and stored failure text name the exception type, not its
-  message** (#1082). When a proxied call fails, the error the MCP client receives,
+  message** (#1083, issue #1082). When a proxied call fails, the error the MCP client receives,
   the `proxy_metrics.error_message` row, the `startup connect failed` line in
   `stm_proxy_health`, and the `extract_error` / `index_error` columns now read e.g.
   `ConnectError`, `HTTP 401 (HTTPStatusError)` or `ValidationError: int_parsing`
@@ -75,7 +78,7 @@ changes inline only. See the deprecation policy in
   overall deadline, lock timeout, policy denial, unknown server — keep their
   message. What the client receives for an upstream tool's `isError` result
   is unchanged; see #1084 below for its stored row.
-- **Runtime log lines name the exception type, not its message** (#1082). Several
+- **Runtime log lines name the exception type, not its message** (#1088, issue #1082). Several
   warnings used to print the exception's message verbatim. This covers the LTM
   client's connect, search and reconnect lines, the "Surfacing degraded", webhook,
   LLM compression and extraction, auto-index, fact indexing and embedding-fallback
@@ -92,7 +95,7 @@ changes inline only. See the deprecation policy in
   errors keep their text; config-load failures are covered by the #1087 note
   below.
 - **Text from the stores and from Core is shown by type, version or known
-  value** (#1082). A SQLite error in the feedback or metrics DB — the
+  value** (#1094, issue #1082). A SQLite error in the feedback or metrics DB — the
   `feedback tables: error` line and `surfacing.feedback_db.error` /
   `feedback_summary.error` in `mms health` and `mms doctor --json`, the
   `stm_proxy_health` feedback line, and `compression.error` / `surfacing.error`
@@ -124,7 +127,7 @@ changes inline only. See the deprecation policy in
   `TokenTracker.get_summary()` replaces `last_hints` with `last_hint_count`.
   Tracebacks are unchanged (#1086).
 - **Config-load failures are shown by location, type or position**
-  (#1087, #1089). The proxy config loader's warning lines, at startup and on
+  (#1097, #1087, #1089). The proxy config loader's warning lines, at startup and on
   every hot reload, now show the location and error type summary that
   `status`, `list`, `health`, `doctor` and `stm_proxy_health` already print,
   instead of pydantic's full message with `input_value=…`. Everywhere the
@@ -138,10 +141,10 @@ changes inline only. See the deprecation policy in
   the writers such as `add` and `remove`) print `Failed to parse <path>:
   JSONDecodeError (line L column C)` or `… UnicodeDecodeError`, and
   `Failed to read <path>: PermissionError` where an unreadable file used to
-  end in a traceback (#1095). Run `mms config validate` for the full
+  end in a traceback (#1098, #1095). Run `mms config validate` for the full
   messages; it now reports an undecodable file as `not valid UTF-8: …`
   instead of crashing.
-- **Upstream `isError` rows store a length, not the text** (#1084). When an
+- **Upstream `isError` rows store a length, not the text** (#1100, #1084). When an
   upstream tool returns `isError: true`, the `proxy_metrics.error_message` row
   now reads `upstream isError (<n> chars)`, or
   `[upstream error: non-text error content]` when the result has no text. It
@@ -151,33 +154,47 @@ changes inline only. See the deprecation policy in
   `structuredContent`, `_meta` and non-text blocks, within the existing
   `max_upstream_bytes` limit and lone-surrogate scrub. Read the upstream's
   message there.
-- **Upstream results with a lone surrogate are delivered escaped** (#1101, #1104).
-  A lone surrogate in any string of an upstream tool result now reaches the
-  client as its `\udxxx` literal. Before, a response with one outside a text
+- **Upstream results with a lone surrogate are delivered escaped** (#1104, #1101).
+  A lone surrogate in any string STM forwards from an upstream tool result now
+  reaches the client as its `\udxxx` literal. Before, a response with one outside a text
   block's `text` failed to serialize, and one in a block's `_meta` key arrived
   as U+FFFD characters. A response with no surrogate is unchanged.
+- **Feedback DB path errors are reported, not raised** (#1096, #1092). A
+  feedback DB path that cannot be looked up — an unreadable parent directory,
+  a symlink loop, a name that is too long, no home directory for `~` — now
+  shows as `feedback tables: error — <Type>` and in the readers' `error`
+  fields. `stm_proxy_health` used to fail on it, and `mms health` collapsed the
+  whole Surfacing Bootstrap block into one error line. A dangling symlink, or a
+  file where a parent directory should be, still reads as missing.
+- **`mms stats` and `mms doctor` report the surfacing opportunity log** (#1071).
+  `mms stats` adds `withheld (holdout)` and `opportunities` lines and `mms doctor` an
+  informational `surfacing opportunities` check, each only when there is
+  something to count. The feedback DB's `surfacing_events` and
+  `surfacing_opportunities` tables gain `arm` and `holdout_rate` columns, NULL
+  for existing rows. With the default `holdout_rate` of `0.0` nothing is
+  withheld.
 - An empty tool filter now matches no tools in `mms tune` and
   `stm_tuning_recommendations`; omit the filter to analyze all tools. In particular,
-  `mms tune --apply --yes --tool ""` no longer writes overrides for other tools (#1036).
+  `mms tune --apply --yes --tool ""` no longer writes overrides for other tools (#1072, #1036).
 
 ### Fixed
 
 - Match `mms list` and `mms status` validity to startup parsing, including
   rejected environment variables, without logging raw validation values
-  from read-only diagnostics (#1051). **Behavior change**: see the upgrade
+  from read-only diagnostics (#1074, #1051). **Behavior change**: see the upgrade
   notes above.
 - Match `mms health` and `mms doctor` config validity to startup parsing,
   keep input values out of their validation errors (including the surfacing
   bootstrap section and its debug log), and stop `health`
-  crashing on a `MEMTOMEM_STM_*` value settings cannot decode (#1075).
+  crashing on a `MEMTOMEM_STM_*` value settings cannot decode (#1078, #1075).
   **Behavior change**: see the upgrade notes above.
 - Keep URL query strings and fragments, and free-form exception text, out of
   `mms health` and `mms doctor`. That covers probe errors from upstream, LTM
   and Ollama endpoints, the surfacing bootstrap error, and an unrecognized LTM
-  state reported by the daemon (shown as `unknown`) (#1079).
+  state reported by the daemon (shown as `unknown`) (#1081, #1079).
   **Behavior change**: see the upgrade notes above.
 - Keep configured values out of the rest of `mms health` and `mms doctor`
-  (#1077): an upstream probe that the SDK rejects as invalid now reports the
+  (#1080, #1077): an upstream probe that the SDK rejects as invalid now reports the
   field location and error type (`invalid server entry: args.1 (string_type)`)
   instead of the pydantic message that quoted the rejected value, and a server
   reply that fails validation reads `invalid server response: …` the same way.
@@ -185,37 +202,56 @@ changes inline only. See the deprecation policy in
   launch arguments the way they already scrubbed `env` / `headers` values
   (values of four or more characters).
   **Behavior change**: see the upgrade notes above.
+- Keep upstream exception text out of what a failed proxied call returns to the
+  MCP client, the `proxy_metrics.error_message` row, the `stm_proxy_health`
+  startup line and the `extract_error` / `index_error` columns. That text could
+  quote the upstream URL's query string or fragment, an argument, or part of a
+  header; a JSON-RPC error message from the upstream is no longer passed
+  through either (#1083, issue #1082). **Behavior change**: see the upgrade
+  notes above.
+- Keep exception text and URL query strings out of runtime log lines: the LTM
+  client, surfacing, webhook, LLM compression and extraction, indexing,
+  embedding-fallback, background-task and tool-graph warnings. The
+  unscanned-compression warning no longer prints the LLM destination's userinfo
+  (#1088, issue #1082). **Behavior change**: see the upgrade notes above.
 - Keep SQLite error messages, the LTM server's free-form `version` and
   `runtime_profile` fields, and Core's hint text out of `mms health`,
   `mms doctor`, `mms stats`, `stm_proxy_health`, `stm_proxy_stats` and the
-  hint log line (#1082). **Behavior change**: see the upgrade notes above.
+  hint log line (#1094, issue #1082). **Behavior change**: see the upgrade notes above.
 - Keep rejected config values, and the paths and bytes quoted in read or
   decode errors, out of config-load failures, and stop `mms doctor` crashing on a config file that
-  is not valid UTF-8 (#1087, #1089). **Behavior change**: see the upgrade
+  is not valid UTF-8 (#1097, #1087, #1089). **Behavior change**: see the upgrade
   notes above.
 - Stop the proxy CLI crashing on a config file it cannot read, and
   `mms config validate` on one that is not valid UTF-8; render the CLI's own
-  parse errors the same way (#1095). **Behavior change**: see the upgrade
+  parse errors the same way (#1098, #1095). **Behavior change**: see the upgrade
   notes above.
+- Report a feedback DB path that cannot be looked up in the feedback readers'
+  `error` field instead of raising it, so `stm_proxy_health` no longer fails on
+  it and `mms health` keeps the rest of the Surfacing Bootstrap block, LTM
+  status included (#1096, #1092). **Behavior change**: see the upgrade notes
+  above.
 - Store a fixed summary instead of an upstream `isError` result's text in
-  `proxy_metrics.error_message` (#1084). **Behavior change**: see the upgrade
+  `proxy_metrics.error_message` (#1100, #1084). **Behavior change**: see the upgrade
   notes above.
 - Deliver an upstream tool result that carries a lone surrogate outside a text
-  block's `text` (#1101, #1104). The ingest scrub escaped only that text,
+  block's `text` (#1104, #1101). The ingest scrub escaped only that text,
   `structuredContent` when it is an object, and the result's `_meta`. A
   surrogate in any other string failed the whole response when it was
   serialized: in a block's `_meta` or `annotations`, in any string of an image,
-  audio, resource link or embedded resource block, in a non-object
-  `structuredContent`, or in `resultType`. It is now delivered as its escaped
+  audio, resource link or embedded resource block, and, on an `isError`
+  result, in a non-object `structuredContent` or in `resultType`. (A successful
+  result does not carry those two fields to the client, before or after this
+  change.) It is now delivered as its escaped
   `\udxxx` literal, as block text has been since #773. A surrogate in a block's
   `_meta` key used to reach the client as U+FFFD replacement characters and is
   now escaped the same way. Responses with no surrogate are unchanged.
   **Behavior change**: see the upgrade notes above.
 - Keep each LLM compression fallback reason with its own result so
-  overlapping calls cannot mislabel proxy metrics (#1055).
+  overlapping calls cannot mislabel proxy metrics (#1074, #1055).
   **Behavior change**: see the upgrade notes above.
-- Honor empty tool filters in compression tuning recommendations and report counts.
-  **Behavior change**: see the upgrade notes above (#1036).
+- Honor empty tool filters in compression tuning recommendations and report counts
+  (#1072, #1036). **Behavior change**: see the upgrade notes above.
 
 ### Added
 
@@ -228,13 +264,14 @@ changes inline only. See the deprecation policy in
   the proxy path never is. `surfacing_stats`, `mms stats` and `mms doctor` count only
   shown events as surfacings and report withheld ones separately, and `mms stats` /
   `mms doctor` now also show the opportunity log. With the default rate no injection is
-  withheld.
+  withheld (#1071). **Behavior change**: see the upgrade notes above.
 - **Trial extractor for the holdout** (`scripts/stm_trial.py`, repository only). A daily
   run copies hashed transcript ledgers, output and injection 4-grams, and every drawn
   event into `~/.memtomem/stm_trial.db` before Claude Code prunes the transcripts;
   `--freeze` ends the burn-in with a frozen snippet stoplist and `--purge --yes` deletes
   the database. The HMAC key is read from `stm_feedback.db` (new read-only
-  `load_hmac_key`) and never copied; no path, id or text is stored in the clear.
+  `load_hmac_key`) and never copied; no path, id or text is stored in the clear (#1073).
+  **Behavior change**: none external.
 - **Outcome resolution for the holdout trial** (`memtomem_stm.surfacing.trial.resolve`).
   A pure function over the extractor's rows, loaded with `load_resolve_inputs` in
   `scripts/stm_trial.py`. For every eligible memory of a drawn event it returns
@@ -242,7 +279,15 @@ changes inline only. See the deprecation policy in
   it reused the memory's text only after the injection, whether a later block showed the
   memory again, and whether the block was delivered. It also returns missing-outcome
   statuses and integrity flags. Reads only the transcript file the event's host ids name,
-  and nothing on the filesystem.
+  and nothing on the filesystem (#1076). **Behavior change**: none external.
+
+### Changed
+
+- docs: the location and type summary that config validation errors print is
+  described as keeping field and key names and dropping values, not as
+  value-free. `SECURITY.md` gains a "Validation error locations" bullet naming
+  the keys a location can carry, and the validation helper's docstring states
+  that data keyed by secrets must use `exception_summary` instead (#1102, #1085).
 
 ## [0.6.0] — 2026-09-26
 
