@@ -667,8 +667,7 @@ class TestErrorMessagePersistence:
 
     async def test_long_upstream_error_stores_its_length_not_a_prefix(self, tmp_path):
         # Before #1084 this row held the first MAX_ERROR_MESSAGE_CHARS of the
-        # text; the cap for STM-composed text is pinned in
-        # ``test_runtime_value_audit.py::test_rendered_text_is_capped``.
+        # joined text; an isError row no longer needs that cap.
         mgr = _make_manager_with_store(tmp_path)
         long_text = "x" * (MAX_ERROR_MESSAGE_CHARS + 250)
         mgr._connections["srv"].session.call_tool.return_value = _make_result(

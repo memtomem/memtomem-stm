@@ -144,11 +144,12 @@ changes inline only. See the deprecation policy in
   upstream tool returns `isError: true`, the `proxy_metrics.error_message` row
   now reads `upstream isError (<n> chars)`, or
   `[upstream error: non-text error content]` when the result has no text. It
-  used to hold the first 500 characters of the upstream's text, which can quote
-  the request back: a URL query, an argument, part of a header. What the
-  client receives does not change: the text, `structuredContent`, `_meta` and
-  non-text blocks, within the existing `max_upstream_bytes` limit and
-  surrogate escaping. Read the upstream's message there.
+  used to hold up to 500 characters of the upstream's text blocks, joined,
+  which can quote the request back: a URL query, an argument, part of a
+  header. What the client receives does not change: the text,
+  `structuredContent`, `_meta` and non-text blocks, within the existing
+  `max_upstream_bytes` limit and the lone-surrogate escaping of text blocks,
+  `structuredContent` and `_meta`. Read the upstream's message there.
 - An empty tool filter now matches no tools in `mms tune` and
   `stm_tuning_recommendations`; omit the filter to analyze all tools. In particular,
   `mms tune --apply --yes --tool ""` no longer writes overrides for other tools (#1036).
