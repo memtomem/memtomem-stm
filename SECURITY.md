@@ -34,6 +34,20 @@ memtomem-stm is an MCP proxy gateway. Its threat surface differs from a server-f
   persuade a model; keep write-tool surfacing disabled and review retrieved
   context before consequential actions.
 - **Sensitive content auto-detection**: Responses containing patterns that look like secrets (API keys, tokens, private keys) are detected and excluded from the response cache. Index exclusion applies only when an embedder is explicitly supplied through the library-mode `ProxyManager(index_engine=...)` extension; the bundled `mms` server does not automatically index tool responses into LTM.
+- **Upstream tool errors**: When an upstream or its transport raises, or the
+  upstream returns a JSON-RPC error, the client and the metrics DB get the
+  type, HTTP status or reserved JSON-RPC code, never the message, which can
+  quote STM's request back (a URL query, an argument, part of a header).
+  Failures STM composes itself, such as an open circuit breaker or an
+  oversized response, keep their text. An upstream tool result with
+  `isError: true` is different: it is the channel the model uses to correct
+  its call, so the client gets its text, `structuredContent`, `_meta` and
+  non-text blocks as the upstream wrote them. The shared ingest handling
+  still applies: an envelope over `max_upstream_bytes` is rejected, and the
+  lone-surrogate scrub escapes the fields it covers (its coverage gaps are
+  #1101). What the upstream echoes there falls under the trust boundary
+  above. The metrics DB keeps only `upstream isError (<n> chars)`, or a fixed
+  placeholder when the result has no text.
 - **Write-tool skip**: Memory surfacing is automatically disabled for upstream tools that mutate state, reducing the risk of injecting stale context into destructive operations.
 - **CLI output redaction**: `mms status --json` and `mms list --json` mask every `env` and `headers` value (`<REDACTED>`, keys preserved) since that machine-readable output is routinely piped to scripts, CI logs, or issue comments. The human-readable `status`/`list` tables never print `env`/`headers` at all; read the on-disk config directly when a value is genuinely needed.
 

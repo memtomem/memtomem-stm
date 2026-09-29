@@ -21,8 +21,8 @@ logger = logging.getLogger(__name__)
 MAX_TRACKED_KEYS = 10_000
 
 # Cap for ``CallMetrics.error_message`` persisted in ``proxy_metrics.db``.
-# Long enough to retain typical JSON-RPC error payloads and short upstream
-# tool messages; short enough that a chatty upstream cannot blow up the DB.
+# Long enough for STM-composed messages (which can name a server or tool);
+# short enough that no single row can blow up the DB.
 MAX_ERROR_MESSAGE_CHARS = 500
 
 
@@ -32,9 +32,9 @@ def format_error_message_from_exc(exc: BaseException) -> str:
     Only for exceptions whose text STM composed (the overall-deadline
     ``TimeoutError``): the message is kept verbatim. An exception from an
     upstream or its transport goes through ``proxy/manager.py:_safe_error_text``
-    instead, which drops the message (#1082). UPSTREAM_ERROR uses
-    ``original_text`` directly because its source is the upstream tool's text
-    payload, not a Python exception.
+    instead, which drops the message (#1082). UPSTREAM_ERROR rows store a
+    fixed summary of the upstream tool's ``isError`` text, not the text itself
+    (``proxy/manager.py:_upstream_error_row_text``, #1084).
     """
     return f"{type(exc).__name__}: {exc}"[:MAX_ERROR_MESSAGE_CHARS]
 
@@ -164,8 +164,10 @@ class CallMetrics:
     # the fixed vocabulary of ``proxy/manager.py:_safe_error_text`` — type name,
     # ``HTTP <code>``, a reserved JSON-RPC code, or STM-composed text — never
     # the exception's message (#1082). For an upstream ``isError=True`` result
-    # it is the upstream's own text, unsanitized (#1084). Truncated by callers
-    # to ``MAX_ERROR_MESSAGE_CHARS``.
+    # it is ``upstream isError (<n> chars)`` or the non-text placeholder, never
+    # the upstream's text (#1084). Callers cap free text at
+    # ``MAX_ERROR_MESSAGE_CHARS``; the fixed ``isError`` summary is short by
+    # construction.
     error_message: str | None = None
     # Compression fidelity tracking
     #

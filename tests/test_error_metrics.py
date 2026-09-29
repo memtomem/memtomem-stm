@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import Any
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -509,7 +510,9 @@ class TestManagerErrorRecording:
 # ── error_message persistence (issue #253) ───────────────────────────────
 
 
-def _make_manager_with_store(tmp_path: Path, max_retries: int = 0) -> ProxyManager:
+def _make_manager_with_store(
+    tmp_path: Path, max_retries: int = 0, **proxy_kwargs: Any
+) -> ProxyManager:
     """Like ``_make_manager`` but with a real MetricsStore so SQL assertions work."""
     server_cfg = UpstreamServerConfig(
         prefix="test",
@@ -521,6 +524,7 @@ def _make_manager_with_store(tmp_path: Path, max_retries: int = 0) -> ProxyManag
     proxy_cfg = ProxyConfig(
         config_path=Path("/tmp/proxy.json"),
         upstream_servers={"srv": server_cfg},
+        **proxy_kwargs,
     )
     store = MetricsStore(tmp_path / "metrics.db")
     store.initialize()
@@ -559,8 +563,9 @@ class TestErrorMessagePersistence:
     Without this, post-mortem inspection cannot distinguish (e.g.) a wrong
     argument name from a rate-limit hit when both surface as ``upstream_error``
     or ``protocol`` rows. See issue #253. For exception-driven rows the text is
-    the exception type or HTTP status, not its message (#1082); upstream
-    ``isError`` text and STM-composed messages are kept.
+    the exception type or HTTP status, not its message (#1082); an upstream
+    ``isError`` row stores a fixed summary of the text (#1084); STM-composed
+    messages are kept.
     """
 
     async def test_programming_persists_message(self, tmp_path):
@@ -647,18 +652,22 @@ class TestErrorMessagePersistence:
         assert cat == "timeout"
         assert msg is not None and msg.startswith("TimeoutError")
 
-    async def test_upstream_error_persists_original_text(self, tmp_path):
+    async def test_upstream_error_persists_a_fixed_summary(self, tmp_path):
         mgr = _make_manager_with_store(tmp_path)
         mgr._connections["srv"].session.call_tool.return_value = _make_result(
             "Error: page slug 'foo' not found", is_error=True
         )
         result = await mgr.call_tool("srv", "tool", {})
+        # The client still receives the upstream's text (#1084 keeps that channel).
         assert result.is_error is True
+        assert result.content[0].text == "Error: page slug 'foo' not found"
         cat, _code, msg = _read_error_row(mgr)
         assert cat == "upstream_error"
-        assert msg == "Error: page slug 'foo' not found"
+        assert msg == "upstream isError (32 chars)"
 
-    async def test_message_truncated_at_cap(self, tmp_path):
+    async def test_long_upstream_error_stores_its_length_not_a_prefix(self, tmp_path):
+        # Before #1084 this row held the first MAX_ERROR_MESSAGE_CHARS of the
+        # joined text; an isError row no longer needs that cap.
         mgr = _make_manager_with_store(tmp_path)
         long_text = "x" * (MAX_ERROR_MESSAGE_CHARS + 250)
         mgr._connections["srv"].session.call_tool.return_value = _make_result(
@@ -667,8 +676,20 @@ class TestErrorMessagePersistence:
         result = await mgr.call_tool("srv", "tool", {})
         assert result.is_error is True
         _cat, _code, msg = _read_error_row(mgr)
-        assert msg is not None
-        assert len(msg) == MAX_ERROR_MESSAGE_CHARS
+        assert msg == f"upstream isError ({MAX_ERROR_MESSAGE_CHARS + 250} chars)"
+
+    async def test_upstream_error_counts_the_blocks_the_client_receives(self, tmp_path):
+        # The shaped text is cut at max_upstream_chars and gains STM's notice;
+        # the client gets every block untouched, so the count follows the blocks.
+        mgr = _make_manager_with_store(tmp_path, max_upstream_chars=10)
+        mgr._connections["srv"].session.call_tool.return_value = SimpleNamespace(
+            content=[_text_content("a" * 30), _text_content("b" * 12)], is_error=True
+        )
+        result = await mgr.call_tool("srv", "tool", {})
+        assert result.is_error is True
+        assert [block.text for block in result.content] == ["a" * 30, "b" * 12]
+        _cat, _code, msg = _read_error_row(mgr)
+        assert msg == "upstream isError (42 chars)"
 
     async def test_success_persists_null_message(self, tmp_path):
         mgr = _make_manager_with_store(tmp_path)
