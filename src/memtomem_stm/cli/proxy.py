@@ -572,7 +572,7 @@ _STARTUP_INVALID_WARNING = "runtime configuration invalid — the server cannot 
 
 
 def _runtime_config_warning(runtime: _RuntimeProxyRead) -> str:
-    """Human guidance for a value-free runtime diagnostic."""
+    """Human guidance for a runtime diagnostic that omits configured values."""
     if runtime.startup_error:
         return _STARTUP_INVALID_WARNING
     return _CONFIG_INVALID_WARNING + "; run `mms config validate` for details"

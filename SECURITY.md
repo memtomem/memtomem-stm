@@ -48,6 +48,15 @@ memtomem-stm is an MCP proxy gateway. Its threat surface differs from a server-f
   #1101). What the upstream echoes there falls under the trust boundary
   above. The metrics DB keeps only `upstream isError (<n> chars)`, or a fixed
   placeholder when the result has no text.
+- **Validation error locations**: When STM validates its config, an
+  `stm_admin` action's parameters, or an upstream's reply to a CLI probe,
+  the error shown to the MCP client or on the CLI gives each error's
+  location and type, never the rejected value. A location can name a key: a
+  config key such as a server, env variable or header name, a parameter key
+  the client sent, or, on a probe's `invalid server response` line, a key
+  the upstream wrote. `mms config validate` prints the full messages. The MCP
+  SDK validates the outer `action` / `params` arguments before STM sees
+  them, and its error quotes the caller's own input back to that caller.
 - **Write-tool skip**: Memory surfacing is automatically disabled for upstream tools that mutate state, reducing the risk of injecting stale context into destructive operations.
 - **CLI output redaction**: `mms status --json` and `mms list --json` mask every `env` and `headers` value (`<REDACTED>`, keys preserved) since that machine-readable output is routinely piped to scripts, CI logs, or issue comments. The human-readable `status`/`list` tables never print `env`/`headers` at all; read the on-disk config directly when a value is genuinely needed.
 

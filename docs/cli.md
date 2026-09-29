@@ -348,7 +348,9 @@ leaves `config_valid` false but reports the env/default fallback in those fields
 the same environment parsing and file loading as server startup; errors identify
 candidate variables and validation locations/types without printing their values.
 For a file validation error, the text warning points to `mms config validate`
-for details; JSON `config_error` keeps only the safe location/type summary (#1051).
+for details; JSON `config_error` keeps only the location/type summary (#1051).
+A location names fields and keys, such as a server, env variable or header name,
+never their values.
 
 ```
 Usage: mms list [OPTIONS]
@@ -598,7 +600,7 @@ Checks, in order:
 |---|---|---|
 | `config file` | same path resolution as `status`/`health` | FAIL: file missing → `next: mms init` (short-circuits the report) |
 | `config JSON` | the `config validate` parse guard | FAIL: unparseable / non-object root (short-circuits) |
-| `config schema` | the `status`/`list`/`health` runtime read | FAIL: valid JSON, invalid schema — a running server would silently fall back to env/defaults; or an environment startup rejects, such as `MEMTOMEM_STM_PROXY='[1]'` — the server cannot start, and `next:` points at the named variables instead of `config validate`. The detail names locations, error types, or variable names, never values |
+| `config schema` | the `status`/`list`/`health` runtime read | FAIL: valid JSON, invalid schema — a running server would silently fall back to env/defaults; or an environment startup rejects, such as `MEMTOMEM_STM_PROXY='[1]'` — the server cannot start, and `next:` points at the named variables instead of `config validate`. The detail names locations (fields and keys such as server, env variable or header names), error types, or variable names, never values |
 | `proxy enabled` | the shared inert-state predicate (`config validate` + the runtime load advisory) | FAIL: upstream servers configured but top-level `enabled` unset — the silent `false` default advertises none of them to clients while each server still probes green; WARN: explicitly disabled (control-only mode). Omitted when no upstreams are configured |
 | `server transports` | the `add` VAL-3/VAL-4 rule | FAIL: stdio server without `command`, network server without `url` |
 | `prefixes` | the shared `proxy/prefixes.py` validators the runtime load path enforces | FAIL: empty or duplicate prefixes (same wording as the server's load rejection) |
@@ -646,7 +648,7 @@ Shows a config summary: the configuration file path, enabled flag, schema-valida
 
 `status --json` is unchanged by that split: it still carries the full redacted file `servers` map (plus `server_count`, `pruned_count`, and additive `effective_server_count` keys), so scripted consumers keep working. `enabled` reports the runtime value after environment overrides whenever startup parsing succeeds, even for a valid file. On a file error, `effective_server_count` and `enabled` describe the env/default fallback that the server uses, while `server_count` describes the file; the text output labels the fallback. If environment parsing prevents startup, `effective_server_count` is `null`, and `enabled` describes the raw file value; the text output labels a non-boolean value as invalid. Every server's `env` and `headers` values are masked (`<REDACTED>`, keys preserved); the human output never prints those fields at all, so read the on-disk config directly when a value is genuinely needed.
 
-When the file is valid JSON but fails schema validation (the state a running server silently degrades to env/defaults on), `status`, `list`, `health`, and `doctor` print a value-free validation location/type summary and a hint to run `mms config validate`. `status`, `list`, and `health` still exit 0; `doctor` FAILs its `config schema` check (exit 1) for both an invalid file and an environment startup rejects. All four check the server's own environment parsing before loading the file, so they also flag malformed variables the merged overlay could hide, including a malformed whole proxy environment block. A `SettingsError` lists candidate variable names, since the exception does not identify one reliably.
+When the file is valid JSON but fails schema validation (the state a running server silently degrades to env/defaults on), `status`, `list`, `health`, and `doctor` print a validation location/type summary (fields and keys such as env or header names, never values) and a hint to run `mms config validate`. `status`, `list`, and `health` still exit 0; `doctor` FAILs its `config schema` check (exit 1) for both an invalid file and an environment startup rejects. All four check the server's own environment parsing before loading the file, so they also flag malformed variables the merged overlay could hide, including a malformed whole proxy environment block. A `SettingsError` lists candidate variable names, since the exception does not identify one reliably.
 
 ### `config validate`
 
