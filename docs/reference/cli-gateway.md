@@ -45,6 +45,7 @@ those managed values explicitly.
 | `mms stats` | Read durable compression/surfacing statistics |
 | `mms tune` | Preview or apply per-tool compression recommendations |
 | `mms selection replay` | Evaluate selection telemetry and the labelled corpus without applying config |
+| `mms selection feedback` | Attach a user-correction or operator-override label to one recorded tool selection |
 | `mms version` | Print the installed version |
 
 ## Toolgraph policy gateway

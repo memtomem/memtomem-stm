@@ -599,7 +599,7 @@ Checks, in order:
 | check | reuses | FAIL / WARN when |
 |---|---|---|
 | `config file` | same path resolution as `status`/`health` | FAIL: file missing → `next: mms init` (short-circuits the report) |
-| `config JSON` | the `config validate` parse guard | FAIL: unparseable / non-object root (short-circuits) |
+| `config JSON` | the `config validate` parse guard | FAIL: unparseable / non-object root, `not valid UTF-8`, or `cannot read file: <Type>` such as `PermissionError` — the exception type only (short-circuits) |
 | `config schema` | the `status`/`list`/`health` runtime read | FAIL: valid JSON, invalid schema — a running server would silently fall back to env/defaults; or an environment startup rejects, such as `MEMTOMEM_STM_PROXY='[1]'` — the server cannot start, and `next:` points at the named variables instead of `config validate`. The detail names locations (fields and keys such as server, env variable or header names), error types, or variable names, never values |
 | `proxy enabled` | the shared inert-state predicate (`config validate` + the runtime load advisory) | FAIL: upstream servers configured but top-level `enabled` unset — the silent `false` default advertises none of them to clients while each server still probes green; WARN: explicitly disabled (control-only mode). Omitted when no upstreams are configured |
 | `server transports` | the `add` VAL-3/VAL-4 rule | FAIL: stdio server without `command`, network server without `url` |
@@ -663,6 +663,7 @@ Options:
 Strictly validates the config file *as written* — no `MEMTOMEM_STM_PROXY__*` env overlay, since this lints the artifact you edit and commit, not the runtime composite. Reports, with non-zero exit on any of them:
 
 - JSON parse errors and non-object roots,
+- a file that cannot be read or is not valid UTF-8 (`cannot read file: …`, `not valid UTF-8: …`). This command prints the full error text, path and byte offset included; `status`, `list` and `doctor` name only the exception type,
 - schema validation errors (dotted location + message, one line each),
 - **unknown keys at every nesting level** (dotted paths like `upstream_servers.gh.tool_overides`). The runtime load deliberately keeps pydantic's `extra="ignore"` for forward compatibility, so a typo'd key silently vanishes there; this command is where typos fail loudly. The load path also logs one aggregated unknown-key warning per load,
 - a missing file (`status: "missing"` — a strict validator with nothing to validate fails, which is what a CI gate wants).
@@ -916,7 +917,9 @@ block. The operator-facing install/uninstall subcommands keep the strict
 host. The hook always exits `0` and emits `{}` (or empty stdout) on malformed
 input, timeout, disabled surfacing, or internal errors. By default it uses the
 local daemon path; set `MEMTOMEM_STM_HOOK__USE_DAEMON=0` for the legacy cold
-in-process path.
+in-process path. The daemon choice, both deadlines and query-text persistence
+can also arrive as the runtime flags `install` writes into the host command;
+see [the hook CLI reference](reference/cli-hooks.md#mms-hook) for the list.
 
 ### `install` / `uninstall` — per-host registration
 
@@ -1018,14 +1021,16 @@ and Windows hosts without sending them an incompatible frame.
 
 `mms project` is a Click subgroup that manages **which MCP servers a given project sees**, separately from the STM proxy gateway config. It writes to a new dotdir, `~/.mms/`, so it doesn't interfere with `~/.memtomem/stm_proxy.json` (the STM proxy bootstrap).
 
-The group ships six subcommands. State lives in three TOML files plus the
-explicit route target:
+The group ships six subcommands. State lives in three TOML files, a
+drift-detection sidecar and a lock file, plus the explicit route target:
 
 | Path | Purpose | Commit? |
 |------|---------|---------|
 | `~/.mms/registry.toml` | Global MCP definition catalog (filled by `mms import`; not by `mms add`) | **No** — gitignore |
 | `~/.mms/projects.toml` | Auto-managed projects index (path + last_seen) | **No** — gitignore |
 | `<project>/.mms/project.toml` | Per-project enabled MCP names | **Yes** |
+| `~/.mms/import_state.toml` | Drift-detection sidecar: the per-server baseline `mms import` records and `mms host` compares against; one per machine, with its own schema version | **No** — gitignore |
+| `~/.mms/.lock` | Advisory cross-process lock taken while the registry or the sidecar is written | **No** |
 
 ```
 Usage: mms project [OPTIONS] COMMAND [ARGS]...
@@ -1169,7 +1174,7 @@ A small set of env keys that could enable code injection through the proxied sub
 ## `mms host` — host-config drift inspection and sync
 
 `mms host` compares the global `~/.mms/registry.toml` catalog and its sidecar
-baseline against MCP entries currently present in host configs.
+baseline (`~/.mms/import_state.toml`) against MCP entries currently present in host configs.
 
 ```
 Usage: mms host [OPTIONS] COMMAND [ARGS]...
@@ -1193,7 +1198,7 @@ discovered in project-local config files under the current directory are
 refused unless `--allow-project-configs` is passed. REMOVE and sidecar
 BACKFILL are not gated, since neither adopts a new registry command.
 
-## MCP Tools (5 default + 1 opt-in + proxied)
+## MCP Tools (5 default + 2 opt-in + proxied)
 
 These are exposed by the `memtomem-stm` MCP server and become available to your agent once it's connected.
 
@@ -1232,6 +1237,11 @@ the value.
 | `compression_stats` | `tool?` | Compression feedback counts by kind and tool |
 | `progressive_stats` | `tool?` | Progressive-delivery follow-up rate, coverage, and per-tool breakdown |
 | `tuning_recommendations` | `since_hours?`, `tool?` | Per-tool compression tuning recommendations from the auto-tuner (apply them with [`mms tune --apply`](#tune)) |
+
+The second opt-in tool, `stm_memory_propose`, submits a pending review-first
+candidate to a compatible core and is advertised only when
+`MEMTOMEM_STM_FORMATION__ENABLED=true` is set before server start; see
+[the review-first tool reference](reference/mcp-tools.md#optional-review-first-tool).
 
 Plus all proxied tools named `{prefix}__{original_tool_name}` (e.g. `fs__read_file`, `gh__search_repositories`).
 

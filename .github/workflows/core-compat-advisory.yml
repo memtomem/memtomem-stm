@@ -70,6 +70,13 @@ jobs:
           - core: "0.5.0"
             expected: schema4
             mcp_pin: ""
+          # 0.6.5 is the newest Core on PyPI at 2026-09-29. The smoke passed
+          # locally against it with `--expect schema4` (context_compose schema
+          # 4 with score_scale, the review-first flow, and the guide's cleanup),
+          # and it declares `mcp[cli]>=2.0.0,<3` itself, so no pin.
+          - core: "0.6.5"
+            expected: schema4
+            mcp_pin: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

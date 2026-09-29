@@ -11,6 +11,31 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Changed
+
+- docs: README and the reference docs are refreshed for 0.6.1. Statements the
+  code had moved past are corrected: `status` and `list` report every schema
+  error by location and type, not only the first; an unreadable or non-UTF-8
+  config file is described per command (`config validate` shows the full error,
+  `doctor`, `status` and `list` only its type); `docs/cli.md` counts two opt-in
+  tools, adding `stm_memory_propose`; and `docs/surfacing.md` names
+  `stm_admin(action="surfacing_stats")` instead of the retired tool. Surfaces no
+  document mentioned are added: the bare `mms hook` runtime flags, `mms
+  selection feedback` in the gateway reference, every `scripts/stm_trial.py`
+  option, outcome resolution as a separate library step, and the
+  `~/.mms/import_state.toml` sidecar and lock file. README gains a command map
+  and links to the MCP tool, proxy JSON and selection-evaluation references,
+  each pinned by a test. **Behavior change**: none external.
+- docs: the reviewed-resume guide's install pins widen to `<0.7`, after the
+  walkthrough was rerun with core 0.6.5 and memtomem-stm 0.6.1. The guide now
+  names the pairs it was exercised with instead of implying every release in
+  the range was, and sets `MEMTOMEM_STM_SURFACING__PREVIEW_MAX_CHARS=1200`,
+  because each demo section is longer than the default 300-character preview
+  and the adjacent snippets it promises did not render. The weekly
+  compatibility advisory gains a core 0.6.5 row, verified locally first: the
+  smoke passes with `--expect schema4`. README and `docs/surfacing.md` call
+  0.6.5 the current Core. **Behavior change**: none external.
+
 ## [0.6.1] — 2026-09-29
 
 ### Upgrade notes

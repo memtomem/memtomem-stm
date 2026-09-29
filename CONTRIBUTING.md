@@ -136,7 +136,7 @@ patterns, not automatic cleanup for unrelated sessions.
 - `src/memtomem_stm/` — Core: MCP server, proxy pipeline, compression, surfacing, caching, observability
   - `proxy/` — bundled pipeline `CLEAN → COMPRESS → SURFACE`, privacy scanning, and an optional library-mode INDEX stage for custom embedders
   - `surfacing/` — Memory surfacing engine and relevance gating
-  - `observability/` — Langfuse tracing and metrics
+  - `observability/` — Langfuse tracing and OTLP span export (proxy metrics live in `proxy/metrics.py`)
   - `cli/` — `mms` / `memtomem-stm-proxy` / `memtomem-stm` CLI (all three entry points resolve to the same Click group, see #260)
   - `daemon/` — Warm surfacing daemon (`mms daemon`): client, discovery, locking, protocol, spawn
   - `mms/` — `mms import` / `mms host` / `mms project` registry state (`~/.mms/`), drift detection, secret classification
