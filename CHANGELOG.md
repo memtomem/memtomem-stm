@@ -151,6 +151,11 @@ changes inline only. See the deprecation policy in
   `structuredContent`, `_meta` and non-text blocks, within the existing
   `max_upstream_bytes` limit and lone-surrogate scrub. Read the upstream's
   message there.
+- **Upstream results with a lone surrogate are delivered escaped** (#1101, #1104).
+  A lone surrogate in any string of an upstream tool result now reaches the
+  client as its `\udxxx` literal. Before, a response with one outside a text
+  block's `text` failed to serialize, and one in a block's `_meta` key arrived
+  as U+FFFD characters. A response with no surrogate is unchanged.
 - An empty tool filter now matches no tools in `mms tune` and
   `stm_tuning_recommendations`; omit the filter to analyze all tools. In particular,
   `mms tune --apply --yes --tool ""` no longer writes overrides for other tools (#1036).
@@ -196,7 +201,7 @@ changes inline only. See the deprecation policy in
   `proxy_metrics.error_message` (#1084). **Behavior change**: see the upgrade
   notes above.
 - Deliver an upstream tool result that carries a lone surrogate outside a text
-  block's `text` (#1101). The ingest scrub escaped only that text,
+  block's `text` (#1101, #1104). The ingest scrub escaped only that text,
   `structuredContent` when it is an object, and the result's `_meta`. A
   surrogate in any other string failed the whole response when it was
   serialized: in a block's `_meta` or `annotations`, in any string of an image,
@@ -205,6 +210,7 @@ changes inline only. See the deprecation policy in
   `\udxxx` literal, as block text has been since #773. A surrogate in a block's
   `_meta` key used to reach the client as U+FFFD replacement characters and is
   now escaped the same way. Responses with no surrogate are unchanged.
+  **Behavior change**: see the upgrade notes above.
 - Keep each LLM compression fallback reason with its own result so
   overlapping calls cannot mislabel proxy metrics (#1055).
   **Behavior change**: see the upgrade notes above.
