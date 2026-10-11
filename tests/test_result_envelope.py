@@ -19,7 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from mcp.types import CallToolResult, ImageContent, TextContent
+from mcp.types import Annotations, CallToolResult, ImageContent, TextContent
 
 from memtomem_stm.proxy.cache import ProxyCache
 from memtomem_stm.proxy.config import (
@@ -134,6 +134,110 @@ def _latest_error(store: MetricsStore) -> dict | None:
 
 
 class TestEnvelopePreservation:
+    @pytest.mark.parametrize("result_meta", [None, {"result": "meta"}])
+    async def test_text_block_metadata_survives_compression_cache_and_sdk(
+        self, make_mgr, result_meta
+    ):
+        from memtomem_stm.proxy._fastmcp_compat import to_call_tool_result
+
+        mgr, _, cache = make_mgr(with_cache=True)
+        cfg = mgr._config.model_copy(deep=True)
+        cfg.min_result_retention = 0.0
+        cfg.upstream_servers["srv"].max_result_chars = 500
+        mgr._config_loader.seed(cfg)
+        text = TextContent(
+            type="text",
+            text="word " * 1000,
+            annotations=Annotations(audience=["user"], priority=0.5),
+            _meta={"tag": "source-block", "custom_extension": {"kept": True}},
+        )
+        session = _set_upstream(mgr, CallToolResult(content=[text], _meta=result_meta))
+        cold = to_call_tool_result(await mgr.call_tool("srv", "tool", {}))
+        cache.close()
+        cache.initialize()
+        warm = to_call_tool_result(await mgr.call_tool("srv", "tool", {}))
+        assert session.call_tool.await_count == 1
+        for res in (cold, warm):
+            block = res.content[0]
+            assert len(block.text) < len(text.text)
+            assert block.annotations == text.annotations
+            assert block.meta == text.meta
+            assert block.meta["custom_extension"] == {"kept": True}
+            assert res.meta == result_meta
+        assert cold.model_dump() == warm.model_dump()
+
+    async def test_multiple_annotated_blocks_preserve_boundaries_and_bypass_pipeline(
+        self, make_mgr
+    ):
+        mgr, store, cache = make_mgr(with_cache=True)
+        cfg = mgr._config.model_copy(update={"max_upstream_chars": 1000})
+        mgr._config_loader.seed(cfg)
+        first = TextContent(type="text", text="a" * 600, annotations=Annotations(audience=["user"]))
+        second = TextContent(type="text", text="b" * 600, _meta={"block": "two"})
+        image = _image_content()
+        session = _set_upstream(
+            mgr,
+            CallToolResult(
+                content=[first, image, second],
+                structured_content={"answer": 42},
+                _meta={"kept": True},
+            ),
+        )
+        mgr._compress_and_surface = AsyncMock(side_effect=AssertionError("must preserve blocks"))
+        mgr._run_index_stage = AsyncMock(side_effect=AssertionError("must not index merged text"))
+        for _ in range(2):
+            res = await mgr.call_tool("srv", "tool", {})
+            assert isinstance(res, CallToolResult)
+            assert res.content[0].text == "a" * 600
+            assert res.content[0].annotations == first.annotations
+            assert res.content[1] is image
+            assert res.content[2].text == "b" * 400
+            assert res.content[2].meta == second.meta
+            assert "max_upstream_chars guard" in res.content[3].text
+            assert res.structured_content == {"answer": 42}
+            assert res.meta == {"kept": True}
+        assert session.call_tool.await_count == 2
+        assert cache.stats()["total_entries"] == 0
+        assert store._db.execute("SELECT count(*) FROM proxy_metrics").fetchone()[0] == 2
+
+    async def test_identical_metadata_preserves_large_blocks_despite_compression_budget(
+        self, make_mgr
+    ):
+        mgr, _, cache = make_mgr(with_cache=True)
+        cfg = mgr._config.model_copy(deep=True)
+        cfg.min_result_retention = 0.0
+        cfg.upstream_servers["srv"].max_result_chars = 500
+        mgr._config_loader.seed(cfg)
+        blocks = [
+            TextContent(
+                type="text",
+                text=char * 200_000,
+                annotations=Annotations(audience=["assistant"]),
+            )
+            for char in ("a", "b")
+        ]
+        session = _set_upstream(mgr, CallToolResult(content=blocks))
+        mgr._compress_and_surface = AsyncMock(side_effect=AssertionError("preserve boundaries"))
+        mgr._run_index_stage = AsyncMock(side_effect=AssertionError("preserve boundaries"))
+        for _ in range(2):
+            result = await mgr.call_tool("srv", "tool", {"_context_query": "explicit memory query"})
+            assert result.content == blocks
+            assert sum(len(block.text) for block in result.content) == 400_000
+        assert session.call_tool.await_count == 2
+        assert cache.stats()["total_entries"] == 0
+        mgr._compress_and_surface.assert_not_awaited()
+        mgr._run_index_stage.assert_not_awaited()
+
+    async def test_multiple_blocks_keep_later_metadata_without_truncation(self, make_mgr):
+        mgr, _, _ = make_mgr()
+        blocks = [
+            TextContent(type="text", text="first"),
+            TextContent(type="text", text="second", _meta={"id": 2}),
+        ]
+        _set_upstream(mgr, CallToolResult(content=blocks))
+        res = await mgr.call_tool("srv", "tool", {})
+        assert res.content == blocks
+
     async def test_text_with_structured_and_meta_returns_envelope(self, make_mgr):
         mgr, _, _ = make_mgr()
         _set_upstream(mgr, _result("payload text", structured={"a": 1}, meta={"trace": "x"}))

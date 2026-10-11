@@ -602,6 +602,12 @@ def _connection_cache_identity(cfg: UpstreamServerConfig) -> str:
     return hashlib.sha256(payload.encode("ascii")).hexdigest()
 
 
+def _text_block_metadata(block: Any) -> dict[str, Any]:
+    if not isinstance(block, mcp_types.TextContent):
+        return {}
+    return block.model_dump(by_alias=True, exclude={"type", "text"}, exclude_none=True)
+
+
 def _scrub_surrogates_in(value: Any) -> Any:
     """``value`` with lone surrogates escaped, or ``value`` itself if it has none.
 
@@ -5224,11 +5230,16 @@ class ProxyManager:
             )
             structured_content = getattr(cached, "structured_content", None)
             result_meta = getattr(cached, "meta", None)
-            if structured_content is not None or result_meta is not None:
+            block_metadata = getattr(cached, "text_block_metadata", None)
+            if structured_content is not None or result_meta is not None or block_metadata:
                 from mcp.types import TextContent
 
                 return mcp_types.CallToolResult(
-                    content=[TextContent(type="text", text=surfaced)],
+                    content=[
+                        TextContent.model_validate(
+                            {**(block_metadata or {}), "type": "text", "text": surfaced}
+                        )
+                    ],
                     structured_content=structured_content,
                     _meta=result_meta,
                 )
@@ -7183,6 +7194,7 @@ class ProxyManager:
         config_fingerprint: str,
         connection_identity_matches: bool,
         source_response_chars: int,
+        text_block_metadata: dict[str, Any] | None,
         postprocess_retry_required: bool = False,
     ) -> None:
         """Stage 5: best-effort cache store of the PRE-surfacing ``comp.compressed``
@@ -7314,6 +7326,7 @@ class ProxyManager:
                     structured_content=structured_content,
                     meta=result_meta,
                     source_response_chars=source_response_chars,
+                    text_block_metadata=text_block_metadata,
                 )
             except Exception:
                 logger.warning(
@@ -7538,6 +7551,54 @@ class ProxyManager:
                 is_error=True,
             )
 
+        text_blocks = [block for block in result.content or [] if block.type == "text"]
+        if len(text_blocks) > 1 and any(_text_block_metadata(block) for block in text_blocks):
+            # Combining blocks can assign one block's audience or metadata to
+            # another's text. Preserve this response's boundaries instead of
+            # compressing/surfacing/indexing it as a single string.
+            remaining = cfg_snap.max_upstream_chars
+            preserved: list = []
+            original_chars = 0
+            delivered_chars = 0
+            for block in result.content or []:
+                if block.type != "text":
+                    preserved.append(block)
+                    continue
+                text = block.text or ""
+                original_chars += len(text)
+                bounded = text[:remaining]
+                remaining -= len(bounded)
+                delivered_chars += len(bounded)
+                if hasattr(block, "model_copy"):
+                    preserved.append(block.model_copy(update={"text": bounded}))
+                else:
+                    preserved.append(mcp_types.TextContent(type="text", text=bounded))
+            if delivered_chars < original_chars:
+                notice = (
+                    f"[response truncated to {cfg_snap.max_upstream_chars} chars at "
+                    "max_upstream_chars guard — upstream returned an oversized payload]"
+                )
+                preserved.append(mcp_types.TextContent(type="text", text=notice))
+                delivered_chars += len(notice)
+            self.tracker.record(
+                CallMetrics(
+                    server=server,
+                    tool=tool,
+                    original_chars=original_chars,
+                    compressed_chars=delivered_chars,
+                    trace_id=trace_id,
+                )
+            )
+            self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
+            self._invalidate_disabled_cache(
+                server, tool, cache_args, cfg_snap=cfg_snap, context_query=context_query
+            )
+            return mcp_types.CallToolResult(
+                content=preserved,
+                structured_content=structured_content,
+                _meta=result_meta,
+            )
+
         if shaped.passthrough is not None:
             # Both passthrough shapes are live upstream calls, so both record the
             # 0/0 metric — otherwise an eligible empty response would carry a
@@ -7715,6 +7776,7 @@ class ProxyManager:
             config_fingerprint=config_fp,
             connection_identity_matches=fetched.connection_identity == cache_identity,
             source_response_chars=len(cleaned),
+            text_block_metadata=_text_block_metadata(shaped.first_text_content) or None,
             postprocess_retry_required=(
                 index_ok is False
                 or extract_ok is False
@@ -7744,15 +7806,13 @@ class ProxyManager:
         # fidelity). Progressive/selective continuations
         # (``stm_proxy_read_more`` / ``stm_proxy_select_chunks``) return plain
         # text and do not re-carry the envelope.
+        template = shaped.first_text_content
+        if template is not None and hasattr(template, "model_copy"):
+            processed_text = template.model_copy(update={"text": final_result})
+        else:
+            processed_text = mcp_types.TextContent(type="text", text=final_result)
         if non_text_content:
             k = shaped.non_text_before_first_text
-            template = shaped.first_text_content
-            if template is not None and hasattr(template, "model_copy"):
-                processed_text = template.model_copy(update={"text": final_result})
-            else:
-                from mcp.types import TextContent
-
-                processed_text = TextContent(type="text", text=final_result)
             content_blocks: list = [
                 *non_text_content[:k],
                 processed_text,
@@ -7766,11 +7826,9 @@ class ProxyManager:
                 )
             return content_blocks
 
-        if has_result_envelope:
-            from mcp.types import TextContent
-
+        if has_result_envelope or _text_block_metadata(template):
             return mcp_types.CallToolResult(
-                content=[TextContent(type="text", text=final_result)],
+                content=[processed_text],
                 structured_content=structured_content,
                 _meta=result_meta,
             )
