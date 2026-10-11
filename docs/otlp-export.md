@@ -65,7 +65,13 @@ logger STM does not own.
 **Redirects are refused.** A telemetry endpoint has no business answering
 3xx, and requests keeps non-`Authorization` headers across hosts — so a
 redirecting collector could otherwise walk your `x-api-key` to a host you
-never configured. A 3xx is a failed export. A malformed endpoint
+never configured. The exporter's transport sends every request with
+redirects off, which is why the `otlp` extra requires OpenTelemetry 1.45.1
+or later, and STM counts a 3xx as a failed export. One exception: when
+`OTEL_PYTHON_EXPORTER_OTLP_HTTP_CREDENTIAL_PROVIDER` (or its `TRACES_`
+variant) installs a credential provider, the exporter uses that provider's
+session as is. The redirect is still not followed, but OpenTelemetry
+reports the dropped batch as delivered. A malformed endpoint
 fails startup rather than becoming a permanent, quiet export failure.
 
 ## What is exported

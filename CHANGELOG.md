@@ -65,6 +65,21 @@ changes inline only. See the deprecation policy in
   smoke passes with `--expect schema4`. README and `docs/surfacing.md` call
   0.6.5 the current Core (#1106). **Behavior change**: none external.
 
+### Fixed
+
+- otlp: with OTLP export enabled, startup failed with an `AttributeError` on
+  `opentelemetry-exporter-otlp-proto-http` 1.45.0 or later, which a fresh
+  `memtomem-stm[otlp]` install resolves since 2026-09-25: that release removed
+  the private session attribute STM set to refuse redirects. The `otlp` extra
+  now floors the SDK and exporter at 1.45.1, whose transport sends every export
+  with redirects off, and STM passes its own requests session instead of
+  touching exporter internals. That exporter counts a 2xx or 3xx status as
+  delivered, so the session's response hook fails a 3xx export; it stays a
+  counted `export_failures` entry as before. **Behavior change**: installations
+  with OTLP export resolve OpenTelemetry 1.45.1 or later. With an OpenTelemetry
+  credential provider configured, STM leaves the provider's session in place,
+  so a 3xx drops the batch without being counted as a failure.
+
 ## [0.6.1] — 2026-09-29
 
 ### Upgrade notes

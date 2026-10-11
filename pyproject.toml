@@ -53,8 +53,8 @@ langfuse = ["langfuse>=4.0", "urllib3>=2.7.0"]
 # exporter pulls grpcio, whose wheels are the Windows/py3.12 pain point and
 # CI runs the suite there too.
 otlp = [
-    "opentelemetry-sdk>=1.30",
-    "opentelemetry-exporter-otlp-proto-http>=1.30",
+    "opentelemetry-sdk>=1.45.1",
+    "opentelemetry-exporter-otlp-proto-http>=1.45.1",
     "urllib3>=2.7.0",
 ]
 langchain = [
@@ -103,8 +103,8 @@ dev = [
     "nbmake>=1.5",
     # Exercised by tests/test_observability_otlp.py via an in-memory span
     # exporter — no network. Mirrors the `otlp` extra.
-    "opentelemetry-sdk>=1.30",
-    "opentelemetry-exporter-otlp-proto-http>=1.30",
+    "opentelemetry-sdk>=1.45.1",
+    "opentelemetry-exporter-otlp-proto-http>=1.45.1",
     # tests/test_docs_links.py parses the public docs with a real CommonMark
     # parser instead of hand-rolling one. Declared rather than leaned on as
     # rich's transitive dependency, which could drop it at any release.

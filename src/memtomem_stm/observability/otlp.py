@@ -42,6 +42,7 @@ not a span — never an error.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import traceback
 from contextlib import contextmanager
@@ -267,6 +268,41 @@ def _remove_log_screen(counters: _Counters) -> None:
         for existing in list(logger_obj.filters):
             if isinstance(existing, _LogScreen) and existing.owns(counters):
                 logger_obj.removeFilter(existing)
+
+
+# The exporter builds its session from an operator-installed credential
+# provider when either is set; supplying STM's session would silently replace
+# that provider's authentication, so STM steps aside instead.
+_CREDENTIAL_PROVIDER_ENVS = (
+    "OTEL_PYTHON_EXPORTER_OTLP_HTTP_CREDENTIAL_PROVIDER",
+    "OTEL_PYTHON_EXPORTER_OTLP_HTTP_TRACES_CREDENTIAL_PROVIDER",
+)
+
+
+class _CollectorRedirected(Exception):
+    """A collector answered 3xx; the export fails instead of following it."""
+
+
+def _refuse_redirect(response: Any, *args: Any, **kwargs: Any) -> Any:
+    # The exporter already sends every request with redirects off, but it
+    # counts a 2xx or 3xx status as delivered, so a 3xx would drop the batch
+    # while reporting success. Raising here turns it into a failed export.
+    if 300 <= response.status_code < 400:
+        status = response.status_code
+        response.close()
+        raise _CollectorRedirected(f"collector answered {status}; redirects are refused")
+    return response
+
+
+def _export_session() -> Any:
+    """Return a requests session that fails 3xx exports, or None to defer."""
+    if any(os.environ.get(name) for name in _CREDENTIAL_PROVIDER_ENVS):
+        return None
+    import requests
+
+    session = requests.Session()
+    session.hooks["response"].append(_refuse_redirect)
+    return session
 
 
 class _CountingExporter:
@@ -578,17 +614,15 @@ def init_otlp(config: OtlpExportConfig, *, span_processor: Any = None) -> OtlpEm
             endpoint=normalize_otlp_endpoint(config.endpoint),
             headers=dict(config.headers) or None,
             timeout=config.timeout_seconds,
+            # A collector answering 3xx must not walk STM's `x-api-key` to a
+            # host the operator never configured: requests keeps
+            # non-Authorization headers across hosts. The exporter's transport
+            # sends every export with redirects off, which is why the `otlp`
+            # extra floors at 1.45.1 — older exporters followed up to 30 hops.
+            # The session makes that 3xx a failed export rather than a
+            # silently dropped batch.
+            session=_export_session(),
         )
-        # Requests follows up to 30 redirects by default and keeps
-        # non-Authorization headers across hosts, so a collector answering 3xx
-        # could walk STM's `x-api-key` to a host the operator never configured
-        # — and the transport logs each hop's host and path. A telemetry
-        # endpoint has no business redirecting: a 3xx is now just a failed
-        # export.
-        # (`allow_redirects` is a per-request kwarg, not a session setting, so
-        # `max_redirects` is what actually holds here — verified against a
-        # local redirecting server: the second hop never receives the header.)
-        exporter._session.max_redirects = 0
         span_processor = BatchSpanProcessor(
             # Duck-typed rather than subclassed: the SDK is an optional extra,
             # so `SpanExporter` cannot be a module-level base class here.
