@@ -13,6 +13,12 @@ changes inline only. See the deprecation policy in
 
 ### Changed
 
+- proxy: bind cached replies to the active transport configuration and retain
+  the cleaned source length for surfacing on cache hits. **Behavior change**:
+  connection edits no longer replay another upstream's cached reply, and warm
+  calls use the same surfacing size gate as cold calls. Cache schema v6 clears
+  existing response-cache rows once; metrics and feedback remain intact.
+
 - docs: README and the reference docs are refreshed for 0.6.1. Statements the
   code had moved past are corrected: `status` and `list` report every schema
   error by location and type, not only the first; an unreadable or non-UTF-8

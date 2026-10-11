@@ -17,7 +17,17 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from mcp.types import CallToolResult
+
     from memtomem_stm.proxy.config import CompressionStrategy
+
+
+@dataclass(frozen=True, slots=True)
+class FetchResult:
+    """Upstream response and the opaque identity of its actual RPC session."""
+
+    result: CallToolResult
+    connection_identity: str
 
 
 @dataclass(frozen=True, slots=True)

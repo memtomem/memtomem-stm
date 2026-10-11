@@ -91,6 +91,7 @@ from memtomem_stm.proxy.memory_ops import (
 from memtomem_stm.proxy.pipeline_stages import (
     CompressionResult,
     ExtractResult,
+    FetchResult,
     IndexResult,
     ShapedResponse,
     ShapePassthrough,
@@ -593,6 +594,12 @@ def _connection_fingerprint(cfg: UpstreamServerConfig) -> tuple[Any, ...]:
         tuple(sorted((cfg.headers or {}).items())),
         cfg.connect_timeout_seconds,
     )
+
+
+def _connection_cache_identity(cfg: UpstreamServerConfig) -> str:
+    """Hash active connection fields, including credentials, without persisting them."""
+    payload = json.dumps(_connection_fingerprint(cfg), ensure_ascii=True)
+    return hashlib.sha256(payload.encode("ascii")).hexdigest()
 
 
 def _scrub_surrogates_in(value: Any) -> Any:
@@ -3952,7 +3959,7 @@ class ProxyManager:
         )
 
     def _cache_key_fingerprint(self, server: str, tool: str, *, cfg_snap: ProxyConfig) -> str:
-        """Compression-settings fingerprint for the response-cache key.
+        """Connection and compression-settings fingerprint for the response cache.
 
         An unknown server (direct dispatch / tests with no registered
         connection) yields ``""`` — mirroring the unknown-server posture of
@@ -3964,13 +3971,17 @@ class ProxyManager:
         if server not in self._connections:
             return ""
         tc = self._resolve_tool_config(server, tool, proxy_cfg=cfg_snap)
-        return compression_fingerprint(
+        compression_fp = compression_fingerprint(
             tc,
             cfg_snap.min_result_retention,
             cfg_snap.max_upstream_chars,
             cfg_snap.max_upstream_bytes,
             cfg_snap.relevance_scorer,
         )
+        connection_identity = _connection_cache_identity(
+            self._server_cfg(self._connections[server], cfg_snap)
+        )
+        return hashlib.sha256(f"{connection_identity}:{compression_fp}".encode("ascii")).hexdigest()
 
     def _clean_content(self, text: str, cleaning_cfg: CleaningConfig) -> str:
         if not cleaning_cfg.enabled:
@@ -5200,7 +5211,12 @@ class ProxyManager:
             surfaced = await self._apply_surfacing(
                 server,
                 tool,
-                arguments,
+                {
+                    **arguments,
+                    "_stm_source_response_chars": getattr(
+                        cached, "source_response_chars", len(cached)
+                    ),
+                },
                 cached,
                 trace_id=trace_id,
                 context_query=context_query if isinstance(context_query, str) else None,
@@ -5696,12 +5712,12 @@ class ProxyManager:
         *,
         trace_id: str | None,
         cfg_snap: ProxyConfig,
-    ) -> "CallToolResult":
+    ) -> FetchResult:
         """Stage 1: fetch the upstream tool result with bounded retry + reconnect.
 
         Owns the connection handle, the per-attempt and overall deadlines, and the
         failure taxonomy (timeout / transport / protocol / programming). Returns the
-        upstream ``CallToolResult`` on success. On failure it records the error
+        upstream result with its actual connection identity. On failure it records the error
         metric, marks the exception via ``_mark_recorded`` (so the outer
         ``call_tool`` does not double-record), best-effort reconnects, and re-raises.
         ``upstream_args`` must already carry ``_trace_id`` — the caller injects it
@@ -5930,6 +5946,9 @@ class ProxyManager:
                 size_slot.rearm()
             try:
                 session, generation = self._acquire_connection_session(conn)
+                # Capture before the await: a reconnect can replace conn.config
+                # while this RPC is still returning from the retired session.
+                connection_identity = _connection_cache_identity(conn.config)
                 try:
                     result = await asyncio.wait_for(
                         session.call_tool(tool, upstream_args),
@@ -5943,7 +5962,7 @@ class ProxyManager:
                 # still closes the breaker.
                 if breaker is not None:
                     breaker.record_success()
-                return result
+                return FetchResult(result=result, connection_identity=connection_identity)
             except Exception as exc:
                 err_code = getattr(getattr(exc, "error", None), "code", None)
                 if is_inbound_message_too_large_error(exc):
@@ -7162,13 +7181,15 @@ class ProxyManager:
         cfg_snap: ProxyConfig,
         context_query: str | None,
         config_fingerprint: str,
+        connection_identity_matches: bool,
+        source_response_chars: int,
         postprocess_retry_required: bool = False,
     ) -> None:
         """Stage 5: best-effort cache store of the PRE-surfacing ``comp.compressed``
         (so memories stay fresh and surfacing re-runs on a hit).
 
         Successful text responses may include JSON-safe result-level
-        ``structuredContent``/``_meta``; cache v5 stores and reconstructs that
+        ``structuredContent``/``_meta``; cache v6 stores and reconstructs that
         envelope. Non-text/mixed content remains unstorable. Rows written here
         are marked ``envelope_safe`` by ``ProxyCache.set``.
 
@@ -7213,6 +7234,14 @@ class ProxyManager:
         hex and is unreachable by any future lookup (hit rate structurally 0%).
         """
         if self._cache is None:
+            return
+        if not connection_identity_matches:
+            # A failed hot edit can deliberately serve the previous connection.
+            # That response must not become a cache hit for the requested one.
+            self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
+            self._invalidate_disabled_cache(
+                server, tool, cache_args, cfg_snap=cfg_snap, context_query=context_query
+            )
             return
         if postprocess_retry_required:
             # Cache hits bypass INDEX/EXTRACT. Keep failed sync work and
@@ -7284,6 +7313,7 @@ class ProxyManager:
                     config_fingerprint=config_fingerprint,
                     structured_content=structured_content,
                     meta=result_meta,
+                    source_response_chars=source_response_chars,
                 )
             except Exception:
                 logger.warning(
@@ -7342,6 +7372,12 @@ class ProxyManager:
         # that invoke ``_call_tool_inner`` bypass the lookup and therefore the
         # miss counter too, matching the no-lookup semantics.
 
+        # Pin the identity paired with the lookup key before any await. The
+        # connection may be replaced (or cleared by stop()) before storage.
+        cache_identity = _connection_cache_identity(
+            self._server_cfg(self._connections[server], cfg_snap)
+        )
+
         # Snapshot the cache-key args BEFORE injecting ``_trace_id`` below.
         # The cache lookup at L771 used the original args (no ``_trace_id``);
         # if cache.set uses the mutated args, every stored entry is keyed on
@@ -7371,9 +7407,10 @@ class ProxyManager:
             # request id (#957). It stays empty for a session that was never
             # wrapped, which is what keeps the measurement below alive there.
             with measured_response() as response_size:
-                result = await self._fetch_upstream(
+                fetched = await self._fetch_upstream(
                     server, tool, upstream_args, trace_id=trace_id, cfg_snap=cfg_snap
                 )
+                result = fetched.result
 
         # ``max_upstream_bytes`` caps the inbound MCP envelope (docs/configuration.md),
         # and for a correlated response the wire check already measured exactly
@@ -7448,7 +7485,7 @@ class ProxyManager:
         # attribute, MagicMock fabricates a truthy non-dict) as well as
         # spec-noncompliant upstreams. When either field is present the
         # return shape below is a full ``CallToolResult`` so the fields reach
-        # the client verbatim. Cache v5 reproduces them for successful text-only
+        # the client verbatim. Cache v6 reproduces them for successful text-only
         # results; mixed/non-text envelopes remain live-call-only.
         raw_structured = getattr(result, "structured_content", None)
         raw_meta = getattr(result, "meta", None)
@@ -7676,6 +7713,8 @@ class ProxyManager:
             cfg_snap=cfg_snap,
             context_query=context_query,
             config_fingerprint=config_fp,
+            connection_identity_matches=fetched.connection_identity == cache_identity,
+            source_response_chars=len(cleaned),
             postprocess_retry_required=(
                 index_ok is False
                 or extract_ok is False

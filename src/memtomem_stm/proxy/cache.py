@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from mcp.types import TextContent
+
 from memtomem_stm.proxy import privacy
 from memtomem_stm.utils.digest import framed_digest
 from memtomem_stm.utils.json_out import dumps as _json_dumps
@@ -415,10 +417,12 @@ def _repair_privacy_policy(db: sqlite3.Connection) -> None:
 
 
 class CachedResponse(str):
-    """Cached text plus an optional safe MCP result-level envelope."""
+    """Cached text, source size, and safe MCP result/block metadata."""
 
     structured_content: dict[str, Any] | None
     meta: dict[str, Any] | None
+    source_response_chars: int
+    text_block_metadata: dict[str, Any] | None
 
     def __new__(
         cls,
@@ -426,10 +430,16 @@ class CachedResponse(str):
         *,
         structured_content: dict[str, Any] | None = None,
         meta: dict[str, Any] | None = None,
+        source_response_chars: int | None = None,
+        text_block_metadata: dict[str, Any] | None = None,
     ) -> CachedResponse:
         obj = super().__new__(cls, value)
         obj.structured_content = structured_content
         obj.meta = meta
+        obj.source_response_chars = (
+            len(value) if source_response_chars is None else source_response_chars
+        )
+        obj.text_block_metadata = text_block_metadata
         return obj
 
 
@@ -441,7 +451,8 @@ class CachedResponse(str):
 # result-level ``_meta`` in ``envelope_json``.
 # v5: framed (length-prefixed) key derivation, args/context_query serialized
 # with ``ensure_ascii=False`` (#784).
-_KEY_SCHEMA_VERSION = 5
+# v6: connection-scoped keys, pre-compression size, and text-block metadata.
+_KEY_SCHEMA_VERSION = 6
 
 
 def _make_key(
@@ -661,26 +672,25 @@ class ProxyCache:
             return None
         if entry.is_expired():
             return None
-        structured_content: dict[str, Any] | None = None
-        meta: dict[str, Any] | None = None
-        if envelope_json is not None:
-            parsed = self._parse_envelope(envelope_json)
-            if parsed is None:
-                # ``set()`` validates before writing, so a malformed envelope
-                # can only come from an out-of-band writer. Mirror the
-                # sensitive-row eviction above: a plain miss would leave the
-                # row as dead weight — immortal for ``ttl_seconds NULL`` rows
-                # — while still counting against ``max_entries``.
-                self._evict_row(key, server, tool, reason="envelope_json is malformed")
-                return None
-            structured_content, meta = parsed
-        return CachedResponse(entry.result, structured_content=structured_content, meta=meta)
+        parsed = self._parse_envelope(envelope_json) if envelope_json is not None else None
+        if parsed is None:
+            # A v6 writer always records the source size, even for plain text.
+            self._evict_row(key, server, tool, reason="envelope_json is missing or malformed")
+            return None
+        structured_content, meta, source_chars, block_metadata = parsed
+        return CachedResponse(
+            entry.result,
+            structured_content=structured_content,
+            meta=meta,
+            source_response_chars=source_chars,
+            text_block_metadata=block_metadata,
+        )
 
     @staticmethod
     def _parse_envelope(
         envelope_json: str,
-    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None] | None:
-        """Validated ``(structured_content, meta)`` from a stored envelope.
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, int, dict[str, Any] | None] | None:
+        """Validated result metadata, source size, and text-block metadata.
 
         ``None`` (as the whole tuple) means the row is malformed: non-JSON,
         an unknown ``schema_version``, or a non-dict field value.
@@ -693,7 +703,7 @@ class ProxyCache:
             envelope = scrub_lone_surrogates(json.loads(envelope_json))
         except (TypeError, ValueError):
             return None
-        if not isinstance(envelope, dict) or envelope.get("schema_version") != 1:
+        if not isinstance(envelope, dict) or envelope.get("schema_version") != 2:
             return None
         raw_structured = envelope.get("structuredContent")
         raw_meta = envelope.get("_meta")
@@ -701,7 +711,18 @@ class ProxyCache:
             return None
         if raw_meta is not None and not isinstance(raw_meta, dict):
             return None
-        return raw_structured, raw_meta
+        source_chars = envelope.get("source_response_chars")
+        if type(source_chars) is not int or source_chars < 0:
+            return None
+        block_metadata = envelope.get("text_block_metadata")
+        if block_metadata is not None:
+            if not isinstance(block_metadata, dict) or {"type", "text"} & block_metadata.keys():
+                return None
+            try:
+                TextContent.model_validate({**block_metadata, "type": "text", "text": ""})
+            except ValueError:
+                return None
+        return raw_structured, raw_meta, source_chars, block_metadata
 
     def _evict_row(self, key: str, server: str, tool: str, *, reason: str) -> None:
         """Best-effort single-row eviction from the ``get()`` read path.
@@ -764,6 +785,8 @@ class ProxyCache:
         config_fingerprint: str = "",
         structured_content: dict[str, Any] | None = None,
         meta: dict[str, Any] | None = None,
+        source_response_chars: int | None = None,
+        text_block_metadata: dict[str, Any] | None = None,
     ) -> None:
         if self._db is None:
             return
@@ -788,26 +811,29 @@ class ProxyCache:
                 config_fingerprint=config_fingerprint,
             )
             return
-        envelope_json: str | None = None
-        if structured_content is not None or meta is not None:
-            try:
-                envelope_json = _json_dumps(
-                    {
-                        "schema_version": 1,
-                        "structuredContent": structured_content,
-                        "_meta": meta,
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            except (TypeError, ValueError):
-                logger.debug(
-                    "Skipping cache store for %s/%s: envelope is not JSON-safe", server, tool
-                )
+        try:
+            envelope_json = _json_dumps(
+                {
+                    "schema_version": 2,
+                    "structuredContent": structured_content,
+                    "_meta": meta,
+                    "source_response_chars": (
+                        len(result) if source_response_chars is None else source_response_chars
+                    ),
+                    "text_block_metadata": text_block_metadata,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if self._parse_envelope(envelope_json) is None:
+                logger.debug("Skipping cache store for %s/%s: envelope is malformed", server, tool)
                 return
-        if privacy.contains_sensitive_content(result) or (
-            envelope_json is not None and privacy.contains_sensitive_content(envelope_json)
+        except (TypeError, ValueError):
+            logger.debug("Skipping cache store for %s/%s: envelope is not JSON-safe", server, tool)
+            return
+        if privacy.contains_sensitive_content(result) or privacy.contains_sensitive_content(
+            envelope_json
         ):
             # SECURITY.md: responses that look like secrets are never
             # persisted to the response cache. Enforced at the store
