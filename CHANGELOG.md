@@ -13,6 +13,12 @@ changes inline only. See the deprecation policy in
 
 ### Changed
 
+- deps: raise the PyJWT security floor to 2.15.0 and the optional LangChain
+  extra's langgraph-sdk floor to 0.4.4 to clear runtime and extras audit findings.
+  **Behavior change**: installations resolve patched versions of these packages;
+  langgraph-sdk remains optional. Refresh the development-only jupyterlab,
+  notebook, and tornado locks to their audited patch releases.
+
 - docs: README and the reference docs are refreshed for 0.6.1. Statements the
   code had moved past are corrected: `status` and `list` report every schema
   error by location and type, not only the first; an unreadable or non-UTF-8
