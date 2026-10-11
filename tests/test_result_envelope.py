@@ -310,19 +310,26 @@ class TestEnvelopePreservation:
         assert res.content == blocks
 
     async def test_capped_annotated_bypass_still_invalidates_disabled_cache(self, make_mgr):
-        from unittest.mock import MagicMock
+        from memtomem_stm.proxy.config import ToolOverrideConfig
 
-        mgr, _, _ = make_mgr(with_cache=True)
+        mgr, _, cache = make_mgr(with_cache=True)
         cfg = mgr._config.model_copy(deep=True)
         cfg.upstream_servers["srv"].max_result_chars = 100
         mgr._config_loader.seed(cfg)
-        spy = MagicMock(wraps=mgr._invalidate_disabled_cache)
-        mgr._invalidate_disabled_cache = spy
+        _set_upstream(mgr, _result("plain text " * 50))
+        await mgr.call_tool("srv", "tool", {})
+        assert cache.stats()["total_entries"] == 1
+
+        disabled = cfg.model_copy(deep=True)
+        disabled.upstream_servers["srv"].tool_overrides = {
+            "tool": ToolOverrideConfig(cache_ttl_seconds=0)
+        }
+        mgr._config_loader.seed(disabled)
         blocks = [TextContent(type="text", text=c * 600, _meta={"id": c}) for c in "ab"]
         _set_upstream(mgr, CallToolResult(content=blocks))
         res = await mgr.call_tool("srv", "tool", {})
         assert len(res.content[0].text) == 100
-        spy.assert_called_once()
+        assert cache.stats()["total_entries"] == 0
 
     async def test_multiple_blocks_keep_later_metadata_without_truncation(self, make_mgr):
         mgr, _, _ = make_mgr()
