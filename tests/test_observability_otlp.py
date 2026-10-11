@@ -38,6 +38,59 @@ from memtomem_stm.observability.otlp import (
 )
 from memtomem_stm.observability.tracing import traced
 
+# Read by the exporter constructor; an unknown name raises there. Spelled out
+# rather than imported so a rename in otlp.py cannot pass silently.
+_CREDENTIAL_PROVIDER_ENVS = (
+    "OTEL_PYTHON_EXPORTER_OTLP_HTTP_CREDENTIAL_PROVIDER",
+    "OTEL_PYTHON_EXPORTER_OTLP_HTTP_TRACES_CREDENTIAL_PROVIDER",
+)
+_CREDENTIAL_PROVIDER_ENV = _CREDENTIAL_PROVIDER_ENVS[0]
+
+
+class _Collector:
+    """A local HTTP collector recording each request's `x-api-key`."""
+
+    def __init__(self, status: int, location: str | None = None) -> None:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        received: list[str | None] = []
+        self.received = received
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("content-length", 0)))
+                received.append(self.headers.get("x-api-key"))
+                self.send_response(status)
+                if location is not None:
+                    self.send_header("Location", location)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        self._server = HTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://localhost:{self._server.server_port}"
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+def _export_one_span(endpoint: str, headers: dict[str, str]) -> int:
+    """Export one span through a real exporter; return the failure count."""
+    emitter = init_otlp(
+        OtlpExportConfig(enabled=True, endpoint=endpoint, headers=headers, timeout_seconds=5)
+    )
+    assert emitter is not None
+    try:
+        emitter._provider.get_tracer("collector-probe").start_span("probe").end()
+        assert emitter._provider.force_flush(10_000)
+        return emitter._counters.snapshot()["export_failures"]
+    finally:
+        shutdown_otlp(emitter, timeout_seconds=5)
+
+
 # A value the shared privacy detector actually matches — asserted below,
 # because a screening test whose input is not detectable would pass
 # tautologically no matter what the exporter does.
@@ -468,13 +521,13 @@ class TestDegradation:
     def test_initialization_failure_is_not_degraded_away(self, monkeypatch):
         """Enabled-but-unbuildable must fail startup, not run silently inert.
 
-        Reachable through the standard OTel environment surface: an invalid
-        `OTEL_EXPORTER_OTLP_COMPRESSION` is rejected by the exporter
-        constructor, not by config validation.
+        Reachable through the standard OTel environment surface: a credential
+        provider that names no installed entry point is rejected by the
+        exporter constructor, not by config validation.
         """
-        monkeypatch.setenv("OTEL_EXPORTER_OTLP_COMPRESSION", "bogus")
+        monkeypatch.setenv(_CREDENTIAL_PROVIDER_ENV, "not-installed")
 
-        with pytest.raises(ValueError):
+        with pytest.raises(RuntimeError, match="not-installed"):
             init_otlp(OtlpExportConfig(enabled=True, endpoint="http://localhost:4318"))
 
     async def test_lifespan_surfaces_an_unbuildable_exporter(self, monkeypatch):
@@ -483,9 +536,9 @@ class TestDegradation:
 
         monkeypatch.setenv("MEMTOMEM_STM_OTLP__ENABLED", "1")
         monkeypatch.setenv("MEMTOMEM_STM_OTLP__ENDPOINT", "http://localhost:4318")
-        monkeypatch.setenv("OTEL_EXPORTER_OTLP_COMPRESSION", "bogus")
+        monkeypatch.setenv(_CREDENTIAL_PROVIDER_ENV, "not-installed")
 
-        with pytest.raises(ValueError):
+        with pytest.raises(RuntimeError, match="not-installed"):
             async with app_lifespan(MagicMock()):
                 pass
 
@@ -698,20 +751,44 @@ class TestConfig:
     def test_redirects_are_refused_so_headers_cannot_walk_hosts(self):
         """requests keeps non-Authorization headers across hosts.
 
-        Verified against a local redirecting server: without this the second
-        hop received `x-api-key` in full.
+        Exercised end to end against a collector that answers 307 to a second
+        host: the redirect target must never be contacted. Exporters before
+        1.45 followed it and handed over `x-api-key` in full.
         """
-        emitter = init_otlp(
-            OtlpExportConfig(
-                enabled=True,
-                endpoint="http://localhost:4318",
-                headers={"x-api-key": "token-123"},
-            )
-        )
-        assert emitter is not None
-        processor = emitter._provider._active_span_processor._span_processors[0]
+        target = _Collector(status=200)
+        collector = _Collector(status=307, location=f"{target.url}/v1/traces")
+        try:
+            failures = _export_one_span(collector.url, headers={"x-api-key": "token-123"})
+        finally:
+            collector.close()
+            target.close()
 
-        assert processor.span_exporter._delegate._session.max_redirects == 0
+        assert collector.received == ["token-123"]
+        assert target.received == []
+        # The exporter counts a 2xx or 3xx as delivered; the batch it
+        # dropped must still surface as a failed export.
+        assert failures == 1
+
+    def test_a_2xx_collector_still_counts_as_delivered(self):
+        """Positive control for the redirect hook: success stays success."""
+        collector = _Collector(status=200)
+        try:
+            failures = _export_one_span(collector.url, headers={"x-api-key": "token-123"})
+        finally:
+            collector.close()
+
+        assert collector.received == ["token-123"]
+        assert failures == 0
+
+    @pytest.mark.parametrize("name", _CREDENTIAL_PROVIDER_ENVS)
+    def test_a_credential_provider_keeps_its_own_session(self, monkeypatch, name):
+        """Supplying STM's session would silently drop the provider's auth."""
+        for env in _CREDENTIAL_PROVIDER_ENVS:
+            monkeypatch.delenv(env, raising=False)
+        assert otlp_mod._export_session() is not None
+        monkeypatch.setenv(name, "some-provider")
+
+        assert otlp_mod._export_session() is None
 
     @pytest.mark.parametrize(
         "endpoint",
