@@ -368,6 +368,11 @@ def test_rewritten_transcript_is_halted_and_rows_kept(env: dict[str, Path], chan
 
 
 def test_no_raw_identifier_or_text_reaches_the_trial_db(env: dict[str, Path]) -> None:
+    # Packed HMAC digests can randomly contain short byte strings such as b"u1".
+    # Use a reproducible fixture key before writing any hashed rows; retain every
+    # plaintext-leak assertion without making it depend on random digest bytes.
+    with sqlite3.connect(env["feedback"]) as db:
+        db.execute("UPDATE stm_meta SET value = ? WHERE name = 'hmac_key'", (bytes(range(32)),))
     _record_event(env, EVENT_ID, arm="shown")
     store = FeedbackStore(env["feedback"])
     store.initialize()
