@@ -358,6 +358,10 @@ Two refinements to the gate (#676):
   limit, `min_score`) still apply. Per-tool `query_template` matches do
   *not* bypass the gate — only the per-call explicit query does.
 
+Responses whose text-block metadata requires preserving separate blocks bypass
+the surfacing pipeline entirely, even with `_context_query`; the explicit query
+only bypasses the size gate. See [response envelope handling](caching.md).
+
 The default of `5000` is deliberately conservative — it favors **precision and
 cost** over **coverage**:
 

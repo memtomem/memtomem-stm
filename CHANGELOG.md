@@ -13,6 +13,16 @@ changes inline only. See the deprecation policy in
 
 ### Changed
 
+- proxy: preserve text-block annotations and metadata through compression and
+  cache replay. **Behavior change**: responses with multiple text blocks and
+  any block metadata preserve their boundaries, including identical metadata,
+  and bypass cleaning, compression, surfacing, indexing, extraction, and
+  caching. Explicit `_context_query` does not override this policy. Their
+  text is bounded by `max_upstream_chars`, not `max_result_chars`; two
+  200,000-character blocks may therefore deliver 400,000 characters. Lower
+  `max_upstream_chars` to limit delivery, or return one upstream text block to
+  retain compression and surfacing. See `docs/caching.md` for the full policy (#1112).
+
 - surfacing: fetch session context before reserving memories for delivery.
   **Behavior change**: cancellation during scratchpad retrieval no longer
   suppresses undelivered memories on the next call; concurrent calls still

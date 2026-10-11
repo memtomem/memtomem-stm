@@ -62,9 +62,32 @@ Key details:
 - **Annotations stay fresh at runtime** — the proxy subscribes to `notifications/tools/list_changed` on every upstream session. When an upstream re-declares its tools mid-connection, the advertised snapshot is re-fetched and any tool whose eligibility flipped toward may-mutate — or that disappeared from the list — has its existing cache rows invalidated, so a pre-flip row can't be served after the flip (or once the annotations move back). Explicit `cache` overrides still win: a tool forced in with `cache: true` is never auto-invalidated. Upstreams that change annotations *without* emitting `list_changed` are picked up on the next reconnect, as before.
 - **Per-tool / per-server cache override** — set `cache: true|false` on a `tool_overrides` entry or on an `UpstreamServerConfig` to force a tool/server in or out of the cache, overriding the annotation policy (precedence: tool > server > policy). Use `cache: false` for a volatile read tool or a writer on an upstream that omits annotations; `cache: true` to re-enable caching for a tool an upstream mis-annotates — under the `strict` policy this is the supported allowlist for un-annotated read-only tools (no separate allowlist setting exists).
 - **Per-tool / per-server TTL override** — set `cache_ttl_seconds` on a `tool_overrides` entry or on an `UpstreamServerConfig` to override how long that tool's/server's responses stay cached, independent of the on/off `cache` gate (precedence: tool > server > global `cache.default_ttl_seconds`). `null` (default) inherits the next level down — at the tool/server level `null` means *inherit*, not *never expires*. A positive value sets the TTL in seconds; `0` disables caching for that tool/server — while the resolved TTL is `≤ 0` the lookup is bypassed, so a stale row is never served (mirroring a global `default_ttl_seconds` of 0); existing on-disk rows are then cleaned up opportunistically (the next identical call invalidates the row regardless of its response shape — text, non-text, mixed, error, or empty). `cache: false` still wins outright, and `cache: true` with `cache_ttl_seconds: 0` is eligible-but-TTL-disabled, i.e. effectively off.
-- **Envelope-aware successful text responses** — cache schema v6 stores the compressed text, pre-compression cleaned length, JSON-safe `structuredContent`, result-level `_meta`. Cache hits reconstruct the same metadata. Upgrading from v5 discards only response-cache rows; metrics and feedback remain intact. Privacy scanning covers both text and envelope JSON. Errors and non-text/mixed content remain uncached; malformed, non-JSON-safe, or unmarked out-of-band rows are never served.
+- **Envelope-aware successful text responses** — cache schema v6 stores the compressed text, pre-compression cleaned length, JSON-safe `structuredContent`, result-level `_meta`, and single text-block metadata (`annotations` and block `_meta`). Cache hits reconstruct the same metadata. Upgrading from v5 discards only response-cache rows; metrics and feedback remain intact. Privacy scanning covers both text and envelope JSON. Multiple text blocks carrying metadata retain their boundaries and bypass compression, surfacing, indexing, extraction, and caching; only input sanitization and upstream size limits apply. Errors and non-text/mixed content remain uncached; malformed, non-JSON-safe, or unmarked out-of-band rows are never served.
 - **Privacy exclusion** — responses that look like secrets are never persisted to the cache; see [SECURITY.md](../SECURITY.md). This guard always applies on top of the policy/override above.
 - **Transient-key exclusion** — to prevent serving expired progressive/selective keys on a cache hit (which would drop the response tail), the cache automatically skips storing any response carrying a transient-key marker (like a `PROGRESSIVE_FOOTER_TOKEN` or a `selection_key` JSON field). The next identical call re-runs the pipeline to generate live keys.
 - Expired entries are purged on startup; oldest entries evicted when `max_entries` is exceeded
 - Clear cache via MCP tool: `stm_admin(action="proxy_cache_clear", params={"server": "gh", "tool": "search_code"})` clears matching response-cache entries; an unfiltered `stm_admin(action="proxy_cache_clear")` flushes the entire response cache **and** the in-memory surfacing result cache
 - TTL defaults to global (`cache.default_ttl_seconds`) but is overridable per-tool / per-server via `cache_ttl_seconds` (see above); `tool_overrides` additionally tune compression, sizing, and cache eligibility (`cache: true|false`)
+
+### Annotated text-block boundaries
+
+**Behavior change**: when a response contains multiple text blocks and any
+block has `annotations` or block `_meta`, the proxy preserves every block's
+boundary and metadata, even when all metadata values are identical. This is
+a preservation policy: equal annotations do not make separate blocks a single
+upstream block. These responses skip cleaning, compression, surfacing,
+indexing, extraction, and caching. An explicit `_context_query` does not
+re-enable surfacing on this path.
+
+The delivered text is limited by `max_upstream_chars` (default 10,000,000),
+not the compression budget `max_result_chars`. For example, two 200,000-character
+blocks with identical annotations deliver 400,000 text characters when within
+the upstream limit, even with a 500-character compression budget. A truncation
+notice is appended when the upstream character limit is reached. The inbound
+`max_upstream_bytes` limit still applies to the complete response envelope.
+
+There is no switch to merge annotated blocks. Configure a smaller
+`max_upstream_chars` to cap this path, accepting truncation, or have the upstream
+return a single annotated block when compression and surfacing are desired.
+Single annotated blocks retain their metadata through compression and cache
+replay. Unannotated multi-block responses retain the existing merge behavior.
