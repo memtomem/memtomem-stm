@@ -469,6 +469,44 @@ class TestSourceResponseCharsForwarding:
         assert "_stm_source_response_chars" not in call["arguments"]
         assert result.endswith(" [mem]")
 
+    async def test_cache_hit_keeps_precompression_size_for_real_surfacing(self, make_mgr):
+        from memtomem_stm.surfacing.engine import SurfacingEngine
+        from test_surfacing_engine import (
+            FakeChunk,
+            FakeSearchResult,
+            _make_config,
+            _make_mcp_adapter,
+        )
+
+        mgr, _, cache = make_mgr(
+            compression=CompressionStrategy.TRUNCATE,
+            max_result_chars=500,
+            min_retention=0.0,
+            with_cache=True,
+        )
+        adapter = _make_mcp_adapter(
+            [
+                FakeSearchResult(
+                    FakeChunk(id="memory-size", content="Remember this application design"), 0.9
+                ),
+            ]
+        )
+        engine = SurfacingEngine(_make_config(min_response_chars=1000), mcp_adapter=adapter)
+        mgr._surfacing_engine = engine
+        mgr._clean_content = lambda text, cfg: text
+        session = mgr._connections["srv"].session
+        session.call_tool.return_value = fake_tool_result("word " * 1000)
+        try:
+            cold = await mgr.call_tool("srv", "read_file", {"path": "src/app.py"})
+            cache.close()
+            cache.initialize()
+            warm = await mgr.call_tool("srv", "read_file", {"path": "src/app.py"})
+            assert "Remember this application design" in cold
+            assert "Remember this application design" in warm
+            assert session.call_tool.await_count == adapter.search.await_count == 1
+        finally:
+            await engine.stop()
+
     async def test_progressive_branch_forwards_len_cleaned(self, make_mgr):
         mgr, _store, _ = make_mgr(
             compression=CompressionStrategy.PROGRESSIVE,

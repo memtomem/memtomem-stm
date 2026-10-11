@@ -228,9 +228,11 @@ def _ok_result(text="ok"):
 
 
 async def _fetch(mgr: ProxyManager, server: str = "srv", tool: str = "t"):
-    return await mgr._fetch_upstream(
-        server, tool, {"_trace_id": None}, trace_id=None, cfg_snap=mgr._config
-    )
+    return (
+        await mgr._fetch_upstream(
+            server, tool, {"_trace_id": None}, trace_id=None, cfg_snap=mgr._config
+        )
+    ).result
 
 
 class TestConfigChangeDetection:
@@ -460,7 +462,10 @@ class TestConfigChangeDetection:
         all_text = "\n".join(r.getMessage() for r in records)
         assert "tok-c" not in all_text  # C never attempted, never logged
         assert "tok-b" not in all_text  # B attempted, rendered as its type (#1082)
-        assert "keeping the existing connection (won't retry until the config changes again): ConnectionError" in all_text
+        assert (
+            "keeping the existing connection (won't retry until the config changes again): ConnectionError"
+            in all_text
+        )
 
     async def test_generation_skip_does_not_damp_and_redetects_next_call(self, tmp_path):
         """When a config-change reconnect is skipped because another reconnect
@@ -816,7 +821,7 @@ class TestLiveStdioReconnect:
             r1 = await mgr._fetch_upstream(
                 "echo", "greet", {"_trace_id": None}, trace_id=None, cfg_snap=mgr._config
             )
-            assert "hello from alpha/v1" in r1.content[0].text
+            assert "hello from alpha/v1" in r1.result.content[0].text
 
             _reseed(mgr, tmp_path, {"echo": cfg_b})
 
@@ -825,7 +830,7 @@ class TestLiveStdioReconnect:
             r2 = await mgr._fetch_upstream(
                 "echo", "greet", {"_trace_id": None}, trace_id=None, cfg_snap=mgr._config
             )
-            assert "hello from beta/v2" in r2.content[0].text
+            assert "hello from beta/v2" in r2.result.content[0].text
 
             conn = mgr._connections["echo"]
             assert conn.reconnect_generation == 1
@@ -837,7 +842,7 @@ class TestLiveStdioReconnect:
             r3 = await mgr._fetch_upstream(
                 "echo", "greet", {"_trace_id": None}, trace_id=None, cfg_snap=mgr._config
             )
-            assert "hello from alpha/v1" in r3.content[0].text
+            assert "hello from alpha/v1" in r3.result.content[0].text
             assert mgr._connections["echo"].reconnect_generation == 2
         finally:
             await mgr.stop()
