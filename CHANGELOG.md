@@ -23,6 +23,11 @@ changes inline only. See the deprecation policy in
   `max_upstream_chars` to limit delivery, or return one upstream text block to
   retain compression and surfacing. See `docs/caching.md` for the full policy (#1112).
 
+- surfacing: fetch session context before reserving memories for delivery.
+  **Behavior change**: cancellation during scratchpad retrieval no longer
+  suppresses undelivered memories on the next call; concurrent calls still
+  deliver each unpinned memory at most once (#1113).
+
 - proxy: bind cached replies to the active transport configuration and retain
   the cleaned source length for surfacing on cache hits. **Behavior change**:
   connection edits no longer replay another upstream's cached reply, and warm
