@@ -55,6 +55,49 @@ class FakeSearchResult:
     score_ceiling: float | None = None
 
 
+async def test_cancelled_scratch_lookup_does_not_reserve_undelivered_memory():
+    memory = FakeSearchResult(FakeChunk(id="cancelled-memory", content="remember this design"), 0.9)
+    adapter = _make_mcp_adapter([memory])
+    entered = asyncio.Event()
+
+    async def blocked_scratch(**kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    adapter.scratch_list = AsyncMock(side_effect=blocked_scratch)
+    engine = SurfacingEngine(_make_config(include_session_context=True), mcp_adapter=adapter)
+    task = asyncio.create_task(
+        engine.surface(
+            "srv",
+            "read_file",
+            {"path": "src/app.py"},
+            "x" * 1000,
+            context_query="application design overview",
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.gather(*engine._abandoned_ops, return_exceptions=True)
+        assert "cancelled-memory" not in engine._surfaced_ids
+        adapter.scratch_list = AsyncMock(return_value=[])
+        followup = await engine.surface(
+            "srv",
+            "read_file",
+            {"path": "src/app.py"},
+            "x" * 1000,
+            context_query="application implementation details",
+        )
+        assert "remember this design" in followup
+        assert adapter.search.await_count == 2
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await engine.stop()
+
+
 def _make_config(**overrides) -> SurfacingConfig:
     defaults = {
         "enabled": True,
@@ -3264,10 +3307,9 @@ class TestConcurrentSurfacedIdsDedup:
     """Dedup invariant: each memory surfaced at most once per session, even
     under concurrency (engine.py:62 / L256 / docstring).
 
-    Before the fix, the in-memory write at ``_surfaced_ids`` happened AFTER
-    the ``scratch_list`` await, opening an interleaving window where two
-    concurrent ``_do_surface`` calls could both build ``relevant`` with the
-    same memory and both return responses containing it."""
+    The final dedup check and ID reservation must have no await between them.
+    Scratchpad I/O happens before both, so concurrent queries must recheck
+    the IDs after that I/O before deciding what to deliver."""
 
     def _make_tracker(self):
         tracker = MagicMock()
@@ -3301,19 +3343,22 @@ class TestConcurrentSurfacedIdsDedup:
             engine.surface(
                 "gh",
                 "read_file",
-                {"path": "src/a.py", "_context_query": "Flask architecture"},
+                {"path": "src/a.py", "_context_query": "Flask application architecture"},
                 LONG_RESPONSE,
             ),
             engine.surface(
                 "gh",
                 "search",
-                {"path": "src/b.py", "_context_query": "Django routes"},
+                {"path": "src/b.py", "_context_query": "Django application routes"},
                 LONG_RESPONSE,
             ),
         )
 
         appears_in_a = "the shared memory content" in out_a
         appears_in_b = "the shared memory content" in out_b
+        assert adapter.search.await_count == 2
+        assert adapter.scratch_list.await_count == 2
+        assert appears_in_a or appears_in_b, "one caller must receive the eligible memory"
         assert not (appears_in_a and appears_in_b), (
             "Session dedup violated under concurrency: shared memory surfaced "
             "in both concurrent responses"
