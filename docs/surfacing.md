@@ -349,7 +349,8 @@ Two refinements to the gate (#676):
   surfacing, the size compared against `min_response_chars` is the
   pre-compression (post-CLEAN) length — so an upstream response that was
   large enough to surface on stays large enough after aggressive compression
-  shrinks what the agent actually receives.
+  shrinks what the agent actually receives. Response-cache hits reuse that stored
+  pre-compression length, including after a proxy restart.
 - **An explicit agent query bypasses the gate.** When the agent passes
   `_context_query` (forwarded by the proxy as the engine's `context_query`),
   the request is an intentional retrieval and surfacing proceeds regardless

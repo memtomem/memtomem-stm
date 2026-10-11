@@ -50,6 +50,59 @@ def _read_privacy_policy_stamp(db_path: Path) -> str | None:
 
 
 class TestProxyCacheBasic:
+    def test_source_size_and_block_metadata_survive_reopen(self, proxy_cache):
+        metadata = {"annotations": {"audience": ["user"]}, "_meta": {"tag": "\ud800"}}
+        proxy_cache.set(
+            "s",
+            "t",
+            {},
+            "short",
+            ttl_seconds=60,
+            source_response_chars=5000,
+            text_block_metadata=metadata,
+        )
+        proxy_cache.close()
+        proxy_cache.initialize()
+        cached = proxy_cache.get("s", "t", {})
+        assert cached.source_response_chars == 5000
+        assert cached.text_block_metadata["annotations"] == {"audience": ["user"]}
+        assert cached.text_block_metadata["_meta"] == {"tag": r"\ud800"}
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            {"_meta": {"password": "hunter2"}},
+            {"annotations": {"audience": ["invalid-role"]}},
+            {"text": "must not replace cached body"},
+            {"type": "image"},
+        ],
+    )
+    def test_unsafe_or_invalid_block_metadata_is_not_cached(self, proxy_cache, metadata):
+        proxy_cache.set("s", "t", {}, "body", ttl_seconds=60, text_block_metadata=metadata)
+        assert proxy_cache.get("s", "t", {}) is None
+
+    @pytest.mark.parametrize(
+        "patch",
+        [
+            {"source_response_chars": None},
+            {"source_response_chars": -1},
+            {"source_response_chars": True},
+            {"source_response_chars": "5000"},
+            {"text_block_metadata": []},
+            {"text_block_metadata": {"annotations": {"audience": ["unknown"]}}},
+        ],
+    )
+    def test_corrupt_size_or_metadata_is_evicted(self, proxy_cache, patch):
+        proxy_cache.set("s", "t", {}, "body", ttl_seconds=60)
+        envelope = json.loads(
+            proxy_cache._db.execute("SELECT envelope_json FROM proxy_cache").fetchone()[0]
+        )
+        envelope.update(patch)
+        proxy_cache._db.execute("UPDATE proxy_cache SET envelope_json=?", (json.dumps(envelope),))
+        proxy_cache._db.commit()
+        assert proxy_cache.get("s", "t", {}) is None
+        assert proxy_cache.stats()["total_entries"] == 0
+
     def test_set_then_get(self, proxy_cache: ProxyCache):
         proxy_cache.set("s", "t", {"a": 1}, "result", ttl_seconds=60.0)
         assert proxy_cache.get("s", "t", {"a": 1}) == "result"
@@ -2005,26 +2058,20 @@ class TestKeySchemaVersionPurge:
         try:
             assert reopened.stats()["total_entries"] == 0  # legacy rows wiped
             (version,) = reopened._db.execute("PRAGMA user_version").fetchone()
-            assert version == 5
+            assert version == 6
         finally:
             reopened.close()
 
-    def test_v4_rows_are_purged_by_the_v5_bump(self, tmp_path):
-        """The upgrade THIS release performs, pinned on its own.
-
-        The other legacy fixtures seed ``user_version`` 0 and 2, so a
-        regression that purged only those and left v4 rows in place would pass
-        both — while the v4 rows it left behind are keyed under the pre-framing
-        derivation and unreachable by any v5 lookup, which is exactly the dead
-        weight the purge exists to drop (#784).
-        """
+    @pytest.mark.parametrize("old_version", [4, 5])
+    def test_prior_rows_are_purged_by_v6_without_touching_other_tables(self, tmp_path, old_version):
+        """Old rows lack identity/size/metadata guarantees; other stores survive."""
         db_path = tmp_path / "c.db"
         cache = ProxyCache(db_path, max_entries=10)
         cache.initialize()
-        cache.set("s", "t", {"a": 1}, "v4-row", ttl_seconds=None)
-        # The v4 table shape is the current one — only the key derivation
-        # changed — so seeding the version is enough to make this a v4 database.
-        cache._db.execute("PRAGMA user_version = 4")
+        cache.set("s", "t", {"a": 1}, "old-row", ttl_seconds=None)
+        cache._db.execute("CREATE TABLE unrelated_metrics (value TEXT)")
+        cache._db.execute("INSERT INTO unrelated_metrics VALUES ('keep')")
+        cache._db.execute(f"PRAGMA user_version = {old_version}")
         cache._db.commit()
         cache.close()
 
@@ -2033,7 +2080,10 @@ class TestKeySchemaVersionPurge:
         try:
             assert reopened.stats()["total_entries"] == 0
             (version,) = reopened._db.execute("PRAGMA user_version").fetchone()
-            assert version == 5
+            assert version == 6
+            assert (
+                reopened._db.execute("SELECT value FROM unrelated_metrics").fetchone()[0] == "keep"
+            )
         finally:
             reopened.close()
 
@@ -2087,7 +2137,7 @@ class TestKeySchemaVersionPurge:
             assert "envelope_safe" in columns
             assert "envelope_json" in columns
             (version,) = cache._db.execute("PRAGMA user_version").fetchone()
-            assert version == 5
+            assert version == 6
         finally:
             cache.close()
 
@@ -2203,7 +2253,7 @@ class TestSurrogateRoundTrip:
         assert proxy_cache.get(literal, "t", {}) == "literal-body"
         assert proxy_cache.get(f"srv{surrogate}", "t", {}) is None
 
-    def test_key_derivation_matches_the_pinned_v5_shape(self):
+    def test_key_derivation_matches_the_pinned_v6_shape(self):
         """The framed derivation, spelled out literally.
 
         Fails if the raw shape drifts without a ``_KEY_SCHEMA_VERSION`` bump —
@@ -2225,7 +2275,7 @@ class TestSurrogateRoundTrip:
         args = {"k": "\u4e2d"}
         fingerprint = "fp\ud800"
         parts = [
-            "5",
+            "6",
             server,
             tool,
             json.dumps(args, sort_keys=True, ensure_ascii=False),

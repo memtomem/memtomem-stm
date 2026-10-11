@@ -16,7 +16,19 @@ changes inline only. See the deprecation policy in
 - surfacing: fetch session context before reserving memories for delivery.
   **Behavior change**: cancellation during scratchpad retrieval no longer
   suppresses undelivered memories on the next call; concurrent calls still
-  deliver each unpinned memory at most once.
+  deliver each unpinned memory at most once (#1113).
+
+- proxy: bind cached replies to the active transport configuration and retain
+  the cleaned source length for surfacing on cache hits. **Behavior change**:
+  connection edits no longer replay another upstream's cached reply, and warm
+  calls use the same surfacing size gate as cold calls. Cache schema v6 clears
+  existing response-cache rows once; metrics and feedback remain intact (#1111).
+
+- deps: raise the PyJWT security floor to 2.15.0 and the optional LangChain
+  extra's langgraph-sdk floor to 0.4.4 to clear runtime and extras audit findings.
+  **Behavior change**: installations resolve patched versions of these packages;
+  langgraph-sdk remains optional. Refresh the development-only jupyterlab,
+  notebook, and tornado locks to their audited patch releases.
 
 - docs: README and the reference docs are refreshed for 0.6.1. Statements the
   code had moved past are corrected: `status` and `list` report every schema
