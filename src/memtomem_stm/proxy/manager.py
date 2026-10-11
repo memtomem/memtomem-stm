@@ -7555,8 +7555,14 @@ class ProxyManager:
         if len(text_blocks) > 1 and any(_text_block_metadata(block) for block in text_blocks):
             # Combining blocks can assign one block's audience or metadata to
             # another's text. Preserve this response's boundaries instead of
-            # compressing/surfacing/indexing it as a single string.
-            remaining = cfg_snap.max_upstream_chars
+            # compressing/surfacing/indexing it as a single string. Nothing
+            # compresses this path, so the tool's char budget caps its text
+            # instead; a token budget applies through its nominal char
+            # conversion, even in unicode estimation mode.
+            tc = self._resolve_tool_config(server, tool, proxy_cfg=cfg_snap)
+            upstream_capped = cfg_snap.max_upstream_chars <= tc.max_chars
+            cap = cfg_snap.max_upstream_chars if upstream_capped else tc.max_chars
+            remaining = cap
             preserved: list = []
             original_chars = 0
             delivered_chars = 0
@@ -7574,10 +7580,20 @@ class ProxyManager:
                 else:
                     preserved.append(mcp_types.TextContent(type="text", text=bounded))
             if delivered_chars < original_chars:
-                notice = (
-                    f"[response truncated to {cfg_snap.max_upstream_chars} chars at "
-                    "max_upstream_chars guard — upstream returned an oversized payload]"
-                )
+                if upstream_capped:
+                    notice = (
+                        f"[response truncated to {cap} chars at "
+                        "max_upstream_chars guard — upstream returned an oversized payload]"
+                    )
+                else:
+                    budget_field = (
+                        "max_result_tokens" if tc.token_budget is not None else "max_result_chars"
+                    )
+                    notice = (
+                        f"[response truncated to {cap} chars: text blocks with metadata "
+                        f"are not compressed; raise {budget_field} for this tool to "
+                        "receive more]"
+                    )
                 preserved.append(mcp_types.TextContent(type="text", text=notice))
                 delivered_chars += len(notice)
             self.tracker.record(
