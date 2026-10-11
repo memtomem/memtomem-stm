@@ -13,6 +13,11 @@ changes inline only. See the deprecation policy in
 
 ### Changed
 
+- surfacing: fetch session context before reserving memories for delivery.
+  **Behavior change**: cancellation during scratchpad retrieval no longer
+  suppresses undelivered memories on the next call; concurrent calls still
+  deliver each unpinned memory at most once.
+
 - docs: README and the reference docs are refreshed for 0.6.1. Statements the
   code had moved past are corrected: `status` and `list` report every schema
   error by location and type, not only the first; an unreadable or non-UTF-8

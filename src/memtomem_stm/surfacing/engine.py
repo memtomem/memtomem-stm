@@ -2818,6 +2818,23 @@ class SurfacingEngine:
                 tool,
                 len(demoted_ids),
             )
+        # Do optional I/O BEFORE the final dedup check and reservations. A
+        # cancellation here has delivered nothing and must reserve nothing;
+        # concurrent calls may claim these IDs while scratch_list is pending.
+        scratch_items: list[dict] | None = None
+        has_candidates = bool(pinned_results) or any(
+            str(r.chunk.id) not in demoted_ids and str(r.chunk.id) not in self._surfaced_ids
+            for r in scored
+        )
+        if self._config.include_session_context and has_candidates:
+            try:
+                scratch_items = await asyncio.wait_for(
+                    self._mcp_adapter.scratch_list(trace_id=trace_id),
+                    timeout=max(0.05, min(0.5, self._config.timeout_seconds / 3)),
+                )
+            except Exception:
+                logger.debug("Failed to fetch session scratch items", exc_info=True)
+
         # ``seen`` dedups WITHIN this single result set. ``_surfaced_ids`` only
         # excludes IDs claimed by *prior* surfacings — it is populated by
         # ``_claim_surfaced_ids`` AFTER this loop, so it cannot catch a duplicate
@@ -2872,12 +2889,8 @@ class SurfacingEngine:
                 )
             return response_text
 
-        # Record in-memory surfaced IDs EAGERLY — before any await — so a
-        # concurrent ``_do_surface`` for an overlapping memory observes the
-        # claim at L261 and excludes it. Without this, the await at
-        # ``scratch_list`` below opens an interleaving window where both
-        # coroutines build ``relevant`` including the same memory and
-        # violate the documented session-dedup invariant.
+        # No await between the final dedup check and this claim: a concurrent
+        # query must see the reservation before it can deliver the same ID.
         new_ids = [str(r.chunk.id) for r in relevant if not getattr(r, "pinned", False)]
         claimed = self._claim_surfaced_ids(new_ids)
 
@@ -2885,21 +2898,6 @@ class SurfacingEngine:
         logger.debug(
             "Surfacing %d memories for %s/%s (query=%s)", len(relevant), server, tool, query[:50]
         )
-
-        # Session context (working memory): when enabled, fetch scratchpad
-        # entries via the MCP adapter and inject alongside LTM hits. Failures
-        # are silent — surfacing must still deliver the LTM hits even if
-        # working memory is unavailable.
-        scratch_items: list[dict] | None = None
-        if self._config.include_session_context:
-            try:
-                scratch_items = await asyncio.wait_for(
-                    self._mcp_adapter.scratch_list(trace_id=trace_id),
-                    timeout=max(0.05, min(0.5, self._config.timeout_seconds / 3)),
-                )
-            except Exception:
-                logger.debug("Failed to fetch session scratch items", exc_info=True)
-                scratch_items = None
 
         # Mint an event ID whenever a tracker is attached: the
         # ``surfacing_events`` row is telemetry (stm_surfacing_stats /
