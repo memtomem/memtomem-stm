@@ -21,10 +21,12 @@ changes inline only. See the deprecation policy in
   reached the client as plain text without them. A response with two or more
   text blocks where any block carries `annotations` or `_meta` now keeps its
   block boundaries and skips cleaning, compression, surfacing and caching. Its
-  text is cut at the tool's budget instead, notice included. On the default
-  config, two annotated blocks of markdown (102,940 chars) deliver 16,000
-  chars where 0.6.1 delivered a 2,740-char compressed view, and a 400,000-char
-  response 0.6.1 cut to 260,000 now delivers 16,000. To receive more, raise
+  text is cut at the tool's budget instead, with the truncation notice counted
+  inside it; when `max_upstream_chars` is the lower or equal limit, the cut
+  happens there and the guard notice follows it, as on other responses. On
+  the default config, two annotated blocks of markdown (102,940 chars) deliver
+  16,000 chars where 0.6.1 delivered a 2,740-char compressed view, and a
+  400,000-char response 0.6.1 cut to 260,000 now delivers 16,000. To receive more, raise
   the tool's `max_result_chars` (or `max_result_tokens` when a token budget is
   set), and `max_upstream_chars` if that is the lower limit.
 - **Response cache is cleared once, and warm calls can surface memories**
@@ -40,7 +42,10 @@ changes inline only. See the deprecation policy in
 - **Dependency floors rise** (#1114, #1116). `pyjwt>=2.15.0` at runtime;
   `langgraph-sdk>=0.4.4` in the `langchain` extra; `opentelemetry-sdk` and
   `opentelemetry-exporter-otlp-proto-http` `>=1.45.1` in the `otlp` extra,
-  which also fixes the startup crash on exporter 1.45.0 or later.
+  which also fixes the startup crash on exporter 1.45.0 or later. With an
+  OpenTelemetry credential provider configured, STM keeps the provider's
+  session, so a redirected (3xx) export drops the batch without counting it in
+  `export_failures`.
 
 ### Changed
 
