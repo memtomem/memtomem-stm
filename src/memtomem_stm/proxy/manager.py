@@ -3219,9 +3219,9 @@ class ProxyManager:
         still drives everything scoped to this call.
 
         Refuses once ``stop()`` has begun, until the next ``start()`` (#1125):
-        every caller (SELECTIVE, HYBRID, the progressive store) rebuilds the
-        slot it publishes into right after this when the slot is empty or
-        holds another config, and a call that waited out teardown on
+        every caller (SELECTIVE, HYBRID, the progressive store) decides right
+        after this whether to rebuild the slot it publishes into, and an empty
+        slot is always rebuilt, so a call that waited out teardown on
         ``_selective_lock`` would otherwise reopen a store ``stop()`` closes.
         """
         if self._stopped:

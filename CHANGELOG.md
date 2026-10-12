@@ -24,12 +24,11 @@ changes inline only. See the deprecation policy in
 - proxy: a SELECTIVE or HYBRID call that had its upstream reply but was
   waiting for the selective compressor while the proxy manager stopped went on
   after shutdown and reopened the selective compressor and its pending store,
-  which nothing closed until the next `stop()` or process exit. It now fails
-  with `ManagerStoppingError` like a reply that lands after `stop()`. Until
-  `start()` runs again, a proxied tool call no longer rebuilds the selective
-  compressor or the progressive store; the ratio guard's progressive and
-  hybrid fallbacks then fall through to truncate, as on any other fallback
-  failure (#1125, #1127).
+  leaving them open after teardown. It now fails with `ManagerStoppingError`
+  like a reply that lands after `stop()`. Until `start()` runs again, a
+  proxied tool call no longer rebuilds the selective compressor or the
+  progressive store; the ratio guard's progressive and hybrid fallbacks then
+  fall through to truncate, as on any other fallback failure (#1125, #1127).
 - metrics: a response whose annotated text blocks were kept apart instead of
   compressed recorded a `proxy_metrics` row with no strategy and no accounting
   basis. `mms stats` therefore counted it among the unclassified/legacy rows
