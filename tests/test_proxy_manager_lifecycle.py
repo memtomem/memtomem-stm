@@ -1411,6 +1411,426 @@ class TestOwnedUpstreamLifecycle:
         assert "bad" not in mgr._connections
 
 
+class _TaskGroupTransport:
+    """A transport shaped like the SDK's streamable HTTP client: it holds a task
+    group open while the session runs, so a failing child cancels the task that
+    entered it, and the failure surfaces only when the group exits (#1132)."""
+
+    def __init__(self, fail: asyncio.Event | None = None, error: BaseException | None = None):
+        self.fail = fail
+        self.error = error
+        self.exited = False
+
+    async def __aenter__(self):
+        import anyio
+
+        self._tg = anyio.create_task_group()
+        await self._tg.__aenter__()
+        if self.fail is not None:
+            self._tg.start_soon(self._fail_when_asked)
+        return (self, self)
+
+    async def _fail_when_asked(self):
+        assert self.fail is not None and self.error is not None
+        await self.fail.wait()
+        raise self.error
+
+    async def __aexit__(self, *exc_info):
+        self.exited = True
+        return await self._tg.__aexit__(*exc_info)
+
+
+class _ParkedSession:
+    """A ClientSession whose ``initialize`` runs a hook, then waits forever."""
+
+    def __init__(self, on_initialize):
+        self.on_initialize = on_initialize
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc_info):
+        return None
+
+    async def initialize(self):
+        await self.on_initialize()
+        await asyncio.Event().wait()
+
+
+class _LiveSession:
+    """A ClientSession that connects and lists no tools."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc_info):
+        return None
+
+    async def initialize(self):
+        return None
+
+    async def list_tools(self):
+        return SimpleNamespace(tools=[])
+
+
+class TestTransportCancelsOwner:
+    """A transport that cancels its owner task is a setup failure, not a
+    cancellation of the caller (#1132)."""
+
+    async def test_start_records_the_server_and_keeps_going(self):
+        bad = UpstreamServerConfig(prefix="bad", connect_timeout_seconds=5.0)
+        good = UpstreamServerConfig(prefix="good", connect_timeout_seconds=5.0)
+        mgr = _make_manager(servers={"bad": bad, "good": good})
+        fail = asyncio.Event()
+        transports = {
+            "bad": _TaskGroupTransport(fail, ConnectionError("All connection attempts failed")),
+            "good": _TaskGroupTransport(),
+        }
+
+        class GoodSession(_ParkedSession):
+            async def initialize(self):
+                return None
+
+            async def list_tools(self):
+                return SimpleNamespace(tools=[])
+
+        async def fail_transport():
+            fail.set()
+
+        # start() connects one server at a time, and each owner builds its
+        # session right after opening its transport.
+        opened: list[str] = []
+
+        def open_transport(cfg):
+            opened.append(cfg.prefix)
+            return transports[cfg.prefix]
+
+        def make_session(*_args, **_kwargs):
+            if opened[-1] == "bad":
+                return _ParkedSession(fail_transport)
+            return GoodSession(None)
+
+        with (
+            patch.object(mgr, "_open_transport", side_effect=open_transport),
+            patch("memtomem_stm.proxy.manager.ClientSession", side_effect=make_session),
+        ):
+            await mgr.start()
+            try:
+                assert mgr._failed_servers == {"bad": "ConnectionError"}
+                assert list(mgr._connections) == ["good"]
+                assert transports["bad"].exited
+            finally:
+                await mgr.stop()
+
+    async def test_start_survives_an_unreachable_streamable_http_upstream(self):
+        import socket
+
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        cfg = UpstreamServerConfig(
+            prefix="dead",
+            transport=TransportType.STREAMABLE_HTTP,
+            url=f"http://127.0.0.1:{port}/mcp",
+            connect_timeout_seconds=10.0,
+            max_retries=0,
+        )
+        mgr = _make_manager(servers={"dead": cfg})
+        await mgr.start()
+        try:
+            assert mgr._failed_servers == {"dead": "ConnectError"}
+            assert mgr._connections == {}
+        finally:
+            await mgr.stop()
+
+    async def test_a_cancelled_caller_still_gets_cancelled_error(self):
+        cfg = UpstreamServerConfig(prefix="srv", connect_timeout_seconds=5.0)
+        mgr = _make_manager(servers={"srv": cfg})
+        mgr._stack = contextlib.AsyncExitStack()
+        transport = _TaskGroupTransport()
+        entered = asyncio.Event()
+
+        async def park():
+            entered.set()
+
+        with (
+            patch.object(mgr, "_open_transport", return_value=transport),
+            patch(
+                "memtomem_stm.proxy.manager.ClientSession",
+                side_effect=lambda *_a, **_k: _ParkedSession(park),
+            ),
+        ):
+            caller = asyncio.create_task(mgr._connect_server("srv", cfg))
+            await entered.wait()
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+
+        assert transport.exited
+        assert "srv" not in mgr._connections
+
+    async def test_caller_cancellation_wins_over_a_transport_failure(self):
+        cfg = UpstreamServerConfig(prefix="srv", connect_timeout_seconds=5.0)
+        mgr = _make_manager(servers={"srv": cfg})
+        mgr._stack = contextlib.AsyncExitStack()
+        fail = asyncio.Event()
+        transport = _TaskGroupTransport(fail, ConnectionError("refused"))
+        caller: asyncio.Task | None = None
+
+        async def fail_and_cancel_caller():
+            assert caller is not None
+            caller.cancel()
+            fail.set()
+
+        with (
+            patch.object(mgr, "_open_transport", return_value=transport),
+            patch(
+                "memtomem_stm.proxy.manager.ClientSession",
+                side_effect=lambda *_a, **_k: _ParkedSession(fail_and_cancel_caller),
+            ),
+        ):
+            caller = asyncio.create_task(mgr._connect_server("srv", cfg))
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+
+        assert transport.exited
+        assert "srv" not in mgr._connections
+
+    async def test_caller_cancelled_after_the_owner_gave_up_still_gets_cancelled_error(self):
+        # The owner has already cancelled ``ready`` when the caller is
+        # cancelled, before the caller resumes: the cancellation is the
+        # caller's, so it must not be turned into a setup failure.
+        cfg = UpstreamServerConfig(prefix="srv", connect_timeout_seconds=5.0)
+        mgr = _make_manager(servers={"srv": cfg})
+        mgr._stack = contextlib.AsyncExitStack()
+        fail = asyncio.Event()
+        caller: asyncio.Task | None = None
+
+        class CancelCallerOnExit(_TaskGroupTransport):
+            async def __aexit__(self, *exc_info):
+                assert caller is not None
+                caller.cancel()
+                return await super().__aexit__(*exc_info)
+
+        transport = CancelCallerOnExit(fail, ConnectionError("refused"))
+
+        async def fail_transport():
+            fail.set()
+
+        with (
+            patch.object(mgr, "_open_transport", return_value=transport),
+            patch(
+                "memtomem_stm.proxy.manager.ClientSession",
+                side_effect=lambda *_a, **_k: _ParkedSession(fail_transport),
+            ),
+        ):
+            caller = asyncio.create_task(mgr._connect_server("srv", cfg))
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+
+        assert transport.exited
+        assert "srv" not in mgr._connections
+
+    async def test_caller_cancelled_while_joining_the_owner_still_gets_cancelled_error(self):
+        cfg = UpstreamServerConfig(prefix="srv", connect_timeout_seconds=5.0)
+        mgr = _make_manager(servers={"srv": cfg})
+        mgr._stack = contextlib.AsyncExitStack()
+        fail = asyncio.Event()
+        release = asyncio.Event()
+        joining = asyncio.Event()
+
+        class SlowExit(_TaskGroupTransport):
+            async def __aexit__(self, *exc_info):
+                import anyio
+
+                # The group's scope is already cancelled here, so an unshielded
+                # wait would be cancelled at once and the unwind never parks.
+                with anyio.CancelScope(shield=True):
+                    await release.wait()
+                return await super().__aexit__(*exc_info)
+
+        transport = SlowExit(fail, ConnectionError("refused"))
+
+        async def fail_transport():
+            fail.set()
+
+        real_shield = asyncio.shield
+
+        def watch_shield(awaitable):
+            if isinstance(awaitable, asyncio.Task) and awaitable.get_name().endswith("-owner"):
+                joining.set()
+            return real_shield(awaitable)
+
+        with (
+            patch.object(mgr, "_open_transport", return_value=transport),
+            patch(
+                "memtomem_stm.proxy.manager.ClientSession",
+                side_effect=lambda *_a, **_k: _ParkedSession(fail_transport),
+            ),
+            patch("memtomem_stm.proxy.manager.asyncio.shield", side_effect=watch_shield),
+        ):
+            caller = asyncio.create_task(mgr._connect_server("srv", cfg))
+            try:
+                await asyncio.wait_for(joining.wait(), 5.0)
+                caller.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await caller
+            finally:
+                release.set()
+                with contextlib.suppress(BaseException):
+                    await caller
+
+        assert "srv" not in mgr._connections
+
+    async def test_owner_cancelled_without_an_error_raises_connection_error(self):
+        cfg = UpstreamServerConfig(prefix="srv", connect_timeout_seconds=5.0)
+        mgr = _make_manager(servers={"srv": cfg})
+        mgr._stack = contextlib.AsyncExitStack()
+        transport = _TaskGroupTransport()
+
+        async def cancel_owner():
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+
+        with (
+            patch.object(mgr, "_open_transport", return_value=transport),
+            patch(
+                "memtomem_stm.proxy.manager.ClientSession",
+                side_effect=lambda *_a, **_k: _ParkedSession(cancel_owner),
+            ),
+        ):
+            with pytest.raises(ConnectionError, match="transport cancelled the connection setup"):
+                await mgr._connect_server("srv", cfg)
+
+        assert transport.exited
+        assert "srv" not in mgr._connections
+
+    async def test_stop_closes_everything_after_a_transport_dropped_mid_session(self):
+        a = UpstreamServerConfig(prefix="a", connect_timeout_seconds=5.0)
+        b = UpstreamServerConfig(prefix="b", connect_timeout_seconds=5.0)
+        mgr = _make_manager(servers={"a": a, "b": b})
+        drop = asyncio.Event()
+        transports = {
+            "a": _TaskGroupTransport(drop, ConnectionError("dropped")),
+            "b": _TaskGroupTransport(),
+        }
+        with (
+            patch.object(mgr, "_open_transport", side_effect=lambda cfg: transports[cfg.prefix]),
+            patch(
+                "memtomem_stm.proxy.manager.ClientSession",
+                side_effect=lambda *_a, **_k: _LiveSession(),
+            ),
+        ):
+            await mgr.start()
+            owner = mgr._connections["a"].owner
+            assert owner is not None and owner.task is not None
+            drop.set()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.shield(owner.task)
+            assert owner.task.cancelled()
+
+            await mgr.stop()
+
+        assert mgr._connections == {}
+        assert transports["a"].exited and transports["b"].exited
+
+    async def test_reconnect_replaces_a_connection_whose_transport_dropped(self):
+        cfg = UpstreamServerConfig(prefix="srv", connect_timeout_seconds=5.0)
+        mgr = _make_manager(servers={"srv": cfg})
+        mgr._stack = contextlib.AsyncExitStack()
+        drop = asyncio.Event()
+        transports = [_TaskGroupTransport(drop, ConnectionError("dropped")), _TaskGroupTransport()]
+        with (
+            patch.object(mgr, "_open_transport", side_effect=transports),
+            patch(
+                "memtomem_stm.proxy.manager.ClientSession",
+                side_effect=lambda *_a, **_k: _LiveSession(),
+            ),
+        ):
+            await mgr._connect_server("srv", cfg)
+            first_owner = mgr._connections["srv"].owner
+            assert first_owner is not None and first_owner.task is not None
+            drop.set()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.shield(first_owner.task)
+
+            await mgr._reconnect_server("srv")
+
+            assert mgr._connections["srv"].owner is not first_owner
+            assert mgr._connections["srv"].reconnect_generation == 1
+            await mgr.stop()
+
+        assert transports[0].exited and transports[1].exited
+
+    async def test_a_cancelled_close_still_gets_cancelled_error(self):
+        cfg = UpstreamServerConfig(prefix="srv", connect_timeout_seconds=5.0)
+        mgr = _make_manager(servers={"srv": cfg})
+        mgr._stack = contextlib.AsyncExitStack()
+        release = asyncio.Event()
+        exiting = asyncio.Event()
+
+        class SlowExit(_TaskGroupTransport):
+            async def __aexit__(self, *exc_info):
+                exiting.set()
+                await release.wait()
+                return await super().__aexit__(*exc_info)
+
+        transport = SlowExit()
+        with (
+            patch.object(mgr, "_open_transport", return_value=transport),
+            patch(
+                "memtomem_stm.proxy.manager.ClientSession",
+                side_effect=lambda *_a, **_k: _LiveSession(),
+            ),
+        ):
+            await mgr._connect_server("srv", cfg)
+            owner = mgr._connections["srv"].owner
+            assert owner is not None
+            closer = asyncio.create_task(owner.close())
+            try:
+                await asyncio.wait_for(exiting.wait(), 5.0)
+                closer.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await closer
+            finally:
+                release.set()
+                assert owner.task is not None
+                await asyncio.shield(owner.task)
+
+        assert transport.exited
+
+    async def test_reconnect_raises_the_transport_failure_and_keeps_the_old_session(self):
+        cfg = UpstreamServerConfig(prefix="srv", connect_timeout_seconds=5.0)
+        mgr = _make_manager(servers={"srv": cfg})
+        mgr._stack = contextlib.AsyncExitStack()
+        old_session = AsyncMock()
+        old_stack = AsyncMock()
+        mgr._connections["srv"] = UpstreamConnection(
+            name="srv", config=cfg, session=old_session, tools=[], stack=old_stack
+        )
+        fail = asyncio.Event()
+        transport = _TaskGroupTransport(fail, ConnectionError("refused"))
+
+        async def fail_transport():
+            fail.set()
+
+        with (
+            patch.object(mgr, "_open_transport", return_value=transport),
+            patch(
+                "memtomem_stm.proxy.manager.ClientSession",
+                side_effect=lambda *_a, **_k: _ParkedSession(fail_transport),
+            ),
+        ):
+            with pytest.raises(ExceptionGroup) as raised:
+                await mgr._reconnect_server("srv")
+
+        assert [type(e) for e in raised.value.exceptions] == [ConnectionError]
+        assert transport.exited
+        assert mgr._connections["srv"].session is old_session
+        old_stack.aclose.assert_not_awaited()
+
+
 # ── tool name overflow (#261 → exposure-time enforcement via #465) ──────
 
 
