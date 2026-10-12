@@ -644,6 +644,42 @@ class TestMultiPathRecovery:
 
 
 class TestStoreLifecycleCleanup:
+    async def test_stopped_manager_does_not_reopen_stores_for_recovery(self, tmp_path):
+        """After stop(), select_chunks and read_more answer with their sentinels
+        instead of opening a store (#1128). Clearing the flag, as start() does,
+        brings recovery back on the same manager."""
+        import re
+
+        from memtomem_stm.proxy.config import ProgressiveConfig
+
+        store = SQLitePendingStore(tmp_path / "pending.db")
+        store.initialize()
+        store.put("k1", _make_selection({"A": "recovered content"}))
+        store.close()
+        mgr, sel = _sqlite_manager(tmp_path)
+        text = "First chunk content. " * 20
+        first = mgr._apply_progressive(
+            text, ProgressiveConfig(chunk_size=40), "srv", "t", sel, cfg_snap=mgr._config
+        )
+        match = re.search(r'key="([0-9a-f]{16})"', first)
+        assert match is not None, first
+        progressive_key = match.group(1)
+
+        await mgr.stop()
+
+        assert "not active" in mgr.select_chunks("k1", ["A"])
+        assert "not found or expired" in mgr.read_more(progressive_key, 40)
+        assert (mgr._selective_compressor, mgr._progressive_store) == (None, None)
+
+        mgr._stopped = False
+        assert mgr.select_chunks("k1", ["A"]) == "recovered content"
+        assert "not found or expired" not in mgr.read_more(progressive_key, 40)
+        try:
+            assert mgr._selective_compressor is not None
+            assert mgr._progressive_store is not None
+        finally:
+            await mgr.stop()
+
     async def test_stop_closes_recovered_stores(self, tmp_path):
         """stop() closes the lazily-built selective and progressive stores and
         nulls them, so a recovery-opened SQLite connection does not leak."""

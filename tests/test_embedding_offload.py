@@ -394,6 +394,8 @@ def _barrier_stub() -> SimpleNamespace:
         _selective_compressor_cfg=None,
         _selective_publish_mu=threading.Lock(),
         _relevance_scorer=BM25Scorer(),
+        # ``select_chunks`` recovery refuses on a stopped manager (#1128).
+        _stopped=False,
     )
     stub._create_selective = MethodType(ProxyManager._create_selective, stub)
     stub._rebuild_selective_compressor = MethodType(
