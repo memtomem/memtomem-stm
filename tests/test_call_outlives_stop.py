@@ -1,10 +1,11 @@
-"""A call whose upstream reply lands after ``stop()`` fails as a stopping manager.
+"""A call that ``stop()`` overtakes fails as a stopping manager.
 
 ``stop()`` clears the connection registry while a call may be awaiting its
 upstream. The call then refuses with ``ManagerStoppingError`` — recorded like
 any other in-pipeline failure — instead of raising ``KeyError`` from whichever
 stage first reads the registry, and without rebuilding the stores ``stop()``
-has just closed.
+has just closed (#1119). A call already past its fetch that waits out teardown
+on ``_selective_lock`` refuses the same way (#1125).
 """
 
 from __future__ import annotations
@@ -128,4 +129,61 @@ def test_superseded_publication_after_stop_raises_stopping(tmp_path):
         with pytest.raises(ManagerStoppingError):
             mgr._publication_pair("srv", "tool", None, stale_pin)
     finally:
+        store.close()
+
+
+async def _call_across_stop_at_selective_lock(mgr: ProxyManager, reply: object) -> None:
+    """Hold ``_selective_lock`` so the call parks there after its fetch, then
+    run ``stop()`` to completion before letting the call take the lock."""
+    mgr._connections["srv"].session.call_tool.return_value = reply
+    lock = mgr._selective_lock
+    await lock.acquire()
+    try:
+        call = asyncio.create_task(mgr.call_tool("srv", "tool", {}))
+        for _ in range(1000):
+            if lock._waiters:
+                break
+            await asyncio.sleep(0)
+        assert lock._waiters, "the call never reached the selective lock"
+        await mgr.stop()
+        assert "srv" not in mgr._connections
+    finally:
+        lock.release()
+    await asyncio.wait_for(call, timeout=5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("compression", [CompressionStrategy.SELECTIVE, CompressionStrategy.HYBRID])
+async def test_call_parked_on_the_selective_lock_during_stop_does_not_rebuild(
+    tmp_path, compression
+):
+    """A live pin's publication never read the registry, so a call that passed
+    the post-fetch check and waited out ``stop()`` on the lock rebuilt the
+    selective compressor and its store after teardown had closed them."""
+    mgr, store, _ = _build(tmp_path, compression)
+    text = "\n\n".join(f"## Section {i}\n" + "word " * 200 for i in range(10))
+    try:
+        with pytest.raises(ManagerStoppingError):
+            await _call_across_stop_at_selective_lock(mgr, fake_tool_result(text))
+    finally:
+        store.close()
+    assert mgr._selective_compressor is None
+
+
+@pytest.mark.asyncio
+async def test_live_publication_refuses_from_stop_until_start(tmp_path):
+    """The live-pin branch refuses too: it is where SELECTIVE, HYBRID and the
+    progressive store all decide what to (re)build. A manager that was never
+    started publishes as before, and ``start()`` lifts the refusal."""
+    mgr, store, proxy_cfg = _build(tmp_path, CompressionStrategy.SELECTIVE)
+    try:
+        assert mgr._pin_is_live_generation(proxy_cfg)
+        assert mgr._publication_pair("srv", "tool", None, proxy_cfg) == (proxy_cfg, None)
+        await mgr.stop()
+        with pytest.raises(ManagerStoppingError):
+            mgr._publication_pair("srv", "tool", None, proxy_cfg)
+        await mgr.start()
+        assert mgr._publication_pair("srv", "tool", None, proxy_cfg) == (proxy_cfg, None)
+    finally:
+        await mgr.stop()
         store.close()

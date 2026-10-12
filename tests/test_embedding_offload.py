@@ -201,6 +201,8 @@ def _selective_stub(compressor: object, lock_timeout: float = 5.0) -> SimpleName
         _config_loader=SimpleNamespace(current=None),
         _selective_compressor=compressor,
         _selective_compressor_cfg=None,
+        # ``_publication_pair`` refuses on a stopped manager (#1125).
+        _stopped=False,
     )
     stub._compress_maybe_offthread = MethodType(ProxyManager._compress_maybe_offthread, stub)
     stub._pin_is_live_generation = MethodType(ProxyManager._pin_is_live_generation, stub)

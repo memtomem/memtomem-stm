@@ -988,6 +988,11 @@ class ProxyManager:
         # stop -> start reuse — and the documented "notification after stop
         # reschedules" contract — keep working.
         self._background_closed: bool = False
+        # Set when stop() begins and kept until the next start() (#1125). Unlike
+        # ``_background_closed`` it survives the end of teardown, so a request
+        # that waited out the whole of stop() can still tell it happened, and
+        # a manager never started (direct dispatch, tests) reads as running.
+        self._stopped: bool = False
         # #557 ``tools/list_changed`` refresh bookkeeping. ``dirty`` marks
         # servers whose advertised tool list is known-stale; ``running`` holds
         # servers with a drain task in flight so notification bursts coalesce
@@ -1020,6 +1025,7 @@ class ProxyManager:
 
     async def start(self) -> None:
         """Connect to all upstream servers, discover their tools."""
+        self._stopped = False
         # Guard against double start — close previous stack to avoid leaking connections
         if self._stack is not None:
             for conn in self._connections.values():
@@ -2959,6 +2965,7 @@ class ProxyManager:
             )
 
     async def stop(self) -> None:
+        self._stopped = True
         self._registered_description_infos.clear()
         self._registered_recovery_snapshots.clear()
         # Close the spawn path first: a stage that schedules its replacement
@@ -3210,7 +3217,17 @@ class ProxyManager:
 
         Costs one loader read, and only in the stale window; the pinned config
         still drives everything scoped to this call.
+
+        Refuses once ``stop()`` has begun, until the next ``start()`` (#1125):
+        every caller (SELECTIVE, HYBRID, the progressive store) decides right
+        after this whether to rebuild the slot it publishes into, and an empty
+        slot is always rebuilt, so a call that waited out teardown on
+        ``_selective_lock`` would otherwise reopen a store ``stop()`` closes.
         """
+        if self._stopped:
+            raise ManagerStoppingError(
+                "proxy manager stopped; no selective or progressive store is available"
+            )
         if self._pin_is_live_generation(cfg_snap):
             return cfg_snap, sel_cfg
         live = self._config
