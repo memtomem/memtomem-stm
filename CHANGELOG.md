@@ -20,7 +20,8 @@ changes inline only. See the deprecation policy in
   caching. Explicit `_context_query` does not override this policy. Their
   text is capped at the tool's compression budget (`max_result_chars`, or
   `max_upstream_chars` when lower) with no retention floor, filling blocks in
-  order and appending a truncation notice; a token budget applies through its
+  order; a budget cut ends in a truncation notice that counts against the
+  budget. A token budget applies through its
   nominal char conversion. Raise the tool's budget to receive more, or return
   one upstream text block to retain compression and surfacing. See
   `docs/caching.md` for the full policy (#1112, #PR).

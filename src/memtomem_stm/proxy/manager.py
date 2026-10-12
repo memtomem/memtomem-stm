@@ -7558,11 +7558,25 @@ class ProxyManager:
             # compressing/surfacing/indexing it as a single string. Nothing
             # compresses this path, so the tool's char budget caps its text
             # instead; a token budget applies through its nominal char
-            # conversion, even in unicode estimation mode.
+            # conversion, even in unicode estimation mode. A budget cut's
+            # notice counts against the budget, as TRUNCATE's suffix does.
             tc = self._resolve_tool_config(server, tool, proxy_cfg=cfg_snap)
             upstream_capped = cfg_snap.max_upstream_chars <= tc.max_chars
             cap = cfg_snap.max_upstream_chars if upstream_capped else tc.max_chars
             remaining = cap
+            budget_notice = None
+            if not upstream_capped and sum(len(b.text or "") for b in text_blocks) > cap:
+                budget_field = (
+                    "max_result_tokens" if tc.token_budget is not None else "max_result_chars"
+                )
+                budget_notice = (
+                    f"[response truncated to {cap} chars: text blocks with metadata "
+                    f"are not compressed; raise {budget_field} for this tool to "
+                    "receive more]"
+                )
+                if len(budget_notice) >= cap:
+                    budget_notice = "…"
+                remaining = cap - len(budget_notice)
             preserved: list = []
             original_chars = 0
             delivered_chars = 0
@@ -7580,20 +7594,10 @@ class ProxyManager:
                 else:
                     preserved.append(mcp_types.TextContent(type="text", text=bounded))
             if delivered_chars < original_chars:
-                if upstream_capped:
-                    notice = (
-                        f"[response truncated to {cap} chars at "
-                        "max_upstream_chars guard — upstream returned an oversized payload]"
-                    )
-                else:
-                    budget_field = (
-                        "max_result_tokens" if tc.token_budget is not None else "max_result_chars"
-                    )
-                    notice = (
-                        f"[response truncated to {cap} chars: text blocks with metadata "
-                        f"are not compressed; raise {budget_field} for this tool to "
-                        "receive more]"
-                    )
+                notice = budget_notice or (
+                    f"[response truncated to {cap} chars at "
+                    "max_upstream_chars guard — upstream returned an oversized payload]"
+                )
                 preserved.append(mcp_types.TextContent(type="text", text=notice))
                 delivered_chars += len(notice)
             self.tracker.record(

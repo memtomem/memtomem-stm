@@ -82,9 +82,11 @@ re-enable surfacing on this path.
 Because nothing compresses these responses, their text is capped at the tool's
 compression budget: the resolved `max_result_chars` (tool, then server, then the
 model-aware global budget), or `max_upstream_chars` when that is lower. Blocks
-fill in order, so later blocks may arrive empty but keep their metadata, and a
-truncation notice block is appended when text was cut. No retention floor
-applies. A `max_result_tokens` budget applies through its nominal
+fill in order, so later blocks may arrive empty but keep their metadata. When
+the budget cuts text, a truncation notice block is appended and counts against
+the budget (a single `…` when the budget is shorter than the notice); when
+`max_upstream_chars` cuts it, the upstream guard's notice is appended after the
+limit, as for any other response. No retention floor applies. A `max_result_tokens` budget applies through its nominal
 `chars_per_token` conversion, also under `token_estimation_mode: "unicode"`, so
 on this path Hangul or CJK text can exceed the token budget. The inbound
 `max_upstream_bytes` limit still applies to the complete response envelope, and

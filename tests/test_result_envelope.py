@@ -123,6 +123,10 @@ def _set_upstream(mgr: ProxyManager, result) -> AsyncMock:
     return session
 
 
+def _text_total(result: CallToolResult) -> int:
+    return sum(len(block.text) for block in result.content if block.type == "text")
+
+
 def _latest_error(store: MetricsStore) -> dict | None:
     row = store._db.execute(
         "SELECT is_error, error_message FROM proxy_metrics ORDER BY id DESC LIMIT 1"
@@ -222,7 +226,8 @@ class TestEnvelopePreservation:
         for _ in range(2):
             result = await mgr.call_tool("srv", "tool", {"_context_query": "explicit memory query"})
             first, second, notice = result.content
-            assert first.text == "a" * 500
+            assert _text_total(result) == 500
+            assert first.text == "a" * (500 - len(notice.text))
             assert second.text == ""
             assert (first.annotations, second.annotations) == (
                 blocks[0].annotations,
@@ -237,7 +242,7 @@ class TestEnvelopePreservation:
         row = store._db.execute(
             "SELECT original_chars, compressed_chars FROM proxy_metrics ORDER BY id DESC LIMIT 1"
         ).fetchone()
-        assert tuple(row) == (400_000, 500 + len(notice.text))
+        assert tuple(row) == (400_000, 500)
 
     async def test_annotated_cap_follows_tool_override_budget(self, make_mgr):
         from memtomem_stm.proxy.config import ToolOverrideConfig
@@ -251,9 +256,11 @@ class TestEnvelopePreservation:
         blocks = [TextContent(type="text", text=c * 1000, _meta={"id": c}) for c in "ab"]
         _set_upstream(mgr, CallToolResult(content=blocks))
         res = await mgr.call_tool("srv", "tool", {})
-        assert [len(b.text) for b in res.content[:2]] == [300, 0]
+        notice = res.content[2].text
+        assert notice.startswith("[response truncated to 300 chars")
+        assert [len(b.text) for b in res.content[:2]] == [300 - len(notice), 0]
         assert [b.meta for b in res.content[:2]] == [{"id": "a"}, {"id": "b"}]
-        assert res.content[2].text.startswith("[response truncated to 300 chars")
+        assert _text_total(res) == 300
 
     async def test_annotated_cap_follows_model_scaled_global_budget(self, make_mgr):
         mgr, _, _ = make_mgr()
@@ -270,7 +277,7 @@ class TestEnvelopePreservation:
         blocks = [TextContent(type="text", text=c * 5000, _meta={"id": c}) for c in "ab"]
         _set_upstream(mgr, CallToolResult(content=blocks))
         res = await mgr.call_tool("srv", "tool", {})
-        assert sum(len(b.text) for b in res.content[:2]) == budget
+        assert _text_total(res) == budget
         assert res.content[2].text.startswith(f"[response truncated to {budget} chars")
 
     async def test_annotated_cap_uses_nominal_chars_in_unicode_token_mode(self, make_mgr):
@@ -286,8 +293,21 @@ class TestEnvelopePreservation:
         blocks = [TextContent(type="text", text="가" * 1000, _meta={"id": n}) for n in (1, 2)]
         _set_upstream(mgr, CallToolResult(content=blocks))
         res = await mgr.call_tool("srv", "tool", {})
-        assert [len(b.text) for b in res.content[:2]] == [350, 0]
+        assert _text_total(res) == 350
+        assert res.content[1].text == ""
         assert "raise max_result_tokens" in res.content[2].text
+
+    @pytest.mark.parametrize("budget", [1, 5])
+    async def test_annotated_budget_below_notice_uses_one_char_marker(self, make_mgr, budget):
+        mgr, _, _ = make_mgr()
+        cfg = mgr._config.model_copy(deep=True)
+        cfg.upstream_servers["srv"].max_result_chars = budget
+        mgr._config_loader.seed(cfg)
+        blocks = [TextContent(type="text", text=c * 600, _meta={"id": c}) for c in "ab"]
+        _set_upstream(mgr, CallToolResult(content=blocks))
+        res = await mgr.call_tool("srv", "tool", {})
+        assert [b.text for b in res.content] == ["a" * (budget - 1), "", "…"]
+        assert [b.meta for b in res.content[:2]] == [{"id": "a"}, {"id": "b"}]
 
     async def test_annotated_upstream_cap_below_budget_keeps_guard_notice(self, make_mgr):
         mgr, _, _ = make_mgr()
@@ -328,7 +348,7 @@ class TestEnvelopePreservation:
         blocks = [TextContent(type="text", text=c * 600, _meta={"id": c}) for c in "ab"]
         _set_upstream(mgr, CallToolResult(content=blocks))
         res = await mgr.call_tool("srv", "tool", {})
-        assert len(res.content[0].text) == 100
+        assert _text_total(res) == 100
         assert cache.stats()["total_entries"] == 0
 
     async def test_multiple_blocks_keep_later_metadata_without_truncation(self, make_mgr):
