@@ -11,6 +11,37 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-10-12
+
+### Upgrade notes
+
+- **Annotated text blocks keep their metadata, and multi-block ones are not
+  compressed** (#1112, #1118). A single text block's `annotations` and block
+  `_meta` now survive compression and cache replay; before, the result
+  reached the client as plain text without them. A response with two or more
+  text blocks where any block carries `annotations` or `_meta` now keeps its
+  block boundaries and skips cleaning, compression, surfacing and caching. Its
+  text is cut at the tool's budget instead, notice included. On the default
+  config, two annotated blocks of markdown (102,940 chars) deliver 16,000
+  chars where 0.6.1 delivered a 2,740-char compressed view, and a 400,000-char
+  response 0.6.1 cut to 260,000 now delivers 16,000. To receive more, raise
+  the tool's `max_result_chars` (or `max_result_tokens` when a token budget is
+  set), and `max_upstream_chars` if that is the lower limit.
+- **Response cache is cleared once, and warm calls can surface memories**
+  (#1111). Cache schema v6 drops existing response-cache rows on first start;
+  metrics and feedback are kept. Cached replies are bound to the upstream
+  connection, so editing a server's URL, headers, transport or command no
+  longer replays the old connection's reply. A cache hit now applies the
+  surfacing size gate to the original cleaned length, as a cold call does, so
+  memories can be injected on warm calls where they were not before.
+- **A cancelled call no longer hides memories from the next one** (#1113).
+  Cancellation while session context was being fetched used to leave the
+  call's memories reserved, so the next call skipped them.
+- **Dependency floors rise** (#1114, #1116). `pyjwt>=2.15.0` at runtime;
+  `langgraph-sdk>=0.4.4` in the `langchain` extra; `opentelemetry-sdk` and
+  `opentelemetry-exporter-otlp-proto-http` `>=1.45.1` in the `otlp` extra,
+  which also fixes the startup crash on exporter 1.45.0 or later.
+
 ### Changed
 
 - proxy: preserve text-block annotations and metadata through compression and
@@ -42,7 +73,7 @@ changes inline only. See the deprecation policy in
   extra's langgraph-sdk floor to 0.4.4 to clear runtime and extras audit findings.
   **Behavior change**: installations resolve patched versions of these packages;
   langgraph-sdk remains optional. Refresh the development-only jupyterlab,
-  notebook, and tornado locks to their audited patch releases.
+  notebook, and tornado locks to their audited patch releases (#1114).
 
 - docs: README and the reference docs are refreshed for 0.6.1. Statements the
   code had moved past are corrected: `status` and `list` report every schema
@@ -82,7 +113,7 @@ changes inline only. See the deprecation policy in
   counted `export_failures` entry as before. **Behavior change**: installations
   with OTLP export resolve OpenTelemetry 1.45.1 or later. With an OpenTelemetry
   credential provider configured, STM leaves the provider's session in place,
-  so a 3xx drops the batch without being counted as a failure.
+  so a 3xx drops the batch without being counted as a failure (#1116).
 
 ## [0.6.1] — 2026-09-29
 
