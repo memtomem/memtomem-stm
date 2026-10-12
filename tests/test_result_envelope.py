@@ -134,7 +134,7 @@ _BYPASS_LABEL = ("none→metadata_bypass", 0, "initial_response_v1")
 
 def _latest_bypass_row(store: MetricsStore) -> tuple:
     row = store._db.execute(
-        "SELECT original_chars, compressed_chars, compression_strategy, "
+        "SELECT original_chars, compressed_chars, cleaned_chars, compression_strategy, "
         "strategy_auto_selected, compression_accounting "
         "FROM proxy_metrics ORDER BY id DESC LIMIT 1"
     ).fetchone()
@@ -253,7 +253,7 @@ class TestEnvelopePreservation:
         assert cache.stats()["total_entries"] == 0
         mgr._compress_and_surface.assert_not_awaited()
         mgr._run_index_stage.assert_not_awaited()
-        assert _latest_bypass_row(store) == (400_000, 500, *_BYPASS_LABEL)
+        assert _latest_bypass_row(store) == (400_000, 500, 400_000, *_BYPASS_LABEL)
 
     async def test_annotated_cap_follows_tool_override_budget(self, make_mgr):
         from memtomem_stm.proxy.config import ToolOverrideConfig
@@ -388,7 +388,7 @@ class TestEnvelopePreservation:
         _set_upstream(mgr, CallToolResult(content=blocks))
         res = await mgr.call_tool("srv", "tool", {})
         assert res.content == blocks
-        assert _latest_bypass_row(store) == (11, 11, *_BYPASS_LABEL)
+        assert _latest_bypass_row(store) == (11, 11, 11, *_BYPASS_LABEL)
 
     async def test_annotated_rows_are_classified_and_left_out_of_tuner_profiles(
         self, make_mgr, tmp_path
@@ -408,6 +408,131 @@ class TestEnvelopePreservation:
         assert summary["initial_response_calls"] == 2
         [profile] = store.get_tool_profiles(since_seconds=3600.0)
         assert (profile["call_count"], profile["p95_original_chars"]) == (1, 60_000)
+
+    async def test_annotated_blocks_are_cleaned_one_by_one(self, make_mgr):
+        mgr, store, _ = make_mgr()
+        markup = '<div class="x">' * 2000 + "body" + "</div>" * 2000
+        blocks = [
+            TextContent(type="text", text=markup, annotations=Annotations(audience=["user"])),
+            TextContent(type="text", text="<div><span></span></div>\n\n  ", _meta={"id": 2}),
+            TextContent(type="text", text="plain", _meta={"id": 3}),
+        ]
+        _set_upstream(mgr, CallToolResult(content=blocks))
+        res = await mgr.call_tool("srv", "tool", {})
+        assert [b.text for b in res.content] == ["body", "", "plain"]
+        assert [(b.annotations, b.meta) for b in res.content] == [
+            (blocks[0].annotations, None),
+            (None, {"id": 2}),
+            (None, {"id": 3}),
+        ]
+        original = len(markup) + 28 + 5
+        assert _latest_bypass_row(store) == (original, 9, 9, *_BYPASS_LABEL)
+
+    async def test_paragraph_repeated_in_another_block_is_kept(self, make_mgr):
+        mgr, _, _ = make_mgr()
+        blocks = [
+            TextContent(
+                type="text",
+                text="same para\n\nsame para\n\nother",
+                annotations=Annotations(audience=["user"]),
+            ),
+            TextContent(
+                type="text", text="same para", annotations=Annotations(audience=["assistant"])
+            ),
+        ]
+        _set_upstream(mgr, CallToolResult(content=blocks))
+        res = await mgr.call_tool("srv", "tool", {})
+        assert [b.text for b in res.content] == ["same para\n\nother", "same para"]
+
+    async def test_annotated_cap_applies_to_cleaned_text(self, make_mgr):
+        mgr, store, _ = make_mgr()
+        cfg = mgr._config.model_copy(deep=True)
+        cfg.upstream_servers["srv"].max_result_chars = 1000
+        mgr._config_loader.seed(cfg)
+        markup = "<p>" * 1000
+        fits = [TextContent(type="text", text=markup + c * 400, _meta={"id": c}) for c in "ab"]
+        _set_upstream(mgr, CallToolResult(content=fits))
+        res = await mgr.call_tool("srv", "tool", {})
+        assert [b.text for b in res.content] == ["a" * 400, "b" * 400]
+        assert _latest_bypass_row(store) == (6800, 800, 800, *_BYPASS_LABEL)
+
+        over = [TextContent(type="text", text=markup + c * 600, _meta={"id": c}) for c in "ab"]
+        _set_upstream(mgr, CallToolResult(content=over))
+        res = await mgr.call_tool("srv", "tool", {})
+        first, second, notice = res.content
+        assert first.text == "a" * 600
+        assert second.text == "b" * (400 - len(notice.text))
+        assert notice.text.startswith("[response truncated to 1000 chars: text blocks")
+        assert _latest_bypass_row(store) == (7200, 1000, 1200, *_BYPASS_LABEL)
+
+    async def test_upstream_guard_bounds_raw_text_before_cleaning(self, make_mgr):
+        mgr, store, _ = make_mgr()
+        cfg = mgr._config.model_copy(update={"max_upstream_chars": 100})
+        mgr._config_loader.seed(cfg)
+        blocks = [
+            TextContent(type="text", text="<p>" * 40 + "tail", _meta={"id": 1}),
+            TextContent(type="text", text="never read", _meta={"id": 2}),
+        ]
+        _set_upstream(mgr, CallToolResult(content=blocks))
+        res = await mgr.call_tool("srv", "tool", {})
+        first, second, notice = res.content
+        assert (first.text, second.text) == ("<", "")
+        assert [first.meta, second.meta] == [{"id": 1}, {"id": 2}]
+        assert notice.text.startswith("[response truncated to 100 chars at max_upstream_chars")
+        assert _latest_bypass_row(store) == (134, 1 + len(notice.text), 1, *_BYPASS_LABEL)
+
+    async def test_annotated_blocks_follow_disabled_cleaning(self, make_mgr):
+        from memtomem_stm.proxy.config import CleaningConfig
+
+        mgr, _, _ = make_mgr()
+        cfg = mgr._config.model_copy(deep=True)
+        cfg.upstream_servers["srv"].cleaning = CleaningConfig(enabled=False)
+        mgr._config_loader.seed(cfg)
+        blocks = [TextContent(type="text", text=f"<b>{c}</b>\n\n", _meta={"id": c}) for c in "ab"]
+        _set_upstream(mgr, CallToolResult(content=blocks))
+        res = await mgr.call_tool("srv", "tool", {})
+        assert res.content == blocks
+
+    @pytest.mark.parametrize(
+        ("upstream", "budget", "lengths", "notice"),
+        [
+            (700, 50000, [600, 100], "guard"),
+            (700, 700, [600, 100], "guard"),
+            (580, 50000, [580, 0], "guard"),
+            (50000, 500, None, "budget"),
+            (900, 500, None, "budget"),
+            (50000, 5, [4, 0], "…"),
+            (50000, 1199, None, "budget"),
+            (50000, 1200, [600, 600], None),
+        ],
+    )
+    async def test_disabled_cleaning_keeps_the_raw_caps(
+        self, make_mgr, upstream, budget, lengths, notice
+    ):
+        from memtomem_stm.proxy.config import CleaningConfig
+
+        mgr, _, _ = make_mgr()
+        cfg = mgr._config.model_copy(update={"max_upstream_chars": upstream}, deep=True)
+        cfg.upstream_servers["srv"].cleaning = CleaningConfig(enabled=False)
+        cfg.upstream_servers["srv"].max_result_chars = budget
+        mgr._config_loader.seed(cfg)
+        raw = {c: "<b>" + c * 597 for c in "ab"}
+        blocks = [TextContent(type="text", text=raw[c], _meta={"id": c}) for c in "ab"]
+        _set_upstream(mgr, CallToolResult(content=blocks))
+        res = await mgr.call_tool("srv", "tool", {})
+        texts = [b.text for b in res.content]
+        if notice == "budget":
+            assert texts[2].startswith(f"[response truncated to {budget} chars: text blocks")
+            fill = budget - len(texts[2])
+            lengths = [min(600, fill), max(0, fill - 600)]
+        elif notice == "guard":
+            assert texts[2].startswith(f"[response truncated to {upstream} chars at max_upstream")
+        elif notice == "…":
+            assert texts[2] == "…"
+        else:
+            assert len(texts) == 2
+        assert texts[:2] == [raw[c][:n] for c, n in zip("ab", lengths)]
+        assert [b.meta for b in res.content[:2]] == [{"id": "a"}, {"id": "b"}]
 
     async def test_text_with_structured_and_meta_returns_envelope(self, make_mgr):
         mgr, _, _ = make_mgr()

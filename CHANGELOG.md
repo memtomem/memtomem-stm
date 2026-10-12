@@ -11,6 +11,24 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Changed
+
+- proxy: a response whose annotated text blocks are kept apart instead of
+  compressed (#1112, #1118) delivered each block's raw text, so markup used up
+  the tool's budget. On the default config, two annotated blocks of 46,803
+  chars, each a three-letter word wrapped in HTML tags, delivered 16,000
+  chars: markup from the first block, an empty second block and the
+  truncation notice. They now deliver the two words, 6 chars.
+  Each block is now cleaned on its own with the tool's `cleaning` settings
+  before the budget cap, keeping its `annotations` and `_meta`; a block that
+  cleans to nothing is delivered empty. A paragraph repeated in another block
+  is kept, since that block may address a different audience, and
+  `max_upstream_chars` still bounds the raw text before cleaning. The
+  `proxy_metrics` row now records the cleaned length and cleaning time.
+  **Behavior change**: these responses arrive cleaned, so their text can be
+  shorter than before and more of a long response fits the budget; a tool
+  with `cleaning.enabled: false` delivers the same text as before (#1121).
+
 ### Fixed
 
 - proxy: a tool call whose upstream reply arrived after the proxy manager had

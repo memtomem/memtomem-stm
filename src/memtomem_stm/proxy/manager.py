@@ -7606,49 +7606,73 @@ class ProxyManager:
         if len(text_blocks) > 1 and any(_text_block_metadata(block) for block in text_blocks):
             # Combining blocks can assign one block's audience or metadata to
             # another's text. Preserve this response's boundaries instead of
-            # compressing/surfacing/indexing it as a single string. Nothing
-            # compresses this path, so the tool's char budget caps its text
-            # instead; a token budget applies through its nominal char
-            # conversion, even in unicode estimation mode. A budget cut's
-            # notice counts against the budget, as TRUNCATE's suffix does.
+            # compressing/surfacing/indexing it as a single string. Cleaning
+            # rewrites one string without moving text between strings, so each
+            # block is cleaned on its own: markup and repeats inside a block
+            # go, and a paragraph repeated in another block stays, since that
+            # block may be addressed to another audience. As on the normal
+            # path, max_upstream_chars bounds the raw text before the cleaner
+            # reads it.
             tc = self._resolve_tool_config(server, tool, proxy_cfg=cfg_snap)
-            upstream_capped = cfg_snap.max_upstream_chars <= tc.max_chars
-            cap = cfg_snap.max_upstream_chars if upstream_capped else tc.max_chars
+            upstream_left = cfg_snap.max_upstream_chars
+            upstream_cut = False
+            original_chars = 0
+            cleaned_blocks: list[str] = []
+            with traced(
+                "proxy_call_clean",
+                metadata={"server": server, "tool": tool},
+            ):
+                _t0 = _time.monotonic()
+                for text_block in text_blocks:
+                    text = text_block.text or ""
+                    original_chars += len(text)
+                    if len(text) > upstream_left:
+                        text = text[:upstream_left]
+                        upstream_cut = True
+                    upstream_left -= len(text)
+                    cleaned_blocks.append(self._clean_content(text, tc.cleaning))
+                _clean_ms = (_time.monotonic() - _t0) * 1000
+            cleaned_chars = sum(len(text) for text in cleaned_blocks)
+            # Nothing compresses this path, so the tool's char budget caps the
+            # cleaned text instead; a token budget applies through its nominal
+            # char conversion, even in unicode estimation mode. A budget cut's
+            # notice counts against the budget, as TRUNCATE's suffix does; the
+            # guard's notice follows the text, as it does on the normal path.
+            cap = tc.max_chars
             remaining = cap
-            budget_notice = None
-            if not upstream_capped and sum(len(b.text or "") for b in text_blocks) > cap:
+            notice = None
+            if cleaned_chars > cap:
                 budget_field = (
                     "max_result_tokens" if tc.token_budget is not None else "max_result_chars"
                 )
-                budget_notice = (
+                notice = (
                     f"[response truncated to {cap} chars: text blocks with metadata "
                     f"are not compressed; raise {budget_field} for this tool to "
                     "receive more]"
                 )
-                if len(budget_notice) >= cap:
-                    budget_notice = "…"
-                remaining = cap - len(budget_notice)
+                if len(notice) >= cap:
+                    notice = "…"
+                remaining = cap - len(notice)
+            elif upstream_cut:
+                notice = (
+                    f"[response truncated to {cfg_snap.max_upstream_chars} chars at "
+                    "max_upstream_chars guard — upstream returned an oversized payload]"
+                )
             preserved: list = []
-            original_chars = 0
             delivered_chars = 0
+            cleaned_iter = iter(cleaned_blocks)
             for block in result.content or []:
                 if block.type != "text":
                     preserved.append(block)
                     continue
-                text = block.text or ""
-                original_chars += len(text)
-                bounded = text[:remaining]
+                bounded = next(cleaned_iter)[:remaining]
                 remaining -= len(bounded)
                 delivered_chars += len(bounded)
                 if hasattr(block, "model_copy"):
                     preserved.append(block.model_copy(update={"text": bounded}))
                 else:
                     preserved.append(mcp_types.TextContent(type="text", text=bounded))
-            if delivered_chars < original_chars:
-                notice = budget_notice or (
-                    f"[response truncated to {cap} chars at "
-                    "max_upstream_chars guard — upstream returned an oversized payload]"
-                )
+            if notice is not None:
                 preserved.append(mcp_types.TextContent(type="text", text=notice))
                 delivered_chars += len(notice)
             # Labelled so readers can tell this path apart (#1122): the tuner
@@ -7662,6 +7686,8 @@ class ProxyManager:
                     tool=tool,
                     original_chars=original_chars,
                     compressed_chars=delivered_chars,
+                    cleaned_chars=cleaned_chars,
+                    clean_ms=_clean_ms,
                     trace_id=trace_id,
                     compression_strategy=METADATA_BYPASS_STRATEGY,
                     strategy_auto_selected=False,
