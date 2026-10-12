@@ -15,10 +15,12 @@ changes inline only. See the deprecation policy in
 
 - proxy: a tool call whose upstream reply arrived after the proxy manager had
   stopped raised a bare `KeyError`. It now fails with `ManagerStoppingError`,
-  recorded as an `internal_error` metrics row, for every response shape,
-  including upstream error and empty replies that used to be returned. The
-  refusal comes before compression, so such a call no longer reopens the
-  selective or progressive stores that shutdown has just closed (#1119).
+  recorded as an `internal_error` metrics row. The refusal comes before
+  compression, so such a call no longer reopens the selective or progressive
+  stores that shutdown has just closed. **Behavior change**: during shutdown,
+  an upstream error reply or an empty reply that lands after `stop()` is now
+  refused with `ManagerStoppingError` instead of being returned to the client;
+  calls that finish before `stop()` are unchanged (#1119, #1124).
 
 ## [0.6.2] — 2026-10-12
 
