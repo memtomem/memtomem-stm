@@ -31,9 +31,10 @@ changes inline only. See the deprecation policy in
   `compression_strategy = 'none→metadata_bypass'` and stamped with the
   initial-response accounting basis, and `mms stats --json` gains a per-tool
   `tuner_calls` count. **Behavior change**: `mms stats` no longer warns about
-  these rows; tuner profiles and the readiness count exclude them, so a tool
-  that only ever took this path is neither profiled nor reported ready. Rows
-  written before this release are not relabelled (#1122, #1126).
+  these rows, and tuner profiles and the readiness count exclude them. Rows
+  written before this release are not relabelled and still count, so a tool's
+  profile and readiness change only as labelled rows replace them
+  (#1122, #1126).
 
 ## [0.6.2] — 2026-10-12
 
