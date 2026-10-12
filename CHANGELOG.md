@@ -29,6 +29,14 @@ changes inline only. See the deprecation policy in
   proxied tool call no longer rebuilds the selective compressor or the
   progressive store; the ratio guard's progressive and hybrid fallbacks then
   fall through to truncate, as on any other fallback failure (#1125, #1127).
+- proxy: `stm_proxy_read_more` and `stm_proxy_select_chunks` reopen the
+  configured SQLite pending store when no store is open yet, so keys issued
+  before a restart stay readable. After the proxy manager stopped, that same
+  path reopened the store shutdown had just closed and left it open.
+  **Behavior change**: after `stop()` and until the next `start()`, these two
+  tools answer as for an unknown key ("not found or expired" / "not active")
+  instead of reading the pending store; a running proxy is unchanged
+  (#1128, #1129).
 - metrics: a response whose annotated text blocks were kept apart instead of
   compressed recorded a `proxy_metrics` row with no strategy and no accounting
   basis. `mms stats` therefore counted it among the unclassified/legacy rows

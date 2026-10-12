@@ -988,10 +988,10 @@ class ProxyManager:
         # stop -> start reuse — and the documented "notification after stop
         # reschedules" contract — keep working.
         self._background_closed: bool = False
-        # Set when stop() begins and kept until the next start() (#1125). Unlike
-        # ``_background_closed`` it survives the end of teardown, so a request
-        # that waited out the whole of stop() can still tell it happened, and
-        # a manager never started (direct dispatch, tests) reads as running.
+        # Set when stop() begins and kept until the next start() (#1125, #1128).
+        # Unlike ``_background_closed`` it survives the end of teardown, so a
+        # request that runs across or after stop() can still tell it happened,
+        # and a manager never started (direct dispatch, tests) reads as running.
         self._stopped: bool = False
         # #557 ``tools/list_changed`` refresh bookkeeping. ``dirty`` marks
         # servers whose advertised tool list is known-stale; ``running`` holds
@@ -4856,6 +4856,13 @@ class ProxyManager:
             # the very defect this mutex exists to prevent. The build stays
             # outside the lock (it opens SQLite), so the slot is re-checked under
             # it and a candidate that lost the race is closed rather than leaked.
+            #
+            # After stop() the slot is empty because teardown closed it, not
+            # because this process just started: reopening it would leave a
+            # store no teardown closes (#1128). start() clears the flag, so
+            # restart recovery is unaffected.
+            if self._stopped:
+                return "Selective compression not active — no pending TOC selections."
             sel_cfg = self._sqlite_cfg_holding_key(key, cfg_live) or (cfgs[0] if cfgs else None)
             if sel_cfg is None:
                 return "Selective compression not active — no pending TOC selections."
@@ -5047,6 +5054,10 @@ class ProxyManager:
         cfgs = self._distinct_sqlite_selective_cfgs(cfg_live)
         temp_store: ProgressiveStoreAdapter | None = None
         if self._progressive_store is None:
+            # As in select_chunks: an empty slot after stop() is one teardown
+            # closed, so answer as for an unknown key rather than reopen it (#1128).
+            if self._stopped:
+                return f"Progressive delivery key '{key}' not found or expired."
             fallback = self._sqlite_cfg_holding_key(key, cfg_live) or (cfgs[0] if cfgs else None)
             if fallback is not None:
                 try:
