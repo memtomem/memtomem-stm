@@ -11,6 +11,15 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Fixed
+
+- proxy: a tool call whose upstream reply arrived after the proxy manager had
+  stopped raised a bare `KeyError`. It now fails with `ManagerStoppingError`,
+  recorded as an `internal_error` metrics row, for every response shape,
+  including upstream error and empty replies that used to be returned. The
+  refusal comes before compression, so such a call no longer reopens the
+  selective or progressive stores that shutdown has just closed (#1119).
+
 ## [0.6.2] — 2026-10-12
 
 ### Upgrade notes

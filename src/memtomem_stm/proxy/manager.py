@@ -3880,11 +3880,29 @@ class ProxyManager:
         kwargs["publish_lock"] = self._selective_publish_mu
         return SelectiveCompressor(**kwargs)
 
+    def _connection_or_stopping(self, server: str) -> UpstreamConnection:
+        """The registered connection, or :class:`ManagerStoppingError` once
+        ``stop()`` has cleared the registry (#1119).
+
+        Entries leave the registry only when ``stop()`` (or ``start()``'s
+        double-start guard) clears it, so a request that found its server at
+        the start and misses it after an await has been outlived by teardown.
+        Refusing is the #890 answer: a ``KeyError`` reads as a bug, and going
+        on could rebuild selective/progressive stores ``stop()`` has already
+        closed.
+        """
+        conn = self._connections.get(server)
+        if conn is None:
+            raise ManagerStoppingError(
+                f"proxy manager stopped while a call to '{server}' was in flight"
+            )
+        return conn
+
     def _resolve_tool_config(
         self, server: str, tool: str, proxy_cfg: ProxyConfig | None = None
     ) -> ToolConfig:
         config = proxy_cfg or self._config
-        conn = self._connections[server]
+        conn = self._connection_or_stopping(server)
         # Per-server fields ride the hot-reloaded snapshot: compression /
         # cleaning / tool_overrides / budget edits apply on the next tool call
         # without a reconnect (the behavior docs/configuration.md promises).
@@ -7424,6 +7442,11 @@ class ProxyManager:
                     server, tool, upstream_args, trace_id=trace_id, cfg_snap=cfg_snap
                 )
                 result = fetched.result
+
+        # A reply that lands after stop() is refused here, for every response
+        # shape alike, rather than at whichever later stage first reads the
+        # cleared registry.
+        self._connection_or_stopping(server)
 
         # ``max_upstream_bytes`` caps the inbound MCP envelope (docs/configuration.md),
         # and for a correlated response the wire check already measured exactly
