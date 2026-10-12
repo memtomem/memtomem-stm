@@ -11,6 +11,41 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.6.3] — 2026-10-12
+
+### Upgrade notes
+
+- **An unreachable HTTP upstream no longer keeps the server from starting**
+  (#1132, #1134). On 0.6.2, one `streamable_http` upstream that could not be
+  reached at startup made the whole STM server fail to start. It is now
+  recorded as failed in `stm_proxy_health` and the other upstreams start.
+  No configuration change is needed; this is the reason for the release.
+- **Annotated multi-block responses are cleaned again** (#1121, #1130). A
+  successful response with two or more text blocks, any of them carrying
+  `annotations` or block `_meta`, still keeps its block boundaries and skips
+  compression, but each block now goes through the tool's `cleaning` settings
+  before the budget cap, as all of its text did on 0.6.1 before 0.6.2 kept
+  the blocks apart. On the default config, two annotated blocks of 46,803
+  chars of HTML around a three-letter word each deliver the two words, where
+  0.6.2 delivered 16,000 chars of markup and truncation notice and 0.6.1 the
+  two words merged into one string. To receive the raw text as 0.6.2 did,
+  set `cleaning.enabled: false` for the tool; `strip_html: false` keeps the
+  markup and still applies the rest of cleaning.
+- **Late replies during shutdown are refused** (#1124). A tool call whose
+  upstream reply arrives after the proxy manager stopped now fails with
+  `ManagerStoppingError`. On 0.6.2 such a reply raised a bare `KeyError`,
+  except an upstream error reply or a reply with no text block (empty,
+  image-only, structured-only), which reached the client.
+  Calls that finish before shutdown are unchanged.
+- **Follow-up reads answer "not found" after shutdown** (#1129).
+  `stm_proxy_read_more` and `stm_proxy_select_chunks` no longer reopen the
+  SQLite pending store between `stop()` and the next `start()`; they answer
+  "not found or expired" and "Selective compression not active".
+- **`mms stats` stops warning about annotated bypass rows** (#1126). Those rows
+  are now labelled `none→metadata_bypass`, and tuner profiles and the
+  readiness count in `mms status` / `mms doctor` leave them out. Rows written
+  by 0.6.2 keep no label and still count until newer rows replace them.
+
 ### Changed
 
 - proxy: a response whose annotated text blocks are kept apart instead of
@@ -27,7 +62,8 @@ changes inline only. See the deprecation policy in
   `proxy_metrics` row now records the cleaned length and cleaning time.
   **Behavior change**: these responses arrive cleaned, so their text can be
   shorter than before and more of a long response fits the budget; a tool
-  with `cleaning.enabled: false` delivers the same text as before (#1121).
+  with `cleaning.enabled: false` delivers the same text as before (#1121,
+  #1130).
 
 ### Fixed
 
@@ -47,14 +83,15 @@ changes inline only. See the deprecation policy in
   remaining upstreams (measured against a real streamable HTTP upstream that
   was killed). Closing it now reports the unwind's error, which `stop()` and
   reconnect already log and move past. A caller that is itself cancelled
-  still gets `CancelledError` (#1132).
+  still gets `CancelledError` (#1132, #1134).
 - proxy: a tool call whose upstream reply arrived after the proxy manager had
   stopped raised a bare `KeyError`. It now fails with `ManagerStoppingError`,
   recorded as an `internal_error` metrics row. The refusal comes before
   compression, so such a call no longer reopens the selective or progressive
   stores that shutdown has just closed. **Behavior change**: during shutdown,
-  an upstream error reply or an empty reply that lands after `stop()` is now
-  refused with `ManagerStoppingError` instead of being returned to the client;
+  an upstream error reply or a reply with no text block (empty, image-only,
+  structured-only) that lands after `stop()` is now refused with
+  `ManagerStoppingError` instead of being returned to the client;
   calls that finish before `stop()` are unchanged (#1119, #1124).
 - proxy: a SELECTIVE or HYBRID call that had its upstream reply but was
   waiting for the selective compressor while the proxy manager stopped went on
