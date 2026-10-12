@@ -4857,10 +4857,9 @@ class ProxyManager:
             # outside the lock (it opens SQLite), so the slot is re-checked under
             # it and a candidate that lost the race is closed rather than leaked.
             #
-            # After stop() the slot is empty because teardown closed it, not
-            # because this process just started: reopening it would leave a
-            # store no teardown closes (#1128). start() clears the flag, so
-            # restart recovery is unaffected.
+            # After stop(), recovery must not open or reopen a store: one
+            # opened here would outlive the teardown that already ran (#1128).
+            # start() clears the flag, so restart recovery is unaffected.
             if self._stopped:
                 return "Selective compression not active — no pending TOC selections."
             sel_cfg = self._sqlite_cfg_holding_key(key, cfg_live) or (cfgs[0] if cfgs else None)
@@ -5054,8 +5053,8 @@ class ProxyManager:
         cfgs = self._distinct_sqlite_selective_cfgs(cfg_live)
         temp_store: ProgressiveStoreAdapter | None = None
         if self._progressive_store is None:
-            # As in select_chunks: an empty slot after stop() is one teardown
-            # closed, so answer as for an unknown key rather than reopen it (#1128).
+            # As in select_chunks: after stop(), answer with the missing-key
+            # sentinel rather than open or reopen a store (#1128).
             if self._stopped:
                 return f"Progressive delivery key '{key}' not found or expired."
             fallback = self._sqlite_cfg_holding_key(key, cfg_live) or (cfgs[0] if cfgs else None)

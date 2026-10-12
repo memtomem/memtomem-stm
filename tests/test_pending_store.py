@@ -646,8 +646,8 @@ class TestMultiPathRecovery:
 class TestStoreLifecycleCleanup:
     async def test_stopped_manager_does_not_reopen_stores_for_recovery(self, tmp_path):
         """After stop(), select_chunks and read_more answer with their sentinels
-        instead of reopening the stores teardown closed (#1128). Clearing the
-        flag, as start() does, brings recovery back on the same manager."""
+        instead of opening a store (#1128). Clearing the flag, as start() does,
+        brings recovery back on the same manager."""
         import re
 
         from memtomem_stm.proxy.config import ProgressiveConfig
