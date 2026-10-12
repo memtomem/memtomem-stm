@@ -262,6 +262,23 @@ class TestEnvelopePreservation:
         assert [b.meta for b in res.content[:2]] == [{"id": "a"}, {"id": "b"}]
         assert _text_total(res) == 300
 
+    async def test_budget_left_after_a_short_block_fills_the_next_one(self, make_mgr):
+        mgr, _, _ = make_mgr()
+        cfg = mgr._config.model_copy(deep=True)
+        cfg.upstream_servers["srv"].max_result_chars = 500
+        mgr._config_loader.seed(cfg)
+        blocks = [
+            TextContent(type="text", text="a" * 50, _meta={"id": "a"}),
+            TextContent(type="text", text="b" * 2000, _meta={"id": "b"}),
+        ]
+        _set_upstream(mgr, CallToolResult(content=blocks))
+        res = await mgr.call_tool("srv", "tool", {})
+        first, second, notice = res.content
+        assert first.text == "a" * 50
+        assert second.text == "b" * (500 - 50 - len(notice.text))
+        assert [first.meta, second.meta] == [{"id": "a"}, {"id": "b"}]
+        assert _text_total(res) == 500
+
     async def test_annotated_cap_follows_model_scaled_global_budget(self, make_mgr):
         mgr, _, _ = make_mgr()
         cfg = mgr._config.model_copy(deep=True)
