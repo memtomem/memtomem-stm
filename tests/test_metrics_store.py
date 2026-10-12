@@ -432,6 +432,52 @@ class TestRecordPersistsNewFields:
         assert ("lf", "search") in keys
         assert ("builtin", "Bash") not in keys
 
+    def test_get_tool_profiles_excludes_metadata_bypass_rows(self, store):
+        # Annotated multi-block responses are never compressed (#1112), so
+        # their rows say nothing about the settings the tuner adjusts (#1122).
+        # Rows with no strategy at all (passthrough, legacy) stay in.
+        for original, violation in ((1000, False), (2000, True), (3000, False)):
+            store.record(
+                CallMetrics(
+                    server="lf",
+                    tool="search",
+                    original_chars=original,
+                    compressed_chars=original // 2,
+                    cleaned_chars=original,
+                    compression_strategy="hybrid",
+                    strategy_auto_selected=True,
+                    ratio_violation=violation,
+                    compression_accounting="initial_response_v1",
+                )
+            )
+        store.record(CallMetrics(server="lf", tool="search", original_chars=0, compressed_chars=0))
+        # One small and one large bypass row: whichever side of the p95 rank
+        # they land on, counting them moves it.
+        for server, original in (("lf", 5), ("lf", 500_000), ("annotated_only", 500_000)):
+            store.record(
+                CallMetrics(
+                    server=server,
+                    tool="search",
+                    original_chars=original,
+                    compressed_chars=min(original, 16_000),
+                    compression_strategy="none→metadata_bypass",
+                    strategy_auto_selected=False,
+                    compression_accounting="initial_response_v1",
+                )
+            )
+
+        profiles = {p["server"]: p for p in store.get_tool_profiles(since_seconds=3600.0)}
+
+        assert set(profiles) == {"lf"}
+        lf = profiles["lf"]
+        assert (lf["call_count"], lf["violation_count"], lf["p95_original_chars"]) == (4, 1, 2000)
+        assert (lf["avg_ratio"], lf["ratio_count"]) == (0.5, 3)
+        assert (
+            lf["auto_dominant_strategy"],
+            lf["auto_dominant_strategy_count"],
+            lf["auto_strategy_count"],
+        ) == ("hybrid", 3, 3)
+
     def test_error_stats_exclude_hook_source(self, store):
         # The exposure health filter (#465) is proxy analytics; hook rows must
         # not enter its per-(server, tool) call/error counts.
@@ -843,6 +889,8 @@ class TestReadCompressionSummary:
         # 'mcp' on a legacy DB still sees the legacy rows (all implicitly mcp).
         mcp = read_compression_summary(db_path, source="mcp")
         assert mcp["total_calls"] == 1
+        # No strategy column means no bypass label: every row is a tuner sample.
+        assert mcp["by_tool"][0]["tuner_calls"] == 1
 
     def test_schema_outdated_false_when_only_source_missing(self, tmp_path):
         # A DB that has ``is_error`` but predates ``source``: error counts are

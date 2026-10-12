@@ -169,6 +169,7 @@ from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
 from memtomem_stm.proxy._locks import LockTimeoutError, bounded_lock
 from memtomem_stm.proxy.metrics import (
     MAX_ERROR_MESSAGE_CHARS,
+    METADATA_BYPASS_STRATEGY,
     CallMetrics,
     ErrorCategory,
     TokenTracker,
@@ -7623,6 +7624,11 @@ class ProxyManager:
                 )
                 preserved.append(mcp_types.TextContent(type="text", text=notice))
                 delivered_chars += len(notice)
+            # Labelled so readers can tell this path apart (#1122): the tuner
+            # drops it, since no compressor or retention floor ran. The row is
+            # on the initial-response basis — ``delivered_chars`` is the text
+            # this one response carried, notice included, and nothing is
+            # surfaced or read further — so stats count it as classified.
             self.tracker.record(
                 CallMetrics(
                     server=server,
@@ -7630,6 +7636,9 @@ class ProxyManager:
                     original_chars=original_chars,
                     compressed_chars=delivered_chars,
                     trace_id=trace_id,
+                    compression_strategy=METADATA_BYPASS_STRATEGY,
+                    strategy_auto_selected=False,
+                    compression_accounting="initial_response_v1",
                 )
             )
             self._record_unstorable_response(server, tool, cfg_snap=cfg_snap)
