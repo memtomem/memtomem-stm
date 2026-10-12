@@ -18,10 +18,14 @@ changes inline only. See the deprecation policy in
   any block metadata preserve their boundaries, including identical metadata,
   and bypass cleaning, compression, surfacing, indexing, extraction, and
   caching. Explicit `_context_query` does not override this policy. Their
-  text is bounded by `max_upstream_chars`, not `max_result_chars`; two
-  200,000-character blocks may therefore deliver 400,000 characters. Lower
-  `max_upstream_chars` to limit delivery, or return one upstream text block to
-  retain compression and surfacing. See `docs/caching.md` for the full policy (#1112).
+  text is capped at the tool's compression budget (`max_result_chars`, or
+  `max_upstream_chars` when lower) with no retention floor, filling blocks in
+  order; a budget cut ends in a truncation notice that counts against the
+  budget, while a `max_upstream_chars` cut appends the upstream guard notice
+  after the limit, as on other responses. A token budget applies through its
+  nominal char conversion. Raise the tool's budget to receive more, or return
+  one upstream text block to retain compression and surfacing. See
+  `docs/caching.md` for the full policy (#1112, #1118).
 
 - surfacing: fetch session context before reserving memories for delivery.
   **Behavior change**: cancellation during scratchpad retrieval no longer

@@ -123,6 +123,10 @@ def _set_upstream(mgr: ProxyManager, result) -> AsyncMock:
     return session
 
 
+def _text_total(result: CallToolResult) -> int:
+    return sum(len(block.text) for block in result.content if block.type == "text")
+
+
 def _latest_error(store: MetricsStore) -> dict | None:
     row = store._db.execute(
         "SELECT is_error, error_message FROM proxy_metrics ORDER BY id DESC LIMIT 1"
@@ -200,33 +204,169 @@ class TestEnvelopePreservation:
         assert cache.stats()["total_entries"] == 0
         assert store._db.execute("SELECT count(*) FROM proxy_metrics").fetchone()[0] == 2
 
-    async def test_identical_metadata_preserves_large_blocks_despite_compression_budget(
-        self, make_mgr
-    ):
-        mgr, _, cache = make_mgr(with_cache=True)
+    @pytest.mark.parametrize("identical", [True, False])
+    async def test_annotated_blocks_are_capped_at_the_compression_budget(self, make_mgr, identical):
+        mgr, store, cache = make_mgr(with_cache=True)
         cfg = mgr._config.model_copy(deep=True)
         cfg.min_result_retention = 0.0
         cfg.upstream_servers["srv"].max_result_chars = 500
         mgr._config_loader.seed(cfg)
+        audiences = ("assistant", "assistant") if identical else ("assistant", "user")
         blocks = [
             TextContent(
                 type="text",
                 text=char * 200_000,
-                annotations=Annotations(audience=["assistant"]),
+                annotations=Annotations(audience=[audience]),
             )
-            for char in ("a", "b")
+            for char, audience in zip(("a", "b"), audiences)
         ]
         session = _set_upstream(mgr, CallToolResult(content=blocks))
         mgr._compress_and_surface = AsyncMock(side_effect=AssertionError("preserve boundaries"))
         mgr._run_index_stage = AsyncMock(side_effect=AssertionError("preserve boundaries"))
         for _ in range(2):
             result = await mgr.call_tool("srv", "tool", {"_context_query": "explicit memory query"})
-            assert result.content == blocks
-            assert sum(len(block.text) for block in result.content) == 400_000
+            first, second, notice = result.content
+            assert _text_total(result) == 500
+            assert first.text == "a" * (500 - len(notice.text))
+            assert second.text == ""
+            assert (first.annotations, second.annotations) == (
+                blocks[0].annotations,
+                blocks[1].annotations,
+            )
+            assert notice.text.startswith("[response truncated to 500 chars: text blocks")
+            assert "raise max_result_chars" in notice.text
         assert session.call_tool.await_count == 2
         assert cache.stats()["total_entries"] == 0
         mgr._compress_and_surface.assert_not_awaited()
         mgr._run_index_stage.assert_not_awaited()
+        row = store._db.execute(
+            "SELECT original_chars, compressed_chars FROM proxy_metrics ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert tuple(row) == (400_000, 500)
+
+    async def test_annotated_cap_follows_tool_override_budget(self, make_mgr):
+        from memtomem_stm.proxy.config import ToolOverrideConfig
+
+        mgr, _, _ = make_mgr()
+        cfg = mgr._config.model_copy(deep=True)
+        cfg.upstream_servers["srv"].tool_overrides = {
+            "tool": ToolOverrideConfig(max_result_chars=300)
+        }
+        mgr._config_loader.seed(cfg)
+        blocks = [TextContent(type="text", text=c * 1000, _meta={"id": c}) for c in "ab"]
+        _set_upstream(mgr, CallToolResult(content=blocks))
+        res = await mgr.call_tool("srv", "tool", {})
+        notice = res.content[2].text
+        assert notice.startswith("[response truncated to 300 chars")
+        assert [len(b.text) for b in res.content[:2]] == [300 - len(notice), 0]
+        assert [b.meta for b in res.content[:2]] == [{"id": "a"}, {"id": "b"}]
+        assert _text_total(res) == 300
+
+    async def test_budget_left_after_a_short_block_fills_the_next_one(self, make_mgr):
+        mgr, _, _ = make_mgr()
+        cfg = mgr._config.model_copy(deep=True)
+        cfg.upstream_servers["srv"].max_result_chars = 500
+        mgr._config_loader.seed(cfg)
+        blocks = [
+            TextContent(type="text", text="a" * 50, _meta={"id": "a"}),
+            TextContent(type="text", text="b" * 2000, _meta={"id": "b"}),
+        ]
+        _set_upstream(mgr, CallToolResult(content=blocks))
+        res = await mgr.call_tool("srv", "tool", {})
+        first, second, notice = res.content
+        assert first.text == "a" * 50
+        assert second.text == "b" * (500 - 50 - len(notice.text))
+        assert [first.meta, second.meta] == [{"id": "a"}, {"id": "b"}]
+        assert _text_total(res) == 500
+
+    async def test_annotated_cap_follows_model_scaled_global_budget(self, make_mgr):
+        mgr, _, _ = make_mgr()
+        cfg = mgr._config.model_copy(deep=True)
+        cfg.consumer_model = "claude-opus-4"
+        cfg.context_budget_ratio = 0.001
+        cfg.upstream_servers["srv"] = UpstreamServerConfig(
+            prefix="test", max_retries=0, reconnect_delay_seconds=0.0
+        )
+        mgr._connections["srv"].config = cfg.upstream_servers["srv"]
+        mgr._config_loader.seed(cfg)
+        budget = cfg.effective_max_result_chars()
+        assert 0 < budget < cfg.default_max_result_chars
+        blocks = [TextContent(type="text", text=c * 5000, _meta={"id": c}) for c in "ab"]
+        _set_upstream(mgr, CallToolResult(content=blocks))
+        res = await mgr.call_tool("srv", "tool", {})
+        assert _text_total(res) == budget
+        assert res.content[2].text.startswith(f"[response truncated to {budget} chars")
+
+    async def test_annotated_cap_uses_nominal_chars_in_unicode_token_mode(self, make_mgr):
+        from memtomem_stm.proxy.config import TokenEstimationMode
+
+        mgr, _, _ = make_mgr()
+        cfg = mgr._config.model_copy(deep=True)
+        srv = cfg.upstream_servers["srv"]
+        srv.max_result_tokens = 100
+        srv.chars_per_token = 3.5
+        srv.token_estimation_mode = TokenEstimationMode.UNICODE
+        mgr._config_loader.seed(cfg)
+        blocks = [TextContent(type="text", text="가" * 1000, _meta={"id": n}) for n in (1, 2)]
+        _set_upstream(mgr, CallToolResult(content=blocks))
+        res = await mgr.call_tool("srv", "tool", {})
+        assert _text_total(res) == 350
+        assert res.content[1].text == ""
+        assert "raise max_result_tokens" in res.content[2].text
+
+    @pytest.mark.parametrize("budget", [1, 5])
+    async def test_annotated_budget_below_notice_uses_one_char_marker(self, make_mgr, budget):
+        mgr, _, _ = make_mgr()
+        cfg = mgr._config.model_copy(deep=True)
+        cfg.upstream_servers["srv"].max_result_chars = budget
+        mgr._config_loader.seed(cfg)
+        blocks = [TextContent(type="text", text=c * 600, _meta={"id": c}) for c in "ab"]
+        _set_upstream(mgr, CallToolResult(content=blocks))
+        res = await mgr.call_tool("srv", "tool", {})
+        assert [b.text for b in res.content] == ["a" * (budget - 1), "", "…"]
+        assert [b.meta for b in res.content[:2]] == [{"id": "a"}, {"id": "b"}]
+
+    async def test_annotated_upstream_cap_below_budget_keeps_guard_notice(self, make_mgr):
+        mgr, _, _ = make_mgr()
+        cfg = mgr._config.model_copy(update={"max_upstream_chars": 700})
+        mgr._config_loader.seed(cfg)
+        blocks = [TextContent(type="text", text=c * 600, _meta={"id": c}) for c in "ab"]
+        _set_upstream(mgr, CallToolResult(content=blocks))
+        res = await mgr.call_tool("srv", "tool", {})
+        assert [len(b.text) for b in res.content[:2]] == [600, 100]
+        assert "max_upstream_chars guard" in res.content[2].text
+
+    async def test_annotated_blocks_exactly_at_budget_get_no_notice(self, make_mgr):
+        mgr, _, _ = make_mgr()
+        cfg = mgr._config.model_copy(deep=True)
+        cfg.upstream_servers["srv"].max_result_chars = 1000
+        mgr._config_loader.seed(cfg)
+        blocks = [TextContent(type="text", text=c * 500, _meta={"id": c}) for c in "ab"]
+        _set_upstream(mgr, CallToolResult(content=blocks))
+        res = await mgr.call_tool("srv", "tool", {})
+        assert res.content == blocks
+
+    async def test_capped_annotated_bypass_still_invalidates_disabled_cache(self, make_mgr):
+        from memtomem_stm.proxy.config import ToolOverrideConfig
+
+        mgr, _, cache = make_mgr(with_cache=True)
+        cfg = mgr._config.model_copy(deep=True)
+        cfg.upstream_servers["srv"].max_result_chars = 100
+        mgr._config_loader.seed(cfg)
+        _set_upstream(mgr, _result("plain text " * 50))
+        await mgr.call_tool("srv", "tool", {})
+        assert cache.stats()["total_entries"] == 1
+
+        disabled = cfg.model_copy(deep=True)
+        disabled.upstream_servers["srv"].tool_overrides = {
+            "tool": ToolOverrideConfig(cache_ttl_seconds=0)
+        }
+        mgr._config_loader.seed(disabled)
+        blocks = [TextContent(type="text", text=c * 600, _meta={"id": c}) for c in "ab"]
+        _set_upstream(mgr, CallToolResult(content=blocks))
+        res = await mgr.call_tool("srv", "tool", {})
+        assert _text_total(res) == 100
+        assert cache.stats()["total_entries"] == 0
 
     async def test_multiple_blocks_keep_later_metadata_without_truncation(self, make_mgr):
         mgr, _, _ = make_mgr()
