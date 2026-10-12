@@ -16,10 +16,12 @@ changes inline only. See the deprecation policy in
 ### Upgrade notes
 
 - **Annotated text blocks keep their metadata, and multi-block ones are not
-  compressed** (#1112, #1118). A single text block's `annotations` and block
-  `_meta` now survive compression and cache replay; before, the result
-  reached the client as plain text without them. A response with two or more
-  text blocks where any block carries `annotations` or `_meta` now keeps its
+  compressed** (#1112, #1118). In a successful text-only response, a single
+  text block's `annotations` and block `_meta` now survive compression and
+  cache replay; before, such a result reached the client as plain text
+  without them (error and mixed-content results already kept them). A
+  successful response with two or more text blocks where any block carries
+  `annotations` or `_meta` now keeps its
   block boundaries and skips cleaning, compression, surfacing and caching. Its
   text is cut at the tool's budget instead, with the truncation notice counted
   inside it; when `max_upstream_chars` is the lower or equal limit, the cut
