@@ -25,7 +25,7 @@ changes inline only. See the deprecation policy in
   after the limit, as on other responses. A token budget applies through its
   nominal char conversion. Raise the tool's budget to receive more, or return
   one upstream text block to retain compression and surfacing. See
-  `docs/caching.md` for the full policy (#1112, #PR).
+  `docs/caching.md` for the full policy (#1112, #1118).
 
 - surfacing: fetch session context before reserving memories for delivery.
   **Behavior change**: cancellation during scratchpad retrieval no longer
