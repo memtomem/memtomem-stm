@@ -25,6 +25,12 @@ MAX_TRACKED_KEYS = 10_000
 # short enough that no single row can blow up the DB.
 MAX_ERROR_MESSAGE_CHARS = 500
 
+# ``compression_strategy`` of a response whose annotated text blocks were kept
+# apart instead of compressed (#1112): no compressor ran, so the base is
+# ``none``, and the suffix names why. The tuner drops these rows by this exact
+# value, so the writer and that reader share this one definition.
+METADATA_BYPASS_STRATEGY = "none→metadata_bypass"
+
 
 def format_error_message_from_exc(exc: BaseException) -> str:
     """Format an exception for ``CallMetrics.error_message`` (capped).

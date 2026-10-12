@@ -92,6 +92,15 @@ on this path Hangul or CJK text can exceed the token budget. The inbound
 `max_upstream_bytes` limit still applies to the complete response envelope, and
 error results are not capped.
 
+Each such call records a `proxy_metrics` row with `compression_strategy`
+`none→metadata_bypass`, so `WHERE compression_strategy = 'none→metadata_bypass'`
+counts how often the path runs. `compressed_chars` is the text delivered,
+notice included: a value below `original_chars` means a cap cut the response,
+but not which cap, and a cut smaller than the appended `max_upstream_chars`
+notice does not show up this way. The auto-tuner leaves these rows out of its
+per-tool profiles, and `mms status` and `mms doctor` leave them out of their
+tuning-readiness count, because no compressor ran on them.
+
 There is no switch to merge annotated blocks. Raise `max_result_chars` (or
 `max_result_tokens`) for the tool to receive more of such a response, or have
 the upstream return a single annotated block when compression and surfacing are

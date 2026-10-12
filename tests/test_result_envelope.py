@@ -30,7 +30,7 @@ from memtomem_stm.proxy.config import (
 )
 from memtomem_stm.proxy.manager import _NON_TEXT_ERROR_TEXT, ProxyManager, UpstreamConnection
 from memtomem_stm.proxy.metrics import TokenTracker
-from memtomem_stm.proxy.metrics_store import MetricsStore
+from memtomem_stm.proxy.metrics_store import MetricsStore, read_compression_summary
 
 # ── fixtures / helpers (style mirrors test_call_tool_inner_characterization) ─
 
@@ -125,6 +125,20 @@ def _set_upstream(mgr: ProxyManager, result) -> AsyncMock:
 
 def _text_total(result: CallToolResult) -> int:
     return sum(len(block.text) for block in result.content if block.type == "text")
+
+
+# What an annotated multi-block row records besides its sizes (#1122):
+# strategy label, AUTO provenance, accounting basis.
+_BYPASS_LABEL = ("none→metadata_bypass", 0, "initial_response_v1")
+
+
+def _latest_bypass_row(store: MetricsStore) -> tuple:
+    row = store._db.execute(
+        "SELECT original_chars, compressed_chars, compression_strategy, "
+        "strategy_auto_selected, compression_accounting "
+        "FROM proxy_metrics ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    return tuple(row)
 
 
 def _latest_error(store: MetricsStore) -> dict | None:
@@ -239,10 +253,7 @@ class TestEnvelopePreservation:
         assert cache.stats()["total_entries"] == 0
         mgr._compress_and_surface.assert_not_awaited()
         mgr._run_index_stage.assert_not_awaited()
-        row = store._db.execute(
-            "SELECT original_chars, compressed_chars FROM proxy_metrics ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        assert tuple(row) == (400_000, 500)
+        assert _latest_bypass_row(store) == (400_000, 500, *_BYPASS_LABEL)
 
     async def test_annotated_cap_follows_tool_override_budget(self, make_mgr):
         from memtomem_stm.proxy.config import ToolOverrideConfig
@@ -369,7 +380,7 @@ class TestEnvelopePreservation:
         assert cache.stats()["total_entries"] == 0
 
     async def test_multiple_blocks_keep_later_metadata_without_truncation(self, make_mgr):
-        mgr, _, _ = make_mgr()
+        mgr, store, _ = make_mgr()
         blocks = [
             TextContent(type="text", text="first"),
             TextContent(type="text", text="second", _meta={"id": 2}),
@@ -377,6 +388,26 @@ class TestEnvelopePreservation:
         _set_upstream(mgr, CallToolResult(content=blocks))
         res = await mgr.call_tool("srv", "tool", {})
         assert res.content == blocks
+        assert _latest_bypass_row(store) == (11, 11, *_BYPASS_LABEL)
+
+    async def test_annotated_rows_are_classified_and_left_out_of_tuner_profiles(
+        self, make_mgr, tmp_path
+    ):
+        mgr, store, _ = make_mgr()
+        _set_upstream(mgr, _result("x" * 60_000))
+        await mgr.call_tool("srv", "tool", {})
+        blocks = [
+            TextContent(type="text", text=c * 200_000, annotations=Annotations(priority=0.5))
+            for c in "ab"
+        ]
+        _set_upstream(mgr, CallToolResult(content=blocks))
+        await mgr.call_tool("srv", "tool", {})
+
+        summary = read_compression_summary(tmp_path / "metrics.db")
+        assert (summary["total_calls"], summary["unclassified_mcp_calls"]) == (2, 0)
+        assert summary["initial_response_calls"] == 2
+        [profile] = store.get_tool_profiles(since_seconds=3600.0)
+        assert (profile["call_count"], profile["p95_original_chars"]) == (1, 60_000)
 
     async def test_text_with_structured_and_meta_returns_envelope(self, make_mgr):
         mgr, _, _ = make_mgr()

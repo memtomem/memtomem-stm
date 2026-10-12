@@ -8,7 +8,7 @@ import threading
 import time
 from pathlib import Path
 
-from memtomem_stm.proxy.metrics import CallMetrics
+from memtomem_stm.proxy.metrics import METADATA_BYPASS_STRATEGY, CallMetrics
 from memtomem_stm.utils.json_out import (
     escape_lone_surrogates,
     has_lone_surrogate,
@@ -306,6 +306,15 @@ def read_compression_summary(
         )
         success = "is_error = 0" if has_is_error else "1"
         sized = "(original_chars > 0 OR compressed_chars > 0)"
+        # The calls the tuner's profiles count: every row but an annotated
+        # bypass, which ``get_tool_profiles`` drops (#1122). A DB without the
+        # column predates the label, so all of its rows count.
+        if "compression_strategy" in cols:
+            tuner_expr = "SUM(CASE WHEN compression_strategy IS NOT ? THEN 1 ELSE 0 END)"
+            select_params: list[object] = [METADATA_BYPASS_STRATEGY]
+        else:
+            tuner_expr = "COUNT(*)"
+            select_params = []
         # One statement, so the provenance counts and size totals share a
         # snapshot while the server appends rows.
         rows = db.execute(
@@ -313,10 +322,10 @@ def read_compression_summary(
             f"SUM(compressed_chars), {error_expr}, "
             f"SUM(CASE WHEN {mcp} AND {known} THEN 1 ELSE 0 END), "
             f"SUM(CASE WHEN {mcp} AND NOT {known} AND {success} AND {sized} "
-            "THEN 1 ELSE 0 END) "
+            f"THEN 1 ELSE 0 END), {tuner_expr} "
             f"FROM proxy_metrics{where} GROUP BY server, tool "
             "ORDER BY COUNT(*) DESC",
-            params,
+            [*select_params, *params],
         ).fetchall()
     except sqlite3.Error as exc:
         summary["error"] = exception_summary(exc)
@@ -327,7 +336,17 @@ def read_compression_summary(
     by_tool: list[dict[str, object]] = []
     total_calls = total_error = total_orig = total_comp = 0
     classified = unclassified = 0
-    for server, tool_name, calls, orig, comp, errors, known_calls, unknown_calls in rows:
+    for (
+        server,
+        tool_name,
+        calls,
+        orig,
+        comp,
+        errors,
+        known_calls,
+        unknown_calls,
+        tuner_calls,
+    ) in rows:
         classified += known_calls or 0
         unclassified += unknown_calls or 0
         calls = calls or 0
@@ -346,6 +365,7 @@ def read_compression_summary(
                 "original_chars": orig,
                 "compressed_chars": comp,
                 "saved_ratio": _saved_ratio(orig, comp),
+                "tuner_calls": tuner_calls or 0,
             }
         )
 
@@ -839,6 +859,13 @@ class MetricsStore:
         happened (#933). ``call_count`` includes all of them, plus every error
         path and the success paths that bypass compression entirely.
 
+        The one exception is a response whose annotated text blocks were kept
+        apart instead of compressed (``METADATA_BYPASS_STRATEGY``, #1122).
+        Every statement here drops those rows: no compressor or retention
+        floor ran on them, so counting them would dilute the violation rate
+        and move ``p95_original_chars`` with calls the settings being tuned
+        never acted on. A tool that only ever took that path has no profile.
+
         Within that population the grouping key is the strategy the call
         *started on*: ``compression_strategy`` records what a call ran under,
         and the ratio-guard ladder rewrites it on degradation, so the stored
@@ -882,9 +909,10 @@ class MetricsStore:
                     SUM(is_error)                                     AS error_count
                 FROM proxy_metrics
                 WHERE created_at >= ? AND source = 'mcp'
+                    AND compression_strategy IS NOT ?
                 GROUP BY server, tool
                 """,
-                (cutoff,),
+                (cutoff, METADATA_BYPASS_STRATEGY),
             ).fetchall()
 
             profiles: list[dict] = []
@@ -902,13 +930,24 @@ class MetricsStore:
                     """
                     SELECT original_chars FROM proxy_metrics
                     WHERE server = ? AND tool = ? AND created_at >= ? AND source = 'mcp'
+                        AND compression_strategy IS NOT ?
                     ORDER BY original_chars ASC
                     LIMIT 1 OFFSET MAX(0, CAST(
                         (SELECT COUNT(*) FROM proxy_metrics
-                         WHERE server = ? AND tool = ? AND created_at >= ? AND source = 'mcp')
+                         WHERE server = ? AND tool = ? AND created_at >= ? AND source = 'mcp'
+                             AND compression_strategy IS NOT ?)
                         * 0.95 AS INTEGER) - 1)
                     """,
-                    (server, tool, cutoff, server, tool, cutoff),
+                    (
+                        server,
+                        tool,
+                        cutoff,
+                        METADATA_BYPASS_STRATEGY,
+                        server,
+                        tool,
+                        cutoff,
+                        METADATA_BYPASS_STRATEGY,
+                    ),
                 ).fetchone()
                 # The strategy AUTO chose most often, how often it chose it,
                 # and the population both are over.  All three come from ONE
@@ -944,16 +983,27 @@ class MetricsStore:
                         (SELECT COUNT(*) FROM proxy_metrics
                          WHERE server = ? AND tool = ? AND created_at >= ?
                              AND compression_strategy IS NOT NULL
+                             AND compression_strategy IS NOT ?
                              AND strategy_auto_selected = 1 AND source = 'mcp')
                     FROM proxy_metrics
                     WHERE server = ? AND tool = ? AND created_at >= ?
                         AND compression_strategy IS NOT NULL
+                        AND compression_strategy IS NOT ?
                         AND strategy_auto_selected = 1 AND source = 'mcp'
                     GROUP BY selected_strategy
                     ORDER BY COUNT(*) DESC
                     LIMIT 1
                     """,
-                    (server, tool, cutoff, server, tool, cutoff),
+                    (
+                        server,
+                        tool,
+                        cutoff,
+                        METADATA_BYPASS_STRATEGY,
+                        server,
+                        tool,
+                        cutoff,
+                        METADATA_BYPASS_STRATEGY,
+                    ),
                 ).fetchone()
                 profiles.append(
                     {

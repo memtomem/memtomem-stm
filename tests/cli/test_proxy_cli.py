@@ -1136,10 +1136,10 @@ class TestStatus:
             lambda db_path, tool=None, source=None: {
                 "available": True,
                 "by_tool": [
-                    {"tool": "no-server-key", "calls": 9},
-                    {"server": "docs", "tool": "search", "calls": 7},
+                    {"tool": "no-server-key", "tuner_calls": 9},
+                    {"server": "docs", "tool": "search", "tuner_calls": 7},
                     "not-a-dict",
-                    {"server": "docs", "tool": "stringy", "calls": "7"},
+                    {"server": "docs", "tool": "stringy", "tuner_calls": "7"},
                 ],
             },
         )
@@ -1148,6 +1148,44 @@ class TestStatus:
 
         assert readiness["ready"] is True
         assert readiness["tools"] == [{"server": "docs", "tool": "search", "calls": 7}]
+
+    def test_tuning_readiness_skips_annotated_bypass_rows(self, tmp_path):
+        """Rows the tuner's profiles drop (#1122) do not count toward readiness."""
+        from memtomem_stm.cli.proxy import _tuning_readiness
+        from memtomem_stm.proxy.metrics import CallMetrics
+        from memtomem_stm.proxy.metrics_store import MetricsStore
+
+        db_path = tmp_path / "metrics.db"
+        store = MetricsStore(db_path)
+        store.initialize()
+        try:
+            for server, compressed, bypassed in (("mixed", 4, 3), ("annotated", 0, 6)):
+                for _ in range(compressed):
+                    store.record(
+                        CallMetrics(server=server, tool="t", original_chars=9, compressed_chars=3)
+                    )
+                for _ in range(bypassed):
+                    store.record(
+                        CallMetrics(
+                            server=server,
+                            tool="t",
+                            original_chars=9,
+                            compressed_chars=9,
+                            compression_strategy="none→metadata_bypass",
+                        )
+                    )
+            for _ in range(5):
+                store.record(
+                    CallMetrics(server="ready", tool="t", original_chars=9, compressed_chars=3)
+                )
+        finally:
+            store.close()
+
+        readiness = _tuning_readiness(
+            {"enabled": True, "upstream_servers": {}, "metrics": {"db_path": str(db_path)}}
+        )
+
+        assert readiness["tools"] == [{"server": "ready", "tool": "t", "calls": 5}]
 
     def test_json_missing_config(self, runner, config):
         result = runner.invoke(cli, ["status", "--json", *_cfg_args(config)])

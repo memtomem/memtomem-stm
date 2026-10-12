@@ -21,6 +21,20 @@ changes inline only. See the deprecation policy in
   an upstream error reply or an empty reply that lands after `stop()` is now
   refused with `ManagerStoppingError` instead of being returned to the client;
   calls that finish before `stop()` are unchanged (#1119, #1124).
+- metrics: a response whose annotated text blocks were kept apart instead of
+  compressed recorded a `proxy_metrics` row with no strategy and no accounting
+  basis. `mms stats` therefore counted it among the unclassified/legacy rows
+  and warned about them. The auto-tuner counted it in a tool's calls, which
+  diluted the violation rate and moved the p95 response size its budget
+  advice uses, and `mms status`/`mms doctor` counted it toward tuning
+  readiness. The row is now labelled
+  `compression_strategy = 'none→metadata_bypass'` and stamped with the
+  initial-response accounting basis, and `mms stats --json` gains a per-tool
+  `tuner_calls` count. **Behavior change**: `mms stats` no longer warns about
+  these rows, and tuner profiles and the readiness count exclude them. Rows
+  written before this release are not relabelled and still count, so a tool's
+  profile and readiness change only as labelled rows replace them
+  (#1122, #1126).
 
 ## [0.6.2] — 2026-10-12
 
