@@ -492,7 +492,17 @@ class _UpstreamConnectionOwner:
             # A caller cancellation must not strand the owner half-closed.
             # The task keeps running its in-task unwind; the cancellation is
             # still delivered to the caller by ``shield``.
-            await asyncio.shield(self.task)
+            current = asyncio.current_task()
+            try:
+                await asyncio.shield(self.task)
+            except asyncio.CancelledError:
+                # When nothing cancelled this caller, the owner itself ended
+                # cancelled, and once the session is published only the SDK
+                # task groups it entered do that: one cancels it when the
+                # connection fails. The connection is already unwound; report how the
+                # unwind went rather than cancelling the caller (#1132).
+                if current is not None and current.cancelling():
+                    raise
         if self.cleanup_error is not None:
             raise self.cleanup_error
 
@@ -2278,6 +2288,29 @@ class ProxyManager:
         try:
             session, tools = await asyncio.shield(owner.ready)
         except asyncio.CancelledError:
+            if owner.ready.cancelled():
+                # The owner cancelled ``ready`` because its own task was
+                # cancelled, and before ``ready`` resolves only the SDK task
+                # groups it entered do that: the streamable HTTP transport's
+                # group cancels the owner when a request fails, and the failure
+                # itself surfaces from the owner's unwind. Once the unwind finishes,
+                # raise that failure as the setup failure it is, so ``start()``
+                # records this server and keeps going (#1132). The owner always
+                # ends cancelled here, so whether this caller was cancelled too,
+                # before or during the wait, is read from its own count.
+                current = asyncio.current_task()
+                try:
+                    await asyncio.shield(owner.task)
+                except asyncio.CancelledError:
+                    if current is not None and current.cancelling():
+                        raise
+                failure = owner.cleanup_error
+                owner.cleanup_error = None
+                if isinstance(failure, Exception):
+                    raise failure
+                raise ConnectionError(
+                    f"upstream '{name}' transport cancelled the connection setup"
+                ) from failure
             # The replacement was not published, so cancellation must tear it
             # down.  The task itself performs the context unwind in-task.
             owner.task.cancel()

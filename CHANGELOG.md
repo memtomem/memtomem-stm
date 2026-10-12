@@ -31,6 +31,23 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- proxy: when a `streamable_http` upstream could not be reached while the proxy
+  started (a closed port, for one), `ProxyManager.start()` raised
+  `CancelledError`, so the whole STM server failed to start and every other
+  upstream's tools went with it; 0.6.2 is affected. A task group inside the
+  SDK transport cancels the task that owns the connection when a request
+  fails, and the proxy took that for a cancellation of the caller. That
+  server is now recorded as failed (as `stm_proxy_health` reports it) with
+  the transport's error, and startup goes on with the others. A reconnect to
+  such an upstream now raises that error instead of `CancelledError`, so the
+  background, config-change and mid-call reconnect paths treat it as a failed
+  reconnect. The same misreading hit a connection whose upstream went away
+  mid-session: the SDK cancels the owner then too, and closing that
+  connection raised `CancelledError`, so `stop()` gave up before closing the
+  remaining upstreams (measured against a real streamable HTTP upstream that
+  was killed). Closing it now reports the unwind's error, which `stop()` and
+  reconnect already log and move past. A caller that is itself cancelled
+  still gets `CancelledError` (#1132).
 - proxy: a tool call whose upstream reply arrived after the proxy manager had
   stopped raised a bare `KeyError`. It now fails with `ManagerStoppingError`,
   recorded as an `internal_error` metrics row. The refusal comes before
