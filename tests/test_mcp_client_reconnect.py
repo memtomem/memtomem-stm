@@ -1931,6 +1931,172 @@ class TestOwnerTaskLifecycle:
         assert adapter._stack is None and adapter._session is None
 
 
+# ── Transport task group cancels the owner (#1136) ───────────────────────
+
+
+@pytest.fixture
+def resetting_ltm_url():
+    """A streamable HTTP URL whose server accepts each connection and closes it.
+
+    The SDK's request fails inside the transport's task group, which cancels
+    the adapter's owner task; the failure itself surfaces only from the
+    rollback (#1132). The listener stays bound for the whole test, so no other
+    process can take the port.
+    """
+    import socket
+    import threading
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    listener.settimeout(0.1)
+    done = threading.Event()
+
+    def serve() -> None:
+        while not done.is_set():
+            try:
+                conn, _ = listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            conn.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{listener.getsockname()[1]}/mcp"
+    finally:
+        done.set()
+        thread.join(timeout=5)
+        listener.close()
+
+
+def _assert_transport_failure(exc: BaseException) -> None:
+    from memtomem_stm.utils.redact import root_cause_exc
+
+    root = root_cause_exc(exc)
+    assert not isinstance(root, RuntimeError), f"generic owner error reached the caller: {exc!r}"
+    assert isinstance(root, McpClientSearchAdapter._TRANSPORT_ERRORS), repr(exc)
+
+
+class TestTransportCancelledStart:
+    """Over streamable HTTP a failed start cancels the owner task. The caller
+    must get the transport failure, not ``owner task stopped`` (#1136)."""
+
+    @staticmethod
+    def _adapter(url: str) -> McpClientSearchAdapter:
+        return McpClientSearchAdapter(
+            SurfacingConfig(ltm_mcp_transport="streamable_http", ltm_mcp_url=url)
+        )
+
+    async def test_start_raises_the_transport_failure(self, resetting_ltm_url):
+        adapter = self._adapter(resetting_ltm_url)
+        try:
+            with pytest.raises(Exception) as excinfo:
+                await adapter.start()
+            _assert_transport_failure(excinfo.value)
+            current = asyncio.current_task()
+            assert current is not None and current.cancelling() == 0
+        finally:
+            await adapter.stop()
+
+    async def test_reconnect_raises_the_transport_failure(self, resetting_ltm_url):
+        from contextlib import AsyncExitStack
+
+        adapter = self._adapter(resetting_ltm_url)
+        # A published generation: ``_do_close`` clears the session only when
+        # a stack exists, so the reconnect reaches ``_do_start``.
+        adapter._session = MagicMock()
+        adapter._stack = AsyncExitStack()
+        adapter._generation = 1
+        try:
+            with pytest.raises(Exception) as excinfo:
+                await adapter._reconnect(1)
+            _assert_transport_failure(excinfo.value)
+        finally:
+            await adapter.stop()
+
+    async def test_logs_name_the_transport_failure(self, resetting_ltm_url, caplog):
+        adapter = self._adapter(resetting_ltm_url)
+        try:
+            with caplog.at_level("WARNING", logger="memtomem_stm.surfacing.mcp_client"):
+                await adapter.warm_up()
+                assert await adapter._heal_if_needed() is False
+        finally:
+            await adapter.stop()
+        messages = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        disabled = [m for m in messages if "surfacing disabled" in m]
+        assert len(disabled) == 1
+        assert not disabled[0].endswith(": RuntimeError"), disabled[0]
+        recreated = [m for m in messages if "exited unexpectedly" in m]
+        assert len(recreated) == 1
+        assert "after a failed start (" in recreated[0]
+        assert "(RuntimeError)" not in recreated[0]
+
+    async def test_recovered_failure_does_not_label_a_later_exit(self, resetting_ltm_url, caplog):
+        adapter = self._adapter(resetting_ltm_url)
+        try:
+            with pytest.raises(Exception):
+                await adapter.start()
+
+            with caplog.at_level("WARNING", logger="memtomem_stm.surfacing.mcp_client"):
+                owner = adapter._ensure_owner()
+                assert not owner.done()
+            [first] = [r.getMessage() for r in caplog.records]
+            assert "after a failed start (" in first
+            caplog.clear()
+
+            # An unrelated outside cancellation of the idle replacement.
+            owner.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await owner
+            with caplog.at_level("WARNING", logger="memtomem_stm.surfacing.mcp_client"):
+                adapter._ensure_owner()
+            [second] = [r.getMessage() for r in caplog.records]
+            assert second == "LTM adapter owner task exited unexpectedly — recreating"
+        finally:
+            await adapter.stop()
+
+    async def test_stop_mid_start_keeps_reporting_the_stop(self, monkeypatch):
+        from memtomem_stm.surfacing import mcp_client as mod
+
+        entered = asyncio.Event()
+
+        class FailingTeardown:
+            async def __aenter__(self):
+                return (MagicMock(), MagicMock())
+
+            async def __aexit__(self, *_exc_info):
+                raise RuntimeError("teardown failed")
+
+        class ParkedSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc_info):
+                return None
+
+            async def initialize(self):
+                entered.set()
+                await asyncio.Event().wait()
+
+        monkeypatch.setattr(mod, "stdio_client", lambda _params: FailingTeardown())
+        monkeypatch.setattr(mod, "ClientSession", lambda *_a, **_k: ParkedSession())
+        monkeypatch.setattr(McpClientSearchAdapter, "_STOP_TIMEOUT_SECONDS", 0.1)
+        adapter = McpClientSearchAdapter(SurfacingConfig(result_format="compact"))
+
+        start = asyncio.create_task(adapter.start())
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        await asyncio.wait_for(adapter.stop(), timeout=5)
+
+        # ``stop()`` cancelled the owner; its teardown failure is not the
+        # start's failure, so the caller still hears that the owner stopped.
+        with pytest.raises(RuntimeError, match="owner task stopped"):
+            await asyncio.wait_for(start, timeout=5)
+        assert adapter._cancelled_start_failure is None
+
+
 # ── Background warm-up (#664 PR 2) ───────────────────────────────────────
 
 
