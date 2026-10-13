@@ -680,6 +680,14 @@ class McpClientSearchAdapter:
         self._owner_task: asyncio.Task[None] | None = None
         self._current_req: _OwnerRequest | None = None
         self._stopped = False
+        # The rollback failure of a start whose body was cancelled while the
+        # adapter was not stopping. The case it exists for: over streamable
+        # HTTP the transport's task group cancels the owner when a request
+        # fails, and the error itself surfaces only from the unwind (#1132).
+        # An outside cancellation whose unwind also failed is kept the same
+        # way; nothing here tells the two apart. The owner hands it to the
+        # waiting caller (#1136).
+        self._cancelled_start_failure: BaseException | None = None
 
     async def start(self) -> None:
         """Connect to the memtomem MCP server.
@@ -725,6 +733,7 @@ class McpClientSearchAdapter:
 
     async def _do_start(self) -> None:
         """Enter the transport/session contexts. Owner-task only (#663)."""
+        self._cancelled_start_failure = None
         if self._session is not None:
             # An abandoned start (#664) already warmed the session while this
             # op sat in the queue; starting again would overwrite _stack and
@@ -751,13 +760,15 @@ class McpClientSearchAdapter:
             # them a session that never completed the MCP handshake.
             self._session = session
             self._generation += 1
-        except BaseException:
+        except BaseException as exc:
             # Roll back any contexts we entered (transport subprocess, session
             # streams) so a failed start — common during reconnect storms —
             # doesn't leak file descriptors and child processes across retries.
             try:
                 await stack.aclose()
-            except Exception:
+            except Exception as cleanup_exc:
+                if isinstance(exc, asyncio.CancelledError) and not self._stopped:
+                    self._cancelled_start_failure = cleanup_exc
                 logger.debug("Error during MCP client start() cleanup", exc_info=True)
             self._stack = None
             self._session = None
@@ -1033,7 +1044,18 @@ class McpClientSearchAdapter:
         owner = self._owner_task
         if owner is None or owner.done():
             if owner is not None and not self._stopped:
-                logger.warning("LTM adapter owner task exited unexpectedly — recreating")
+                # Stays a WARNING even with a recovered start failure: an
+                # outside cancellation whose unwind also failed looks the same.
+                failure = self._cancelled_start_failure
+                self._cancelled_start_failure = None
+                if failure is not None:
+                    logger.warning(
+                        "LTM adapter owner task exited unexpectedly after a failed start "
+                        "(%s) — recreating",
+                        self._scrub_exc(failure),
+                    )
+                else:
+                    logger.warning("LTM adapter owner task exited unexpectedly — recreating")
                 if self._stack is not None:
                     # The dead owner entered these contexts; their anyio
                     # cancel scopes are affine to that (now-gone) task, so a
@@ -1126,9 +1148,15 @@ class McpClientSearchAdapter:
                         # If the cancel did NOT come from this op's caller
                         # (its future would already be cancelled), the caller
                         # is still awaiting — fail its future so it degrades
-                        # to ``no_session`` instead of hanging forever.
+                        # to ``no_session`` instead of hanging forever. When
+                        # the start's rollback kept a failure, the caller gets
+                        # that instead; when a streamable HTTP request failed,
+                        # it is the request's real error (#1136).
                         if not req.fut.done():
-                            req.fut.set_exception(RuntimeError("LTM adapter owner task stopped"))
+                            req.fut.set_exception(
+                                self._cancelled_start_failure
+                                or RuntimeError("LTM adapter owner task stopped")
+                            )
                         raise
                     except BaseException as exc:
                         if not req.fut.done():

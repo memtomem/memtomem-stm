@@ -11,6 +11,22 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Fixed
+
+- surfacing: when the LTM server was configured with
+  `ltm_mcp_transport = "streamable_http"` and could not be reached, the
+  failure was reported as `RuntimeError` ("LTM adapter owner task stopped")
+  instead of the transport error. The logs read `LTM warm-up failed …:
+  RuntimeError` and `surfacing disabled: RuntimeError`, and the real error
+  appeared only in a DEBUG traceback. As in #1132, a task group inside the SDK
+  transport cancels the task that owns the connection when a request fails.
+  The adapter's start and reconnect now raise the error recovered while
+  rolling back, so those lines name the transport failure. The
+  `owner task exited unexpectedly` WARNING stays, because a cancellation from
+  outside whose rollback also fails looks the same, but it now names the
+  failed start. Surfacing was already disabled in either case; only what is
+  reported changes (#1136).
+
 ## [0.6.3] — 2026-10-12
 
 ### Upgrade notes
