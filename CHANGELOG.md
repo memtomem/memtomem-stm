@@ -13,6 +13,26 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- cli: a `--json` run whose config file could not be read or parsed wrote
+  nothing to stdout, even though `--json` promises one JSON document for
+  operational failures. The human error went to stderr and the exit code was
+  1. This affected `add`, `remove`, `prune`, `eject`, `status`, `list`,
+  `health`, `gateway status`, `gateway explain`, `tune` and `project route`.
+  These commands now also print `{"action": ..., "ok": false, "error":
+  "config_unreadable" | "config_invalid", "message": ..., "path": ...}` with
+  exit 1. `config_unreadable` means the file cannot be read.
+  `config_invalid` means it is not UTF-8, not JSON, not an object, or has an
+  `upstream_servers` that is neither an object nor `null`. The message is
+  the same sentence as the stderr line, which names the path and the error
+  type, never the file's content.
+  `remove`, `prune` and `eject` read the config before they check `--yes`, so
+  a broken file is reported with exit 1 rather than as
+  `confirmation_required` with exit 2. The other `--json` failures that still
+  print no document (`tune`'s missing file and failed validation, and the
+  `gateway` and `project route` command errors) are #1138. Errors the read
+  and parse checks do not catch, such as JSON nested too deeply to parse
+  or an `upstream_servers` of `null`, still end without a document (#1139)
+  (#1099).
 - surfacing: when the LTM server was configured with
   `ltm_mcp_transport = "streamable_http"` and could not be reached, the
   failure was reported as `RuntimeError` ("LTM adapter owner task stopped")

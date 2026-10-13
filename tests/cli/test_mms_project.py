@@ -438,6 +438,52 @@ def test_route_apply_guards_its_backup_read(runner, sandbox, monkeypatch):
     assert config.read_text(encoding="utf-8") == "{}"  # nothing written
 
 
+def test_route_json_on_invalid_json_emits_the_failure_document(runner, sandbox):
+    """A config ``_load`` cannot parse still yields the ``--json`` document (#1099)."""
+    _seed_routable_project(runner)
+    config = sandbox["home"] / "proxy.json"
+    config.write_text("{", encoding="utf-8")
+
+    res = runner.invoke(project_group, ["route", "--config", str(config), "--json"])
+
+    assert res.exit_code == 1, res.output
+    payload = json.loads(res.stdout)
+    assert payload["action"] == "route"
+    assert payload["ok"] is False
+    assert payload["error"] == "config_invalid"
+    assert payload["path"] == str(config.resolve())
+    assert "JSONDecodeError (line 1 column 2)" in payload["message"]
+
+
+def test_route_json_apply_guards_its_backup_read(runner, sandbox, monkeypatch):
+    """The backup read fails after ``_load`` succeeded; the document still comes out."""
+    _seed_routable_project(runner)
+    config = sandbox["home"] / "proxy.json"
+    config.write_text("{}", encoding="utf-8")
+    real_read_text = Path.read_text
+    reads = []
+
+    def fail_second_read(self, *args, **kwargs):
+        if self == config.resolve():
+            reads.append(self)
+            if len(reads) == 2:
+                raise PermissionError(13, "Permission denied", "/cnry-dir/cnry-file")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fail_second_read)
+    res = runner.invoke(project_group, ["route", "--config", str(config), "--apply", "--json"])
+
+    assert len(reads) == 2
+    assert res.exit_code == 1, res.output
+    payload = json.loads(res.stdout)
+    assert payload["action"] == "route"
+    assert payload["ok"] is False
+    assert payload["error"] == "config_unreadable"
+    assert payload["message"] == f"Failed to read {config.resolve()}: PermissionError"
+    assert "cnry" not in res.stdout
+    assert config.read_text(encoding="utf-8") == "{}"  # nothing written
+
+
 def test_route_apply_writes_valid_additive_config_and_is_idempotent(runner, sandbox):
     from memtomem_stm.proxy.config import ProxyConfig
 

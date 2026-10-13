@@ -7,6 +7,7 @@ writers. It used to print ``str(exc)`` for a parse or decode error and let an
 ``status`` / ``health`` / ``doctor``; these are the readers it did not reach.
 """
 
+import json
 from pathlib import Path
 
 import pytest
@@ -153,3 +154,148 @@ def test_config_validate_reports_an_undecodable_file(tmp_path):
     # The local validator keeps full detail: the byte and its position.
     assert "not valid UTF-8" in result.output
     assert "0xff" in result.output
+
+
+# ── --json mode: the failure document still reaches stdout (#1099) ────────
+
+# Every ``--json`` command whose config read goes through ``_load`` /
+# ``_read_config_text``, with the ``action`` its document carries. The
+# arguments get each one past its own usage checks to the config read.
+JSON_COMMANDS = [
+    ("add", ["add", "fs", "--prefix", "fs", "--command", "x", "--json"]),
+    ("add", ["add", "--from-clients", "--all", "--json"]),
+    ("remove", ["remove", "fs", "--yes", "--json"]),
+    ("prune", ["prune", "fs", "--yes", "--json"]),
+    ("eject", ["eject", "fs", "--yes", "--json"]),
+    ("status", ["status", "--json"]),
+    ("list", ["list", "--json"]),
+    ("health", ["health", "--json"]),
+    ("gateway-status", ["gateway", "status", "--json"]),
+    ("gateway-explain", ["gateway", "explain", "fs__read", "--json"]),
+    ("tune", ["tune", "--json"]),
+]
+JSON_COMMAND_IDS = [
+    "add",
+    "add-from-clients",
+    "remove",
+    "prune",
+    "eject",
+    "status",
+    "list",
+    "health",
+    "gateway-status",
+    "gateway-explain",
+    "tune",
+]
+
+
+def _failure_document(result, action: str, error: str, path: Path) -> dict:
+    """The one stdout document of a failed ``--json`` run, checked field by field."""
+    assert result.exit_code == 1, result.output
+    document = json.loads(result.stdout)
+    assert document["action"] == action
+    assert document["ok"] is False
+    assert document["error"] == error
+    assert document["path"] == str(path.resolve())
+    return document
+
+
+@pytest.mark.parametrize(("action", "argv"), JSON_COMMANDS, ids=JSON_COMMAND_IDS)
+def test_json_run_on_invalid_json_emits_the_failure_document(tmp_path, action, argv):
+    path = tmp_path / "proxy.json"
+    path.write_text('{"a": "\\q"}')
+
+    result = CliRunner().invoke(cli, [*argv, "--config", str(path)])
+
+    document = _failure_document(result, action, "config_invalid", path)
+    assert document["message"] == (
+        f"Failed to parse {path.resolve()}: JSONDecodeError (line 1 column 8)"
+    )
+    # The human lines stay on stderr, unchanged.
+    assert "Failed to parse" in result.stderr
+    assert "mms config validate" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("[1]", "top-level must be a JSON object, got list"),
+        ('{"upstream_servers": []}', "'upstream_servers' must be an object, got list"),
+    ],
+    ids=["non-object-root", "non-object-upstream-servers"],
+)
+@pytest.mark.parametrize("command", ["status", "remove"])
+def test_json_run_on_a_wrong_shape_emits_config_invalid(tmp_path, content, expected, command):
+    path = tmp_path / "proxy.json"
+    path.write_text(content)
+    argv = ["status", "--json"] if command == "status" else ["remove", "fs", "--yes", "--json"]
+
+    result = CliRunner().invoke(cli, [*argv, "--config", str(path)])
+
+    document = _failure_document(result, command, "config_invalid", path)
+    assert document["message"] == f"{path.resolve()} {expected}"
+    assert expected in result.stderr
+
+
+@pytest.mark.parametrize("command", ["status", "remove"])
+def test_json_run_on_an_undecodable_file_emits_config_invalid(tmp_path, command):
+    path = tmp_path / "proxy.json"
+    path.write_bytes(UNDECODABLE)
+    argv = ["status", "--json"] if command == "status" else ["remove", "fs", "--yes", "--json"]
+
+    result = CliRunner().invoke(cli, [*argv, "--config", str(path)])
+
+    document = _failure_document(result, command, "config_invalid", path)
+    assert document["message"] == f"Failed to parse {path.resolve()}: UnicodeDecodeError"
+    assert "0xff" not in result.stdout
+    assert CANARY not in result.stdout
+
+
+@pytest.mark.parametrize("command", ["status", "remove"])
+def test_json_run_on_an_unreadable_file_emits_config_unreadable(tmp_path, command):
+    # A directory at the config path is unreadable on every platform; the
+    # exception type differs (IsADirectoryError / PermissionError), the code
+    # does not.
+    path = tmp_path / "proxy.json"
+    path.mkdir()
+    argv = ["status", "--json"] if command == "status" else ["remove", "fs", "--yes", "--json"]
+
+    result = CliRunner().invoke(cli, [*argv, "--config", str(path)])
+
+    document = _failure_document(result, command, "config_unreadable", path)
+    assert document["message"].startswith(f"Failed to read {path.resolve()}: ")
+
+
+def test_json_tune_guards_its_second_read(tmp_path, monkeypatch):
+    """``tune`` reads the file twice; a failure on the later read keeps the document."""
+    path = tmp_path / "proxy.json"
+    path.write_text("{}")
+    real_read_text = Path.read_text
+    reads = []
+
+    def fail_second_read(self, *args, **kwargs):
+        if self == path.resolve():
+            reads.append(self)
+            if len(reads) == 2:
+                raise PermissionError(13, "Permission denied", "/cnry-dir/cnry-file")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fail_second_read)
+    result = CliRunner().invoke(cli, ["tune", "--json", "--config", str(path)])
+
+    assert len(reads) == 2
+    document = _failure_document(result, "tune", "config_unreadable", path)
+    assert document["message"] == f"Failed to read {path.resolve()}: PermissionError"
+    assert "cnry" not in result.stdout
+
+
+def test_non_json_runs_keep_their_plain_exit(tmp_path):
+    """Preservation control: without ``--json`` stdout stays empty, as before."""
+    path = tmp_path / "proxy.json"
+    path.write_text("{")
+
+    result = CliRunner().invoke(cli, ["remove", "fs", "--yes", "--config", str(path)])
+
+    _assert_clean_exit(result)
+    assert result.stdout == ""
+    assert "Failed to parse" in result.stderr
