@@ -470,7 +470,7 @@ def route_cmd(
     enabled = list(project.config.mcp.enabled)
     path = Path(resolve_cli_config_path(config_path).path)
     path = path.expanduser().resolve()
-    data = _load(path)
+    data = _load(path, json_action="route" if as_json else None)
     if "upstream_servers" not in data:
         data["upstream_servers"] = {}
     raw_upstreams = data["upstream_servers"]
@@ -537,7 +537,9 @@ def route_cmd(
         backup: Path | None = None
         if path.exists():
             # Guarded like the first read in `_load` (#1095).
-            backup = _backup_config_snapshot(path, _read_config_text(path))
+            backup = _backup_config_snapshot(
+                path, _read_config_text(path, json_action="route" if as_json else None)
+            )
         _save(path, data)
         payload["applied"] = list(planned)
         if backup is not None:

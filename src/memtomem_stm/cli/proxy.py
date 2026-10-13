@@ -400,17 +400,25 @@ def _new_config_cache_block() -> dict[str, Any]:
     return {"tool_annotation_policy": "strict"}
 
 
-def _config_file_failure(resolved: Path, exc: Exception) -> NoReturn:
+def _config_file_failure(
+    resolved: Path, exc: Exception, *, json_action: str | None = None
+) -> NoReturn:
     """Exit on a config file the CLI cannot read, decode or parse.
 
     The same rendering as every other config-load reader (#1095): an OS or
     decode error's text carries the path or the bytes, and a JSON error's
     ``msg`` can quote the offending character. ``mms config validate`` shows
     the full detail.
+
+    With ``json_action`` (the caller runs in ``--json`` mode) the exit goes
+    through ``_json_fail`` so stdout still carries the one failure document:
+    ``config_unreadable`` when the file cannot be read, ``config_invalid``
+    when it cannot be decoded or parsed (#1099).
     """
     from memtomem_stm.proxy.config import config_load_error_summary
 
     verb = "read" if isinstance(exc, OSError) else "parse"
+    message = f"Failed to {verb} {resolved}: {config_load_error_summary(exc)}"
     click.echo(
         f"{_err('Error:')} Failed to {verb} {_disp(str(resolved))}: "
         f"{config_load_error_summary(exc)}",
@@ -418,45 +426,60 @@ def _config_file_failure(resolved: Path, exc: Exception) -> NoReturn:
     )
     validate = _shell_join(["mms", "config", "validate", "--config", str(resolved)])
     click.echo(f"  Run `{validate}` for details.", err=True)
+    if json_action is not None:
+        code = "config_unreadable" if isinstance(exc, OSError) else "config_invalid"
+        _json_fail(json_action, code, message, path=str(resolved))
     raise SystemExit(1) from exc
 
 
-def _read_config_text(resolved: Path) -> str:
+def _config_shape_failure(resolved: Path, message: str, *, json_action: str | None) -> NoReturn:
+    """Exit on a config file that parses but has the wrong top-level shape."""
+    click.echo(f"{_err('Error:')} {message}", err=True)
+    if json_action is not None:
+        _json_fail(json_action, "config_invalid", message.rstrip("."), path=str(resolved))
+    raise SystemExit(1)
+
+
+def _read_config_text(resolved: Path, *, json_action: str | None = None) -> str:
     """The config file's text, or a clean exit when it cannot be read or decoded."""
     try:
         return resolved.read_text(encoding="utf-8")
     except (OSError, ValueError) as exc:
-        _config_file_failure(resolved, exc)
+        _config_file_failure(resolved, exc, json_action=json_action)
 
 
-def _load(config_path: Path) -> dict[str, Any]:
+def _load(config_path: Path, *, json_action: str | None = None) -> dict[str, Any]:
+    """The config file as a dict, or a clean exit when it is unusable.
+
+    ``json_action`` names the caller's ``--json`` action; pass it whenever the
+    command runs in ``--json`` mode so a broken file still yields the failure
+    document on stdout (#1099).
+    """
     resolved = config_path.expanduser().resolve()
     if not resolved.exists():
         return {"enabled": True, "cache": _new_config_cache_block(), "upstream_servers": {}}
-    text = _read_config_text(resolved)
+    text = _read_config_text(resolved, json_action=json_action)
     try:
         data = json.loads(text)
     except ValueError as exc:
-        _config_file_failure(resolved, exc)
+        _config_file_failure(resolved, exc, json_action=json_action)
     # Structural guard: the rest of the CLI assumes top-level dict with a dict
     # `upstream_servers`. Without this, a valid-but-wrong-shape JSON (e.g. a
     # list or a string, or `upstream_servers: "oops"`) crashes downstream with
     # an AttributeError traceback instead of a clean user-facing error.
     if not isinstance(data, dict):
-        click.echo(
-            f"{_err('Error:')} {resolved} top-level must be a JSON object, "
-            f"got {type(data).__name__}.",
-            err=True,
+        _config_shape_failure(
+            resolved,
+            f"{resolved} top-level must be a JSON object, got {type(data).__name__}.",
+            json_action=json_action,
         )
-        raise SystemExit(1)
     servers = data.get("upstream_servers")
     if servers is not None and not isinstance(servers, dict):
-        click.echo(
-            f"{_err('Error:')} {resolved} 'upstream_servers' must be an object, "
-            f"got {type(servers).__name__}.",
-            err=True,
+        _config_shape_failure(
+            resolved,
+            f"{resolved} 'upstream_servers' must be an object, got {type(servers).__name__}.",
+            json_action=json_action,
         )
-        raise SystemExit(1)
     return data
 
 
@@ -1631,7 +1654,9 @@ def gateway_status(config_path: str | None, *, as_json: bool = False) -> None:
 
     path = Path(config_path)
     try:
-        config = ProxyConfig.model_validate(_load(path))
+        config = ProxyConfig.model_validate(
+            _load(path, json_action="gateway-status" if as_json else None)
+        )
     except ValidationError as exc:
         raise click.ClickException(f"invalid proxy config: {exc.errors()[0]['msg']}") from exc
     tg = config.toolgraph
@@ -1702,7 +1727,9 @@ def gateway_explain(tool_key: str, config_path: str | None, *, as_json: bool = F
     from memtomem_stm.proxy.toolgraph_bundle import PolicyBundleError, load_policy_bundle
 
     try:
-        config = ProxyConfig.model_validate(_load(Path(config_path)))
+        config = ProxyConfig.model_validate(
+            _load(Path(config_path), json_action="gateway-explain" if as_json else None)
+        )
         if config.toolgraph.source != "bundle":
             raise PolicyBundleError("toolgraph.source must be 'bundle' for gateway explain")
         if config.toolgraph.query_profile != config.exposure.profile.value:
@@ -2026,7 +2053,7 @@ def status(config_path: str | None, *, as_json: bool = False) -> None:
             click.echo("Run `mms add` to create a configuration.")
         return
 
-    data = _load(path)
+    data = _load(path, json_action="status" if as_json else None)
     runtime = _runtime_proxy_read(path, config_path)
     enabled = runtime.config.enabled if runtime.config is not None else data.get("enabled", False)
     servers: dict[str, Any] = data.get("upstream_servers", {})
@@ -2121,7 +2148,7 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
             click.echo("Run `mms add` (or `mms init`) to create a configuration.")
         return
 
-    data = _load(path)
+    data = _load(path, json_action="list" if as_json else None)
     servers: dict[str, Any] = data.get("upstream_servers", {})
     from memtomem_stm.proxy.config import (
         compression_source,
@@ -2753,7 +2780,7 @@ def add(
             _json_fail("add", "invalid_name", f"server name {name!r} is not valid UTF-8", name=name)
         sys.exit(1)
 
-    data = _load(path)
+    data = _load(path, json_action="add" if as_json else None)
     servers: dict[str, Any] = data.setdefault("upstream_servers", {})
 
     if name in servers:
@@ -4995,7 +5022,7 @@ def _add_from_clients(
             }
         )
 
-    data = _load(config_path)
+    data = _load(config_path, json_action="add" if as_json else None)
     servers: dict[str, Any] = data.setdefault("upstream_servers", {})
     skipped: list[dict[str, str]] = []
     warnings_json: list[str] = []
@@ -5922,7 +5949,7 @@ def remove(name: str, config_path: str | None, yes: bool, as_json: bool = False)
                 path=str(resolved),
             )
         sys.exit(1)
-    data = _load(path)
+    data = _load(path, json_action="remove" if as_json else None)
     servers: dict[str, Any] = data.get("upstream_servers", {})
 
     if name not in servers:
@@ -6427,8 +6454,8 @@ def tune(
 
     # Both reads are guarded: a bare `read_text` ended in a traceback on an
     # unreadable or undecodable file (#1095).
-    original_text = _read_config_text(resolved)
-    data = _load(resolved)
+    original_text = _read_config_text(resolved, json_action="tune" if as_json else None)
+    data = _load(resolved, json_action="tune" if as_json else None)
 
     # Typed load with the env overlay: the tuner resolves *effective* current
     # values (and the DB paths) the way the server does. A file that fails the
@@ -6678,7 +6705,7 @@ def prune(
             ],
         }
 
-    data = _load(resolved)
+    data = _load(resolved, json_action="prune" if as_json else None)
     upstreams: dict[str, dict[str, Any]] = data.get("upstream_servers", {})
     if not upstreams:
         if as_json:
@@ -7523,7 +7550,7 @@ def eject(
             )
         sys.exit(1)
 
-    data = _load(resolved)
+    data = _load(resolved, json_action="eject" if as_json else None)
     servers: dict[str, Any] = data.get("upstream_servers", {})
     missing = [n for n in names if n not in servers]
     if missing:
@@ -8791,7 +8818,7 @@ def health(
 
     from memtomem_stm.server import _hidden_obs_tools_hint
 
-    data = _load(path)
+    data = _load(path, json_action="health" if as_json else None)
     servers: dict[str, Any] = data.get("upstream_servers", {})
     explicit_config = _explicit_config_path(config_path)
     surfacing_status = _surfacing_bootstrap_status(float(timeout), config_path=explicit_config)
