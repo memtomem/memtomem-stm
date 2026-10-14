@@ -311,6 +311,25 @@ def test_sidecar_rejects_when_only_sidecar_version_bumps(tmp_path, monkeypatch):
     assert state.load_registry(reg_path).servers == {}
 
 
+def test_registry_validation_error_does_not_echo_values(tmp_path):
+    """A mistyped ``env`` value is a token more often than not; the CLI
+    surfaces ``CorruptedConfig`` text as a clean error, so it must carry the
+    failing location and error type, never the value pydantic would quote as
+    ``input_value=``."""
+    secret = "sk-live-registry-canary"
+    reg_path = tmp_path / "registry.toml"
+    reg_path.write_text(
+        "schema_version = 1\n[servers.gh]\n"
+        'command = "gh-mcp"\nprefix = "gh"\n'
+        f'env = {{ GITHUB_TOKEN = ["{secret}"] }}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(state.CorruptedConfig) as exc_info:
+        state.load_registry(reg_path)
+    assert secret not in str(exc_info.value)
+    assert exc_info.value.reason == "schema validation: servers.gh.env.GITHUB_TOKEN (string_type)"
+
+
 def test_import_state_extra_field_rejected(tmp_path):
     """Sidecar shape is locked by ``extra="forbid"`` — an unknown column on
     an entry must be a CorruptedConfig, not a silent accept."""
