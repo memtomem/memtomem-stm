@@ -242,7 +242,7 @@ def write_lock(
 class RegistryServer(BaseModel):
     """A single MCP server definition stored in ``registry.toml``."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     command: str
     args: list[str] = Field(default_factory=list)
@@ -253,7 +253,7 @@ class RegistryServer(BaseModel):
 class RegistryConfig(BaseModel):
     """Top-level model for ``~/.mms/registry.toml``."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     schema_version: int = SCHEMA_VERSION
     servers: dict[str, RegistryServer] = Field(default_factory=dict)
@@ -262,7 +262,7 @@ class RegistryConfig(BaseModel):
 class ProjectIndexEntry(BaseModel):
     """One row in ``projects.toml`` — auto-managed, do not hand-edit."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     name: str
     path: str
@@ -272,26 +272,26 @@ class ProjectIndexEntry(BaseModel):
 class ProjectsIndex(BaseModel):
     """Top-level model for ``~/.mms/projects.toml``."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     schema_version: int = SCHEMA_VERSION
     projects: list[ProjectIndexEntry] = Field(default_factory=list)
 
 
 class ProjectMeta(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
     name: str
 
 
 class ProjectMcp(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
     enabled: list[str] = Field(default_factory=list)
 
 
 class ProjectConfig(BaseModel):
     """Top-level model for ``<project>/.mms/project.toml``."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     schema_version: int = SCHEMA_VERSION
     project: ProjectMeta
@@ -314,7 +314,7 @@ class ImportStateEntry(BaseModel):
     on load instead of a confusing comparison failure later.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     drift_hash: str = Field(pattern=r"^sha256:[0-9a-f]{16}$")
     drift_hash_version: int = Field(ge=1)
@@ -325,7 +325,7 @@ class ImportStateEntry(BaseModel):
 class ImportState(BaseModel):
     """Top-level model for ``~/.mms/import_state.toml`` (W2 sidecar)."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     schema_version: int = IMPORT_STATE_SCHEMA_VERSION
     entries: dict[str, ImportStateEntry] = Field(default_factory=dict)

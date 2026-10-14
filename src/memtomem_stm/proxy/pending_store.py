@@ -12,12 +12,30 @@ from pathlib import Path
 from typing import Protocol
 
 from memtomem_stm.proxy.compression import PendingSelection
+from memtomem_stm.proxy.privacy import contains_sensitive_content
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.utils.json_out import scrub_lone_surrogates
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
 logger = logging.getLogger(__name__)
+
+# Process-local ephemeral storage for sensitive selections when SQLitePendingStore
+# is configured. Keeps secret-bearing chunk text out of the on-disk SQLite file
+# while preserving the SQLite row metadata (seq, format, created_at) and same-process
+# recovery across store instances pointing at the same db_path.
+_EPHEMERAL_LOCK = threading.Lock()
+_EPHEMERAL_CHUNKS: dict[tuple[str, str], dict[str, str]] = {}
+
+
+def _selection_is_sensitive(selection: PendingSelection) -> bool:
+    """Return True if any chunk key or value in *selection* matches secret patterns."""
+    for key, value in selection.chunks.items():
+        if isinstance(key, str) and contains_sensitive_content(key):
+            return True
+        if isinstance(value, str) and contains_sensitive_content(value):
+            return True
+    return False
 
 
 class PendingStore(Protocol):
@@ -138,6 +156,7 @@ class SQLitePendingStore:
 
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
+        self._ephemeral_scope = str(db_path.expanduser().resolve())
         self._db: sqlite3.Connection | None = None
         self._lock = threading.Lock()
 
@@ -215,7 +234,29 @@ class SQLitePendingStore:
     # commit (#901).
     _NEXT_SEQ = "(SELECT IFNULL(MAX(seq), 0) + 1 FROM pending_selections)"
 
+    def _sync_ephemeral_after_delete(self) -> None:
+        """Drop any process-local ephemeral entries whose SQLite rows were evicted."""
+        scope = self._ephemeral_scope
+        with _EPHEMERAL_LOCK:
+            scoped_keys = [k for s, k in _EPHEMERAL_CHUNKS if s == scope]
+        if not scoped_keys:
+            return
+        placeholders = ",".join("?" for _ in scoped_keys)
+        surviving = {
+            row[0]
+            for row in self._get_db().execute(
+                f"SELECT key FROM pending_selections WHERE key IN ({placeholders})",
+                scoped_keys,
+            )
+        }
+        with _EPHEMERAL_LOCK:
+            for k in scoped_keys:
+                if k not in surviving:
+                    _EPHEMERAL_CHUNKS.pop((scope, k), None)
+
     def put(self, key: str, selection: PendingSelection) -> None:
+        sensitive = _selection_is_sensitive(selection)
+        chunks_json = "null" if sensitive else _json_dumps(selection.chunks, ensure_ascii=False)
         with self._lock:
             self._get_db().execute(
                 "INSERT OR REPLACE INTO pending_selections "
@@ -223,13 +264,18 @@ class SQLitePendingStore:
                 f"VALUES (?, ?, ?, ?, ?, {self._NEXT_SEQ})",
                 (
                     key,
-                    _json_dumps(selection.chunks, ensure_ascii=False),
+                    chunks_json,
                     selection.format,
                     time.time(),
                     selection.total_chars,
                 ),
             )
             self._get_db().commit()
+            with _EPHEMERAL_LOCK:
+                if sensitive:
+                    _EPHEMERAL_CHUNKS[(self._ephemeral_scope, key)] = dict(selection.chunks)
+                else:
+                    _EPHEMERAL_CHUNKS.pop((self._ephemeral_scope, key), None)
 
     def get(self, key: str) -> PendingSelection | None:
         with self._lock:
@@ -243,20 +289,31 @@ class SQLitePendingStore:
                 .fetchone()
             )
         if row is None:
+            with _EPHEMERAL_LOCK:
+                _EPHEMERAL_CHUNKS.pop((self._ephemeral_scope, key), None)
             return None
-        try:
-            # Scrub on the way out as well as in. The writer escapes, but this
-            # is a plain ``json.loads``: a ``\ud800`` escape sitting in a row
-            # some other writer (or a hand edit) put there decodes straight back
-            # into the code unit, and would then raise at the next encode
-            # downstream rather than here (#761).
-            chunks = scrub_lone_surrogates(json.loads(row[0]))
-        except json.JSONDecodeError:
-            logger.warning(
-                "Corrupted chunks_json in pending_selections for key=%s; treating as miss",
-                key,
-            )
-            return None
+        if row[0] == "null":
+            with _EPHEMERAL_LOCK:
+                ephemeral = _EPHEMERAL_CHUNKS.get((self._ephemeral_scope, key))
+            if ephemeral is None:
+                return None
+            chunks = scrub_lone_surrogates(dict(ephemeral))
+        else:
+            try:
+                # Scrub on the way out as well as in. The writer escapes, but this
+                # is a plain ``json.loads``: a ``\ud800`` escape sitting in a row
+                # some other writer (or a hand edit) put there decodes straight back
+                # into the code unit, and would then raise at the next encode
+                # downstream rather than here (#761).
+                chunks = scrub_lone_surrogates(json.loads(row[0]))
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Corrupted chunks_json in pending_selections for key=%s; treating as miss",
+                    key,
+                )
+                return None
+            if not isinstance(chunks, dict):
+                return None
         return PendingSelection(
             chunks=chunks,
             format=row[1],
@@ -286,6 +343,8 @@ class SQLitePendingStore:
         with self._lock:
             self._get_db().execute("DELETE FROM pending_selections WHERE key = ?", (key,))
             self._get_db().commit()
+            with _EPHEMERAL_LOCK:
+                _EPHEMERAL_CHUNKS.pop((self._ephemeral_scope, key), None)
 
     def evict_expired(
         self, ttl: float, *, format: str | None = None, exclude_format: str | None = None
@@ -302,6 +361,7 @@ class SQLitePendingStore:
         with self._lock:
             self._get_db().execute(f"DELETE FROM pending_selections WHERE {where}", params)
             self._get_db().commit()
+            self._sync_ephemeral_after_delete()
 
     def evict_oldest(
         self, max_size: int, *, format: str | None = None, exclude_format: str | None = None
@@ -344,6 +404,7 @@ class SQLitePendingStore:
                 [*params, *params, max_size],
             )
             self._get_db().commit()
+            self._sync_ephemeral_after_delete()
 
     def __len__(self) -> int:
         with self._lock:

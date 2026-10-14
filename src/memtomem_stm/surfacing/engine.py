@@ -3030,7 +3030,7 @@ class SurfacingEngine:
                     {
                         "server": server,
                         "tool": tool,
-                        "query": query,
+                        "query": self._persistable_query(query),
                         "memory_ids": delivered_ids,
                         "scores": [r.score for r in relevant if str(r.chunk.id) in delivered_set],
                         "score_scale": score_scale,

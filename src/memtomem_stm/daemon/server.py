@@ -198,6 +198,7 @@ class DaemonServer:
         self._ltm_in_flight = 0
         self._max_pending_requests = config.daemon.max_pending_requests
         self._pending_slots = asyncio.Semaphore(self._max_pending_requests)
+        self._conn_slots = asyncio.BoundedSemaphore(max(64, self._max_pending_requests * 4))
         self._active_requests = 0
         self._busy_rejections = 0
         self._latency = DaemonLatencyTracker()
@@ -428,33 +429,43 @@ class DaemonServer:
     async def _handle_conn(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        try:
-            try:
-                req = await asyncio.wait_for(read_message(reader), timeout=_READ_TIMEOUT_SECONDS)
-            except (ProtocolError, asyncio.TimeoutError):
-                return  # malformed/oversized/slow → drop silently
-            if not token_matches(self._token, req.get("token")):
-                logger.debug("daemon rejected request with bad/missing token")
-                return  # never respond to an unauthenticated peer
-            resp = await self._dispatch(req)
-            if resp is not None:
-                encoded = encode_line(resp)
-                if len(encoded) > MAX_MESSAGE_BYTES:
-                    encoded = encode_line(
-                        {"v": PROTOCOL_VERSION, "ok": False, "status": "unavailable"}
-                    )
-                writer.write(encoded)
-                # Timeout → the generic handler below logs it and the finally
-                # block closes the writer, dropping the stuck consumer.
-                await asyncio.wait_for(writer.drain(), timeout=_WRITE_TIMEOUT_SECONDS)
-        except Exception:
-            logger.debug("daemon connection handler error", exc_info=True)
-        finally:
+        if self._conn_slots.locked():
             try:
                 writer.close()
                 await writer.wait_closed()
             except Exception:
                 pass
+            return
+        async with self._conn_slots:
+            try:
+                try:
+                    req = await asyncio.wait_for(
+                        read_message(reader), timeout=_READ_TIMEOUT_SECONDS
+                    )
+                except (ProtocolError, asyncio.TimeoutError):
+                    return  # malformed/oversized/slow → drop silently
+                if not token_matches(self._token, req.get("token")):
+                    logger.debug("daemon rejected request with bad/missing token")
+                    return  # never respond to an unauthenticated peer
+                resp = await self._dispatch(req)
+                if resp is not None:
+                    encoded = encode_line(resp)
+                    if len(encoded) > MAX_MESSAGE_BYTES:
+                        encoded = encode_line(
+                            {"v": PROTOCOL_VERSION, "ok": False, "status": "unavailable"}
+                        )
+                    writer.write(encoded)
+                    # Timeout → the generic handler below logs it and the finally
+                    # block closes the writer, dropping the stuck consumer.
+                    await asyncio.wait_for(writer.drain(), timeout=_WRITE_TIMEOUT_SECONDS)
+            except Exception:
+                logger.debug("daemon connection handler error", exc_info=True)
+            finally:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
 
     async def _dispatch(self, req: dict[str, Any]) -> dict[str, Any] | None:
         # Protocol-version guard. A wire-incompatible client normally keys to a

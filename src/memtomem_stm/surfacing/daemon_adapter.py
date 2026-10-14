@@ -28,6 +28,7 @@ from memtomem_stm.surfacing.mcp_client import (
     require_context_compose_lists,
 )
 from memtomem_stm.surfacing.rrf_profile import read_score_ceiling_hint
+from memtomem_stm.utils.json_out import has_lone_surrogate
 from memtomem_stm.utils.numeric import safe_float
 
 logger = logging.getLogger(__name__)
@@ -273,6 +274,9 @@ class DaemonLtmAdapter:
                 continue
             score = safe_float(item.get("score"), float("nan"))
             if not math.isfinite(score):
+                continue
+            chunk_id = item.get("chunk_id")
+            if isinstance(chunk_id, str) and has_lone_surrogate(chunk_id):
                 continue
             scale = read_score_scale_hint(item.get("score_scale"))
             result = RemoteSearchResult(
