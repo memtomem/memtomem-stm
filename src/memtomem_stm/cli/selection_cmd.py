@@ -105,10 +105,12 @@ def replay_command(
         log_errors=False,
     )
     if loaded.error is not None:
-        raise click.ClickException(f"cannot read {_disp(str(cfg_path))}: {loaded.error}")
+        # The summary carries config key names (an upstream's name), so it is
+        # escaped like the path.
+        raise click.ClickException(f"cannot read {_disp(str(cfg_path))}: {_disp(loaded.error)}")
     if loaded.env_error is not None:
         raise click.ClickException(
-            f"the MEMTOMEM_STM_PROXY environment is invalid: {loaded.env_error}"
+            f"the MEMTOMEM_STM_PROXY environment is invalid: {_disp(loaded.env_error)}"
         )
     assert loaded.config is not None
     cfg = loaded.config
