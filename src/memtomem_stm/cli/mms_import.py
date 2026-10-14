@@ -253,7 +253,10 @@ def import_command(
         )
         return
 
-    registry = state.load_registry()
+    try:
+        registry = state.load_registry()
+    except state.MmsConfigError as exc:
+        raise click.ClickException(_disp(str(exc))) from exc
     new, conflicts, idempotent = _classify_against_registry(candidates, registry)
 
     # ADD candidates that came from project-local files under cwd — an
@@ -321,7 +324,10 @@ def import_command(
     # Load existing sidecar up front — needed to decide whether any
     # idempotent entries require backfill (sidecar row missing for an
     # entry that is already in the registry).
-    existing_state = state.load_import_state()
+    try:
+        existing_state = state.load_import_state()
+    except state.MmsConfigError as exc:
+        raise click.ClickException(_disp(str(exc))) from exc
 
     # Single timestamp captured at the action boundary — shared by every
     # row written this run (new + backfill) so PR3 can read "all rows

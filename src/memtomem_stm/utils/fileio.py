@@ -73,6 +73,12 @@ def atomic_write_text(
     resolved = path.expanduser().resolve()
     if ensure_parent:
         resolved.parent.mkdir(parents=True, exist_ok=True, mode=parent_mode)
+    effective_mode = mode
+    if effective_mode is None:
+        try:
+            effective_mode = resolved.stat().st_mode & 0o777
+        except OSError:
+            effective_mode = None
     fd, tmp_path = tempfile.mkstemp(
         prefix=resolved.name + ".",
         suffix=".tmp",
@@ -88,9 +94,9 @@ def atomic_write_text(
                 # name durable ahead of the content it points at.
                 f.flush()
                 os.fsync(f.fileno())
-        if mode is not None:
+        if effective_mode is not None:
             try:
-                tmp.chmod(mode)
+                tmp.chmod(effective_mode)
             except OSError:
                 pass
         _replace_with_windows_retry(tmp, resolved)

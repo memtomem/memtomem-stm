@@ -120,6 +120,19 @@ class TestAtomicWriteText:
         bits = target.stat().st_mode & 0o077
         assert bits == 0, f"unexpected world/group bits: {oct(bits)}"
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="NTFS doesn't expose POSIX mode bits; ACL is the right primitive",
+    )
+    def test_no_mode_preserves_existing_file_permissions(self, tmp_path: Path):
+        """When overwriting an existing file with ``mode=None``, preserve its
+        existing permissions (e.g. 0o644 on host settings files)."""
+        target = tmp_path / "settings.json"
+        target.write_text("{}", encoding="utf-8")
+        os.chmod(target, 0o644)
+        atomic_write_text(target, '{"updated": true}')
+        assert (target.stat().st_mode & 0o777) == 0o644
+
     def test_ensure_parent_creates_missing_dirs(self, tmp_path: Path):
         target = tmp_path / "deep" / "nested" / "file.txt"
         atomic_write_text(target, "x")

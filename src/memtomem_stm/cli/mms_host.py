@@ -378,8 +378,11 @@ def status_cmd(json_output: bool) -> None:
     Exit code is always 0 — drift is a normal observation, not a CI
     failure signal.
     """
-    registry = state.load_registry()
-    import_state = state.load_import_state()
+    try:
+        registry = state.load_registry()
+        import_state = state.load_import_state()
+    except state.MmsConfigError as exc:
+        raise click.ClickException(_disp(str(exc))) from exc
 
     if not registry.servers:
         if json_output:
@@ -524,7 +527,10 @@ def scan_cmd(from_host: str, json_output: bool) -> None:
 
     Exit code is always 0; this is read-only inspection.
     """
-    registry = state.load_registry()
+    try:
+        registry = state.load_registry()
+    except state.MmsConfigError as exc:
+        raise click.ClickException(_disp(str(exc))) from exc
     candidates = discover(from_host, Path.cwd().resolve())
     rows = _scan_rows(candidates, registry)
     if json_output:
@@ -982,8 +988,11 @@ def sync_cmd(
     """
     cwd = Path.cwd().resolve()
     candidates = discover("all", cwd)
-    registry = state.load_registry()
-    import_state = state.load_import_state()
+    try:
+        registry = state.load_registry()
+        import_state = state.load_import_state()
+    except state.MmsConfigError as exc:
+        raise click.ClickException(_disp(str(exc))) from exc
 
     # Two orthogonal classifiers (see Action-bucket matrix in the plan).
     new, conflicts, _idempotent = _classify_against_registry(candidates, registry)
