@@ -60,6 +60,7 @@ from pathlib import Path
 import click
 
 from memtomem_stm.cli._display import _disp
+from memtomem_stm.cli._mms_errors import surface_mms_state_errors
 from memtomem_stm.cli._write_lock import with_write_lock
 from memtomem_stm.mms import state
 from memtomem_stm.mms.drift import HASH_VERSION, compute_drift_hash
@@ -212,6 +213,7 @@ def _classify_against_registry(
     "config files (.mcp.json / .cursor/mcp.json) under the current directory. "
     "Without this flag, --apply refuses to register them.",
 )
+@surface_mms_state_errors
 @with_write_lock
 def import_command(
     from_host: str, is_plan: bool, show_imported: bool, allow_project_configs: bool
@@ -253,10 +255,7 @@ def import_command(
         )
         return
 
-    try:
-        registry = state.load_registry()
-    except state.MmsConfigError as exc:
-        raise click.ClickException(_disp(str(exc))) from exc
+    registry = state.load_registry()
     new, conflicts, idempotent = _classify_against_registry(candidates, registry)
 
     # ADD candidates that came from project-local files under cwd — an
@@ -324,10 +323,7 @@ def import_command(
     # Load existing sidecar up front — needed to decide whether any
     # idempotent entries require backfill (sidecar row missing for an
     # entry that is already in the registry).
-    try:
-        existing_state = state.load_import_state()
-    except state.MmsConfigError as exc:
-        raise click.ClickException(_disp(str(exc))) from exc
+    existing_state = state.load_import_state()
 
     # Single timestamp captured at the action boundary — shared by every
     # row written this run (new + backfill) so PR3 can read "all rows

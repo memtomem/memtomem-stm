@@ -62,6 +62,7 @@ import click
 
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.cli._display import _disp
+from memtomem_stm.cli._mms_errors import surface_mms_state_errors
 from memtomem_stm.cli._write_lock import with_write_lock
 from memtomem_stm.cli.mms_import import _classify_against_registry, _format_env_summary
 from memtomem_stm.mms import state
@@ -371,18 +372,16 @@ def _render_json(rows: list[dict]) -> None:
 
 @host_group.command("status")
 @click.option("--json", "json_output", is_flag=True, help="Machine-readable output.")
+@surface_mms_state_errors
 def status_cmd(json_output: bool) -> None:
     """Show drift state of every registry entry vs sidecar baseline.
 
     Read-only: never writes to registry, sidecar, or anywhere else.
-    Exit code is always 0 — drift is a normal observation, not a CI
-    failure signal.
+    Exit code is 0 — drift is a normal observation, not a CI failure
+    signal — unless the ``~/.mms`` state files cannot be read (exit 1).
     """
-    try:
-        registry = state.load_registry()
-        import_state = state.load_import_state()
-    except state.MmsConfigError as exc:
-        raise click.ClickException(_disp(str(exc))) from exc
+    registry = state.load_registry()
+    import_state = state.load_import_state()
 
     if not registry.servers:
         if json_output:
@@ -509,6 +508,7 @@ def _render_scan_json(rows: list[dict]) -> None:
     help="Limit scan to one host config.",
 )
 @click.option("--json", "json_output", is_flag=True, help="Machine-readable output.")
+@surface_mms_state_errors
 def scan_cmd(from_host: str, json_output: bool) -> None:
     """List MCP entries discovered across host configs.
 
@@ -525,12 +525,10 @@ def scan_cmd(from_host: str, json_output: bool) -> None:
     delegated to ``mms host status`` (it surfaces shape mismatches as
     ``changed``).
 
-    Exit code is always 0; this is read-only inspection.
+    Exit code is 0 (read-only inspection) unless ``registry.toml`` cannot
+    be read (exit 1).
     """
-    try:
-        registry = state.load_registry()
-    except state.MmsConfigError as exc:
-        raise click.ClickException(_disp(str(exc))) from exc
+    registry = state.load_registry()
     candidates = discover(from_host, Path.cwd().resolve())
     rows = _scan_rows(candidates, registry)
     if json_output:
@@ -928,6 +926,7 @@ def _render_orphan_no_baseline_footer(n: int) -> None:
     "project-local config files (.mcp.json / .cursor/mcp.json) under the "
     "current directory. Without this flag, --apply refuses to register them.",
 )
+@surface_mms_state_errors
 @with_write_lock
 def sync_cmd(
     is_plan: bool, json_output: bool, yes: bool, force: bool, allow_project_configs: bool
@@ -988,11 +987,8 @@ def sync_cmd(
     """
     cwd = Path.cwd().resolve()
     candidates = discover("all", cwd)
-    try:
-        registry = state.load_registry()
-        import_state = state.load_import_state()
-    except state.MmsConfigError as exc:
-        raise click.ClickException(_disp(str(exc))) from exc
+    registry = state.load_registry()
+    import_state = state.load_import_state()
 
     # Two orthogonal classifiers (see Action-bucket matrix in the plan).
     new, conflicts, _idempotent = _classify_against_registry(candidates, registry)

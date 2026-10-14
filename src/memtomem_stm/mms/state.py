@@ -32,6 +32,7 @@ from pathlib import Path
 import tomli_w
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from memtomem_stm.proxy.config import validation_error_summary
 from memtomem_stm.utils.fileio import atomic_write_text
 from memtomem_stm.utils.locking import open_lock_fd, release_lock, try_lock
 
@@ -364,7 +365,7 @@ def load_registry(path: Path | None = None) -> RegistryConfig:
     try:
         return RegistryConfig.model_validate(raw)
     except ValidationError as e:
-        raise CorruptedConfig(p, f"schema validation: {e}") from e
+        raise CorruptedConfig(p, f"schema validation: {validation_error_summary(e)}") from e
 
 
 def load_projects_index(path: Path | None = None) -> ProjectsIndex:
@@ -377,7 +378,7 @@ def load_projects_index(path: Path | None = None) -> ProjectsIndex:
     try:
         return ProjectsIndex.model_validate(raw)
     except ValidationError as e:
-        raise CorruptedConfig(p, f"schema validation: {e}") from e
+        raise CorruptedConfig(p, f"schema validation: {validation_error_summary(e)}") from e
 
 
 def load_project_config(path: Path) -> ProjectConfig:
@@ -389,7 +390,7 @@ def load_project_config(path: Path) -> ProjectConfig:
     try:
         return ProjectConfig.model_validate(raw)
     except ValidationError as e:
-        raise CorruptedConfig(path, f"schema validation: {e}") from e
+        raise CorruptedConfig(path, f"schema validation: {validation_error_summary(e)}") from e
 
 
 def load_import_state(path: Path | None = None) -> ImportState:
@@ -410,7 +411,7 @@ def load_import_state(path: Path | None = None) -> ImportState:
     try:
         return ImportState.model_validate(raw)
     except ValidationError as e:
-        raise CorruptedConfig(p, f"schema validation: {e}") from e
+        raise CorruptedConfig(p, f"schema validation: {validation_error_summary(e)}") from e
 
 
 # ---------------------------------------------------------------------------

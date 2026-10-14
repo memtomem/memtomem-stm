@@ -830,3 +830,21 @@ def test_cli_rejects_conflicting_input_modes(tmp_path: Path) -> None:
 
     assert result.exit_code == 2
     assert "cannot be combined" in result.output
+
+
+def test_cli_stops_on_an_unparseable_config_and_reports_it_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Replay refuses to run on defaults the user did not configure, and the
+    loader's own parse warning would be a second, contradictory report."""
+    config = tmp_path / "stm_proxy.json"
+    config.write_text('{"a": "\\q"}', encoding="utf-8")
+
+    with caplog.at_level("WARNING", logger="memtomem_stm.proxy.config"):
+        result = CliRunner().invoke(
+            cli, ["selection", "replay", "--no-telemetry", "--config", str(config)]
+        )
+
+    assert result.exit_code == 1
+    assert f"cannot read {config}: JSONDecodeError (line 1 column 8)" in result.output
+    assert [r.getMessage() for r in caplog.records if "Failed to parse" in r.getMessage()] == []

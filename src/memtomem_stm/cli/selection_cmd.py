@@ -100,9 +100,12 @@ def replay_command(
         cfg_path,
         env_overrides=collect_proxy_env_overrides(),
         missing_ok=True,
+        # The error below is the report; the loader's own "using defaults"
+        # warning would contradict it, since replay stops instead.
+        log_errors=False,
     )
     if loaded.error is not None:
-        raise click.ClickException(f"cannot read {cfg_path}: {loaded.error}")
+        raise click.ClickException(f"cannot read {_disp(str(cfg_path))}: {loaded.error}")
     if loaded.env_error is not None:
         raise click.ClickException(
             f"the MEMTOMEM_STM_PROXY environment is invalid: {loaded.env_error}"

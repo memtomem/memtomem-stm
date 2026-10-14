@@ -347,7 +347,9 @@ def _setup_json_result(action: str):  # noqa: ANN201
                     servers = data.get("upstream_servers", {}) if isinstance(data, dict) else {}
                     if isinstance(servers, dict):
                         server_names = sorted(str(name) for name in servers)
-                except (OSError, json.JSONDecodeError, ValueError):
+                except (OSError, ValueError, RecursionError):
+                    # Best-effort detail for the failure document; the
+                    # command's own load already reported why (``_load``).
                     pass
             payload = {
                 "action": action,
@@ -474,10 +476,11 @@ def _load(config_path: Path, *, json_action: str | None = None) -> dict[str, Any
             f"{resolved} top-level must be a JSON object, got {type(data).__name__}.",
             json_action=json_action,
         )
-    if "upstream_servers" in data and not isinstance(data["upstream_servers"], dict):
+    servers = data.get("upstream_servers")
+    if "upstream_servers" in data and not isinstance(servers, dict):
         _config_shape_failure(
             resolved,
-            f"{resolved} 'upstream_servers' must be an object, got {type(data['upstream_servers']).__name__}.",
+            f"{resolved} 'upstream_servers' must be an object, got {type(servers).__name__}.",
             json_action=json_action,
         )
     return data
@@ -4159,9 +4162,17 @@ def _desktop_json_remove_entry(name: str) -> tuple[bool, str | None]:
     if not isinstance(servers, dict) or name not in servers:
         return (False, f"'{name}' not registered in {path}")
     del servers[name]
+    # Keep the host's own mode, as the restore counterpart
+    # (``_json_config_set_entry``) does; removing an entry is not a reason
+    # to change who can read the file.
+    mode: int | None
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        mode = None
     try:
         atomic_write_text(
-            path, _json_dumps(data, indent=2, ensure_ascii=False) + "\n", durable=True
+            path, _json_dumps(data, indent=2, ensure_ascii=False) + "\n", mode=mode, durable=True
         )
     except OSError as exc:
         return (False, f"write error: {exc}")
@@ -7850,7 +7861,6 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
     ``health``/``doctor`` render ``error`` verbatim.
     """
     import httpx2
-
     from mcp import ClientSession
     from mcp.client.sse import sse_client
     from mcp.client.stdio import StdioServerParameters, stdio_client
@@ -8098,7 +8108,6 @@ async def _probe_ltm_mcp_server(
     ``create_subprocess_exec(stderr=...)``, which requires ``fileno``).
     """
     import httpx2
-
     from mcp import ClientSession
     from mcp.client.sse import sse_client
     from mcp.client.stdio import StdioServerParameters, stdio_client

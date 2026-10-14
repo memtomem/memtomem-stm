@@ -2167,6 +2167,25 @@ class TestAtomicSave:
         assert (mcp_path.stat().st_mode & 0o777) == 0o644
 
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    def test_desktop_remove_entry_preserves_existing_mode(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        # Claude Desktop's config is the host's file: removing our entry
+        # keeps whatever mode the user gave it, like the restore path does.
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        desktop_path = tmp_path / "claude_desktop_config.json"
+        desktop_path.write_text(
+            json.dumps({"mcpServers": {"memtomem-stm": {"command": "mms"}}}), encoding="utf-8"
+        )
+        desktop_path.chmod(0o644)
+        monkeypatch.setattr(proxy_mod, "_desktop_config_path", lambda: desktop_path)
+
+        assert proxy_mod._desktop_json_remove_entry("memtomem-stm") == (True, None)
+        assert json.loads(desktop_path.read_text(encoding="utf-8")) == {"mcpServers": {}}
+        assert (desktop_path.stat().st_mode & 0o777) == 0o644
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
     def test_write_mcp_json_new_file_gets_project_mode(self, tmp_path: Path) -> None:
         from memtomem_stm.cli.proxy import _write_mcp_json_for_stm
 
