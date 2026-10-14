@@ -1430,3 +1430,28 @@ class TestAnthropicMalformedBlockIsNotIgnorable:
         ):
             raw = await extractor._anthropic("text", "prompt")
         assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == ["kept"]
+
+    async def test_custom_system_prompt_with_json_braces_does_not_keyerror(self):
+        """Custom system_prompt containing literal JSON braces like
+        ``{"content": "..."}`` alongside ``{max_facts}`` must not raise KeyError."""
+        llm_cfg = LLMCompressorConfig(
+            provider=LLMProvider.OLLAMA,
+            model="qwen3:4b",
+            system_prompt='Return at most {max_facts} items shaped like {"content": "x"}.',
+        )
+        cfg = ExtractionConfig(
+            enabled=True,
+            strategy=ExtractionStrategy.LLM,
+            llm=llm_cfg,
+            min_response_chars=10,
+            max_facts=7,
+        )
+        extractor = FactExtractor(cfg)
+        payload = {"message": {"role": "assistant", "content": '[{"content": "ok"}]'}}
+        with patch.object(
+            extractor._client, "post", AsyncMock(return_value=_mock_http_response(payload))
+        ) as post_mock:
+            facts = await extractor.extract("x" * 100, server="s", tool="t")
+        assert [f.content for f in facts] == ["ok"]
+        sent_json = post_mock.call_args.kwargs["json"]
+        assert 'at most 7 items shaped like {"content": "x"}' in sent_json["messages"][0]["content"]

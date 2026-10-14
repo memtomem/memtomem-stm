@@ -389,7 +389,7 @@ class FactExtractor:
 
     async def _call_api(self, text: str) -> str:
         assert self._client is not None
-        system_prompt = self._llm_cfg.system_prompt.format(max_facts=self._cfg.max_facts)
+        system_prompt = self._llm_cfg.system_prompt.replace("{max_facts}", str(self._cfg.max_facts))
         match self._llm_cfg.provider:
             case LLMProvider.OPENAI:
                 return await self._openai(text, system_prompt)
