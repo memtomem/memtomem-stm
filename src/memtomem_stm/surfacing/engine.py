@@ -1457,9 +1457,10 @@ class SurfacingEngine:
         in-memory ``RelevanceGate.record_surfacing(query)`` cooldown
         signal (and the in-flight ``query`` argument used for similarity
         comparison, dedup, formatter rendering, etc.) intentionally keeps
-        the raw text — this knob only governs **what leaves the process**:
-        the persisted row and the surface webhook's ``query`` field,
-        nothing about the in-process surface call.
+        the raw text of a non-sensitive query — this knob only governs **two output fields**: the
+        persisted row and the surface webhook's ``query``. The LTM search
+        still receives the raw text; a query that matches a sensitive
+        pattern is digested before retrieval regardless of this knob.
 
         Secret guard: regardless of ``persist_query_text``, a query whose
         text matches a known sensitive pattern (API key, bearer token, JWT,
@@ -1471,8 +1472,8 @@ class SurfacingEngine:
         — credentials *and* PII — unlike the LLM compression routing gate,
         which scans ``CREDENTIAL_PATTERNS`` only: an email is fine to show
         an external summarizer but not fine to persist. Only the persisted
-        value and the webhook ``query`` are affected — the in-flight
-        ``query`` keeps its raw text as described above.
+        value and the webhook ``query`` are affected — a non-sensitive
+        in-flight ``query`` keeps its raw text as described above.
         """
         if not self._config.persist_query_text:
             return self._hashed_query(query)
