@@ -177,7 +177,9 @@ class CompressionTuner:
         tool_filter: str | None = None,
     ) -> list[TuningRecommendation]:
         profiles = self.get_profiles(since_seconds=since_seconds, tool_filter=tool_filter)
+        return self.analyze_profiles(profiles)
 
+    def analyze_profiles(self, profiles: list[ToolProfile]) -> list[TuningRecommendation]:
         recommendations: list[TuningRecommendation] = []
         for p in profiles:
             if p.call_count < MIN_CALLS:

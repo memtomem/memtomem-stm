@@ -27,6 +27,9 @@ from memtomem_stm.cli.proxy import _LAZY_SUBCOMMANDS, cli
 _MUST_STAY_UNLOADED = [
     "mcp",
     "memtomem_stm.proxy.manager",
+    "memtomem_stm.mms.state",
+    "pydantic",
+    "tomli_w",
     *(module for module, _attr in _LAZY_SUBCOMMANDS.values()),
 ]
 

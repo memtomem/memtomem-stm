@@ -18,7 +18,6 @@ from typing import Any, TypeVar
 import click
 
 from memtomem_stm.cli._display import _disp
-from memtomem_stm.mms import state
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -63,6 +62,8 @@ def with_write_lock(f: F) -> F:
 
     @functools.wraps(f)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
+        from memtomem_stm.mms import state
+
         enabled = not kwargs.get("is_plan", False)
         try:
             with state.write_lock(enabled=enabled):
@@ -113,6 +114,8 @@ def hook_hosts_write_lock(*, enabled: bool) -> Iterator[None]:
     the staleness guard inside ``hook_hosts.apply_change``, which refuses to
     overwrite contents the plan never saw.
     """
+    from memtomem_stm.mms import state
+
     try:
         with state.write_lock(
             enabled=enabled,
@@ -164,6 +167,8 @@ def with_config_write_lock(
     def decorate(f: F) -> F:
         @functools.wraps(f)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            from memtomem_stm.mms import state
+
             enabled = skip is None or not skip(kwargs)
             try:
                 with state.write_lock(

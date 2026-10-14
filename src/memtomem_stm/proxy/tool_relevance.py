@@ -189,8 +189,17 @@ def derive_query(arguments: dict[str, Any] | None) -> tuple[str, str] | None:
 
 def _candidate_document(info: ProxyToolInfo) -> tuple[str, str]:
     """(heading, body) for BM25: name as heading, advertised text as body."""
+    cache_key = (info.prefixed_name, info.description, id(info.input_schema))
+    cached = getattr(info, "_cached_candidate_doc", None)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
     schema_text = json.dumps(info.input_schema or {}, sort_keys=True, separators=(",", ":"))
-    return info.prefixed_name, f"{info.description} {schema_text[:_MAX_SCHEMA_CHARS]}"
+    doc = (info.prefixed_name, f"{info.description} {schema_text[:_MAX_SCHEMA_CHARS]}")
+    try:
+        setattr(info, "_cached_candidate_doc", (cache_key, doc))
+    except (AttributeError, TypeError):
+        pass
+    return doc
 
 
 def _graph_facts_for(
