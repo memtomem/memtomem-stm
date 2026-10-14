@@ -47,6 +47,21 @@ changes inline only. See the deprecation policy in
   failed start. Surfacing was already disabled in either case; only what is
   reported changes (#1136).
 
+### Security
+
+- cli: `mms gateway status` printed the first validation message for an
+  invalid config, and `mms gateway explain` printed the whole pydantic error.
+  Both can quote the rejected values. They now print each error's location
+  and type, like the other CLI config reads. **Behavior change**: the error
+  reads `invalid proxy config: upstream_servers.x (value_error)` instead of,
+  for example, `Value error, reconnect_delay_seconds (7777.0) must be <=
+  max_reconnect_delay_seconds (5.0)` (#1141).
+- surfacing: the surface webhook payload's `query` was always the raw
+  extracted query. It now uses the same form as the persisted
+  `surfacing_events.query`. **Behavior change**: webhook subscribers receive
+  a `sha256:` digest instead of the query when `persist_query_text` is
+  `false`, and whenever the query matches a sensitive pattern (#1141).
+
 ## [0.6.3] — 2026-10-12
 
 ### Upgrade notes
