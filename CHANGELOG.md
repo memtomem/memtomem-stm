@@ -13,6 +13,16 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- privacy: the email rule in the sensitive-content detector slowed down
+  quadratically on long unbroken runs containing dots: 64 KB of `a.a.a.…` took
+  about 2 s. One such response could stall any scan that uses the default
+  patterns, such as the response cache's privacy gate. The rule is now linear
+  (256 KB in a few milliseconds). **Behavior change**: the rule also matches
+  a local part with no word boundary in it (`--@example.com`) or one right
+  after a non-ASCII letter (`jöe@bar.com`), so those are no longer cached.
+  The response cache's privacy fingerprint covers the pattern text, so the
+  first start after upgrading runs the cache's one-time privacy repair sweep,
+  which takes time proportional to the cache's size (#1149).
 - cli: a `--json` run whose config file could not be read or parsed wrote
   nothing to stdout, even though `--json` promises one JSON document for
   operational failures. The human error went to stderr and the exit code was

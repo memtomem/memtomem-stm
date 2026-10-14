@@ -198,8 +198,15 @@ CREDENTIAL_PATTERNS = [
 # operator's chosen strategy to truncation. Consumers that gate STORAGE
 # (e.g. surfacing query persistence) should keep scanning the full
 # DEFAULT_PATTERNS.
+#
+# The email rule starts only where a local-part run starts. A leading ``\b``
+# let every word boundary inside a long run like ``a.a.a.…`` begin a match
+# that scanned to the end of the run, which made the search quadratic (64 KB
+# took about 2 s). Every address the ``\b`` form found is still found; it
+# additionally matches a local part with no word boundary in it (``--@x.io``)
+# or one right after a non-ASCII letter (``jöe@x.io``).
 PII_PATTERNS = [
-    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+    r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
 ]
 
 # Backwards-compatible union — the default for contains_sensitive_content
