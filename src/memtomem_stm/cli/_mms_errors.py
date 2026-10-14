@@ -14,7 +14,7 @@ from __future__ import annotations
 import functools
 import sys
 from collections.abc import Callable
-from typing import Any, TypeVar
+from typing import Any, NoReturn, TypeVar
 
 import click
 
@@ -52,24 +52,33 @@ def surface_mms_state_errors(f: F) -> F:
         try:
             return f(*args, **kwargs)
         except state.MmsConfigError as exc:
-            if kwargs.get("json_output") or kwargs.get("as_json"):
-                ctx = click.get_current_context(silent=True)
-                action = ctx.command.name if ctx and ctx.command.name else f.__name__
-                click.echo(f"Error: {_disp(str(exc))}", err=True)
-                click.echo(
-                    _json_dumps(
-                        {
-                            "action": action,
-                            "ok": False,
-                            "error": _error_code(exc),
-                            "message": str(exc),
-                        },
-                        indent=2,
-                        ensure_ascii=False,
-                    )
-                )
-                sys.exit(1)
-            raise click.ClickException(_disp(str(exc))) from exc
+            exit_on_state_error(exc, kwargs, fallback_action=f.__name__)
 
     setattr(wrapper, MARKER, True)
     return wrapper  # type: ignore[return-value]
+
+
+def exit_on_state_error(
+    exc: state.MmsConfigError, kwargs: dict[str, Any], *, fallback_action: str
+) -> NoReturn:
+    """The one rendering of a state error, for this decorator and for
+    ``with_write_lock``, whose lock is taken before the callback runs and so
+    must render its own timeout the same way."""
+    if kwargs.get("json_output") or kwargs.get("as_json"):
+        ctx = click.get_current_context(silent=True)
+        action = ctx.command.name if ctx and ctx.command.name else fallback_action
+        click.echo(f"Error: {_disp(str(exc))}", err=True)
+        click.echo(
+            _json_dumps(
+                {
+                    "action": action,
+                    "ok": False,
+                    "error": _error_code(exc),
+                    "message": str(exc),
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        sys.exit(1)
+    raise click.ClickException(_disp(str(exc))) from exc

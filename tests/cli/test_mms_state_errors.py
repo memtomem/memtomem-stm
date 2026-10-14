@@ -149,3 +149,21 @@ def test_import_reports_a_corrupt_registry_cleanly(runner, sandbox):
     assert res.exit_code == 1
     assert not isinstance(res.exception, state.MmsConfigError)
     assert SECRET not in res.output
+
+
+def test_host_sync_json_reports_a_lock_timeout_as_a_document(runner, sandbox, monkeypatch):
+    """``with_write_lock`` takes the lock before the callback runs, so its
+    timeout never reaches the callback's decorator; it must render the same
+    document itself."""
+
+    def _held(*args, **kwargs):
+        raise state.WriteLockTimeout(state.mms_home() / ".lock", 5.0)
+
+    monkeypatch.setattr(state, "write_lock", _held)
+
+    res = runner.invoke(host_group, ["sync", "--apply", "--yes", "--json"])
+
+    assert res.exit_code == 1
+    doc = json.loads(res.stdout)
+    assert (doc["action"], doc["ok"], doc["error"]) == ("sync", False, "mms_lock_timeout")
+    assert "timed out" in res.stderr
