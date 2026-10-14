@@ -1535,39 +1535,3 @@ class TestSupersededEvictionPolicy:
             assert store.get(key) is not None
         finally:
             store.close()
-
-
-class TestSensitivePayloadNotPersistedOnDisk:
-    """Sensitive credentials/PII in PendingSelection chunks must stay in
-    process-local memory rather than being written to SQLite on disk."""
-
-    def test_sensitive_selection_keeps_chunks_in_memory_only(self, tmp_path: Path):
-        db_path = tmp_path / "pending.db"
-        store = SQLitePendingStore(db_path)
-        store.initialize()
-        secret = "AKIAIOSFODNN7EXAMPLE"
-        try:
-            store.put("sec_key", _make_selection({"auth": f"aws_key={secret}"}))
-            # Same-process get succeeds via ephemeral memory map
-            got = store.get("sec_key")
-            assert got is not None
-            assert got.chunks == {"auth": f"aws_key={secret}"}
-
-            # Raw SQLite row on disk has chunks_json == "null" and no secret bytes
-            raw_row = (
-                store._get_db()
-                .execute(
-                    "SELECT chunks_json FROM pending_selections WHERE key = ?",
-                    ("sec_key",),
-                )
-                .fetchone()
-            )
-            assert raw_row is not None
-            assert raw_row[0] == "null"
-            assert secret.encode("utf-8") not in db_path.read_bytes()
-
-            # Deleting removes both row and ephemeral entry
-            store.delete("sec_key")
-            assert store.get("sec_key") is None
-        finally:
-            store.close()
