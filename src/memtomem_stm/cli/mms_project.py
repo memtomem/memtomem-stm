@@ -19,6 +19,7 @@ import click
 
 from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG, resolve_cli_config_path
 from memtomem_stm.cli._display import _disp
+from memtomem_stm.cli._mms_errors import surface_mms_state_errors
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.cli._write_lock import with_config_write_lock, with_write_lock
 from memtomem_stm.mms import state
@@ -193,6 +194,7 @@ def _same_registry_route(existing: object, server: state.RegistryServer) -> bool
     "--name", "name_opt", default=None, help="Override project name (default: dir basename)."
 )
 @click.option("--force", is_flag=True, help="Overwrite an existing .mms/project.toml.")
+@surface_mms_state_errors
 @with_write_lock
 def init_cmd(path: Path | None, name_opt: str | None, force: bool) -> None:
     """Create ``<path>/.mms/project.toml`` (default path = cwd) and add to index."""
@@ -211,8 +213,14 @@ def init_cmd(path: Path | None, name_opt: str | None, force: bool) -> None:
         project=state.ProjectMeta(name=project_name),
         mcp=state.ProjectMcp(enabled=[]),
     )
+    # Read the index before writing the marker: an unreadable index would
+    # otherwise fail the command after the marker exists, and the rerun then
+    # refuses with "already exists" while the project stays unindexed.
+    idx = state.load_projects_index()
     state.save_project_config(cfg, marker)
-    _refresh_index(project_name, target_root)
+    state.save_projects_index(
+        state.upsert_project_in_index(idx, name=project_name, path=str(target_root))
+    )
     click.echo(f"Created {_disp(str(marker))}")
     click.echo(f"Indexed in {_disp(str(state.projects_index_path()))}")
 
@@ -225,6 +233,7 @@ def init_cmd(path: Path | None, name_opt: str | None, force: bool) -> None:
 @project_group.command("show")
 @click.argument("name", required=False)
 @click.option("--json", "json_output", is_flag=True, help="Machine-readable output.")
+@surface_mms_state_errors
 def show_cmd(name: str | None, json_output: bool) -> None:
     """Show the detected (or named) project, with init hints when no marker."""
     if name is not None:
@@ -297,6 +306,7 @@ def _emit_show(proj: Project, json_output: bool, *, cwd: Path) -> None:
 @project_group.command("list")
 @click.option("--prune", is_flag=True, help="Remove entries whose path no longer exists.")
 @click.option("--json", "json_output", is_flag=True, help="Machine-readable output.")
+@surface_mms_state_errors
 def list_cmd(prune: bool, json_output: bool) -> None:
     """List known projects from the index. Mark current cwd's project with ``*``."""
     cwd = Path.cwd().resolve()
@@ -307,22 +317,19 @@ def list_cmd(prune: bool, json_output: bool) -> None:
     # loser's save drops the winner's kept entries. A plain ``list`` (no prune)
     # is read-only and stays unlocked, mirroring the ``--plan`` skip convention.
     pruned: list[state.ProjectIndexEntry] = []
-    try:
-        with state.write_lock(enabled=prune):
-            idx = state.load_projects_index()
-            if prune:
-                kept: list[state.ProjectIndexEntry] = []
-                for entry in idx.projects:
-                    if Path(entry.path).is_dir():
-                        kept.append(entry)
-                    else:
-                        pruned.append(entry)
-                if pruned:
-                    new_idx = state.ProjectsIndex(schema_version=idx.schema_version, projects=kept)
-                    state.save_projects_index(new_idx)
-                    idx = new_idx
-    except state.WriteLockTimeout as exc:
-        raise click.ClickException(_disp(str(exc))) from exc
+    with state.write_lock(enabled=prune):
+        idx = state.load_projects_index()
+        if prune:
+            kept: list[state.ProjectIndexEntry] = []
+            for entry in idx.projects:
+                if Path(entry.path).is_dir():
+                    kept.append(entry)
+                else:
+                    pruned.append(entry)
+            if pruned:
+                new_idx = state.ProjectsIndex(schema_version=idx.schema_version, projects=kept)
+                state.save_projects_index(new_idx)
+                idx = new_idx
 
     def _is_current(entry: state.ProjectIndexEntry) -> bool:
         return Path(entry.path).resolve() == cwd
@@ -368,6 +375,7 @@ def list_cmd(prune: bool, json_output: bool) -> None:
 @click.option(
     "--project", "project_name", default=None, help="Target project (default: detect from cwd)."
 )
+@surface_mms_state_errors
 @with_write_lock
 def enable_cmd(mcps: tuple[str, ...], project_name: str | None) -> None:
     """Add MCP names to the project's enabled list."""
@@ -431,6 +439,7 @@ def enable_cmd(mcps: tuple[str, ...], project_name: str | None) -> None:
     help="Write additive routes (default: preview only).",
 )
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable result.")
+@surface_mms_state_errors
 @with_config_write_lock(
     skip=lambda kwargs: not kwargs.get("do_apply"),
     json_envelope=True,
@@ -460,11 +469,8 @@ def route_cmd(
         _schema_validation_error,
     )
 
-    try:
-        project = _resolve_project_for_mutation(project_name)
-        registry = state.load_registry()
-    except state.MmsConfigError as exc:
-        raise click.ClickException(_disp(str(exc))) from exc
+    project = _resolve_project_for_mutation(project_name)
+    registry = state.load_registry()
 
     assert project.config is not None and project.marker_path is not None
     enabled = list(project.config.mcp.enabled)
@@ -575,6 +581,7 @@ def route_cmd(
 @click.option(
     "--project", "project_name", default=None, help="Target project (default: detect from cwd)."
 )
+@surface_mms_state_errors
 @with_write_lock
 def disable_cmd(mcps: tuple[str, ...], project_name: str | None) -> None:
     """Remove MCP names from the project's enabled list.

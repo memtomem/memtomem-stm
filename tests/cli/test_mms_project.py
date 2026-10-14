@@ -820,11 +820,12 @@ class TestRemainingRawRendersEscape:
     def test_list_prune_write_lock_timeout_escapes_the_lock_path(
         self, runner, sandbox, monkeypatch
     ):
-        """``list --prune`` catches the timeout itself, not via the decorator.
+        """``list --prune`` takes the lock inline, not via ``with_write_lock``.
 
-        Targeted at that catch specifically: routing through a decorated
-        command instead would pass even with this site left raw, since
-        ``_write_lock`` escapes on its own.
+        Its timeout reaches ``surface_mms_state_errors`` directly, so this
+        targets that renderer: routing through a ``with_write_lock`` command
+        would pass even with it left raw, since ``_write_lock`` escapes on
+        its own.
         """
         hostile_lock = Path("/tmp") / "lo\x1b[31m\rck" / ".mms.lock"
 

@@ -482,8 +482,9 @@ def validation_error_summary(exc: ValidationError) -> str:
     Both ``input_value=`` (what ``str(exc)`` embeds) and the rendered ``msg``
     can carry the value that failed validation, so neither is used. Callers:
     the config-load path below and ``stm_admin``'s action-parameter errors, which
-    reach an MCP client, and the CLI's config reads and upstream probes
-    (``health``, ``doctor``, ``add --validate``, ``init``).
+    reach an MCP client, the CLI's config reads and upstream probes
+    (``health``, ``doctor``, ``add --validate``, ``init``), and the ``~/.mms``
+    state loaders, whose ``CorruptedConfig`` the ``mms`` commands print.
 
     A location is not only schema: pydantic puts the dict key of the failing
     entry in it. For these callers the keys are config key names (such as

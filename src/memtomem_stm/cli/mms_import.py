@@ -60,6 +60,7 @@ from pathlib import Path
 import click
 
 from memtomem_stm.cli._display import _disp
+from memtomem_stm.cli._mms_errors import surface_mms_state_errors
 from memtomem_stm.cli._write_lock import with_write_lock
 from memtomem_stm.mms import state
 from memtomem_stm.mms.drift import HASH_VERSION, compute_drift_hash
@@ -212,6 +213,7 @@ def _classify_against_registry(
     "config files (.mcp.json / .cursor/mcp.json) under the current directory. "
     "Without this flag, --apply refuses to register them.",
 )
+@surface_mms_state_errors
 @with_write_lock
 def import_command(
     from_host: str, is_plan: bool, show_imported: bool, allow_project_configs: bool
