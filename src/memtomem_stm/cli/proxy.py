@@ -1652,7 +1652,7 @@ def gateway_status(config_path: str | None, *, as_json: bool = False) -> None:
     config_path = resolve_cli_config_path(config_path).path
     from pydantic import ValidationError
 
-    from memtomem_stm.proxy.config import ProxyConfig
+    from memtomem_stm.proxy.config import ProxyConfig, validation_error_summary
     from memtomem_stm.proxy.toolgraph_bundle import PolicyBundleError, load_policy_bundle
 
     path = Path(config_path)
@@ -1661,7 +1661,9 @@ def gateway_status(config_path: str | None, *, as_json: bool = False) -> None:
             _load(path, json_action="gateway-status" if as_json else None)
         )
     except ValidationError as exc:
-        raise click.ClickException(f"invalid proxy config: {exc.errors()[0]['msg']}") from exc
+        raise click.ClickException(
+            f"invalid proxy config: {validation_error_summary(exc)}"
+        ) from exc
     tg = config.toolgraph
     result: dict[str, Any] = {
         "enabled": tg.enabled,
@@ -1726,7 +1728,7 @@ def gateway_explain(tool_key: str, config_path: str | None, *, as_json: bool = F
     config_path = resolve_cli_config_path(config_path).path
     from pydantic import ValidationError
 
-    from memtomem_stm.proxy.config import ProxyConfig
+    from memtomem_stm.proxy.config import ProxyConfig, validation_error_summary
     from memtomem_stm.proxy.toolgraph_bundle import PolicyBundleError, load_policy_bundle
 
     try:
@@ -1744,7 +1746,11 @@ def gateway_explain(tool_key: str, config_path: str | None, *, as_json: bool = F
             expected_agent=config.toolgraph.agent_id,
             expected_profile=config.exposure.profile.value,
         )
-    except (ValidationError, PolicyBundleError) as exc:
+    except ValidationError as exc:
+        raise click.ClickException(
+            f"invalid proxy config: {validation_error_summary(exc)}"
+        ) from exc
+    except PolicyBundleError as exc:
         raise click.ClickException(str(exc)) from exc
     decision = snapshot.decisions.get(tool_key)
     if decision is None:

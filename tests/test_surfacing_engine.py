@@ -3730,6 +3730,33 @@ class TestWebhookExceptionPaths:
             await asyncio.gather(*pending, return_exceptions=True)
         assert captured["score_scale"] == "rerank"
 
+    @pytest.mark.parametrize("persist", [True, False])
+    async def test_webhook_query_follows_persist_query_text(self, persist):
+        """The webhook carries the query in the form that is persisted: the raw
+        text by default, the ``sha256:`` digest when ``persist_query_text`` is off."""
+        captured: dict = {}
+
+        async def capture_fire(event, payload):
+            captured.update(payload)
+
+        webhook_manager = MagicMock()
+        webhook_manager.fire = capture_fire
+        engine = SurfacingEngine(
+            config=_make_config(fire_webhook=True, persist_query_text=persist),
+            mcp_adapter=_make_mcp_adapter(
+                [FakeSearchResult(chunk=FakeChunk(content="mem"), score=0.5)]
+            ),
+            webhook_manager=webhook_manager,
+        )
+        await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        pending = list(engine._background_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        raw = engine._mcp_adapter.search.call_args.kwargs["query"]
+        assert raw and not raw.startswith("sha256:")
+        assert captured["query"] == (raw if persist else engine._persistable_query(raw))
+        assert captured["query"].startswith("sha256:") is (not persist)
+
     async def test_webhook_http_error_is_logged_not_raised(self, caplog):
         """fire() raising (simulating HTTP 500) → warning logged, caller unaffected."""
 
