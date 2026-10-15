@@ -1075,14 +1075,15 @@ Without `NAME`: runs the §6 detection algorithm against cwd (marker walk-up →
 Usage: mms project list [OPTIONS]
 
 Options:
-  --prune  Remove entries whose root or marker is missing.
+  --prune  Remove entries with missing markers or non-directory roots.
   --json   Machine-readable output.
 ```
 
 Prints all known projects with the current cwd's project marked `*`. `--prune`
 removes index entries whose root or `.mms/project.toml` marker is confirmed
-missing and reports each removed entry by name; it never deletes project files.
-If an entry is inaccessible, has an invalid marker, or has the wrong file type,
+missing, or whose root is no longer a directory, and reports each removed entry
+by name; it never deletes project files.
+If an entry is inaccessible or its marker is invalid or not a regular file,
 pruning exits with an error and leaves the entire index unchanged. In `--json`
 mode this is a JSON failure document; successful output lists removed entries
 under `pruned`.

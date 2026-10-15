@@ -17,7 +17,8 @@ changes inline only. See the deprecation policy in
   validation. Missing-marker recovery preserves the indexed name and explains
   that re-init resets enabled MCPs. **Behavior change**: `mms project list
   --prune` also removes missing-marker registrations; inaccessible or invalid
-  projects abort pruning without changing the index (#1154).
+  projects abort pruning without changing the index and identify the failed entry.
+  Non-directory roots remain prunable without deleting files (#1154).
 
 - compression: section-aware truncation in `TruncateCompressor` skipped
   every later line equal to one it had already kept, so a section lost its

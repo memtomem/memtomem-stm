@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import errno
+import json
 import shlex
 import sys
 from pathlib import Path
@@ -410,7 +410,68 @@ def test_missing_marker_hint_preserves_name(runner, sandbox, command):
     assert state.load_projects_index().projects[0].name == name
 
 
-@pytest.mark.parametrize("damage", ["directory", "malformed", "invalid_utf8", "root_file"])
+@pytest.mark.parametrize("json_output", [False, True])
+def test_prune_non_directory_root_preserves_file_and_valid_project(runner, sandbox, json_output):
+    assert runner.invoke(project_group, ["init"]).exit_code == 0
+    root = sandbox["home"] / "stale"
+    root.mkdir()
+    assert runner.invoke(project_group, ["init", str(root), "--name", "stale"]).exit_code == 0
+    marker = root / state.PROJECT_MARKER_RELPATH
+    marker.unlink()
+    marker.parent.rmdir()
+    root.rmdir()
+    root.write_text("user file")
+    shown = runner.invoke(project_group, ["show", "stale"])
+    assert shown.exit_code == 1
+    assert "list --prune" in shown.output
+    assert "mms project init" not in shown.output
+    result = runner.invoke(project_group, ["list", "--prune"] + (["--json"] if json_output else []))
+    assert result.exit_code == 0, result.output
+    if json_output:
+        assert json.loads(result.stdout)["pruned"] == [{"name": "stale", "path": str(root)}]
+    else:
+        assert "pruned: stale" in result.stdout
+    assert root.read_text() == "user file"
+    assert [entry.name for entry in state.load_projects_index().projects] == ["proj"]
+    again = runner.invoke(project_group, ["list", "--prune", "--json"])
+    assert again.exit_code == 0
+    assert json.loads(again.stdout)["pruned"] == []
+
+
+def test_enoent_with_file_parent_does_not_offer_init(runner, sandbox, monkeypatch):
+    assert runner.invoke(project_group, ["init", "--name", "demo"]).exit_code == 0
+    marker = sandbox["cwd"] / state.PROJECT_MARKER_RELPATH
+    marker.unlink()
+    marker.parent.rmdir()
+    marker.parent.write_text("user file")
+    original = Path.stat
+
+    def missing(path, *args, **kwargs):
+        if path == marker:
+            raise FileNotFoundError(errno.ENOENT, "simulated missing-path report")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", missing)
+    shown = runner.invoke(project_group, ["show", "demo"])
+    assert shown.exit_code == 1
+    assert "mms project init" not in shown.output
+    assert "list --prune" in shown.output
+    assert runner.invoke(project_group, ["list", "--prune"]).exit_code == 0
+    assert marker.parent.read_text() == "user file"
+
+
+def test_unrenderable_name_omits_recreate_command(runner, sandbox):
+    name = "demo\x1b[31m"
+    assert runner.invoke(project_group, ["init", "--name", name]).exit_code == 0
+    (sandbox["cwd"] / state.PROJECT_MARKER_RELPATH).unlink()
+    result = runner.invoke(project_group, ["show", name])
+    assert result.exit_code == 1
+    assert "Recreate the marker" not in result.output
+    assert "\x1b" not in result.output
+    assert "list --prune" in result.output
+
+
+@pytest.mark.parametrize("damage", ["directory", "malformed", "invalid_utf8"])
 def test_prune_and_named_lookup_keep_invalid_projects(runner, sandbox, damage):
     root = sandbox["home"] / "invalid"
     root.mkdir()
@@ -423,11 +484,6 @@ def test_prune_and_named_lookup_keep_invalid_projects(runner, sandbox, damage):
         marker.write_text("invalid = [")
     elif damage == "invalid_utf8":
         marker.write_bytes(b"\xff")
-    else:
-        marker.unlink()
-        marker.parent.rmdir()
-        root.rmdir()
-        root.write_text("not a directory")
     # A stale entry before the invalid one must not be partially pruned.
     idx = state.load_projects_index()
     idx.projects.insert(
@@ -449,6 +505,7 @@ def test_prune_and_named_lookup_keep_invalid_projects(runner, sandbox, damage):
         assert state.projects_index_path().read_bytes() == before
         if "--json" in args:
             assert json.loads(result.stdout)["error"] == "mms_state_invalid"
+            assert "Project 'demo': prune aborted; index unchanged" in result.stdout
 
 
 @pytest.mark.parametrize("error_number", [errno.EACCES, errno.EPERM, errno.EIO])

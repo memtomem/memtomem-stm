@@ -84,7 +84,7 @@ def _project_payload(p: Project) -> dict:
 
 
 class _MissingIndexedProject(Exception):
-    """Only confirmed ENOENT/ENOTDIR may remove an index entry."""
+    """Confirmed missing paths or non-directory roots may remove an index entry."""
 
     def __init__(self, *, can_reinitialize: bool = False) -> None:
         self.can_reinitialize = can_reinitialize
@@ -102,22 +102,30 @@ def _load_indexed_project(entry: state.ProjectIndexEntry) -> Project:
         try:
             mode = path.stat().st_mode
         except (FileNotFoundError, NotADirectoryError) as exc:
-            # ENOTDIR at the marker can mean .mms is a regular file. Cleanup
-            # is valid, but re-init cannot repair that obstruction.
-            raise _MissingIndexedProject(
-                can_reinitialize=not directory and isinstance(exc, FileNotFoundError)
-            ) from exc
+            can_reinitialize = False
+            if not directory and isinstance(exc, FileNotFoundError):
+                # Some platforms report ENOENT for a non-directory parent.
+                # Do not offer init when .mms is an existing file or cannot
+                # be inspected. An absent parent can be created by init.
+                try:
+                    can_reinitialize = stat.S_ISDIR(marker.parent.stat().st_mode)
+                except FileNotFoundError:
+                    can_reinitialize = True
+                except OSError:
+                    pass
+            raise _MissingIndexedProject(can_reinitialize=can_reinitialize) from exc
         except OSError as exc:
             raise state.CorruptedConfig(path, f"cannot inspect ({type(exc).__name__})") from exc
         valid = stat.S_ISDIR(mode) if directory else stat.S_ISREG(mode)
         if not valid:
-            expected = "directory" if directory else "regular marker file"
-            raise state.CorruptedConfig(path, f"expected a {expected}; repair this path")
+            if directory:
+                raise _MissingIndexedProject()
+            raise state.CorruptedConfig(path, "expected a regular marker file; repair this path")
     try:
         cfg = state.load_project_config(marker)
     except (OSError, UnicodeError) as exc:
-        # Includes disappearance after stat: leave the index intact rather
-        # than classifying a failed read as permission to delete an entry.
+        # Failed reads preserve the index. Disappearance detected by the
+        # loader's is_file check also propagates as CorruptedConfig.
         raise state.CorruptedConfig(marker, f"cannot read ({type(exc).__name__})") from exc
     return Project(
         root=root, source=Source.MARKER, name=cfg.project.name, marker_path=marker, config=cfg
@@ -130,15 +138,16 @@ def _load_named_project(entry: state.ProjectIndexEntry) -> Project:
     except _MissingIndexedProject as exc:
         message = (
             f"Project '{_disp(entry.name)}' indexed at {_disp(entry.path)} "
-            "but its root or marker file is missing. "
+            "but its root is missing or not a directory, or its marker file is missing. "
         )
         if exc.can_reinitialize:
             # Reuse the CLI's native-shell quoting and unsafe-character
             # refusal, importing only on this error path to avoid a cycle.
-            from memtomem_stm.cli.proxy import _shell_join
+            from memtomem_stm.cli.proxy import _HINT_UNRENDERABLE, _shell_join
 
             command = _shell_join(["mms", "project", "init", entry.path, "--name", entry.name])
-            message += f"Recreate the marker with `{command}` (enabled MCPs will be empty), or "
+            if command != _HINT_UNRENDERABLE:
+                message += f"Recreate the marker with `{command}` (enabled MCPs will be empty), or "
         message += "run `mms project list --prune` to remove the stale registration."
         raise click.ClickException(message) from exc
 
@@ -337,7 +346,9 @@ def _emit_show(proj: Project, json_output: bool, *, cwd: Path) -> None:
 
 
 @project_group.command("list")
-@click.option("--prune", is_flag=True, help="Remove entries whose root or marker is missing.")
+@click.option(
+    "--prune", is_flag=True, help="Remove entries with missing markers or non-directory roots."
+)
 @click.option("--json", "json_output", is_flag=True, help="Machine-readable output.")
 @surface_mms_state_errors
 def list_cmd(prune: bool, json_output: bool) -> None:
@@ -359,6 +370,11 @@ def list_cmd(prune: bool, json_output: bool) -> None:
                     _load_indexed_project(entry)
                 except _MissingIndexedProject:
                     pruned.append(entry)
+                except state.CorruptedConfig as exc:
+                    raise state.CorruptedConfig(
+                        exc.path,
+                        f"Project '{_disp(entry.name)}': prune aborted; index unchanged; {exc.reason}",
+                    ) from exc
                 else:
                     kept.append(entry)
             if pruned:
