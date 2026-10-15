@@ -20,7 +20,7 @@ from collections.abc import Iterator
 from contextlib import AsyncExitStack, contextmanager, redirect_stderr, redirect_stdout
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from functools import wraps
 from typing import TYPE_CHECKING, Any, NoReturn, TextIO
@@ -70,6 +70,7 @@ from memtomem_stm.utils.redact import (
     root_cause_exc as _root_cause_exc,
     sanitize_secrets,
 )
+
 
 def utc_now_iso() -> str:
     """UTC now formatted per RFC §5 (seconds precision, trailing ``Z``)."""

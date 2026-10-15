@@ -1072,6 +1072,32 @@ def test_orchestrate_writes_metrics_only_to_hermetic_db(
     assert not (home / ".memtomem" / "proxy_metrics.db").exists()
 
 
+def test_orchestrate_metrics_count_preserved_stderr_in_the_compressed_size(
+    monkeypatch: pytest.MonkeyPatch,
+    _hermetic_hook_state: tuple[Path, Path],
+):
+    """Only stdout is compressed; stderr survives in the replacement. Its size
+    has to count on both sides, or the row records savings the call never had."""
+    from memtomem_stm.config import STMConfig
+    from memtomem_stm.proxy.metrics_store import read_compression_summary
+
+    metrics_db, _home = _hermetic_hook_state
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__METRICS_ENABLED", "1")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED", "1")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__MAX_CHARS", "2000")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__COMPRESSION__MIN_RETENTION", "0")
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd._run_hook", AsyncMock(return_value={}))
+    resp = {"stdout": _BIG_STDOUT, "stderr": "w" * 2000}
+    replaced = maybe_compress_builtin(_bash_call(resp), STMConfig().hook.compression)
+    assert isinstance(replaced, dict) and replaced["stderr"] == resp["stderr"]
+
+    asyncio.run(_orchestrate(_bash_payload(resp), ClaudeHookAdapter()))
+
+    row = read_compression_summary(metrics_db, source="hook")["by_tool"][0]
+    assert row["original_chars"] == len(_tool_response_to_text(resp))
+    assert row["compressed_chars"] == len(_tool_response_to_text(replaced))
+
+
 def test_record_hook_metrics_disabled_writes_nothing(tmp_path: Path):
     cfg = _metrics_config(tmp_path, enabled=False)
     _record_hook_metrics(_canonical(_bash_payload({"stdout": _BIG_STDOUT})), None, None, cfg)

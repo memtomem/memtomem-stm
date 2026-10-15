@@ -621,6 +621,7 @@ async def test_daemon_adapter_accepts_selected_schema_and_forwards_scope(
             "trace_id": "trace-1",
         },
         timeout=adapter._timeout,
+        fingerprint=config_fingerprint(adapter._daemon_config),
     )
 
     request.return_value = ("ok", {"ok": True, "pinned": [], "retrieved": []})

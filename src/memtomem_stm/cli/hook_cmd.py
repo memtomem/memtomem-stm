@@ -701,8 +701,6 @@ def _record_hook_metrics(
     updated: dict[str, Any] | None,
     additional_context: str | None,
     config: "STMConfig",
-    *,
-    compressed_chars_hint: int | None = None,
 ) -> None:
     """Record one native built-in tool call into ``proxy_metrics.db`` (``source='hook'``).
 
@@ -728,14 +726,9 @@ def _record_hook_metrics(
         original_chars = len(call.tool_response_text)
         if original_chars == 0:
             return  # nothing observed (empty / malformed result) — skip
-        if updated is not None:
-            compressed_chars = (
-                compressed_chars_hint
-                if compressed_chars_hint is not None and compressed_chars_hint > 0
-                else len(_tool_response_to_text(updated))
-            )
-        else:
-            compressed_chars = original_chars
+        compressed_chars = (
+            len(_tool_response_to_text(updated)) if updated is not None else original_chars
+        )
         surfaced_chars = len(additional_context) if additional_context else 0
 
         # Lazy import: keep ``mms hook --help`` and the metrics-disabled path off
@@ -847,13 +840,7 @@ async def _orchestrate(
         except Exception:
             logger.debug("surfacing failed — keeping the compression half", exc_info=True)
     additional_context = _extract_surfaced_context(surf_out)
-    _record_hook_metrics(
-        call,
-        updated,
-        additional_context,
-        config,
-        compressed_chars_hint=compression.compressed_chars,
-    )
+    _record_hook_metrics(call, updated, additional_context, config)
     return adapter.render(updated_tool_output=updated, additional_context=additional_context)
 
 

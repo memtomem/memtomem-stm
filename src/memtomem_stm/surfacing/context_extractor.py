@@ -75,9 +75,11 @@ class ContextExtractor:
                     parts.append(self._first_sentence(value, max_chars=200))
             elif (
                 key in _SEMANTIC_KEYS
-                and isinstance(value, (int, float))
+                and isinstance(value, (str, int, float))
                 and not isinstance(value, bool)
             ):
+                # Short strings (<= 2 chars) and numbers still count; containers
+                # are skipped so a nested dict or list is never stringified.
                 val_str = str(value)
                 if not self._is_identifier(val_str):
                     parts.append(val_str)
