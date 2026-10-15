@@ -5026,9 +5026,9 @@ class ProxyManager:
         resp = ProgressiveResponse(
             content=text,
             total_chars=len(text),
-            total_lines=text.count("\n") + 1,
-            content_type=ProgressiveChunker.detect_content_type(text),
-            structure_hint=ProgressiveChunker.structure_hint(text),
+            total_lines=0,
+            content_type="text",
+            structure_hint="",
             created_at=_time.monotonic(),
             ttl_seconds=cfg.ttl_seconds,
             server=server,
@@ -5738,7 +5738,12 @@ class ProxyManager:
             # miss would skew the hit-rate diagnostics.
             self.tracker.record_cache_miss()
             return await self._call_tool_inner(
-                server, tool, arguments, trace_id=trace_id, cfg_snap=cfg_snap
+                server,
+                tool,
+                arguments,
+                trace_id=trace_id,
+                cfg_snap=cfg_snap,
+                config_fp=config_fp,
             ), False
 
     def _server_cfg(self, conn: UpstreamConnection, cfg_snap: ProxyConfig) -> UpstreamServerConfig:
@@ -6658,7 +6663,10 @@ class ProxyManager:
                         # be meaningful.  Minimum 3 headings — below that,
                         # truncate loses little structural information.
                         _MIN_HEADINGS_FOR_HYBRID = 3
-                        if not progressive_fallback:
+                        if (
+                            not progressive_fallback
+                            and effective_compression != CompressionStrategy.HYBRID
+                        ):
                             # Canonical heading count (shared with
                             # auto_select_strategy) — the old ``count("\n#")``
                             # missed a heading at offset 0 and over-counted any
@@ -7423,6 +7431,7 @@ class ProxyManager:
         *,
         trace_id: str | None = None,
         cfg_snap: ProxyConfig,
+        config_fp: str | None = None,
     ) -> str | list | CallToolResult:
         # Public entry point ``call_tool`` generates the trace_id and passes
         # it in so it can match the enclosing Langfuse span. Direct callers
@@ -7454,7 +7463,8 @@ class ProxyManager:
         # Cache-key fingerprint of the resolved compression settings, paired
         # with ``context_query`` everywhere a key is derived below (store +
         # disabled-cache invalidations).
-        config_fp = self._cache_key_fingerprint(server, tool, cfg_snap=cfg_snap)
+        if config_fp is None:
+            config_fp = self._cache_key_fingerprint(server, tool, cfg_snap=cfg_snap)
 
         # Cache lookup, hit path, and miss accounting are all owned by
         # ``_call_tool_guarded``: a hit returns there, an ELIGIBLE miss is
@@ -7720,6 +7730,10 @@ class ProxyManager:
                     original_chars=original_chars,
                     compressed_chars=delivered_chars,
                     cleaned_chars=cleaned_chars,
+                    original_tokens=max(1, int(original_chars / 3.5)) if original_chars > 0 else 0,
+                    compressed_tokens=(
+                        max(1, int(delivered_chars / 3.5)) if delivered_chars > 0 else 0
+                    ),
                     clean_ms=_clean_ms,
                     trace_id=trace_id,
                     compression_strategy=METADATA_BYPASS_STRATEGY,

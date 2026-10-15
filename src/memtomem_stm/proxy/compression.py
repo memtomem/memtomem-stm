@@ -563,19 +563,29 @@ class TruncateCompressor(_PlainTextRetention):
         # ── Phase 1: Minimum representation for EVERY section ──
         # Heading + first meaningful content line (guarantees tail section visibility)
         minimums: list[str] = []  # one per section
+        consumed_counts: list[int] = []  # index into body.split("\n") after kept lines
         min_used = 0
         for i, (title, body) in enumerate(sections):
-            lines = body.split("\n")
+            raw_lines = body.split("\n")
             # Skip leading empty lines (match position may include \n before heading)
-            while lines and not lines[0].strip():
-                lines = lines[1:]
-            kept = [lines[0]] if lines else [title]  # heading
-            for line in lines[1:]:
-                if line.strip() and not line.strip().startswith("#"):
-                    kept.append(line)
-                    break
+            start_idx = 0
+            while start_idx < len(raw_lines) and not raw_lines[start_idx].strip():
+                start_idx += 1
+            if start_idx < len(raw_lines):
+                kept = [raw_lines[start_idx]]  # heading
+                consumed = start_idx + 1
+                for idx in range(start_idx + 1, len(raw_lines)):
+                    line = raw_lines[idx]
+                    if line.strip() and not line.strip().startswith("#"):
+                        kept.append(line)
+                        consumed = idx + 1
+                        break
+            else:
+                kept = [title]
+                consumed = len(raw_lines)
             snippet = "\n".join(kept)
             minimums.append(snippet)
+            consumed_counts.append(consumed)
             min_used += len(snippet) + 2
 
         if preamble:
@@ -595,7 +605,13 @@ class TruncateCompressor(_PlainTextRetention):
             if scores is not None:
                 # ── Query-aware: allocate budget proportional to relevance ──
                 self._enrich_by_relevance(
-                    sections, minimums, enriched, scores, enrich_budget, summary_idx
+                    sections,
+                    minimums,
+                    enriched,
+                    scores,
+                    enrich_budget,
+                    summary_idx,
+                    consumed_counts,
                 )
             else:
                 # ── Original: enrich sections top-down ──
@@ -611,10 +627,7 @@ class TruncateCompressor(_PlainTextRetention):
                     else:
                         lines = body.split("\n")
                         kept = enriched[i].split("\n")
-                        kept_set = set(kept)
-                        for line in lines:
-                            if line in kept_set:
-                                continue
+                        for line in lines[consumed_counts[i] :]:
                             if len(line) + 1 > enrich_budget:
                                 break
                             kept.append(line)
@@ -664,6 +677,7 @@ class TruncateCompressor(_PlainTextRetention):
         scores: list[float],
         budget: int,
         summary_idx: int,
+        consumed_counts: list[int] | None = None,
     ) -> None:
         """Distribute enrichment budget proportional to relevance scores.
 
@@ -716,11 +730,13 @@ class TruncateCompressor(_PlainTextRetention):
                 # Partial: add lines until allocation exhausted
                 lines = body.split("\n")
                 kept = enriched[i].split("\n")
-                kept_set = set(kept)
                 alloc_left = allocations[i]
-                for line in lines:
-                    if line in kept_set:
-                        continue
+                start_offset = (
+                    consumed_counts[i]
+                    if consumed_counts is not None and i < len(consumed_counts)
+                    else len(kept)
+                )
+                for line in lines[start_offset:]:
                     if len(line) + 1 > alloc_left:
                         break
                     kept.append(line)

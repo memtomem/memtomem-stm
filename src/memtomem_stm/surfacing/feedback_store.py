@@ -2103,6 +2103,7 @@ class FeedbackStore:
             rows = db.execute(
                 "SELECT e.tool, COUNT(*) FROM surfacing_feedback f "
                 "JOIN surfacing_events e ON f.surfacing_id = e.id "
+                "WHERE (e.score_scale IS NULL OR e.score_scale = 'rrf') "
                 "GROUP BY e.tool"
             ).fetchall()
             return {tool: count for tool, count in rows}
