@@ -13,6 +13,9 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- security: require MCP SDK 2.2.0 or newer to address CVE-2026-59951
+  (unbounded StreamableHTTP session accumulation), and refresh the lockfile (#1156).
+
 - cli: project pruning and named lookup now share explicit path and marker
   validation. Missing-marker recovery preserves the indexed name and explains
   that re-init resets enabled MCPs. **Behavior change**: `mms project list
