@@ -1040,3 +1040,19 @@ async def test_overlapping_llm_calls_keep_their_own_fallback_reason(slow_fails):
         assert slow.fallback_reason is None
         assert len(fast.text) <= 100
         assert fast.fallback_reason == "llm_error"
+
+
+def test_section_aware_truncate_preserves_closing_code_fences():
+    """Duplicate lines like closing ``` fences must not be stripped as
+    'already kept' when the opening fence is also ```."""
+    comp = TruncateCompressor()
+    doc = (
+        "# Guide\n"
+        "```\n"
+        "line_1 = 1\n"
+        "```\n" + ("filler line for budget pressure\n" * 40) + "## Details\n"
+        "More details here.\n"
+    )
+    out = comp.compress(doc, max_chars=250)
+    # Both opening and closing fences of the first block should survive when budget allows
+    assert out.count("```") >= 2

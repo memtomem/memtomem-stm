@@ -24,6 +24,8 @@ class SurfacingCache:
         self._cache: dict[str, tuple[float, list[Any]]] = {}
 
     def get(self, query: str) -> list[Any] | None:
+        if self._ttl <= 0:
+            return None
         key = self._hash(query)
         entry = self._cache.get(key)
         if entry is None:
@@ -35,6 +37,8 @@ class SurfacingCache:
         return results
 
     def set(self, query: str, results: list[Any]) -> None:
+        if self._ttl <= 0:
+            return
         key = self._hash(query)
         # Re-insert to move an existing key to the tail (preserves FIFO order).
         if key in self._cache:

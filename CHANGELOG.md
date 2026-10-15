@@ -13,6 +13,21 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- compression: section-aware truncation in `TruncateCompressor` skipped
+  every later line equal to one it had already kept, so a section lost its
+  closing code fence (` ``` `) and any repeated line. It now resumes after
+  the lines it kept, in document order. Metadata-bypass calls also add
+  estimated token counts to the session's token totals instead of 0, and the
+  ratio-guard fallback no longer re-runs hybrid compression
+  when hybrid was the strategy that just failed. **Behavior change**:
+  truncated sections keep duplicate lines and closing fences (#1142).
+- surfacing: the "auto-tune ready" / "need N more" labels in
+  `stm_surfacing_stats` counted feedback on every score scale, while the
+  tuner only uses `rrf` (and unscaled) events. They now apply the same
+  score-scale filter. A `cache_ttl_seconds` of 0 or less no longer stores
+  entries in the surfacing cache (lookups already missed). **Behavior
+  change**: the labels can show fewer rated events on stores with non-`rrf`
+  feedback (#1142).
 - privacy: the email rule in the sensitive-content detector slowed down
   quadratically on long unbroken runs containing dots: 64 KB of `a.a.a.…` took
   about 2 s. One such response could stall any scan that uses the default
