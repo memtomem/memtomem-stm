@@ -32,6 +32,7 @@ from pathlib import Path
 import tomli_w
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from memtomem_stm.proxy.config import validation_error_summary
 from memtomem_stm.utils.fileio import atomic_write_text
 from memtomem_stm.utils.locking import open_lock_fd, release_lock, try_lock
 
@@ -242,7 +243,7 @@ def write_lock(
 class RegistryServer(BaseModel):
     """A single MCP server definition stored in ``registry.toml``."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     command: str
     args: list[str] = Field(default_factory=list)
@@ -253,7 +254,7 @@ class RegistryServer(BaseModel):
 class RegistryConfig(BaseModel):
     """Top-level model for ``~/.mms/registry.toml``."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     schema_version: int = SCHEMA_VERSION
     servers: dict[str, RegistryServer] = Field(default_factory=dict)
@@ -262,7 +263,7 @@ class RegistryConfig(BaseModel):
 class ProjectIndexEntry(BaseModel):
     """One row in ``projects.toml`` — auto-managed, do not hand-edit."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     name: str
     path: str
@@ -272,26 +273,26 @@ class ProjectIndexEntry(BaseModel):
 class ProjectsIndex(BaseModel):
     """Top-level model for ``~/.mms/projects.toml``."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     schema_version: int = SCHEMA_VERSION
     projects: list[ProjectIndexEntry] = Field(default_factory=list)
 
 
 class ProjectMeta(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
     name: str
 
 
 class ProjectMcp(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
     enabled: list[str] = Field(default_factory=list)
 
 
 class ProjectConfig(BaseModel):
     """Top-level model for ``<project>/.mms/project.toml``."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     schema_version: int = SCHEMA_VERSION
     project: ProjectMeta
@@ -314,7 +315,7 @@ class ImportStateEntry(BaseModel):
     on load instead of a confusing comparison failure later.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     drift_hash: str = Field(pattern=r"^sha256:[0-9a-f]{16}$")
     drift_hash_version: int = Field(ge=1)
@@ -325,7 +326,7 @@ class ImportStateEntry(BaseModel):
 class ImportState(BaseModel):
     """Top-level model for ``~/.mms/import_state.toml`` (W2 sidecar)."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     schema_version: int = IMPORT_STATE_SCHEMA_VERSION
     entries: dict[str, ImportStateEntry] = Field(default_factory=dict)
@@ -364,7 +365,7 @@ def load_registry(path: Path | None = None) -> RegistryConfig:
     try:
         return RegistryConfig.model_validate(raw)
     except ValidationError as e:
-        raise CorruptedConfig(p, f"schema validation: {e}") from e
+        raise CorruptedConfig(p, f"schema validation: {validation_error_summary(e)}") from e
 
 
 def load_projects_index(path: Path | None = None) -> ProjectsIndex:
@@ -377,7 +378,7 @@ def load_projects_index(path: Path | None = None) -> ProjectsIndex:
     try:
         return ProjectsIndex.model_validate(raw)
     except ValidationError as e:
-        raise CorruptedConfig(p, f"schema validation: {e}") from e
+        raise CorruptedConfig(p, f"schema validation: {validation_error_summary(e)}") from e
 
 
 def load_project_config(path: Path) -> ProjectConfig:
@@ -389,7 +390,7 @@ def load_project_config(path: Path) -> ProjectConfig:
     try:
         return ProjectConfig.model_validate(raw)
     except ValidationError as e:
-        raise CorruptedConfig(path, f"schema validation: {e}") from e
+        raise CorruptedConfig(path, f"schema validation: {validation_error_summary(e)}") from e
 
 
 def load_import_state(path: Path | None = None) -> ImportState:
@@ -410,7 +411,7 @@ def load_import_state(path: Path | None = None) -> ImportState:
     try:
         return ImportState.model_validate(raw)
     except ValidationError as e:
-        raise CorruptedConfig(p, f"schema validation: {e}") from e
+        raise CorruptedConfig(p, f"schema validation: {validation_error_summary(e)}") from e
 
 
 # ---------------------------------------------------------------------------

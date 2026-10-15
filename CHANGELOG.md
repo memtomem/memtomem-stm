@@ -13,6 +13,16 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- privacy: the email rule in the sensitive-content detector slowed down
+  quadratically on long unbroken runs containing dots: 64 KB of `a.a.a.…` took
+  about 2 s. One such response could stall any scan that uses the default
+  patterns, such as the response cache's privacy gate. The rule is now linear
+  (256 KB in a few milliseconds). **Behavior change**: the rule also matches
+  a local part with no word boundary in it (`--@example.com`) or one right
+  after a non-ASCII letter (`jöe@bar.com`), so those are no longer cached.
+  The response cache's privacy fingerprint covers the pattern text, so the
+  first start after upgrading runs the cache's one-time privacy repair sweep,
+  which takes time proportional to the cache's size (#1149).
 - cli: a `--json` run whose config file could not be read or parsed wrote
   nothing to stdout, even though `--json` promises one JSON document for
   operational failures. The human error went to stderr and the exit code was
@@ -46,6 +56,21 @@ changes inline only. See the deprecation policy in
   outside whose rollback also fails looks the same, but it now names the
   failed start. Surfacing was already disabled in either case; only what is
   reported changes (#1136).
+
+### Security
+
+- cli: `mms gateway status` printed the first validation message for an
+  invalid config, and `mms gateway explain` printed the whole pydantic error.
+  Both can quote the rejected values. They now print each error's location
+  and type, like the other CLI config reads. **Behavior change**: the error
+  reads `invalid proxy config: upstream_servers.x (value_error)` instead of,
+  for example, `Value error, reconnect_delay_seconds (7777.0) must be <=
+  max_reconnect_delay_seconds (5.0)` (#1141).
+- surfacing: the surface webhook payload's `query` was always the raw
+  extracted query. It now uses the same form as the persisted
+  `surfacing_events.query`. **Behavior change**: webhook subscribers receive
+  a `sha256:` digest instead of the query when `persist_query_text` is
+  `false`, and whenever the query matches a sensitive pattern (#1141).
 
 ## [0.6.3] — 2026-10-12
 

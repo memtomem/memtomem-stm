@@ -145,8 +145,16 @@ def test_references_are_the_reviewed_set():
     assert dict(refs) == {
         ("cli/proxy.py", "_runtime_proxy_read"): 1,
         ("cli/proxy.py", "_probe_failure_message"): 1,
+        # ``mms gateway``: the same ProxyConfig the config-load path validates.
+        ("cli/proxy.py", "gateway_status"): 1,
+        ("cli/proxy.py", "gateway_explain"): 1,
         ("cli/proxy.py", "_surfacing_bootstrap_error"): 1,
         ("cli/proxy.py", "doctor"): 1,
+        # ``~/.mms`` state: keys are server, env-variable and import-entry names.
+        ("mms/state.py", "load_registry"): 1,
+        ("mms/state.py", "load_projects_index"): 1,
+        ("mms/state.py", "load_project_config"): 1,
+        ("mms/state.py", "load_import_state"): 1,
         ("proxy/config.py", "config_load_error_summary"): 1,
         ("server.py", "stm_admin"): 1,
     }

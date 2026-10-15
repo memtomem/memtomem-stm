@@ -1220,6 +1220,35 @@ def test_gateway_mode_preview_then_atomic_apply(tmp_path, monkeypatch):
     assert saved["toolgraph"]["query_profile"] == "review"
 
 
+@pytest.mark.parametrize("argv", [["gateway", "status"], ["gateway", "explain", "x__echo"]])
+def test_gateway_invalid_config_error_omits_configured_values(tmp_path, monkeypatch, argv):
+    # A model validator's rendered ``msg`` interpolates the rejected values;
+    # both gateway commands must print ``loc (type)`` instead.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config = tmp_path / "proxy.json"
+    config.write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "upstream_servers": {
+                    "x": {
+                        "command": "echo",
+                        "prefix": "x",
+                        "reconnect_delay_seconds": 7777,
+                        "max_reconnect_delay_seconds": 5,
+                    }
+                },
+            }
+        )
+    )
+
+    result = CliRunner().invoke(cli, [*argv, "--config", str(config)])
+
+    assert result.exit_code != 0
+    assert "invalid proxy config: upstream_servers.x (value_error)" in result.output
+    assert "7777" not in result.output
+
+
 def test_gateway_mode_preview_does_not_mutate_loaded_config(monkeypatch):
     data = {"enabled": True, "upstream_servers": {}}
     monkeypatch.setattr(proxy_cli, "_load", lambda _path: data)

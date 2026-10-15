@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 
 import pytest
 
@@ -348,6 +349,50 @@ class TestCredentialPiiSplit:
     def test_email_is_pii_not_credential(self, sample: str) -> None:
         assert privacy.contains_sensitive_content(sample, privacy.PII_PATTERNS) is True
         assert privacy.contains_sensitive_content(sample, privacy.CREDENTIAL_PATTERNS) is False
+
+    @pytest.mark.parametrize(
+        ("sample", "expected"),
+        [
+            # Found by the old ``\b``-anchored rule and still found.
+            ("Author: Jane Doe <jane@example.com>", True),
+            ("%%foo@bar.com", True),
+            (".foo@bar.com", True),
+            ("mailto:joe@bar.com", True),
+            ("a@b.com,c@d.org", True),
+            ("_x_@y.io", True),
+            ("git@github.com:org/repo.git", True),
+            # New: no word boundary in the local part, or a non-ASCII letter
+            # right before it. The old rule missed these.
+            ("--@example.com", True),
+            ("..@example.com", True),
+            ("jöe@bar.com", True),
+            # Not addresses, before or after.
+            ("user@localhost", False),
+            ("user@host.123", False),
+            ("@scope/pkg@1.2.3", False),
+            ("https://x.com/@joe.bar", False),
+            ("a." * 50 + "@b", False),
+        ],
+    )
+    def test_email_rule_verdicts(self, sample: str, expected: bool) -> None:
+        assert privacy.contains_sensitive_content(sample, privacy.PII_PATTERNS) is expected
+
+    @pytest.mark.parametrize(
+        "sample",
+        [
+            "a." * 131_072,  # one 256 KB local-part run, no "@"
+            "a." * 131_072 + "@b",  # the run ends at "@" with no valid domain
+            "a@" + "a." * 131_072,  # a 256 KB domain run with no TLD
+            "x@" + "aaaa1." * 43_690,  # TLD candidates that each fail on a digit
+        ],
+        ids=["local-run", "local-run-bad-domain", "domain-run", "domain-digit-tlds"],
+    )
+    def test_email_rule_is_linear_on_long_runs(self, sample: str) -> None:
+        # The ``\b``-anchored rule took about 2 s on 64 KB of ``a.`` and grew
+        # quadratically; this rule scans 256 KB in a few milliseconds.
+        started = time.perf_counter()
+        privacy.contains_sensitive_content(sample, privacy.PII_PATTERNS)
+        assert time.perf_counter() - started < 0.5
 
     @pytest.mark.parametrize(
         "sample",

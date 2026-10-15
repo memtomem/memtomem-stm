@@ -221,8 +221,9 @@ def test_json_run_on_invalid_json_emits_the_failure_document(tmp_path, action, a
     [
         ("[1]", "top-level must be a JSON object, got list"),
         ('{"upstream_servers": []}', "'upstream_servers' must be an object, got list"),
+        ('{"upstream_servers": null}', "'upstream_servers' must be an object, got NoneType"),
     ],
-    ids=["non-object-root", "non-object-upstream-servers"],
+    ids=["non-object-root", "non-object-upstream-servers", "null-upstream-servers"],
 )
 @pytest.mark.parametrize("command", ["status", "remove"])
 def test_json_run_on_a_wrong_shape_emits_config_invalid(tmp_path, content, expected, command):
@@ -235,6 +236,38 @@ def test_json_run_on_a_wrong_shape_emits_config_invalid(tmp_path, content, expec
     document = _failure_document(result, command, "config_invalid", path)
     assert document["message"] == f"{path.resolve()} {expected}"
     assert expected in result.stderr
+
+
+# Nested past the interpreter's recursion limit, ``json.loads`` raises
+# ``RecursionError`` rather than a ``ValueError``.
+DEEP = "[" * 200_000 + "]" * 200_000
+
+
+@pytest.mark.parametrize("command", ["status", "remove"])
+def test_json_run_on_a_too_deep_file_emits_config_invalid(tmp_path, command):
+    path = tmp_path / "proxy.json"
+    path.write_text(DEEP)
+    argv = ["status", "--json"] if command == "status" else ["remove", "fs", "--yes", "--json"]
+
+    result = CliRunner().invoke(cli, [*argv, "--config", str(path)])
+
+    document = _failure_document(result, command, "config_invalid", path)
+    assert document["message"] == f"Failed to parse {path.resolve()}: RecursionError"
+
+
+def test_json_setup_run_on_a_too_deep_file_still_emits_its_document(tmp_path):
+    """The setup commands' ``--json`` wrapper re-reads the file for the
+    document's ``servers`` list; that best-effort read must not end the run
+    in a traceback with no document."""
+    path = tmp_path / "proxy.json"
+    path.write_text(DEEP)
+
+    result = CliRunner().invoke(cli, ["register", "--json", "--config", str(path)])
+
+    assert result.exception is None or isinstance(result.exception, SystemExit), result.output
+    document = json.loads(result.stdout)
+    assert document["action"] == "register"
+    assert document["servers"] == []
 
 
 @pytest.mark.parametrize("command", ["status", "remove"])
