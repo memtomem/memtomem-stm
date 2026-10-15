@@ -15,7 +15,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self, Union, get_args, get_origin
 
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from pydantic.fields import FieldInfo
 
 from memtomem_stm.proxy.token_estimate import MAX_CHAR_BUDGET, tokens_to_chars
@@ -482,8 +482,9 @@ def validation_error_summary(exc: ValidationError) -> str:
     Both ``input_value=`` (what ``str(exc)`` embeds) and the rendered ``msg``
     can carry the value that failed validation, so neither is used. Callers:
     the config-load path below and ``stm_admin``'s action-parameter errors, which
-    reach an MCP client, and the CLI's config reads and upstream probes
-    (``health``, ``doctor``, ``add --validate``, ``init``).
+    reach an MCP client, the CLI's config reads and upstream probes
+    (``health``, ``doctor``, ``add --validate``, ``init``), and the ``~/.mms``
+    state loaders, whose ``CorruptedConfig`` the ``mms`` commands print.
 
     A location is not only schema: pydantic puts the dict key of the failing
     entry in it. For these callers the keys are config key names (such as
@@ -1524,6 +1525,8 @@ class UpstreamOrigin(BaseModel):
     redacted serializer in ``cli/proxy.py``) rather than dumping it.
     """
 
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     schema_version: int = 1
     source: OriginSource
     duplicates: list[OriginSource] = []
@@ -1532,6 +1535,8 @@ class UpstreamOrigin(BaseModel):
 
 
 class UpstreamServerConfig(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     command: str = ""
     args: list[str] = []
     env: dict[str, str] | None = None
@@ -1885,6 +1890,8 @@ class ToolgraphConfig(BaseModel):
     contract failures (``on_protocol_error``).
     """
 
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     enabled: bool = False
     source: Literal["stdio", "bundle"] = "stdio"
     """Policy source. ``stdio`` preserves the one-shot MCP consult; ``bundle``
@@ -2211,6 +2218,8 @@ class ConfigLoadResult:
 
 
 class ProxyConfig(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     enabled: bool = False
     config_path: Path = Path("~/.memtomem/stm_proxy.json")
     upstream_servers: dict[str, UpstreamServerConfig] = {}

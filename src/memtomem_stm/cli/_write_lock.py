@@ -18,6 +18,7 @@ from typing import Any, TypeVar
 import click
 
 from memtomem_stm.cli._display import _disp
+from memtomem_stm.cli._mms_errors import exit_on_state_error
 from memtomem_stm.mms import state
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -54,8 +55,11 @@ def with_write_lock(f: F) -> F:
     (``is_plan=True``) skip the lock: they never write, and the mutating
     side's atomic per-file writes already keep readers consistent.
 
-    A timed-out acquisition surfaces as :class:`click.ClickException` —
-    "Error: <reason>", exit code 1 — instead of a traceback.
+    A timed-out acquisition surfaces as "Error: <reason>", exit code 1,
+    instead of a traceback — or, when the command's ``--json`` flag is set,
+    as the ``mms_lock_timeout`` failure document. The lock is taken before
+    the callback runs, so ``surface_mms_state_errors`` on the callback never
+    sees this timeout; both render through ``exit_on_state_error``.
 
     ``functools.wraps`` keeps the callback's docstring visible to Click's
     help renderer.
@@ -68,7 +72,7 @@ def with_write_lock(f: F) -> F:
             with state.write_lock(enabled=enabled):
                 return f(*args, **kwargs)
         except state.WriteLockTimeout as exc:
-            raise click.ClickException(_disp(str(exc))) from exc
+            exit_on_state_error(exc, kwargs, fallback_action=f.__name__)
 
     return wrapper  # type: ignore[return-value]
 

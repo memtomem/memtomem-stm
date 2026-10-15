@@ -96,11 +96,24 @@ def replay_command(
         raise click.UsageError("--no-telemetry cannot be combined with --log")
 
     cfg_path = Path(config_path)
-    cfg = ProxyConfig.load_from_file(
+    loaded = ProxyConfig.load_from_file_with_status(
         cfg_path,
         env_overrides=collect_proxy_env_overrides(),
         missing_ok=True,
-    ) or ProxyConfig(config_path=cfg_path)
+        # The error below is the report; the loader's own "using defaults"
+        # warning would contradict it, since replay stops instead.
+        log_errors=False,
+    )
+    if loaded.error is not None:
+        # The summary carries config key names (an upstream's name), so it is
+        # escaped like the path.
+        raise click.ClickException(f"cannot read {_disp(str(cfg_path))}: {_disp(loaded.error)}")
+    if loaded.env_error is not None:
+        raise click.ClickException(
+            f"the MEMTOMEM_STM_PROXY environment is invalid: {_disp(loaded.env_error)}"
+        )
+    assert loaded.config is not None
+    cfg = loaded.config
     telemetry_path: Path | None
     if no_telemetry:
         telemetry_path = None

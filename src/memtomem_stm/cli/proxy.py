@@ -347,7 +347,9 @@ def _setup_json_result(action: str):  # noqa: ANN201
                     servers = data.get("upstream_servers", {}) if isinstance(data, dict) else {}
                     if isinstance(servers, dict):
                         server_names = sorted(str(name) for name in servers)
-                except (OSError, json.JSONDecodeError, ValueError):
+                except (OSError, ValueError, RecursionError):
+                    # Best-effort detail for the failure document; the
+                    # command's own load already reported why (``_load``).
                     pass
             payload = {
                 "action": action,
@@ -461,12 +463,13 @@ def _load(config_path: Path, *, json_action: str | None = None) -> dict[str, Any
     text = _read_config_text(resolved, json_action=json_action)
     try:
         data = json.loads(text)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         _config_file_failure(resolved, exc, json_action=json_action)
     # Structural guard: the rest of the CLI assumes top-level dict with a dict
     # `upstream_servers`. Without this, a valid-but-wrong-shape JSON (e.g. a
-    # list or a string, or `upstream_servers: "oops"`) crashes downstream with
-    # an AttributeError traceback instead of a clean user-facing error.
+    # list or a string, or `upstream_servers: "oops"` / `null`) crashes
+    # downstream with an AttributeError traceback instead of a clean
+    # user-facing error.
     if not isinstance(data, dict):
         _config_shape_failure(
             resolved,
@@ -474,7 +477,7 @@ def _load(config_path: Path, *, json_action: str | None = None) -> dict[str, Any
             json_action=json_action,
         )
     servers = data.get("upstream_servers")
-    if servers is not None and not isinstance(servers, dict):
+    if "upstream_servers" in data and not isinstance(servers, dict):
         _config_shape_failure(
             resolved,
             f"{resolved} 'upstream_servers' must be an object, got {type(servers).__name__}.",
@@ -1649,7 +1652,7 @@ def gateway_status(config_path: str | None, *, as_json: bool = False) -> None:
     config_path = resolve_cli_config_path(config_path).path
     from pydantic import ValidationError
 
-    from memtomem_stm.proxy.config import ProxyConfig
+    from memtomem_stm.proxy.config import ProxyConfig, validation_error_summary
     from memtomem_stm.proxy.toolgraph_bundle import PolicyBundleError, load_policy_bundle
 
     path = Path(config_path)
@@ -1658,7 +1661,9 @@ def gateway_status(config_path: str | None, *, as_json: bool = False) -> None:
             _load(path, json_action="gateway-status" if as_json else None)
         )
     except ValidationError as exc:
-        raise click.ClickException(f"invalid proxy config: {exc.errors()[0]['msg']}") from exc
+        raise click.ClickException(
+            f"invalid proxy config: {validation_error_summary(exc)}"
+        ) from exc
     tg = config.toolgraph
     result: dict[str, Any] = {
         "enabled": tg.enabled,
@@ -1723,7 +1728,7 @@ def gateway_explain(tool_key: str, config_path: str | None, *, as_json: bool = F
     config_path = resolve_cli_config_path(config_path).path
     from pydantic import ValidationError
 
-    from memtomem_stm.proxy.config import ProxyConfig
+    from memtomem_stm.proxy.config import ProxyConfig, validation_error_summary
     from memtomem_stm.proxy.toolgraph_bundle import PolicyBundleError, load_policy_bundle
 
     try:
@@ -1741,7 +1746,11 @@ def gateway_explain(tool_key: str, config_path: str | None, *, as_json: bool = F
             expected_agent=config.toolgraph.agent_id,
             expected_profile=config.exposure.profile.value,
         )
-    except (ValidationError, PolicyBundleError) as exc:
+    except ValidationError as exc:
+        raise click.ClickException(
+            f"invalid proxy config: {validation_error_summary(exc)}"
+        ) from exc
+    except PolicyBundleError as exc:
         raise click.ClickException(str(exc)) from exc
     decision = snapshot.decisions.get(tool_key)
     if decision is None:
@@ -4159,9 +4168,17 @@ def _desktop_json_remove_entry(name: str) -> tuple[bool, str | None]:
     if not isinstance(servers, dict) or name not in servers:
         return (False, f"'{name}' not registered in {path}")
     del servers[name]
+    # Keep the host's own mode, as the restore counterpart
+    # (``_json_config_set_entry``) does; removing an entry is not a reason
+    # to change who can read the file.
+    mode: int | None
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        mode = None
     try:
         atomic_write_text(
-            path, _json_dumps(data, indent=2, ensure_ascii=False) + "\n", durable=True
+            path, _json_dumps(data, indent=2, ensure_ascii=False) + "\n", mode=mode, durable=True
         )
     except OSError as exc:
         return (False, f"write error: {exc}")
@@ -7850,7 +7867,6 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
     ``health``/``doctor`` render ``error`` verbatim.
     """
     import httpx2
-
     from mcp import ClientSession
     from mcp.client.sse import sse_client
     from mcp.client.stdio import StdioServerParameters, stdio_client
@@ -8098,7 +8114,6 @@ async def _probe_ltm_mcp_server(
     ``create_subprocess_exec(stderr=...)``, which requires ``fileno``).
     """
     import httpx2
-
     from mcp import ClientSession
     from mcp.client.sse import sse_client
     from mcp.client.stdio import StdioServerParameters, stdio_client
