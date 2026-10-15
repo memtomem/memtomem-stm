@@ -1431,9 +1431,10 @@ class TestAnthropicMalformedBlockIsNotIgnorable:
             raw = await extractor._anthropic("text", "prompt")
         assert [f.content for f in _parse_facts_json(raw, max_facts=10)] == ["kept"]
 
-    async def test_custom_system_prompt_with_json_braces_does_not_keyerror(self):
-        """Custom system_prompt containing literal JSON braces like
-        ``{"content": "..."}`` alongside ``{max_facts}`` must not raise KeyError."""
+    async def test_custom_prompt_with_unescaped_braces_falls_back_to_heuristic(self, caplog):
+        """The prompt is a ``str.format`` template: an unescaped ``{"content": ...}``
+        raises at formatting, so extraction logs it and uses the heuristic instead
+        of sending a half-rendered prompt. Escaped ``{{...}}`` is the supported form."""
         llm_cfg = LLMCompressorConfig(
             provider=LLMProvider.OLLAMA,
             model="qwen3:4b",
@@ -1447,11 +1448,23 @@ class TestAnthropicMalformedBlockIsNotIgnorable:
             max_facts=7,
         )
         extractor = FactExtractor(cfg)
+        post = AsyncMock()
+        with patch.object(extractor._client, "post", post), caplog.at_level("WARNING"):
+            await extractor.extract("x" * 100, server="s", tool="t")
+        post.assert_not_awaited()
+        assert "falling back to heuristic: KeyError" in caplog.text
+
+    async def test_default_prompt_is_sent_with_single_braces(self):
+        # The default prompt escapes its JSON example as ``{{...}}`` for
+        # str.format; a substitution that skips format sends the model
+        # ``[{{"content": ...}}]`` instead.
+        cfg = ExtractionConfig(enabled=True, strategy=ExtractionStrategy.LLM, min_response_chars=10)
+        extractor = FactExtractor(cfg)
         payload = {"message": {"role": "assistant", "content": '[{"content": "ok"}]'}}
         with patch.object(
             extractor._client, "post", AsyncMock(return_value=_mock_http_response(payload))
         ) as post_mock:
-            facts = await extractor.extract("x" * 100, server="s", tool="t")
-        assert [f.content for f in facts] == ["ok"]
-        sent_json = post_mock.call_args.kwargs["json"]
-        assert 'at most 7 items shaped like {"content": "x"}' in sent_json["messages"][0]["content"]
+            await extractor.extract("x" * 100, server="s", tool="t")
+        sent = post_mock.call_args.kwargs["json"]["messages"][0]["content"]
+        assert '[{"content": "...", ' in sent
+        assert "{{" not in sent and "}}" not in sent
