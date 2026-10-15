@@ -13,6 +13,12 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- cli: project pruning and named lookup now share explicit path and marker
+  validation. Missing-marker recovery preserves the indexed name and explains
+  that re-init resets enabled MCPs. **Behavior change**: `mms project list
+  --prune` also removes missing-marker registrations; inaccessible or invalid
+  projects abort pruning without changing the index (#1154).
+
 - compression: section-aware truncation in `TruncateCompressor` skipped
   every later line equal to one it had already kept, so a section lost its
   closing code fence (` ``` `) and any repeated line. It now resumes after

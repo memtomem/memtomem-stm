@@ -12,6 +12,7 @@ The W1 contract for ``enable`` against an empty registry is a
 from __future__ import annotations
 
 import json as _json
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +83,66 @@ def _project_payload(p: Project) -> dict:
     return payload
 
 
+class _MissingIndexedProject(Exception):
+    """Only confirmed ENOENT/ENOTDIR may remove an index entry."""
+
+    def __init__(self, *, can_reinitialize: bool = False) -> None:
+        self.can_reinitialize = can_reinitialize
+
+
+def _load_indexed_project(entry: state.ProjectIndexEntry) -> Project:
+    """Shared classification for named lookup and prune, independent of
+    pathlib's version-dependent boolean predicates. Prune validates all kept
+    markers before saving anything, so an unreadable/invalid entry aborts the
+    operation without partially rewriting the index.
+    """
+    root = Path(entry.path)
+    marker = root / state.PROJECT_MARKER_RELPATH
+    for path, directory in ((root, True), (marker, False)):
+        try:
+            mode = path.stat().st_mode
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            # ENOTDIR at the marker can mean .mms is a regular file. Cleanup
+            # is valid, but re-init cannot repair that obstruction.
+            raise _MissingIndexedProject(
+                can_reinitialize=not directory and isinstance(exc, FileNotFoundError)
+            ) from exc
+        except OSError as exc:
+            raise state.CorruptedConfig(path, f"cannot inspect ({type(exc).__name__})") from exc
+        valid = stat.S_ISDIR(mode) if directory else stat.S_ISREG(mode)
+        if not valid:
+            expected = "directory" if directory else "regular marker file"
+            raise state.CorruptedConfig(path, f"expected a {expected}; repair this path")
+    try:
+        cfg = state.load_project_config(marker)
+    except (OSError, UnicodeError) as exc:
+        # Includes disappearance after stat: leave the index intact rather
+        # than classifying a failed read as permission to delete an entry.
+        raise state.CorruptedConfig(marker, f"cannot read ({type(exc).__name__})") from exc
+    return Project(
+        root=root, source=Source.MARKER, name=cfg.project.name, marker_path=marker, config=cfg
+    )
+
+
+def _load_named_project(entry: state.ProjectIndexEntry) -> Project:
+    try:
+        return _load_indexed_project(entry)
+    except _MissingIndexedProject as exc:
+        message = (
+            f"Project '{_disp(entry.name)}' indexed at {_disp(entry.path)} "
+            "but its root or marker file is missing. "
+        )
+        if exc.can_reinitialize:
+            # Reuse the CLI's native-shell quoting and unsafe-character
+            # refusal, importing only on this error path to avoid a cycle.
+            from memtomem_stm.cli.proxy import _shell_join
+
+            command = _shell_join(["mms", "project", "init", entry.path, "--name", entry.name])
+            message += f"Recreate the marker with `{command}` (enabled MCPs will be empty), or "
+        message += "run `mms project list --prune` to remove the stale registration."
+        raise click.ClickException(message) from exc
+
+
 def _resolve_project_for_mutation(project_name: str | None) -> Project:
     """Resolve which project a mutation (enable/disable) targets.
 
@@ -112,23 +173,7 @@ def _resolve_project_for_mutation(project_name: str | None) -> Project:
             f"Project name '{_disp(project_name)}' is ambiguous ({len(matches)} matches). "
             "Use `mms project show NAME` from inside the target project root instead."
         )
-    entry = matches[0]
-    marker = Path(entry.path) / state.PROJECT_MARKER_RELPATH
-    if not marker.is_file():
-        raise click.ClickException(
-            f"Project '{_disp(project_name)}' indexed at {_disp(str(entry.path))} "
-            "but marker file is missing. "
-            "The directory may have been moved or the marker deleted; "
-            "run `mms project list --prune` to clean up."
-        )
-    cfg = state.load_project_config(marker)
-    return Project(
-        root=Path(entry.path),
-        source=Source.MARKER,
-        name=cfg.project.name,
-        marker_path=marker,
-        config=cfg,
-    )
+    return _load_named_project(matches[0])
 
 
 def _refresh_index(name: str, root: Path) -> None:
@@ -253,19 +298,7 @@ def show_cmd(name: str | None, json_output: bool) -> None:
                 "target project root instead."
             )
         entry = matches[0]
-        marker = Path(entry.path) / state.PROJECT_MARKER_RELPATH
-        if not marker.is_file():
-            raise click.ClickException(
-                f"Project '{_disp(name)}' indexed at {_disp(str(entry.path))} but marker is missing."
-            )
-        cfg = state.load_project_config(marker)
-        proj = Project(
-            root=Path(entry.path),
-            source=Source.MARKER,
-            name=cfg.project.name,
-            marker_path=marker,
-            config=cfg,
-        )
+        proj = _load_named_project(entry)
         _emit_show(proj, json_output, cwd=Path(entry.path))
         return
 
@@ -304,7 +337,7 @@ def _emit_show(proj: Project, json_output: bool, *, cwd: Path) -> None:
 
 
 @project_group.command("list")
-@click.option("--prune", is_flag=True, help="Remove entries whose path no longer exists.")
+@click.option("--prune", is_flag=True, help="Remove entries whose root or marker is missing.")
 @click.option("--json", "json_output", is_flag=True, help="Machine-readable output.")
 @surface_mms_state_errors
 def list_cmd(prune: bool, json_output: bool) -> None:
@@ -322,10 +355,12 @@ def list_cmd(prune: bool, json_output: bool) -> None:
         if prune:
             kept: list[state.ProjectIndexEntry] = []
             for entry in idx.projects:
-                if Path(entry.path).is_dir():
-                    kept.append(entry)
-                else:
+                try:
+                    _load_indexed_project(entry)
+                except _MissingIndexedProject:
                     pruned.append(entry)
+                else:
+                    kept.append(entry)
             if pruned:
                 new_idx = state.ProjectsIndex(schema_version=idx.schema_version, projects=kept)
                 state.save_projects_index(new_idx)

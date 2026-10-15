@@ -1075,11 +1075,25 @@ Without `NAME`: runs the §6 detection algorithm against cwd (marker walk-up →
 Usage: mms project list [OPTIONS]
 
 Options:
-  --prune  Remove entries whose path no longer exists.
+  --prune  Remove entries whose root or marker is missing.
   --json   Machine-readable output.
 ```
 
-Prints all known projects with the current cwd's project marked `*`. `--prune` removes entries whose `path` no longer points at a directory and reports each pruned entry by name.
+Prints all known projects with the current cwd's project marked `*`. `--prune`
+removes index entries whose root or `.mms/project.toml` marker is confirmed
+missing and reports each removed entry by name; it never deletes project files.
+If an entry is inaccessible, has an invalid marker, or has the wrong file type,
+pruning exits with an error and leaves the entire index unchanged. In `--json`
+mode this is a JSON failure document; successful output lists removed entries
+under `pruned`.
+
+For a missing marker in an existing directory, named lookup offers two choices:
+recreate it with `mms project init <path> --name <indexed name>`, or remove the
+stale registration with `mms project list --prune`. The displayed init command
+quotes the actual path and name for the native shell (POSIX shell or Windows
+cmd.exe). Re-init preserves the registered name but starts with an empty enabled
+MCP list; it does not recover deleted selections. Invalid or unreadable markers
+must be repaired instead of pruned.
 
 ### `mms project enable` / `mms project disable`
 
