@@ -10,7 +10,6 @@ import inspect
 import json
 import logging
 import math
-import re
 import sqlite3
 import threading
 import time as _time
@@ -4990,22 +4989,6 @@ class ProxyManager:
             self._progressive_store_cfg = sel_cfg
         return self._progressive_store
 
-    _SELECTION_KEY_RE = re.compile(r'"selection_key"\s*:\s*"([0-9a-f]{16})"')
-
-    def _discard_orphaned_toc_key(self, text: str) -> None:
-        """Delete a TOC selection key from the active pending store when a
-        HYBRID output is discarded by the ratio-guard fallback ladder."""
-        m = self._SELECTION_KEY_RE.search(text)
-        if m is None:
-            return
-        sel = self._selective_compressor
-        store = getattr(sel, "_store", None)
-        if store is not None:
-            try:
-                store.delete(m.group(1))
-            except Exception:
-                logger.debug("Failed to delete orphaned TOC key", exc_info=True)
-
     def _apply_progressive(
         self,
         text: str,
@@ -6635,8 +6618,6 @@ class ProxyManager:
                             dynamic,
                         )
                     else:
-                        if effective_compression == CompressionStrategy.HYBRID:
-                            self._discard_orphaned_toc_key(compressed)
                         original_strategy = effective_compression.value
                         pcfg = tc.progressive or ProgressiveConfig()
                         hybrid_fallback = False
@@ -6715,8 +6696,6 @@ class ProxyManager:
                                             compressed_ratio,
                                             len(compressed) / cleaned_len,
                                         )
-                                    else:
-                                        self._discard_orphaned_toc_key(compressed)
                                 except Exception:
                                     logger.debug(
                                         "Hybrid fallback failed for %s/%s, "
