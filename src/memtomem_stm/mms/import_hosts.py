@@ -33,10 +33,12 @@ import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from memtomem_stm.mms.secrets import Classification, classify_env
-from memtomem_stm.mms.state import RegistryServer
+
+if TYPE_CHECKING:
+    from memtomem_stm.mms.state import RegistryServer
 
 # ---------------------------------------------------------------------------
 # Shape-agnostic primitives (re-exported for cli/proxy.py)
@@ -223,6 +225,8 @@ def _to_registry_server(name: str, raw: dict[str, Any]) -> RegistryServer | None
             if not isinstance(k, str) or k.upper() in _DANGEROUS_ENV_KEYS:
                 continue
             env[k] = str(v)
+
+    from memtomem_stm.mms.state import RegistryServer
 
     return RegistryServer(command=command, args=args, env=env, prefix=_derive_prefix(name))
 

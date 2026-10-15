@@ -73,12 +73,16 @@ class ContextExtractor:
                     parts.append(self._tokenize_pattern(value))
                 else:
                     parts.append(self._first_sentence(value, max_chars=200))
-            elif key in _SEMANTIC_KEYS and not self._is_identifier(str(value)):
-                # A semantic key whose value is an opaque id (uuid/hex/bool) is
-                # filtered here too — pre-fix only the free-text branch applied
-                # the identifier filter, so a semantic-keyed id leaked into the
-                # query (inconsistent and a poor search term).
-                parts.append(str(value))
+            elif (
+                key in _SEMANTIC_KEYS
+                and isinstance(value, (str, int, float))
+                and not isinstance(value, bool)
+            ):
+                # Short strings (<= 2 chars) and numbers still count; containers
+                # are skipped so a nested dict or list is never stringified.
+                val_str = str(value)
+                if not self._is_identifier(val_str):
+                    parts.append(val_str)
 
         # Fall back to the tool name when the extracted args alone do not clear
         # ``min_query_tokens`` — not only when ``parts`` is empty. KR-4.2: a

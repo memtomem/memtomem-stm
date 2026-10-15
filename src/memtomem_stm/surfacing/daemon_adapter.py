@@ -9,6 +9,7 @@ from typing import Any, cast, get_args
 
 from memtomem_stm.config import STMConfig
 from memtomem_stm.daemon import client
+from memtomem_stm.daemon.discovery import config_fingerprint
 from memtomem_stm.daemon.protocol import (
     MAX_CONTEXT_COMPOSE_SCHEMA,
     OP_LTM_CANDIDATE_PROPOSE,
@@ -39,6 +40,7 @@ class DaemonLtmAdapter:
 
     def __init__(self, daemon_config: STMConfig) -> None:
         self._daemon_config = daemon_config
+        self._fingerprint = config_fingerprint(daemon_config)
         self._timeout = daemon_config.surfacing.timeout_seconds
         self._compose_schema: int | None = None
         self._candidate_propose_supported: bool | None = None
@@ -51,7 +53,14 @@ class DaemonLtmAdapter:
 
     async def warm_up(self) -> None:
         try:
-            if await client.ping(self._daemon_config, timeout=min(2.0, self._timeout)) is None:
+            if (
+                await client.ping(
+                    self._daemon_config,
+                    timeout=min(2.0, self._timeout),
+                    fingerprint=self._fingerprint,
+                )
+                is None
+            ):
                 await self._spawn_best_effort()
         except asyncio.CancelledError:
             raise
@@ -105,6 +114,7 @@ class DaemonLtmAdapter:
                 "trace_id": trace_id,
             },
             timeout=self._timeout,
+            fingerprint=self._fingerprint,
         )
         if state == "missing":
             # The daemon generation is gone. Forget capability verdicts from
@@ -211,6 +221,7 @@ class DaemonLtmAdapter:
                 "trace_id": trace_id,
             },
             timeout=self._timeout,
+            fingerprint=self._fingerprint,
         )
         if state != "ok" or resp is None or not resp.get("ok"):
             if resp is not None and resp.get("status") == "unsupported":
@@ -241,7 +252,11 @@ class DaemonLtmAdapter:
             "trace_id": trace_id,
         }
         state, resp = await client.ltm_request(
-            self._daemon_config, OP_LTM_SEARCH, payload, timeout=self._timeout
+            self._daemon_config,
+            OP_LTM_SEARCH,
+            payload,
+            timeout=self._timeout,
+            fingerprint=self._fingerprint,
         )
         if state == "missing":
             self._compose_schema = None
@@ -302,6 +317,7 @@ class DaemonLtmAdapter:
             OP_LTM_INCREMENT_ACCESS,
             {"chunk_ids": chunk_ids, "trace_id": trace_id},
             timeout=self._timeout,
+            fingerprint=self._fingerprint,
         )
 
     async def scratch_list(self, *, trace_id: str | None = None) -> list[dict]:
@@ -311,6 +327,7 @@ class DaemonLtmAdapter:
             OP_LTM_SCRATCH_LIST,
             {"trace_id": trace_id},
             timeout=timeout,
+            fingerprint=self._fingerprint,
         )
         if state != "ok" or resp is None or not resp.get("ok"):
             return []

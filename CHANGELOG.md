@@ -72,6 +72,17 @@ changes inline only. See the deprecation policy in
   failed start. Surfacing was already disabled in either case; only what is
   reported changes (#1136).
 
+### Changed
+
+- performance: `mms` no longer imports the `~/.mms` state layer (and with
+  it `pydantic` and `tomli_w`) to start the CLI group; the daemon adapter
+  computes its config fingerprint once instead of per request;
+  `stm_tuning_recommendations` reads tool profiles once instead of twice.
+  The surfacing query extractor no longer stringifies a dict or list passed
+  under a semantic key such as `query` or `path`. **Behavior change**: such
+  a container value no longer contributes to the surfacing query; strings
+  and numbers still do (#1143).
+
 ### Security
 
 - cli: `mms gateway status` printed the first validation message for an

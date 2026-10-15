@@ -647,6 +647,8 @@ async def _run_hook(
     ``config`` is reused from :func:`_orchestrate` when given (saving a redundant
     ``STMConfig()`` load); ``None`` loads on demand.
     """
+    if not _hook_eligible(call):
+        return {}
     bounded = _bounded_call(call)
     if _daemon_enabled():
         from memtomem_stm.config import STMConfig, log_stm_config_failure

@@ -100,7 +100,9 @@ async def _request(
                 pass
 
 
-def _live_handshake_candidate(config: STMConfig) -> dict[str, Any] | None:
+def _live_handshake_candidate(
+    config: STMConfig, *, fingerprint: str | None = None
+) -> dict[str, Any] | None:
     """Read *this config's* handshake and reject it on version/fingerprint drift.
 
     The handshake path is keyed by ``config``'s fingerprint, so we only ever read
@@ -110,7 +112,7 @@ def _live_handshake_candidate(config: STMConfig) -> dict[str, Any] | None:
     corrupted/hand-edited file whose content doesn't match its keyed name; a
     version mismatch likewise means "not the daemon we want".
     """
-    fp = config_fingerprint(config)
+    fp = fingerprint if fingerprint is not None else config_fingerprint(config)
     hs = read_handshake(handshake_path(config.data_dir, fp))
     if hs is None:
         return None
@@ -121,9 +123,11 @@ def _live_handshake_candidate(config: STMConfig) -> dict[str, Any] | None:
     return hs
 
 
-async def ping(config: STMConfig, *, timeout: float = 2.0) -> dict[str, Any] | None:
+async def ping(
+    config: STMConfig, *, timeout: float = 2.0, fingerprint: str | None = None
+) -> dict[str, Any] | None:
     """Return the handshake dict iff a live, matching daemon answers ``ping``."""
-    hs = _live_handshake_candidate(config)
+    hs = _live_handshake_candidate(config, fingerprint=fingerprint)
     if hs is None:
         return None
     resp = await _request(hs, OP_PING, None, timeout=timeout)
@@ -170,6 +174,7 @@ async def ltm_request(
     payload: dict[str, Any],
     *,
     timeout: float,
+    fingerprint: str | None = None,
 ) -> tuple[LtmRequestState, dict[str, Any] | None]:
     """Send one deadline-bounded low-level LTM request through the daemon.
 
@@ -184,7 +189,7 @@ async def ltm_request(
         OP_LTM_SCRATCH_LIST,
     }:
         return "invalid", None
-    hs = _live_handshake_candidate(config)
+    hs = _live_handshake_candidate(config, fingerprint=fingerprint)
     if hs is None:
         return "missing", None
     # Same-host loopback processes share the OS monotonic-clock epoch, so this

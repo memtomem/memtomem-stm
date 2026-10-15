@@ -318,8 +318,10 @@ class ProgressiveChunker:
     @staticmethod
     def _remaining_headings(content: str, from_offset: int) -> str:
         """Return a compact list of markdown headings after *from_offset*."""
-        remaining = content[from_offset:]
-        headings = _HEADING_RE.findall(remaining)
+        start = (
+            from_offset - 1 if from_offset > 0 and content[from_offset - 1] == "\n" else from_offset
+        )
+        headings = _HEADING_RE.findall(content, start)
         if not headings:
             return ""
         # Show up to 5 headings

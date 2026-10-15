@@ -2816,7 +2816,7 @@ async def stm_tuning_recommendations(
     )
     since = since_hours * 3600.0
     profiles = tuner.get_profiles(since_seconds=since, tool_filter=tool)
-    recs = tuner.analyze(since_seconds=since, tool_filter=tool)
+    recs = tuner.analyze_profiles(profiles)
     return format_recommendations(recs, profiles, since_hours)
 
 

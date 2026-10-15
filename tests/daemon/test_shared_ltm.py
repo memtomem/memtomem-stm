@@ -621,6 +621,7 @@ async def test_daemon_adapter_accepts_selected_schema_and_forwards_scope(
             "trace_id": "trace-1",
         },
         timeout=adapter._timeout,
+        fingerprint=config_fingerprint(adapter._daemon_config),
     )
 
     request.return_value = ("ok", {"ok": True, "pinned": [], "retrieved": []})
@@ -1245,3 +1246,23 @@ async def test_adapter_decodes_compose_score_ceiling(
     assert bundle.score_ceiling == pytest.approx(2 / 11)
     assert bundle.retrieved[0].score_ceiling == pytest.approx(2 / 11)
     assert bundle.pinned[0].score_ceiling is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["search", "scratch_list"])
+async def test_daemon_adapter_passes_its_cached_fingerprint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    # The adapter computes the config fingerprint once; every request has to
+    # carry it, or client.ltm_request re-derives it from the config each call.
+    request = AsyncMock(return_value=("unavailable", None))
+    monkeypatch.setattr("memtomem_stm.surfacing.daemon_adapter.client.ltm_request", request)
+    adapter = DaemonLtmAdapter(_config(tmp_path))
+    monkeypatch.setattr(adapter, "_spawn_best_effort", AsyncMock())
+
+    if method == "search":
+        await adapter.search("q", trace_id="trace-1")
+    else:
+        await adapter.scratch_list(trace_id="trace-1")
+
+    assert request.await_args.kwargs["fingerprint"] == config_fingerprint(adapter._daemon_config)

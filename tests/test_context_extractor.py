@@ -122,6 +122,19 @@ class TestExplicitContextQueryKwarg:
 
 
 class TestHeuristicExtraction:
+    def test_short_semantic_string_counts_toward_the_query(self):
+        # A semantic-keyed string too short for the free-text branch still joins
+        # the query; dropping it left "read file" (2 tokens) under the 3-token
+        # floor, so surfacing silently stopped firing for the call.
+        assert _extract("read_file", {"path": "y"}) == "y read file"
+        assert _extract("read_file", {"name": "42"}) == "42 read file"
+        assert _extract("read_file", {"title": 7}) == "7 read file"
+
+    def test_semantic_container_values_are_not_stringified(self):
+        result = _extract("read_file", {"query": {"text": "nested payload words"}})
+        assert "nested" not in (result or "")
+        assert "{" not in (result or "")
+
     def test_semantic_string_args(self):
         result = _extract("tool", {"path": "/src/main.py", "query": "search term"})
         # Path is tokenized: /src/main.py → "src main py"

@@ -141,12 +141,17 @@ class RelevanceGate:
             return GateRejection("gate_rate_limit")
 
         # Cooldown: skip if very similar query was recently surfaced
-        for ts, prev_query in reversed(self._recent_queries):
-            if now - ts >= self._config.cooldown_seconds:
-                break
-            if self._jaccard_similarity(query, prev_query) > _SIMILARITY_THRESHOLD:
-                self._observability.record_skip(tool, "gate_cooldown")
-                return GateRejection("gate_cooldown")
+        query_tokens = set(query.lower().split())
+        if query_tokens:
+            for ts, prev_query in reversed(self._recent_queries):
+                if now - ts >= self._config.cooldown_seconds:
+                    break
+                prev_tokens = set(prev_query.lower().split())
+                if prev_tokens:
+                    similarity = len(query_tokens & prev_tokens) / len(query_tokens | prev_tokens)
+                    if similarity > _SIMILARITY_THRESHOLD:
+                        self._observability.record_skip(tool, "gate_cooldown")
+                        return GateRejection("gate_cooldown")
 
         # Eagerly claim the rate-limit slot. A concurrent ``should_surface``
         # for a different query will now observe this timestamp and apply

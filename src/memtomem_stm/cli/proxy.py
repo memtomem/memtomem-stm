@@ -20,7 +20,7 @@ from collections.abc import Iterator
 from contextlib import AsyncExitStack, contextmanager, redirect_stderr, redirect_stdout
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from functools import wraps
 from typing import TYPE_CHECKING, Any, NoReturn, TextIO
@@ -60,7 +60,6 @@ from memtomem_stm.mms.import_hosts import (
     project_local_gate_message,
 )
 from memtomem_stm.mms.secrets import REDACTED_DISPLAY
-from memtomem_stm.mms.state import utc_now_iso
 from memtomem_stm.proxy import prefixes, tool_name_budget
 from memtomem_stm.proxy.staged_status import ProbeStage, StagedProbeResult
 from memtomem_stm.utils.fileio import atomic_write_text
@@ -71,6 +70,12 @@ from memtomem_stm.utils.redact import (
     root_cause_exc as _root_cause_exc,
     sanitize_secrets,
 )
+
+
+def utc_now_iso() -> str:
+    """UTC now formatted per RFC §5 (seconds precision, trailing ``Z``)."""
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
 
 # Backward-compatible private alias for this module's decorators. The
 # canonical value lives in ``cli._defaults`` so sibling command modules do
