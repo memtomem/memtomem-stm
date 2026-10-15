@@ -321,7 +321,7 @@ class ProgressiveChunker:
         start = (
             from_offset - 1 if from_offset > 0 and content[from_offset - 1] == "\n" else from_offset
         )
-        headings = [m.group(1) for m in _HEADING_RE.finditer(content, start)]
+        headings = _HEADING_RE.findall(content, start)
         if not headings:
             return ""
         # Show up to 5 headings

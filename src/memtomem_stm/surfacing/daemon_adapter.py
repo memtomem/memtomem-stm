@@ -252,7 +252,11 @@ class DaemonLtmAdapter:
             "trace_id": trace_id,
         }
         state, resp = await client.ltm_request(
-            self._daemon_config, OP_LTM_SEARCH, payload, timeout=self._timeout
+            self._daemon_config,
+            OP_LTM_SEARCH,
+            payload,
+            timeout=self._timeout,
+            fingerprint=self._fingerprint,
         )
         if state == "missing":
             self._compose_schema = None
@@ -323,6 +327,7 @@ class DaemonLtmAdapter:
             OP_LTM_SCRATCH_LIST,
             {"trace_id": trace_id},
             timeout=timeout,
+            fingerprint=self._fingerprint,
         )
         if state != "ok" or resp is None or not resp.get("ok"):
             return []

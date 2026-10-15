@@ -2481,7 +2481,7 @@ async def stm_selection_stats(
         )
 
     with traced("stm_selection_stats"):
-        agg = await asyncio.to_thread(aggregate_selection_log, sink.path)
+        agg = aggregate_selection_log(sink.path)
         live = sink.snapshot()
         # An empty disk log with no live activity is genuinely "no data".
         # But if events were written and then rotated/sampled away, the live
@@ -2815,12 +2815,8 @@ async def stm_tuning_recommendations(
         config=app.proxy_manager._config,
     )
     since = since_hours * 3600.0
-
-    def _run_tuner() -> tuple[list[Any], list[Any]]:
-        profs = tuner.get_profiles(since_seconds=since, tool_filter=tool)
-        return profs, tuner.analyze_profiles(profs)
-
-    profiles, recs = await asyncio.to_thread(_run_tuner)
+    profiles = tuner.get_profiles(since_seconds=since, tool_filter=tool)
+    recs = tuner.analyze_profiles(profiles)
     return format_recommendations(recs, profiles, since_hours)
 
 
