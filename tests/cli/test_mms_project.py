@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import errno
 import json
+import shlex
 import sys
 from pathlib import Path
 
@@ -346,6 +348,214 @@ def test_disable_noop_when_not_enabled(runner, sandbox):
     res = runner.invoke(project_group, ["disable", "never-enabled"])
     assert res.exit_code == 0
     assert "No changes" in res.output
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_prune_missing_marker_preserves_files_and_is_idempotent(runner, sandbox, json_output):
+    assert runner.invoke(project_group, ["init", "--name", "demo"]).exit_code == 0
+    root = sandbox["cwd"]
+    (root / state.PROJECT_MARKER_RELPATH).unlink()
+    keep = root / "keep.txt"
+    keep.write_text("user content")
+    args = ["list", "--prune"] + (["--json"] if json_output else [])
+    result = runner.invoke(project_group, args)
+    assert result.exit_code == 0, result.output
+    if json_output:
+        assert json.loads(result.stdout)["pruned"] == [{"name": "demo", "path": str(root)}]
+    else:
+        assert "pruned: demo" in result.stdout
+    assert state.load_projects_index().projects == []
+    assert keep.read_text() == "user content"
+    second = runner.invoke(project_group, args)
+    assert second.exit_code == 0
+    if json_output:
+        assert json.loads(second.stdout)["pruned"] == []
+    else:
+        assert "pruned:" not in second.stdout
+    missing = runner.invoke(project_group, ["show", "demo"])
+    assert missing.exit_code == 1
+    assert "not found" in missing.output and "--prune" not in missing.output
+
+
+@pytest.mark.parametrize("command", ["show", "enable", "disable", "route"])
+def test_missing_marker_hint_preserves_name(runner, sandbox, command):
+    from memtomem_stm.cli.proxy import _shell_join
+
+    root = sandbox["home"] / "project with spaces"
+    root.mkdir()
+    name = "demo ' $name"
+    _seed_registry("fake")
+    assert runner.invoke(project_group, ["init", str(root), "--name", name]).exit_code == 0
+    (root / state.PROJECT_MARKER_RELPATH).unlink()
+    args = (
+        ["show", name]
+        if command == "show"
+        else [command, *(["fake"] if command in ("enable", "disable") else []), "--project", name]
+    )
+    result = runner.invoke(project_group, args)
+    assert result.exit_code == 1, result.output
+    repair_args = ["mms", "project", "init", str(root), "--name", name]
+    rendered = _shell_join(repair_args)
+    assert f"`{rendered}`" in result.output
+    assert "enabled MCPs will be empty" in result.output
+    assert "list --prune" in result.output
+    # Native quoting already has Windows command-shell tests. Execute the
+    # displayed POSIX argv here; keep the recovery journey portable on Windows.
+    recovered_args = shlex.split(rendered)[2:] if sys.platform != "win32" else repair_args[2:]
+    assert runner.invoke(project_group, recovered_args).exit_code == 0
+    shown = runner.invoke(project_group, ["show", name, "--json"])
+    assert shown.exit_code == 0, shown.output
+    assert json.loads(shown.stdout)["name"] == name
+    assert json.loads(shown.stdout)["enabled"] == []
+    assert state.load_projects_index().projects[0].name == name
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_prune_non_directory_root_preserves_file_and_valid_project(runner, sandbox, json_output):
+    assert runner.invoke(project_group, ["init"]).exit_code == 0
+    root = sandbox["home"] / "stale"
+    root.mkdir()
+    assert runner.invoke(project_group, ["init", str(root), "--name", "stale"]).exit_code == 0
+    marker = root / state.PROJECT_MARKER_RELPATH
+    marker.unlink()
+    marker.parent.rmdir()
+    root.rmdir()
+    root.write_text("user file")
+    shown = runner.invoke(project_group, ["show", "stale"])
+    assert shown.exit_code == 1
+    assert "list --prune" in shown.output
+    assert "mms project init" not in shown.output
+    result = runner.invoke(project_group, ["list", "--prune"] + (["--json"] if json_output else []))
+    assert result.exit_code == 0, result.output
+    if json_output:
+        assert json.loads(result.stdout)["pruned"] == [{"name": "stale", "path": str(root)}]
+    else:
+        assert "pruned: stale" in result.stdout
+    assert root.read_text() == "user file"
+    assert [entry.name for entry in state.load_projects_index().projects] == ["proj"]
+    again = runner.invoke(project_group, ["list", "--prune", "--json"])
+    assert again.exit_code == 0
+    assert json.loads(again.stdout)["pruned"] == []
+
+
+def test_enoent_with_file_parent_does_not_offer_init(runner, sandbox, monkeypatch):
+    assert runner.invoke(project_group, ["init", "--name", "demo"]).exit_code == 0
+    marker = sandbox["cwd"] / state.PROJECT_MARKER_RELPATH
+    marker.unlink()
+    marker.parent.rmdir()
+    marker.parent.write_text("user file")
+    original = Path.stat
+
+    def missing(path, *args, **kwargs):
+        if path == marker:
+            raise FileNotFoundError(errno.ENOENT, "simulated missing-path report")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", missing)
+    shown = runner.invoke(project_group, ["show", "demo"])
+    assert shown.exit_code == 1
+    assert "mms project init" not in shown.output
+    assert "list --prune" in shown.output
+    assert runner.invoke(project_group, ["list", "--prune"]).exit_code == 0
+    assert marker.parent.read_text() == "user file"
+
+
+def test_unrenderable_name_omits_recreate_command(runner, sandbox):
+    name = "demo\x1b[31m"
+    assert runner.invoke(project_group, ["init", "--name", name]).exit_code == 0
+    (sandbox["cwd"] / state.PROJECT_MARKER_RELPATH).unlink()
+    result = runner.invoke(project_group, ["show", name])
+    assert result.exit_code == 1
+    assert "Recreate the marker" not in result.output
+    assert "\x1b" not in result.output
+    assert "list --prune" in result.output
+
+
+@pytest.mark.parametrize("damage", ["directory", "malformed", "invalid_utf8"])
+def test_prune_and_named_lookup_keep_invalid_projects(runner, sandbox, damage):
+    root = sandbox["home"] / "invalid"
+    root.mkdir()
+    assert runner.invoke(project_group, ["init", str(root), "--name", "demo"]).exit_code == 0
+    marker = root / state.PROJECT_MARKER_RELPATH
+    if damage == "directory":
+        marker.unlink()
+        marker.mkdir()
+    elif damage == "malformed":
+        marker.write_text("invalid = [")
+    elif damage == "invalid_utf8":
+        marker.write_bytes(b"\xff")
+    # A stale entry before the invalid one must not be partially pruned.
+    idx = state.load_projects_index()
+    idx.projects.insert(
+        0,
+        state.ProjectIndexEntry(
+            name="gone", path=str(root.parent / "gone"), last_seen="2026-10-16T00:00:00Z"
+        ),
+    )
+    state.save_projects_index(idx)
+    before = state.projects_index_path().read_bytes()
+    for args in (
+        ["list", "--prune", "--json"],
+        ["show", "demo"],
+        ["disable", "fake", "--project", "demo"],
+    ):
+        result = runner.invoke(project_group, args)
+        assert result.exit_code == 1, result.output
+        assert "list --prune" not in result.output and "mms project init" not in result.output
+        assert state.projects_index_path().read_bytes() == before
+        if "--json" in args:
+            assert json.loads(result.stdout)["error"] == "mms_state_invalid"
+            assert "Project 'demo': prune aborted; index unchanged" in result.stdout
+
+
+@pytest.mark.parametrize("error_number", [errno.EACCES, errno.EPERM, errno.EIO])
+@pytest.mark.parametrize("target", ["root", "marker", "read"])
+def test_prune_and_lookup_do_not_confuse_io_errors_with_absence(
+    runner, sandbox, monkeypatch, error_number, target
+):
+    assert runner.invoke(project_group, ["init", "--name", "demo"]).exit_code == 0
+    root = sandbox["cwd"]
+    marker = root / state.PROJECT_MARKER_RELPATH
+    before = state.projects_index_path().read_bytes()
+    method = "open" if target == "read" else "stat"
+    original = getattr(Path, method)
+    failing = root if target == "root" else marker
+
+    def fail(path, *args, **kwargs):
+        if path == failing:
+            raise OSError(error_number, "sensitive-error-detail")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, method, fail)
+    for args in (
+        ["list", "--prune", "--json"],
+        ["show", "demo"],
+        ["disable", "fake", "--project", "demo"],
+    ):
+        result = runner.invoke(project_group, args)
+        assert result.exit_code == 1, result.output
+        assert "cannot" in result.output
+        assert "sensitive-error-detail" not in result.output
+        assert "list --prune" not in result.output and "mms project init" not in result.output
+        assert state.projects_index_path().read_bytes() == before
+
+
+@pytest.mark.parametrize("error_type", [FileNotFoundError, NotADirectoryError])
+def test_prune_only_confirmed_missing_marker_errors(runner, sandbox, monkeypatch, error_type):
+    assert runner.invoke(project_group, ["init", "--name", "demo"]).exit_code == 0
+    marker = sandbox["cwd"] / state.PROJECT_MARKER_RELPATH
+    original = Path.stat
+
+    def missing(path, *args, **kwargs):
+        if path == marker:
+            raise error_type()
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", missing)
+    result = runner.invoke(project_group, ["list", "--prune", "--json"])
+    assert result.exit_code == 0, result.output
+    assert len(json.loads(result.stdout)["pruned"]) == 1
+    assert state.load_projects_index().projects == []
 
 
 # ---------------------------------------------------------------------------
