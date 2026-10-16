@@ -22,6 +22,7 @@ sandbox.
 
 from __future__ import annotations
 
+import stat
 import time
 import tomllib
 from collections.abc import Iterator
@@ -369,11 +370,24 @@ def load_registry(path: Path | None = None) -> RegistryConfig:
 
 
 def load_projects_index(path: Path | None = None) -> ProjectsIndex:
-    """Load ``projects.toml``. Returns empty index if file is missing."""
+    """Load ``projects.toml``; only a missing file means an empty index.
+
+    Reject non-regular paths before callers can write a project marker.
+    Use stat explicitly so inspection errors cannot be mistaken for absence.
+    """
     p = path or projects_index_path()
-    if not p.is_file():
+    try:
+        mode = p.stat().st_mode
+    except FileNotFoundError:
         return ProjectsIndex()
-    raw = _load_toml_dict(p)
+    except OSError as exc:
+        raise CorruptedConfig(p, f"cannot inspect ({type(exc).__name__})") from exc
+    if not stat.S_ISREG(mode):
+        raise CorruptedConfig(p, "expected a regular file for projects index; repair this path")
+    try:
+        raw = _load_toml_dict(p)
+    except OSError as exc:
+        raise CorruptedConfig(p, f"cannot read ({type(exc).__name__})") from exc
     _check_schema_version(p, raw, SCHEMA_VERSION)
     try:
         return ProjectsIndex.model_validate(raw)

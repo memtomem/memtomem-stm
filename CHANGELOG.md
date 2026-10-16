@@ -25,6 +25,14 @@ changes inline only. See the deprecation policy in
   unchanged; if a later index write fails after the marker was saved, exit 1 with
   explicit partial-completion and rerun guidance instead of implying no change.
 
+- cli: reject a non-regular projects index in the shared loader (#1160, #1162).
+  **Behavior change**: a directory or other non-regular `~/.mms/projects.toml`
+  now produces a clean exit 1 instead of being treated as an empty index;
+  JSON-capable commands return `mms_state_invalid` with `--json`. `mms project init`
+  fails before creating a marker or overwriting an existing marker with `--force`.
+  A missing index remains supported. Non-UTF-8 index handling is tracked separately
+  in #1159.
+
 - progressive: enforce each response's stored sliding TTL before renewal and
   during publication cleanup, using backend-local clocks and atomic expiry checks
   (#1155, #1157). **Behavior change**: expired or malformed progressive entries cannot

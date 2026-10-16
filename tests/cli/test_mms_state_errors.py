@@ -137,6 +137,97 @@ def test_project_init_leaves_no_marker_when_the_index_is_unreadable(runner, sand
     assert not (sandbox["cwd"] / state.PROJECT_MARKER_RELPATH).exists()
 
 
+@pytest.mark.parametrize("existing_marker", [False, True], ids=["new", "force"])
+def test_project_init_directory_index_preserves_marker_and_recovers(
+    runner, sandbox, existing_marker
+):
+    marker = sandbox["cwd"] / state.PROJECT_MARKER_RELPATH
+    before = None
+    if existing_marker:
+        state.save_project_config(
+            state.ProjectConfig(
+                project=state.ProjectMeta(name="original"),
+                mcp=state.ProjectMcp(enabled=["keep-me"]),
+            ),
+            marker,
+        )
+        before = marker.read_bytes()
+    index = state.projects_index_path()
+    index.mkdir(parents=True)
+    sentinel = index / "keep.txt"
+    sentinel.write_bytes(b"preserve index directory contents")
+    argv = ["init", "--name", "replacement", *(["--force"] if existing_marker else [])]
+
+    for _ in range(2):
+        result = runner.invoke(project_group, argv)
+        assert result.exit_code == 1
+        assert isinstance(result.exception, SystemExit)
+        assert result.exception.code == 1
+        assert "Error:" in result.stderr and "regular file" in result.stderr
+        assert "Traceback" not in result.output
+        assert "Created " not in result.output
+        if existing_marker:
+            assert marker.read_bytes() == before
+        else:
+            assert not marker.exists()
+        assert sentinel.read_bytes() == b"preserve index directory contents"
+
+    sentinel.unlink()
+    index.rmdir()
+    result = runner.invoke(project_group, argv)
+    assert result.exit_code == 0, result.output
+    assert state.load_project_config(marker).project.name == "replacement"
+    assert [entry.name for entry in state.load_projects_index().projects] == ["replacement"]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["list"],
+        ["list", "--prune"],
+        ["show", "p"],
+        ["route", "--project", "p"],
+        ["route", "--project", "p", "--apply"],
+    ],
+)
+@pytest.mark.parametrize("json_output", [False, True])
+def test_project_index_directory_errors_preserve_files(runner, sandbox, argv, json_output):
+    assert runner.invoke(project_group, ["init", "--name", "p"]).exit_code == 0
+    marker = sandbox["cwd"] / state.PROJECT_MARKER_RELPATH
+    before = marker.read_bytes()
+    index = state.projects_index_path()
+    index.unlink()
+    index.mkdir()
+    sentinel = index / "keep.txt"
+    sentinel.write_bytes(b"keep")
+    proxy = sandbox["home"] / "proxy.json"
+    proxy.write_bytes(b'{"upstream_servers": {}}\n')
+    args = [*argv]
+    if argv[0] == "route":
+        args.extend(["--config", str(proxy)])
+    if json_output:
+        args.append("--json")
+
+    result = runner.invoke(project_group, args)
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit)
+    assert result.exception.code == 1
+    assert "regular file" in result.stderr
+    assert "Traceback" not in result.output
+    assert marker.read_bytes() == before
+    assert sentinel.read_bytes() == b"keep"
+    assert list(index.iterdir()) == [sentinel]
+    assert proxy.read_bytes() == b'{"upstream_servers": {}}\n'
+    if json_output:
+        payload = json.loads(result.stdout)
+        assert (payload["action"], payload["ok"], payload["error"]) == (
+            argv[0],
+            False,
+            "mms_state_invalid",
+        )
+
+
 def test_import_reports_a_corrupt_registry_cleanly(runner, sandbox):
     (sandbox["home"] / ".claude.json").write_text(
         json.dumps({"mcpServers": {"fs": {"command": "npx", "args": ["-y", "@fs"]}}}),
