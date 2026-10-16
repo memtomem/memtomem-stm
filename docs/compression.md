@@ -185,7 +185,7 @@ sequenceDiagram
     STM-->>Agent: final chunk (has_more=false)
 ```
 
-The first chunk includes a metadata footer with remaining headings/structure hints and a `ttl` field so the agent can decide whether to continue reading and how urgently:
+Every non-final chunk includes a metadata footer with remaining headings/structure hints and a `ttl` field so the agent can decide whether to continue reading and how urgently:
 
 ```
 ---
@@ -193,6 +193,16 @@ The first chunk includes a metadata footer with remaining headings/structure hin
 [Remaining: "Configuration", "API Reference", ...]
 [-> stm_proxy_read_more(key="abc123", offset=4000)]
 ```
+
+Heading positions are indexed once per stored response, including empty results.
+A compressed index is stored separately from TTL metadata and removed with the
+response. Existing entries acquire it on their first valid read; SQLite persists
+it across restart. Reads decode the compact index and inspect only the search path
+and up to five displayed headings, including when clients alternate between keys.
+Indexes are limited to 100,000 candidates (2 MB decoded) and 128 KiB encoded.
+Responses exceeding either limit retain the original suffix-scan behavior; a stored
+fallback marker prevents repeated index-building attempts. These limits bound index
+storage and decoding, not the existing cost of loading the response body.
 
 A successful `stm_proxy_read_more` lookup renews an unexpired response's sliding
 TTL. Expiry is checked before renewal: an age equal to or greater than the stored

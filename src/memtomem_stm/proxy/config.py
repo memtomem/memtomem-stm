@@ -1404,7 +1404,7 @@ class ProgressiveConfig(BaseModel):
     ttl_seconds: float = Field(default=1800.0, ge=0.0)
     """Time-to-live for stored responses (seconds)."""
     include_structure_hint: bool = True
-    """Include remaining headings/structure hint in first chunk footer."""
+    """Include remaining headings/structure hint in every non-final chunk footer."""
 
 
 class ToolOverrideConfig(BaseModel):

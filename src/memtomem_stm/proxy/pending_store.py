@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from memtomem_stm.proxy.compression import PendingSelection
+from memtomem_stm.proxy.heading_index import HeadingIndex, ensure_heading_index
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.utils.json_out import scrub_lone_surrogates
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
@@ -65,6 +66,7 @@ class ProgressiveEntry:
 
     selection: PendingSelection
     metadata: dict[str, Any]
+    heading_index: HeadingIndex | None = None
 
 
 class PendingStore(Protocol):
@@ -140,11 +142,14 @@ class InMemoryPendingStore:
                 del self._data[key]
                 self._order.remove(key)
                 return None
+            index = None
+            if meta.get("include_structure_hint", True):
+                index, _ = ensure_heading_index(sel.chunks["__content__"], sel.chunks)
             if renew:
                 sel.created_at = now
                 self._order.remove(key)
                 self._order.append(key)
-            return ProgressiveEntry(replace(sel, chunks=dict(sel.chunks)), meta)
+            return ProgressiveEntry(replace(sel, chunks=dict(sel.chunks)), meta, index)
 
     def evict_progressive_expired(self) -> None:
         with self._lock:
@@ -362,7 +367,8 @@ class SQLitePendingStore:
         A miss must not wait on another writer before alternate-store recovery.
         A hit is authoritatively re-read after taking the write lock, so a
         concurrent refresh or replacement cannot be deleted using a stale read.
-        Only timestamp and recency rank are written on successful renewal.
+        Only timestamp and recency rank are written on renewal, except for a
+        one-time heading-index repair of legacy or malformed optional metadata.
         """
         with self._lock:
             db = self._get_db()
@@ -389,6 +395,15 @@ class SQLitePendingStore:
                 if meta is None or sel is None:
                     db.execute("DELETE FROM pending_selections WHERE key = ?", (key,))
                     return None
+                index = None
+                repaired = False
+                if meta.get("include_structure_hint", True):
+                    index, repaired = ensure_heading_index(sel.chunks["__content__"], sel.chunks)
+                if repaired:
+                    db.execute(
+                        "UPDATE pending_selections SET chunks_json = ? WHERE key = ?",
+                        (_json_dumps(sel.chunks, ensure_ascii=False), key),
+                    )
                 if renew:
                     db.execute(
                         f"UPDATE pending_selections SET created_at = ?, seq = {self._NEXT_SEQ} "
@@ -396,7 +411,7 @@ class SQLitePendingStore:
                         (now, key),
                     )
                     sel.created_at = now
-                return ProgressiveEntry(sel, meta)
+                return ProgressiveEntry(sel, meta, index)
 
     def evict_progressive_expired(self) -> None:
         with self._lock:
