@@ -16,9 +16,11 @@ changes inline only. See the deprecation policy in
 - progressive: enforce each response's stored sliding TTL before renewal and
   during publication cleanup, using backend-local clocks and atomic expiry checks
   (#1155, #1157). **Behavior change**: expired or malformed progressive entries cannot
-  be renewed; invalid TTL metadata is a miss instead of a default lifetime.
+  be renewed; absent metadata or an invalid explicit TTL is a miss instead of a
+  default lifetime.
   Configured `ttl_seconds: 0` now expires immediately: the initial chunk is
-  delivered, but its progressive key cannot be used for follow-up reads.
+  delivered, with an expiry notice instead of a command when content remains. SELECTIVE
+  retrieval rejects progressive keys, preventing cross-strategy TTL revival.
   Legacy metadata objects without TTL retain the 1,800-second default. Upgrade
   all processes sharing a SQLite pending-store file together.
 

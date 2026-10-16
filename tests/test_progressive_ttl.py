@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from memtomem_stm.proxy import pending_store as stores
-from memtomem_stm.proxy.compression import PendingSelection
+from memtomem_stm.proxy.compression import PendingSelection, SelectiveCompressor
 from memtomem_stm.proxy.config import ProxyConfig, SelectiveConfig, UpstreamServerConfig
 from memtomem_stm.proxy.manager import ProxyManager
 from memtomem_stm.proxy.metrics import TokenTracker
@@ -463,3 +463,16 @@ def test_sqlite_eviction_does_not_decode_response_bodies(tmp_path, monkeypatch):
         ]
     finally:
         backend.close()
+
+
+@pytest.mark.parametrize("age", [0, 10, 100])
+@pytest.mark.parametrize("sections", [["__content__"], ["__meta__"], ["unknown"]])
+def test_selective_rejects_progressive_without_renewal(storage, age, sections):
+    backend, adapter, clock = storage
+    seed(backend, clock)
+    before = backend.get("key").created_at
+    clock.now += age
+    result = SelectiveCompressor(store=backend).select("key", sections)
+    assert "not found or expired" in result
+    assert backend.get("key").created_at == before
+    assert (adapter.get("key", renew=True) is not None) is (age < 10)

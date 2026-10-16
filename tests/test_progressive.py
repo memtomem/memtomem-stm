@@ -555,6 +555,15 @@ class TestProgressiveConfig:
 
 
 class TestProgressiveTTL:
+    @pytest.mark.parametrize("key", ["key1", ""])
+    def test_zero_ttl_shows_expiry_without_followup_command(self, key):
+        chunker = ProgressiveChunker(chunk_size=100)
+        result = chunker.first_chunk("x" * 500, key, ttl_seconds=0)
+        assert "x" * 100 in result
+        assert "ttl=0s" in result
+        assert "follow-up reads unavailable" in result
+        assert "stm_proxy_read_more" not in result
+
     def test_first_chunk_includes_ttl(self):
         """First chunk footer must expose TTL when provided."""
         chunker = ProgressiveChunker(chunk_size=100)

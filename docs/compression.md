@@ -197,12 +197,14 @@ The first chunk includes a metadata footer with remaining headings/structure hin
 A successful `stm_proxy_read_more` lookup renews an unexpired response's sliding
 TTL. Expiry is checked before renewal: an age equal to or greater than the stored
 TTL returns the existing missing/expired response, and a late read cannot revive
-it. A zero TTL expires immediately. Publication cleanup uses each stored response's
-own TTL, so another tool's shorter or longer TTL does not change its lifetime.
+it. A zero TTL expires immediately; when content remains, the initial chunk explains
+that follow-up reads are unavailable instead of showing a read-more command.
+Publication cleanup uses each stored response's own TTL, so another tool's shorter
+or longer TTL does not change its lifetime.
 Size/recency eviction remains a separate limit. The `ttl` field is omitted on the
 last chunk (`has_more=False`).
 
-**Behavior change (#1155):** malformed/non-object progressive metadata or an
+**Behavior change (#1155):** absent, malformed, or non-object progressive metadata or an
 explicit invalid TTL is treated as missing/expired without renewal. TTL must be a
 finite nonnegative number, not a boolean or string. A valid legacy metadata object
 without `ttl_seconds` retains the 1,800-second default, measured from the backend's

@@ -261,7 +261,9 @@ class ProgressiveChunker:
             if hint:
                 parts.append(f"\n[Remaining: {hint}]")
 
-        if has_more and key:
+        if has_more and ttl_seconds == 0:
+            parts.append("\n[Expired immediately; follow-up reads unavailable.]")
+        elif has_more and key:
             parts.append(f'\n[-> stm_proxy_read_more(key="{key}", offset={next_offset})]')
         elif has_more:
             parts.append(f"\n[-> stm_proxy_read_more(offset={next_offset})]")
