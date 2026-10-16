@@ -65,8 +65,7 @@ def test_index_preflight_preserves_marker(project, monkeypatch, command, named, 
     assert res.exit_code == 1
     assert "Error:" in res.stderr
     assert marker.read_bytes() == before
-    if failure in {"directory", "read", "utf8"}:
-        assert "No project settings were written." in res.stderr
+    assert "No project settings were written." in res.stderr
     assert "secret-error-value" not in res.output
     assert "\x1b" not in res.output
     assert "Enabled in" not in res.output and "Disabled in" not in res.output

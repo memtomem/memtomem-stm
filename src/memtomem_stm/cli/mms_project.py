@@ -159,7 +159,8 @@ def _resolve_project_for_mutation(
 
     Without ``--project NAME``: detect from cwd; require a marker
     (init suggested otherwise). With ``--project NAME``: look up in
-    the projects index and load that project's marker.
+    the projects index and load that project's marker. A supplied ``index``
+    reuses the caller's preflight snapshot; otherwise named lookup loads it.
     """
     if project_name is None:
         p = detect_project(Path.cwd())
@@ -202,6 +203,8 @@ def _load_index_before_project_change() -> state.ProjectsIndex:
                     "No project settings were written."
                 )
         return state.load_projects_index()
+    except state.MmsConfigError as exc:
+        raise click.ClickException(f"{_disp(str(exc))} No project settings were written.") from exc
     except (OSError, UnicodeError) as exc:
         raise click.ClickException(
             f"Cannot read projects index {_disp(str(path))}: {type(exc).__name__}. "
