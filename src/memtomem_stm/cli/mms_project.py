@@ -229,7 +229,7 @@ def _save_project_change(
         ) from exc
     try:
         state.save_projects_index(updated)
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         raise click.ClickException(
             f"Project settings were saved to {_disp(str(proj.marker_path))}, "
             f"but saving projects index {_disp(str(state.projects_index_path()))} "

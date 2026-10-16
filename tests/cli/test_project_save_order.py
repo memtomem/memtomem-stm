@@ -73,9 +73,13 @@ def test_index_preflight_preserves_marker(project, monkeypatch, command, named, 
 
 @pytest.mark.parametrize("command", ["enable", "disable"])
 @pytest.mark.parametrize("named", [False, True], ids=["cwd", "named"])
-@pytest.mark.parametrize("after_replace", [False, True], ids=["before-write", "after-write"])
+@pytest.mark.parametrize(
+    ("after_replace", "encoding_error"),
+    [(False, False), (True, False), (False, True)],
+    ids=["before-write", "after-write", "encoding-error"],
+)
 def test_partial_index_save_and_idempotent_recovery(
-    project, monkeypatch, command, named, after_replace
+    project, monkeypatch, command, named, after_replace, encoding_error
 ):
     runner, marker = project
     argv = prepare(project, command, named)
@@ -83,6 +87,9 @@ def test_partial_index_save_and_idempotent_recovery(
     before = state.projects_index_path().read_bytes()
 
     def failed(index, path=None):
+        if encoding_error:
+            # Produce a real encoder failure portably, without a non-UTF-8 filesystem.
+            "secret-error-value\x1b[31m\udcff".encode("utf-8")
         if after_replace:
             original(index, path)
         raise OSError("secret-error-value\x1b[31m")
@@ -94,7 +101,8 @@ def test_partial_index_save_and_idempotent_recovery(
     expected = ["tool"] if command == "enable" else []
     assert state.load_project_config(marker).mcp.enabled == expected
     assert "Project settings were saved" in res.stderr
-    assert "could not be confirmed: OSError" in res.stderr
+    error_type = "UnicodeEncodeError" if encoding_error else "OSError"
+    assert f"could not be confirmed: {error_type}" in res.stderr
     assert "rerun the same command" in res.stderr
     assert "not been rolled back" in res.stderr
     assert "secret-error-value" not in res.output and "\x1b" not in res.output
