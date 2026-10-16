@@ -258,6 +258,10 @@ def test_renewal_keeps_sqlite_payload_and_recency(tmp_path, monkeypatch):
     try:
         seed(backend, clock, "first")
         seed(backend, clock, "second")
+        # Legacy rows acquire their heading index once; subsequent renewals
+        # must still leave the payload untouched (#1153).
+        ProgressiveStoreAdapter(backend).get("first")
+        ProgressiveStoreAdapter(backend).get("second")
         # Updating chunks_json would fire this trigger even if bytes are equal.
         backend._get_db().execute(
             "CREATE TRIGGER no_payload_rewrite BEFORE UPDATE OF chunks_json "

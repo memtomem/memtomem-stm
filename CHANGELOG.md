@@ -13,6 +13,10 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- progressive: index remaining headings once per response instead of scanning the
+  remaining body on each chunk; persist the index across SQLite restart and repair
+  legacy entries on first valid read (#1153).
+
 - progressive: enforce each response's stored sliding TTL before renewal and
   during publication cleanup, using backend-local clocks and atomic expiry checks
   (#1155, #1157). **Behavior change**: expired or malformed progressive entries cannot

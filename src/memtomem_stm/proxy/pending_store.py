@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from memtomem_stm.proxy.compression import PendingSelection
+from memtomem_stm.proxy.heading_index import INDEX_KEY, ensure_heading_index
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.utils.json_out import scrub_lone_surrogates
 from memtomem_stm.utils.sqlite_private import ensure_private_db_files
@@ -57,6 +58,57 @@ def _live_progressive_metadata(selection: PendingSelection, now: float) -> dict[
     if meta is None or not _metadata_live(meta, selection.created_at, now):
         return None
     return meta
+
+
+class _ProgressiveMetadataCache:
+    """One decoded metadata snapshot, never a response body or a global cache.
+
+    Raw metadata plus key and content length bind the snapshot. Other-process
+    updates are observed by comparing against each authoritative row read. Clear
+    on local mutation, eviction, miss and close; retaining just one snapshot
+    bounds idle memory even if another process removes its row.
+    """
+
+    def __init__(self) -> None:
+        self.clear()
+
+    def clear(self) -> None:
+        self.key: str | None = None
+        self.raw: str | None = None
+        self.length = 0
+        self.meta: dict[str, Any] | None = None
+
+    def read(
+        self, key: str, sel: PendingSelection, now: float
+    ) -> tuple[dict[str, Any] | None, bool]:
+        if not isinstance(sel.chunks, dict):
+            self.clear()
+            return None, False
+        content = sel.chunks.get("__content__")
+        raw = sel.chunks.get("__meta__")
+        if not isinstance(content, str) or not isinstance(raw, str):
+            if not isinstance(content, str):
+                logger.warning("Progressive entry missing __content__; treating as miss")
+            self.clear()
+            return None, False
+        if self.key == key and self.raw == raw and self.length == len(content):
+            meta = self.meta
+        else:
+            meta = _live_progressive_metadata(sel, now)
+        if meta is None or not _metadata_live(meta, sel.created_at, now):
+            self.clear()
+            return None, False
+        # A matching snapshot already has a validated immutable index.
+        changed = False
+        if meta is not self.meta:
+            changed = ensure_heading_index(content, meta)
+            if meta.get(INDEX_KEY) is not None and meta.get("include_structure_hint", True):
+                meta[INDEX_KEY] = tuple(tuple(row) for row in meta[INDEX_KEY])
+        if changed:
+            raw = _json_dumps(meta, ensure_ascii=False)
+            sel.chunks["__meta__"] = raw
+        self.key, self.raw, self.length, self.meta = key, raw, len(content), meta
+        return dict(meta), changed
 
 
 @dataclass(frozen=True)
@@ -108,6 +160,7 @@ class InMemoryPendingStore:
         self._data: dict[str, PendingSelection] = {}
         self._order: deque[str] = deque()
         self._lock = threading.Lock()
+        self._progressive_meta = _ProgressiveMetadataCache()
 
     # Invariant: ``_order`` holds exactly the keys of ``_data``, once each,
     # in recency order (oldest left) — matching the SQLite backend, which keeps
@@ -119,6 +172,7 @@ class InMemoryPendingStore:
 
     def put(self, key: str, selection: PendingSelection) -> None:
         with self._lock:
+            self._progressive_meta.clear()
             if key in self._data:
                 self._order.remove(key)
             self._data[key] = selection
@@ -133,9 +187,10 @@ class InMemoryPendingStore:
         with self._lock:
             sel = self._data.get(key)
             if sel is None or sel.format != "progressive":
+                self._progressive_meta.clear()
                 return None
             now = time.monotonic()
-            meta = _live_progressive_metadata(sel, now)
+            meta, _ = self._progressive_meta.read(key, sel, now)
             if meta is None:
                 del self._data[key]
                 self._order.remove(key)
@@ -148,6 +203,7 @@ class InMemoryPendingStore:
 
     def evict_progressive_expired(self) -> None:
         with self._lock:
+            self._progressive_meta.clear()
             now = time.monotonic()
             expired = {
                 key
@@ -169,6 +225,7 @@ class InMemoryPendingStore:
 
     def delete(self, key: str) -> None:
         with self._lock:
+            self._progressive_meta.clear()
             if self._data.pop(key, None) is not None:
                 self._order.remove(key)
 
@@ -176,6 +233,7 @@ class InMemoryPendingStore:
         self, ttl: float, *, format: str | None = None, exclude_format: str | None = None
     ) -> None:
         with self._lock:
+            self._progressive_meta.clear()
             now = time.monotonic()
             expired = {
                 k
@@ -193,6 +251,7 @@ class InMemoryPendingStore:
         self, max_size: int, *, format: str | None = None, exclude_format: str | None = None
     ) -> None:
         with self._lock:
+            self._progressive_meta.clear()
             scoped = [
                 key
                 for key in self._order
@@ -228,6 +287,7 @@ class SQLitePendingStore:
         self._db_path = db_path
         self._db: sqlite3.Connection | None = None
         self._lock = threading.Lock()
+        self._progressive_meta = _ProgressiveMetadataCache()
 
     def initialize(self) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -288,6 +348,7 @@ class SQLitePendingStore:
         return any(row[1] == "seq" for row in db.execute("PRAGMA table_info(pending_selections)"))
 
     def close(self) -> None:
+        self._progressive_meta.clear()
         if self._db:
             self._db.close()
             self._db = None
@@ -305,6 +366,7 @@ class SQLitePendingStore:
 
     def put(self, key: str, selection: PendingSelection) -> None:
         with self._lock:
+            self._progressive_meta.clear()
             self._get_db().execute(
                 "INSERT OR REPLACE INTO pending_selections "
                 "(key, chunks_json, format, created_at, total_chars, seq) "
@@ -362,7 +424,8 @@ class SQLitePendingStore:
         A miss must not wait on another writer before alternate-store recovery.
         A hit is authoritatively re-read after taking the write lock, so a
         concurrent refresh or replacement cannot be deleted using a stale read.
-        Only timestamp and recency rank are written on successful renewal.
+        Only timestamp and recency rank are written on renewal, except for a
+        one-time heading-index repair of legacy or malformed optional metadata.
         """
         with self._lock:
             db = self._get_db()
@@ -373,6 +436,7 @@ class SQLitePendingStore:
                 ).fetchone()
                 is None
             ):
+                self._progressive_meta.clear()
                 return None
             with db:
                 db.execute("BEGIN IMMEDIATE")
@@ -382,13 +446,21 @@ class SQLitePendingStore:
                     (key,),
                 ).fetchone()
                 if row is None:
+                    self._progressive_meta.clear()
                     return None
                 sel = self._decode_row(key, row)
                 now = time.time()
-                meta = _live_progressive_metadata(sel, now) if sel is not None else None
+                meta, repaired = (
+                    self._progressive_meta.read(key, sel, now) if sel is not None else (None, False)
+                )
                 if meta is None or sel is None:
                     db.execute("DELETE FROM pending_selections WHERE key = ?", (key,))
                     return None
+                if repaired:
+                    db.execute(
+                        "UPDATE pending_selections SET chunks_json = ? WHERE key = ?",
+                        (_json_dumps(sel.chunks, ensure_ascii=False), key),
+                    )
                 if renew:
                     db.execute(
                         f"UPDATE pending_selections SET created_at = ?, seq = {self._NEXT_SEQ} "
@@ -400,6 +472,7 @@ class SQLitePendingStore:
 
     def evict_progressive_expired(self) -> None:
         with self._lock:
+            self._progressive_meta.clear()
             db = self._get_db()
             with db:
                 db.execute("BEGIN IMMEDIATE")
@@ -445,6 +518,7 @@ class SQLitePendingStore:
 
     def delete(self, key: str) -> None:
         with self._lock:
+            self._progressive_meta.clear()
             self._get_db().execute("DELETE FROM pending_selections WHERE key = ?", (key,))
             self._get_db().commit()
 
@@ -461,6 +535,7 @@ class SQLitePendingStore:
             where += " AND format != ?"
             params.append(exclude_format)
         with self._lock:
+            self._progressive_meta.clear()
             self._get_db().execute(f"DELETE FROM pending_selections WHERE {where}", params)
             self._get_db().commit()
 
@@ -476,6 +551,7 @@ class SQLitePendingStore:
             where += " AND format != ?"
             params.append(exclude_format)
         with self._lock:
+            self._progressive_meta.clear()
             # Order on ``seq``, not ``created_at`` (#901). Recency here means
             # the order operations happened in, and ``seq`` records exactly
             # that: every put and every touch takes the next value.

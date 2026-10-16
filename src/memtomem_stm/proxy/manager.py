@@ -5041,6 +5041,7 @@ class ProxyManager:
         chunker = ProgressiveChunker(
             chunk_size=cfg.chunk_size,
             include_hint=cfg.include_structure_hint,
+            heading_index=resp.heading_index,
         )
         first = chunker.first_chunk_result(text, key, ttl_seconds=cfg.ttl_seconds)
         if self._progressive_reads_tracker is not None:
@@ -5142,7 +5143,9 @@ class ProxyManager:
                 # from a tuned ``progressive.chunk_size`` / hint preference.
                 chunk_size = limit or resp.chunk_size
                 chunker = ProgressiveChunker(
-                    chunk_size=chunk_size, include_hint=resp.include_structure_hint
+                    chunk_size=chunk_size,
+                    include_hint=resp.include_structure_hint,
+                    heading_index=resp.heading_index,
                 )
                 output = chunker.read_chunk_result(
                     resp.content, offset, limit, key=key, ttl_seconds=resp.ttl_seconds
