@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import stat
 import sys
 import tomllib
@@ -88,6 +89,62 @@ def test_save_registry_uses_0o600(sandbox_home):
 def test_load_projects_index_returns_empty_when_missing(sandbox_home):
     idx = state.load_projects_index()
     assert idx.projects == []
+
+
+@pytest.mark.parametrize("kind", ["directory", "fifo"])
+def test_projects_index_rejects_non_regular_path(tmp_path, kind):
+    path = tmp_path / "projects.toml"
+    if kind == "directory":
+        path.mkdir()
+    else:
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("FIFO creation requires POSIX")
+        os.mkfifo(path)
+    with pytest.raises(state.CorruptedConfig, match="regular file") as error:
+        state.load_projects_index(path)
+    assert error.value.path == path
+
+
+@pytest.mark.parametrize("target_kind", ["file", "directory", "missing"])
+def test_projects_index_symlink_follows_target(tmp_path, target_kind):
+    target = tmp_path / "target"
+    if target_kind == "file":
+        state.save_projects_index(state.ProjectsIndex(), target)
+    elif target_kind == "directory":
+        target.mkdir()
+    link = tmp_path / "projects.toml"
+    try:
+        link.symlink_to(target, target_is_directory=target_kind == "directory")
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlinks unavailable")
+    if target_kind == "directory":
+        with pytest.raises(state.CorruptedConfig, match="regular file"):
+            state.load_projects_index(link)
+    else:
+        assert state.load_projects_index(link) == state.ProjectsIndex()
+
+
+@pytest.mark.parametrize("operation", ["stat", "open"])
+@pytest.mark.parametrize("error_type", [PermissionError, NotADirectoryError, OSError])
+def test_projects_index_io_errors_are_safe_config_errors(
+    tmp_path, monkeypatch, operation, error_type
+):
+    path = tmp_path / "projects.toml"
+    state.save_projects_index(state.ProjectsIndex(), path)
+    original = getattr(Path, operation)
+
+    def fail_index(self, *args, **kwargs):
+        if self == path:
+            raise error_type("private-error-detail\x1b[31m")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, operation, fail_index)
+    with pytest.raises(state.CorruptedConfig) as error:
+        state.load_projects_index(path)
+    assert error.value.path == path
+    assert error_type.__name__ in str(error.value)
+    assert "private-error-detail" not in str(error.value)
+    assert "\x1b" not in str(error.value)
 
 
 def test_projects_index_round_trip(sandbox_home):
