@@ -111,8 +111,9 @@ def test_manager_reuses_index_with_fresh_chunkers(backend, tmp_path, monkeypatch
     for offset in (0, 80, 41, 0, 200):
         assert "[progressive:" in manager.read_more("key", offset)
     assert builds == [len(content)]
-    meta = json.loads(backend.get("key").chunks["__meta__"])
-    assert headings.INDEX_KEY in meta  # includes the cached empty result
+    chunks = backend.get("key").chunks
+    assert headings.INDEX_KEY in chunks  # includes the persisted empty result
+    assert headings.INDEX_KEY not in json.loads(chunks["__meta__"])
 
 
 def test_legacy_index_survives_sqlite_reopen(tmp_path, monkeypatch):
@@ -152,20 +153,20 @@ def test_replacement_and_eviction_own_index_lifetime(backend):
     adapter = ProgressiveStoreAdapter(backend)
     adapter.put("key", response("# old\nbody\n" * 10))
     adapter.put("key", response("plain body\n" * 10))
-    assert adapter.get("key").heading_index == ()
+    assert adapter.get("key").heading_index == b""
     adapter.evict(1800, 0)
     assert backend.get("key") is None
     adapter.put("key", response("# new\nbody\n" * 10))
     assert adapter.get("key").heading_index
 
 
-@pytest.mark.parametrize("index", [None, {}, [[True, 1, 2, 1, 1]], [[0, 2, 5, 0, 99]]])
+@pytest.mark.parametrize("index", ["", "{}", "v2:not-base64!", "v2:eA=="])
 def test_malformed_optional_index_repaired(backend, index):
     content = "# title\nbody\n" * 10
     backend.put(
         "key",
         PendingSelection(
-            chunks={"__content__": content, "__meta__": json.dumps({headings.INDEX_KEY: index})},
+            chunks={"__content__": content, "__meta__": "{}", headings.INDEX_KEY: index},
             format="progressive",
             created_at=time.monotonic(),
             total_chars=len(content),
@@ -202,22 +203,31 @@ def test_chunker_reconstruction_and_content_replacement():
         assert "".join(parts) == content
 
 
-def test_repeated_reads_do_not_decode_or_validate_index_again(backend, monkeypatch):
-    from memtomem_stm.proxy import pending_store
-
+def test_alternating_reads_only_inspect_logarithmic_and_displayed_rows(backend, monkeypatch):
     adapter = ProgressiveStoreAdapter(backend)
-    adapter.put("key", response("# title\nbody\n" * 100))
-    adapter.get("key")
+    content = "# title\nbody\n" * 4000
+    for key in ("a", "b"):
+        adapter.put(key, response(content))
 
     def forbidden(*args):
-        pytest.fail("unchanged metadata was decoded or validated again")
+        pytest.fail("alternating reads rebuilt index")
 
-    monkeypatch.setattr(pending_store, "_parse_progressive_metadata", forbidden)
-    monkeypatch.setattr(headings, "valid_heading_index", forbidden)
-    for _ in range(10):
-        assert adapter.get("key", renew=True).heading_index
-    adapter.delete("key")
-    assert backend._progressive_meta.meta is None
+    monkeypatch.setattr(headings, "build_heading_index", forbidden)
+    monkeypatch.setattr(progressive, "build_heading_index", forbidden)
+    original = headings._field
+    reads = []
+
+    def counted(*args):
+        reads.append(1)
+        return original(*args)
+
+    monkeypatch.setattr(headings, "_field", counted)
+    for key in ("a", "b") * 5:
+        resp = adapter.get(key, renew=True)
+        reads.clear()
+        chunker = ProgressiveChunker(40, heading_index=resp.heading_index)
+        assert "Remaining:" in chunker.read_chunk(resp.content, 0)
+        assert len(reads) <= 20  # binary search plus count, never a full validation walk
 
 
 def test_external_sqlite_replacement_invalidates_metadata_snapshot(tmp_path):
@@ -238,7 +248,6 @@ def test_external_sqlite_replacement_invalidates_metadata_snapshot(tmp_path):
         )
         write_adapter.delete("key")
         assert read_adapter.get("key") is None
-        assert reader._progressive_meta.meta is None
     finally:
         reader.close()
         writer.close()
@@ -299,3 +308,82 @@ def test_legacy_index_repair_writes_once_without_renewing(tmp_path):
         )
     finally:
         store.close()
+
+
+def test_eviction_only_parses_small_ttl_metadata(backend, monkeypatch):
+    from memtomem_stm.proxy import pending_store
+
+    adapter = ProgressiveStoreAdapter(backend)
+    adapter.put("key", response("# comment\ncode()\n" * 40000))
+    chunks = backend.get("key").chunks
+    assert len(chunks["__meta__"]) < 1024
+    assert len(chunks[headings.INDEX_KEY]) <= headings.MAX_ENCODED
+    seen = []
+    original = pending_store._parse_progressive_metadata
+
+    def parsed(raw):
+        seen.append(len(raw))
+        return original(raw)
+
+    def forbidden(*args):
+        pytest.fail("expiry cleanup decoded the heading index")
+
+    monkeypatch.setattr(pending_store, "_parse_progressive_metadata", parsed)
+    monkeypatch.setattr(headings, "decode_heading_index", forbidden)
+    adapter.evict(1800, 200)
+    assert seen and max(seen) < 1024
+    assert backend.get("key") is not None
+
+
+def test_codec_roundtrip_and_size_on_comment_heavy_source():
+    content = "\n".join(
+        f"# comment number {i} explaining things\nx_{i} = compute({i})" for i in range(40000)
+    )
+    index = headings.build_heading_index(content)
+    encoded = headings.encode_heading_index(index)
+    assert encoded != "scan"
+    assert len(encoded) < len(content) // 20
+    assert headings.decode_heading_index(encoded) == index
+    for offset in (0, 1, 4000, len(content) // 2, len(content)):
+        assert headings.remaining_headings(content, offset, index) == old_hint(content, offset)
+
+
+@pytest.mark.parametrize("limit", ["rows", "encoded"])
+def test_index_limit_persists_fallback_without_rebuilding(backend, monkeypatch, limit):
+    if limit == "rows":
+        monkeypatch.setattr(headings, "MAX_BYTES", 20)
+    else:
+        monkeypatch.setattr(headings, "MAX_ENCODED", 5)
+    content = "# title\nbody\n" * 20
+    adapter = ProgressiveStoreAdapter(backend)
+    adapter.put("key", response(content))
+    assert backend.get("key").chunks[headings.INDEX_KEY] == "scan"
+
+    def forbidden(*args):
+        pytest.fail("oversized index rebuilt")
+
+    monkeypatch.setattr(headings, "build_heading_index", forbidden)
+    for _ in range(3):
+        resp = adapter.get("key")
+        assert resp.heading_index == headings.FALLBACK
+        assert headings.remaining_headings(content, 40, resp.heading_index) == old_hint(content, 40)
+
+
+def test_decoder_bounds_expansion_and_rejects_trailing_stream():
+    import base64
+    import zlib
+
+    oversized = "v2:" + base64.b64encode(zlib.compress(b"x" * (headings.MAX_BYTES + 20))).decode()
+    assert headings.decode_heading_index(oversized) is None
+    trailing = "v2:" + base64.b64encode(zlib.compress(b"") + b"trailing").decode()
+    assert headings.decode_heading_index(trailing) is None
+    assert headings.decode_heading_index("v2:" + "A" * headings.MAX_ENCODED) is None
+
+
+def test_bad_touched_record_falls_back_without_crashing():
+    import struct
+
+    content = "# title\nbody\n"
+    for row in [(0, 2, 999, 1, 1), (0, 2, 7, 0, 1), (0, 2, 7, 1, 999)]:
+        index = struct.pack("<IIIII", *row)
+        assert headings.remaining_headings(content, 0, index) == old_hint(content, 0)

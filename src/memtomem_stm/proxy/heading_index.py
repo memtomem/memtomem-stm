@@ -1,72 +1,146 @@
-"""Persistable suffix-heading index for progressive responses (#1153)."""
+"""Bounded, compact suffix-heading indexes for progressive responses (#1153)."""
 
+import base64
+import binascii
 import re
-from bisect import bisect_left
+import struct
+import zlib
 from typing import Any
 
-# Lookahead records overlapping candidates too: ``# \n# title`` can match
-# differently when a read starts at the second line. Links reproduce findall's
-# non-overlapping matches from any requested offset without rescanning text.
 _CANDIDATES = re.compile(r"(?=((?:^|\n)#{1,6}\s+(.+)))")
-INDEX_KEY = "heading_index_v1"
-# Each record: regex start, title start, match end, next record, suffix count.
-HeadingIndex = tuple[tuple[int, ...], ...]
+_HEADING_RE = re.compile(r"(?:^|\n)#{1,6}\s+(.+)")
+INDEX_KEY = "__heading_index__"
+# Binary records: regex start, title start, match end, next record, suffix count.
+_RECORD = struct.Struct("<IIIII")
+MAX_ROWS = 100_000
+MAX_BYTES = MAX_ROWS * _RECORD.size
+MAX_ENCODED = 128 * 1024
+FALLBACK = b"scan"
+HeadingIndex = bytes
+
+
+def _field(rows: bytes | bytearray, i: int, field: int) -> int:
+    return struct.unpack_from("<I", rows, i * _RECORD.size + field * 4)[0]
+
+
+def _lower_bound(rows: bytes | bytearray, start: int, lo: int = 0) -> int:
+    hi = len(rows) // _RECORD.size
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _field(rows, mid, 0) < start:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
 
 
 def build_heading_index(content: str) -> HeadingIndex:
-    rows = [[m.start(1), m.start(2), m.end(1), 0, 0] for m in _CANDIDATES.finditer(content)]
-    for i in range(len(rows) - 1, -1, -1):
-        nxt = bisect_left(rows, rows[i][2], lo=i + 1, key=lambda row: row[0])
-        rows[i][3] = nxt
-        rows[i][4] = 1 + (rows[nxt][4] if nxt < len(rows) else 0)
-    return tuple(tuple(row) for row in rows)
+    if len(content) >= 2**32:
+        return FALLBACK
+    rows = bytearray()
+    # Lookahead preserves overlapping candidates such as '# \n# title'.
+    # Stop before a pathological response allocates an unbounded index.
+    for m in _CANDIDATES.finditer(content):
+        if len(rows) == MAX_BYTES:
+            return FALLBACK
+        rows.extend(_RECORD.pack(m.start(1), m.start(2), m.end(1), 0, 0))
+    n = len(rows) // _RECORD.size
+    for i in range(n - 1, -1, -1):
+        nxt = _lower_bound(rows, _field(rows, i, 2), i + 1)
+        count = 1 + (_field(rows, nxt, 4) if nxt < n else 0)
+        struct.pack_into("<II", rows, i * _RECORD.size + 12, nxt, count)
+    return bytes(rows)
 
 
 def valid_heading_index(value: Any, length: int) -> bool:
-    """Reject malformed optional indexes; legacy/corrupt indexes are rebuilt."""
-    if not isinstance(value, (list, tuple)):
-        return False
-    previous = -1
-    for row in value:
+    # Structural bounds only. Query checks the O(log h + 5) records it touches;
+    # never walk all headings on a read or a switch between response keys.
+    return isinstance(value, bytes) and (
+        value == FALLBACK or (len(value) <= MAX_BYTES and len(value) % _RECORD.size == 0)
+    )
+
+
+def encode_heading_index(rows: HeadingIndex) -> str:
+    if rows == FALLBACK:
+        return "scan"
+    # Byte shuffling exposes similar high bytes to zlib without Python integer
+    # arrays or per-record JSON. Inverse uses 20 C-level extended slice copies.
+    shuffled = b"".join(rows[i :: _RECORD.size] for i in range(_RECORD.size))
+    encoded = base64.b64encode(zlib.compress(shuffled)).decode("ascii")
+    return "v2:" + encoded if len(encoded) + 3 <= MAX_ENCODED else "scan"
+
+
+def decode_heading_index(value: Any) -> HeadingIndex | None:
+    if value == "scan":
+        return FALLBACK
+    if not isinstance(value, str) or not value.startswith("v2:") or len(value) > MAX_ENCODED:
+        return None
+    try:
+        packed = base64.b64decode(value[3:], validate=True)
+        decoder = zlib.decompressobj()
+        shuffled = decoder.decompress(packed, MAX_BYTES + 1)
         if (
-            not isinstance(row, (list, tuple))
-            or len(row) != 5
-            or any(type(v) is not int for v in row)
+            not decoder.eof
+            or decoder.unused_data
+            or len(shuffled) > MAX_BYTES
+            or len(shuffled) % _RECORD.size
         ):
-            return False
-        start, title, end, _, _ = row
-        if not previous < start < title < end <= length:
-            return False
-        previous = start
-    for i in range(len(value) - 1, -1, -1):
-        nxt = bisect_left(value, value[i][2], lo=i + 1, key=lambda row: row[0])
-        if value[i][3] != nxt or value[i][4] != 1 + (value[nxt][4] if nxt < len(value) else 0):
-            return False
-    return True
+            return None
+        n = len(shuffled) // _RECORD.size
+        rows = bytearray(len(shuffled))
+        for i in range(_RECORD.size):
+            rows[i :: _RECORD.size] = shuffled[i * n : (i + 1) * n]
+        return bytes(rows)
+    except (ValueError, binascii.Error, zlib.error):
+        return None
 
 
-def ensure_heading_index(content: str, meta: dict[str, Any]) -> bool:
-    """Populate once while the caller holds the entry's mutation lock."""
-    if not meta.get("include_structure_hint", True):
-        return False
-    if valid_heading_index(meta.get(INDEX_KEY), len(content)):
-        return False
-    meta[INDEX_KEY] = build_heading_index(content)
-    return True
+def ensure_heading_index(content: str, chunks: dict[str, str]) -> tuple[HeadingIndex, bool]:
+    rows = decode_heading_index(chunks.get(INDEX_KEY))
+    if rows is not None:
+        return rows, False
+    rows = build_heading_index(content)
+    encoded = encode_heading_index(rows)
+    chunks[INDEX_KEY] = encoded
+    return (FALLBACK if encoded == "scan" else rows), True
 
 
-def remaining_headings(content: str, offset: int, rows: HeadingIndex) -> str:
+def legacy_remaining_headings(content: str, offset: int) -> str:
     start = offset - 1 if offset > 0 and content[offset - 1] == "\n" else offset
-    i = bisect_left(rows, start, key=lambda row: row[0])
-    if i == len(rows):
-        return ""
-    count = rows[i][4]
-    shown = []
-    for _ in range(min(5, count)):
-        row = rows[i]
-        shown.append(f'"{content[row[1] : row[2]].strip()}"')
-        i = row[3]
-    result = ", ".join(shown)
+    titles = _HEADING_RE.findall(content, start)
+    return _render([title.strip() for title in titles[:5]], len(titles))
+
+
+def _render(titles: list[str], count: int) -> str:
+    result = ", ".join(f'"{title}"' for title in titles)
     if count > 5:
         result += f", ... (+{count - 5} more)"
     return result
+
+
+def remaining_headings(content: str, offset: int, rows: HeadingIndex) -> str:
+    if rows == FALLBACK:
+        return legacy_remaining_headings(content, offset)
+    start = offset - 1 if offset > 0 and content[offset - 1] == "\n" else offset
+    if not valid_heading_index(rows, len(content)):
+        return legacy_remaining_headings(content, offset)
+    n = len(rows) // _RECORD.size
+    i = _lower_bound(rows, start)
+    if i == n:
+        return ""
+    count = _field(rows, i, 4)
+    if not 1 <= count <= n - i:
+        return legacy_remaining_headings(content, offset)
+    titles = []
+    for step in range(min(5, count)):
+        begin, title, end, nxt, remaining = _RECORD.unpack_from(rows, i * _RECORD.size)
+        if not (
+            start <= begin < title < end <= len(content)
+            and i < nxt <= n
+            and remaining == count - step
+            and (nxt < n if remaining > 1 else nxt == n)
+        ):
+            return legacy_remaining_headings(content, offset)
+        titles.append(content[title:end].strip())
+        start, i = end, nxt
+    return _render(titles, count)

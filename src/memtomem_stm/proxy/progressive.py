@@ -16,6 +16,8 @@ from memtomem_stm.proxy.heading_index import (
     HeadingIndex,
     build_heading_index,
     remaining_headings,
+    encode_heading_index,
+    legacy_remaining_headings,
 )
 from memtomem_stm.proxy.pending_store import PendingStore
 from memtomem_stm.utils.json_out import dumps as _json_dumps
@@ -84,7 +86,6 @@ class ProgressiveStoreAdapter:
                 "trace_id": resp.trace_id,
                 "chunk_size": resp.chunk_size,
                 "include_structure_hint": resp.include_structure_hint,
-                INDEX_KEY: resp.heading_index,
             },
             ensure_ascii=False,
         )
@@ -94,6 +95,8 @@ class ProgressiveStoreAdapter:
             created_at=resp.created_at,
             total_chars=resp.total_chars,
         )
+        if resp.heading_index is not None:
+            selection.chunks[INDEX_KEY] = encode_heading_index(resp.heading_index)
         self._store.put(key, selection)
 
     def get(self, key: str, *, renew: bool = False) -> ProgressiveResponse | None:
@@ -115,7 +118,7 @@ class ProgressiveStoreAdapter:
             trace_id=meta.get("trace_id"),
             chunk_size=meta.get("chunk_size", 4000),
             include_structure_hint=meta.get("include_structure_hint", True),
-            heading_index=meta.get(INDEX_KEY),
+            heading_index=entry.heading_index,
         )
 
     def touch(self, key: str) -> None:
@@ -326,7 +329,7 @@ class ProgressiveChunker:
     @staticmethod
     def _remaining_headings(content: str, from_offset: int) -> str:
         """Return a compact list of markdown headings after *from_offset*."""
-        return remaining_headings(content, from_offset, build_heading_index(content))
+        return legacy_remaining_headings(content, from_offset)
 
     @staticmethod
     def detect_content_type(text: str) -> str:

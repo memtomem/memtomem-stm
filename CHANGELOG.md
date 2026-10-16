@@ -11,11 +11,14 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
-### Fixed
+### Changed
 
-- progressive: index remaining headings once per response instead of scanning the
-  remaining body on each chunk; persist the index across SQLite restart and repair
-  legacy entries on first valid read (#1153).
+- progressive: use a bounded, compressed heading index for sequential and interleaved
+  chunk reads; store it separately from TTL metadata so expiry cleanup stays cheap.
+  Persist indexes across SQLite restart and repair legacy entries on first valid
+  read. Responses exceeding the index limits retain suffix scanning (#1153).
+
+### Fixed
 
 - progressive: enforce each response's stored sliding TTL before renewal and
   during publication cleanup, using backend-local clocks and atomic expiry checks
