@@ -13,6 +13,17 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- progressive: enforce each response's stored sliding TTL before renewal and
+  during publication cleanup, using backend-local clocks and atomic expiry checks
+  (#1155, #1157). **Behavior change**: expired or malformed progressive entries cannot
+  be renewed; absent metadata or an invalid explicit TTL is a miss instead of a
+  default lifetime.
+  Configured `ttl_seconds: 0` now expires immediately: the initial chunk is
+  delivered, with an expiry notice instead of a command when content remains. SELECTIVE
+  retrieval rejects progressive keys, preventing cross-strategy TTL revival.
+  Legacy metadata objects without TTL retain the 1,800-second default. Upgrade
+  all processes sharing a SQLite pending-store file together.
+
 - security: require MCP SDK 2.2.0 or newer to address CVE-2026-59951
   (unbounded StreamableHTTP session accumulation), and refresh the lockfile (#1156).
 

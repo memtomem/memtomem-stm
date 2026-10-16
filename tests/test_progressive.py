@@ -403,8 +403,8 @@ class TestProgressiveStoreAdapter:
             assert store.get("broken") is None
         assert any("missing __content__" in r.message for r in caplog.records)
 
-    def test_corrupted_meta_uses_defaults(self, caplog):
-        """Corrupted __meta__ JSON should log and fall back to defaults."""
+    def test_corrupted_meta_is_a_miss(self, caplog):
+        """Corrupted metadata must not silently extend retention with defaults."""
         backing = InMemoryPendingStore()
         backing.put(
             "bad_meta",
@@ -418,10 +418,8 @@ class TestProgressiveStoreAdapter:
         store = ProgressiveStoreAdapter(backing)
         with caplog.at_level("WARNING"):
             got = store.get("bad_meta")
-        assert got is not None
-        assert got.content == "hello"
-        assert got.content_type == "text"  # default
-        assert any("Corrupted __meta__ JSON" in r.message for r in caplog.records)
+        assert got is None
+        assert backing.get("bad_meta") is None
 
     def test_touch_does_not_error(self):
         store = ProgressiveStoreAdapter(InMemoryPendingStore())
@@ -557,6 +555,15 @@ class TestProgressiveConfig:
 
 
 class TestProgressiveTTL:
+    @pytest.mark.parametrize("key", ["key1", ""])
+    def test_zero_ttl_shows_expiry_without_followup_command(self, key):
+        chunker = ProgressiveChunker(chunk_size=100)
+        result = chunker.first_chunk("x" * 500, key, ttl_seconds=0)
+        assert "x" * 100 in result
+        assert "ttl=0s" in result
+        assert "follow-up reads unavailable" in result
+        assert "stm_proxy_read_more" not in result
+
     def test_first_chunk_includes_ttl(self):
         """First chunk footer must expose TTL when provided."""
         chunker = ProgressiveChunker(chunk_size=100)

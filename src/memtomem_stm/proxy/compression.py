@@ -1076,7 +1076,9 @@ class SelectiveCompressor:
         self._store.evict_expired(self._ttl, exclude_format="progressive")
 
         pending = self._store.get(key)
-        if pending is None:
+        # Both strategies may share one SQLite file. Only read_more may read
+        # or renew progressive rows, using their entry-local expiry checks.
+        if pending is None or pending.format == "progressive":
             return f"Selection key '{key}' not found or expired."
 
         self._store.touch(key)
