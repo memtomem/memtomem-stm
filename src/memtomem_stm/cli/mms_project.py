@@ -204,7 +204,7 @@ def _load_index_before_project_change() -> state.ProjectsIndex:
                 )
         return state.load_projects_index()
     except state.MmsConfigError as exc:
-        raise click.ClickException(f"{_disp(str(exc))} No project settings were written.") from exc
+        raise click.ClickException(f"{_disp(str(exc))}\nNo project settings were written.") from exc
     except (OSError, UnicodeError) as exc:
         raise click.ClickException(
             f"Cannot read projects index {_disp(str(path))}: {type(exc).__name__}. "
@@ -217,6 +217,13 @@ def _save_project_change(
 ) -> None:
     """Save under the caller's write lock, exposing partial completion honestly."""
     updated = state.upsert_project_in_index(index, name=proj.name, path=str(proj.root))
+    try:
+        state.serialize_projects_index(updated)
+    except (TypeError, ValueError) as exc:
+        raise click.ClickException(
+            f"Cannot serialize projects index {_disp(str(state.projects_index_path()))}: "
+            f"{type(exc).__name__}. No project settings were written."
+        ) from exc
     assert proj.marker_path is not None
     try:
         state.save_project_config(config, proj.marker_path)

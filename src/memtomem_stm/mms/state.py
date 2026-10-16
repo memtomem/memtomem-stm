@@ -425,10 +425,17 @@ def save_registry(config: RegistryConfig, path: Path | None = None) -> None:
     atomic_write_text(p, tomli_w.dumps(config.model_dump()), mode=_REGISTRY_MODE, durable=True)
 
 
+def serialize_projects_index(index: ProjectsIndex) -> str:
+    """Serialize and validate UTF-8 without writing, for multi-file preflight."""
+    text = tomli_w.dumps(index.model_dump())
+    text.encode("utf-8")
+    return text
+
+
 def save_projects_index(index: ProjectsIndex, path: Path | None = None) -> None:
     """Atomically write ``projects.toml`` with mode 0o600 (paths are private)."""
     p = path or projects_index_path()
-    atomic_write_text(p, tomli_w.dumps(index.model_dump()), mode=_PROJECTS_INDEX_MODE, durable=True)
+    atomic_write_text(p, serialize_projects_index(index), mode=_PROJECTS_INDEX_MODE, durable=True)
 
 
 def save_project_config(config: ProjectConfig, path: Path) -> None:

@@ -1,11 +1,13 @@
 """Project toggles preflight the index and report partial saves (#1145)."""
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
 from helpers import set_home
+from memtomem_stm.cli import mms_project
 from memtomem_stm.cli.mms_project import project_group
 from memtomem_stm.mms import state
 
@@ -33,6 +35,27 @@ def prepare(project, command, named):
     if command == "disable":
         assert runner.invoke(project_group, ["enable", "tool"]).exit_code == 0
     return [command, "tool", *(["--project", "p"] if named else [])]
+
+
+@pytest.mark.parametrize("command", ["enable", "disable"])
+def test_unencodable_root_preserves_both_files(project, monkeypatch, command):
+    runner, marker = project
+    argv = prepare(project, command, False)
+    detected = mms_project.detect_project(marker.parent.parent)
+    # Inject path data, not a save failure: the real serializer must reject it.
+    detected = replace(detected, root=marker.parent.parent / "secret-path-\udcff")
+    monkeypatch.setattr(mms_project, "detect_project", lambda _: detected)
+    before_marker = marker.read_bytes()
+    before_index = state.projects_index_path().read_bytes()
+    for _ in range(2):
+        result = runner.invoke(project_group, argv)
+        assert result.exit_code == 1
+        assert "UnicodeEncodeError" in result.stderr
+        assert "No project settings were written." in result.stderr
+        assert "secret-path" not in result.output
+        assert "Project settings were saved" not in result.output
+        assert marker.read_bytes() == before_marker
+        assert state.projects_index_path().read_bytes() == before_index
 
 
 @pytest.mark.parametrize("command", ["enable", "disable"])
