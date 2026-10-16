@@ -20,6 +20,11 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- cli: validate the projects index before `mms project enable/disable` writes the
+  marker (#1145, #1161). **Behavior change**: index read failures leave project settings
+  unchanged; if a later index write fails after the marker was saved, exit 1 with
+  explicit partial-completion and rerun guidance instead of implying no change.
+
 - progressive: enforce each response's stored sliding TTL before renewal and
   during publication cleanup, using backend-local clocks and atomic expiry checks
   (#1155, #1157). **Behavior change**: expired or malformed progressive entries cannot

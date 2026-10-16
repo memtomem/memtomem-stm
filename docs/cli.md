@@ -1110,6 +1110,8 @@ Options:
 
 `enable` validates every requested name against the registry and rejects unknown ones, listing the registered set as a hint — register or import the MCP first, then enable it. (The validity check was originally deferred to sync time, but no sync surface ever consumed the project enabled list, so a typo would have sat in `project.toml` and silently resolved to nothing at proxy time.) `disable` stays registry-agnostic by design.
 
+Both commands read and validate the projects index before writing the marker. An unreadable or invalid index fails without changing project settings. If the marker is saved but the subsequent index write fails, the command exits 1 and reports the partial completion; it does not roll back the marker. Fix the index write problem and rerun the same command to refresh the index. Repeating an already applied enable/disable is safe and still refreshes the index. The two files are not a single atomic transaction.
+
 ### `mms project route`
 
 ```

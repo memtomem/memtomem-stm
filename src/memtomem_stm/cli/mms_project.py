@@ -152,12 +152,15 @@ def _load_named_project(entry: state.ProjectIndexEntry) -> Project:
         raise click.ClickException(message) from exc
 
 
-def _resolve_project_for_mutation(project_name: str | None) -> Project:
+def _resolve_project_for_mutation(
+    project_name: str | None, *, index: state.ProjectsIndex | None = None
+) -> Project:
     """Resolve which project a mutation (enable/disable) targets.
 
     Without ``--project NAME``: detect from cwd; require a marker
     (init suggested otherwise). With ``--project NAME``: look up in
-    the projects index and load that project's marker.
+    the projects index and load that project's marker. A supplied ``index``
+    reuses the caller's preflight snapshot; otherwise named lookup loads it.
     """
     if project_name is None:
         p = detect_project(Path.cwd())
@@ -169,7 +172,7 @@ def _resolve_project_for_mutation(project_name: str | None) -> Project:
         return p
 
     # --project NAME path
-    idx = state.load_projects_index()
+    idx = index if index is not None else state.load_projects_index()
     matches = [entry for entry in idx.projects if entry.name == project_name]
     if not matches:
         raise click.ClickException(
@@ -185,11 +188,62 @@ def _resolve_project_for_mutation(project_name: str | None) -> Project:
     return _load_named_project(matches[0])
 
 
-def _refresh_index(name: str, root: Path) -> None:
-    """Upsert ``(name, root)`` into the projects index."""
-    idx = state.load_projects_index()
-    idx = state.upsert_project_in_index(idx, name=name, path=str(root))
-    state.save_projects_index(idx)
+def _load_index_before_project_change() -> state.ProjectsIndex:
+    """Fail before writing a marker when the index cannot be read."""
+    path = state.projects_index_path()
+    try:
+        try:
+            mode = path.stat().st_mode
+        except FileNotFoundError:
+            pass  # A missing index is the supported empty-index case.
+        else:
+            if not stat.S_ISREG(mode):
+                raise click.ClickException(
+                    f"Cannot read projects index {_disp(str(path))}: not a regular file. "
+                    "No project settings were written."
+                )
+        return state.load_projects_index()
+    except state.MmsConfigError as exc:
+        raise click.ClickException(f"{_disp(str(exc))}\nNo project settings were written.") from exc
+    except (OSError, UnicodeError) as exc:
+        raise click.ClickException(
+            f"Cannot read projects index {_disp(str(path))}: {type(exc).__name__}. "
+            "No project settings were written."
+        ) from exc
+
+
+def _save_project_change(
+    proj: Project, config: state.ProjectConfig, index: state.ProjectsIndex
+) -> None:
+    """Save under the caller's write lock, exposing partial completion honestly."""
+    updated = state.upsert_project_in_index(index, name=proj.name, path=str(proj.root))
+    try:
+        state.serialize_projects_index(updated)
+    except (TypeError, ValueError) as exc:
+        raise click.ClickException(
+            f"Cannot serialize projects index {_disp(str(state.projects_index_path()))}: "
+            f"{type(exc).__name__}. No project settings were written."
+        ) from exc
+    assert proj.marker_path is not None
+    try:
+        state.save_project_config(config, proj.marker_path)
+    except OSError as exc:
+        # A durable write may fail after replacement; do not promise rollback.
+        raise click.ClickException(
+            f"Could not confirm saving project marker {_disp(str(proj.marker_path))}: "
+            f"{type(exc).__name__}. The projects index was not updated. "
+            "Resolve the write error, inspect project settings, and rerun the same command."
+        ) from exc
+    try:
+        state.save_projects_index(updated)
+    except (OSError, UnicodeError) as exc:
+        raise click.ClickException(
+            f"Project settings were saved to {_disp(str(proj.marker_path))}, "
+            f"but saving projects index {_disp(str(state.projects_index_path()))} "
+            f"could not be confirmed: {type(exc).__name__}. "
+            "Resolve the index write error and rerun the same command to refresh it; "
+            "project settings have not been rolled back."
+        ) from exc
 
 
 def _registry_route_entry(
@@ -430,7 +484,8 @@ def list_cmd(prune: bool, json_output: bool) -> None:
 @with_write_lock
 def enable_cmd(mcps: tuple[str, ...], project_name: str | None) -> None:
     """Add MCP names to the project's enabled list."""
-    proj = _resolve_project_for_mutation(project_name)
+    index = _load_index_before_project_change()
+    proj = _resolve_project_for_mutation(project_name, index=index)
 
     registry = state.load_registry()
     if not registry.servers:
@@ -464,9 +519,7 @@ def enable_cmd(mcps: tuple[str, ...], project_name: str | None) -> None:
         project=proj.config.project,
         mcp=state.ProjectMcp(enabled=current),
     )
-    assert proj.marker_path is not None
-    state.save_project_config(new_cfg, proj.marker_path)
-    _refresh_index(proj.name, proj.root)
+    _save_project_change(proj, new_cfg, index)
 
     if added:
         click.echo(f"Enabled in '{_disp(proj.name)}': {_disp(', '.join(added))}")
@@ -640,7 +693,8 @@ def disable_cmd(mcps: tuple[str, ...], project_name: str | None) -> None:
     Runs against the project state only — does not consult the registry,
     so disable works even when the registry is empty.
     """
-    proj = _resolve_project_for_mutation(project_name)
+    index = _load_index_before_project_change()
+    proj = _resolve_project_for_mutation(project_name, index=index)
 
     assert proj.config is not None
     current = list(proj.config.mcp.enabled)
@@ -655,9 +709,7 @@ def disable_cmd(mcps: tuple[str, ...], project_name: str | None) -> None:
         project=proj.config.project,
         mcp=state.ProjectMcp(enabled=current),
     )
-    assert proj.marker_path is not None
-    state.save_project_config(new_cfg, proj.marker_path)
-    _refresh_index(proj.name, proj.root)
+    _save_project_change(proj, new_cfg, index)
 
     if removed:
         click.echo(f"Disabled in '{_disp(proj.name)}': {_disp(', '.join(removed))}")
