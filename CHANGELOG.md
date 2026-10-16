@@ -21,7 +21,7 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - cli: validate the projects index before `mms project enable/disable` writes the
-  marker (#1145). **Behavior change**: index read failures leave project settings
+  marker (#1145, #1161). **Behavior change**: index read failures leave project settings
   unchanged; if a later index write fails after the marker was saved, exit 1 with
   explicit partial-completion and rerun guidance instead of implying no change.
 
