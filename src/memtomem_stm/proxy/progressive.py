@@ -7,19 +7,12 @@ it in chunks on demand — like Claude Code reads files 150 lines at a time.
 from __future__ import annotations
 
 import json
-import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 from memtomem_stm.proxy.compression import PendingSelection
+from memtomem_stm.proxy.pending_store import PendingStore
 from memtomem_stm.utils.json_out import dumps as _json_dumps
-from memtomem_stm.utils.json_out import scrub_lone_surrogates
-
-if TYPE_CHECKING:
-    from memtomem_stm.proxy.pending_store import PendingStore
-
-logger = logging.getLogger(__name__)
 
 _HEADING_RE = re.compile(r"(?:^|\n)#{1,6}\s+(.+)")
 
@@ -61,8 +54,8 @@ class ProgressiveResponse:
 class ProgressiveStoreAdapter:
     """Adapts PendingStore for progressive delivery storage.
 
-    Reuses the existing PendingStore (InMemory or SQLite) without changes
-    by encoding ProgressiveResponse into PendingSelection with format="progressive".
+    Encodes ProgressiveResponse with format="progressive"; backing stores
+    atomically validate its TTL against their own clock before renewal.
     """
 
     def __init__(self, store: PendingStore) -> None:
@@ -92,27 +85,13 @@ class ProgressiveStoreAdapter:
         )
         self._store.put(key, selection)
 
-    def get(self, key: str) -> ProgressiveResponse | None:
-        sel = self._store.get(key)
-        if sel is None or sel.format != "progressive":
+    def get(self, key: str, *, renew: bool = False) -> ProgressiveResponse | None:
+        entry = self._store.get_progressive(key, renew=renew)
+        if entry is None:
             return None
-        content = sel.chunks.get("__content__")
-        if content is None:
-            logger.warning(
-                "Progressive entry missing __content__ for key=%s; treating as miss", key
-            )
-            return None
-        try:
-            # The backing store scrubs its own chunk payload, but this parses
-            # a JSON document nested *inside* one of those chunks — an escape
-            # surviving that outer scrub decodes back to the code unit here
-            # (#781).
-            meta = scrub_lone_surrogates(json.loads(sel.chunks.get("__meta__", "{}")))
-        except json.JSONDecodeError:
-            logger.warning("Corrupted __meta__ JSON for progressive key=%s; using defaults", key)
-            meta = {}
+        sel, meta = entry.selection, entry.metadata
         return ProgressiveResponse(
-            content=content,
+            content=sel.chunks["__content__"],
             total_chars=sel.total_chars,
             total_lines=meta.get("total_lines", 0),
             content_type=meta.get("content_type", "text"),
@@ -128,13 +107,15 @@ class ProgressiveStoreAdapter:
         )
 
     def touch(self, key: str) -> None:
-        self._store.touch(key)
+        self._store.get_progressive(key, renew=True)
 
     def delete(self, key: str) -> None:
         self._store.delete(key)
 
     def evict(self, ttl: float, max_size: int) -> None:
-        self._store.evict_expired(ttl, format="progressive")
+        # Keep the positional ttl argument for callers, but the publisher's
+        # TTL must never set another response's lifetime.
+        self._store.evict_progressive_expired()
         self._store.evict_oldest(max_size, format="progressive")
 
     def close(self) -> None:

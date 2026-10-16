@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from memtomem_stm.proxy.compression import PendingSelection
 from memtomem_stm.utils.json_out import dumps as _json_dumps
@@ -18,6 +20,51 @@ from memtomem_stm.utils.sqlite_private import ensure_private_db_files
 from memtomem_stm.utils.sqlite_tuning import tune_connection
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_progressive_metadata(raw: str | bytes | None) -> dict[str, Any] | None:
+    """Validate persisted progressive metadata without extending invalid TTLs.
+
+    Legacy objects without a TTL retain the historical 1800-second default.
+    A malformed object or an explicit invalid TTL is a miss, not a default.
+    """
+    try:
+        meta = scrub_lone_surrogates(json.loads(raw)) if raw is not None else None
+        if not isinstance(meta, dict):
+            return None
+        ttl = meta.get("ttl_seconds", 1800.0)
+        if isinstance(ttl, bool) or not isinstance(ttl, (int, float)):
+            return None
+        if not math.isfinite(ttl) or ttl < 0:
+            return None
+    except (ValueError, TypeError, OverflowError, RecursionError):
+        return None
+    return meta
+
+
+def _metadata_live(meta: dict[str, Any], created_at: float, now: float) -> bool:
+    ttl = meta.get("ttl_seconds", 1800.0)
+    return ttl > 0 and now - created_at < ttl
+
+
+def _live_progressive_metadata(selection: PendingSelection, now: float) -> dict[str, Any] | None:
+    if not isinstance(selection.chunks, dict):
+        return None
+    if not isinstance(selection.chunks.get("__content__"), str):
+        logger.warning("Progressive entry missing __content__; treating as miss")
+        return None
+    meta = _parse_progressive_metadata(selection.chunks.get("__meta__"))
+    if meta is None or not _metadata_live(meta, selection.created_at, now):
+        return None
+    return meta
+
+
+@dataclass(frozen=True)
+class ProgressiveEntry:
+    """A live snapshot with metadata validated under the backend's lock."""
+
+    selection: PendingSelection
+    metadata: dict[str, Any]
 
 
 class PendingStore(Protocol):
@@ -32,10 +79,17 @@ class PendingStore(Protocol):
     keep different clocks (``InMemoryPendingStore`` monotonic,
     ``SQLitePendingStore`` wall), so ``created_at`` values are not comparable
     across them. ``evict_expired`` ages rows against the backend's own clock.
+
+    Progressive reads use ``get_progressive``: expiry validation and optional
+    renewal are atomic with deletion/replacement, and use each entry's stored
+    TTL. ``evict_progressive_expired`` applies that same policy store-wide.
+    Generic get/touch/evict_expired retain SELECTIVE's separate policy.
     """
 
     def put(self, key: str, selection: PendingSelection) -> None: ...
     def get(self, key: str) -> PendingSelection | None: ...
+    def get_progressive(self, key: str, *, renew: bool = False) -> ProgressiveEntry | None: ...
+    def evict_progressive_expired(self) -> None: ...
     def touch(self, key: str) -> None: ...
     def delete(self, key: str) -> None: ...
     def evict_expired(
@@ -73,6 +127,37 @@ class InMemoryPendingStore:
     def get(self, key: str) -> PendingSelection | None:
         with self._lock:
             return self._data.get(key)
+
+    def get_progressive(self, key: str, *, renew: bool = False) -> ProgressiveEntry | None:
+        """Check expiry and optionally renew under the same mutation lock."""
+        with self._lock:
+            sel = self._data.get(key)
+            if sel is None or sel.format != "progressive":
+                return None
+            now = time.monotonic()
+            meta = _live_progressive_metadata(sel, now)
+            if meta is None:
+                del self._data[key]
+                self._order.remove(key)
+                return None
+            if renew:
+                sel.created_at = now
+                self._order.remove(key)
+                self._order.append(key)
+            return ProgressiveEntry(replace(sel, chunks=dict(sel.chunks)), meta)
+
+    def evict_progressive_expired(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            expired = {
+                key
+                for key, sel in self._data.items()
+                if sel.format == "progressive" and _live_progressive_metadata(sel, now) is None
+            }
+            for key in expired:
+                del self._data[key]
+            if expired:
+                self._order = deque(key for key in self._order if key not in expired)
 
     def touch(self, key: str) -> None:
         with self._lock:
@@ -133,7 +218,10 @@ class SQLitePendingStore:
     non-SELECTIVE strategy through its ``sqlite3.Error`` guard rather than
     failing the call). Reads and expiry from the older code keep working, so an
     upgrade strands no key that is already out — but the instances have to be
-    upgraded together rather than one at a time.
+    upgraded together rather than one at a time. For progressive TTL (#1155),
+    old processes also apply their publisher's TTL to unrelated rows; all
+    processes sharing this file must upgrade/restart together for entry-local
+    expiry to hold. No blanket purge of existing rows is needed.
     """
 
     def __init__(self, db_path: Path) -> None:
@@ -242,6 +330,10 @@ class SQLitePendingStore:
                 )
                 .fetchone()
             )
+        return self._decode_row(key, row)
+
+    @staticmethod
+    def _decode_row(key: str, row: tuple | None) -> PendingSelection | None:
         if row is None:
             return None
         try:
@@ -251,7 +343,7 @@ class SQLitePendingStore:
             # into the code unit, and would then raise at the next encode
             # downstream rather than here (#761).
             chunks = scrub_lone_surrogates(json.loads(row[0]))
-        except json.JSONDecodeError:
+        except (ValueError, TypeError, RecursionError):
             logger.warning(
                 "Corrupted chunks_json in pending_selections for key=%s; treating as miss",
                 key,
@@ -263,6 +355,75 @@ class SQLitePendingStore:
             created_at=row[2],
             total_chars=row[3],
         )
+
+    def get_progressive(self, key: str, *, renew: bool = False) -> ProgressiveEntry | None:
+        """Read-only miss probe, then atomic validation/deletion/renewal.
+
+        A miss must not wait on another writer before alternate-store recovery.
+        A hit is authoritatively re-read after taking the write lock, so a
+        concurrent refresh or replacement cannot be deleted using a stale read.
+        Only timestamp and recency rank are written on successful renewal.
+        """
+        with self._lock:
+            db = self._get_db()
+            if (
+                db.execute(
+                    "SELECT 1 FROM pending_selections WHERE key = ? AND format = 'progressive'",
+                    (key,),
+                ).fetchone()
+                is None
+            ):
+                return None
+            with db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute(
+                    "SELECT chunks_json, format, created_at, total_chars "
+                    "FROM pending_selections WHERE key = ? AND format = 'progressive'",
+                    (key,),
+                ).fetchone()
+                if row is None:
+                    return None
+                sel = self._decode_row(key, row)
+                now = time.time()
+                meta = _live_progressive_metadata(sel, now) if sel is not None else None
+                if meta is None or sel is None:
+                    db.execute("DELETE FROM pending_selections WHERE key = ?", (key,))
+                    return None
+                if renew:
+                    db.execute(
+                        f"UPDATE pending_selections SET created_at = ?, seq = {self._NEXT_SEQ} "
+                        "WHERE key = ?",
+                        (now, key),
+                    )
+                    sel.created_at = now
+                return ProgressiveEntry(sel, meta)
+
+    def evict_progressive_expired(self) -> None:
+        with self._lock:
+            db = self._get_db()
+            with db:
+                db.execute("BEGIN IMMEDIATE")
+                now = time.time()
+                # Project only metadata into Python: decoding every response
+                # body while holding the writer lock makes publication costly.
+                # CASE short-circuits malformed JSON before any JSON extractor;
+                # invalid outer JSON or field types become a missing metadata
+                # value and follow the same fail-closed expiry policy. Return
+                # metadata bytes so SQLite's text decoder cannot raise on lone
+                # surrogate escapes before Python validates/scrubs the JSON.
+                rows = db.execute(
+                    "SELECT key, created_at, CASE WHEN json_valid(chunks_json) THEN "
+                    "CASE WHEN json_type(chunks_json, '$.__content__') = 'text' "
+                    "AND json_type(chunks_json, '$.__meta__') = 'text' "
+                    "THEN CAST(json_extract(chunks_json, '$.__meta__') AS BLOB) END END "
+                    "FROM pending_selections WHERE format = 'progressive'"
+                )
+                expired = []
+                for key, created_at, raw_meta in rows:
+                    meta = _parse_progressive_metadata(raw_meta)
+                    if meta is None or not _metadata_live(meta, created_at, now):
+                        expired.append((key,))
+                db.executemany("DELETE FROM pending_selections WHERE key = ?", expired)
 
     def touch(self, key: str) -> None:
         with self._lock:

@@ -5015,8 +5015,7 @@ class ProxyManager:
         store = self._get_progressive_store(publish_sel)
         if pin_is_live:
             # Eviction is STORE-WIDE, so it must never run on a superseded
-            # policy: a stale pin carrying a smaller ``max_stored`` (or a
-            # ``ttl_seconds`` the operator has since raised) would delete keys
+            # policy: a stale pin carrying a smaller ``max_stored`` would delete keys
             # the CURRENT generation just handed to its clients. The pinned
             # config still describes this response's own chunking below —
             # that part is scoped to this call and rides the snapshot.
@@ -5104,7 +5103,7 @@ class ProxyManager:
                 store = self._get_progressive_store()
         else:
             store = self._get_progressive_store()
-        resp = store.get(key)
+        resp = store.get(key, renew=True)
         if resp is None and len(cfgs) > 1:
             # The cached store did not hold the key, but with multiple distinct
             # stores configured an earlier call may have cached a *different*
@@ -5122,7 +5121,7 @@ class ProxyManager:
                     )
                     temp_store = None
                 if temp_store is not None:
-                    alt_resp = temp_store.get(key)
+                    alt_resp = temp_store.get(key, renew=True)
                     if alt_resp is not None:
                         store, resp = temp_store, alt_resp
         try:
@@ -5137,7 +5136,6 @@ class ProxyManager:
                     "key": key,
                 },
             ):
-                store.touch(key)
                 # Continue with the chunking the first chunk used (persisted on
                 # the ProgressiveResponse) — an explicit ``limit`` from the agent
                 # still wins. Hardcoding ``4000`` here made follow-ups diverge

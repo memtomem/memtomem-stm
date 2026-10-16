@@ -403,8 +403,8 @@ class TestProgressiveStoreAdapter:
             assert store.get("broken") is None
         assert any("missing __content__" in r.message for r in caplog.records)
 
-    def test_corrupted_meta_uses_defaults(self, caplog):
-        """Corrupted __meta__ JSON should log and fall back to defaults."""
+    def test_corrupted_meta_is_a_miss(self, caplog):
+        """Corrupted metadata must not silently extend retention with defaults."""
         backing = InMemoryPendingStore()
         backing.put(
             "bad_meta",
@@ -418,10 +418,8 @@ class TestProgressiveStoreAdapter:
         store = ProgressiveStoreAdapter(backing)
         with caplog.at_level("WARNING"):
             got = store.get("bad_meta")
-        assert got is not None
-        assert got.content == "hello"
-        assert got.content_type == "text"  # default
-        assert any("Corrupted __meta__ JSON" in r.message for r in caplog.records)
+        assert got is None
+        assert backing.get("bad_meta") is None
 
     def test_touch_does_not_error(self):
         store = ProgressiveStoreAdapter(InMemoryPendingStore())

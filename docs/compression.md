@@ -194,7 +194,26 @@ The first chunk includes a metadata footer with remaining headings/structure hin
 [-> stm_proxy_read_more(key="abc123", offset=4000)]
 ```
 
-Each call to `stm_proxy_read_more` resets the TTL. The `ttl` field is omitted on the last chunk (`has_more=False`).
+A successful `stm_proxy_read_more` lookup renews an unexpired response's sliding
+TTL. Expiry is checked before renewal: an age equal to or greater than the stored
+TTL returns the existing missing/expired response, and a late read cannot revive
+it. A zero TTL expires immediately. Publication cleanup uses each stored response's
+own TTL, so another tool's shorter or longer TTL does not change its lifetime.
+Size/recency eviction remains a separate limit. The `ttl` field is omitted on the
+last chunk (`has_more=False`).
+
+**Behavior change (#1155):** malformed/non-object progressive metadata or an
+explicit invalid TTL is treated as missing/expired without renewal. TTL must be a
+finite nonnegative number, not a boolean or string. A valid legacy metadata object
+without `ttl_seconds` retains the 1,800-second default, measured from the backend's
+stored last-access time. Memory uses its monotonic clock; SQLite uses wall time,
+including after restart.
+
+All processes sharing a SQLite pending-store file must upgrade/restart together:
+an older process can still apply its publishing tool's TTL to other responses.
+Valid existing rows are preserved; no blanket purge is required. These rules
+apply to progressive responses, not SELECTIVE pending selections, and TTL is not
+a guarantee of secure deletion of database pages.
 
 | Feature | Selective | Progressive |
 |---------|-----------|-------------|
