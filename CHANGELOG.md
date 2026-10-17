@@ -48,6 +48,11 @@ changes inline only. See the deprecation policy in
   corrupt state file already produces. The remaining #1176 items
   (an unwritable config directory or an unopenable write lock under `project
   route --apply` and the other config mutators) are not changed here.
+  **Behavior change**: these inputs used to end in a traceback with an empty
+  stdout; they now exit 1 with one error line and, in `--json` mode, one
+  failure document (`tune` adds the `store_invalid` code). `gateway status`
+  keeps its exit 0 with `INVALID` for a rejected bundle, so the two bundle
+  cases move from exit 1 to exit 0.
 
 - logging: a traceback attached to a log line is escaped the way the line's own
   values are (#1173, #1177). #1166 escaped the env-hint lines that name a broken
