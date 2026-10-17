@@ -298,3 +298,40 @@ def test_registration_policy_error_escapes_the_implicated_variable(tmp_path, mon
     assert "prevented resolving the registration's runtime policy" in message
     assert ESCAPED_ENV in message
     assert "‮" not in message
+
+
+def test_surfacing_bootstrap_debug_log_escapes_but_the_status_keeps_raw(
+    tmp_path, monkeypatch, caplog
+):
+    from memtomem_stm.cli import proxy as proxy_mod
+
+    config = tmp_path / "proxy.json"
+    config.write_text(json.dumps({"upstream_servers": {}}))
+    monkeypatch.setenv(HOSTILE_ENV, "5")
+
+    with caplog.at_level(logging.DEBUG, logger="memtomem_stm.cli.proxy"):
+        status = proxy_mod._surfacing_bootstrap_status(1.0, config_path=str(config))
+
+    logged = _messages(caplog)
+    assert "Surfacing bootstrap status inspection failed" in logged
+    assert ESCAPED_ENV in logged
+    assert "‮" not in logged
+    assert HOSTILE_ENV in status["error"]  # the --json document renders this dict
+
+
+def test_registration_json_message_mirrors_the_escaped_terminal_line(tmp_path, monkeypatch):
+    """The setup commands' --json ``message`` is the last stderr line, so it
+    carries the terminal escaping; the line's existing ``_disp(str(exc))``
+    fallback already reached it the same way."""
+    config = tmp_path / "proxy.json"
+    config.write_text(json.dumps({"upstream_servers": {}}))
+    monkeypatch.setenv(HOSTILE_ENV, "5")
+
+    result = CliRunner().invoke(
+        cli, ["register", "--config", str(config), "--mcp", "json", "--json"]
+    )
+
+    document = json.loads(result.stdout)
+    assert document["error"] == "setup_failed"
+    assert ESCAPED_ENV in document["message"]
+    assert "‮" not in document["message"]

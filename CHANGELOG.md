@@ -63,11 +63,13 @@ changes inline only. See the deprecation policy in
   - the text output of `mms selection feedback` config errors, including the
     config path;
   - `mms gateway status` / `explain` on an invalid config;
-  - the `mms health` Surfacing Bootstrap error;
+  - the `mms health` Surfacing Bootstrap error, and its debug log line;
   - the variable hint in the runtime-policy errors of `mms hook install` and of
     registration.
 
   `--json` documents and `ConfigLoadResult` keep the raw text for their consumers.
+  One exception: the setup commands' `--json` `message` (for example, `mms register
+  --json`) is a copy of the last stderr line, so it carries the same escaping.
   The display escaping now lives in `memtomem_stm.utils.display`, so the loader can
   use it; `cli/_display` re-exports it.
   **Behavior change**: none for ordinary names and paths. A displayed value that

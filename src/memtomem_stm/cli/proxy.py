@@ -8657,7 +8657,7 @@ def _surfacing_bootstrap_status(
         # The rendered error only: a traceback repeats the exception's message,
         # which can carry configured values (#1075) or anything the failing
         # code quoted (#1079).
-        logger.debug("Surfacing bootstrap status inspection failed: %s", error)
+        logger.debug("Surfacing bootstrap status inspection failed: %s", _disp(error))
         return {
             "enabled": None,
             "feedback_enabled": None,
