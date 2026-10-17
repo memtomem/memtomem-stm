@@ -44,6 +44,12 @@ changes inline only. See the deprecation policy in
   offset-only message and leave it untouched, also when the file turns non-UTF-8
   between plan and apply. Install-type detection skips a non-UTF-8
   `pyproject.toml` in the current directory or its parents, as it skips a malformed one.
+  **Behavior change**: these inputs used to end in a traceback (exit 1). Now the
+  `mms` state commands and `mms hook install`/`uninstall` print one
+  `Error: <path> … not valid UTF-8 (byte offset N)` line and exit 1, and `--json`
+  state commands also print the failure document. Import discovery skips an
+  undecodable Codex config and `mms hook install` ignores an undecodable
+  `pyproject.toml`; in both cases the command keeps running.
 
 - progressive: enforce each response's stored sliding TTL before renewal and
   during publication cleanup, using backend-local clocks and atomic expiry checks
