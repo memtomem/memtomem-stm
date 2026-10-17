@@ -34,7 +34,7 @@ changes inline only. See the deprecation policy in
 
 - cli: `mms config validate`, `mms doctor` and the `.mcp.json` merge behind
   `mms init --client json` report a JSON file holding an integer literal past the
-  interpreter's digit limit (4,300 digits by default) instead of crashing (#1179).
+  interpreter's digit limit (4,300 digits by default) instead of crashing (#1179, #1182).
   `json.loads` raises a plain `ValueError` for it, not a `JSONDecodeError`, and those
   readers caught only the latter; the `.mcp.json` merge also let a `RecursionError`
   from deep nesting through. `config validate` and `doctor` now report `invalid JSON:
