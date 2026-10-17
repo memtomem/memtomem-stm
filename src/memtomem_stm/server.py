@@ -2488,9 +2488,9 @@ async def stm_selection_stats(
         # under it.
         agg = await asyncio.to_thread(_aggregate_selection_log_unrotated, sink.path)
         if agg is None:
-            # Another reader held the rotation lock past the retry budget. Read
-            # on the loop, as before #1152: this process's writer cannot
-            # rotate in the middle of that.
+            # The rotation lock was not taken (held by another reader, or not
+            # creatable). Read on the loop, as before #1152: this process's
+            # writer cannot rotate in the middle of that.
             agg = aggregate_selection_log(sink.path)
         live = sink.snapshot()
         # An empty disk log with no live activity is genuinely "no data".
@@ -2513,16 +2513,16 @@ def _aggregate_selection_log_unrotated(path: Path) -> dict[str, Any] | None:
     the lock makes it defer instead: on Windows the open reader blocks the
     rename, and the append that triggered it would fail.
 
-    Returns ``None`` when another reader holds the lock for the whole retry
-    budget, so the caller can read on the loop instead. A lock that cannot be
-    set up at all (an unwritable directory) reads here without it: the writer
-    cannot take that lock either, so it cannot rotate.
+    Returns ``None`` whenever the lock is not held, so the caller reads on
+    the loop instead: another reader held it for the whole retry budget, or
+    it could not be set up. A setup error may be transient (``EMFILE``), so it
+    is no evidence that the writer cannot rotate.
     """
     try:
         guard = rotation_lock(path, attempts=_SELECTION_STATS_LOCK_ATTEMPTS)
         acquired = guard.__enter__()
     except OSError:
-        return aggregate_selection_log(path)
+        return None
     try:
         return aggregate_selection_log(path) if acquired else None
     finally:

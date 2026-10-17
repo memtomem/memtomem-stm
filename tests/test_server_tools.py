@@ -1991,7 +1991,7 @@ class TestSelectionStats:
 
         def blocking(path):
             entered.set()
-            release.wait(5)
+            release.wait()  # set by the finally below; no timeout to race
             return real(path)
 
         def helper_then_signal(path):
@@ -2030,7 +2030,8 @@ class TestSelectionStats:
             assert log.events_written == 2 and log.write_errors == 0
         finally:
             release.set()
-        assert await asyncio.to_thread(finished.wait, 5)
+            # Join the worker before the monkeypatches unwind.
+            assert await asyncio.to_thread(finished.wait, 5)
         assert "error" not in outcome
         assert isinstance(outcome["result"], dict) and outcome["result"]["exists"]
         with rotation_lock(tmp_path / "sel.jsonl") as acquired:
@@ -2071,9 +2072,9 @@ class TestSelectionStats:
         assert "Selection Stats" in result
         assert threads == [threading.get_ident()]
 
-    async def test_lock_setup_failure_still_reads_off_the_loop(self, tmp_path, monkeypatch):
-        """An unwritable directory: the lock file cannot be created, so the
-        writer cannot rotate either, and the worker reads without the lock."""
+    async def test_lock_setup_failure_reads_on_the_loop(self, tmp_path, monkeypatch):
+        """The lock file cannot be created. The error may be transient, so the
+        writer may still rotate later; the read moves back onto the loop."""
         import contextlib
         import threading
 
@@ -2105,7 +2106,7 @@ class TestSelectionStats:
         monkeypatch.setattr(server, "aggregate_selection_log", probe)
         result = await stm_selection_stats(ctx=_ctx_with_selection(tmp_path, log=log))
         assert "Selection Stats" in result
-        assert len(threads) == 1 and threads[0] != threading.get_ident()
+        assert threads == [threading.get_ident()]
 
 
 # ── stm_tuning_recommendations ────────────────────────────────────────────

@@ -23,8 +23,9 @@ changes inline only. See the deprecation policy in
   in-flight proxied calls for about 0.24 s; measured max loop lag drops to about
   18 ms. The worker holds the log's rotation lock while it reads, so this process's
   writer defers a rotation instead of renaming the file under it. On Windows that
-  rename would fail, and the append that triggered it would be lost. If another
-  reader holds the lock past the retry budget, the read runs on the loop as before.
+  rename would fail, and the append that triggered it would be lost. If the lock
+  cannot be taken, because another reader holds it or it cannot be created, the
+  read runs on the loop as before.
   `stm_tuning_recommendations` stays on the loop: it measured under 1 ms on real
   data at the default metrics retention (`max_history` 10,000).
   **Behavior change**: none external.
