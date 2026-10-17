@@ -693,10 +693,13 @@ def log_stm_config_failure(
     one this line is reporting.
     """
     from memtomem_stm.proxy.config import env_var_hint_for_validation_error
+    from memtomem_stm.utils.display import _disp
 
     logger.warning(
         "invalid MEMTOMEM_STM_* configuration while %s%s",
         context,
-        env_var_hint_for_validation_error(exc),
+        # The names are the operator's own variables, and one can carry a
+        # newline or a bidi control that would forge or reorder the line (#1166).
+        _disp(env_var_hint_for_validation_error(exc)),
         exc_info=exc if exc_info else None,
     )

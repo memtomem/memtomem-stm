@@ -35,6 +35,7 @@ from pathlib import Path
 from memtomem_stm.mms.state import (
     PROJECT_MARKER_RELPATH,
     ProjectConfig,
+    is_regular_file,
     load_project_config,
 )
 
@@ -95,7 +96,7 @@ def detect_project(cwd: Path) -> Project:
     # 1. marker walk-up
     for p in [resolved, *resolved.parents]:
         marker = p / PROJECT_MARKER_RELPATH
-        if marker.is_file():
+        if is_regular_file(marker):
             cfg = load_project_config(marker)  # may raise — propagate per §6.1
             return Project(
                 root=p,

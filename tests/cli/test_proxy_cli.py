@@ -2193,6 +2193,79 @@ class TestAtomicSave:
         assert json.loads(desktop_path.read_text(encoding="utf-8")) == {"mcpServers": {}}
         assert (desktop_path.stat().st_mode & 0o777) == 0o644
 
+    def test_desktop_remove_entry_refuses_a_non_utf8_file(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        # Discovery reads an undecodable file as absent, so prune reaches this
+        # writer only if the file changes after discovery; it still must not raise.
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        desktop_path = tmp_path / "claude_desktop_config.json"
+        prefix = b'{"mcpServers": {"sk-live-prune-canary": '
+        desktop_path.write_bytes(prefix + b"\xff}}")
+        monkeypatch.setattr(proxy_mod, "_desktop_config_path", lambda: desktop_path)
+
+        ok, err = proxy_mod._desktop_json_remove_entry("memtomem-stm")
+
+        assert (ok, err) == (
+            False,
+            f"{desktop_path} is not valid UTF-8 (byte offset {len(prefix)})",
+        )
+        assert desktop_path.read_bytes() == prefix + b"\xff}}"
+
+    @pytest.mark.parametrize("writer", ["remove", "set"])
+    def test_json_host_writers_survive_a_failing_inspection(
+        self, tmp_path: Path, monkeypatch, writer
+    ) -> None:
+        # ``Path.exists`` raised PermissionError from ``stat`` on 3.12/3.13
+        # before the writers' handlers; only the read itself decides now.
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        path = tmp_path / "host.json"
+        path.write_text(json.dumps({"mcpServers": {"demo": {"command": "old"}}}), encoding="utf-8")
+        monkeypatch.setattr(proxy_mod, "_desktop_config_path", lambda: path)
+        real_stat = Path.stat
+
+        def fake_stat(self, *args, **kwargs):
+            if self == path:
+                raise PermissionError(13, "Permission denied", str(self))
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", fake_stat)
+
+        if writer == "remove":
+            result = proxy_mod._desktop_json_remove_entry("demo")
+            expected: dict = {}
+        else:
+            result = proxy_mod._json_config_set_entry(
+                path, "demo", {"command": "new"}, default_mode=0o600
+            )
+            expected = {"demo": {"command": "new"}}
+
+        assert result == (True, None)
+        assert json.loads(path.read_text(encoding="utf-8"))["mcpServers"] == expected
+
+    @pytest.mark.parametrize("writer", ["remove", "set"])
+    def test_json_host_writers_treat_a_missing_file_as_before(
+        self, tmp_path: Path, monkeypatch, writer
+    ) -> None:
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        path = tmp_path / "host.json"
+        monkeypatch.setattr(proxy_mod, "_desktop_config_path", lambda: path)
+
+        if writer == "remove":
+            assert proxy_mod._desktop_json_remove_entry("demo") == (False, f"{path} not found")
+            assert not path.exists()
+        else:
+            ok = proxy_mod._json_config_set_entry(
+                path, "demo", {"command": "x"}, default_mode=0o600
+            )
+            assert ok == (True, None)
+            assert json.loads(path.read_text(encoding="utf-8")) == {
+                "mcpServers": {"demo": {"command": "x"}}
+            }
+
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
     def test_write_mcp_json_new_file_gets_project_mode(self, tmp_path: Path) -> None:
         from memtomem_stm.cli.proxy import _write_mcp_json_for_stm
@@ -12249,6 +12322,34 @@ class TestEjectCommand:
         assert result.exit_code == 0, result.output
         written = json.loads(desktop.read_text(encoding="utf-8"))
         assert written["mcpServers"]["demo"] == original
+
+    @pytest.mark.parametrize("kind", ["mcp-json", "claude-desktop"])
+    def test_a_non_utf8_host_config_fails_the_entry_without_writing(
+        self, runner, config, tmp_path, _hermetic_home, kind
+    ):
+        """The no-clobber pre-check reads an undecodable host file as absent,
+        so the plan reaches the writer; the writer must refuse, not raise."""
+        from memtomem_stm.mms.import_hosts import _desktop_config_path
+
+        if kind == "mcp-json":
+            target = tmp_path / "proj" / ".mcp.json"
+            entry = _eject_entry(kind=kind, path=str(target), original={"command": "npx"})
+        else:
+            target = _desktop_config_path()
+            entry = _eject_entry(kind=kind, original={"command": "npx"})
+        target.parent.mkdir(parents=True, exist_ok=True)
+        prefix = b'{"mcpServers": {"sk-live-eject-canary": '
+        target.write_bytes(prefix + b"\xff}}")
+        self._seed_config(config, {"demo": entry})
+
+        result = runner.invoke(cli, ["eject", "demo", "--yes", *_cfg_args(config)])
+
+        assert result.exit_code == 1, result.output
+        assert isinstance(result.exception, SystemExit), result.exception
+        assert f"is not valid UTF-8 (byte offset {len(prefix)})" in result.output
+        assert "sk-live-eject-canary" not in result.output
+        assert target.read_bytes() == prefix + b"\xff}}"
+        assert "demo" in self._stm_servers(config)
 
     # ── schema-loss hard gate ──
 

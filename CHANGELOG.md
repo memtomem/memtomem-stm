@@ -63,12 +63,37 @@ changes inline only. See the deprecation policy in
   undecodable Codex config and `mms hook install` ignores an undecodable
   `pyproject.toml`; in both cases the command keeps running.
 
+- cli, daemon: report unreadable and non-UTF-8 files that #1159 left out as clean
+  errors instead of tracebacks (#1163, #1169).
+  - `~/.mms/registry.toml`, `import_state.toml` and a project marker that cannot be
+    read, or whose directory cannot be inspected, raise the same corruption error
+    as the projects index: `<path>: cannot read (PermissionError)` or
+    `cannot inspect (…)`. Project detection (`mms project show`, `route`) applies
+    the same rule to the marker it finds walking up from the current directory.
+    A missing file, or one under a non-directory parent, is handled as before: an
+    empty registry or import state, `file not found` for a marker.
+  - `mms eject` refuses a non-UTF-8 `.mcp.json` or Claude Desktop target with
+    `<path> is not valid UTF-8 (byte offset N)`, leaves the file and the STM entry
+    in place, and prints the manual restore hint. The Desktop pruning writer behind
+    `mms add --from-clients --prune` refuses such a file the same way. A failure
+    to inspect the target no longer escapes before the read either.
+  - `mms daemon status` ignores a non-UTF-8 handshake file from another config, and
+    reports one for its own config as `stale` with `handshake_unreadable`.
+  - `mms selection replay --dataset` reports a dataset that cannot be decoded as
+    `dataset is not valid <ENCODING> (byte offset N)`, naming the encoding the JSON
+    parser detected (UTF-8, or UTF-16/32, which it also accepts).
+
+  **Behavior change**: each of these inputs used to end in a traceback. The `mms`
+  state commands and `mms selection replay` now print one `Error:` line and exit 1;
+  `--json` state commands also print the `mms_state_invalid` failure document.
+  `mms eject` lists the entry under `could not eject` and exits 1. `mms daemon status`
+  exits 0. No message quotes file bytes.
+
 - cli, proxy: escape config key names and implicated environment-variable names in
   the config validation errors listed below (#1147, #1167). A key carrying a newline or a
   bidi control, such as an upstream's name, could forge an extra terminal line or
-  reorder the rest of it. Not yet covered, tracked in #1166: the hook/daemon
-  `invalid MEMTOMEM_STM_* configuration while …` log line and the server-startup
-  log, as well as operator-supplied paths and arguments. Now escaped:
+  reorder the rest of it. Operator-supplied paths and arguments and the hook/daemon
+  log line follow in the #1166 entry below. Now escaped:
   - the proxy config loader's warnings: `Failed to parse proxy config`,
     `Env-only proxy config failed validation`, the unknown-key list, and the
     implicated `MEMTOMEM_STM_PROXY__*` names;
@@ -86,6 +111,27 @@ changes inline only. See the deprecation policy in
   use it; `cli/_display` re-exports it.
   **Behavior change**: none for ordinary names and paths. A displayed value that
   contains a control or bidi character now prints as `\uXXXX`.
+
+- cli, proxy: escape operator-supplied paths, ids, filters and exception text in
+  terminal and log output (#1166, #1172). They are echoed into the same lines #1147 escaped
+  key names in, and a newline or a bidi control in one could forge or reorder a line.
+  Now escaped:
+  - every `mms selection feedback` failure message, in text output: the log path,
+    `--selection-id`, the `--server`/`--tool` filter, a selection id read back from
+    the log, and exception text such as an unreadable segment or a lock error;
+  - `mms selection replay`: the missing `--log` path, evaluation errors, and the
+    dataset id in the text summary and `summary.md` (the `--json` report keeps it);
+  - the config path in every proxy config loader log line: permissive mode,
+    unknown keys, the `tool_annotation_policy` advisory, inert upstreams, `Failed to
+    parse proxy config`, and the missing-file debug line;
+  - the variable names in the hook/daemon `invalid MEMTOMEM_STM_* configuration
+    while …` log line and in the server's startup `Invalid MEMTOMEM_STM_* environment
+    configuration` log line.
+
+  `--json` documents keep the raw values. Still not covered: the traceback that
+  those two log lines attach renders the failing validation location raw.
+  **Behavior change**: none for ordinary values. A displayed value that contains a
+  control or bidi character now prints as `\uXXXX`.
 
 - progressive: enforce each response's stored sliding TTL before renewal and
   during publication cleanup, using backend-local clocks and atomic expiry checks

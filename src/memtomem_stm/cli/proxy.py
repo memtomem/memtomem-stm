@@ -4157,10 +4157,13 @@ def _desktop_json_remove_entry(name: str) -> tuple[bool, str | None]:
     ``os.replace`` is the only way to keep the update coherent.
     """
     path = _desktop_config_path()
-    if not path.exists():
-        return (False, f"{path} not found")
     try:
         raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return (False, f"{path} not found")
+    except UnicodeDecodeError as exc:
+        # The exception's own text quotes the offending byte; give the offset only.
+        return (False, f"{path} is not valid UTF-8 (byte offset {exc.start})")
     except OSError as exc:
         return (False, f"read error: {exc}")
     try:
@@ -7028,11 +7031,20 @@ def _json_config_set_entry(
     to newly created files.
     """
     existing: dict[str, Any] = {}
-    if path.exists():
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except OSError as exc:
-            return (False, f"read error: {exc}")
+    raw: str | None
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raw = None
+    except UnicodeDecodeError as exc:
+        # The exception's own text quotes the offending byte; give the offset only.
+        return (
+            False,
+            f"{path} is not valid UTF-8 (byte offset {exc.start}) — fix or move it aside and retry",
+        )
+    except OSError as exc:
+        return (False, f"read error: {exc}")
+    if raw is not None:
         try:
             loaded = json.loads(raw)
         except (json.JSONDecodeError, ValueError) as exc:

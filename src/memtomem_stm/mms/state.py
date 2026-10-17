@@ -347,6 +347,25 @@ def _load_toml_dict(path: Path) -> dict:
     except UnicodeDecodeError as e:
         # The exception's own text quotes the offending byte; give the offset only.
         raise CorruptedConfig(path, f"not valid UTF-8 (byte offset {e.start})") from e
+    except OSError as e:
+        raise CorruptedConfig(path, f"cannot read ({type(e).__name__})") from e
+
+
+def is_regular_file(path: Path) -> bool:
+    """Whether ``path`` is a regular file; only a missing path counts as absent.
+
+    A missing path or a non-directory parent is absence, as with
+    ``Path.is_file``. Any other inspection failure (an unreadable parent
+    directory) is a ``CorruptedConfig``: ``Path.is_file`` lets it escape as a
+    ``PermissionError`` on 3.12/3.13 and reports the file as missing on 3.14.
+    """
+    try:
+        mode = path.stat().st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as exc:
+        raise CorruptedConfig(path, f"cannot inspect ({type(exc).__name__})") from exc
+    return stat.S_ISREG(mode)
 
 
 def _check_schema_version(path: Path, raw: dict, expected: int) -> None:
@@ -362,7 +381,7 @@ def _check_schema_version(path: Path, raw: dict, expected: int) -> None:
 def load_registry(path: Path | None = None) -> RegistryConfig:
     """Load ``registry.toml``. Returns empty config if file is missing."""
     p = path or registry_path()
-    if not p.is_file():
+    if not is_regular_file(p):
         return RegistryConfig()
     raw = _load_toml_dict(p)
     _check_schema_version(p, raw, SCHEMA_VERSION)
@@ -387,10 +406,7 @@ def load_projects_index(path: Path | None = None) -> ProjectsIndex:
         raise CorruptedConfig(p, f"cannot inspect ({type(exc).__name__})") from exc
     if not stat.S_ISREG(mode):
         raise CorruptedConfig(p, "expected a regular file for projects index; repair this path")
-    try:
-        raw = _load_toml_dict(p)
-    except OSError as exc:
-        raise CorruptedConfig(p, f"cannot read ({type(exc).__name__})") from exc
+    raw = _load_toml_dict(p)
     _check_schema_version(p, raw, SCHEMA_VERSION)
     try:
         return ProjectsIndex.model_validate(raw)
@@ -400,7 +416,7 @@ def load_projects_index(path: Path | None = None) -> ProjectsIndex:
 
 def load_project_config(path: Path) -> ProjectConfig:
     """Load a per-project ``project.toml``. Raises if file is missing."""
-    if not path.is_file():
+    if not is_regular_file(path):
         raise CorruptedConfig(path, "file not found")
     raw = _load_toml_dict(path)
     _check_schema_version(path, raw, SCHEMA_VERSION)
@@ -421,7 +437,7 @@ def load_import_state(path: Path | None = None) -> ImportState:
     install, or pre-W2 user upgrading) — same idiom as :func:`load_registry`.
     """
     p = path or import_state_path()
-    if not p.is_file():
+    if not is_regular_file(p):
         return ImportState()
     raw = _load_toml_dict(p)
     _check_schema_version(p, raw, IMPORT_STATE_SCHEMA_VERSION)

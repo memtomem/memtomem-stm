@@ -167,7 +167,7 @@ def read_handshake(path: Path) -> dict[str, Any] | None:
     """Parse the handshake file; ``None`` if absent, unreadable, or malformed."""
     try:
         raw = path.read_text(encoding="utf-8")
-    except (FileNotFoundError, OSError):
+    except (OSError, UnicodeDecodeError):
         return None
     try:
         data = json.loads(raw)
