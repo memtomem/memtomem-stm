@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import json
+import shutil
 import shlex
 import sys
 from pathlib import Path
@@ -1093,3 +1094,132 @@ class TestShowFallbackBranchesEscapePaths:
 
         assert "\x1b" not in out and "\r" not in out
         assert "\\u001B" in out and "\\u000D" in out
+
+
+# ---------------------------------------------------------------------------
+# route --json: every operational failure emits the failure document (#1138)
+# ---------------------------------------------------------------------------
+
+
+def _route_failure(res, error: str) -> dict:
+    assert res.exit_code == 1, res.output
+    payload = json.loads(res.stdout)
+    assert (payload["action"], payload["ok"], payload["error"]) == ("route", False, error)
+    assert "Error:" in res.stderr
+    return payload
+
+
+def test_route_json_without_a_marker_emits_project_not_initialized(runner, sandbox):
+    config = sandbox["home"] / "proxy.json"
+
+    res = runner.invoke(project_group, ["route", "--config", str(config), "--json"])
+
+    payload = _route_failure(res, "project_not_initialized")
+    assert str(sandbox["cwd"]) in payload["message"]
+    assert "mms project init" in payload["message"]
+
+
+def test_route_json_unknown_named_project_emits_project_not_found(runner, sandbox):
+    config = sandbox["home"] / "proxy.json"
+
+    res = runner.invoke(
+        project_group, ["route", "--project", "nope", "--config", str(config), "--json"]
+    )
+
+    payload = _route_failure(res, "project_not_found")
+    assert payload["message"].startswith("Project 'nope' not found in ")
+
+
+def test_route_json_ambiguous_named_project_emits_project_ambiguous(runner, sandbox):
+    _seed_routable_project(runner)
+    index = state.load_projects_index()
+    twin = state.ProjectIndexEntry(
+        name=index.projects[0].name,
+        path=str(sandbox["home"] / "twin"),
+        last_seen="2026-01-01T00:00:00Z",
+    )
+    state.save_projects_index(state.ProjectsIndex(projects=[*index.projects, twin]))
+    config = sandbox["home"] / "proxy.json"
+
+    res = runner.invoke(
+        project_group,
+        ["route", "--project", index.projects[0].name, "--config", str(config), "--json"],
+    )
+
+    payload = _route_failure(res, "project_ambiguous")
+    assert "(2 matches)" in payload["message"]
+
+
+def test_route_json_indexed_project_without_a_marker_emits_project_missing(runner, sandbox):
+    _seed_routable_project(runner)
+    shutil.rmtree(sandbox["cwd"] / ".mms")
+    config = sandbox["home"] / "proxy.json"
+
+    res = runner.invoke(
+        project_group, ["route", "--project", "proj", "--config", str(config), "--json"]
+    )
+
+    payload = _route_failure(res, "project_missing")
+    assert "mms project list --prune" in payload["message"]
+
+
+def test_route_json_apply_on_an_invalid_result_emits_result_invalid(runner, sandbox):
+    """A pre-existing broken sibling entry fails the whole-file validation; nothing is written."""
+    _seed_routable_project(runner)
+    config = sandbox["home"] / "proxy.json"
+    before = json.dumps({"upstream_servers": {"broken": {"transport": "stdio"}}})
+    config.write_text(before, encoding="utf-8")
+
+    res = runner.invoke(project_group, ["route", "--config", str(config), "--apply", "--json"])
+
+    payload = _route_failure(res, "result_invalid")
+    assert payload["path"] == str(config)
+    assert payload["message"].startswith("routing would produce an invalid proxy config (")
+    assert payload["message"].endswith("; nothing written")
+    assert config.read_text(encoding="utf-8") == before
+    assert not list(sandbox["home"].glob("proxy.json.bak-*"))
+
+
+def test_route_json_result_invalid_keeps_the_rejected_value_out_of_the_document(runner, sandbox):
+    """The duplicate-prefix validator names the prefix in its ``msg``; stdout gets the summary."""
+    _seed_routable_project(runner)
+    config = sandbox["home"] / "proxy.json"
+    canary = "sk-live-canary"
+    config.write_text(
+        json.dumps(
+            {
+                "upstream_servers": {
+                    "one": {"command": "x", "prefix": canary},
+                    "two": {"command": "y", "prefix": canary},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    res = runner.invoke(project_group, ["route", "--config", str(config), "--apply", "--json"])
+
+    payload = _route_failure(res, "result_invalid")
+    assert canary not in res.stdout
+    assert payload["message"].startswith("routing would produce an invalid proxy config (")
+    # Positive control: the detailed terminal line still names it, as before.
+    assert canary in res.stderr
+
+
+def test_route_failure_message_is_raw_in_json_and_escaped_on_the_terminal(runner, sandbox):
+    """The #1166 split: the document carries the value as is, stderr display-escapes it."""
+    config = sandbox["home"] / "proxy.json"
+    hostile = "evil\x1b[31mname"
+
+    as_json = runner.invoke(
+        project_group, ["route", "--project", hostile, "--config", str(config), "--json"]
+    )
+    as_text = runner.invoke(project_group, ["route", "--project", hostile, "--config", str(config)])
+
+    payload = _route_failure(as_json, "project_not_found")
+    assert hostile in payload["message"]
+    assert "\x1b" not in as_json.stderr
+    assert as_text.exit_code == 1, as_text.output
+    assert as_text.stdout == ""
+    assert "\x1b" not in as_text.stderr
+    assert "evil" in as_text.stderr

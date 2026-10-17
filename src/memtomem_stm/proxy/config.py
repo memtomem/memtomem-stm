@@ -2197,6 +2197,13 @@ class ConfigLoadResult:
     config: ProxyConfig | None
     error: str | None
     unknown_keys: tuple[str, ...] = ()
+    error_kind: Literal["unreadable", "invalid"] | None = None
+    """Which failure ``error`` describes, for callers that answer differently:
+    ``unreadable`` when the file could not be read (an ``OSError``),
+    ``invalid`` when it was read but could not be decoded, parsed or
+    validated. ``None`` whenever ``error`` is ``None``. The same split
+    ``mms``'s own config readers use for their ``config_unreadable`` /
+    ``config_invalid`` failure codes (#1138)."""
     env_error: str | None = None
     """Set when the ``MEMTOMEM_STM_PROXY`` environment is not the one
     ``config`` reflects. Two shapes, and the second is independent of whether a
@@ -2587,7 +2594,10 @@ class ProxyConfig(BaseModel):
                     _env_override_hint(exc, overlay, file_data),
                 )
             return ConfigLoadResult(
-                config=None, error=config_load_error_summary(exc), unknown_keys=unknown_keys
+                config=None,
+                error=config_load_error_summary(exc),
+                unknown_keys=unknown_keys,
+                error_kind="unreadable" if isinstance(exc, OSError) else "invalid",
             )
 
 

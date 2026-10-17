@@ -607,7 +607,8 @@ policy non-enforcing. Bundle mode never starts a Toolgraph subprocess and the
 
 Use `review` first for a vibe-coding-friendly rollout, inspect decisions with
 `mms gateway explain`, then switch to `strict` after the catalog and grants are
-stable. `mms gateway mode` previews by default; only `--apply` writes the
+stable. Both inspection commands take `--json`; their failure codes are listed
+under the `--json` contract in [cli.md](cli.md#mms--memtomem-stm-proxy). `mms gateway mode` previews by default; only `--apply` writes the
 configuration. Applying `strict` warns when the target bundle does not exist;
 the next server start will fail closed until Toolgraph publishes it.
 

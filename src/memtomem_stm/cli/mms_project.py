@@ -20,7 +20,7 @@ import click
 
 from memtomem_stm.cli._defaults import DEFAULT_PROXY_CONFIG, resolve_cli_config_path
 from memtomem_stm.cli._display import _disp
-from memtomem_stm.cli._mms_errors import surface_mms_state_errors
+from memtomem_stm.cli._mms_errors import CodedFailure, surface_mms_state_errors
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.cli._write_lock import with_config_write_lock, with_write_lock
 from memtomem_stm.mms import state
@@ -137,7 +137,7 @@ def _load_named_project(entry: state.ProjectIndexEntry) -> Project:
         return _load_indexed_project(entry)
     except _MissingIndexedProject as exc:
         message = (
-            f"Project '{_disp(entry.name)}' indexed at {_disp(entry.path)} "
+            f"Project '{entry.name}' indexed at {entry.path} "
             "but its root is missing or not a directory, or its marker file is missing. "
         )
         if exc.can_reinitialize:
@@ -149,7 +149,7 @@ def _load_named_project(entry: state.ProjectIndexEntry) -> Project:
             if command != _HINT_UNRENDERABLE:
                 message += f"Recreate the marker with `{command}` (enabled MCPs will be empty), or "
         message += "run `mms project list --prune` to remove the stale registration."
-        raise click.ClickException(message) from exc
+        raise CodedFailure("project_missing", message) from exc
 
 
 def _resolve_project_for_mutation(
@@ -165,9 +165,10 @@ def _resolve_project_for_mutation(
     if project_name is None:
         p = detect_project(Path.cwd())
         if p.source is not Source.MARKER:
-            raise click.ClickException(
-                f"No project marker at {_disp(str(p.root))} (detected via {p.source.value}). "
-                "Run `mms project init` here first."
+            raise CodedFailure(
+                "project_not_initialized",
+                f"No project marker at {p.root} (detected via {p.source.value}). "
+                "Run `mms project init` here first.",
             )
         return p
 
@@ -175,15 +176,16 @@ def _resolve_project_for_mutation(
     idx = index if index is not None else state.load_projects_index()
     matches = [entry for entry in idx.projects if entry.name == project_name]
     if not matches:
-        raise click.ClickException(
-            f"Project '{_disp(project_name)}' not found in "
-            f"{_disp(str(state.projects_index_path()))}. "
-            "Run `mms project list` to see known projects."
+        raise CodedFailure(
+            "project_not_found",
+            f"Project '{project_name}' not found in {state.projects_index_path()}. "
+            "Run `mms project list` to see known projects.",
         )
     if len(matches) > 1:
-        raise click.ClickException(
-            f"Project name '{_disp(project_name)}' is ambiguous ({len(matches)} matches). "
-            "Use `mms project show NAME` from inside the target project root instead."
+        raise CodedFailure(
+            "project_ambiguous",
+            f"Project name '{project_name}' is ambiguous ({len(matches)} matches). "
+            "Use `mms project show NAME` from inside the target project root instead.",
         )
     return _load_named_project(matches[0])
 
@@ -571,6 +573,7 @@ def route_cmd(
         _read_config_text,
         _save,
         _schema_validation_error,
+        _schema_validation_summary,
     )
 
     project = _resolve_project_for_mutation(project_name)
@@ -585,7 +588,11 @@ def route_cmd(
         data["upstream_servers"] = {}
     raw_upstreams = data["upstream_servers"]
     if not isinstance(raw_upstreams, dict):
-        raise click.ClickException("invalid proxy config: 'upstream_servers' must be a JSON object")
+        raise CodedFailure(
+            "config_invalid",
+            "invalid proxy config: 'upstream_servers' must be a JSON object",
+            path=str(path),
+        )
     upstreams: dict[str, Any] = raw_upstreams
 
     planned: list[str] = []
@@ -639,10 +646,18 @@ def route_cmd(
             upstreams[name] = entry
         validation_error = _schema_validation_error(data)
         if validation_error is not None:
-            raise click.ClickException(
-                f"routing would produce an invalid proxy config "
-                f"({_disp(str(validation_error))}); "
-                "nothing written"
+            # The terminal keeps the detailed message; the document carries the
+            # location-and-type summary, since a validation ``msg`` can quote
+            # the rejected value (the duplicate-prefix check names the prefix).
+            raise CodedFailure(
+                "result_invalid",
+                f"routing would produce an invalid proxy config ({validation_error}); "
+                "nothing written",
+                json_message=(
+                    "routing would produce an invalid proxy config "
+                    f"({_schema_validation_summary(data)}); nothing written"
+                ),
+                path=str(path),
             )
         backup: Path | None = None
         if path.exists():

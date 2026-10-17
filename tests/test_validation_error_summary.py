@@ -148,6 +148,9 @@ def test_references_are_the_reviewed_set():
         # ``mms gateway``: the same ProxyConfig the config-load path validates.
         ("cli/proxy.py", "gateway_status"): 1,
         ("cli/proxy.py", "gateway_explain"): 1,
+        # ``mms project route --json``: the routed ProxyConfig dict; keys are
+        # upstream server, tool and env-variable names (#1138).
+        ("cli/proxy.py", "_schema_validation_summary"): 1,
         ("cli/proxy.py", "_surfacing_bootstrap_error"): 1,
         ("cli/proxy.py", "doctor"): 1,
         # ``~/.mms`` state: keys are server, env-variable and import-entry names.
