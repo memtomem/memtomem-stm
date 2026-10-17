@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, cast
 
 from mcp.server.mcpserver import Context, MCPServer
@@ -48,7 +49,7 @@ from memtomem_stm.proxy.metadata_recovery import (
 )
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
-from memtomem_stm.proxy.selection_log import aggregate_selection_log
+from memtomem_stm.proxy.selection_log import aggregate_selection_log, rotation_lock
 from memtomem_stm.surfacing.engine import SurfacingEngine
 from memtomem_stm.surfacing.config import holdout_startup_warnings
 from memtomem_stm.surfacing.observability import (
@@ -2481,7 +2482,16 @@ async def stm_selection_stats(
         )
 
     with traced("stm_selection_stats"):
-        agg = aggregate_selection_log(sink.path)
+        # Up to ~0.2 s at the 50 MB rotation cap, so it runs off the loop
+        # (#1152). It reads only the file, never a shared store, so a worker
+        # that outlives a cancelled call has nothing teardown can close
+        # under it.
+        agg = await asyncio.to_thread(_aggregate_selection_log_unrotated, sink.path)
+        if agg is None:
+            # Another reader held the rotation lock past the retry budget. Read
+            # on the loop, as before #1152: this process's writer cannot
+            # rotate in the middle of that.
+            agg = aggregate_selection_log(sink.path)
         live = sink.snapshot()
         # An empty disk log with no live activity is genuinely "no data".
         # But if events were written and then rotated/sampled away, the live
@@ -2491,6 +2501,32 @@ async def stm_selection_stats(
         lines = ["Selection Stats", "==============="]
         lines.extend(_format_selection_stats_sections(agg, live))
         return "\n".join(lines)
+
+
+_SELECTION_STATS_LOCK_ATTEMPTS = 20
+
+
+def _aggregate_selection_log_unrotated(path: Path) -> dict[str, Any] | None:
+    """``aggregate_selection_log`` under the rotation lock, as other readers do.
+
+    Off the loop, this process's own writer can now rotate mid-read. Holding
+    the lock makes it defer instead: on Windows the open reader blocks the
+    rename, and the append that triggered it would fail.
+
+    Returns ``None`` when another reader holds the lock for the whole retry
+    budget, so the caller can read on the loop instead. A lock that cannot be
+    set up at all (an unwritable directory) reads here without it: the writer
+    cannot take that lock either, so it cannot rotate.
+    """
+    try:
+        guard = rotation_lock(path, attempts=_SELECTION_STATS_LOCK_ATTEMPTS)
+        acquired = guard.__enter__()
+    except OSError:
+        return aggregate_selection_log(path)
+    try:
+        return aggregate_selection_log(path) if acquired else None
+    finally:
+        guard.__exit__(None, None, None)
 
 
 def _append_top_section(lines: list[str], title: str, top: list[list[Any]], distinct: int) -> None:
