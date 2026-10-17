@@ -64,7 +64,7 @@ changes inline only. See the deprecation policy in
   `pyproject.toml`; in both cases the command keeps running.
 
 - cli, daemon: report unreadable and non-UTF-8 files that #1159 left out as clean
-  errors instead of tracebacks (#1163).
+  errors instead of tracebacks (#1163, #1169).
   - `~/.mms/registry.toml`, `import_state.toml` and a project marker that cannot be
     read, or whose directory cannot be inspected, raise the same corruption error
     as the projects index: `<path>: cannot read (PermissionError)` or
