@@ -33,7 +33,7 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - cli: `mms doctor` and `mms config validate` report a config file nested too deeply
-  to parse instead of ending in a `RecursionError` traceback (#1139). Both parse the
+  to parse instead of ending in a `RecursionError` traceback (#1139, #1174). Both parse the
   file themselves, outside the reader #1144 fixed; each now reports `invalid JSON:
   nested too deeply to parse (RecursionError)`, as a failing `config JSON` check in
   `doctor` and as an error in `config validate`, in text and `--json` output. The
