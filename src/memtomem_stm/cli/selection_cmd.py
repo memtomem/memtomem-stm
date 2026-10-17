@@ -275,6 +275,9 @@ def feedback_command(
                 as_json,
                 "config_invalid",
                 f"cannot read {cfg_path}: {loaded.error}",
+                # The summary names config keys (an upstream's name); the
+                # --json document keeps them raw for its consumer to decode.
+                text_message=f"cannot read {_disp(str(cfg_path))}: {_disp(loaded.error)}",
             )
         if loaded.env_error is not None:
             # Same hazard by the other route: no file, and the environment the
@@ -284,6 +287,9 @@ def feedback_command(
                 as_json,
                 "config_invalid",
                 f"the MEMTOMEM_STM_PROXY environment is invalid: {loaded.env_error}",
+                text_message=(
+                    f"the MEMTOMEM_STM_PROXY environment is invalid: {_disp(loaded.env_error)}"
+                ),
             )
         # Not ``or ProxyConfig(...)``: with ``missing_ok=True`` the loader
         # returns no config only when it also set one of the errors screened
@@ -625,6 +631,7 @@ def _feedback_failure(
     exit_code: int = 1,
     *,
     extra: dict[str, Any] | None = None,
+    text_message: str | None = None,
 ) -> NoReturn:
     """Exit with a stable error code, in the caller's chosen format.
 
@@ -635,6 +642,10 @@ def _feedback_failure(
     ``selection_id`` behind a ``--last`` that got as far as writing, without
     which the retry the message advises would have to infer its target again,
     and could infer a different one.
+
+    *text_message* replaces *message* in the text rendering only, for a caller
+    whose message carries values that must be escaped for the terminal but kept
+    raw in the JSON document.
     """
     if as_json:
         click.echo(
@@ -651,6 +662,8 @@ def _feedback_failure(
             )
         )
         raise click.exceptions.Exit(exit_code)
+    if text_message is not None:
+        message = text_message
     if exit_code == 2:
         raise click.UsageError(message)
     raise click.ClickException(message)

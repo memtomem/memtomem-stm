@@ -114,7 +114,7 @@ def escape_lone_surrogates(text: str) -> str:
     CPython, so base64 payloads and other ASCII text skip the scan (#1101).
 
     Lowercase to match :func:`dumps` and ``json.dumps``'s own
-    ``ensure_ascii=True`` style. Like the display escaping in ``cli/_display``
+    ``ensure_ascii=True`` style. Like the display escaping in ``utils/display``
     this is non-injective — text that already held the six literal characters
     ``\\ud800`` is indistinguishable from text that held the code unit — which
     is the accepted trade for a value that otherwise cannot be delivered at all.

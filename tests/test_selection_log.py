@@ -3404,3 +3404,70 @@ class TestSelectionFeedbackRobustness:
 
         record("gh__c")  # lock released → rotation proceeds as normal
         assert (tmp_path / "log.jsonl.1").exists()
+
+
+# #1147: the failing location names config keys the author chose, so the text
+# rendering escapes it; the --json document keeps it raw for its consumer.
+_HOSTILE_KEY = "bad\nSuccess\u202e"
+_ESCAPED_KEY = "bad\\u000ASuccess\\u202E"
+
+
+def _feedback_argv(config: Path, *extra: str) -> list[str]:
+    return [
+        "selection",
+        "feedback",
+        "--config",
+        str(config),
+        "--last",
+        "--user-corrected",
+        "--yes",
+        *extra,
+    ]
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_feedback_config_error_escapes_a_hostile_key_in_text_only(tmp_path, json_output):
+    from memtomem_stm.cli.proxy import cli
+
+    config = tmp_path / "proxy.json"
+    config.write_text(
+        json.dumps({"upstream_servers": {_HOSTILE_KEY: "not-an-object"}}), encoding="utf-8"
+    )
+
+    result = CliRunner().invoke(cli, _feedback_argv(config, *(["--json"] if json_output else [])))
+
+    assert result.exit_code == 1
+    if json_output:
+        message = json.loads(result.stdout)["message"]
+        assert message.endswith(f"upstream_servers.{_HOSTILE_KEY} (model_type)")
+    else:
+        assert isinstance(result.exception, SystemExit), result.exception
+        assert (
+            f"cannot read {config}: 1 validation error(s): upstream_servers.{_ESCAPED_KEY}"
+            in result.stderr
+        )
+        assert "\nSuccess" not in result.output and "\u202e" not in result.output
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_feedback_env_error_escapes_a_hostile_key_in_text_only(tmp_path, monkeypatch, json_output):
+    from memtomem_stm.cli.proxy import cli
+
+    monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS", json.dumps({_HOSTILE_KEY: "x"}))
+
+    result = CliRunner().invoke(
+        cli, _feedback_argv(tmp_path / "absent.json", *(["--json"] if json_output else []))
+    )
+
+    assert result.exit_code == 1
+    if json_output:
+        message = json.loads(result.stdout)["message"]
+        assert message.startswith("the MEMTOMEM_STM_PROXY environment is invalid: ")
+        assert _HOSTILE_KEY in message
+    else:
+        assert isinstance(result.exception, SystemExit), result.exception
+        assert (
+            "the MEMTOMEM_STM_PROXY environment is invalid: 1 validation error(s): "
+            f"upstream_servers.{_ESCAPED_KEY} (model_type)"
+        ) in result.stderr
+        assert "\nSuccess" not in result.output and "\u202e" not in result.output
