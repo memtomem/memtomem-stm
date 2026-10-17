@@ -33,6 +33,7 @@ from memtomem_stm.proxy.selection_log import (
 )
 from memtomem_stm.proxy.tool_eligibility import ExposureCandidate, filter_tools
 from memtomem_stm.utils import json_out
+from memtomem_stm.utils.display import _disp
 from memtomem_stm.utils.numeric import finite_number
 from memtomem_stm.proxy.tool_relevance import (
     RANKER_VERSION_BM25,
@@ -948,7 +949,9 @@ def format_selection_report(report: SelectionEvaluationReport) -> str:
         "Selection Replay",
         "================",
         f"Status: {data['status']}",
-        f"Dataset: {data['inputs']['dataset']['id']} ({data['inputs']['dataset']['cases']} cases)",
+        # The id comes from the operator's dataset file; the report keeps it raw (#1166).
+        f"Dataset: {_disp(str(data['inputs']['dataset']['id']))} "
+        f"({data['inputs']['dataset']['cases']} cases)",
     ]
     production = data["production"]
     if production.get("available") is False:

@@ -732,6 +732,25 @@ def test_non_utf8_dataset_is_a_clean_error(tmp_path: Path) -> None:
     assert str(exc_info.value) == reason
 
 
+def test_cli_summary_escapes_a_hostile_dataset_id(tmp_path: Path) -> None:
+    # The id is the operator's; the summary escapes it, the --json report keeps it (#1166).
+    dataset = json.loads(builtin_dataset_path().read_text(encoding="utf-8"))
+    dataset["dataset_id"] = "bad\nSuccess\u202e"
+    path = tmp_path / "dataset.json"
+    path.write_text(json.dumps(dataset), encoding="utf-8")
+    argv = ["selection", "replay", "--no-telemetry", "--dataset", str(path)]
+    argv += ["--config", str(tmp_path / "absent.json")]
+
+    text = CliRunner().invoke(cli, argv)
+    as_json = CliRunner().invoke(cli, [*argv, "--json"])
+
+    assert text.exit_code == 0, text.output
+    assert "Dataset: bad\\u000ASuccess\\u202E (" in text.output
+    assert "\nSuccess" not in text.output and "\u202e" not in text.output
+    assert as_json.exit_code == 0, as_json.output
+    assert json.loads(as_json.output)["inputs"]["dataset"]["id"] == "bad\nSuccess\u202e"
+
+
 def test_undecodable_utf16_dataset_names_the_detected_encoding(tmp_path: Path) -> None:
     # json.loads(bytes) also accepts UTF-16/32, so "not valid UTF-8" would be wrong here.
     path = tmp_path / "dataset.json"

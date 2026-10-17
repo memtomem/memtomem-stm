@@ -74,6 +74,7 @@ from memtomem_stm.surfacing.store_io import (
 )
 from memtomem_stm.utils.anyio_shutdown import await_or_warn, is_clean_cancel_scope_shutdown
 from memtomem_stm.utils import child_reaper
+from memtomem_stm.utils.display import _disp
 from memtomem_stm.utils.parent_liveness import ParentLivenessWatcher
 from memtomem_stm.utils.signal_shutdown import (
     ShutdownSignals,
@@ -3054,7 +3055,8 @@ def main() -> None:
         # never the location itself (#835).
         logger.exception(
             "Invalid MEMTOMEM_STM_* environment configuration%s",
-            env_var_hint_for_validation_error(exc),
+            # Variable names can carry a newline or a bidi control (#1166).
+            _disp(env_var_hint_for_validation_error(exc)),
         )
         raise
     configure_server_logging(startup_config)

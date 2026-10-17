@@ -4362,6 +4362,29 @@ class TestMainExceptionBarrier:
         assert any(r.exc_info is not None for r in error_records)
         assert any("unhandled exception" in r.getMessage() for r in error_records)
 
+    def test_startup_env_hint_escapes_a_hostile_variable_name(self, tmp_path, monkeypatch, caplog):
+        # The hint names the operator's own variables; a newline or a bidi
+        # control in one must not forge or reorder the log line (#1166). The
+        # attached traceback is not covered.
+        import logging
+
+        import pytest as _pytest
+        from pydantic import ValidationError
+
+        from memtomem_stm import server
+
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(tmp_path / "absent.json"))
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH\nSuccess\u202e__COMMAND", "gh")
+        caplog.clear()
+        with caplog.at_level(logging.ERROR, logger="memtomem_stm.server"):
+            with _pytest.raises(ValidationError):
+                server.main()
+
+        [record] = [r for r in caplog.records if "environment configuration" in r.getMessage()]
+        message = record.getMessage()
+        assert "UPSTREAM_SERVERS__GH\\u000ASuccess\\u202E__COMMAND" in message
+        assert "\n" not in message and "\u202e" not in message
+
     def test_clean_exit_does_not_log_error(self, caplog):
         import logging
 

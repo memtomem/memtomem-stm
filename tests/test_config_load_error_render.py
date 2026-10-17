@@ -335,3 +335,62 @@ def test_registration_json_message_mirrors_the_escaped_terminal_line(tmp_path, m
     assert document["error"] == "setup_failed"
     assert ESCAPED_ENV in document["message"]
     assert "‮" not in document["message"]
+
+
+# #1166: every loader log line names the file, and a path can carry a newline or
+# a bidi control. POSIX only: Windows rejects these characters in file names.
+_HOSTILE_DIR = "bad\nSuccess‮"
+_ESCAPED_DIR = "bad\\u000ASuccess\\u202E"
+
+_posix_only = pytest.mark.skipif(
+    __import__("sys").platform == "win32", reason="newline in a file name"
+)
+
+
+def _assert_path_escaped(caplog: pytest.LogCaptureFixture, expected_lines: int) -> None:
+    messages = [r.getMessage() for r in caplog.records if "proxy config" in r.getMessage().lower()]
+    assert len(messages) == expected_lines, messages
+    for message in messages:
+        assert _ESCAPED_DIR in message
+        assert "\nSuccess" not in message and "‮" not in message
+
+
+@_posix_only
+def test_loader_warnings_escape_the_config_path(tmp_path, caplog):
+    path = tmp_path / _HOSTILE_DIR / "proxy.json"
+    path.parent.mkdir()
+    path.write_text(
+        json.dumps({"bogus_key": 1, "upstream_servers": {"gh": {"command": "gh", "prefix": "gh"}}})
+    )
+    path.chmod(0o644)
+
+    with caplog.at_level(logging.WARNING):
+        result = _load(path)
+
+    assert result.config is not None
+    # permissive mode, unknown key, missing tool_annotation_policy, inert upstreams
+    _assert_path_escaped(caplog, 4)
+
+
+@_posix_only
+def test_parse_failure_warning_escapes_the_config_path(tmp_path, caplog):
+    path = tmp_path / _HOSTILE_DIR / "proxy.json"
+    path.parent.mkdir()
+    path.write_text("{not json")
+    path.chmod(0o600)
+
+    with caplog.at_level(logging.WARNING):
+        result = _load(path)
+
+    assert result.error is not None
+    _assert_path_escaped(caplog, 1)
+
+
+def test_missing_file_debug_line_escapes_the_config_path(tmp_path, caplog):
+    # The path need not exist, so this one runs on Windows too.
+    with caplog.at_level(logging.DEBUG, logger="memtomem_stm.proxy.config"):
+        ProxyConfig.load_from_file_with_status(
+            tmp_path / _HOSTILE_DIR / "proxy.json", missing_ok=True
+        )
+
+    _assert_path_escaped(caplog, 1)
