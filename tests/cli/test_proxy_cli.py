@@ -5731,6 +5731,16 @@ class TestDetectInstallType:
         assert cmd == "uv"
         assert args[-1] == "memtomem-stm"
 
+    def test_non_utf8_pyproject_still_defaults(self, tmp_path, monkeypatch):
+        """An undecodable pyproject.toml is skipped like a malformed one."""
+        (tmp_path / "pyproject.toml").write_bytes(b"\xff\xfe")
+        monkeypatch.chdir(tmp_path)
+        from memtomem_stm.cli.proxy import _detect_install_type
+
+        cmd, args = _detect_install_type()
+        assert cmd == "memtomem-stm"
+        assert args == []
+
     def test_adjacent_package_name_does_not_false_positive(self, tmp_path, monkeypatch):
         """A project named `memtomem-stm-extension` (or similar dash-suffixed
         neighbor) must NOT be treated as STM's own source checkout.

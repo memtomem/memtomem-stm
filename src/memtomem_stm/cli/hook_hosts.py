@@ -737,6 +737,11 @@ def apply_change(change: HookChange) -> Path | None:
     path = change.path
     try:
         on_disk = path.read_text(encoding="utf-8") if path.exists() else None
+    except UnicodeDecodeError as exc:
+        raise HookInstallError(
+            f"{path} changed after this change was planned and is no longer valid UTF-8 "
+            f"(byte offset {exc.start}); nothing was written."
+        ) from exc
     except OSError as exc:
         raise HookInstallError(
             f"cannot re-read {path} before writing ({exc}); nothing was written."

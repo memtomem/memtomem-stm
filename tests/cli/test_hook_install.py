@@ -688,6 +688,18 @@ def test_cli_install_non_utf8_config_exits_cleanly_and_untouched(redirect) -> No
     assert path.read_bytes() == b"\xff\xfe"
 
 
+def test_cli_install_ignores_a_non_utf8_pyproject_in_cwd(redirect, tmp_path, monkeypatch) -> None:
+    # Install-type detection walks up from cwd reading pyproject.toml; an
+    # unreadable one means "not an STM project", like a malformed one.
+    redirect("claude")
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "pyproject.toml").write_bytes(b"\xff\xfe")
+    monkeypatch.chdir(project)
+    result = CliRunner().invoke(cli, ["hook", "install", "--host", "claude"])
+    assert result.exit_code == 0, result.exception
+
+
 def test_cli_install_rejects_unknown_and_missing_host() -> None:
     runner = CliRunner()
     assert runner.invoke(cli, ["hook", "install", "--host", "bogus"]).exit_code == 2
@@ -724,6 +736,30 @@ def test_apply_change_refuses_when_file_changed_after_plan(redirect) -> None:
     assert path.read_text(encoding="utf-8") == concurrent  # not clobbered
     # Aborted BEFORE the backup — a refused apply leaves no side effect.
     assert not (path.parent / (path.name + ".bak")).exists()
+
+
+@pytest.mark.parametrize("action", ["install", "uninstall"])
+def test_apply_change_refuses_when_file_turned_non_utf8_after_plan(redirect, action) -> None:
+    path = redirect("claude")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"hooks": {}}\n', encoding="utf-8")
+    install = plan_install("claude", _CMD.format(host="claude"))
+    if action == "uninstall":
+        apply_change(install)
+    change = install if action == "install" else plan_uninstall("claude")
+    assert change.changed
+    backups_before = sorted(path.parent.iterdir())
+    concurrent = b'{"x": 1}\n\xff\xfe'
+    path.write_bytes(concurrent)
+
+    with pytest.raises(HookInstallError) as exc_info:
+        apply_change(change)
+
+    message = str(exc_info.value)
+    assert "is no longer valid UTF-8 (byte offset 9); nothing was written." in message
+    assert "0xff" not in message
+    assert path.read_bytes() == concurrent
+    assert sorted(path.parent.iterdir()) == backups_before
 
 
 def test_apply_change_refuses_when_file_created_after_plan(redirect) -> None:
