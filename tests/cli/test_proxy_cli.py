@@ -745,20 +745,12 @@ class TestDisp:
     the primitive.
     """
 
-    def test_the_leaf_stays_importable_without_the_cli_package(self):
-        """``cli/_display`` exists so every CLI module can import it without a
-        cycle (#760), which only holds while it imports nothing from the
-        package. A single ``from memtomem_stm.cli.proxy import ...`` added here
-        would restore the exact constraint that forced #758's function-local
-        workaround, and would do it silently — ``proxy`` imports this module's
-        siblings, so the cycle only bites the module that imports it *first*.
-        """
+    @staticmethod
+    def _package_imports(module) -> set[str]:
         import ast
         import inspect
 
-        from memtomem_stm.cli import _display
-
-        tree = ast.parse(inspect.getsource(_display))
+        tree = ast.parse(inspect.getsource(module))
         imported = {
             node.module
             for node in ast.walk(tree)
@@ -769,7 +761,23 @@ class TestDisp:
             if isinstance(node, ast.Import)
             for alias in node.names
         }
-        assert not {name for name in imported if name.startswith("memtomem_stm")}
+        return {name for name in imported if name.startswith("memtomem_stm")}
+
+    def test_the_leaf_stays_importable_without_the_cli_package(self):
+        """``utils/display`` exists so every CLI module, and the proxy config
+        loader below the CLI (#1147), can import it without a cycle (#760),
+        which only holds while it imports nothing from the package. A single
+        ``from memtomem_stm.cli.proxy import ...`` added here would restore the
+        exact constraint that forced #758's function-local workaround, and would
+        do it silently — ``proxy`` imports this module's siblings, so the cycle
+        only bites the module that imports it *first*. ``cli/_display`` is the
+        CLI's re-export and may import that leaf and nothing else.
+        """
+        from memtomem_stm.cli import _display
+        from memtomem_stm.utils import display
+
+        assert self._package_imports(display) == set()
+        assert self._package_imports(_display) == {"memtomem_stm.utils.display"}
 
     def test_proxy_still_exports_the_names_it_defined(self):
         """``cli.proxy`` re-exports both names after the move, which is what

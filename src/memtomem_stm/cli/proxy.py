@@ -871,7 +871,7 @@ def _registration_command(config_path: Path) -> tuple[str, list[str], dict[str, 
         # raw traceback.
         from memtomem_stm.proxy.config import env_var_hint_for_validation_error
 
-        detail = env_var_hint_for_validation_error(exc) or f": {_disp(str(exc))}"
+        detail = _disp(env_var_hint_for_validation_error(exc)) or f": {_disp(str(exc))}"
         raise click.ClickException(
             "invalid MEMTOMEM_STM_* configuration prevented resolving the "
             "registration's runtime policy" + detail
@@ -1667,7 +1667,7 @@ def gateway_status(config_path: str | None, *, as_json: bool = False) -> None:
         )
     except ValidationError as exc:
         raise click.ClickException(
-            f"invalid proxy config: {validation_error_summary(exc)}"
+            f"invalid proxy config: {_disp(validation_error_summary(exc))}"
         ) from exc
     tg = config.toolgraph
     result: dict[str, Any] = {
@@ -1753,7 +1753,7 @@ def gateway_explain(tool_key: str, config_path: str | None, *, as_json: bool = F
         )
     except ValidationError as exc:
         raise click.ClickException(
-            f"invalid proxy config: {validation_error_summary(exc)}"
+            f"invalid proxy config: {_disp(validation_error_summary(exc))}"
         ) from exc
     except PolicyBundleError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -8657,7 +8657,7 @@ def _surfacing_bootstrap_status(
         # The rendered error only: a traceback repeats the exception's message,
         # which can carry configured values (#1075) or anything the failing
         # code quoted (#1079).
-        logger.debug("Surfacing bootstrap status inspection failed: %s", error)
+        logger.debug("Surfacing bootstrap status inspection failed: %s", _disp(error))
         return {
             "enabled": None,
             "feedback_enabled": None,
@@ -8697,7 +8697,7 @@ def _surfacing_bootstrap_error(exc: Exception) -> str:
 def _format_surfacing_bootstrap(status: dict[str, Any]) -> list[str]:
     lines = [_hdr("Surfacing Bootstrap"), "=" * 30]
     if status.get("error"):
-        lines.append(f"  {_bad('ERROR')} — {status['error']}")
+        lines.append(f"  {_bad('ERROR')} — {_disp(str(status['error']))}")
         return lines
 
     lines.append(f"  config: {'enabled' if status['enabled'] else 'disabled'}")

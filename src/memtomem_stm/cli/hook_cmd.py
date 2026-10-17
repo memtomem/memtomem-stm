@@ -1303,7 +1303,7 @@ def hook_install_command(
             # SettingsError, so fall back to its own message — it names the
             # failing field ("error parsing value for field ...") and, by
             # settings' contract, carries no configured value.
-            detail = env_var_hint_for_validation_error(exc) or f": {_disp(str(exc))}"
+            detail = _disp(env_var_hint_for_validation_error(exc)) or f": {_disp(str(exc))}"
             raise click.ClickException(
                 "invalid MEMTOMEM_STM_* configuration prevented resolving the "
                 "hook runtime policy" + detail

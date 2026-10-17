@@ -172,3 +172,166 @@ def test_config_validate_keeps_the_full_detail(tmp_path):
 
     assert "invalid JSON: Invalid \\escape" in result.output
     assert "char 7" in result.output
+
+
+# A config key carries whatever the author typed. In a log line, a newline
+# forges a second line and U+202E reorders the rest of this one (#1147).
+HOSTILE_KEY = "bad\nSuccess‮"
+ESCAPED_KEY = "bad\\u000ASuccess\\u202E"
+
+
+def test_file_validation_warning_escapes_the_key_but_the_result_keeps_it(tmp_path, caplog):
+    path = tmp_path / "proxy.json"
+    path.write_text(json.dumps({"upstream_servers": {HOSTILE_KEY: "not-an-object"}}))
+
+    with caplog.at_level(logging.WARNING):
+        result = _load(path)
+
+    logged = _messages(caplog)
+    assert f"upstream_servers.{ESCAPED_KEY} (model_type)" in logged
+    assert "\nSuccess" not in logged and "‮" not in logged
+    # The result is not terminal text: --json documents carry it raw.
+    assert result.error == f"1 validation error(s): upstream_servers.{HOSTILE_KEY} (model_type)"
+
+
+def test_env_only_validation_warning_escapes_the_key(tmp_path, caplog):
+    overrides = collect_proxy_env_overrides(
+        {"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS": json.dumps({HOSTILE_KEY: "x"})}
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = _load(tmp_path / "absent.json", overrides)
+
+    logged = _messages(caplog)
+    assert "Env-only proxy config failed validation" in logged
+    assert f"upstream_servers.{ESCAPED_KEY} (model_type)" in logged
+    assert "\nSuccess" not in logged and "‮" not in logged
+    assert HOSTILE_KEY in result.env_error
+
+
+def test_unknown_key_warning_escapes_the_key(tmp_path, caplog):
+    path = tmp_path / "proxy.json"
+    path.write_text(json.dumps({"upstream_servers": {}, HOSTILE_KEY: 1}))
+
+    with caplog.at_level(logging.WARNING):
+        result = _load(path)
+
+    logged = _messages(caplog)
+    assert f"unknown key(s) (ignored — possible typo): {ESCAPED_KEY}" in logged
+    assert "\nSuccess" not in logged and "‮" not in logged
+    assert result.unknown_keys == (HOSTILE_KEY,)
+
+
+def test_implicated_env_variable_names_are_escaped(tmp_path, caplog):
+    # The server-name segment of the variable name is the author's choice too.
+    path = tmp_path / "proxy.json"
+    path.write_text(json.dumps({"upstream_servers": {}}))
+    overrides = collect_proxy_env_overrides({"MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__BAD‮X": "5"})
+
+    with caplog.at_level(logging.WARNING):
+        _load(path, overrides)
+
+    logged = _messages(caplog)
+    assert (
+        "(env override(s) implicated: MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__BAD\\u202EX)" in logged
+    )
+    assert "‮" not in logged
+
+
+# The env-var hint names variables, and an upstream-name segment of a variable
+# name is the author's choice too.
+HOSTILE_ENV = "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__BAD‮X"
+ESCAPED_ENV = "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__BAD\\u202EX"
+
+
+@pytest.mark.parametrize("argv", [["gateway", "status"], ["gateway", "explain", "x"]])
+def test_gateway_invalid_config_escapes_the_key(tmp_path, argv):
+    config = tmp_path / "proxy.json"
+    config.write_text(json.dumps({"upstream_servers": {HOSTILE_KEY: "not-an-object"}}))
+
+    result = CliRunner().invoke(cli, [*argv, "--config", str(config)])
+
+    assert isinstance(result.exception, SystemExit), result.exception
+    assert result.exit_code == 1
+    assert f"invalid proxy config: upstream_servers.{ESCAPED_KEY} (model_type)" in result.output
+    assert "\nSuccess" not in result.output and "‮" not in result.output
+
+
+def test_surfacing_bootstrap_text_escapes_the_error_but_the_status_keeps_it():
+    from memtomem_stm.cli.proxy import _format_surfacing_bootstrap
+
+    status = {"error": f"invalid configuration: proxy.upstream_servers.{HOSTILE_KEY} (model_type)"}
+
+    rendered = "\n".join(_format_surfacing_bootstrap(status))
+
+    assert f"proxy.upstream_servers.{ESCAPED_KEY} (model_type)" in rendered
+    assert "\nSuccess" not in rendered and "‮" not in rendered
+    assert HOSTILE_KEY in status["error"]  # the --json document renders this dict
+
+
+def test_hook_install_policy_error_escapes_the_implicated_variable(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    monkeypatch.setenv(HOSTILE_ENV, "5")
+
+    result = CliRunner().invoke(cli, ["hook", "install", "--host", "claude"])
+
+    assert isinstance(result.exception, SystemExit), result.exception
+    assert result.exit_code == 1
+    assert "prevented resolving the hook runtime policy" in result.output
+    assert ESCAPED_ENV in result.output
+    assert "‮" not in result.output
+
+
+def test_registration_policy_error_escapes_the_implicated_variable(tmp_path, monkeypatch):
+    import click
+
+    from memtomem_stm.cli.proxy import _registration_command
+
+    config = tmp_path / "proxy.json"
+    config.write_text(json.dumps({"upstream_servers": {}}))
+    monkeypatch.setenv(HOSTILE_ENV, "5")
+
+    with pytest.raises(click.ClickException) as exc_info:
+        _registration_command(config)
+
+    message = exc_info.value.message
+    assert "prevented resolving the registration's runtime policy" in message
+    assert ESCAPED_ENV in message
+    assert "‮" not in message
+
+
+def test_surfacing_bootstrap_debug_log_escapes_but_the_status_keeps_raw(
+    tmp_path, monkeypatch, caplog
+):
+    from memtomem_stm.cli import proxy as proxy_mod
+
+    config = tmp_path / "proxy.json"
+    config.write_text(json.dumps({"upstream_servers": {}}))
+    monkeypatch.setenv(HOSTILE_ENV, "5")
+
+    with caplog.at_level(logging.DEBUG, logger="memtomem_stm.cli.proxy"):
+        status = proxy_mod._surfacing_bootstrap_status(1.0, config_path=str(config))
+
+    logged = _messages(caplog)
+    assert "Surfacing bootstrap status inspection failed" in logged
+    assert ESCAPED_ENV in logged
+    assert "‮" not in logged
+    assert HOSTILE_ENV in status["error"]  # the --json document renders this dict
+
+
+def test_registration_json_message_mirrors_the_escaped_terminal_line(tmp_path, monkeypatch):
+    """The setup commands' --json ``message`` is the last stderr line, so it
+    carries the terminal escaping; the line's existing ``_disp(str(exc))``
+    fallback already reached it the same way."""
+    config = tmp_path / "proxy.json"
+    config.write_text(json.dumps({"upstream_servers": {}}))
+    monkeypatch.setenv(HOSTILE_ENV, "5")
+
+    result = CliRunner().invoke(
+        cli, ["register", "--config", str(config), "--mcp", "json", "--json"]
+    )
+
+    document = json.loads(result.stdout)
+    assert document["error"] == "setup_failed"
+    assert ESCAPED_ENV in document["message"]
+    assert "‮" not in document["message"]

@@ -28,6 +28,7 @@ from pydantic_settings import (
 )
 
 from memtomem_stm.proxy import prefixes
+from memtomem_stm.utils.display import _disp
 from memtomem_stm.utils.redact import exception_summary
 
 logger = logging.getLogger(__name__)
@@ -980,7 +981,7 @@ def _attribute_env_overrides(
                 implicated.add(name)
     if not implicated:
         return ""
-    rendered = sorted(overlay.names.get(name, name.upper()) for name in implicated)
+    rendered = sorted(_disp(overlay.names.get(name, name.upper())) for name in implicated)
     return " (env override(s) implicated: " + ", ".join(rendered) + ")"
 
 
@@ -2502,7 +2503,7 @@ class ProxyConfig(BaseModel):
                     if log_errors:
                         logger.warning(
                             "Env-only proxy config failed validation: %s%s — using defaults",
-                            config_load_error_summary(exc),
+                            _disp(config_load_error_summary(exc)),
                             _env_override_hint(exc, overlay),
                         )
                     # Reported, not raised: the defaults rebuild stays the
@@ -2542,7 +2543,7 @@ class ProxyConfig(BaseModel):
                     "Proxy config %s has %d unknown key(s) (ignored — possible typo): %s",
                     resolved,
                     len(unknown_keys),
-                    ", ".join(unknown_keys),
+                    ", ".join(_disp(key) for key in unknown_keys),
                 )
             if log_warnings and config.cache.enabled and not _has_annotation_policy(data):
                 # Migration advisory: new configs written by `mms init`/`mms add`
@@ -2579,7 +2580,7 @@ class ProxyConfig(BaseModel):
                 logger.warning(
                     "Failed to parse proxy config %s: %s%s",
                     resolved,
-                    config_load_error_summary(exc),
+                    _disp(config_load_error_summary(exc)),
                     _env_override_hint(exc, overlay, file_data),
                 )
             return ConfigLoadResult(
