@@ -113,7 +113,7 @@ changes inline only. See the deprecation policy in
   contains a control or bidi character now prints as `\uXXXX`.
 
 - cli, proxy: escape operator-supplied paths, ids, filters and exception text in
-  terminal and log output (#1166). They are echoed into the same lines #1147 escaped
+  terminal and log output (#1166, #1172). They are echoed into the same lines #1147 escaped
   key names in, and a newline or a bidi control in one could forge or reorder a line.
   Now escaped:
   - every `mms selection feedback` failure message, in text output: the log path,
