@@ -33,7 +33,7 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - cli: `mms tune`, `mms gateway status` / `explain` and the `~/.mms` TOML readers
-  report a corrupt or malformed input instead of crashing (#1176). A metrics or
+  report a corrupt or malformed input instead of crashing (#1176, #1178). A metrics or
   feedback SQLite file that is not a database made `tune` exit with a traceback;
   it now exits 1 with `cannot open the metrics store (<path>): DatabaseError`
   (or `the feedback store`) and, with `--json`, a `store_invalid` document. A policy bundle whose tool
