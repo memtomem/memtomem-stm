@@ -786,7 +786,7 @@ def _pyproject_references_stm(pyp: Path) -> bool:
     """
     try:
         data = tomllib.loads(pyp.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError):
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
         return False
     project = data.get("project")
     if not isinstance(project, dict):

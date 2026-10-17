@@ -344,6 +344,9 @@ def _load_toml_dict(path: Path) -> dict:
             return tomllib.load(f)
     except tomllib.TOMLDecodeError as e:
         raise CorruptedConfig(path, f"TOML parse error: {e}") from e
+    except UnicodeDecodeError as e:
+        # The exception's own text quotes the offending byte; give the offset only.
+        raise CorruptedConfig(path, f"not valid UTF-8 (byte offset {e.start})") from e
 
 
 def _check_schema_version(path: Path, raw: dict, expected: int) -> None:

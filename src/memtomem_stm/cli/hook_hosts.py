@@ -516,6 +516,12 @@ def _read_current(path: Path, fmt: str) -> tuple[dict[str, Any], str] | None:
         return None
     try:
         raw = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        # The exception's own text quotes the offending byte; give the offset only.
+        raise HookInstallError(
+            f"{path} exists but is not valid UTF-8 (byte offset {exc.start}); refusing to "
+            "modify it. Fix or remove the file, then re-run."
+        ) from exc
     except OSError as exc:
         raise HookInstallError(f"cannot read {path}: {exc}") from exc
     try:
@@ -731,6 +737,11 @@ def apply_change(change: HookChange) -> Path | None:
     path = change.path
     try:
         on_disk = path.read_text(encoding="utf-8") if path.exists() else None
+    except UnicodeDecodeError as exc:
+        raise HookInstallError(
+            f"{path} changed after this change was planned and is no longer valid UTF-8 "
+            f"(byte offset {exc.start}); nothing was written."
+        ) from exc
     except OSError as exc:
         raise HookInstallError(
             f"cannot re-read {path} before writing ({exc}); nothing was written."

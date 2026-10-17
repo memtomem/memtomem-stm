@@ -103,7 +103,7 @@ def _read_toml_safely(path: Path) -> dict[str, Any] | None:
             return None
         with path.open("rb") as f:
             data = tomllib.load(f)
-    except (OSError, tomllib.TOMLDecodeError):
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
         return None
     return data if isinstance(data, dict) else None
 

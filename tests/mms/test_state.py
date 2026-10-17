@@ -527,6 +527,35 @@ def test_toml_parse_error_is_corruption(tmp_path):
     assert "TOML parse error" in exc_info.value.reason
 
 
+# A valid prefix with a canary and a multibyte character, then a byte UTF-8
+# rejects. Two prefix lengths, so a fixed offset in the message cannot pass.
+_NON_UTF8_PREFIXES = [
+    "schema_version = 1\n# sk-live-utf8-canary \uac00\n".encode(),
+    "# sk-live-utf8-canary\n".encode(),
+]
+
+
+@pytest.mark.parametrize("prefix", _NON_UTF8_PREFIXES, ids=["multibyte", "short"])
+@pytest.mark.parametrize(
+    "loader",
+    [
+        state.load_registry,
+        state.load_projects_index,
+        state.load_project_config,
+        state.load_import_state,
+    ],
+    ids=lambda f: f.__name__,
+)
+def test_non_utf8_file_is_corruption_without_its_bytes(tmp_path, loader, prefix):
+    target = tmp_path / "state.toml"
+    target.write_bytes(prefix + b"\xff\xfe")
+    with pytest.raises(state.CorruptedConfig) as exc_info:
+        loader(target)
+    assert exc_info.value.path == target
+    assert exc_info.value.reason == f"not valid UTF-8 (byte offset {len(prefix)})"
+    assert "canary" not in str(exc_info.value)
+
+
 def test_extra_field_rejected(tmp_path):
     target = tmp_path / "project.toml"
     target.write_text(
