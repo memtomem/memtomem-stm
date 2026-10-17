@@ -34,7 +34,7 @@ changes inline only. See the deprecation policy in
   in #1159.
 
 - cli: report a non-UTF-8 `~/.mms` state file or project marker as a clean exit 1
-  instead of a `UnicodeDecodeError` traceback (#1159). The shared TOML loader now
+  instead of a `UnicodeDecodeError` traceback (#1159, #1164). The shared TOML loader now
   raises the same corruption error as a TOML parse failure, naming the path and the
   byte offset but not the bytes; `--json` commands return `mms_state_invalid`.
   This covers every command that reads that state, including `mms import`, `mms host`
