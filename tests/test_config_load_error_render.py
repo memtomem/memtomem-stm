@@ -394,3 +394,60 @@ def test_missing_file_debug_line_escapes_the_config_path(tmp_path, caplog):
         )
 
     _assert_path_escaped(caplog, 1)
+
+
+# ---------------------------------------------------------------------------
+# ``ConfigLoadResult.error_kind`` (#1138)
+# ---------------------------------------------------------------------------
+
+
+def test_error_kind_is_unreadable_for_an_os_error(tmp_path, monkeypatch):
+    path = tmp_path / "proxy.json"
+    path.write_text("{}")
+    real_read_text = Path.read_text
+
+    def refuse(self, *args, **kwargs):
+        if self == path.resolve():
+            raise PermissionError(13, "Permission denied", "/cnry-dir/cnry-file")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", refuse)
+    result = _load(path)
+
+    assert result.config is None
+    assert (result.error, result.error_kind) == ("PermissionError", "unreadable")
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["{", b'{"a": "\xff"}', json.dumps({"default_max_result_chars": -1})],
+    ids=["json-error", "undecodable", "validation-error"],
+)
+def test_error_kind_is_invalid_for_a_decode_parse_or_validation_error(tmp_path, content):
+    path = tmp_path / "proxy.json"
+    if isinstance(content, bytes):
+        path.write_bytes(content)
+    else:
+        path.write_text(content)
+
+    result = _load(path)
+
+    assert result.config is None
+    assert result.error is not None
+    assert result.error_kind == "invalid"
+
+
+def test_error_kind_is_none_without_an_error(tmp_path):
+    present = tmp_path / "proxy.json"
+    present.write_text("{}")
+
+    assert _load(present).error_kind is None
+    assert _load(tmp_path / "missing.json").error_kind is None
+    missing_not_ok = ProxyConfig.load_from_file_with_status(
+        tmp_path / "missing.json", missing_ok=False
+    )
+    assert (missing_not_ok.config, missing_not_ok.error, missing_not_ok.error_kind) == (
+        None,
+        None,
+        None,
+    )

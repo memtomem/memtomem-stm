@@ -32,6 +32,29 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- cli: `mms tune --json`, `mms gateway status --json`, `mms gateway explain --json` and
+  `mms project route --json` emit the `{"action", "ok": false, "error", "message"}`
+  failure document on every remaining operational failure, instead of a stderr line
+  with an empty stdout (#1138). `tune` reports `config_not_found`, and its typed
+  validation with the environment overlay now keeps the loader's failure category:
+  `config_unreadable` for an I/O failure, `config_invalid` otherwise, with the
+  location-and-type summary in `message`. `gateway status` / `explain` report
+  `config_invalid`; `explain` adds `source_not_bundle`, `profile_mismatch`,
+  `bundle_unreadable`, `bundle_invalid` and `unknown_tool`. `project route` reports
+  `project_not_initialized`, `project_not_found`, `project_ambiguous`,
+  `project_missing` and `result_invalid`. `tune --json` with no metrics database
+  yet emits the empty preview document and moves its "nothing to tune" note to
+  stderr; it used to print that note on stdout. `project route`'s `result_invalid`
+  document carries the location-and-type summary; the terminal keeps the detailed
+  message. Text output is otherwise unchanged, except that a config `tune` cannot
+  re-read, or that is gone by its typed load, is reported as unreadable or not found
+  instead of as failing validation.
+  **Behavior change**: in `--json` mode these failures now write a JSON document to
+  stdout (exit code unchanged); a script that read an empty stdout as the failure
+  signal should branch on `ok` / `error`. `tune --json` with no metrics database
+  prints its note on stderr instead of stdout.
+  `ConfigLoadResult` gains `error_kind` (`"unreadable"` / `"invalid"` / `None`).
+
 - cli: `mms doctor` and `mms config validate` report a config file nested too deeply
   to parse instead of ending in a `RecursionError` traceback (#1139, #1174). Both parse the
   file themselves, outside the reader #1144 fixed; each now reports `invalid JSON:

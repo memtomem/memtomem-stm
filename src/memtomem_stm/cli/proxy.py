@@ -513,6 +513,24 @@ def _schema_validation_error(data: dict[str, Any]) -> str | None:
     return None
 
 
+def _schema_validation_summary(data: dict[str, Any]) -> str | None:
+    """``_schema_validation_error``'s failure as a location-and-type summary.
+
+    For a ``--json`` document: the ``msg`` the detailed form quotes can embed
+    the rejected value (the duplicate-prefix check names the prefix), and
+    stdout is what scripts and CI logs keep (#1051).
+    """
+    from pydantic import ValidationError
+
+    from memtomem_stm.proxy.config import ProxyConfig, validation_error_summary
+
+    try:
+        ProxyConfig.model_validate(data)
+    except ValidationError as exc:
+        return validation_error_summary(exc)
+    return None
+
+
 @dataclass(frozen=True)
 class _RuntimeProxyRead:
     config: ProxyConfig | None
@@ -1644,6 +1662,30 @@ def version() -> None:
     click.echo(f"memtomem-stm {pkg_version('memtomem-stm')}")
 
 
+def _gateway_fail(
+    action: str,
+    code: str,
+    message: str,
+    *,
+    as_json: bool,
+    cause: BaseException | None = None,
+    **fields: Any,
+) -> NoReturn:
+    """Exit a ``gateway`` command on an operational failure.
+
+    Without ``--json`` this is Click's ``Error: <message>`` exit. With it,
+    stderr gets the same line and stdout the one failure document, so a
+    script parsing ``mms gateway status --json`` / ``explain --json`` gets a
+    document on every operational failure, not only on an unreadable config
+    file (#1138). ``message`` is raw: the terminal line is display-escaped
+    here, the document carries it as is.
+    """
+    if as_json:
+        click.echo(f"{_err('Error:')} {_disp(message)}", err=True)
+        _json_fail(action, code, message, **fields)
+    raise click.ClickException(_disp(message)) from cause
+
+
 @click.group(name="gateway")
 def gateway_group() -> None:
     """Inspect and configure Toolgraph-backed gateway policy."""
@@ -1666,9 +1708,14 @@ def gateway_status(config_path: str | None, *, as_json: bool = False) -> None:
             _load(path, json_action="gateway-status" if as_json else None)
         )
     except ValidationError as exc:
-        raise click.ClickException(
-            f"invalid proxy config: {_disp(validation_error_summary(exc))}"
-        ) from exc
+        _gateway_fail(
+            "gateway-status",
+            "config_invalid",
+            f"invalid proxy config: {validation_error_summary(exc)}",
+            as_json=as_json,
+            cause=exc,
+            path=str(path.expanduser().resolve()),
+        )
     tg = config.toolgraph
     result: dict[str, Any] = {
         "enabled": tg.enabled,
@@ -1736,31 +1783,64 @@ def gateway_explain(tool_key: str, config_path: str | None, *, as_json: bool = F
     from memtomem_stm.proxy.config import ProxyConfig, validation_error_summary
     from memtomem_stm.proxy.toolgraph_bundle import PolicyBundleError, load_policy_bundle
 
+    path = Path(config_path)
     try:
         config = ProxyConfig.model_validate(
-            _load(Path(config_path), json_action="gateway-explain" if as_json else None)
+            _load(path, json_action="gateway-explain" if as_json else None)
         )
-        if config.toolgraph.source != "bundle":
-            raise PolicyBundleError("toolgraph.source must be 'bundle' for gateway explain")
-        if config.toolgraph.query_profile != config.exposure.profile.value:
-            raise PolicyBundleError(
-                "toolgraph.query_profile must match exposure.profile in bundle mode"
-            )
+    except ValidationError as exc:
+        _gateway_fail(
+            "gateway-explain",
+            "config_invalid",
+            f"invalid proxy config: {validation_error_summary(exc)}",
+            as_json=as_json,
+            cause=exc,
+            path=str(path.expanduser().resolve()),
+        )
+    # Each failure keeps its own code: the first two are config problems a
+    # script fixes with `mms gateway mode`, the third is the bundle file itself.
+    if config.toolgraph.source != "bundle":
+        _gateway_fail(
+            "gateway-explain",
+            "source_not_bundle",
+            "toolgraph.source must be 'bundle' for gateway explain",
+            as_json=as_json,
+        )
+    if config.toolgraph.query_profile != config.exposure.profile.value:
+        _gateway_fail(
+            "gateway-explain",
+            "profile_mismatch",
+            "toolgraph.query_profile must match exposure.profile in bundle mode",
+            as_json=as_json,
+        )
+    bundle_path = config.toolgraph.bundle_path.expanduser()
+    try:
         snapshot = load_policy_bundle(
             config.toolgraph.bundle_path,
             expected_agent=config.toolgraph.agent_id,
             expected_profile=config.exposure.profile.value,
         )
-    except ValidationError as exc:
-        raise click.ClickException(
-            f"invalid proxy config: {_disp(validation_error_summary(exc))}"
-        ) from exc
     except PolicyBundleError as exc:
-        raise click.ClickException(str(exc)) from exc
+        # The loader folds a read failure into its own error type, with the
+        # OSError chained; keep the unreadable / invalid split the config
+        # readers use.
+        code = "bundle_unreadable" if isinstance(exc.__cause__, OSError) else "bundle_invalid"
+        _gateway_fail(
+            "gateway-explain",
+            code,
+            str(exc),
+            as_json=as_json,
+            cause=exc,
+            bundle_path=str(bundle_path),
+        )
     decision = snapshot.decisions.get(tool_key)
     if decision is None:
-        raise click.ClickException(
-            f"{tool_key!r} is not in the active bundle; strict mode treats it as unmapped"
+        _gateway_fail(
+            "gateway-explain",
+            "unknown_tool",
+            f"{tool_key!r} is not in the active bundle; strict mode treats it as unmapped",
+            as_json=as_json,
+            tool_key=tool_key,
         )
     result = {
         "tool_key": tool_key,
@@ -6334,6 +6414,17 @@ def _render_tune_preview(
         )
 
 
+def _tune_config_not_found(resolved: Path, *, as_json: bool) -> NoReturn:
+    """``tune``'s missing-config exit; the ``--json`` shape matches ``remove``'s."""
+    click.echo(f"{_err('Error:')} config not found at {_disp(str(resolved))}.", err=True)
+    click.echo("  Run `mms init` first.", err=True)
+    if as_json:
+        _json_fail(
+            "tune", "config_not_found", f"config not found at {resolved}", path=str(resolved)
+        )
+    sys.exit(1)
+
+
 def _tune_json_payload(
     changes: list[_TuneChange],
     skipped: list[str],
@@ -6473,9 +6564,7 @@ def tune(
     path = Path(config_path)
     resolved = path.expanduser().resolve()
     if not resolved.exists():
-        click.echo(f"{_err('Error:')} config not found at {resolved}.", err=True)
-        click.echo("  Run `mms init` first.", err=True)
-        sys.exit(1)
+        _tune_config_not_found(resolved, as_json=as_json)
 
     # Both reads are guarded: a bare `read_text` ended in a traceback on an
     # unreadable or undecodable file (#1095).
@@ -6485,17 +6574,31 @@ def tune(
     # Typed load with the env overlay: the tuner resolves *effective* current
     # values (and the DB paths) the way the server does. A file that fails the
     # typed load is one a running server silently ignores (#611) — refuse to
-    # write overrides into it.
-    typed_cfg = ProxyConfig.load_from_file(
+    # write overrides into it. The status form keeps the failure category:
+    # a file that vanished since the check above, one that could not be
+    # re-read, and one that fails validation each get their own code in
+    # ``--json`` mode (#1138).
+    loaded = ProxyConfig.load_from_file_with_status(
         path, env_overrides=collect_proxy_env_overrides(), missing_ok=False
     )
-    if typed_cfg is None:
-        click.echo(
-            f"{_err('Error:')} config fails validation — run `mms config validate` "
-            "and fix it before tuning.",
-            err=True,
-        )
+    if loaded.config is None:
+        if loaded.error is None:
+            _tune_config_not_found(resolved, as_json=as_json)
+        fix_it = "run `mms config validate` and fix it before tuning"
+        if loaded.error_kind == "unreadable":
+            code = "config_unreadable"
+            human = message = f"config could not be read ({loaded.error})"
+        else:
+            # The terminal line stays the sentence it always was; the document
+            # adds the loader's location-and-type summary for scripts.
+            code = "config_invalid"
+            human = f"config fails validation — {fix_it}"
+            message = f"config fails validation ({loaded.error}) — {fix_it}"
+        click.echo(f"{_err('Error:')} {_disp(human)}.", err=True)
+        if as_json:
+            _json_fail("tune", code, message, path=str(resolved))
         sys.exit(1)
+    typed_cfg = loaded.config
 
     # Reaching here means the env-overlaid composite validated; the file AS
     # WRITTEN can still be invalid (an env var can replace a malformed
@@ -6523,7 +6626,17 @@ def tune(
 
     metrics_path = typed_cfg.metrics.db_path.expanduser()
     if not metrics_path.exists():
-        click.echo(f"No proxy metrics recorded yet at {metrics_path} — nothing to tune.")
+        note = f"No proxy metrics recorded yet at {metrics_path} — nothing to tune."
+        if as_json:
+            # Not a failure, but stdout must still carry exactly one JSON
+            # document: the empty preview, with the note on stderr (#1138).
+            click.echo(_disp(note), err=True)
+            payload = _tune_json_payload(
+                [], [], resolved=resolved, since_hours=since_hours, tool_filter=tool_filter
+            )
+            click.echo(_json_dumps(payload, indent=2, ensure_ascii=False))
+            return
+        click.echo(note)
         return
     feedback_path = typed_cfg.compression_feedback.db_path.expanduser()
 
