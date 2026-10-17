@@ -19,7 +19,7 @@ changes inline only. See the deprecation policy in
   read. Responses exceeding the index limits retain suffix scanning (#1153).
 
 - server: `stm_selection_stats` parses the selection log in a worker thread instead
-  of on the event loop (#1152). Near the 50 MB rotation cap one call stalled
+  of on the event loop (#1152, #1168). Near the 50 MB rotation cap one call stalled
   in-flight proxied calls for about 0.24 s; measured max loop lag drops to about
   18 ms. The worker holds the log's rotation lock while it reads, so this process's
   writer defers a rotation instead of renaming the file under it. On Windows that
