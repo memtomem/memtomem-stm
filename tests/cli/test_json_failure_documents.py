@@ -307,3 +307,223 @@ def test_text_runs_keep_their_plain_exit(tmp_path, argv):
         )
     else:
         assert "default_max_result_chars" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# #1176: malformed bundles and a corrupt store ended in a traceback
+# ---------------------------------------------------------------------------
+
+
+def _write_bundle_with_decision(tmp_path: Path, decision: object) -> None:
+    _write_bundle(tmp_path)
+    bundle = tmp_path / "bundle.json"
+    doc = json.loads(bundle.read_text())
+    doc["tools"][0]["decision"] = decision
+    bundle.write_text(json.dumps(doc))
+
+
+def _write_bundle_with_a_huge_integer(tmp_path: Path) -> None:
+    _write_bundle(tmp_path)
+    bundle = tmp_path / "bundle.json"
+    text = bundle.read_text().replace('"generation": 7', '"generation": ' + "1" * 5000)
+    assert "1" * 5000 in text
+    bundle.write_text(text)
+
+
+def test_gateway_status_json_reports_a_list_decision_as_invalid(tmp_path):
+    path = _bundle_config(tmp_path)
+    _write_bundle_with_decision(tmp_path, [])
+
+    result = CliRunner().invoke(cli, ["gateway", "status", "--json", "--config", str(path)])
+
+    assert result.exit_code == 0, result.output
+    document = json.loads(result.stdout)
+    assert document["valid"] is False
+    assert document["error"] == "tools[0].decision is invalid"
+
+
+def test_gateway_status_text_reports_a_list_decision_as_invalid(tmp_path):
+    path = _bundle_config(tmp_path)
+    _write_bundle_with_decision(tmp_path, [])
+
+    result = CliRunner().invoke(cli, ["gateway", "status", "--config", str(path)])
+
+    assert result.exit_code == 0, result.output
+    assert "INVALID" in result.stdout
+    assert "tools[0].decision is invalid" in result.stdout
+
+
+def test_gateway_explain_json_reports_a_list_decision_as_bundle_invalid(tmp_path):
+    path = _bundle_config(tmp_path)
+    _write_bundle_with_decision(tmp_path, [])
+
+    result = CliRunner().invoke(
+        cli, ["gateway", "explain", "graph-srv::read", "--json", "--config", str(path)]
+    )
+
+    document = _failure_document(result, "gateway-explain", "bundle_invalid")
+    assert document["message"] == "tools[0].decision is invalid"
+
+
+def test_gateway_explain_text_reports_a_list_decision_cleanly(tmp_path):
+    path = _bundle_config(tmp_path)
+    _write_bundle_with_decision(tmp_path, [])
+
+    result = CliRunner().invoke(
+        cli, ["gateway", "explain", "graph-srv::read", "--config", str(path)]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert isinstance(result.exception, SystemExit)
+    assert result.stdout == ""
+    assert "tools[0].decision is invalid" in result.stderr
+
+
+def test_gateway_status_json_reports_a_huge_integer_as_invalid(tmp_path):
+    """``json.loads`` raises a plain ``ValueError`` past the int digit limit."""
+    path = _bundle_config(tmp_path)
+    _write_bundle_with_a_huge_integer(tmp_path)
+
+    result = CliRunner().invoke(cli, ["gateway", "status", "--json", "--config", str(path)])
+
+    assert result.exit_code == 0, result.output
+    document = json.loads(result.stdout)
+    assert document["valid"] is False
+    assert document["error"].startswith("bundle is not valid UTF-8 JSON: ")
+
+
+def test_gateway_explain_json_reports_a_huge_integer_as_bundle_invalid(tmp_path):
+    path = _bundle_config(tmp_path)
+    _write_bundle_with_a_huge_integer(tmp_path)
+
+    result = CliRunner().invoke(
+        cli, ["gateway", "explain", "graph-srv::read", "--json", "--config", str(path)]
+    )
+
+    document = _failure_document(result, "gateway-explain", "bundle_invalid")
+    assert document["message"].startswith("bundle is not valid UTF-8 JSON: ")
+
+
+def _tune_config_with_a_non_sqlite_metrics_file(tmp_path: Path) -> tuple[Path, Path]:
+    metrics = tmp_path / "cnry-metrics.db"
+    metrics.write_text("not sqlite")
+    path = tmp_path / "proxy.json"
+    path.write_text(
+        json.dumps({"enabled": True, "upstream_servers": {}, "metrics": {"db_path": str(metrics)}})
+    )
+    return path, metrics
+
+
+def test_tune_json_reports_a_non_sqlite_metrics_store(tmp_path):
+    path, metrics = _tune_config_with_a_non_sqlite_metrics_file(tmp_path)
+
+    result = CliRunner().invoke(cli, ["tune", "--json", "--config", str(path)])
+
+    document = _failure_document(result, "tune", "store_invalid")
+    assert document["path"] == str(path.resolve())
+    assert document["stores"] == [str(metrics)]
+    assert document["message"] == (f"cannot open the metrics store ({metrics}): DatabaseError")
+    # The sqlite message ("file is not a database") never reaches the document.
+    assert "not a database" not in result.stdout
+
+
+def test_tune_text_reports_a_non_sqlite_metrics_store(tmp_path):
+    path, metrics = _tune_config_with_a_non_sqlite_metrics_file(tmp_path)
+
+    result = CliRunner().invoke(cli, ["tune", "--config", str(path)])
+
+    assert result.exit_code == 1, result.output
+    assert isinstance(result.exception, SystemExit)
+    assert result.stdout == ""
+    assert f"Error: cannot open the metrics store ({metrics}): DatabaseError" in result.stderr
+
+
+def test_tune_reports_a_non_sqlite_feedback_store_by_name(tmp_path):
+    """The step and the file named are the ones that actually failed."""
+    metrics = tmp_path / "metrics.db"
+    feedback = tmp_path / "feedback.db"
+    feedback.write_text("not sqlite")
+    path = tmp_path / "proxy.json"
+    path.write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "upstream_servers": {},
+                "metrics": {"db_path": str(metrics)},
+                "compression_feedback": {"db_path": str(feedback)},
+            }
+        )
+    )
+    from memtomem_stm.proxy.metrics_store import MetricsStore
+
+    store = MetricsStore(metrics)
+    store.initialize()
+    store.close()
+
+    result = CliRunner().invoke(cli, ["tune", "--json", "--config", str(path)])
+
+    document = _failure_document(result, "tune", "store_invalid")
+    assert document["stores"] == [str(feedback)]
+    assert document["message"] == f"cannot open the feedback store ({feedback}): DatabaseError"
+
+
+def test_tune_text_escapes_the_store_path_and_the_document_keeps_it_raw(tmp_path):
+    hostile = tmp_path / "m\u202eetrics.db"
+    hostile.write_text("not sqlite")
+    path = tmp_path / "proxy.json"
+    path.write_text(json.dumps({"upstream_servers": {}, "metrics": {"db_path": str(hostile)}}))
+
+    text = CliRunner().invoke(cli, ["tune", "--config", str(path)])
+    as_json = CliRunner().invoke(cli, ["tune", "--json", "--config", str(path)])
+
+    assert text.exit_code == 1, text.output
+    assert "\u202e" not in text.stderr
+    assert "\\u202E" in text.stderr
+    document = _failure_document(as_json, "tune", "store_invalid")
+    assert document["stores"] == [str(hostile)]
+    assert "\u202e" in document["message"]
+
+
+@pytest.mark.parametrize(
+    ("with_feedback", "step"),
+    [(False, "analyze the metrics store"), (True, "analyze the stores")],
+    ids=["metrics-only", "metrics-and-feedback"],
+)
+def test_tune_reports_an_analysis_failure_with_every_store_it_was_reading(
+    tmp_path, monkeypatch, with_feedback, step
+):
+    """Past ``initialize``, a read failure cannot be pinned on one file, so the
+    message names the step and lists each store the analysis touches."""
+    import sqlite3
+
+    from memtomem_stm.proxy.compression_feedback_store import CompressionFeedbackStore
+    from memtomem_stm.proxy.metrics_store import MetricsStore
+    from memtomem_stm.proxy.tuner import CompressionTuner
+
+    metrics = tmp_path / "metrics.db"
+    store = MetricsStore(metrics)
+    store.initialize()
+    store.close()
+    config = {"enabled": True, "upstream_servers": {}, "metrics": {"db_path": str(metrics)}}
+    expected_stores = [str(metrics)]
+    if with_feedback:
+        feedback = tmp_path / "feedback.db"
+        fb = CompressionFeedbackStore(feedback, retention_days=0)
+        fb.initialize()
+        fb.close()
+        config["compression_feedback"] = {"db_path": str(feedback)}
+        expected_stores.append(str(feedback))
+    path = tmp_path / "proxy.json"
+    path.write_text(json.dumps(config))
+
+    def broken_analyze(self, *args, **kwargs):
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    monkeypatch.setattr(CompressionTuner, "analyze", broken_analyze)
+
+    result = CliRunner().invoke(cli, ["tune", "--json", "--config", str(path)])
+
+    document = _failure_document(result, "tune", "store_invalid")
+    assert document["stores"] == expected_stores
+    assert document["message"] == f"cannot {step} ({', '.join(expected_stores)}): DatabaseError"
+    assert "malformed" not in result.stdout

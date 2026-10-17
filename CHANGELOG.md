@@ -32,6 +32,23 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- cli: `mms tune`, `mms gateway status` / `explain` and the `~/.mms` TOML readers
+  report a corrupt or malformed input instead of crashing (#1176). A metrics or
+  feedback SQLite file that is not a database made `tune` exit with a traceback;
+  it now exits 1 with `cannot open the metrics store (<path>): DatabaseError`
+  (or `the feedback store`) and, with `--json`, a `store_invalid` document. A policy bundle whose tool
+  `decision` is a list, an integer literal past the interpreter's digit limit,
+  or nesting past its recursion limit escaped the bundle parser as `TypeError`,
+  `ValueError` or `RecursionError`; each is now a bundle error, so `gateway
+  status` prints `INVALID` and `gateway explain` the `bundle_invalid` document.
+  A `registry.toml` / `projects.toml` nested past the recursion limit, holding
+  an integer literal past the digit limit, or declaring a `schema_version` too
+  large to print, escaped `project route` and the other `~/.mms` readers as a
+  traceback; all three are now the `mms_state_invalid` failure every other
+  corrupt state file already produces. The remaining #1176 items
+  (an unwritable config directory or an unopenable write lock under `project
+  route --apply` and the other config mutators) are not changed here.
+
 - logging: a traceback attached to a log line is escaped the way the line's own
   values are (#1173, #1177). #1166 escaped the env-hint lines that name a broken
   `MEMTOMEM_STM_*` variable, but the `ValidationError` traceback attached by

@@ -398,8 +398,13 @@ def parse_policy_bundle(
     """
     try:
         raw = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except ValueError as exc:
+        # ``UnicodeDecodeError`` and ``JSONDecodeError`` are both ValueErrors,
+        # and so is the one ``json.loads`` raises for an integer literal past
+        # ``sys.get_int_max_str_digits()`` -- that last one escaped (#1176).
         raise PolicyBundleError(f"bundle is not valid UTF-8 JSON: {exc}") from exc
+    except RecursionError as exc:
+        raise PolicyBundleError("bundle is nested too deeply to parse (RecursionError)") from exc
     doc = _object(raw, "bundle")
     version = doc.get("schema_version")
     if isinstance(version, bool) or version != SCHEMA_VERSION:
@@ -437,7 +442,9 @@ def parse_policy_bundle(
         if key in decisions:
             raise PolicyBundleError(f"duplicate tool_key {key!r}")
         decision = item.get("decision")
-        if decision not in {"eligible", "rejected"}:
+        # The type check comes first: an unhashable value (a list, an object)
+        # would otherwise escape the set membership as a ``TypeError`` (#1176).
+        if not isinstance(decision, str) or decision not in {"eligible", "rejected"}:
             raise PolicyBundleError(f"tools[{index}].decision is invalid")
         reason = item.get("reason")
         if decision == "rejected" and not isinstance(reason, str):
