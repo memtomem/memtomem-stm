@@ -866,3 +866,71 @@ def test_cli_config_error_escapes_a_hostile_upstream_name(tmp_path: Path) -> Non
     assert result.exit_code == 1
     assert "upstream_servers.bad\\u000ASuccess\\u202E (model_type)" in result.output
     assert "\nSuccess" not in result.output and "‮" not in result.output
+
+
+def _refuse_evaluation(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    calls: list[object] = []
+    monkeypatch.setattr(
+        "memtomem_stm.cli.selection_cmd.evaluate_selection",
+        lambda *a, **kw: calls.append((a, kw)),
+    )
+    return calls
+
+
+def test_cli_stops_on_an_invalid_env_override_and_escapes_its_location(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The env_error branch: with no config file, an override that fails
+    validation is reported as the environment's fault, and replay stops instead
+    of running on defaults. The summary names the failing key, which the
+    override's JSON chose, so a newline or bidi control in it is escaped.
+
+    With a config file present, the same override fails the merged validation
+    and is reported through ``loaded.error`` instead, which the tests above
+    cover.
+    """
+    calls = _refuse_evaluation(monkeypatch)
+    monkeypatch.setenv(
+        "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS", json.dumps({"bad\nSuccess\u202e": "x"})
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["selection", "replay", "--no-telemetry", "--config", str(tmp_path / "missing.json")],
+    )
+
+    assert isinstance(result.exception, SystemExit), result.exception
+    assert result.exit_code == 1
+    assert (
+        "the MEMTOMEM_STM_PROXY environment is invalid: 1 validation error(s): "
+        "upstream_servers.bad\\u000ASuccess\\u202E (model_type)"
+    ) in result.output
+    assert "\nSuccess" not in result.output and "\u202e" not in result.output
+    assert calls == []
+
+
+def test_cli_stops_when_the_bare_env_block_cannot_be_decoded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bare ``MEMTOMEM_STM_PROXY`` that is not a JSON object is dropped whole,
+    so the load would otherwise succeed on the file alone. That config is not
+    the operator's, and replay stops even though the file itself is valid.
+    This message names only the variable, never its value, so it carries no
+    characters an override could choose."""
+    calls = _refuse_evaluation(monkeypatch)
+    config = tmp_path / "stm_proxy.json"
+    config.write_text(json.dumps({"upstream_servers": {}}), encoding="utf-8")
+    monkeypatch.setenv("MEMTOMEM_STM_PROXY", "{not json")
+
+    result = CliRunner().invoke(
+        cli, ["selection", "replay", "--no-telemetry", "--config", str(config)]
+    )
+
+    assert isinstance(result.exception, SystemExit), result.exception
+    assert result.exit_code == 1
+    assert (
+        "the MEMTOMEM_STM_PROXY environment is invalid: MEMTOMEM_STM_PROXY could not "
+        "be decoded as a proxy config object and was ignored entirely"
+    ) in result.output
+    assert "not json" not in result.output
+    assert calls == []
