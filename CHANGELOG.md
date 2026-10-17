@@ -35,7 +35,7 @@ changes inline only. See the deprecation policy in
 - cli: `mms tune --json`, `mms gateway status --json`, `mms gateway explain --json` and
   `mms project route --json` emit the `{"action", "ok": false, "error", "message"}`
   failure document on every remaining operational failure, instead of a stderr line
-  with an empty stdout (#1138). `tune` reports `config_not_found`, and its typed
+  with an empty stdout (#1138, #1175). `tune` reports `config_not_found`, and its typed
   validation with the environment overlay now keeps the loader's failure category:
   `config_unreadable` for an I/O failure, `config_invalid` otherwise, with the
   location-and-type summary in `message`. `gateway status` / `explain` report
