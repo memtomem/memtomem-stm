@@ -9,6 +9,7 @@ keeps a new subcommand from skipping it.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import click
 import pytest
@@ -296,6 +297,72 @@ def test_host_status_reports_a_non_utf8_registry_cleanly(runner, sandbox, json_o
     result = runner.invoke(host_group, ["status", *(["--json"] if json_output else [])])
 
     _assert_clean_non_utf8_exit(result, json_output, "status")
+
+
+def _deny(monkeypatch, method: str, target) -> None:
+    """``Path.<method>`` raises ``PermissionError`` for ``target`` only — the
+    portable stand-in for ``chmod 000`` (no effect on Windows or as root)."""
+    real = getattr(Path, method)
+
+    def fake(self, *args, **kwargs):
+        if self == target:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, method, fake)
+
+
+def _assert_clean_read_failure(result, json_output: bool, action: str, reason: str) -> None:
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit), result.exception
+    assert "Error:" in result.stderr and reason in result.stderr
+    if json_output:
+        doc = json.loads(result.stdout)
+        assert (doc["action"], doc["ok"], doc["error"]) == (action, False, "mms_state_invalid")
+        assert doc["message"].endswith(reason)
+
+
+@pytest.mark.parametrize(
+    ("method", "reason"),
+    [("open", "cannot read (PermissionError)"), ("stat", "cannot inspect (PermissionError)")],
+    ids=["read", "inspect"],
+)
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_host_status_reports_an_unreadable_registry_cleanly(
+    runner, sandbox, monkeypatch, json_output, method, reason
+):
+    path = state.registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("schema_version = 1\n", encoding="utf-8")
+    _deny(monkeypatch, method, path)
+
+    result = runner.invoke(host_group, ["status", *(["--json"] if json_output else [])])
+
+    _assert_clean_read_failure(result, json_output, "status", reason)
+
+
+@pytest.mark.parametrize(
+    ("method", "reason"),
+    [("open", "cannot read (PermissionError)"), ("stat", "cannot inspect (PermissionError)")],
+    ids=["read", "inspect"],
+)
+@pytest.mark.parametrize("command", ["route", "show"])
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_project_detection_reports_an_unreadable_marker_cleanly(
+    runner, sandbox, monkeypatch, json_output, command, method, reason
+):
+    # Both commands find the marker by walking up from the cwd.
+    assert runner.invoke(project_group, ["init", "--name", "p"]).exit_code == 0
+    args = [command]
+    if command == "route":
+        proxy = sandbox["home"] / "proxy.json"
+        proxy.write_bytes(b'{"upstream_servers": {}}\n')
+        args += ["--config", str(proxy)]
+    _deny(monkeypatch, method, sandbox["cwd"] / state.PROJECT_MARKER_RELPATH)
+
+    result = runner.invoke(project_group, [*args, *(["--json"] if json_output else [])])
+
+    _assert_clean_read_failure(result, json_output, command, reason)
 
 
 def test_import_reports_a_corrupt_registry_cleanly(runner, sandbox):

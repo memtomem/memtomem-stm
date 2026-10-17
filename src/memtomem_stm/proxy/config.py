@@ -471,7 +471,7 @@ def warn_if_upstreams_inert(
         "disabled%s — the upstream configuration is present but inert; the gate is "
         "applied at startup, so upstream tools are not advertised to MCP clients until "
         'it is true. Add "enabled": true (or remove upstream_servers) to silence.',
-        resolved,
+        _disp(str(resolved)),
         count,
         " explicitly" if state == "explicit" else ' ("enabled" is unset and defaults to false)',
     )
@@ -2473,6 +2473,9 @@ class ProxyConfig(BaseModel):
         failure is not reported twice.
         """
         resolved = path.expanduser().resolve()
+        # Every log line below names the file through ``shown``: a path can carry a
+        # newline or a bidi control, which would forge or reorder the line (#1166).
+        shown = _disp(str(resolved))
         overlay = _as_overlay(env_overrides)
         env_data = overlay.fragment if overlay is not None else None
         # Independent of whether the surviving fragment is empty: a dropped
@@ -2480,7 +2483,7 @@ class ProxyConfig(BaseModel):
         # the fragment cannot be the thing that decides this.
         env_rejected = _rejected_env_error(overlay)
         if not resolved.exists():
-            logger.debug("Proxy config file not found: %s", resolved)
+            logger.debug("Proxy config file not found: %s", shown)
             if not missing_ok:
                 return ConfigLoadResult(config=None, error=None)
             if env_data:
@@ -2519,7 +2522,7 @@ class ProxyConfig(BaseModel):
         if mode is not None and log_warnings:
             logger.warning(
                 "Proxy config %s has permissive mode %o — consider restricting to 0600",
-                resolved,
+                shown,
                 mode,
             )
         file_data: dict[str, Any] | None = None
@@ -2541,7 +2544,7 @@ class ProxyConfig(BaseModel):
                 # re-runs this on every mtime change.
                 logger.warning(
                     "Proxy config %s has %d unknown key(s) (ignored — possible typo): %s",
-                    resolved,
+                    shown,
                     len(unknown_keys),
                     ", ".join(_disp(key) for key in unknown_keys),
                 )
@@ -2558,7 +2561,7 @@ class ProxyConfig(BaseModel):
                     "'conservative' default. New configs are created with 'strict'; add "
                     '"cache": {"tool_annotation_policy": "strict"} (or "conservative" to '
                     "pin current behavior) to silence this.",
-                    resolved,
+                    shown,
                 )
             if log_warnings:
                 # Checked against the MERGED data so an env-enabled proxy
@@ -2579,7 +2582,7 @@ class ProxyConfig(BaseModel):
             if log_errors:
                 logger.warning(
                     "Failed to parse proxy config %s: %s%s",
-                    resolved,
+                    shown,
                     _disp(config_load_error_summary(exc)),
                     _env_override_hint(exc, overlay, file_data),
                 )

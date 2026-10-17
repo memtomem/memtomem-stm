@@ -33,6 +33,7 @@ from memtomem_stm.proxy.selection_log import (
 )
 from memtomem_stm.proxy.tool_eligibility import ExposureCandidate, filter_tools
 from memtomem_stm.utils import json_out
+from memtomem_stm.utils.display import _disp
 from memtomem_stm.utils.numeric import finite_number
 from memtomem_stm.proxy.tool_relevance import (
     RANKER_VERSION_BM25,
@@ -163,6 +164,12 @@ def load_selection_dataset(path: Path | str | None = None) -> dict[str, Any]:
         data = json.loads(raw_bytes)
     except json.JSONDecodeError as exc:
         raise SelectionEvaluationError(f"invalid dataset JSON: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        # The exception's own text quotes the offending byte; give the offset only.
+        # json.loads(bytes) detects UTF-8/16/32, so name the encoding it tried.
+        raise SelectionEvaluationError(
+            f"dataset is not valid {exc.encoding.upper()} (byte offset {exc.start})"
+        ) from exc
     if not isinstance(data, dict) or data.get("schema_version") != DATASET_SCHEMA_VERSION:
         raise SelectionEvaluationError(f"dataset schema_version must be {DATASET_SCHEMA_VERSION}")
     cases = data.get("cases")
@@ -942,7 +949,9 @@ def format_selection_report(report: SelectionEvaluationReport) -> str:
         "Selection Replay",
         "================",
         f"Status: {data['status']}",
-        f"Dataset: {data['inputs']['dataset']['id']} ({data['inputs']['dataset']['cases']} cases)",
+        # The id comes from the operator's dataset file; the report keeps it raw (#1166).
+        f"Dataset: {_disp(str(data['inputs']['dataset']['id']))} "
+        f"({data['inputs']['dataset']['cases']} cases)",
     ]
     production = data["production"]
     if production.get("available") is False:

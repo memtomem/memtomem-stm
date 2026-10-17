@@ -619,6 +619,29 @@ class TestLogStmConfigFailure:
         # (STMConfig sets hide_input_in_errors at the root).
         assert "hunter2-cmd" not in caplog.text
 
+    def test_a_hostile_variable_name_is_escaped(self, tmp_path, monkeypatch, caplog):
+        # The hint names the operator's own variables; a newline or a bidi
+        # control in one must not forge or reorder the log line (#1166).
+        import logging
+
+        from memtomem_stm.config import log_stm_config_failure
+
+        # Upper case throughout: Windows upper-cases environment variable names.
+        name = "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH\nSUCCESS\u202e__COMMAND"
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(tmp_path / "absent.json"))
+        monkeypatch.setenv(name, "gh")
+        with pytest.raises(ValidationError) as caught:
+            STMConfig()
+
+        probe = logging.getLogger("test.log_stm_config_failure.hostile")
+        with caplog.at_level(logging.WARNING, logger=probe.name):
+            log_stm_config_failure(caught.value, logger=probe, context="probing", exc_info=False)
+
+        [record] = [r for r in caplog.records if r.name == probe.name]
+        message = record.getMessage()
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH\\u000ASUCCESS\\u202E__COMMAND" in message
+        assert "\n" not in message and "\u202e" not in message
+
     def test_non_validation_error_keeps_a_coherent_line(self, caplog):
         import logging
 

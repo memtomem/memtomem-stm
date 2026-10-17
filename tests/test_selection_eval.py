@@ -716,6 +716,75 @@ def test_oversized_graph_risk_score_in_a_dataset_is_a_clean_error(tmp_path: Path
         load_selection_dataset(path)
 
 
+# The invalid byte sits mid-string: a leading ``0xff 0xfe`` is a UTF-16 BOM to
+# ``json.loads(bytes)`` and fails as a JSONDecodeError instead.
+_NON_UTF8_DATASET_PREFIX = b'{"schema_version": 1, "note": "sk-live-dataset-canary '
+
+
+def test_non_utf8_dataset_is_a_clean_error(tmp_path: Path) -> None:
+    path = tmp_path / "dataset.json"
+    path.write_bytes(_NON_UTF8_DATASET_PREFIX + b'\xff"}')
+
+    with pytest.raises(SelectionEvaluationError) as exc_info:
+        load_selection_dataset(path)
+
+    reason = f"dataset is not valid UTF-8 (byte offset {len(_NON_UTF8_DATASET_PREFIX)})"
+    assert str(exc_info.value) == reason
+
+
+def test_cli_summary_escapes_a_hostile_dataset_id(tmp_path: Path) -> None:
+    # The id is the operator's; the summary escapes it, the --json report keeps it (#1166).
+    dataset = json.loads(builtin_dataset_path().read_text(encoding="utf-8"))
+    dataset["dataset_id"] = "bad\nSuccess\u202e"
+    path = tmp_path / "dataset.json"
+    path.write_text(json.dumps(dataset), encoding="utf-8")
+    argv = ["selection", "replay", "--no-telemetry", "--dataset", str(path)]
+    argv += ["--config", str(tmp_path / "absent.json")]
+
+    text = CliRunner().invoke(cli, argv)
+    as_json = CliRunner().invoke(cli, [*argv, "--json"])
+
+    assert text.exit_code == 0, text.output
+    assert "Dataset: bad\\u000ASuccess\\u202E (" in text.output
+    assert "\nSuccess" not in text.output and "\u202e" not in text.output
+    assert as_json.exit_code == 0, as_json.output
+    assert json.loads(as_json.output)["inputs"]["dataset"]["id"] == "bad\nSuccess\u202e"
+
+
+def test_undecodable_utf16_dataset_names_the_detected_encoding(tmp_path: Path) -> None:
+    # json.loads(bytes) also accepts UTF-16/32, so "not valid UTF-8" would be wrong here.
+    path = tmp_path / "dataset.json"
+    path.write_bytes('{"schema_version": 1}'.encode("utf-16-le")[:-1])
+
+    with pytest.raises(SelectionEvaluationError) as exc_info:
+        load_selection_dataset(path)
+
+    assert str(exc_info.value).startswith("dataset is not valid UTF-16-LE (byte offset ")
+
+
+def test_cli_reports_a_non_utf8_dataset_without_a_traceback(tmp_path: Path) -> None:
+    path = tmp_path / "dataset.json"
+    path.write_bytes(_NON_UTF8_DATASET_PREFIX + b'\xff"}')
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "selection",
+            "replay",
+            "--no-telemetry",
+            "--dataset",
+            str(path),
+            "--config",
+            str(tmp_path / "absent.json"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit), result.exception
+    assert "dataset is not valid UTF-8 (byte offset" in result.output
+    assert "canary" not in result.output
+
+
 def test_unknown_future_ranker_skips_v1_score_parity(tmp_path: Path) -> None:
     log = tmp_path / "selection.jsonl"
     selection = _selection()

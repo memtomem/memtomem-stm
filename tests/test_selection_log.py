@@ -3471,3 +3471,131 @@ def test_feedback_env_error_escapes_a_hostile_key_in_text_only(tmp_path, monkeyp
             f"upstream_servers.{_ESCAPED_KEY} (model_type)"
         ) in result.stderr
         assert "\nSuccess" not in result.output and "\u202e" not in result.output
+
+
+# #1166: paths, ids, filters and exception text reach the same failure messages.
+# Each case puts the hostile value where the operator (or a damaged log) can.
+
+
+def _assert_value_escaped(result, json_output: bool, *, exit_code: int = 1) -> None:
+    assert result.exit_code == exit_code, result.output
+    if json_output:
+        assert _HOSTILE_KEY in json.loads(result.stdout)["message"]
+    else:
+        assert isinstance(result.exception, SystemExit), result.exception
+        assert _ESCAPED_KEY in result.stderr
+        assert "\nSuccess" not in result.output and "‮" not in result.output
+
+
+def _hostile_record() -> dict:
+    return {
+        "event": "selection",
+        "selection_id": _HOSTILE_KEY,
+        "server": "gh",
+        "selected_tool": "gh__a",
+        "trace_id": "t",
+        "ranker_version": "v1",
+    }
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+class TestFeedbackFailureEscapesValues:
+    def _run(self, tmp_path, log_path, json_output, *args):
+        fmt = ["--json"] if json_output else []
+        return _run_feedback(tmp_path, log_path, *args, "--user-corrected", *fmt)
+
+    def _seeded(self, tmp_path) -> Path:
+        log_path = tmp_path / "log.jsonl"
+        _seed_log(log_path, rows=[{"server": "gh", "tool": "gh__a", "ranker_version": "v1"}])
+        return log_path
+
+    def test_no_log_path(self, tmp_path, json_output):
+        result = self._run(tmp_path, tmp_path / f"{_HOSTILE_KEY}.jsonl", json_output, "--last")
+        _assert_value_escaped(result, json_output)
+
+    def test_not_found_selection_id(self, tmp_path, json_output):
+        log_path = self._seeded(tmp_path)
+        result = self._run(tmp_path, log_path, json_output, "--selection-id", _HOSTILE_KEY)
+        _assert_value_escaped(result, json_output)
+
+    def test_no_match_filter(self, tmp_path, json_output):
+        log_path = self._seeded(tmp_path)
+        result = self._run(tmp_path, log_path, json_output, "--last", "--server", _HOSTILE_KEY)
+        _assert_value_escaped(result, json_output)
+
+    def test_unreadable_segment(self, tmp_path, monkeypatch, json_output):
+        log_path = self._seeded(tmp_path)
+
+        def unreadable(*args, **kwargs):
+            raise selection_log_module.SelectionLogUnreadable(_HOSTILE_KEY, OSError("denied"))
+
+        monkeypatch.setattr(selection_cmd, "resolve_selection", unreadable)
+        result = self._run(tmp_path, log_path, json_output, "--last")
+        _assert_value_escaped(result, json_output)
+
+    def test_directory_listing_error(self, tmp_path, monkeypatch, json_output):
+        log_path = self._seeded(tmp_path)
+
+        def unlistable(*args, **kwargs):
+            raise OSError(_HOSTILE_KEY)
+
+        monkeypatch.setattr(selection_cmd, "discover_log_files", unlistable)
+        result = self._run(tmp_path, log_path, json_output, "--last")
+        _assert_value_escaped(result, json_output)
+
+    def test_lock_setup_error(self, tmp_path, monkeypatch, json_output):
+        log_path = self._seeded(tmp_path)
+
+        def no_lock(*args, **kwargs):
+            raise OSError(_HOSTILE_KEY)
+
+        monkeypatch.setattr(selection_cmd, "rotation_lock", no_lock)
+        result = self._run(tmp_path, log_path, json_output, "--last")
+        _assert_value_escaped(result, json_output)
+
+    @pytest.mark.parametrize("second", [(None, None), (None, "no ranker_version")])
+    def test_resolved_id_from_the_log(self, tmp_path, monkeypatch, json_output, second):
+        # log_rotated / selection_changed name the id the log itself supplied.
+        log_path = self._seeded(tmp_path)
+        answers = iter([(_hostile_record(), None), second])
+        monkeypatch.setattr(selection_cmd, "resolve_selection", lambda *a, **k: next(answers))
+        result = self._run(tmp_path, log_path, json_output, "--last")
+        _assert_value_escaped(result, json_output)
+
+    def test_unconfirmed_write_names_the_id(self, tmp_path, monkeypatch, json_output):
+        log_path = self._seeded(tmp_path)
+        monkeypatch.setattr(
+            selection_cmd, "resolve_selection", lambda *a, **k: (_hostile_record(), None)
+        )
+        monkeypatch.setattr(
+            selection_cmd, "_write_label", lambda *a, **k: selection_cmd.APPEND_UNCONFIRMED
+        )
+        result = self._run(tmp_path, log_path, json_output, "--last")
+        _assert_value_escaped(result, json_output)
+        if json_output:
+            assert json.loads(result.stdout)["selection_id"] == _HOSTILE_KEY
+
+
+def _run_replay(tmp_path: Path, *args: str):
+    from memtomem_stm.cli.proxy import cli
+
+    return CliRunner().invoke(
+        cli,
+        ["selection", "replay", "--config", str(tmp_path / "absent-proxy.json"), *args],
+    )
+
+
+def test_replay_escapes_a_missing_log_path(tmp_path):
+    result = _run_replay(tmp_path, "--log", str(tmp_path / f"{_HOSTILE_KEY}.jsonl"))
+    _assert_value_escaped(result, False)
+
+
+def test_replay_escapes_an_evaluation_error(tmp_path, monkeypatch):
+    from memtomem_stm.proxy.selection_eval import SelectionEvaluationError
+
+    def failing(**kwargs):
+        raise SelectionEvaluationError(f"cannot read dataset: {_HOSTILE_KEY}")
+
+    monkeypatch.setattr(selection_cmd, "evaluate_selection", failing)
+    result = _run_replay(tmp_path, "--no-telemetry")
+    _assert_value_escaped(result, False)
