@@ -4374,7 +4374,8 @@ class TestMainExceptionBarrier:
         from memtomem_stm import server
 
         monkeypatch.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(tmp_path / "absent.json"))
-        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH\nSuccess\u202e__COMMAND", "gh")
+        # Upper case throughout: Windows upper-cases environment variable names.
+        monkeypatch.setenv("MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH\nSUCCESS\u202e__COMMAND", "gh")
         caplog.clear()
         with caplog.at_level(logging.ERROR, logger="memtomem_stm.server"):
             with _pytest.raises(ValidationError):
@@ -4382,7 +4383,7 @@ class TestMainExceptionBarrier:
 
         [record] = [r for r in caplog.records if "environment configuration" in r.getMessage()]
         message = record.getMessage()
-        assert "UPSTREAM_SERVERS__GH\\u000ASuccess\\u202E__COMMAND" in message
+        assert "UPSTREAM_SERVERS__GH\\u000ASUCCESS\\u202E__COMMAND" in message
         assert "\n" not in message and "\u202e" not in message
 
     def test_clean_exit_does_not_log_error(self, caplog):

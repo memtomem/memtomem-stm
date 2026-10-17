@@ -626,7 +626,8 @@ class TestLogStmConfigFailure:
 
         from memtomem_stm.config import log_stm_config_failure
 
-        name = "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH\nSuccess\u202e__COMMAND"
+        # Upper case throughout: Windows upper-cases environment variable names.
+        name = "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH\nSUCCESS\u202e__COMMAND"
         monkeypatch.setenv("MEMTOMEM_STM_PROXY__CONFIG_PATH", str(tmp_path / "absent.json"))
         monkeypatch.setenv(name, "gh")
         with pytest.raises(ValidationError) as caught:
@@ -638,7 +639,7 @@ class TestLogStmConfigFailure:
 
         [record] = [r for r in caplog.records if r.name == probe.name]
         message = record.getMessage()
-        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH\\u000ASuccess\\u202E__COMMAND" in message
+        assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH\\u000ASUCCESS\\u202E__COMMAND" in message
         assert "\n" not in message and "\u202e" not in message
 
     def test_non_validation_error_keeps_a_coherent_line(self, caplog):
