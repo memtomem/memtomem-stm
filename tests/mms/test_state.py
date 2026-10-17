@@ -556,6 +556,64 @@ def test_non_utf8_file_is_corruption_without_its_bytes(tmp_path, loader, prefix)
     assert "canary" not in str(exc_info.value)
 
 
+_ALL_LOADERS = [
+    state.load_registry,
+    state.load_projects_index,
+    state.load_project_config,
+    state.load_import_state,
+]
+
+
+def _fail_for(monkeypatch, method: str, target: Path) -> None:
+    """Make ``Path.<method>`` raise ``PermissionError`` for ``target`` only.
+
+    ``chmod`` cannot produce this on Windows or as root, so it is injected.
+    """
+    real = getattr(Path, method)
+
+    def fake(self, *args, **kwargs):
+        if self == target:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, method, fake)
+
+
+@pytest.mark.parametrize("loader", _ALL_LOADERS, ids=lambda f: f.__name__)
+def test_unreadable_file_is_corruption(tmp_path, monkeypatch, loader):
+    target = tmp_path / "state.toml"
+    target.write_text("schema_version = 1\n", encoding="utf-8")
+    _fail_for(monkeypatch, "open", target)
+    with pytest.raises(state.CorruptedConfig) as exc_info:
+        loader(target)
+    assert exc_info.value.path == target
+    assert exc_info.value.reason == "cannot read (PermissionError)"
+
+
+@pytest.mark.parametrize("loader", _ALL_LOADERS, ids=lambda f: f.__name__)
+def test_uninspectable_file_is_corruption_not_absence(tmp_path, monkeypatch, loader):
+    # An unreadable parent directory fails ``stat``; that is not "missing".
+    target = tmp_path / "state.toml"
+    target.write_text("schema_version = 1\n", encoding="utf-8")
+    _fail_for(monkeypatch, "stat", target)
+    with pytest.raises(state.CorruptedConfig) as exc_info:
+        loader(target)
+    assert exc_info.value.path == target
+    assert exc_info.value.reason == "cannot inspect (PermissionError)"
+
+
+@pytest.mark.parametrize(
+    ("loader", "empty"),
+    [(state.load_registry, state.RegistryConfig()), (state.load_import_state, state.ImportState())],
+    ids=["load_registry", "load_import_state"],
+)
+def test_missing_file_under_a_non_directory_is_still_absence(tmp_path, loader, empty):
+    parent = tmp_path / "not-a-dir"
+    parent.write_text("", encoding="utf-8")
+    assert loader(parent / "state.toml") == empty
+    assert loader(tmp_path / "absent.toml") == empty
+
+
 def test_extra_field_rejected(tmp_path):
     target = tmp_path / "project.toml"
     target.write_text(
