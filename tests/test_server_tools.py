@@ -1938,6 +1938,176 @@ class TestSelectionStats:
         assert "Selection Stats" in result
         assert "events_sampled_out: 1" in result
 
+    async def test_aggregate_runs_off_the_loop_under_the_rotation_lock(self, tmp_path, monkeypatch):
+        import threading
+
+        from memtomem_stm import server
+        from memtomem_stm.proxy.selection_log import rotation_lock
+
+        log = _selection_log(tmp_path)
+        log.log_selection(
+            server="gh",
+            selected_tool="gh__a",
+            candidate_tools=["gh__a"],
+            arguments={},
+            trace_id=None,
+        )
+        seen: dict[str, object] = {}
+        real = server.aggregate_selection_log
+
+        def probe(path):
+            seen["thread"] = threading.get_ident()
+            with rotation_lock(path) as acquired:
+                seen["lock_free"] = acquired
+            return real(path)
+
+        monkeypatch.setattr(server, "aggregate_selection_log", probe)
+        result = await stm_selection_stats(ctx=_ctx_with_selection(tmp_path, log=log))
+
+        assert "Selection Stats" in result
+        assert seen["thread"] != threading.get_ident()
+        assert seen["lock_free"] is False  # held by the reader for the whole read
+
+    async def test_writer_defers_rotation_while_a_cancelled_read_finishes(
+        self, tmp_path, monkeypatch
+    ):
+        """Cancelling the tool does not stop the worker (#1152). While it reads,
+        lifespan teardown runs (the sink's ``close``), this process's writer
+        must still append, and must defer the rotation its size cap asks for
+        rather than rename the file under the reader. The worker must then
+        finish without an exception and release the lock, after which rotation
+        resumes."""
+        import threading
+
+        from memtomem_stm import server
+        from memtomem_stm.proxy.selection_log import SelectionTelemetryLog, rotation_lock
+
+        log = SelectionTelemetryLog(tmp_path / "sel.jsonl", max_bytes=1)
+        log.initialize()
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+        outcome: dict[str, object] = {}
+        real = server.aggregate_selection_log
+        real_helper = server._aggregate_selection_log_unrotated
+
+        def blocking(path):
+            entered.set()
+            release.wait()  # set by the finally below; no timeout to race
+            return real(path)
+
+        def helper_then_signal(path):
+            # Signalled after the helper returns, i.e. after it released the
+            # lock; the outcome is kept so a worker failure cannot pass.
+            try:
+                outcome["result"] = real_helper(path)
+            except BaseException as exc:
+                outcome["error"] = exc
+                raise
+            finally:
+                finished.set()
+            return outcome["result"]
+
+        monkeypatch.setattr(server, "aggregate_selection_log", blocking)
+        monkeypatch.setattr(server, "_aggregate_selection_log_unrotated", helper_then_signal)
+
+        def append() -> str:
+            return log.log_selection(
+                server="gh", selected_tool="gh__a", candidate_tools=[], arguments={}, trace_id=None
+            )
+
+        try:
+            task = asyncio.create_task(
+                stm_selection_stats(ctx=_ctx_with_selection(tmp_path, log=log))
+            )
+            assert await asyncio.to_thread(entered.wait, 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            log.close()  # what lifespan teardown does to the sink
+
+            append()
+            append()  # over max_bytes: this one asks for a rotation
+            assert not (tmp_path / "sel.jsonl.1").exists()
+            assert log.events_written == 2 and log.write_errors == 0
+        finally:
+            release.set()
+            # Join the worker before the monkeypatches unwind.
+            assert await asyncio.to_thread(finished.wait, 5)
+        assert "error" not in outcome
+        assert isinstance(outcome["result"], dict) and outcome["result"]["exists"]
+        with rotation_lock(tmp_path / "sel.jsonl") as acquired:
+            assert acquired
+        append()
+        assert (tmp_path / "sel.jsonl.1").exists()
+
+    async def test_a_held_lock_falls_back_to_the_loop_read(self, tmp_path, monkeypatch):
+        """Another reader holding the lock past the retry budget: the worker
+        must not read unprotected, so the read moves back onto the loop, where
+        this process's writer cannot rotate in the middle of it."""
+        import threading
+
+        from memtomem_stm import server
+        from memtomem_stm.proxy.selection_log import rotation_lock
+
+        log = _selection_log(tmp_path)
+        log.log_selection(
+            server="gh",
+            selected_tool="gh__a",
+            candidate_tools=["gh__a"],
+            arguments={},
+            trace_id=None,
+        )
+        threads: list[int] = []
+        real = server.aggregate_selection_log
+
+        def probe(path):
+            threads.append(threading.get_ident())
+            return real(path)
+
+        monkeypatch.setattr(server, "aggregate_selection_log", probe)
+        monkeypatch.setattr(server, "_SELECTION_STATS_LOCK_ATTEMPTS", 1)
+        with rotation_lock(tmp_path / "sel.jsonl") as held:
+            assert held
+            result = await stm_selection_stats(ctx=_ctx_with_selection(tmp_path, log=log))
+
+        assert "Selection Stats" in result
+        assert threads == [threading.get_ident()]
+
+    async def test_lock_setup_failure_reads_on_the_loop(self, tmp_path, monkeypatch):
+        """The lock file cannot be created. The error may be transient, so the
+        writer may still rotate later; the read moves back onto the loop."""
+        import contextlib
+        import threading
+
+        from memtomem_stm import server
+
+        log = _selection_log(tmp_path)
+        log.log_selection(
+            server="gh",
+            selected_tool="gh__a",
+            candidate_tools=["gh__a"],
+            arguments={},
+            trace_id=None,
+        )
+
+        @contextlib.contextmanager
+        def unavailable(*args, **kwargs):
+            # Raised on entry, where the real lock opens its sidecar file.
+            raise PermissionError("cannot create the lock file")
+            yield
+
+        threads: list[int] = []
+        real = server.aggregate_selection_log
+
+        def probe(path):
+            threads.append(threading.get_ident())
+            return real(path)
+
+        monkeypatch.setattr(server, "rotation_lock", unavailable)
+        monkeypatch.setattr(server, "aggregate_selection_log", probe)
+        result = await stm_selection_stats(ctx=_ctx_with_selection(tmp_path, log=log))
+        assert "Selection Stats" in result
+        assert threads == [threading.get_ident()]
+
 
 # ── stm_tuning_recommendations ────────────────────────────────────────────
 
