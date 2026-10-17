@@ -33,7 +33,7 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - logging: a traceback attached to a log line is escaped the way the line's own
-  values are (#1173). #1166 escaped the env-hint lines that name a broken
+  values are (#1173, #1177). #1166 escaped the env-hint lines that name a broken
   `MEMTOMEM_STM_*` variable, but the `ValidationError` traceback attached by
   `log_stm_config_failure` and by server startup still rendered the failing
   location raw, and that location quotes the operator's upstream key from
