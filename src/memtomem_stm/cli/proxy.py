@@ -9572,6 +9572,15 @@ def doctor(
                 "not valid UTF-8",
                 f"mms config validate {cfg_arg}",
             )
+        except RecursionError:
+            # Not a ValueError, so it escaped as a traceback (#1139).
+            check(
+                "config_json",
+                "config JSON",
+                "FAIL",
+                "invalid JSON: nested too deeply to parse (RecursionError)",
+                f"mms config validate {cfg_arg}",
+            )
         except OSError as exc:
             check(
                 "config_json",

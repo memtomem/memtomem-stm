@@ -32,6 +32,16 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- cli: `mms doctor` and `mms config validate` report a config file nested too deeply
+  to parse instead of ending in a `RecursionError` traceback (#1139, #1174). Both parse the
+  file themselves, outside the reader #1144 fixed; each now reports `invalid JSON:
+  nested too deeply to parse (RecursionError)`, as a failing `config JSON` check in
+  `doctor` and as an error in `config validate`, in text and `--json` output. The
+  reader that completes environment-only upstream entries from the file during
+  `STMConfig()` treats such a file as unreadable, like a malformed one.
+  **Behavior change**: these inputs used to end in a traceback (exit 1); both
+  commands now exit 1 with their normal report.
+
 - cli: validate the projects index before `mms project enable/disable` writes the
   marker (#1145, #1161). **Behavior change**: index read failures leave project settings
   unchanged; if a later index write fails after the marker was saved, exit 1 with

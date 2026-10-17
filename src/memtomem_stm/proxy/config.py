@@ -2782,7 +2782,7 @@ def _file_upstream_servers(path: Path) -> dict[str, Any]:
     """
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return {}
     if not isinstance(data, dict):
         return {}
