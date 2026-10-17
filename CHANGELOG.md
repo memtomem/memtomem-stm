@@ -52,7 +52,7 @@ changes inline only. See the deprecation policy in
   `pyproject.toml`; in both cases the command keeps running.
 
 - cli, proxy: escape config key names and implicated environment-variable names in
-  the config validation errors listed below (#1147). A key carrying a newline or a
+  the config validation errors listed below (#1147, #1167). A key carrying a newline or a
   bidi control, such as an upstream's name, could forge an extra terminal line or
   reorder the rest of it. Not yet covered, tracked in #1166: the hook/daemon
   `invalid MEMTOMEM_STM_* configuration while …` log line and the server-startup
