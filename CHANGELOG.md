@@ -32,6 +32,29 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- cli: an OS failure on the proxy-config write path exits cleanly instead of with a
+  traceback (#1176, part 2). Every `stm_proxy.json` mutator (`add`, `init`, `remove`,
+  `surfacing`, `prune`, `eject`, `gateway mode`, `tune --apply`, `project route --apply`)
+  shares two steps that can raise after the command decided to write -- opening the
+  write lock and the atomic replace -- and `tune --apply` / `project route --apply` add a
+  third, the pre-apply backup snapshot. A read-only
+  config directory or a lock path that cannot be opened ended each of them in an
+  uncaught `PermissionError` / `IsADirectoryError` with an empty stdout. The decorator
+  that already renders the lock timeout now renders these too: text mode prints
+  `Error: cannot write <config> (PermissionError); the file was not replaced by this write` (or
+  `cannot create a backup of …`, or `cannot open the write lock <lock> (…)`), and the
+  commands with a `--json` envelope emit `config_write_failed` (with `path`) or
+  `config_lock_unavailable`. The `~/.mms` lock has the same guard, rendered as
+  `mms_lock_unavailable` by the state-error decorator on `mms project` / `mms host` /
+  `mms import`. The "not replaced by this write" claim rests on the write helper: the
+  backup runs before the replace, and the replace renames a finished sibling temp file,
+  so an `OSError` out of either step leaves the file as it was. It is a claim about the
+  failing write only: a command that saves twice (`add --from-clients --prune`) may
+  already have landed its first save.
+  **Behavior change**: these failures exit 1 with one error line (and one `--json`
+  document where the command has an envelope) instead of a traceback; exit codes are
+  unchanged.
+
 - cli: `mms tune`, `mms gateway status` / `explain` and the `~/.mms` TOML readers
   report a corrupt or malformed input instead of crashing (#1176, #1178). A metrics or
   feedback SQLite file that is not a database made `tune` exit with a traceback;

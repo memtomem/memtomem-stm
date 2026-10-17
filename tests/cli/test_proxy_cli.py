@@ -2309,6 +2309,7 @@ class TestAtomicSave:
 
     def test_save_cleans_up_temp_on_failure(self, tmp_path: Path, monkeypatch) -> None:
         """If ``os.replace`` fails, the sibling temp file must be removed."""
+        from memtomem_stm.cli._write_lock import ConfigWriteError
         from memtomem_stm.cli.proxy import _save
 
         target = tmp_path / "stm_proxy.json"
@@ -2320,8 +2321,12 @@ class TestAtomicSave:
         # the rename now happens there, so patch the helper's ``os.replace``.
         monkeypatch.setattr("memtomem_stm.utils.fileio.os.replace", boom)
 
-        with pytest.raises(OSError, match="simulated rename"):
+        # ``_save`` folds the OSError into the error the CLI renders (#1176),
+        # keeping it as the cause and never quoting its text.
+        with pytest.raises(ConfigWriteError) as info:
             _save(target, {"enabled": True})
+        assert str(info.value.__cause__) == "simulated rename failure"
+        assert "simulated" not in str(info.value)
 
         leftover = list(tmp_path.glob("stm_proxy.json.*.tmp"))
         assert leftover == []

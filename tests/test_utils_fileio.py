@@ -309,6 +309,7 @@ class TestSaveProxyConfigStillAtomic:
     def test_save_failure_preserves_old_content(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
+        from memtomem_stm.cli._write_lock import ConfigWriteError
         from memtomem_stm.cli.proxy import _save
 
         target = tmp_path / "stm_proxy.json"
@@ -320,9 +321,12 @@ class TestSaveProxyConfigStillAtomic:
             lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")),
         )
 
-        with pytest.raises(OSError):
+        # ``_save`` folds the OSError into the error the CLI renders (#1176);
+        # the cause is kept, and the target is still untouched.
+        with pytest.raises(ConfigWriteError) as info:
             _save(target, {"enabled": False, "upstream_servers": {"z": {"prefix": "z"}}})
 
+        assert isinstance(info.value.__cause__, OSError)
         assert target.read_text(encoding="utf-8") == original
 
 

@@ -50,7 +50,7 @@ from memtomem_stm.cli._defaults import (
 from memtomem_stm.cli._display import _disp, _disp_escapes
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.utils.json_out import has_lone_surrogate, unencodable_field
-from memtomem_stm.cli._write_lock import with_config_write_lock
+from memtomem_stm.cli._write_lock import ConfigWriteError, with_config_write_lock
 from memtomem_stm.cli.host_runtime import resolve_host_runtime_policy
 from memtomem_stm.mms.import_hosts import (
     _DANGEROUS_ENV_KEYS,
@@ -319,6 +319,11 @@ def _setup_json_result(action: str):  # noqa: ANN201
             out = io.StringIO()
             err = io.StringIO()
             exit_code = 0
+            # A failed config write keeps init's own result schema but names
+            # its code and path like every other mutator's envelope (#1176);
+            # this wrapper sits inside ``with_config_write_lock``, so it sees
+            # the exception first.
+            write_failure: ConfigWriteError | None = None
             with redirect_stdout(out), redirect_stderr(err):
                 try:
                     fn(*args, **kwargs)
@@ -338,14 +343,26 @@ def _setup_json_result(action: str):  # noqa: ANN201
                     )
                 except click.ClickException as exc:
                     exit_code = exc.exit_code
+                    if isinstance(exc, ConfigWriteError):
+                        write_failure = exc
                     click.echo(exc.format_message(), err=True)
 
-            config_path = (
-                Path(resolve_cli_config_path(kwargs.get("config_path")).path).expanduser().resolve()
-            )
+            # Post-failure inspection must not fail itself: ``resolve()`` reads
+            # the cwd and ``exists()`` raises on a directory without traversal
+            # permission, both plausible right after a write that failed for
+            # the same reason (#1176).
+            config_path = Path(resolve_cli_config_path(kwargs.get("config_path")).path).expanduser()
+            try:
+                config_path = config_path.resolve()
+            except OSError:
+                pass
+            try:
+                present = config_path.exists()
+            except OSError:
+                present = False
             server_names: list[str] = []
             config_data: dict[str, Any] | None = None
-            if config_path.exists():
+            if present:
                 try:
                     data = json.loads(config_path.read_text(encoding="utf-8"))
                     if isinstance(data, dict):
@@ -366,7 +383,14 @@ def _setup_json_result(action: str):  # noqa: ANN201
                 or kwargs.get("client_mode")
                 or kwargs.get("mcp_mode"),
             }
-            if exit_code:
+            if write_failure is not None:
+                payload["error"] = write_failure.code
+                payload["message"] = write_failure.raw_message
+                payload["path"] = str(write_failure.path)
+                # The capture above swallowed the terminal line; every other
+                # mutator prints one, so init does too.
+                click.echo(f"Error: {write_failure.message}", err=True)
+            elif exit_code:
                 payload["error"] = "setup_failed"
                 lines = [line.strip() for line in err.getvalue().splitlines() if line.strip()]
                 message = lines[-1] if lines else "setup command failed"
@@ -725,7 +749,22 @@ def _save(config_path: Path, data: dict[str, Any]) -> None:
     even if the parent directory is shared.
     """
     payload = _json_dumps(data, indent=2, ensure_ascii=False) + "\n"
-    atomic_write_text(config_path, payload, mode=0o600, durable=True)
+    # The path the error names is fixed BEFORE the write: ``resolve()`` of a
+    # relative path reads the cwd, and an error handler must not repeat a
+    # filesystem call that can fail the same way (a cwd deleted mid-command
+    # would turn the clean error back into a traceback).
+    shown = config_path.expanduser()
+    try:
+        shown = shown.resolve()
+    except OSError:
+        pass
+    try:
+        atomic_write_text(config_path, payload, mode=0o600, durable=True)
+    except OSError as exc:
+        # A read-only directory, a full disk, a vanished parent: the helper
+        # leaves the target untouched, and ``with_config_write_lock`` on every
+        # mutator renders this instead of a traceback (#1176).
+        raise ConfigWriteError("write", shown, exc) from exc
 
 
 # ── MCP client registration helpers ─────────────────────────────────────
@@ -6474,6 +6513,11 @@ def _backup_config_snapshot(resolved: Path, original_text: str) -> Path:
         except FileExistsError:
             i += 1
             continue
+        except OSError as exc:
+            # The backup runs before the config write, so a slot that cannot
+            # be created (read-only directory) aborts the apply with the
+            # config untouched; rendered by ``with_config_write_lock`` (#1176).
+            raise ConfigWriteError("create a backup of", resolved, exc) from exc
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(original_text)
@@ -6482,10 +6526,23 @@ def _backup_config_snapshot(resolved: Path, original_text: str) -> Path:
                 candidate.chmod(0o600)
             except OSError:
                 pass
+        except OSError as exc:
+            _discard_backup_slot(candidate)
+            raise ConfigWriteError("create a backup of", resolved, exc) from exc
         except Exception:
-            candidate.unlink(missing_ok=True)
+            _discard_backup_slot(candidate)
             raise
         return candidate
+
+
+def _discard_backup_slot(candidate: Path) -> None:
+    """Remove a half-written backup slot; best effort, so the failure that
+    brought us here is the one reported (the directory can have become
+    unwritable between the ``O_EXCL`` create and this unlink)."""
+    try:
+        candidate.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _apply_tune_changes(data: dict[str, Any], selected: list[_TuneChange]) -> None:
