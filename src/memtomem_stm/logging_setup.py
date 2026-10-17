@@ -12,6 +12,14 @@ Hardening matches the data-at-rest convention (``utils/fileio.py``,
 ``0o700`` (a pre-existing directory keeps its mode). There is no
 handler-level redaction hook: call sites render error text before logging it,
 e.g. ``proxy/manager.py:_safe_error_text`` for upstream failures (#1082).
+
+The one thing the handlers do render themselves is an attached traceback, and
+that text can quote operator input a call site never saw — a pydantic
+``ValidationError`` location carries the upstream key from a
+``MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__<KEY>__…`` variable name. So every
+handler STM installs formats through :class:`DisplayEscapingFormatter`, which
+escapes the exception and stack text line by line the way call sites escape
+values (#1173).
 """
 
 from __future__ import annotations
@@ -30,6 +38,11 @@ if TYPE_CHECKING:
 STDERR_FORMAT = "%(levelname)s %(name)s: %(message)s"
 """Server stderr format — unchanged from the pre-#612 ``basicConfig``."""
 
+HOOK_STDERR_FORMAT = "%(message)s"
+"""``mms hook`` stderr format: the bare message, exactly what the stdlib's
+``logging.lastResort`` handler printed before the hook installed a handler of
+its own (#1173). The hook's stderr reaches the host, so the shape stays."""
+
 FILE_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 """File format carries timestamps: a persistent log spans restarts."""
 
@@ -37,6 +50,115 @@ LOG_FILE_MAX_BYTES = 2 * 1024 * 1024
 LOG_FILE_BACKUP_COUNT = 3
 """2 MiB × (1 current + 3 backups) caps the worst-case footprint at 8 MiB
 while keeping enough history to cover a crash discovered a few days late."""
+
+
+class DisplayEscapingFormatter(logging.Formatter):
+    """A ``Formatter`` whose exception and stack text cannot carry a
+    display-hostile character to the terminal or the log file (#1173).
+
+    The message itself is the call site's job (each renders its values through
+    ``utils/display._disp``), but the traceback is rendered here, and a
+    ``ValidationError`` location quotes the operator's own environment: the
+    upstream key of ``MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__<KEY>__…`` reaches
+    the ``loc`` as ``upstream_servers.<key>``. A newline or a bidi control in
+    that name would otherwise forge or reorder the lines below the escaped hint.
+
+    Escaping is per line of the exception text, so the stack keeps its line
+    structure. That leaves one thing open by design: a newline the operator
+    injected still splits a location across two lines, and the second line is
+    an unindented line inside the traceback block — under the bare-message
+    hook format nothing distinguishes it from a message of its own, and under
+    the prefixed formats exception text that starts with ``WARNING name:``
+    reads as a line of its own too. What the formatter closes is reordering
+    and terminal control: every bidi control, ESC and other C0/C1 character
+    becomes its ``\\uXXXX`` form. ``_disp`` is idempotent on its own
+    output, so a message a call site already escaped is unchanged. The stdlib
+    caches the rendered exception on the record (``exc_text``) across handlers;
+    ``format`` escapes that cache too, so the order handlers run in does not
+    decide what the file gets.
+    """
+
+    def formatException(self, ei) -> str:  # type: ignore[no-untyped-def, override]
+        return _escape_lines(super().formatException(ei))
+
+    def formatStack(self, stack_info: str) -> str:
+        return _escape_lines(super().formatStack(stack_info))
+
+    def format(self, record: logging.LogRecord) -> str:
+        if record.exc_text:
+            record.exc_text = _escape_lines(record.exc_text)
+        return super().format(record)
+
+
+def _escape_lines(text: str) -> str:
+    from memtomem_stm.utils.display import _disp
+
+    return "\n".join(_disp(line) for line in text.split("\n"))
+
+
+def stderr_handler(fmt: str = STDERR_FORMAT) -> logging.Handler:
+    """A ``sys.stderr`` handler with the escaping formatter.
+
+    Binds the stream at creation, as ``logging.StreamHandler()`` and the
+    ``basicConfig(format=...)`` calls it replaces always did.
+    """
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(DisplayEscapingFormatter(fmt))
+    return handler
+
+
+class _CurrentStderrHandler(logging.StreamHandler):  # type: ignore[type-arg]
+    """``StreamHandler`` that writes to whatever ``sys.stderr`` is at emit time.
+
+    The shape of the stdlib's ``logging.lastResort`` (``_StderrHandler``):
+    the stream is a property, so a process that swaps ``sys.stderr`` after the
+    handler exists — Click's test runner per invocation, a host that redirects
+    late — still gets the lines. ``mms hook`` relied on ``lastResort`` before
+    #1173 and keeps that behavior through this class.
+    """
+
+    def __init__(self, level: int = logging.NOTSET) -> None:
+        logging.Handler.__init__(self, level)
+
+    @property
+    def stream(self):  # type: ignore[no-untyped-def, override]
+        return sys.stderr
+
+    @stream.setter
+    def stream(self, value: object) -> None:  # the base class assigns it; ignored
+        pass
+
+
+def configure_hook_logging() -> None:
+    """Root logging for ``mms hook``: the ``logging.lastResort`` contract with
+    the escaping formatter (#1173).
+
+    Before this the hook installed no handler and the stdlib's last resort
+    printed WARNING-and-up records as the bare message to the current
+    ``sys.stderr``. This keeps all three — the handler's own level is WARNING,
+    so a child logger an embedding process set to DEBUG still emits nothing
+    below WARNING here; the format is ``%(message)s``; the stream is resolved
+    per record — and only adds the formatter. The root logger's level is left
+    as it is (no ``level=``): a process that set it to ERROR before running
+    the hook keeps that gating, as it did under the last resort. Same no-op
+    rule as ``basicConfig`` without ``force``.
+    """
+    handler = _CurrentStderrHandler(level=logging.WARNING)
+    handler.setFormatter(DisplayEscapingFormatter(HOOK_STDERR_FORMAT))
+    logging.basicConfig(handlers=[handler])
+
+
+def configure_stderr_logging(
+    *, level: int = logging.WARNING, fmt: str = STDERR_FORMAT, force: bool = False
+) -> None:
+    """``logging.basicConfig`` with one stderr handler and the escaping formatter.
+
+    Same no-op rule as ``basicConfig`` without ``force``: a root logger that
+    already has handlers (an embedding process, pytest's capture) is left
+    alone, so the early-failure sites that call this keep their pre-#1173
+    behavior of never replacing a host's logging.
+    """
+    logging.basicConfig(level=level, handlers=[stderr_handler(fmt)], force=force)
 
 
 def _unsafe_log_target_reason(target: Path) -> str | None:
@@ -106,7 +228,7 @@ def open_private_log_handler(
     handler = PrivateRotatingFileHandler(
         resolved, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
     )
-    handler.setFormatter(logging.Formatter(FILE_FORMAT))
+    handler.setFormatter(DisplayEscapingFormatter(FILE_FORMAT))
     return handler
 
 
@@ -118,9 +240,7 @@ def configure_server_logging(config: STMConfig) -> Path | None:
     diagnostic aid must not take the server down with it; the failure is
     logged to stderr instead).
     """
-    stderr_handler = logging.StreamHandler(sys.stderr)
-    stderr_handler.setFormatter(logging.Formatter(STDERR_FORMAT))
-    handlers: list[logging.Handler] = [stderr_handler]
+    handlers: list[logging.Handler] = [stderr_handler(STDERR_FORMAT)]
     active_path: Path | None = None
     file_error: str | None = None
     if config.log_file is not None:

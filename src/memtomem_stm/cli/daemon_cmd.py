@@ -24,13 +24,17 @@ import json
 import logging
 import os
 import signal
-import sys
 import time
 from typing import TYPE_CHECKING, Any
 
 import click
 
-from memtomem_stm.logging_setup import FILE_FORMAT, open_private_log_handler
+from memtomem_stm.logging_setup import (
+    FILE_FORMAT,
+    configure_stderr_logging,
+    open_private_log_handler,
+    stderr_handler,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -58,17 +62,17 @@ def _load_config() -> STMConfig:
     except Exception as exc:
         # #847 observability: this runs BEFORE _configure_logging (the config
         # names the destination), so give the line a stderr handler the way
-        # server.main() does, then re-raise — every daemon subcommand still
-        # exits non-zero exactly as before. A detached run's failure stays
-        # file-less (data_dir is unknowable from a config that will not
-        # build); `mms doctor`'s env_overrides check covers that hole.
-        from memtomem_stm.logging_setup import STDERR_FORMAT
-
-        logging.basicConfig(level=logging.WARNING, format=STDERR_FORMAT)
+        # server.main() does, then exit 1 — every daemon subcommand still
+        # exits non-zero exactly as before, now without the interpreter's
+        # second, unescaped traceback (#1173; the logged one is escaped). A
+        # detached run's failure stays file-less (data_dir is unknowable from
+        # a config that will not build); `mms doctor`'s env_overrides check
+        # covers that hole.
+        configure_stderr_logging(level=logging.WARNING)
         log_stm_config_failure(
             exc, logger=logging.getLogger(__name__), context="loading the daemon configuration"
         )
-        raise
+        raise SystemExit(1) from exc
 
 
 def _as_int(value: Any, default: int = -1) -> int:
@@ -178,13 +182,8 @@ def _configure_logging(config: STMConfig, *, detached: bool) -> None:
     if detached:
         handler = open_private_log_handler((config.data_dir / "stm-daemon.log").expanduser())
     else:
-        handler = logging.StreamHandler(sys.stderr)
-    logging.basicConfig(
-        level=level,
-        handlers=[handler],
-        format=FILE_FORMAT,
-        force=True,
-    )
+        handler = stderr_handler(FILE_FORMAT)
+    logging.basicConfig(level=level, handlers=[handler], force=True)
 
 
 @click.group(name="daemon")

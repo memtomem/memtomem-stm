@@ -30,7 +30,7 @@ from mcp.types import CallToolResult
 
 from memtomem_stm import __version__ as _stm_version
 from memtomem_stm.config import STMConfig
-from memtomem_stm.logging_setup import STDERR_FORMAT, configure_server_logging
+from memtomem_stm.logging_setup import configure_server_logging, configure_stderr_logging
 from memtomem_stm.proxy.compression_feedback import CompressionFeedbackTracker
 from memtomem_stm.proxy.config import (
     ProxyConfig,
@@ -3049,16 +3049,27 @@ def main() -> None:
     try:
         startup_config = STMConfig()
     except Exception as exc:
-        logging.basicConfig(level=logging.WARNING, format=STDERR_FORMAT)
+        # ``force``: constructing ``MCPServer`` at import already installed the
+        # SDK's Rich handler on the root logger, so a plain ``basicConfig`` here
+        # was a no-op and this line rendered through Rich — with the failing
+        # location raw. The server owns this process's logging (the success
+        # path replaces the root handlers the same way a few lines down), so
+        # take it over here too (#1173).
+        configure_stderr_logging(level=logging.WARNING, force=True)
         # The traceback renders the failing LOCATION; the hint renders the
         # variable name the operator has to edit, which for a missing field is
-        # never the location itself (#835).
+        # never the location itself (#835). The location can quote the
+        # operator's variable name too, which the handler's formatter escapes
+        # (#1173).
         logger.exception(
             "Invalid MEMTOMEM_STM_* environment configuration%s",
             # Variable names can carry a newline or a bidi control (#1166).
             _disp(env_var_hint_for_validation_error(exc)),
         )
-        raise
+        # Exit 1 as before, but not by re-raising: the interpreter would print
+        # the same traceback a second time, outside the escaping formatter
+        # (#1173). The cause stays attached for an embedding caller.
+        raise SystemExit(1) from exc
     configure_server_logging(startup_config)
     # Exception barrier (#209): without this, an unhandled exception from
     # ``mcp.run()`` (e.g. a background task crashing the event loop) ends the

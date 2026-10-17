@@ -1021,6 +1021,15 @@ def hook_command(
     payload: dict[str, Any] | None = None
     wrote = False
     try:
+        # The hook used to log through the stdlib's last-resort handler (bare
+        # message, WARNING and up, the current stderr). This keeps that contract
+        # and adds the formatter that escapes an attached traceback: the
+        # pass-through barriers below log one, and a ``ValidationError``
+        # location quotes the operator's variable name (#1173). No-op when an
+        # embedding process already configured logging.
+        from memtomem_stm.logging_setup import configure_hook_logging
+
+        configure_hook_logging()
         overrides = runtime_env_overrides(
             use_daemon=runtime_use_daemon,
             surfacing_timeout_seconds=surfacing_timeout_seconds,
