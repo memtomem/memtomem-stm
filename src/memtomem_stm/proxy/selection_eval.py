@@ -163,6 +163,12 @@ def load_selection_dataset(path: Path | str | None = None) -> dict[str, Any]:
         data = json.loads(raw_bytes)
     except json.JSONDecodeError as exc:
         raise SelectionEvaluationError(f"invalid dataset JSON: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        # The exception's own text quotes the offending byte; give the offset only.
+        # json.loads(bytes) detects UTF-8/16/32, so name the encoding it tried.
+        raise SelectionEvaluationError(
+            f"dataset is not valid {exc.encoding.upper()} (byte offset {exc.start})"
+        ) from exc
     if not isinstance(data, dict) or data.get("schema_version") != DATASET_SCHEMA_VERSION:
         raise SelectionEvaluationError(f"dataset schema_version must be {DATASET_SCHEMA_VERSION}")
     cases = data.get("cases")

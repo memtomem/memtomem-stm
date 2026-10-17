@@ -63,6 +63,32 @@ changes inline only. See the deprecation policy in
   undecodable Codex config and `mms hook install` ignores an undecodable
   `pyproject.toml`; in both cases the command keeps running.
 
+- cli, daemon: report unreadable and non-UTF-8 files that #1159 left out as clean
+  errors instead of tracebacks (#1163, #1169).
+  - `~/.mms/registry.toml`, `import_state.toml` and a project marker that cannot be
+    read, or whose directory cannot be inspected, raise the same corruption error
+    as the projects index: `<path>: cannot read (PermissionError)` or
+    `cannot inspect (…)`. Project detection (`mms project show`, `route`) applies
+    the same rule to the marker it finds walking up from the current directory.
+    A missing file, or one under a non-directory parent, is handled as before: an
+    empty registry or import state, `file not found` for a marker.
+  - `mms eject` refuses a non-UTF-8 `.mcp.json` or Claude Desktop target with
+    `<path> is not valid UTF-8 (byte offset N)`, leaves the file and the STM entry
+    in place, and prints the manual restore hint. The Desktop pruning writer behind
+    `mms add --from-clients --prune` refuses such a file the same way. A failure
+    to inspect the target no longer escapes before the read either.
+  - `mms daemon status` ignores a non-UTF-8 handshake file from another config, and
+    reports one for its own config as `stale` with `handshake_unreadable`.
+  - `mms selection replay --dataset` reports a dataset that cannot be decoded as
+    `dataset is not valid <ENCODING> (byte offset N)`, naming the encoding the JSON
+    parser detected (UTF-8, or UTF-16/32, which it also accepts).
+
+  **Behavior change**: each of these inputs used to end in a traceback. The `mms`
+  state commands and `mms selection replay` now print one `Error:` line and exit 1;
+  `--json` state commands also print the `mms_state_invalid` failure document.
+  `mms eject` lists the entry under `could not eject` and exits 1. `mms daemon status`
+  exits 0. No message quotes file bytes.
+
 - cli, proxy: escape config key names and implicated environment-variable names in
   the config validation errors listed below (#1147, #1167). A key carrying a newline or a
   bidi control, such as an upstream's name, could forge an extra terminal line or

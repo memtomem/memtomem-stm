@@ -118,6 +118,9 @@ def test_read_handshake_missing_and_malformed(tmp_path: Path):
     bad = tmp_path / "bad.json"
     bad.write_text("{not json", encoding="utf-8")
     assert discovery.read_handshake(bad) is None
+    undecodable = tmp_path / "undecodable.json"
+    undecodable.write_bytes(b'{"token": "\xff"}')
+    assert discovery.read_handshake(undecodable) is None
 
 
 def test_handshake_and_lock_paths_keyed_by_fingerprint(tmp_path: Path):
@@ -1669,6 +1672,41 @@ class TestDaemonForeignOrphans:
         assert result.exit_code == 0, result.output
         assert "pid=98765 fp=foreignfp000000" in result.output
         assert "stop --all" in result.output
+
+    def test_status_skips_an_undecodable_foreign_handshake(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        import json
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        discovery.handshake_path(tmp_path, "foreignfp000000").write_bytes(b'{"pid": "\xff"}')
+        _no_daemon(monkeypatch)
+
+        result = CliRunner().invoke(_cli(), ["daemon", "status", "--json"])
+
+        assert result.exit_code == 0, result.output
+        info = json.loads(result.output)
+        assert (info["state"], info["foreign"]) == ("stopped", [])
+
+    def test_status_reports_an_undecodable_current_handshake_as_unreadable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        import json
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        current = discovery.config_fingerprint(STMConfig())
+        discovery.handshake_path(tmp_path, current).write_bytes(b'{"pid": "\xff"}')
+        _no_daemon(monkeypatch)
+
+        result = CliRunner().invoke(_cli(), ["daemon", "status", "--json"])
+
+        assert result.exit_code == 0, result.output
+        info = json.loads(result.output)
+        assert (info["state"], info.get("handshake_unreadable")) == ("stale", True)
 
     def test_bare_stop_leaves_foreign_untouched(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
