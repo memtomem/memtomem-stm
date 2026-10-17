@@ -13,13 +13,43 @@ import functools
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, NoReturn, TypeVar
 
 import click
 
 from memtomem_stm.cli._display import _disp
 
 F = TypeVar("F", bound=Callable[..., Any])
+
+
+class ConfigWriteError(click.ClickException):
+    """An ``OSError`` from the proxy-config write path, after the command
+    decided to write (#1176).
+
+    Raised by ``_save`` (the atomic replace) and ``_backup_config_snapshot``
+    (the pre-apply backup) in ``cli.proxy``; rendered by
+    :func:`with_config_write_lock`, which every ``stm_proxy.json`` mutator
+    already carries, so no caller needs its own ``except``. Both steps leave
+    the config file as it was when they raise: the backup runs before the
+    replace, and ``atomic_write_text`` writes a sibling temp file and only
+    then renames it, so an ``OSError`` out of it means the rename did not
+    happen. The message says so -- about THIS write. A command that saves
+    twice (``add --from-clients --prune`` saves the import, then the prune
+    marks) may already have landed its first save when the second fails.
+
+    ``raw_message`` goes to the ``--json`` document as is; the terminal line
+    carries the path display-escaped (it is operator-supplied; the sentence
+    around it is ours, so only the value is escaped). Type only, no OS text:
+    the OS message quotes the path (#1166 precedent).
+    """
+
+    code = "config_write_failed"
+
+    def __init__(self, step: str, path: Path, exc: OSError) -> None:
+        tail = f"({type(exc).__name__}); the file was not replaced by this write"
+        self.raw_message = f"cannot {step} {path} {tail}"
+        super().__init__(f"cannot {step} {_disp(str(path))} {tail}")
+        self.path = path
 
 
 def stm_config_lock_path() -> Path:
@@ -72,7 +102,7 @@ def with_write_lock(f: F) -> F:
         try:
             with state.write_lock(enabled=enabled):
                 return f(*args, **kwargs)
-        except state.WriteLockTimeout as exc:
+        except (state.WriteLockTimeout, state.WriteLockUnavailable) as exc:
             exit_on_state_error(exc, kwargs, fallback_action=f.__name__)
 
     return wrapper  # type: ignore[return-value]
@@ -127,7 +157,7 @@ def hook_hosts_write_lock(*, enabled: bool) -> Iterator[None]:
             holder_hint=_HOOK_HOSTS_LOCK_HOLDER_HINT,
         ):
             yield
-    except state.WriteLockTimeout as exc:
+    except (state.WriteLockTimeout, state.WriteLockUnavailable) as exc:
         raise click.ClickException(_disp(str(exc))) from exc
 
 
@@ -182,29 +212,61 @@ def with_config_write_lock(
                 ):
                     return f(*args, **kwargs)
             except state.WriteLockTimeout as exc:
-                if json_envelope and kwargs.get("as_json"):
-                    import sys as _sys
-
-                    from memtomem_stm.utils.json_out import dumps as _json_dumps
-
-                    ctx = click.get_current_context(silent=True)
-                    action = ctx.command.name if ctx and ctx.command.name else f.__name__
-                    click.echo(f"Error: {_disp(str(exc))}", err=True)
-                    click.echo(
-                        _json_dumps(
-                            {
-                                "action": action,
-                                "ok": False,
-                                "error": "config_lock_timeout",
-                                "message": str(exc),
-                            },
-                            indent=2,
-                            ensure_ascii=False,
-                        )
-                    )
-                    _sys.exit(1)
-                raise click.ClickException(_disp(str(exc))) from exc
+                _fail(f, kwargs, json_envelope, "config_lock_timeout", str(exc), cause=exc)
+            except state.WriteLockUnavailable as exc:
+                _fail(f, kwargs, json_envelope, "config_lock_unavailable", str(exc), cause=exc)
+            except ConfigWriteError as exc:
+                # Raised inside the span by ``_save`` / ``_backup_config_snapshot``
+                # (#1176); same two renderings as the lock failures above.
+                _fail(
+                    f,
+                    kwargs,
+                    json_envelope,
+                    exc.code,
+                    exc.raw_message,
+                    cause=exc,
+                    shown=exc.message,
+                    path=str(exc.path),
+                )
 
         return wrapper  # type: ignore[return-value]
 
     return decorate
+
+
+def _fail(
+    f: Callable[..., Any],
+    kwargs: dict[str, Any],
+    json_envelope: bool,
+    code: str,
+    message: str,
+    *,
+    cause: BaseException,
+    shown: str | None = None,
+    **fields: Any,
+) -> NoReturn:
+    """Exit on a failure the config-lock span owns: the single-document
+    ``--json`` envelope when the command opted in and asked for JSON, Click's
+    ``Error: <message>`` otherwise. ``message`` is raw and goes to the
+    document as is; the terminal gets ``shown`` when the raiser escaped the
+    value itself, else ``message`` display-escaped whole (the lock errors are
+    assembled in ``mms.state``, which does not import the display helper)."""
+    if shown is None:
+        shown = _disp(message)
+    if json_envelope and kwargs.get("as_json"):
+        import sys as _sys
+
+        from memtomem_stm.utils.json_out import dumps as _json_dumps
+
+        ctx = click.get_current_context(silent=True)
+        action = ctx.command.name if ctx and ctx.command.name else f.__name__
+        click.echo(f"Error: {shown}", err=True)
+        click.echo(
+            _json_dumps(
+                {"action": action, "ok": False, "error": code, "message": message, **fields},
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        _sys.exit(1)
+    raise click.ClickException(shown) from cause

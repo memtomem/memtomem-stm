@@ -60,6 +60,8 @@ class CodedFailure(click.ClickException):
 def _error_code(exc: state.MmsConfigError) -> str:
     if isinstance(exc, state.WriteLockTimeout):
         return "mms_lock_timeout"
+    if isinstance(exc, state.WriteLockUnavailable):
+        return "mms_lock_unavailable"
     if isinstance(exc, state.SchemaVersionMismatch):
         return "mms_schema_mismatch"
     return "mms_state_invalid"

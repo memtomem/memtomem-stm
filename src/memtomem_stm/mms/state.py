@@ -161,6 +161,20 @@ class WriteLockTimeout(MmsConfigError):
         self.timeout = timeout
 
 
+class WriteLockUnavailable(MmsConfigError):
+    """The write lock file could not be created or opened (#1176).
+
+    An ``OSError`` from the lock's own setup -- its directory cannot be
+    created, the path is a directory, the directory is read-only -- not from
+    anything the locked command did. Type only: the OS message would quote
+    the path twice and, for some errors, the bytes it choked on.
+    """
+
+    def __init__(self, path: Path, exc: OSError) -> None:
+        super().__init__(f"cannot open the write lock {path} ({type(exc).__name__})")
+        self.path = path
+
+
 # ---------------------------------------------------------------------------
 # Cross-process write lock
 # ---------------------------------------------------------------------------
@@ -214,8 +228,13 @@ def write_lock(
     wait = WRITE_LOCK_TIMEOUT_SECONDS if timeout is None else timeout
     if lock_path is None:
         lock_path = write_lock_path()
-    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = open_lock_fd(lock_path)
+    # Only the lock's own setup is folded: an OSError raised by the body
+    # below belongs to the command and keeps propagating (#1176).
+    try:
+        lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = open_lock_fd(lock_path)
+    except OSError as exc:
+        raise WriteLockUnavailable(lock_path, exc) from exc
     try:
         deadline = time.monotonic() + wait
         while True:
