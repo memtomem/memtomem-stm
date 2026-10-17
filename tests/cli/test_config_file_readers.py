@@ -255,6 +255,59 @@ def test_json_run_on_a_too_deep_file_emits_config_invalid(tmp_path, command):
     assert document["message"] == f"Failed to parse {path.resolve()}: RecursionError"
 
 
+_NESTED_TOO_DEEPLY = "invalid JSON: nested too deeply to parse (RecursionError)"
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_config_validate_reports_a_too_deep_file(tmp_path, json_output):
+    # `config validate` parses the file itself, outside `_load` (#1139).
+    path = tmp_path / "proxy.json"
+    path.write_text(DEEP)
+
+    result = CliRunner().invoke(
+        cli, ["config", "validate", "--config", str(path), *(["--json"] if json_output else [])]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit), result.exception
+    if json_output:
+        assert _NESTED_TOO_DEEPLY in json.loads(result.stdout)["errors"]
+    else:
+        assert f"Error: {_NESTED_TOO_DEEPLY}" in result.output
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_doctor_reports_a_too_deep_file(tmp_path, json_output):
+    # `doctor` parses the file itself too, for its config JSON check (#1139).
+    path = tmp_path / "proxy.json"
+    path.write_text(DEEP)
+
+    result = CliRunner().invoke(
+        cli, ["doctor", "--config", str(path), *(["--json"] if json_output else [])]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit), result.exception
+    if json_output:
+        checks = {c["id"]: c for c in json.loads(result.stdout)["checks"]}
+        assert (checks["config_json"]["status"], checks["config_json"]["detail"]) == (
+            "FAIL",
+            _NESTED_TOO_DEEPLY,
+        )
+    else:
+        assert _NESTED_TOO_DEEPLY in result.output
+
+
+def test_env_completion_reader_tolerates_a_too_deep_file(tmp_path):
+    # Read during STMConfig(); a broken file must not become a construction failure.
+    from memtomem_stm.proxy.config import _file_upstream_servers
+
+    path = tmp_path / "proxy.json"
+    path.write_text(DEEP)
+
+    assert _file_upstream_servers(path) == {}
+
+
 def test_json_setup_run_on_a_too_deep_file_still_emits_its_document(tmp_path):
     """The setup commands' ``--json`` wrapper re-reads the file for the
     document's ``servers`` list; that best-effort read must not end the run
