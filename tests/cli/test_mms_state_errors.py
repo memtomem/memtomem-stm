@@ -395,3 +395,97 @@ def test_host_sync_json_reports_a_lock_timeout_as_a_document(runner, sandbox, mo
     doc = json.loads(res.stdout)
     assert (doc["action"], doc["ok"], doc["error"]) == ("sync", False, "mms_lock_timeout")
     assert "timed out" in res.stderr
+
+
+def _registry_nested_too_deeply() -> None:
+    """Valid-looking TOML whose array nesting outruns the parser's recursion."""
+    path = state.registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("schema_version = 1\nx = " + "[" * 1500 + "]" * 1500 + "\n", encoding="utf-8")
+
+
+def test_project_route_reports_a_too_deep_registry_cleanly(runner, sandbox):
+    """``tomllib`` escaped as a ``RecursionError`` instead of a parse error (#1176)."""
+    assert runner.invoke(project_group, ["init", "--name", "p"]).exit_code == 0
+    _registry_nested_too_deeply()
+
+    res = runner.invoke(project_group, ["route"])
+
+    assert res.exit_code == 1
+    assert isinstance(res.exception, SystemExit)
+    assert res.stdout == ""
+    assert "Error:" in res.stderr
+    assert "TOML nested too deeply to parse (RecursionError)" in res.stderr
+
+
+def test_project_route_json_reports_a_too_deep_registry_as_a_document(runner, sandbox):
+    assert runner.invoke(project_group, ["init", "--name", "p"]).exit_code == 0
+    _registry_nested_too_deeply()
+
+    res = runner.invoke(project_group, ["route", "--json"])
+
+    assert res.exit_code == 1
+    doc = json.loads(res.stdout)
+    assert (doc["action"], doc["ok"], doc["error"]) == ("route", False, "mms_state_invalid")
+    assert doc["message"].endswith("TOML nested too deeply to parse (RecursionError)")
+
+
+def _registry_with_an_oversized_integer() -> None:
+    """``tomllib`` converts the literal with ``int()``, whose digit-limit
+    ``ValueError`` is not a ``TOMLDecodeError``."""
+    path = state.registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("schema_version = 1\nx = " + "1" * 5000 + "\n", encoding="utf-8")
+
+
+def test_project_route_reports_an_oversized_integer_in_the_registry_cleanly(runner, sandbox):
+    assert runner.invoke(project_group, ["init", "--name", "p"]).exit_code == 0
+    _registry_with_an_oversized_integer()
+
+    res = runner.invoke(project_group, ["route"])
+
+    assert res.exit_code == 1
+    assert isinstance(res.exception, SystemExit)
+    assert res.stdout == ""
+    assert "TOML value could not be parsed (ValueError)" in res.stderr
+    assert "4300" not in res.output  # the conversion's own text stays out
+
+
+def test_project_route_json_reports_an_oversized_integer_as_a_document(runner, sandbox):
+    assert runner.invoke(project_group, ["init", "--name", "p"]).exit_code == 0
+    _registry_with_an_oversized_integer()
+
+    res = runner.invoke(project_group, ["route", "--json"])
+
+    assert res.exit_code == 1
+    doc = json.loads(res.stdout)
+    assert (doc["action"], doc["ok"], doc["error"]) == ("route", False, "mms_state_invalid")
+    assert doc["message"].endswith("TOML value could not be parsed (ValueError)")
+
+
+def _registry_with_an_unprintable_schema_version() -> None:
+    """A hex literal has no digit limit on the way in; the mismatch message
+    would hit it rendering the value in decimal."""
+    path = state.registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("schema_version = 0x" + "f" * 5000 + "\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_project_route_reports_an_unprintable_schema_version_cleanly(runner, sandbox, json_output):
+    assert runner.invoke(project_group, ["init", "--name", "p"]).exit_code == 0
+    _registry_with_an_unprintable_schema_version()
+
+    res = runner.invoke(project_group, ["route", *(["--json"] if json_output else [])])
+
+    assert res.exit_code == 1
+    assert isinstance(res.exception, SystemExit)
+    reason = "`schema_version` is too large to be a version"
+    if json_output:
+        doc = json.loads(res.stdout)
+        assert (doc["action"], doc["ok"], doc["error"]) == ("route", False, "mms_state_invalid")
+        assert doc["message"].endswith(reason)
+    else:
+        assert res.stdout == ""
+        assert reason in res.stderr
+    assert "fff" not in res.output

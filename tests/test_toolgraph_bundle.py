@@ -827,9 +827,9 @@ async def test_stdio_verdicts_survive_a_bundle_refresh(tmp_path):
 
     manager._refresh_toolgraph_bundle()
 
-    assert manager._toolgraph_external_rejects == {
-        ("srv", tool.name): REASON_TOOLGRAPH_UNMAPPED
-    }, "the bundle gate retired a verdict it did not produce"
+    assert manager._toolgraph_external_rejects == {("srv", tool.name): REASON_TOOLGRAPH_UNMAPPED}, (
+        "the bundle gate retired a verdict it did not produce"
+    )
 
 
 @pytest.mark.asyncio
@@ -907,9 +907,7 @@ async def test_strict_withhold_does_not_survive_a_move_to_review(tmp_path):
 
     manager._refresh_toolgraph_bundle()
 
-    assert manager._toolgraph_withhold_all is None, (
-        "a strict-era withhold survived into review"
-    )
+    assert manager._toolgraph_withhold_all is None, "a strict-era withhold survived into review"
     assert manager._toolgraph_degraded is True, "review still degrades; only the withhold lifts"
 
 
@@ -2259,3 +2257,33 @@ def test_metadata_drifting_to_a_surrogate_drifts_one_tool_not_the_catalog(tmp_pa
     assert ("srv", "read") not in manager._toolgraph_external_rejects
     assert manager._toolgraph_bind_stats["catalog_total"] == 2
     assert manager._toolgraph_bind_stats["stm_drifted"] == 1
+
+
+@pytest.mark.parametrize("decision", [[], {}, None, True, 1], ids=type)
+def test_parser_rejects_a_non_string_decision_as_a_bundle_error(decision):
+    """An unhashable ``decision`` used to escape the set-membership check as
+    a ``TypeError`` (#1176); every non-string shape is a bundle error."""
+    doc = _bundle(_tool())
+    doc["tools"][0]["decision"] = decision
+    with pytest.raises(PolicyBundleError, match=r"tools\[0\]\.decision is invalid"):
+        _parse(doc)
+
+
+def test_parser_rejects_an_integer_literal_past_the_digit_limit():
+    """``json.loads`` raises a plain ``ValueError`` (not ``JSONDecodeError``)
+    for an integer literal longer than ``sys.get_int_max_str_digits()``."""
+    payload = canonical_json_bytes(_bundle(_tool())).replace(
+        b'"generation":7', b'"generation":' + b"1" * 5000
+    )
+    assert b"1" * 5000 in payload  # the replacement found the canonical spelling
+    with pytest.raises(PolicyBundleError, match="not valid UTF-8 JSON") as info:
+        parse_policy_bundle(payload, expected_agent="stm-proxy", expected_profile="strict")
+    assert isinstance(info.value.__cause__, ValueError)
+    assert not isinstance(info.value.__cause__, json.JSONDecodeError)
+
+
+def test_parser_rejects_a_bundle_nested_past_the_recursion_limit():
+    payload = b"[" * 100_000
+    with pytest.raises(PolicyBundleError, match="nested too deeply") as info:
+        parse_policy_bundle(payload, expected_agent="stm-proxy", expected_profile="strict")
+    assert isinstance(info.value.__cause__, RecursionError)

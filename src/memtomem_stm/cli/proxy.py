@@ -13,6 +13,7 @@ import os
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tomllib
@@ -6658,12 +6659,40 @@ def tune(
         if feedback_path.exists()
         else None
     )
+    # ``step`` / ``store_paths`` track which store(s) the failing call was
+    # touching, so the error names the file at fault for an ``initialize``
+    # failure and both candidates for an ``analyze`` failure: a DB file SQLite
+    # cannot open or read (not a database, truncated) raises
+    # ``sqlite3.DatabaseError`` out of the store, which used to escape as a
+    # traceback (#1176). The message carries the path(s) and the exception
+    # type only -- the driver's text is not quoted (#1166).
+    step, store_paths = "open the metrics store", [metrics_path]
     try:
         metrics_store.initialize()
         if feedback_store is not None:
+            step, store_paths = "open the feedback store", [feedback_path]
             feedback_store.initialize()
+            step, store_paths = "analyze the stores", [metrics_path, feedback_path]
+        else:
+            step, store_paths = "analyze the metrics store", [metrics_path]
         tuner = CompressionTuner(metrics_store, feedback_store, config=typed_cfg)
         recs = tuner.analyze(since_seconds=since_hours * 3600.0, tool_filter=tool_filter)
+    except sqlite3.DatabaseError as exc:
+        kind = type(exc).__name__
+        # Escape each path, not the assembled line (``utils/display``): the
+        # document keeps the raw values.
+        shown = ", ".join(_disp(str(p)) for p in store_paths)
+        click.echo(f"{_err('Error:')} cannot {step} ({shown}): {kind}", err=True)
+        if as_json:
+            raw = ", ".join(str(p) for p in store_paths)
+            _json_fail(
+                "tune",
+                "store_invalid",
+                f"cannot {step} ({raw}): {kind}",
+                path=str(resolved),
+                stores=[str(p) for p in store_paths],
+            )
+        sys.exit(1)
     finally:
         metrics_store.close()
         if feedback_store is not None:

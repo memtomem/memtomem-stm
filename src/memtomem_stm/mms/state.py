@@ -344,9 +344,20 @@ def _load_toml_dict(path: Path) -> dict:
             return tomllib.load(f)
     except tomllib.TOMLDecodeError as e:
         raise CorruptedConfig(path, f"TOML parse error: {e}") from e
+    except RecursionError as e:
+        # Not a TOMLDecodeError: the parser recurses per nesting level, so a
+        # file nested past the interpreter's limit escaped as a traceback
+        # (#1176; the proxy config readers closed the same gap in #1139).
+        raise CorruptedConfig(path, "TOML nested too deeply to parse (RecursionError)") from e
     except UnicodeDecodeError as e:
         # The exception's own text quotes the offending byte; give the offset only.
         raise CorruptedConfig(path, f"not valid UTF-8 (byte offset {e.start})") from e
+    except ValueError as e:
+        # Ordered after the two ValueError subclasses above. The remaining
+        # parse failure: an integer literal past ``sys.get_int_max_str_digits()``
+        # surfaces as the plain ``ValueError`` of its conversion (#1176). Type
+        # only -- the conversion's text is not quoted.
+        raise CorruptedConfig(path, f"TOML value could not be parsed ({type(e).__name__})") from e
     except OSError as e:
         raise CorruptedConfig(path, f"cannot read ({type(e).__name__})") from e
 
@@ -375,6 +386,14 @@ def _check_schema_version(path: Path, raw: dict, expected: int) -> None:
     if not isinstance(found, int):
         raise CorruptedConfig(path, f"`schema_version` must be int, got {type(found).__name__}")
     if found != expected:
+        try:
+            str(found)
+        except ValueError:
+            # tomllib accepted the literal (a hex / octal / binary literal has
+            # no digit limit) but rendering it in decimal is past
+            # ``sys.get_int_max_str_digits()``, so the mismatch message itself
+            # would raise. No such value is a schema version (#1176).
+            raise CorruptedConfig(path, "`schema_version` is too large to be a version") from None
         raise SchemaVersionMismatch(path, found, expected)
 
 
