@@ -51,6 +51,28 @@ changes inline only. See the deprecation policy in
   undecodable Codex config and `mms hook install` ignores an undecodable
   `pyproject.toml`; in both cases the command keeps running.
 
+- cli, proxy: escape config key names and implicated environment-variable names in
+  the config validation errors listed below (#1147). A key carrying a newline or a
+  bidi control, such as an upstream's name, could forge an extra terminal line or
+  reorder the rest of it. Not yet covered, tracked in #1166: the hook/daemon
+  `invalid MEMTOMEM_STM_* configuration while …` log line and the server-startup
+  log, as well as operator-supplied paths and arguments. Now escaped:
+  - the proxy config loader's warnings: `Failed to parse proxy config`,
+    `Env-only proxy config failed validation`, the unknown-key list, and the
+    implicated `MEMTOMEM_STM_PROXY__*` names;
+  - the text output of `mms selection feedback` config errors, including the
+    config path;
+  - `mms gateway status` / `explain` on an invalid config;
+  - the `mms health` Surfacing Bootstrap error;
+  - the variable hint in the runtime-policy errors of `mms hook install` and of
+    registration.
+
+  `--json` documents and `ConfigLoadResult` keep the raw text for their consumers.
+  The display escaping now lives in `memtomem_stm.utils.display`, so the loader can
+  use it; `cli/_display` re-exports it.
+  **Behavior change**: none for ordinary names and paths. A displayed value that
+  contains a control or bidi character now prints as `\uXXXX`.
+
 - progressive: enforce each response's stored sliding TTL before renewal and
   during publication cleanup, using backend-local clocks and atomic expiry checks
   (#1155, #1157). **Behavior change**: expired or malformed progressive entries cannot
