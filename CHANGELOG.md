@@ -33,7 +33,7 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - cli: an OS failure on the proxy-config write path exits cleanly instead of with a
-  traceback (#1176, part 2). Every `stm_proxy.json` mutator (`add`, `init`, `remove`,
+  traceback (#1176, #1180). Every `stm_proxy.json` mutator (`add`, `init`, `remove`,
   `surfacing`, `prune`, `eject`, `gateway mode`, `tune --apply`, `project route --apply`)
   shares two steps that can raise after the command decided to write -- opening the
   write lock and the atomic replace -- and `tune --apply` / `project route --apply` add a
