@@ -120,7 +120,7 @@ def replay_command(
     elif log_path is not None:
         telemetry_path = log_path.expanduser()
         if not telemetry_path.exists():
-            raise click.ClickException(f"telemetry log not found: {telemetry_path}")
+            raise click.ClickException(f"telemetry log not found: {_disp(str(telemetry_path))}")
     else:
         telemetry_path = cfg.selection_telemetry.path.expanduser()
 
@@ -133,7 +133,7 @@ def replay_command(
             baseline_graph_scale=cfg.toolgraph.risk_penalty_scale,
         )
     except SelectionEvaluationError as exc:
-        raise click.ClickException(str(exc)) from exc
+        raise click.ClickException(_disp(str(exc))) from exc
 
     summary = format_selection_report(report)
     if output_dir is not None:
@@ -274,10 +274,9 @@ def feedback_command(
             _feedback_failure(
                 as_json,
                 "config_invalid",
-                f"cannot read {cfg_path}: {loaded.error}",
-                # The summary names config keys (an upstream's name); the
-                # --json document keeps them raw for its consumer to decode.
-                text_message=f"cannot read {_disp(str(cfg_path))}: {_disp(loaded.error)}",
+                "cannot read {path}: {error}",
+                # The summary names config keys (an upstream's name).
+                values={"path": cfg_path, "error": loaded.error},
             )
         if loaded.env_error is not None:
             # Same hazard by the other route: no file, and the environment the
@@ -286,10 +285,8 @@ def feedback_command(
             _feedback_failure(
                 as_json,
                 "config_invalid",
-                f"the MEMTOMEM_STM_PROXY environment is invalid: {loaded.env_error}",
-                text_message=(
-                    f"the MEMTOMEM_STM_PROXY environment is invalid: {_disp(loaded.env_error)}"
-                ),
+                "the MEMTOMEM_STM_PROXY environment is invalid: {error}",
+                values={"error": loaded.env_error},
             )
         # Not ``or ProxyConfig(...)``: with ``missing_ok=True`` the loader
         # returns no config only when it also set one of the errors screened
@@ -310,10 +307,15 @@ def feedback_command(
         # wrong diagnosis, and a traceback is not something a scripted caller
         # can branch on.
         _feedback_failure(
-            as_json, "log_unreadable", f"cannot list the log directory for {telemetry_path}: {exc}"
+            as_json,
+            "log_unreadable",
+            "cannot list the log directory for {path}: {error}",
+            values={"path": telemetry_path, "error": exc},
         )
     if not segments:
-        _feedback_failure(as_json, "no_log", f"selection log not found: {telemetry_path}")
+        _feedback_failure(
+            as_json, "no_log", "selection log not found: {path}", values={"path": telemetry_path}
+        )
     # No open-each-segment preflight here: the resolve below already refuses an
     # unreadable segment (``TelemetryReader`` wraps every read failure, the open
     # included, as ``SelectionLogUnreadable``) and both resolve sites map that to
@@ -345,7 +347,7 @@ def feedback_command(
             # A segment that cannot be read is refused rather than skipped:
             # skipping the newest one silently promotes an older row to "most
             # recent" — a label on a selection the operator never chose.
-            _feedback_failure(as_json, "log_unreadable", str(exc))
+            _feedback_failure(as_json, "log_unreadable", "{error}", values={"error": exc})
         except OSError as exc:
             # Discovery lists the directory again, under the lock this time, so
             # it can fail here even though the listing above succeeded. Caught
@@ -355,7 +357,8 @@ def feedback_command(
             _feedback_failure(
                 as_json,
                 "log_unreadable",
-                f"cannot list the log directory for {telemetry_path}: {exc}",
+                "cannot list the log directory for {path}: {error}",
+                values={"path": telemetry_path, "error": exc},
             )
     # Resolve before writing: an id that matches nothing would append a label
     # that joins to no selection — silently useless to every reader, and
@@ -372,11 +375,17 @@ def feedback_command(
         _feedback_failure(
             as_json,
             "unusable_record",
-            f"the matched selection cannot be labelled ({defect})",
+            "the matched selection cannot be labelled ({defect})",
+            values={"defect": defect},
         )
     if record is None:
         if selection_id is not None:
-            _feedback_failure(as_json, "not_found", f"no selection record with id {selection_id}")
+            _feedback_failure(
+                as_json,
+                "not_found",
+                "no selection record with id {id}",
+                values={"id": selection_id},
+            )
         scope = ", ".join(
             part
             for part in (f"server={server}" if server else "", f"tool={tool}" if tool else "")
@@ -385,7 +394,8 @@ def feedback_command(
         _feedback_failure(
             as_json,
             "no_match",
-            f"no selection record matches{' ' + scope if scope else ''}",
+            "no selection record matches{scope}",
+            values={"scope": " " + scope if scope else ""},
         )
     resolved_id = record.get("selection_id")
     assert isinstance(resolved_id, str) and resolved_id  # resolve_selection screens this
@@ -436,14 +446,15 @@ def feedback_command(
                 telemetry_path, selection_id=resolved_id, include_rotated=include_rotated
             )
         except SelectionLogUnreadable as exc:
-            _feedback_failure(as_json, "log_unreadable", str(exc))
+            _feedback_failure(as_json, "log_unreadable", "{error}", values={"error": exc})
         except OSError as exc:
             # Same directory listing, and the confirmation window is exactly
             # when its permissions can change underneath the command.
             _feedback_failure(
                 as_json,
                 "log_unreadable",
-                f"cannot list the log directory for {telemetry_path}: {exc}",
+                "cannot list the log directory for {path}: {error}",
+                values={"path": telemetry_path, "error": exc},
             )
         if verified is None and verify_defect is not None:
             # Present but no longer labellable — a conflicting copy landing in
@@ -453,15 +464,17 @@ def feedback_command(
             _feedback_failure(
                 as_json,
                 "selection_changed",
-                f"selection {resolved_id} changed between confirmation and append "
-                f"({verify_defect}); nothing was written — re-run to see the current record",
+                "selection {id} changed between confirmation and append "
+                "({defect}); nothing was written — re-run to see the current record",
+                values={"id": resolved_id, "defect": verify_defect},
             )
         if verified is None:
             _feedback_failure(
                 as_json,
                 "log_rotated",
-                f"selection {resolved_id} is no longer in the log (rotated out between "
+                "selection {id} is no longer in the log (rotated out between "
                 "resolution and append); nothing was written",
+                values={"id": resolved_id},
             )
         if _label_identity(verified) != _label_identity(record):
             # Still present, but no longer the row that was confirmed: a copy
@@ -472,8 +485,9 @@ def feedback_command(
             _feedback_failure(
                 as_json,
                 "selection_changed",
-                f"selection {resolved_id} changed between confirmation and append; "
+                "selection {id} changed between confirmation and append; "
                 "nothing was written — re-run to see the current record",
+                values={"id": resolved_id},
             )
         status = _write_label(
             log,
@@ -516,16 +530,18 @@ def feedback_command(
             _feedback_failure(
                 as_json,
                 f"write_{status}",
-                f"the label's bytes reached {telemetry_path} but the record could not be "
-                f"confirmed there; re-run with --selection-id {resolved_id}, and if that "
-                f"does not report success, resolve the storage fault before retrying again",
+                "the label's bytes reached {path} but the record could not be "
+                "confirmed there; re-run with --selection-id {id}, and if that "
+                "does not report success, resolve the storage fault before retrying again",
                 extra={"selection_id": resolved_id},
+                values={"path": telemetry_path, "id": resolved_id},
             )
         if status != APPEND_WRITTEN:
             _feedback_failure(
                 as_json,
                 f"write_{status}",
-                f"no label was written to {telemetry_path} (append status: {status})",
+                "no label was written to {path} (append status: {status})",
+                values={"path": telemetry_path, "status": status},
             )
         result = {
             "action": "selection-feedback",
@@ -564,7 +580,8 @@ def _rotation_guard(path: Path, as_json: bool) -> Iterator[bool]:
         _feedback_failure(
             as_json,
             "lock_failed",
-            f"cannot create the rotation lock beside {path}: {exc}",
+            "cannot create the rotation lock beside {path}: {error}",
+            values={"path": path, "error": exc},
         )
     try:
         yield entered
@@ -631,7 +648,7 @@ def _feedback_failure(
     exit_code: int = 1,
     *,
     extra: dict[str, Any] | None = None,
-    text_message: str | None = None,
+    values: dict[str, Any] | None = None,
 ) -> NoReturn:
     """Exit with a stable error code, in the caller's chosen format.
 
@@ -643,10 +660,17 @@ def _feedback_failure(
     which the retry the message advises would have to infer its target again,
     and could infer a different one.
 
-    *text_message* replaces *message* in the text rendering only, for a caller
-    whose message carries values that must be escaped for the terminal but kept
-    raw in the JSON document.
+    With *values*, *message* is a ``str.format`` template and each value is
+    interpolated twice: as given into the JSON document, whose consumer decodes
+    it, and escaped with ``_disp`` into the text rendering, because paths,
+    ids, filters and exception text can carry a newline or a bidi control that
+    would forge or reorder a terminal line (#1166). Only the values are
+    escaped, never the assembled line.
     """
+    text_message = message
+    if values is not None:
+        message = message.format(**{k: str(v) for k, v in values.items()})
+        text_message = text_message.format(**{k: _disp(str(v)) for k, v in values.items()})
     if as_json:
         click.echo(
             json_out.dumps(
@@ -662,8 +686,6 @@ def _feedback_failure(
             )
         )
         raise click.exceptions.Exit(exit_code)
-    if text_message is not None:
-        message = text_message
     if exit_code == 2:
-        raise click.UsageError(message)
-    raise click.ClickException(message)
+        raise click.UsageError(text_message)
+    raise click.ClickException(text_message)

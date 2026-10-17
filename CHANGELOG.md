@@ -92,9 +92,8 @@ changes inline only. See the deprecation policy in
 - cli, proxy: escape config key names and implicated environment-variable names in
   the config validation errors listed below (#1147, #1167). A key carrying a newline or a
   bidi control, such as an upstream's name, could forge an extra terminal line or
-  reorder the rest of it. Not yet covered, tracked in #1166: the hook/daemon
-  `invalid MEMTOMEM_STM_* configuration while …` log line and the server-startup
-  log, as well as operator-supplied paths and arguments. Now escaped:
+  reorder the rest of it. Operator-supplied paths and arguments and the hook/daemon
+  log line follow in the #1166 entry below. Now escaped:
   - the proxy config loader's warnings: `Failed to parse proxy config`,
     `Env-only proxy config failed validation`, the unknown-key list, and the
     implicated `MEMTOMEM_STM_PROXY__*` names;
@@ -112,6 +111,27 @@ changes inline only. See the deprecation policy in
   use it; `cli/_display` re-exports it.
   **Behavior change**: none for ordinary names and paths. A displayed value that
   contains a control or bidi character now prints as `\uXXXX`.
+
+- cli, proxy: escape operator-supplied paths, ids, filters and exception text in
+  terminal and log output (#1166, #1172). They are echoed into the same lines #1147 escaped
+  key names in, and a newline or a bidi control in one could forge or reorder a line.
+  Now escaped:
+  - every `mms selection feedback` failure message, in text output: the log path,
+    `--selection-id`, the `--server`/`--tool` filter, a selection id read back from
+    the log, and exception text such as an unreadable segment or a lock error;
+  - `mms selection replay`: the missing `--log` path, evaluation errors, and the
+    dataset id in the text summary and `summary.md` (the `--json` report keeps it);
+  - the config path in every proxy config loader log line: permissive mode,
+    unknown keys, the `tool_annotation_policy` advisory, inert upstreams, `Failed to
+    parse proxy config`, and the missing-file debug line;
+  - the variable names in the hook/daemon `invalid MEMTOMEM_STM_* configuration
+    while …` log line and in the server's startup `Invalid MEMTOMEM_STM_* environment
+    configuration` log line.
+
+  `--json` documents keep the raw values. Still not covered: the traceback that
+  those two log lines attach renders the failing validation location raw.
+  **Behavior change**: none for ordinary values. A displayed value that contains a
+  control or bidi character now prints as `\uXXXX`.
 
 - progressive: enforce each response's stored sliding TTL before renewal and
   during publication cleanup, using backend-local clocks and atomic expiry checks
