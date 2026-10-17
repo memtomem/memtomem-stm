@@ -1290,7 +1290,7 @@ def hook_install_command(
             change = hook_hosts.plan_install(host, command)
             backup = hook_hosts.apply_change(change) if apply_ else None
         except hook_hosts.HookInstallError as exc:
-            # One choke point for all seven ``HookInstallError`` raises: the
+            # One choke point for every ``HookInstallError`` raise: the
             # messages interpolate a config path and a parser's own text, and
             # this is where they become terminal output (#780).
             raise click.ClickException(_disp(str(exc))) from exc
@@ -1358,7 +1358,7 @@ def hook_uninstall_command(host: str, apply_: bool) -> None:
             change = hook_hosts.plan_uninstall(host)
             backup = hook_hosts.apply_change(change) if apply_ else None
         except hook_hosts.HookInstallError as exc:
-            # One choke point for all seven ``HookInstallError`` raises: the
+            # One choke point for every ``HookInstallError`` raise: the
             # messages interpolate a config path and a parser's own text, and
             # this is where they become terminal output (#780).
             raise click.ClickException(_disp(str(exc))) from exc

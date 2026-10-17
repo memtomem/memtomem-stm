@@ -329,6 +329,15 @@ class TestScanCodex:
         (codex_dir / "config.toml").write_text("not [valid toml\n", encoding="utf-8")
         assert ih.scan_codex(tmp_path) == []
 
+    def test_non_utf8_toml_returns_empty(self, sandbox_home, tmp_path):
+        # tomllib decodes before parsing, so this is a UnicodeDecodeError,
+        # not a TOMLDecodeError (#1159).
+        codex_dir = sandbox_home / ".codex"
+        codex_dir.mkdir()
+        (codex_dir / "config.toml").write_bytes(b"[mcp_servers]\n\xff\xfe")
+        assert ih._read_toml_safely(codex_dir / "config.toml") is None
+        assert ih.scan_codex(tmp_path) == []
+
     def test_honors_codex_home(self, sandbox_home, tmp_path, monkeypatch):
         codex_home = tmp_path / "portable-codex"
         codex_home.mkdir()

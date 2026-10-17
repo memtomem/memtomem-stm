@@ -228,6 +228,76 @@ def test_project_index_directory_errors_preserve_files(runner, sandbox, argv, js
         )
 
 
+_UTF8_CANARY = "sk-live-utf8-canary"
+_NON_UTF8_PREFIX = f"schema_version = 1\n# {_UTF8_CANARY} \uac00\n".encode()
+_NON_UTF8_REASON = f"not valid UTF-8 (byte offset {len(_NON_UTF8_PREFIX)})"
+
+
+def _assert_clean_non_utf8_exit(result, json_output: bool, action: str) -> None:
+    assert result.exit_code == 1
+    # CliRunner swallows an uncaught exception into exit 1 without a traceback
+    # in the output, so only SystemExit proves the error was rendered.
+    assert isinstance(result.exception, SystemExit), result.exception
+    assert result.exception.code == 1
+    assert "Error:" in result.stderr and _NON_UTF8_REASON in result.stderr
+    assert _UTF8_CANARY not in result.output
+    if json_output:
+        doc = json.loads(result.stdout)
+        assert (doc["action"], doc["ok"], doc["error"]) == (action, False, "mms_state_invalid")
+        assert doc["message"].endswith(_NON_UTF8_REASON)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["init", "--name", "p", "--force"],
+        ["route", "--project", "p"],
+        ["list"],
+        ["list", "--json"],
+    ],
+    ids=lambda v: " ".join(v),
+)
+def test_project_commands_report_a_non_utf8_index_cleanly(runner, sandbox, argv):
+    assert runner.invoke(project_group, ["init", "--name", "p"]).exit_code == 0
+    marker = sandbox["cwd"] / state.PROJECT_MARKER_RELPATH
+    before = marker.read_bytes()
+    index = state.projects_index_path()
+    index.write_bytes(_NON_UTF8_PREFIX + b"\xff\xfe")
+    args = [*argv]
+    if argv[0] == "route":
+        proxy = sandbox["home"] / "proxy.json"
+        proxy.write_bytes(b'{"upstream_servers": {}}\n')
+        args.extend(["--config", str(proxy)])
+
+    result = runner.invoke(project_group, args)
+
+    _assert_clean_non_utf8_exit(result, "--json" in argv, argv[0])
+    assert marker.read_bytes() == before
+    assert index.read_bytes() == _NON_UTF8_PREFIX + b"\xff\xfe"
+
+
+def test_project_init_leaves_no_marker_when_the_index_is_not_utf8(runner, sandbox):
+    index = state.projects_index_path()
+    index.parent.mkdir(parents=True, exist_ok=True)
+    index.write_bytes(_NON_UTF8_PREFIX + b"\xff\xfe")
+
+    result = runner.invoke(project_group, ["init", "--name", "p"])
+
+    _assert_clean_non_utf8_exit(result, False, "init")
+    assert not (sandbox["cwd"] / state.PROJECT_MARKER_RELPATH).exists()
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_host_status_reports_a_non_utf8_registry_cleanly(runner, sandbox, json_output):
+    path = state.registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(_NON_UTF8_PREFIX + b"\xff\xfe")
+
+    result = runner.invoke(host_group, ["status", *(["--json"] if json_output else [])])
+
+    _assert_clean_non_utf8_exit(result, json_output, "status")
+
+
 def test_import_reports_a_corrupt_registry_cleanly(runner, sandbox):
     (sandbox["home"] / ".claude.json").write_text(
         json.dumps({"mcpServers": {"fs": {"command": "npx", "args": ["-y", "@fs"]}}}),
