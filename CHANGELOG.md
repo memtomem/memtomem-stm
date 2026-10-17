@@ -33,6 +33,16 @@ changes inline only. See the deprecation policy in
   A missing index remains supported. Non-UTF-8 index handling is tracked separately
   in #1159.
 
+- cli: report a non-UTF-8 `~/.mms` state file or project marker as a clean exit 1
+  instead of a `UnicodeDecodeError` traceback (#1159). The shared TOML loader now
+  raises the same corruption error as a TOML parse failure, naming the path and the
+  byte offset but not the bytes; `--json` commands return `mms_state_invalid`.
+  This covers every command that reads that state, including `mms import`, `mms host`
+  and `mms project`. Two host-config readers had the same gap: a non-UTF-8 Codex
+  `config.toml` is now skipped during import discovery like a malformed one, and
+  `mms hook install`/`uninstall` refuse a non-UTF-8 host config with the same
+  offset-only message and leave it untouched.
+
 - progressive: enforce each response's stored sliding TTL before renewal and
   during publication cleanup, using backend-local clocks and atomic expiry checks
   (#1155, #1157). **Behavior change**: expired or malformed progressive entries cannot

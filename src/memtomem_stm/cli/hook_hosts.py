@@ -516,6 +516,12 @@ def _read_current(path: Path, fmt: str) -> tuple[dict[str, Any], str] | None:
         return None
     try:
         raw = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        # The exception's own text quotes the offending byte; give the offset only.
+        raise HookInstallError(
+            f"{path} exists but is not valid UTF-8 (byte offset {exc.start}); refusing to "
+            "modify it. Fix or remove the file, then re-run."
+        ) from exc
     except OSError as exc:
         raise HookInstallError(f"cannot read {path}: {exc}") from exc
     try:

@@ -395,6 +395,21 @@ def test_plan_install_refuses_malformed_config(redirect) -> None:
         plan_install("claude", "memtomem-stm hook --host claude")
 
 
+@pytest.mark.parametrize("host", ["claude", "codex"])
+@pytest.mark.parametrize(
+    "prefix", [b"", b"# \xea\xb0\x80 sk-live-hook-canary\n"], ids=["bare", "prefix"]
+)
+def test_plan_install_refuses_non_utf8_config_without_its_bytes(redirect, host, prefix) -> None:
+    path = redirect(host)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(prefix + b"\xff\xfe")
+    with pytest.raises(HookInstallError) as exc_info:
+        plan_install(host, f"memtomem-stm hook --host {host}")
+    message = str(exc_info.value)
+    assert f"is not valid UTF-8 (byte offset {len(prefix)})" in message
+    assert "canary" not in message and "0xff" not in message
+
+
 def test_plan_install_refuses_non_object_toplevel(redirect) -> None:
     path = redirect("claude")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -658,6 +673,19 @@ def test_cli_install_malformed_config_exits_nonzero(redirect) -> None:
     assert result.exit_code != 0
     assert "not valid JSON" in result.output
     assert path.read_text(encoding="utf-8") == "{bad"  # untouched
+
+
+def test_cli_install_non_utf8_config_exits_cleanly_and_untouched(redirect) -> None:
+    path = redirect("codex")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\xff\xfe")
+    result = CliRunner().invoke(cli, ["hook", "install", "--host", "codex", "--apply"])
+    # CliRunner turns an uncaught exception into exit 1 too; only SystemExit
+    # proves the error was rendered.
+    assert isinstance(result.exception, SystemExit), result.exception
+    assert result.exit_code == 1
+    assert "is not valid UTF-8 (byte offset 0)" in result.output
+    assert path.read_bytes() == b"\xff\xfe"
 
 
 def test_cli_install_rejects_unknown_and_missing_host() -> None:

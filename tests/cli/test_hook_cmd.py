@@ -1367,7 +1367,7 @@ class TestHookPreviewAndErrorsEscape:
     The block embeds the source-checkout command, so a path with a hostile
     character renders in all four previews. The errors interpolate a config
     path and a parser's own text; they are escaped at the two ``ClickException``
-    sites rather than at all seven raises, so future messages are covered too.
+    sites rather than at each raise, so future messages are covered too.
     """
 
     HOSTILE = "ho\x1b[31m\rst"
