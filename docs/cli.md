@@ -1319,6 +1319,16 @@ the path is writable, or a `stderr only — configured log file <path> is not
 writable` warning when it isn't. If the file can't be opened at startup
 (read-only path), the server logs a warning to stderr and keeps running.
 
+Every handler STM installs (stderr, the file, the daemon's log, `mms hook`'s
+stderr) escapes an attached traceback line by line: a bidi control, an escape
+sequence or another C0/C1 character inside it renders as `\uXXXX`, the same
+way log lines render config- and environment-derived values, so a hostile
+upstream key in a `MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__<KEY>__…` variable
+cannot reorder the lines around a validation traceback or drive the terminal
+(#1173). A newline in such a key still splits the traceback's location line in
+two; the escaping keeps line structure, so that second line is not marked as
+injected.
+
 See [Configuration → General](configuration.md#general) for details.
 
 ## Trimming the advertised MCP tool surface

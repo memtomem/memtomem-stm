@@ -32,6 +32,36 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- logging: a traceback attached to a log line is escaped the way the line's own
+  values are (#1173). #1166 escaped the env-hint lines that name a broken
+  `MEMTOMEM_STM_*` variable, but the `ValidationError` traceback attached by
+  `log_stm_config_failure` and by server startup still rendered the failing
+  location raw, and that location quotes the operator's upstream key from
+  `MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__<KEY>__…`, so a bidi control or an
+  escape sequence in the name reached stderr and the log file. Every handler STM
+  installs (server stderr and `MEMTOMEM_STM_LOG_FILE`, the daemon's stderr and
+  `stm-daemon.log`, the early-failure stderr handlers) now formats exception and
+  stack text through `DisplayEscapingFormatter`, line by line, so the stack keeps
+  its shape while C0/C1 controls, bidi controls and lone surrogates become
+  `\uXXXX`. `mms hook` installs the same formatter on a bare-message stderr
+  handler, the destination and shape of the stdlib's last-resort handler it used
+  before, so the pass-through barrier's traceback is covered too. Left open by
+  design: a newline the operator injected still splits a location across two
+  lines inside the traceback, and under the hook's bare-message format that second
+  line is not distinguishable from a message of its own; what is closed is
+  reordering (bidi controls) and terminal control sequences.
+  Server startup's own early-failure line (`Invalid MEMTOMEM_STM_* environment
+  configuration`) used to render through the MCP SDK's Rich handler, which the
+  server module installs at import and which a plain `basicConfig` could not
+  replace; the server now takes the root logger over there as it already did on
+  the success path.
+  **Behavior change**: logged tracebacks render such characters as `\uXXXX`
+  instead of raw; ordinary tracebacks are byte-identical. The server's
+  early-failure traceback is plain text in the `LEVEL name: message` stderr format
+  instead of Rich's panel. `memtomem-stm` and every `mms daemon` subcommand
+  still exit 1 on an invalid `MEMTOMEM_STM_*` environment, but no longer let the
+  interpreter print the same traceback a second time after the logged one.
+
 - cli: `mms tune --json`, `mms gateway status --json`, `mms gateway explain --json` and
   `mms project route --json` emit the `{"action", "ok": false, "error", "message"}`
   failure document on every remaining operational failure, instead of a stderr line

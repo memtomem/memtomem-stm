@@ -2237,7 +2237,7 @@ class TestBrokenConfigObservability:
         # so the failure produced no log line at all.
         assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND" in caplog.text
 
-    def test_load_config_logs_before_raising(self, caplog):
+    def test_load_config_logs_before_exiting(self, caplog):
         import logging
 
         from pydantic import ValidationError
@@ -2245,7 +2245,11 @@ class TestBrokenConfigObservability:
         from memtomem_stm.cli.daemon_cmd import _load_config
 
         with caplog.at_level(logging.WARNING):
-            with pytest.raises(ValidationError):
+            with pytest.raises(SystemExit) as exit_:
                 _load_config()
 
+        # Exit 1 without re-raising: the interpreter's second traceback would
+        # bypass the escaping formatter (#1173). The cause stays attached.
+        assert exit_.value.code == 1
+        assert isinstance(exit_.value.__cause__, ValidationError)
         assert "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH__COMMAND" in caplog.text
