@@ -32,6 +32,19 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- cli: `mms config validate`, `mms doctor` and the `.mcp.json` merge behind
+  `mms init --client json` report a JSON file holding an integer literal past the
+  interpreter's digit limit (4,300 digits by default) instead of crashing (#1179).
+  `json.loads` raises a plain `ValueError` for it, not a `JSONDecodeError`, and those
+  readers caught only the latter; the `.mcp.json` merge also let a `RecursionError`
+  from deep nesting through. `config validate` and `doctor` now report `invalid JSON:
+  a value could not be parsed (ValueError)` (as an error and as a failing `config
+  JSON` check), and the merge aborts with `Failed to parse <path>: ValueError.` (or
+  `RecursionError.`) and leaves the file untouched. The conversion's own text is not
+  quoted.
+  **Behavior change**: these inputs used to end in a traceback (exit 1); the commands
+  now exit 1 with their normal report.
+
 - cli: an OS failure on the proxy-config write path exits cleanly instead of with a
   traceback (#1176, #1180). Every `stm_proxy.json` mutator (`add`, `init`, `remove`,
   `surfacing`, `prune`, `eject`, `gateway mode`, `tune --apply`, `project route --apply`)

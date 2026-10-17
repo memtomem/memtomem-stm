@@ -1238,6 +1238,16 @@ def _write_mcp_json_for_stm(
                 err=True,
             )
             raise SystemExit(1) from exc
+        except (ValueError, RecursionError) as exc:
+            # Neither is a JSONDecodeError: an integer literal past the digit
+            # limit, or nesting past the recursion limit (#1179). No position
+            # to report, and the conversion's text is not quoted.
+            click.echo(
+                f"{_err('Error:')} Failed to parse {_disp(str(mcp_path))}: {type(exc).__name__}.",
+                err=True,
+            )
+            click.echo("    Registration aborted; the file was not modified.", err=True)
+            raise SystemExit(1) from exc
         if not isinstance(loaded, dict):
             click.echo(
                 f"{_err('Error:')} {mcp_path} top-level must be a JSON object, "
@@ -9778,6 +9788,17 @@ def doctor(
                 "config JSON",
                 "FAIL",
                 "invalid JSON: nested too deeply to parse (RecursionError)",
+                f"mms config validate {cfg_arg}",
+            )
+        except ValueError:
+            # After ``JSONDecodeError`` / ``UnicodeDecodeError`` (both
+            # ValueErrors): the plain one ``json.loads`` raises for an integer
+            # literal past ``sys.get_int_max_str_digits()`` (#1179).
+            check(
+                "config_json",
+                "config JSON",
+                "FAIL",
+                "invalid JSON: a value could not be parsed (ValueError)",
                 f"mms config validate {cfg_arg}",
             )
         except OSError as exc:

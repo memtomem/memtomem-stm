@@ -106,6 +106,11 @@ def validate_command(config_path: str | None, as_json: bool) -> None:
             # A ValueError, not an OSError: without this it escaped as a
             # traceback (#1095). This command keeps full local detail.
             errors.append(f"not valid UTF-8: {exc}")
+        except ValueError:
+            # After the two ValueError subclasses above. What is left is the
+            # plain ValueError ``json.loads`` raises for an integer literal
+            # past ``sys.get_int_max_str_digits()`` (#1179).
+            errors.append("invalid JSON: a value could not be parsed (ValueError)")
         except OSError as exc:
             errors.append(f"cannot read file: {exc}")
         if data is not None:
