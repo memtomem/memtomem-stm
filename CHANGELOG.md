@@ -39,9 +39,11 @@ changes inline only. See the deprecation policy in
   - `mms daemon status` exits 0 and reports a non-UTF-8 handshake of its own
     config as `stale` with `handshake_unreadable`;
   - `mms selection replay` prints its `Error:` line on stderr only, leaving
-    stdout empty under `--json`. It now also exits 1 on a broken `--config`,
-    where it used to exit 0 with a report computed on defaults, and rejects
-    a non-string `dataset_id` that it used to copy into the report;
+    stdout empty under `--json`. It now also exits 1 on a broken `--config`
+    or an invalid `MEMTOMEM_STM_PROXY` / `MEMTOMEM_STM_PROXY__*` override,
+    where it used to exit 0 with a report computed on defaults (repair or
+    unset the override), and rejects a non-string `dataset_id` that it used
+    to copy into the report;
   - `mms host status` / `scan` exit 1 on unreadable state;
   - import discovery skips an undecodable Codex config and `mms hook install`
     ignores an undecodable `pyproject.toml`, and both keep running.
@@ -82,8 +84,9 @@ changes inline only. See the deprecation policy in
   status` / `explain` print each config error's location and type. The
   surface webhook's `query` now equals the persisted `surfacing_events.query`:
   with `persist_query_text: false` it is a `sha256:` digest instead of the raw
-  query, and a sensitive query's digest differs from the one 0.6.3 sent. The
-  default `true` sends what 0.6.3 sent.
+  query, and a sensitive query's digest differs from the one 0.6.3 sent. With
+  the default `true`, the payload changes only for a query that the broader
+  email rule below now classes as sensitive, which arrives as a digest.
 - **Smaller default-path changes.** Truncated sections keep duplicate lines
   and closing fences, and metadata-bypass calls count toward the session's
   token totals instead of adding 0, which can move the savings percentage
@@ -225,8 +228,8 @@ changes inline only. See the deprecation policy in
   **Behavior change**: these inputs used to end in a traceback with an empty
   stdout; they now exit 1 with one error line and, in `--json` mode, one
   failure document (`tune` adds the `store_invalid` code). `gateway status`
-  keeps its exit 0 with `INVALID` for a rejected bundle, so the two bundle
-  cases move from exit 1 to exit 0.
+  keeps its exit 0 with `INVALID` for a rejected bundle, so the three bundle
+  shapes move from exit 1 to exit 0.
 
 - logging: a traceback attached to a log line is escaped the way the line's own
   values are (#1173, #1177). #1166 escaped the env-hint lines that name a broken
@@ -516,7 +519,9 @@ changes inline only. See the deprecation policy in
   false`, subscribers receive a `sha256:` digest instead of the raw query,
   and a sensitive query's digest becomes the persisted one (a digest of the
   retrieval digest), which differs from what 0.6.3 sent. With the default
-  `true` the payload is unchanged (#1141).
+  `true` this change leaves the payload as 0.6.3 sent it; a query that the
+  #1149 email rule now classes as sensitive arrives as a digest there too
+  (#1141).
 
 ## [0.6.3] — 2026-10-12
 
