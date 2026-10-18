@@ -11,12 +11,92 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.6.4] — 2026-10-18
+
+### Upgrade notes
+
+- **The MCP SDK floor is now 2.2.0** (#1156). `mcp[cli]>=2.2.0,<3` addresses
+  CVE-2026-59951 (unbounded StreamableHTTP session accumulation). An
+  environment pinned to `mcp` 2.0 or 2.1 must move up with this release.
+- **Bad input ends with a report, not a traceback** (#1144, #1164, #1169,
+  #1174, #1178, #1180, #1182, #1184, #1186, #1187). Input the readers did not
+  anticipate (non-UTF-8 `~/.mms` state and host files, JSON nested too deeply
+  or holding an over-long integer, a malformed policy bundle, a metrics file
+  that is not a database, an unwritable config or state directory, a bad
+  selection dataset) used to crash the `mms` command that read it. Malformed
+  and non-UTF-8 proxy configs were already reported cleanly. What replaces
+  the traceback depends on the command:
+  - most print one `Error:` line and exit 1; under `--json`, the config
+    commands (`add`, `remove`, `status`, `list`, `tune`, `gateway explain`,
+    `project route`, …) and the `mms host` / `mms project` state commands
+    print the `{"action", "ok": false, "error", "message"}` failure document;
+  - `mms doctor` and `mms config validate` print their normal report with a
+    failing check and exit 1, in text and `--json` alike;
+  - `mms gateway status` reports such a bundle as `INVALID` (`"valid": false`
+    under `--json`) and exits 0, as it already did for other rejected bundles;
+    these shapes crashed with exit 1;
+  - `mms eject` lists a non-UTF-8 target under `could not eject` and exits 1;
+  - `mms daemon status` exits 0 and reports a non-UTF-8 handshake of its own
+    config as `stale` with `handshake_unreadable`;
+  - `mms selection replay` prints its `Error:` line on stderr only, leaving
+    stdout empty under `--json`. It now also exits 1 on a broken `--config`,
+    where it used to exit 0 with a report computed on defaults, and rejects
+    a non-string `dataset_id` that it used to copy into the report;
+  - `mms host status` / `scan` exit 1 on unreadable state;
+  - import discovery skips an undecodable Codex config and `mms hook install`
+    ignores an undecodable `pyproject.toml`, and both keep running.
+- **`--json` failures print a document** (#1140, #1175). `add`, `remove`,
+  `prune`, `eject`, `status`, `list`, `health`, `gateway status` /
+  `explain`, `tune` and `project route` used to leave stdout empty on many
+  failures; they now print `{"action", "ok": false, "error", "message"}`.
+  A script that read an empty stdout as the failure signal should branch on
+  `ok` / `error`. `remove`, `prune` and `eject` report a broken config with
+  exit 1 instead of `confirmation_required` (exit 2). `tune --json` with no
+  metrics database prints its note on stderr instead of stdout.
+- **Projects index checks are stricter** (#1156, #1161, #1162). A directory
+  or other non-regular `~/.mms/projects.toml` is an error instead of an empty
+  index. `mms project enable` / `disable` read the index before they change
+  the project's settings, so a read failure changes nothing; if the index
+  write after the marker save fails, they exit 1 and say what was saved and
+  that a rerun completes it. `mms project list --prune` also removes
+  registrations whose marker is missing, and aborts without changing the
+  index on an inaccessible or invalid project.
+- **Control and bidi characters in displayed values print as `\uXXXX`**
+  (#1167, #1172, #1177). This covers config key names, operator-supplied
+  paths, ids and filters, and logged tracebacks; `--json` documents keep the
+  raw text. Ordinary values are unchanged. The server's early-failure
+  traceback is plain `LEVEL name: message` text instead of Rich's panel, and
+  is printed once.
+- **Progressive entries honor their stored TTL** (#1157). Expired or malformed
+  entries cannot be renewed, and `ttl_seconds: 0` now expires immediately:
+  the first chunk is delivered with an expiry notice. Upgrade all processes
+  that share one SQLite pending-store file together.
+- **The email rule matches more, and the cache repairs itself once** (#1149).
+  Text with an address such as `--@example.com` or `jöe@bar.com` now counts as
+  sensitive in every check that uses the default patterns: the response is
+  not cached or indexed, extracted facts from it are not stored, and a
+  surfacing query holding one is digested before the LTM search. The first start after upgrading runs
+  the response cache's one-time privacy repair sweep, which takes time
+  proportional to the cache's size.
+- **Gateway errors and the webhook query hide values** (#1141). `mms gateway
+  status` / `explain` print each config error's location and type. The
+  surface webhook's `query` now equals the persisted `surfacing_events.query`:
+  with `persist_query_text: false` it is a `sha256:` digest instead of the raw
+  query, and a sensitive query's digest differs from the one 0.6.3 sent. The
+  default `true` sends what 0.6.3 sent.
+- **Smaller default-path changes.** Truncated sections keep duplicate lines
+  and closing fences, and metadata-bypass calls count toward the session's
+  token totals instead of adding 0, which can move the savings percentage
+  (#1142). The auto-tune readiness labels count only `rrf`
+  and unscaled feedback, as the tuner does (#1142). A dict or list under a
+  semantic key such as `query` no longer feeds the surfacing query (#1143).
+
 ### Changed
 
 - progressive: use a bounded, compressed heading index for sequential and interleaved
   chunk reads; store it separately from TTL metadata so expiry cleanup stays cheap.
   Persist indexes across SQLite restart and repair legacy entries on first valid
-  read. Responses exceeding the index limits retain suffix scanning (#1153).
+  read. Responses exceeding the index limits retain suffix scanning (#1153, #1158).
 
 - server: `stm_selection_stats` parses the selection log in a worker thread instead
   of on the event loop (#1152, #1168). Near the 50 MB rotation cap one call stalled
@@ -29,6 +109,15 @@ changes inline only. See the deprecation policy in
   `stm_tuning_recommendations` stays on the loop: it measured under 1 ms on real
   data at the default metrics retention (`max_history` 10,000).
   **Behavior change**: none external.
+
+- performance: `mms` no longer imports the `~/.mms` state layer (and with
+  it `pydantic` and `tomli_w`) to start the CLI group; the daemon adapter
+  computes its config fingerprint once instead of per request;
+  `stm_tuning_recommendations` reads tool profiles once instead of twice.
+  The surfacing query extractor no longer stringifies a dict or list passed
+  under a semantic key such as `query` or `path`. **Behavior change**: such
+  a container value no longer contributes to the surfacing query; strings
+  and numbers still do (#1143).
 
 ### Fixed
 
@@ -51,8 +140,9 @@ changes inline only. See the deprecation policy in
 - cli: `mms selection replay --dataset` reports a dataset with an integer past the
   interpreter's digit limit, nested too deeply to parse, or holding a non-finite number,
   instead of crashing (#1183, #1186).
-  The dataset loader caught `JSONDecodeError` and `UnicodeDecodeError` but not the
-  plain `ValueError` or the `RecursionError` that `json.loads` raises for the first two.
+  The dataset loader caught `JSONDecodeError` (and, from #1169 below, `UnicodeDecodeError`)
+  but not the plain `ValueError` or the `RecursionError` that `json.loads` raises for the
+  first two.
   Both now exit with `Error: invalid dataset JSON: a value could not be parsed (ValueError)`
   or `… nested too deeply to parse (RecursionError)`, in text and `--json` mode alike;
   the conversion's own text is not quoted. A dataset that parses but carries `NaN`,
@@ -131,7 +221,7 @@ changes inline only. See the deprecation policy in
   traceback; all three are now the `mms_state_invalid` failure every other
   corrupt state file already produces. The remaining #1176 items
   (an unwritable config directory or an unopenable write lock under `project
-  route --apply` and the other config mutators) are not changed here.
+  route --apply` and the other config mutators) are fixed by #1180 above.
   **Behavior change**: these inputs used to end in a traceback with an empty
   stdout; they now exit 1 with one error line and, in `--json` mode, one
   failure document (`tune` adds the `store_invalid` code). `gateway status`
@@ -211,8 +301,8 @@ changes inline only. See the deprecation policy in
   now produces a clean exit 1 instead of being treated as an empty index;
   JSON-capable commands return `mms_state_invalid` with `--json`. `mms project init`
   fails before creating a marker or overwriting an existing marker with `--force`.
-  A missing index remains supported. Non-UTF-8 index handling is tracked separately
-  in #1159.
+  A missing index remains supported. Non-UTF-8 index handling is the #1164 entry
+  below.
 
 - cli: report a non-UTF-8 `~/.mms` state file or project marker as a clean exit 1
   instead of a `UnicodeDecodeError` traceback (#1159, #1164). The shared TOML loader now
@@ -297,8 +387,9 @@ changes inline only. See the deprecation policy in
     while …` log line and in the server's startup `Invalid MEMTOMEM_STM_* environment
     configuration` log line.
 
-  `--json` documents keep the raw values. Still not covered: the traceback that
-  those two log lines attach renders the failing validation location raw.
+  `--json` documents keep the raw values. The traceback that those two log
+  lines attach, which rendered the failing validation location raw, is escaped
+  by #1177 above.
   **Behavior change**: none for ordinary values. A displayed value that contains a
   control or bidi character now prints as `\uXXXX`.
 
@@ -313,15 +404,12 @@ changes inline only. See the deprecation policy in
   Legacy metadata objects without TTL retain the 1,800-second default. Upgrade
   all processes sharing a SQLite pending-store file together.
 
-- security: require MCP SDK 2.2.0 or newer to address CVE-2026-59951
-  (unbounded StreamableHTTP session accumulation), and refresh the lockfile (#1156).
-
 - cli: project pruning and named lookup now share explicit path and marker
   validation. Missing-marker recovery preserves the indexed name and explains
   that re-init resets enabled MCPs. **Behavior change**: `mms project list
   --prune` also removes missing-marker registrations; inaccessible or invalid
   projects abort pruning without changing the index and identify the failed entry.
-  Non-directory roots remain prunable without deleting files (#1154).
+  Non-directory roots remain prunable without deleting files (#1154, #1156).
 
 - compression: section-aware truncation in `TruncateCompressor` skipped
   every later line equal to one it had already kept, so a section lost its
@@ -330,7 +418,10 @@ changes inline only. See the deprecation policy in
   estimated token counts to the session's token totals instead of 0, and the
   ratio-guard fallback no longer re-runs hybrid compression
   when hybrid was the strategy that just failed. **Behavior change**:
-  truncated sections keep duplicate lines and closing fences (#1142).
+  truncated sections keep duplicate lines and closing fences, and
+  metadata-bypass calls now count toward the session's original and
+  compressed token totals, which can move the reported savings percentage
+  (#1142).
 - surfacing: the "auto-tune ready" / "need N more" labels in
   `stm_surfacing_stats` counted feedback on every score scale, while the
   tuner only uses `rrf` (and unscaled) events. They now apply the same
@@ -344,10 +435,34 @@ changes inline only. See the deprecation policy in
   patterns, such as the response cache's privacy gate. The rule is now linear
   (256 KB in a few milliseconds). **Behavior change**: the rule also matches
   a local part with no word boundary in it (`--@example.com`) or one right
-  after a non-ASCII letter (`jöe@bar.com`), so those are no longer cached.
+  after a non-ASCII letter (`jöe@bar.com`). Every check that uses the default
+  patterns now treats such text as sensitive: it is not cached or indexed,
+  facts extracted from it are not stored, and a surfacing query holding one
+  is digested before the LTM search.
   The response cache's privacy fingerprint covers the pattern text, so the
   first start after upgrading runs the cache's one-time privacy repair sweep,
   which takes time proportional to the cache's size (#1149).
+- cli: a hand-edited `~/.mms` state file (`registry.toml`, `projects.toml`,
+  `import_state.toml`, a project marker) that fails to parse or validate no
+  longer ends an `mms host`, `mms project` or `mms import` command in a
+  traceback (#1144). Each prints `Error: <path>: <reason>` and exits 1; with
+  `--json`, stdout carries the failure document with `mms_state_invalid`,
+  `mms_schema_mismatch` or `mms_lock_timeout`. A schema failure names each
+  location and error type, such as `servers.x.command (string_type)`, instead
+  of the pydantic message, which could quote the rejected value. `mms project
+  init` reads the projects index before it writes the marker, so an unreadable
+  index no longer leaves a marker that the rerun refuses without `--force`.
+  `mms selection replay` stops on a `--config` file that cannot be read or
+  parsed, or on invalid `MEMTOMEM_STM_*` overrides, instead of evaluating on
+  defaults. The proxy CLI's config reader rejects `"upstream_servers": null`
+  and reports JSON nested too deeply to parse as a parse failure; both used to
+  end in a traceback. Removing STM's entry from Claude Desktop's config keeps
+  the file's existing permissions; it used to narrow `0o644` to `0o600`.
+  **Behavior change**: `mms host status` and `mms host scan` exit 1 when the
+  state files cannot be read; they used to crash. `--json` runs of these
+  commands write a failure document where stdout was empty. `mms selection
+  replay` with a broken `--config` exits 1 where it used to exit 0 with a
+  report computed on defaults.
 - cli: a `--json` run whose config file could not be read or parsed wrote
   nothing to stdout, even though `--json` promises one JSON document for
   operational failures. The human error went to stderr and the exit code was
@@ -356,18 +471,17 @@ changes inline only. See the deprecation policy in
   These commands now also print `{"action": ..., "ok": false, "error":
   "config_unreadable" | "config_invalid", "message": ..., "path": ...}` with
   exit 1. `config_unreadable` means the file cannot be read.
-  `config_invalid` means it is not UTF-8, not JSON, not an object, or has an
-  `upstream_servers` that is neither an object nor `null`. The message is
+  `config_invalid` means it is not UTF-8, not JSON (including JSON nested too
+  deeply to parse), not an object, or has an `upstream_servers` that is not an
+  object; the deep-nesting and `null` cases are #1144 above. The message is
   the same sentence as the stderr line, which names the path and the error
   type, never the file's content.
   `remove`, `prune` and `eject` read the config before they check `--yes`, so
   a broken file is reported with exit 1 rather than as
   `confirmation_required` with exit 2. The other `--json` failures that still
   print no document (`tune`'s missing file and failed validation, and the
-  `gateway` and `project route` command errors) are #1138. Errors the read
-  and parse checks do not catch, such as JSON nested too deeply to parse
-  or an `upstream_servers` of `null`, still end without a document (#1139)
-  (#1099).
+  `gateway` and `project route` command errors) were #1138, fixed by #1175
+  above (#1099, #1140).
 - surfacing: when the LTM server was configured with
   `ltm_mcp_transport = "streamable_http"` and could not be reached, the
   failure was reported as `RuntimeError` ("LTM adapter owner task stopped")
@@ -380,20 +494,12 @@ changes inline only. See the deprecation policy in
   `owner task exited unexpectedly` WARNING stays, because a cancellation from
   outside whose rollback also fails looks the same, but it now names the
   failed start. Surfacing was already disabled in either case; only what is
-  reported changes (#1136).
-
-### Changed
-
-- performance: `mms` no longer imports the `~/.mms` state layer (and with
-  it `pydantic` and `tomli_w`) to start the CLI group; the daemon adapter
-  computes its config fingerprint once instead of per request;
-  `stm_tuning_recommendations` reads tool profiles once instead of twice.
-  The surfacing query extractor no longer stringifies a dict or list passed
-  under a semantic key such as `query` or `path`. **Behavior change**: such
-  a container value no longer contributes to the surfacing query; strings
-  and numbers still do (#1143).
+  reported changes (#1136, #1137).
 
 ### Security
+
+- security: require MCP SDK 2.2.0 or newer to address CVE-2026-59951
+  (unbounded StreamableHTTP session accumulation), and refresh the lockfile (#1156).
 
 - cli: `mms gateway status` printed the first validation message for an
   invalid config, and `mms gateway explain` printed the whole pydantic error.
@@ -402,11 +508,15 @@ changes inline only. See the deprecation policy in
   reads `invalid proxy config: upstream_servers.x (value_error)` instead of,
   for example, `Value error, reconnect_delay_seconds (7777.0) must be <=
   max_reconnect_delay_seconds (5.0)` (#1141).
-- surfacing: the surface webhook payload's `query` was always the raw
-  extracted query. It now uses the same form as the persisted
-  `surfacing_events.query`. **Behavior change**: webhook subscribers receive
-  a `sha256:` digest instead of the query when `persist_query_text` is
-  `false`, and whenever the query matches a sensitive pattern (#1141).
+- surfacing: the surface webhook payload's `query` ignored
+  `persist_query_text`. It carried the raw extracted query, or, for a query
+  matching a sensitive pattern, the `sha256:` digest that retrieval already
+  used. It now carries the same value as the persisted
+  `surfacing_events.query`. **Behavior change**: with `persist_query_text:
+  false`, subscribers receive a `sha256:` digest instead of the raw query,
+  and a sensitive query's digest becomes the persisted one (a digest of the
+  retrieval digest), which differs from what 0.6.3 sent. With the default
+  `true` the payload is unchanged (#1141).
 
 ## [0.6.3] — 2026-10-12
 
