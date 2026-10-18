@@ -785,6 +785,71 @@ def test_cli_reports_a_non_utf8_dataset_without_a_traceback(tmp_path: Path) -> N
     assert "canary" not in result.output
 
 
+@pytest.fixture
+def default_digit_limit():
+    """Pin the limit the 5,000-digit input is sized against: ``PYTHONINTMAXSTRDIGITS``
+    can disable it, and then the literal parses and the test fails for the wrong reason."""
+    previous = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(4300)
+    try:
+        yield
+    finally:
+        sys.set_int_max_str_digits(previous)
+
+
+_UNPARSEABLE_DATASETS = {
+    "digit-limit": ("9" * 5000, "a value could not be parsed (ValueError)"),
+    "nesting": ("[" * 100_000, "nested too deeply to parse (RecursionError)"),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_UNPARSEABLE_DATASETS))
+def test_unparseable_dataset_is_a_clean_error(
+    tmp_path: Path, kind: str, default_digit_limit: None
+) -> None:
+    body, reason = _UNPARSEABLE_DATASETS[kind]
+    path = tmp_path / "dataset.json"
+    path.write_text(body, encoding="utf-8")
+
+    with pytest.raises(SelectionEvaluationError) as exc_info:
+        load_selection_dataset(path)
+
+    assert str(exc_info.value) == f"invalid dataset JSON: {reason}"
+
+
+@pytest.mark.parametrize("literal", ["NaN", "-Infinity", "1e999"])
+def test_non_finite_number_in_a_dataset_is_a_clean_error(tmp_path: Path, literal: str) -> None:
+    # Outside every validated field, so only the canonical serialization sees it.
+    text = builtin_dataset_path().read_text(encoding="utf-8").rstrip()
+    path = tmp_path / "dataset.json"
+    path.write_text(f'{text[:-1]}, "extra": {literal}}}', encoding="utf-8")
+
+    with pytest.raises(SelectionEvaluationError) as exc_info:
+        load_selection_dataset(path)
+
+    assert str(exc_info.value) == "dataset contains a non-finite number (NaN or Infinity)"
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("kind", sorted(_UNPARSEABLE_DATASETS))
+def test_cli_reports_an_unparseable_dataset_without_a_traceback(
+    tmp_path: Path, kind: str, json_output: bool, default_digit_limit: None
+) -> None:
+    body, reason = _UNPARSEABLE_DATASETS[kind]
+    path = tmp_path / "dataset.json"
+    path.write_text(body, encoding="utf-8")
+    argv = ["selection", "replay", "--no-telemetry", "--dataset", str(path)]
+    argv += ["--config", str(tmp_path / "absent.json")]
+    if json_output:
+        argv.append("--json")
+
+    result = CliRunner().invoke(cli, argv)
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit), result.exception
+    assert result.output == f"Error: invalid dataset JSON: {reason}\n"
+
+
 def test_unknown_future_ranker_skips_v1_score_parity(tmp_path: Path) -> None:
     log = tmp_path / "selection.jsonl"
     selection = _selection()

@@ -32,6 +32,21 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- cli: `mms selection replay --dataset` reports a dataset with an integer past the
+  interpreter's digit limit, nested too deeply to parse, or holding a non-finite number,
+  instead of crashing (#1183).
+  The dataset loader caught `JSONDecodeError` and `UnicodeDecodeError` but not the
+  plain `ValueError` or the `RecursionError` that `json.loads` raises for the first two.
+  Both now exit with `Error: invalid dataset JSON: a value could not be parsed (ValueError)`
+  or `… nested too deeply to parse (RecursionError)`, in text and `--json` mode alike;
+  the conversion's own text is not quoted. A dataset that parses but carries `NaN`,
+  `Infinity` or an overflowing literal such as `1e999` in a field the loader does not
+  check failed the same way, with a `ValueError` from the canonical serialization that
+  computes the dataset hash; it now exits with `Error: dataset contains a non-finite
+  number (NaN or Infinity)`.
+  **Behavior change**: these inputs used to end in a traceback (exit 1); the command
+  now exits 1 with its normal error line.
+
 - cli: an OS failure writing a `~/.mms` state file exits cleanly instead of with a
   traceback (#1181, #1184). `registry.toml`, `projects.toml`, `import_state.toml` and a
   project's `.mms/project.toml` are written by four savers that let the `OSError` from

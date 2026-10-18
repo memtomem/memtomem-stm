@@ -170,6 +170,15 @@ def load_selection_dataset(path: Path | str | None = None) -> dict[str, Any]:
         raise SelectionEvaluationError(
             f"dataset is not valid {exc.encoding.upper()} (byte offset {exc.start})"
         ) from exc
+    except ValueError as exc:
+        # After the two subclasses above: an integer past the str-digit limit.
+        raise SelectionEvaluationError(
+            "invalid dataset JSON: a value could not be parsed (ValueError)"
+        ) from exc
+    except RecursionError as exc:
+        raise SelectionEvaluationError(
+            "invalid dataset JSON: nested too deeply to parse (RecursionError)"
+        ) from exc
     if not isinstance(data, dict) or data.get("schema_version") != DATASET_SCHEMA_VERSION:
         raise SelectionEvaluationError(f"dataset schema_version must be {DATASET_SCHEMA_VERSION}")
     cases = data.get("cases")
@@ -256,13 +265,20 @@ def load_selection_dataset(path: Path | str | None = None) -> dict[str, Any]:
     # raises rather than one that only measures (#757): a fixture case may
     # carry a legal ``"\ud800"`` escape, and `mms selection replay` does not
     # catch `UnicodeEncodeError`.
-    canonical = json_out.dumps(
-        data,
-        sort_keys=True,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
+    try:
+        canonical = json_out.dumps(
+            data,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except ValueError as exc:
+        # json.loads accepts NaN, Infinity and an overflowing literal such as 1e999
+        # anywhere the checks above do not look; allow_nan=False rejects them here.
+        raise SelectionEvaluationError(
+            "dataset contains a non-finite number (NaN or Infinity)"
+        ) from exc
     data["_sha256"] = hashlib.sha256(canonical).hexdigest()
     data["_split_counts"] = dict(sorted(split_counts.items()))
     return data
