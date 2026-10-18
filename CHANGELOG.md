@@ -33,7 +33,7 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - cli: `mms selection replay --dataset` reports a dataset whose evaluator fields are invalid
-  instead of crashing (#1185). The loader checked what it needs for split accounting but
+  instead of crashing (#1185, #1187). The loader checked what it needs for split accounting but
   not every field the evaluator reads later, so four inputs passed it and then ended in a
   traceback: a case `profile` that is not an exposure profile (`ValueError`), a candidate
   with no `name` (`KeyError`), a `tool_expose_in_profiles` or `server_expose_in_profiles`
