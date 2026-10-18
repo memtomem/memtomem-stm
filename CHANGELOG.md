@@ -34,7 +34,7 @@ changes inline only. See the deprecation policy in
 
 - cli: `mms selection replay --dataset` reports a dataset with an integer past the
   interpreter's digit limit, nested too deeply to parse, or holding a non-finite number,
-  instead of crashing (#1183).
+  instead of crashing (#1183, #1186).
   The dataset loader caught `JSONDecodeError` and `UnicodeDecodeError` but not the
   plain `ValueError` or the `RecursionError` that `json.loads` raises for the first two.
   Both now exit with `Error: invalid dataset JSON: a value could not be parsed (ValueError)`
