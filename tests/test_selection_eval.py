@@ -7,6 +7,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 from click.testing import CliRunner
@@ -815,6 +816,127 @@ def test_unparseable_dataset_is_a_clean_error(
         load_selection_dataset(path)
 
     assert str(exc_info.value) == f"invalid dataset JSON: {reason}"
+
+
+def _nested(depth: int) -> Any:
+    value: Any = 0
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+def _drop_name(dataset: dict[str, Any]) -> None:
+    del dataset["cases"][0]["candidates"][0]["name"]
+
+
+def _set_profile(dataset: dict[str, Any]) -> None:
+    dataset["cases"][0]["profile"] = "invalid"
+
+
+def _set_signal(key: str, value: Any) -> Any:
+    def mutate(dataset: dict[str, Any]) -> None:
+        dataset["cases"][0]["candidates"][0].setdefault("signals", {})[key] = value
+
+    return mutate
+
+
+def _set_dataset_id(value: Any) -> Any:
+    def mutate(dataset: dict[str, Any]) -> None:
+        dataset["dataset_id"] = value
+
+    return mutate
+
+
+# Each row crashed `selection replay` past the loader (#1185); the 1,100-deep
+# dataset_id only on Python 3.12 in --json mode, but the loader rejects it on all.
+_EVALUATOR_FIELD_ROWS = {
+    "missing-name": (_drop_name, "{case}/{candidate}: name is required"),
+    "unknown-profile": (_set_profile, "{case}: invalid profile"),
+    "tool-expose-int": (
+        _set_signal("tool_expose_in_profiles", 42),
+        "{case}/{candidate}: tool_expose_in_profiles must be a list of exposure profiles",
+    ),
+    "server-expose-unknown": (
+        _set_signal("server_expose_in_profiles", ["nope"]),
+        "{case}/{candidate}: server_expose_in_profiles must be a list of exposure profiles",
+    ),
+    "nested-dataset-id": (_set_dataset_id(_nested(1100)), "dataset_id must be a string"),
+    "int-dataset-id": (_set_dataset_id(42), "dataset_id must be a string"),
+}
+
+
+def _write_mutated_dataset(tmp_path: Path, kind: str) -> tuple[Path, str]:
+    mutate, template = _EVALUATOR_FIELD_ROWS[kind]
+    dataset = json.loads(builtin_dataset_path().read_text(encoding="utf-8"))
+    case = dataset["cases"][0]
+    mutate(dataset)
+    path = tmp_path / "dataset.json"
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(5000)  # json.dumps of the 1,100-deep row
+    try:
+        path.write_text(json.dumps(dataset), encoding="utf-8")
+    finally:
+        sys.setrecursionlimit(limit)
+    reason = template.format(case=case["case_id"], candidate=case["candidates"][0]["candidate_id"])
+    return path, reason
+
+
+@pytest.mark.parametrize("kind", sorted(_EVALUATOR_FIELD_ROWS))
+def test_invalid_evaluator_field_is_a_loader_error(tmp_path: Path, kind: str) -> None:
+    path, reason = _write_mutated_dataset(tmp_path, kind)
+
+    with pytest.raises(SelectionEvaluationError) as exc_info:
+        load_selection_dataset(path)
+
+    assert str(exc_info.value) == reason
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("kind", sorted(_EVALUATOR_FIELD_ROWS))
+def test_cli_reports_an_invalid_evaluator_field(
+    tmp_path: Path, kind: str, json_output: bool
+) -> None:
+    path, reason = _write_mutated_dataset(tmp_path, kind)
+    argv = ["selection", "replay", "--no-telemetry", "--dataset", str(path)]
+    argv += ["--config", str(tmp_path / "absent.json")]
+    if json_output:
+        argv.append("--json")
+
+    result = CliRunner().invoke(cli, argv)
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit), result.exception
+    assert result.output == f"Error: {reason}\n"
+
+
+@pytest.mark.parametrize(
+    "field", ["profile", "tool_expose_in_profiles", "server_expose_in_profiles"]
+)
+def test_absent_field_evaluates_like_its_explicit_default(tmp_path: Path, field: str) -> None:
+    # Absent means the default: the new checks must accept it, and the evaluator must
+    # score it exactly as the default written out ("strict" profile, null signal).
+    dataset = json.loads(builtin_dataset_path().read_text(encoding="utf-8"))
+    filled = 0
+    for case in dataset["cases"]:
+        if field == "profile":
+            if field not in case:
+                case[field] = "strict"
+                filled += 1
+            continue
+        for candidate in case["candidates"]:
+            signals = candidate.setdefault("signals", {})
+            if field not in signals:
+                signals[field] = None
+                filled += 1
+    assert filled > 0
+    path = tmp_path / "dataset.json"
+    path.write_text(json.dumps(dataset), encoding="utf-8")
+
+    absent = evaluate_selection().data
+    explicit = evaluate_selection(dataset_path=path).data
+
+    assert explicit["variants"] == absent["variants"]
+    assert explicit["comparison"] == absent["comparison"]
 
 
 @pytest.mark.parametrize("literal", ["NaN", "-Infinity", "1e999"])

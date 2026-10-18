@@ -32,6 +32,22 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- cli: `mms selection replay --dataset` reports a dataset whose evaluator fields are invalid
+  instead of crashing (#1185). The loader checked what it needs for split accounting but
+  not every field the evaluator reads later, so four inputs passed it and then ended in a
+  traceback: a case `profile` that is not an exposure profile (`ValueError`), a candidate
+  with no `name` (`KeyError`), a `tool_expose_in_profiles` or `server_expose_in_profiles`
+  signal that is not a list of profiles (pydantic `ValidationError`), and, on Python 3.12
+  with `--json`, a deeply nested `dataset_id` (`RecursionError` while writing the report).
+  The loader now parses the profile and builds both exposure models the way the evaluator
+  does, and requires `name` and a string `dataset_id`. Each failure is one `Error:` line that
+  quotes no value. A case field error names the case; a candidate field error names the
+  case and the candidate.
+  An absent profile, or an absent or `null` exposure signal, still means the default.
+  **Behavior change**: a non-string `dataset_id` (number, `null`, list, object), which
+  used to be copied into the report, is now rejected. The other inputs used to end in a
+  traceback (exit 1) and now exit 1 with the error line.
+
 - cli: `mms selection replay --dataset` reports a dataset with an integer past the
   interpreter's digit limit, nested too deeply to parse, or holding a non-finite number,
   instead of crashing (#1183, #1186).

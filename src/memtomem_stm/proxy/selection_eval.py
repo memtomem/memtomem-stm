@@ -14,9 +14,12 @@ import json
 import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from functools import partial
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
+
+from pydantic import ValidationError
 
 from memtomem_stm.proxy.config import (
     ExposureConfig,
@@ -181,6 +184,9 @@ def load_selection_dataset(path: Path | str | None = None) -> dict[str, Any]:
         ) from exc
     if not isinstance(data, dict) or data.get("schema_version") != DATASET_SCHEMA_VERSION:
         raise SelectionEvaluationError(f"dataset schema_version must be {DATASET_SCHEMA_VERSION}")
+    # The report embeds it; a deeply nested value fails `to_json` on 3.12.
+    if not isinstance(data.get("dataset_id", ""), str):
+        raise SelectionEvaluationError("dataset_id must be a string")
     cases = data.get("cases")
     if not isinstance(cases, list) or not cases:
         raise SelectionEvaluationError("dataset cases must be a non-empty list")
@@ -200,6 +206,11 @@ def load_selection_dataset(path: Path | str | None = None) -> dict[str, Any]:
             raise SelectionEvaluationError(f"{case_id}: invalid group_id")
         if split not in ("train", "validation", "test"):
             raise SelectionEvaluationError(f"{case_id}: invalid split {split!r}")
+        if "profile" in case:
+            try:
+                ExposureProfile(case["profile"])
+            except ValueError as exc:
+                raise SelectionEvaluationError(f"{case_id}: invalid profile") from exc
         previous = group_splits.setdefault(group_id, split)
         if previous != split:
             raise SelectionEvaluationError(f"group {group_id!r} leaks across splits")
@@ -227,6 +238,19 @@ def load_selection_dataset(path: Path | str | None = None) -> dict[str, Any]:
             signals = candidate.get("signals", {})
             if not isinstance(labels, dict) or not isinstance(signals, dict):
                 raise SelectionEvaluationError(f"{case_id}/{candidate_id}: invalid labels/signals")
+            if "name" not in candidate:
+                raise SelectionEvaluationError(f"{case_id}/{candidate_id}: name is required")
+            # Built by the same models `_candidate_from_fixture` feeds them to.
+            for key, build in (
+                ("tool_expose_in_profiles", ToolOverrideConfig),
+                ("server_expose_in_profiles", partial(UpstreamServerConfig, prefix="fixture")),
+            ):
+                try:
+                    build(expose_in_profiles=signals.get(key))
+                except ValidationError as exc:
+                    raise SelectionEvaluationError(
+                        f"{case_id}/{candidate_id}: {key} must be a list of exposure profiles"
+                    ) from exc
             grade = labels.get("relevance_grade")
             safety = labels.get("safety")
             exposure = labels.get("expected_exposure")
