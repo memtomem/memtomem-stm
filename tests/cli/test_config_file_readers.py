@@ -385,3 +385,95 @@ def test_non_json_runs_keep_their_plain_exit(tmp_path):
     _assert_clean_exit(result)
     assert result.stdout == ""
     assert "Failed to parse" in result.stderr
+
+
+# An integer literal past ``sys.get_int_max_str_digits()`` (4,300 by default):
+# ``json.loads`` raises a plain ``ValueError`` for it, not a ``JSONDecodeError``,
+# so a reader that catches only the latter let it escape (#1179).
+HUGE_INTEGER = '{"upstream_servers": {}, "x": ' + "1" * 5000 + "}"
+_UNPARSABLE_VALUE = "invalid JSON: a value could not be parsed (ValueError)"
+
+
+@pytest.fixture
+def default_digit_limit():
+    """Pin the limit these inputs are sized against: ``PYTHONINTMAXSTRDIGITS``
+    (or ``-X int_max_str_digits``) can disable it or raise it past 5,000, and
+    then the literal parses fine and the tests fail for the wrong reason."""
+    import sys
+
+    previous = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(4300)
+    try:
+        yield
+    finally:
+        sys.set_int_max_str_digits(previous)
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_config_validate_reports_an_integer_past_the_digit_limit(
+    tmp_path, json_output, default_digit_limit
+):
+    path = tmp_path / "proxy.json"
+    path.write_text(HUGE_INTEGER)
+
+    result = CliRunner().invoke(
+        cli, ["config", "validate", "--config", str(path), *(["--json"] if json_output else [])]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit), result.exception
+    if json_output:
+        assert _UNPARSABLE_VALUE in json.loads(result.stdout)["errors"]
+    else:
+        assert f"Error: {_UNPARSABLE_VALUE}" in result.output
+    assert "4300" not in result.output  # the conversion's own text stays out
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_doctor_reports_an_integer_past_the_digit_limit(tmp_path, json_output, default_digit_limit):
+    path = tmp_path / "proxy.json"
+    path.write_text(HUGE_INTEGER)
+
+    result = CliRunner().invoke(
+        cli, ["doctor", "--config", str(path), *(["--json"] if json_output else [])]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit), result.exception
+    if json_output:
+        checks = {c["id"]: c for c in json.loads(result.stdout)["checks"]}
+        assert (checks["config_json"]["status"], checks["config_json"]["detail"]) == (
+            "FAIL",
+            _UNPARSABLE_VALUE,
+        )
+    else:
+        assert _UNPARSABLE_VALUE in result.output
+    assert "4300" not in result.output
+
+
+@pytest.mark.parametrize(
+    ("content", "kind"),
+    [
+        ('{"mcpServers": {}, "x": ' + "1" * 5000 + "}", "ValueError"),
+        ("[" * 100_000, "RecursionError"),
+    ],
+    ids=["digit-limit", "too-deep"],
+)
+def test_mcp_json_registration_aborts_cleanly_on_an_unparsable_value(
+    tmp_path, capsys, content, kind, default_digit_limit
+):
+    """``mms init --client json`` merges into an existing ``.mcp.json``; neither
+    exception is a ``JSONDecodeError``, so both escaped the parse guard."""
+    mcp_path = tmp_path / ".mcp.json"
+    mcp_path.write_text(content)
+    before = mcp_path.read_bytes()
+
+    with pytest.raises(SystemExit) as excinfo:
+        proxy_mod._write_mcp_json_for_stm(tmp_path, "memtomem-stm", [])
+
+    assert excinfo.value.code == 1
+    assert mcp_path.read_bytes() == before
+    err = capsys.readouterr().err
+    assert f"Failed to parse {mcp_path}: {kind}." in err
+    assert "Registration aborted; the file was not modified" in err
+    assert "4300" not in err
