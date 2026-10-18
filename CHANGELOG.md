@@ -32,6 +32,23 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- cli: an OS failure writing a `~/.mms` state file exits cleanly instead of with a
+  traceback (#1181). `registry.toml`, `projects.toml`, `import_state.toml` and a
+  project's `.mms/project.toml` are written by four savers that let the `OSError` from
+  the atomic write escape, so a read-only directory or a full disk ended `mms project
+  init`, `mms project list --prune`, `mms import --apply` and `mms host sync --apply`
+  in an uncaught `PermissionError`. The savers now raise a state error that every
+  `mms project` / `mms host` / `mms import` command already renders: `Error: cannot
+  write <file> (PermissionError); the file was not replaced by this write`, and in
+  `--json` mode (`project list`, `host sync`) the failure document with code
+  `mms_state_write_failed`. When the failing write is the second of two (`project
+  init`'s index after its marker, `import` / `host sync`'s sidecar after the
+  registry), the message adds `; already written: <first file>`. `mms project enable`
+  / `disable` keep their own partial-completion messages (#1161).
+  **Behavior change**: these failures exit 1 with one error line (and one `--json`
+  document where the command has `--json`) instead of a traceback; exit codes are
+  unchanged.
+
 - cli: `mms config validate`, `mms doctor` and the `.mcp.json` merge behind
   `mms init --client json` report a JSON file holding an integer literal past the
   interpreter's digit limit (4,300 digits by default) instead of crashing (#1179, #1182).

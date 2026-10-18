@@ -214,6 +214,11 @@ def _load_index_before_project_change() -> state.ProjectsIndex:
         ) from exc
 
 
+def _failure_kind(exc: BaseException) -> str:
+    """The OS error's type name, also through the saver's ``StateWriteFailed``."""
+    return exc.kind if isinstance(exc, state.StateWriteFailed) else type(exc).__name__
+
+
 def _save_project_change(
     proj: Project, config: state.ProjectConfig, index: state.ProjectsIndex
 ) -> None:
@@ -229,20 +234,22 @@ def _save_project_change(
     assert proj.marker_path is not None
     try:
         state.save_project_config(config, proj.marker_path)
-    except OSError as exc:
+    except (state.StateWriteFailed, OSError) as exc:
         # A durable write may fail after replacement; do not promise rollback.
+        # The saver folds its OSError into StateWriteFailed (#1181); a raw
+        # OSError is still caught for anything that raises it directly.
         raise click.ClickException(
             f"Could not confirm saving project marker {_disp(str(proj.marker_path))}: "
-            f"{type(exc).__name__}. The projects index was not updated. "
+            f"{_failure_kind(exc)}. The projects index was not updated. "
             "Resolve the write error, inspect project settings, and rerun the same command."
         ) from exc
     try:
         state.save_projects_index(updated)
-    except (OSError, UnicodeError) as exc:
+    except (state.StateWriteFailed, OSError, UnicodeError) as exc:
         raise click.ClickException(
             f"Project settings were saved to {_disp(str(proj.marker_path))}, "
             f"but saving projects index {_disp(str(state.projects_index_path()))} "
-            f"could not be confirmed: {type(exc).__name__}. "
+            f"could not be confirmed: {_failure_kind(exc)}. "
             "Resolve the index write error and rerun the same command to refresh it; "
             "project settings have not been rolled back."
         ) from exc
@@ -328,9 +335,14 @@ def init_cmd(path: Path | None, name_opt: str | None, force: bool) -> None:
     # refuses with "already exists" while the project stays unindexed.
     idx = state.load_projects_index()
     state.save_project_config(cfg, marker)
-    state.save_projects_index(
-        state.upsert_project_in_index(idx, name=project_name, path=str(target_root))
-    )
+    try:
+        state.save_projects_index(
+            state.upsert_project_in_index(idx, name=project_name, path=str(target_root))
+        )
+    except state.StateWriteFailed as exc:
+        # The marker landed; say so rather than let the rerun's "already
+        # exists" be the first sign of it (#1181).
+        raise exc.after(marker) from exc
     click.echo(f"Created {_disp(str(marker))}")
     click.echo(f"Indexed in {_disp(str(state.projects_index_path()))}")
 
