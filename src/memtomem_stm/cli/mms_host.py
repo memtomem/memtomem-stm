@@ -1270,7 +1270,13 @@ def sync_cmd(
     new_import_state = state.ImportState(
         schema_version=import_state.schema_version, entries=new_state_entries
     )
-    state.save_import_state(new_import_state)
+    try:
+        state.save_import_state(new_import_state)
+    except state.StateWriteFailed as exc:
+        # Step 1 may already have replaced the registry; name it (#1181).
+        if registry_changed:
+            raise exc.after(state.registry_path()) from exc
+        raise
 
     if json_output:
         _render_sync_json("apply", plan_payload, summary, aborted=False)

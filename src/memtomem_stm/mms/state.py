@@ -161,6 +161,35 @@ class WriteLockTimeout(MmsConfigError):
         self.timeout = timeout
 
 
+class StateWriteFailed(MmsConfigError):
+    """The atomic write of a ``~/.mms`` state file raised an ``OSError`` (#1181).
+
+    Raised by the ``save_*`` helpers below so ``surface_mms_state_errors``,
+    already on every ``mms project`` / ``mms host`` / ``mms import`` command,
+    renders it instead of a traceback. "Not replaced by this write" is a
+    property of ``atomic_write_text``: it renames a finished sibling temp file
+    last, and nothing after the rename raises, so an ``OSError`` out of it
+    means the target is as it was. A command that writes two files reports the
+    one that already landed through ``already_written``. Type only: the OS
+    message quotes the path again (#1166 precedent).
+    """
+
+    def __init__(self, path: Path, kind: str, *, already_written: tuple[Path, ...] = ()) -> None:
+        message = f"cannot write {path} ({kind}); the file was not replaced by this write"
+        if already_written:
+            message += "; already written: " + ", ".join(str(p) for p in already_written)
+        super().__init__(message)
+        self.path = path
+        self.kind = kind
+        self.already_written = already_written
+
+    def after(self, *written: Path) -> StateWriteFailed:
+        """The same failure, reported by a caller that wrote ``written`` first."""
+        return StateWriteFailed(
+            self.path, self.kind, already_written=(*self.already_written, *written)
+        )
+
+
 class WriteLockUnavailable(MmsConfigError):
     """The write lock file could not be created or opened (#1176).
 
@@ -490,10 +519,18 @@ def load_import_state(path: Path | None = None) -> ImportState:
 # ---------------------------------------------------------------------------
 
 
+def _write_state(path: Path, text: str, *, mode: int | None) -> None:
+    """``atomic_write_text`` for a state file, its ``OSError`` as a state error."""
+    try:
+        atomic_write_text(path, text, mode=mode, durable=True)
+    except OSError as exc:
+        raise StateWriteFailed(path, type(exc).__name__) from exc
+
+
 def save_registry(config: RegistryConfig, path: Path | None = None) -> None:
     """Atomically write ``registry.toml`` with mode 0o600 (contains secrets)."""
     p = path or registry_path()
-    atomic_write_text(p, tomli_w.dumps(config.model_dump()), mode=_REGISTRY_MODE, durable=True)
+    _write_state(p, tomli_w.dumps(config.model_dump()), mode=_REGISTRY_MODE)
 
 
 def serialize_projects_index(index: ProjectsIndex) -> str:
@@ -506,20 +543,18 @@ def serialize_projects_index(index: ProjectsIndex) -> str:
 def save_projects_index(index: ProjectsIndex, path: Path | None = None) -> None:
     """Atomically write ``projects.toml`` with mode 0o600 (paths are private)."""
     p = path or projects_index_path()
-    atomic_write_text(p, serialize_projects_index(index), mode=_PROJECTS_INDEX_MODE, durable=True)
+    _write_state(p, serialize_projects_index(index), mode=_PROJECTS_INDEX_MODE)
 
 
 def save_project_config(config: ProjectConfig, path: Path) -> None:
     """Atomically write a per-project ``project.toml`` (committed file, default mode)."""
-    atomic_write_text(
-        path, tomli_w.dumps(config.model_dump()), mode=_PROJECT_FILE_MODE, durable=True
-    )
+    _write_state(path, tomli_w.dumps(config.model_dump()), mode=_PROJECT_FILE_MODE)
 
 
 def save_import_state(state: ImportState, path: Path | None = None) -> None:
     """Atomically write ``import_state.toml`` with mode 0o600."""
     p = path or import_state_path()
-    atomic_write_text(p, tomli_w.dumps(state.model_dump()), mode=_IMPORT_STATE_MODE, durable=True)
+    _write_state(p, tomli_w.dumps(state.model_dump()), mode=_IMPORT_STATE_MODE)
 
 
 # ---------------------------------------------------------------------------

@@ -365,7 +365,13 @@ def import_command(
         schema_version=existing_state.schema_version,
         entries={**existing_state.entries, **new_entries, **backfill_entries},
     )
-    state.save_import_state(merged_state)
+    try:
+        state.save_import_state(merged_state)
+    except state.StateWriteFailed as exc:
+        # The registry may already have landed above; name it (#1181).
+        if new:
+            raise exc.after(state.registry_path()) from exc
+        raise
 
     click.echo("")
     if new:

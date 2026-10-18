@@ -62,6 +62,8 @@ def _error_code(exc: state.MmsConfigError) -> str:
         return "mms_lock_timeout"
     if isinstance(exc, state.WriteLockUnavailable):
         return "mms_lock_unavailable"
+    if isinstance(exc, state.StateWriteFailed):
+        return "mms_state_write_failed"
     if isinstance(exc, state.SchemaVersionMismatch):
         return "mms_schema_mismatch"
     return "mms_state_invalid"

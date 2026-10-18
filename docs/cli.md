@@ -1143,8 +1143,9 @@ With `--json`, stdout carries one document: `{"action": "route", "ok": true, "mo
 `path`), the config-file codes `config_unreadable` / `config_invalid` /
 `config_lock_timeout` / `config_lock_unavailable` / `config_write_failed` (the backup
 or the write failed and left the file as it was; carries `path`), or an `mms_*`
-state code for a corrupt `~/.mms` file or a `~/.mms` lock that cannot be opened
-(`mms_lock_unavailable`).
+state code for a corrupt `~/.mms` file, a `~/.mms` lock that cannot be opened
+(`mms_lock_unavailable`), or a `~/.mms` state file that cannot be written
+(`mms_state_write_failed`).
 
 ## `mms import` — populate the registry from host configs
 
