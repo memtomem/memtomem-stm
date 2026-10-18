@@ -33,7 +33,7 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - cli: an OS failure writing a `~/.mms` state file exits cleanly instead of with a
-  traceback (#1181). `registry.toml`, `projects.toml`, `import_state.toml` and a
+  traceback (#1181, #1184). `registry.toml`, `projects.toml`, `import_state.toml` and a
   project's `.mms/project.toml` are written by four savers that let the `OSError` from
   the atomic write escape, so a read-only directory or a full disk ended `mms project
   init`, `mms project list --prune`, `mms import --apply` and `mms host sync --apply`
