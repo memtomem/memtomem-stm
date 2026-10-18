@@ -41,8 +41,9 @@ changes inline only. See the deprecation policy in
   - `mms selection replay` prints its `Error:` line on stderr only, leaving
     stdout empty under `--json`. It now also exits 1 on a broken `--config`
     or an invalid `MEMTOMEM_STM_PROXY` / `MEMTOMEM_STM_PROXY__*` override,
-    where it used to exit 0 with a report computed on defaults (repair or
-    unset the override), and rejects a non-string `dataset_id` that it used
+    where it used to exit 0 with a report anyway, on defaults for a broken
+    file or with the override ignored (repair or unset the override), and
+    rejects a non-string `dataset_id` that it used
     to copy into the report;
   - `mms host status` / `scan` exit 1 on unreadable state;
   - import discovery skips an undecodable Codex config and `mms hook install`
@@ -52,8 +53,7 @@ changes inline only. See the deprecation policy in
   `explain`, `tune` and `project route` used to leave stdout empty on many
   failures; they now print `{"action", "ok": false, "error", "message"}`.
   A script that read an empty stdout as the failure signal should branch on
-  `ok` / `error`. `remove`, `prune` and `eject` report a broken config with
-  exit 1 instead of `confirmation_required` (exit 2). `tune --json` with no
+  `ok` / `error`; exit codes are unchanged. `tune --json` with no
   metrics database prints its note on stderr instead of stdout.
 - **Projects index checks are stricter** (#1156, #1161, #1162). A directory
   or other non-regular `~/.mms/projects.toml` is an error instead of an empty
@@ -65,8 +65,9 @@ changes inline only. See the deprecation policy in
   index on an inaccessible or invalid project.
 - **Control and bidi characters in displayed values print as `\uXXXX`**
   (#1167, #1172, #1177). This covers config key names, operator-supplied
-  paths, ids and filters, and logged tracebacks; `--json` documents keep the
-  raw text. Ordinary values are unchanged. The server's early-failure
+  paths, ids and filters, and logged tracebacks (a newline injected into a
+  traceback's location still splits it across lines); `--json` documents
+  keep the raw text. Ordinary values are unchanged. The server's early-failure
   traceback is plain `LEVEL name: message` text instead of Rich's panel, and
   is printed once.
 - **Progressive entries honor their stored TTL** (#1157). Expired or malformed
@@ -77,7 +78,10 @@ changes inline only. See the deprecation policy in
   Text with an address such as `--@example.com` or `jöe@bar.com` now counts as
   sensitive in every check that uses the default patterns: the response is
   not cached or indexed, extracted facts from it are not stored, and a
-  surfacing query holding one is digested before the LTM search. The first start after upgrading runs
+  surfacing query holding one is digested before the LTM search.
+  `mms selection replay` refuses a `--dataset` that contains such an address
+  (`dataset matched sensitive-content patterns`, exit 1), where 0.6.3 ran it;
+  remove the address from the dataset. The first start after upgrading runs
   the response cache's one-time privacy repair sweep, which takes time
   proportional to the cache's size.
 - **Gateway errors and the webhook query hide values** (#1141). `mms gateway
@@ -480,8 +484,8 @@ changes inline only. See the deprecation policy in
   the same sentence as the stderr line, which names the path and the error
   type, never the file's content.
   `remove`, `prune` and `eject` read the config before they check `--yes`, so
-  a broken file is reported with exit 1 rather than as
-  `confirmation_required` with exit 2. The other `--json` failures that still
+  a broken file gets the document rather than `confirmation_required`; they
+  exited 1 on such a file on 0.6.3 as well. The other `--json` failures that still
   print no document (`tune`'s missing file and failed validation, and the
   `gateway` and `project route` command errors) were #1138, fixed by #1175
   above (#1099, #1140).
