@@ -3178,7 +3178,9 @@ def add(
             sys.exit(1)
         tools_reachable = probe.tools
         if not as_json:
-            click.echo(f"{_ok('Validated:')} {probe.tools} tool(s) reachable.")
+            click.echo(
+                f"{_ok('Validated:')} {probe.tools} tool(s) reachable{probe.nonconforming_note}."
+            )
 
     servers[name] = entry
     _save(path, data)
@@ -5385,7 +5387,10 @@ def _add_from_clients(
             rows_by_name[n]["reachable"] = probe.connected
             rows_by_name[n]["tools_reachable"] = probe.tools if probe.connected else None
             if probe.connected:
-                info(f"  {_ok('Reachable:')} {_disp(n)} — {probe.tools} tool(s).")
+                info(
+                    f"  {_ok('Reachable:')} {_disp(n)} — {probe.tools} tool(s)"
+                    f"{probe.nonconforming_note}."
+                )
             else:
                 failed_probes.append((n, probe))
                 # One message string for both surfaces so the stderr wording
@@ -5884,7 +5889,10 @@ def init(
         probes = asyncio.run(_probe_servers(probe_map, 10))
         for n, probe in probes.items():
             if probe.connected:
-                click.echo(f"  {_ok('Reachable:')} {_disp(n)} — {probe.tools} tool(s).")
+                click.echo(
+                    f"  {_ok('Reachable:')} {_disp(n)} — {probe.tools} tool(s)"
+                    f"{probe.nonconforming_note}."
+                )
             else:
                 click.echo(
                     f"  {_warn('Warning:')} {_disp(n)} — probe failed: {_disp(probe.error or '')}",
@@ -8113,6 +8121,7 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
     transport = str(cfg.get("transport", "stdio"))
     stage = ProbeStage.CONFIGURED
     tools = 0
+    nonconforming_tools = 0
     overflowing: tuple[str, ...] = ()
     description_chars: tuple[tuple[str, int], ...] = ()
     schema_description_tools: tuple[str, ...] = ()
@@ -8159,9 +8168,13 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
                 stage = ProbeStage.MCP_INITIALIZED
                 result = await asyncio.wait_for(session.list_tools(), timeout=remaining())
                 prefix = cfg.get("prefix", "")
-                tools = len(result.tools)
+                # The proxy's ingest rule (#1090): a tool named outside the MCP
+                # grammar is counted and dropped before any per-tool field
+                # below can carry its name into a report.
+                listed, nonconforming_tools = tool_name_budget.conforming_tools(result.tools)
+                tools = len(listed)
                 overflowing = tuple(
-                    t.name for t in result.tools if tool_name_budget.overflows(prefix, t.name)
+                    t.name for t in listed if tool_name_budget.overflows(prefix, t.name)
                 )
                 # Same shape as the name-overflow line above: an advertisement
                 # rule applied here, where the text exists, so nothing
@@ -8181,11 +8194,11 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
                             )
                         ),
                     )
-                    for t in result.tools
+                    for t in listed
                 )
                 schema_description_tools = tuple(
                     t.name
-                    for t in result.tools
+                    for t in listed
                     if distill_schema(getattr(t, "input_schema", None) or {}, True)
                     != (getattr(t, "input_schema", None) or {})
                 )
@@ -8207,6 +8220,7 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
                 stage=stage,
                 transport=transport,
                 tools=tools,
+                nonconforming_tools=nonconforming_tools,
                 overflowing=overflowing,
                 description_chars=description_chars,
                 schema_description_tools=schema_description_tools,
@@ -8226,6 +8240,7 @@ async def _probe_one(cfg: dict[str, Any], timeout: float) -> StagedProbeResult:
         stage=stage,
         transport=transport,
         tools=tools,
+        nonconforming_tools=nonconforming_tools,
         overflowing=overflowing,
         description_chars=description_chars,
         schema_description_tools=schema_description_tools,
@@ -9137,7 +9152,9 @@ def health(
     click.echo("=" * 30)
     for name, info in results.items():
         if info.connected:
-            click.echo(f"  {_disp(name)}: {_ok('connected')} ({info.tools} tools)")
+            click.echo(
+                f"  {_disp(name)}: {_ok('connected')} ({info.tools} tools{info.nonconforming_note})"
+            )
             if show_names:
                 if info.overflowing:
                     click.echo(
@@ -10007,6 +10024,20 @@ def doctor(
                 results = asyncio.run(_probe_servers(servers, timeout))
                 servers_payload = {n: r.as_dict() for n, r in results.items()}
                 for n, r in results.items():
+                    if r.connected and r.nonconforming_tools:
+                        # Reachable, but the proxy refuses some of what it lists
+                        # (#1090); a WARN is where an operator looks for why a
+                        # tool is missing. Count only — the names are the
+                        # untrusted text the refusal keeps out of reports.
+                        check(
+                            f"upstream:{n}",
+                            f"upstream: {n}",
+                            "WARN",
+                            f"{r.tools} tool(s){r.nonconforming_note}",
+                            "ask the upstream's maintainer to rename those tools; "
+                            "STM does not proxy them",
+                        )
+                        continue
                     if r.connected:
                         check(f"upstream:{n}", f"upstream: {n}", "PASS", f"{r.tools} tool(s)")
                         continue

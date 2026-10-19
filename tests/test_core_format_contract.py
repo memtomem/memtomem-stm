@@ -497,6 +497,24 @@ class TestStructuredScoreScale:
         results, _ = StructuredResultParser().parse(payload)
         assert results[0].score_scale == "rrf2"
 
+    def test_unknown_scale_label_is_kept_but_not_logged(self, caplog):
+        """#1090: the label is stored verbatim for telemetry, but Core's text
+        does not reach the log line that notes it."""
+        import logging
+
+        from memtomem_stm.surfacing.mcp_client import StructuredResultParser
+
+        payload = (
+            '{"score_scale": "evil\\u001b[31m", "results": ['
+            '{"rank": 1, "score": 0.9, "source": "a.md", "namespace": "default",'
+            ' "content": "body"}]}'
+        )
+        with caplog.at_level(logging.DEBUG, logger="memtomem_stm.surfacing.mcp_client"):
+            results, _ = StructuredResultParser().parse(payload)
+        assert results[0].score_scale == "evil\x1b[31m"
+        assert "unrecognized score_scale label" in caplog.text
+        assert "evil" not in caplog.text
+
     def test_compact_parser_never_stamps_scale(self):
         from memtomem_stm.surfacing.mcp_client import CompactResultParser
 

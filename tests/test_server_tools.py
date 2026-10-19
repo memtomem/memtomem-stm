@@ -1176,11 +1176,18 @@ class TestSurfacingStats:
         ctx = _make_ctx(feedback_tracker=mock_tracker, surfacing_engine=mock_engine)
 
         result = await stm_surfacing_stats(ctx=ctx)
-        assert "Score scale:     rerank (core-reported; reranker: fake-rr)" in result
+        assert "Score scale:     rerank (core-reported; reranker reported)" in result
+        assert "fake-rr" not in result
 
         snapshot["score_scale"] = {"last_reported": "rrf", "reranker": None}
         result = await stm_surfacing_stats(ctx=ctx)
         assert "Score scale:     rrf (core-reported)" in result
+
+        # #1090: a label STM does not know is Core's text, not shown.
+        snapshot["score_scale"] = {"last_reported": "evil\x1b[31m", "reranker": None}
+        result = await stm_surfacing_stats(ctx=ctx)
+        assert "Score scale:     unrecognized (core-reported)" in result
+        assert "evil" not in result
 
     async def test_score_scale_line_annotates_suspended_filter(self):
         """Scale gate: when the engine snapshot says the last-reported scale
@@ -1215,7 +1222,7 @@ class TestSurfacingStats:
 
         result = await stm_surfacing_stats(ctx=ctx)
         assert (
-            "Score scale:     rerank (core-reported; reranker: fake-rr; "
+            "Score scale:     rerank (core-reported; reranker reported; "
             "min_score filter suspended for unpinned tools)" in result
         )
 

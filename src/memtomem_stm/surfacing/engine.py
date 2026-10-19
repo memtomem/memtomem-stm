@@ -38,6 +38,7 @@ from memtomem_stm.surfacing.formatter import RenderManifest, SurfacingFormatter
 from memtomem_stm.surfacing.grams import eligible_source
 from memtomem_stm.surfacing.mcp_client import (
     KNOWN_SCORE_SCALES,
+    render_score_scale,
     LtmCapabilities,
     LtmTransportError,
     SearchOutcome,
@@ -1374,7 +1375,8 @@ class SurfacingEngine:
                     server,
                     tool,
                     scale,
-                    f" (reranker={reranker})" if reranker else "",
+                    # Presence only: the model ID is Core's text (#1090).
+                    " (reranker reported)" if reranker else "",
                     min_score,
                     result_max,
                     remedy,
@@ -3035,7 +3037,7 @@ class SurfacingEngine:
                         "query": self._persistable_query(query),
                         "memory_ids": delivered_ids,
                         "scores": [r.score for r in relevant if str(r.chunk.id) in delivered_set],
-                        "score_scale": score_scale,
+                        "score_scale": render_score_scale(score_scale),
                         "surfacing_id": surfacing_id,
                     },
                 )

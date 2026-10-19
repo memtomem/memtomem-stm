@@ -23,6 +23,24 @@ changes inline only. See the deprecation policy in
   one of STM's fixed decisions and ratings nor `error:` followed by an ASCII
   identifier is counted under a new `other` key instead of under its own text.
   Totals are unchanged.
+- **Upstream tool names and Core score-scale labels are checked before they
+  are shown** (#1090).
+  An upstream's tool names reached log lines, MCP responses, LTM frontmatter,
+  telemetry and the MCP SDK's own registration warning as listed. Core's
+  `score_scale` label reached logs, `stm_surfacing_stats` and the surfacing
+  webhook as sent, and its `reranker` model ID a WARNING and
+  `stm_surfacing_stats`. **Behavior change**: a tool whose name falls
+  outside the MCP tool-name grammar (`[A-Za-z0-9._-]`, 1–128 characters) is
+  no longer proxied. It is counted, never named: in a WARNING each time the
+  upstream connects or re-lists its tools, in
+  `stm_proxy_health` (still part of "N tools discovered", plus a line giving
+  the count), as `nonconforming_tools` in `mms health --json` and `mms doctor
+  --json`, and as a doctor WARN for that upstream. **Behavior change**: a
+  `score_scale` STM does not know is shown as `unrecognized`, both in the
+  webhook payload and in the `stm_surfacing_stats` "Score scale" and "Score
+  scales" lines. A literal `unknown` from Core is counted there too, no
+  longer merged with events Core did not label. The reranker model ID is
+  shown only as `reranker reported`. Stored values are unchanged.
 
 ## [0.6.4] — 2026-10-18
 

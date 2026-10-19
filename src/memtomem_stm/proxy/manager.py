@@ -17,7 +17,7 @@ import uuid
 from collections import Counter
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
-from collections.abc import Awaitable, Callable, Collection, Coroutine, Mapping
+from collections.abc import Awaitable, Callable, Collection, Coroutine, Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -575,6 +575,10 @@ class UpstreamConnection:
     # clears it. Lives on the connection for the same stable-identity reason
     # as the lock/generation/breaker.
     last_failed_connection_fp: tuple[Any, ...] | None = None
+    # How many tools the upstream's latest ``tools/list`` named outside the MCP
+    # tool-name grammar (#1090). They never enter ``tools``; the count is what
+    # lets health tell a refused tool from one the upstream never listed.
+    nonconforming_tools: int = 0
 
 
 def _connection_fingerprint(cfg: UpstreamServerConfig) -> tuple[Any, ...]:
@@ -1770,8 +1774,8 @@ class ProxyManager:
         ref_to_keys, refs = self._build_toolgraph_candidates(cfg)
         if not refs:
             logger.info(
-                "Tool-graph provider enabled but no upstream tools were discovered "
-                "— consult skipped"
+                "Tool-graph provider enabled but no grammar-conforming upstream tools "
+                "were discovered — consult skipped"
             )
             # A successful consult of nothing still covers nothing, which is a
             # different statement from "no consult happened" (#918). Leaving
@@ -2368,6 +2372,29 @@ class ProxyManager:
         # so every retry sees the same outcome instead of a fresh empty unwind.
         await asyncio.shield(task)
 
+    @staticmethod
+    def _ingest_tool_listing(name: str, tools: Iterable[Any]) -> tuple[list[Any], int]:
+        """Keep only the listed tools whose names match the MCP tool-name grammar.
+
+        Every catalogue STM publishes into ``conn.tools`` — connect, reconnect
+        and ``tools/list_changed`` — passes through here, so a tool name read
+        out of the catalogue (into log lines, MCP responses, LTM frontmatter,
+        telemetry, the SDK's own registration warning) is a conforming one
+        (#1090). That does not reach text an upstream puts in a tool *result*,
+        or names an older STM already persisted. A refused tool is counted,
+        never named: its name is exactly the untrusted text the check keeps
+        out of the output.
+        """
+        kept, refused = tool_name_budget.conforming_tools(tools)
+        if refused:
+            logger.warning(
+                "Upstream '%s' listed %d tool(s) whose names are outside the MCP "
+                "tool-name grammar ([A-Za-z0-9._-], 1-128 chars); they are not proxied",
+                name,
+                refused,
+            )
+        return kept, refused
+
     async def _connect_server(self, name: str, cfg: UpstreamServerConfig) -> None:
         if self._stack is None:
             raise RuntimeError("ProxyManager.start() not called")
@@ -2386,6 +2413,7 @@ class ProxyManager:
             return
 
         session, owner, tools = await self._establish_connection(name, cfg)
+        tools, nonconforming = self._ingest_tool_listing(name, tools)
 
         # #261 operator guidance, logged at discovery where the config
         # context is at hand. The tool itself stays in ``conn.tools``: the
@@ -2429,6 +2457,7 @@ class ProxyManager:
             tools=tools,
             owner=owner,
             breaker=breaker,
+            nonconforming_tools=nonconforming,
         )
         self._tool_catalog_revision += 1
         # A successful connect clears any prior startup-failure record (#580).
@@ -2651,6 +2680,7 @@ class ProxyManager:
             # swap and later unwinds its contexts itself; no completed request
             # task leaves an AnyIO cancel scope for another task to close.
             session, owner, tools = await self._establish_connection(name, cfg)
+            tools, nonconforming = self._ingest_tool_listing(name, tools)
 
             old_owner = conn.owner
             old_stack = conn.stack
@@ -2668,6 +2698,7 @@ class ProxyManager:
             conn.stack = None
             conn.stack_close = None
             conn.tools = tools
+            conn.nonconforming_tools = nonconforming
             self._tool_catalog_revision += 1
             # ``prefix`` composes the client-visible tool name, which is the
             # handle registration ownership is keyed on (#891/#908) and which
@@ -2836,11 +2867,12 @@ class ProxyManager:
             return
         cfg_snap = self._config
         old_names = {n for t in conn.tools if (n := getattr(t, "name", None)) is not None}
-        new_tools = list(result.tools)
+        new_tools, nonconforming = self._ingest_tool_listing(name, result.tools)
         new_names = {t.name for t in new_tools}
         all_names = old_names | new_names
         was_eligible = {t: self._tool_cache_eligible(name, t, cfg_snap=cfg_snap) for t in all_names}
         conn.tools = new_tools
+        conn.nonconforming_tools = nonconforming
         self._tool_catalog_revision += 1
         stale = [
             t
@@ -5174,9 +5206,12 @@ class ProxyManager:
         """Return per-server health: connection status, tool counts.
 
         ``tools`` counts the DISCOVERED catalogue (everything the upstream
-        listed — since #465 ``conn.tools`` is no longer pre-filtered at
-        connect time); ``advertised_tools`` counts how many of them are
-        exposed, so operators can tell a withheld tool from a missing one. It
+        listed whose name matches the MCP tool-name grammar — #465 removed the
+        connect-time exposure skip, and only the grammar check of #1090 sits in
+        front of ``conn.tools``); ``nonconforming_tools`` counts the listed
+        tools that check refused, so the full listing is ``tools +
+        nonconforming_tools``. ``advertised_tools`` counts how many of ``tools``
+        are exposed, so operators can tell a withheld tool from a missing one. It
         reflects the most recent ``get_proxy_tools()`` pass — in the server that
         is startup registration, plus any re-advertisement a catalogue change
         triggered (#917), so both counts move together instead of ``tools``
@@ -5196,6 +5231,7 @@ class ProxyManager:
             health[name] = {
                 "connected": conn.session is not None,
                 "tools": len(conn.tools),
+                "nonconforming_tools": conn.nonconforming_tools,
                 "advertised_tools": sum(
                     1 for info in self._advertised_infos if info.server == name
                 ),
@@ -5215,6 +5251,7 @@ class ProxyManager:
             health[name] = {
                 "connected": False,
                 "tools": 0,
+                "nonconforming_tools": 0,
                 "advertised_tools": 0,
                 "error": error,
             }

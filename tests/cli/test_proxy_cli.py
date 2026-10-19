@@ -15816,6 +15816,46 @@ asyncio.run(main())
         assert "overflow" in result.output.lower()
         assert "query_docs_filesystem_docs_by_lang_chain" in result.output
 
+    def test_refused_tool_names_are_counted_without_names_flag(
+        self, runner, config, monkeypatch
+    ):
+        """#1090: tools named outside the MCP grammar are not proxied. The
+        count is part of the plain report (an operator should not need a flag
+        to learn why a tool is missing), in text and in ``--json``."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        config.write_text(
+            json.dumps(
+                {
+                    "upstream_servers": {
+                        "docs": {"prefix": "docs", "transport": "stdio", "command": "x"}
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        async def fake_probe_servers(servers, timeout):
+            return {
+                "docs": StagedProbeResult(
+                    stage=ProbeStage.TOOLS_DISCOVERED, tools=0, nonconforming_tools=2
+                )
+            }
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+
+        result = runner.invoke(cli, ["health", *_cfg_args(config)])
+        assert result.exit_code == 0
+        assert (
+            "docs: connected (0 tools; 2 more not proxied: name outside the MCP "
+            "tool-name grammar)"
+        ) in result.output
+
+        result = runner.invoke(cli, ["health", "--json", *_cfg_args(config)])
+        payload = json.loads(result.output)
+        assert payload["servers"]["docs"]["tools"] == 0
+        assert payload["servers"]["docs"]["nonconforming_tools"] == 2
+
     def test_names_flag_says_all_fit_when_clean(self, runner, config, monkeypatch):
         """When no tool overflows, ``--names`` confirms positively (lets
         the user distinguish 'clean check ran' from 'flag was a no-op')."""
@@ -16146,6 +16186,65 @@ class TestDoctor:
         # Advisory only: a WARN-only run still exits 0.
         assert result.exit_code == 0, result.output
 
+    def test_upstream_with_refused_tool_names_warns_by_count(self, runner, config, monkeypatch):
+        """#1090: tools named outside the MCP grammar are not proxied. Doctor
+        is where an operator looks for a missing tool, so a reachable upstream
+        that lists some WARNs (exit 0) and gives the count, never a name."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        async def fake_probe_servers(servers, timeout):
+            return {
+                n: StagedProbeResult(
+                    stage=ProbeStage.TOOLS_DISCOVERED, tools=1, nonconforming_tools=3
+                )
+                for n in servers
+            }
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        self._healthy_config(config)
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+        check = self._check_by_id(result, "upstream:fake")
+        assert check is not None
+        assert check["status"] == "WARN"
+        assert check["detail"] == (
+            "1 tool(s); 3 more not proxied: name outside the MCP tool-name grammar"
+        )
+        assert check["next_action"]
+        payload = json.loads(result.output)
+        assert payload["servers"]["fake"]["nonconforming_tools"] == 3
+        assert payload["servers"]["fake"]["tools"] == 1
+        assert result.exit_code == 0, result.output
+
+    def test_upstream_whose_every_tool_is_refused_still_warns_by_count(
+        self, runner, config, monkeypatch
+    ):
+        """#1090: zero conforming tools is not "advertises nothing" — the
+        upstream listed tools and the proxy refused all of them."""
+        from memtomem_stm.cli import proxy as proxy_mod
+
+        async def fake_probe_servers(servers, timeout):
+            return {
+                n: StagedProbeResult(
+                    stage=ProbeStage.TOOLS_DISCOVERED, tools=0, nonconforming_tools=2
+                )
+                for n in servers
+            }
+
+        monkeypatch.setattr(proxy_mod, "_probe_servers", fake_probe_servers)
+        self._healthy_config(config)
+
+        result = runner.invoke(cli, ["doctor", "--json", *_cfg_args(config)])
+        check = self._check_by_id(result, "upstream:fake")
+        assert check is not None
+        assert check["status"] == "WARN"
+        assert check["detail"] == (
+            "0 tool(s); 2 more not proxied: name outside the MCP tool-name grammar"
+        )
+
+        result = runner.invoke(cli, ["doctor", *_cfg_args(config)])
+        assert "2 more not proxied: name outside the MCP tool-name grammar" in result.output
+
     def test_description_budget_passes_by_default_without_leaking_text(
         self, runner, config, monkeypatch
     ):
@@ -16167,6 +16266,7 @@ class TestDoctor:
         assert set(payload["servers"]["fake"]) == {
             "connected",
             "tools",
+            "nonconforming_tools",
             "overflowing",
             "error",
             "stage",

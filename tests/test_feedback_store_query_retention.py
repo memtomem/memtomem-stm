@@ -337,6 +337,30 @@ class TestScoreScaleColumn:
         finally:
             store.close()
 
+    def test_get_stats_counts_labels_stm_does_not_know_as_unrecognized(
+        self, tmp_path: Path
+    ) -> None:
+        """#1090: a label Core sent that is not in ``KNOWN_SCORE_SCALES`` is
+        Core's text, so the distribution counts it instead of showing it. A
+        literal ``"unknown"`` from Core is reported-but-unrecognized and must
+        not merge with the NULL rows' ``"unknown"`` (not reported)."""
+        store = FeedbackStore(tmp_path / "fb.db")
+        store.initialize()
+        try:
+            store.record_surfacing("e1", "s", "t", "q1", ["m1"], [0.5], score_scale="rrf")
+            store.record_surfacing("e2", "s", "t", "q2", ["m2"], [0.5], score_scale="evil\x1b[31m")
+            store.record_surfacing("e3", "s", "t", "q3", ["m3"], [0.5], score_scale="\u202ex")
+            store.record_surfacing("e4", "s", "t", "q4", ["m4"], [0.5], score_scale="unknown")
+            store.record_surfacing("e5", "s", "t", "q5", ["m5"], [0.5])
+            stats = store.get_stats(limit=5)
+            assert stats["score_scale_distribution"] == {
+                "rrf": 1,
+                "unrecognized": 3,
+                "unknown": 1,
+            }
+        finally:
+            store.close()
+
     def test_empty_stats_shape_includes_scale_distribution(self, tmp_path: Path) -> None:
         store = FeedbackStore(tmp_path / "fb.db")
         store.initialize()

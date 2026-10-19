@@ -121,6 +121,8 @@ def _unmeasured_reason(probe: StagedProbeResult | None, name: str) -> str:
         stage = probe.failed_stage
         reached = f" — failed at '{stage.display()}'" if stage is not None else ""
         return f"tool discovery did not complete{reached}; see upstream: {name}"
+    if not probe.tools and probe.nonconforming_tools:
+        return "every tool this upstream lists is named outside the MCP tool-name grammar"
     if not probe.tools:
         return "this upstream advertises no tools"
     return "the probe reported no per-tool description lengths"
