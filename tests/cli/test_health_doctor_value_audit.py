@@ -1029,6 +1029,40 @@ def test_stats_db_errors_name_only_type_and_code(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("command", "as_json"),
+    [("stats", False), ("stats", True), ("health", True), ("doctor", True)],
+    ids=["stats-text", "stats-json", "health-json", "doctor-json"],
+)
+def test_stored_decisions_and_ratings_outside_stm_vocabulary_are_folded(
+    tmp_path, monkeypatch, command, as_json
+):
+    """``mms stats`` prints both maps; health and doctor carry them in
+    ``feedback_summary`` (#1091)."""
+    from helpers import FOREIGN_FEEDBACK_CANARIES, seed_foreign_feedback_vocabulary
+
+    feedback = tmp_path / "feedback.db"
+    seed_foreign_feedback_vocabulary(feedback)
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "false")
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__FEEDBACK_DB_PATH", str(feedback))
+    config = tmp_path / "stm_proxy.json"
+    config.write_text(json.dumps({"upstream_servers": {}}))
+    extra = ["--json"] if as_json else []
+    timeout = [] if command == "stats" else ["--timeout", "3"]
+    output = _run([command, "--config", str(config), *timeout, *extra])
+
+    # Positive controls: the foreign rows were read and counted.
+    if as_json:
+        data = json.loads(output)
+        summary = data["surfacing"] if command == "stats" else data["surfacing"]["feedback_summary"]
+        assert summary["opportunity_decisions"]["other"] == 4
+        assert summary["rating_distribution"]["other"] == 2
+    else:
+        assert "by decision: other 4, " in output
+        assert "    other                2" in output
+    _assert_clean(output, FOREIGN_FEEDBACK_CANARIES, as_json=as_json)
+
+
+@pytest.mark.parametrize(
     ("module", "reader"),
     [
         ("memtomem_stm.surfacing.feedback_store", "inspect_feedback_db"),

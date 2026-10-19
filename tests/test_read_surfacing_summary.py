@@ -11,6 +11,9 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
+
+from helpers import seed_foreign_feedback_vocabulary
 from memtomem_stm.surfacing.feedback_store import FeedbackStore, read_surfacing_summary
 
 
@@ -81,3 +84,79 @@ class TestReadSurfacingSummary:
         read_surfacing_summary(db_path)
 
         assert db_path.stat().st_mtime_ns == before
+
+
+class TestForeignVocabulary:
+    """Stored decisions and ratings STM never writes are counted, not shown (#1091)."""
+
+    DECISIONS = {
+        "surfaced": 1,
+        "skip:gate_cooldown": 1,
+        "error:timeout": 1,
+        "error:TimeoutError": 1,
+        "other": 4,
+    }
+    RATINGS = {"helpful": 1, "not_relevant": 1, "other": 2}
+
+    def test_offline_summary_folds_foreign_values(self, tmp_path):
+        db_path = tmp_path / "feedback.db"
+        seed_foreign_feedback_vocabulary(db_path)
+
+        summary = read_surfacing_summary(db_path)
+
+        assert summary["opportunity_decisions"] == self.DECISIONS
+        assert summary["opportunities_total"] == 8
+        assert summary["rating_distribution"] == self.RATINGS
+        assert summary["total_feedback"] == 4
+
+    def test_live_stats_fold_foreign_values(self, tmp_path):
+        db_path = tmp_path / "feedback.db"
+        seed_foreign_feedback_vocabulary(db_path)
+        store = FeedbackStore(db_path)
+        store.initialize()
+        try:
+            stats = store.get_stats()
+        finally:
+            store.close()
+
+        assert stats["opportunity_decisions"] == self.DECISIONS
+        assert stats["opportunities_total"] == 8
+        assert stats["rating_distribution"] == self.RATINGS
+        assert stats["total_feedback"] == 4
+
+    def test_every_value_stm_writes_is_kept(self):
+        """Drift guard: a new skip reason, outcome or rating is recognized
+        without editing the reader, as is an ASCII exception-type label."""
+        from typing import get_args
+
+        from memtomem_stm.surfacing import feedback_store
+        from memtomem_stm.surfacing.engine import _OUTCOME_LABELS, _skip_label
+        from memtomem_stm.surfacing.feedback import VALID_RATINGS
+        from memtomem_stm.surfacing.observability import SkipReason
+
+        written = {
+            *_OUTCOME_LABELS.values(),
+            *(_skip_label(reason) for reason in get_args(SkipReason)),
+            f"error:{TimeoutError.__name__}",
+            f"error:{BaseExceptionGroup.__name__}",
+        }
+        assert len(written) > 20
+        assert [d for d in written if not feedback_store._known_gate_decision(d)] == []
+        assert [r for r in VALID_RATINGS if not feedback_store._known_rating(r)] == []
+        assert not feedback_store._known_gate_decision(feedback_store._UNRECOGNIZED)
+        assert not feedback_store._known_rating(feedback_store._UNRECOGNIZED)
+
+
+def test_load_hmac_key_open_failure_names_the_type_not_the_message(tmp_path, monkeypatch):
+    from memtomem_stm.surfacing import feedback_store
+
+    db_path = tmp_path / "feedback.db"
+    seed_foreign_feedback_vocabulary(db_path)
+
+    def failing_connect(*args, **kwargs):
+        raise sqlite3.OperationalError("unable to open cnrySchemaText")
+
+    monkeypatch.setattr(feedback_store.sqlite3, "connect", failing_connect)
+    with pytest.raises(RuntimeError) as info:
+        feedback_store.load_hmac_key(db_path)
+    assert str(info.value) == "cannot open surfacing feedback DB: OperationalError"

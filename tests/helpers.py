@@ -140,3 +140,63 @@ def wire_proxy_manager(
         cache.initialize()
         mgr._cache = cache
     return mgr, store, cache
+
+
+FOREIGN_FEEDBACK_CANARIES = ("cnryDecision", "cnryRating", "cnryErrorTail", "\x1b")
+
+
+def seed_foreign_feedback_vocabulary(db_path: Path) -> None:
+    """A feedback DB whose ``gate_decision`` / ``rating`` columns hold, next to
+    STM's own values, values STM never writes (a foreign or corrupted file):
+    4 folded decisions (one a non-ASCII exception name) and 2 foreign ratings
+    (#1091)."""
+    import sqlite3
+
+    from memtomem_stm.surfacing.feedback_store import FeedbackStore
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    store = FeedbackStore(db_path)
+    store.initialize()
+    try:
+        store.record_surfacing("s1", "c7", "query-docs", "q", ["m1"], [0.9])
+        store.record_feedback("s1", "helpful", "m1")
+    finally:
+        store.close()
+    db = sqlite3.connect(db_path)
+    try:
+        columns = [row[1] for row in db.execute("PRAGMA table_info('surfacing_opportunities')")]
+        decisions = [
+            "surfaced",
+            "skip:gate_cooldown",
+            "error:timeout",
+            "error:TimeoutError",
+            "cnryDecision\x1b[31m",
+            "error:cnry cnryErrorTail",
+            "error:\u00c9chec",
+            "skip:cnryDecision",
+        ]
+        for i, decision in enumerate(decisions):
+            row = dict.fromkeys(columns)
+            row.update(
+                id=f"o{i}",
+                server="c7",
+                tool="query-docs",
+                arg_shape_json="{}",
+                response_len=1,
+                gate_decision=decision,
+                created_at=1.0,
+            )
+            db.execute(
+                f"INSERT INTO surfacing_opportunities ({', '.join(row)}) "
+                f"VALUES ({', '.join('?' * len(row))})",
+                list(row.values()),
+            )
+        for rating in ("not_relevant", "cnryRating\x1b[2J", "HELPFUL"):
+            db.execute(
+                "INSERT INTO surfacing_feedback (surfacing_id, memory_id, rating, created_at) "
+                "VALUES ('s1', 'm1', ?, 1.0)",
+                (rating,),
+            )
+        db.commit()
+    finally:
+        db.close()

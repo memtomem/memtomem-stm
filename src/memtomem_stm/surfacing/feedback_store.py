@@ -10,11 +10,11 @@ import secrets
 import sqlite3
 import threading
 import time
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, TypeGuard, get_args
 
 from memtomem_stm.surfacing.grams import (
     KEY_BYTES,
@@ -24,6 +24,7 @@ from memtomem_stm.surfacing.grams import (
     path_key,
     snippet_grams,
 )
+from memtomem_stm.surfacing.observability import SkipReason
 from memtomem_stm.utils.json_out import (
     escape_lone_surrogates,
     has_lone_surrogate,
@@ -35,7 +36,67 @@ from memtomem_stm.utils.sqlite_tuning import tune_connection
 
 logger = logging.getLogger(__name__)
 
+# Canonical UX order: strong positive → weak positive → negative →
+# "I already had this". The formatter renders these in the same order
+# in the agent-facing rating spec, so the validator and the agent-visible
+# hint cannot drift (#350). ``partially_helpful`` (#353 part 2) sits
+# between ``helpful`` and the two negatives so the hint reads as a
+# strength gradient — agents pick the closest band rather than
+# defaulting to ``helpful`` when the memory only gave context.
+# Defined here, beside the table it describes, so the readers below can fold
+# what is not one of them (re-exported by ``surfacing.feedback``).
+VALID_RATINGS: tuple[str, ...] = (
+    "helpful",
+    "partially_helpful",
+    "not_relevant",
+    "already_known",
+)
+
 _NEGATIVE_FEEDBACK_RATINGS = ("not_relevant", "already_known")
+
+_GATE_DECISIONS: frozenset[str] = frozenset(
+    {
+        "surfaced",
+        "held_out",
+        "empty_render",
+        *(f"skip:{reason}" for reason in get_args(SkipReason) if reason != "empty_render"),
+    }
+)
+"""Every ``gate_decision`` STM writes, except ``error:<exception type>``."""
+
+_UNRECOGNIZED = "other"
+"""The key a stored rating or gate decision outside STM's vocabulary is counted
+under. Neither vocabulary contains it."""
+
+
+def _known_rating(value: object) -> TypeGuard[str]:
+    return value in VALID_RATINGS
+
+
+def _known_gate_decision(value: object) -> TypeGuard[str]:
+    if value in _GATE_DECISIONS:
+        return True
+    # ``error:<type name>``: the engine labels an unexpected exception by its
+    # class name, which the probe errors render too (``exception_summary``).
+    # ASCII only: a non-ASCII class name is folded, its count kept.
+    if not isinstance(value, str) or not value.startswith("error:"):
+        return False
+    name = value.removeprefix("error:")
+    return name.isascii() and name.isidentifier()
+
+
+def _fold_unrecognized(
+    rows: Iterable[tuple[object, int]], known: Callable[[object], TypeGuard[str]]
+) -> dict[str, int]:
+    """Counts keyed by stored value, with every value *known* rejects summed
+    under ``other``, so a foreign or corrupted file's text is not shown (#1091).
+    Totals are unchanged."""
+    counts: dict[str, int] = {}
+    for value, count in rows:
+        key = value if known(value) else _UNRECOGNIZED
+        counts[key] = counts.get(key, 0) + int(count)
+    return counts
+
 
 _FAULT_SUMMARY_WINDOW_DAYS = 7
 """Lookback window for the fault counters in ``read_surfacing_summary``,
@@ -571,7 +632,7 @@ def load_hmac_key(db_path: Path) -> bytes:
     try:
         db = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True)
     except sqlite3.Error as exc:
-        raise RuntimeError(f"cannot open surfacing feedback DB: {exc}") from exc
+        raise RuntimeError(f"cannot open surfacing feedback DB: {exception_summary(exc)}") from exc
     try:
         return _read_hmac_key(db)
     except sqlite3.Error as exc:
@@ -597,7 +658,8 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
     out of it and counted in ``withheld_total``. A file written before the
     ``arm`` column existed is probed first and every row counts as shown.
     ``opportunities_total`` / ``opportunity_decisions`` read the opportunity
-    log when the file has one.
+    log when the file has one. A gate decision or rating STM does not write is
+    counted under ``other`` (``_fold_unrecognized``).
     """
     summary: dict[str, object] = {
         "path": str(db_path),
@@ -696,7 +758,7 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
                 f"{where} GROUP BY gate_decision",
                 params,
             ).fetchall()
-            decisions = {row[0]: row[1] for row in decision_rows}
+            decisions = _fold_unrecognized(decision_rows, _known_gate_decision)
             summary["opportunity_decisions"] = decisions
             summary["opportunities_total"] = sum(decisions.values())
 
@@ -712,7 +774,7 @@ def read_surfacing_summary(db_path: Path, tool: str | None = None) -> dict[str, 
                 rating_rows = db.execute(
                     "SELECT rating, COUNT(*) FROM surfacing_feedback GROUP BY rating"
                 ).fetchall()
-            distribution = {row[0]: row[1] for row in rating_rows}
+            distribution = _fold_unrecognized(rating_rows, _known_rating)
             summary["rating_distribution"] = distribution
             summary["total_feedback"] = sum(distribution.values())
 
@@ -1670,14 +1732,14 @@ class FeedbackStore:
             # Counted before the zero-events return below: most opportunities
             # are calls that surfaced nothing, so a window can hold them with
             # no event at all. Same ``tool`` / ``since`` filters as the events.
-            opportunity_decisions = {
-                str(decision): int(count)
-                for decision, count in db.execute(
+            opportunity_decisions = _fold_unrecognized(
+                db.execute(
                     "SELECT gate_decision, COUNT(*) FROM surfacing_opportunities"
                     f"{where_sql} GROUP BY gate_decision ORDER BY gate_decision",
                     event_params,
-                ).fetchall()
-            }
+                ).fetchall(),
+                _known_gate_decision,
+            )
             # Also before the return: a window can hold only withheld events.
             withheld_total = db.execute(
                 "SELECT COUNT(*) FROM surfacing_events WHERE "
@@ -1790,7 +1852,7 @@ class FeedbackStore:
                 f"{rating_where} GROUP BY f.rating",
                 event_params,
             ).fetchall()
-            rating_distribution = {r[0]: r[1] for r in rating_rows}
+            rating_distribution = _fold_unrecognized(rating_rows, _known_rating)
             total_feedback = sum(rating_distribution.values())
 
             recent: list[dict] = []
