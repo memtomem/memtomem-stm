@@ -24,7 +24,7 @@ changes inline only. See the deprecation policy in
   identifier is counted under a new `other` key instead of under its own text.
   Totals are unchanged.
 - **Upstream tool names and Core score-scale labels are checked before they
-  are shown** (#1090).
+  are shown** (#1090, #1191).
   An upstream's tool names reached log lines, MCP responses, LTM frontmatter,
   telemetry and the MCP SDK's own registration warning as listed. Core's
   `score_scale` label reached logs, `stm_surfacing_stats` and the surfacing
