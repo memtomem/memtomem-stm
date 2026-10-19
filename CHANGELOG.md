@@ -11,6 +11,19 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Fixed
+
+- **Surfacing stats show only the decisions and ratings STM records** (#1091,
+  #1190).
+  `mms stats`, the `feedback_summary` of `mms health --json` / `mms doctor
+  --json`, and `stm_surfacing_stats` used to print every stored gate decision
+  and rating as found. A feedback DB that cannot be opened read-only is now
+  reported to the holdout-trial extractor by error type, without SQLite's
+  message. **Behavior change**: in those maps, a stored value that is neither
+  one of STM's fixed decisions and ratings nor `error:` followed by an ASCII
+  identifier is counted under a new `other` key instead of under its own text.
+  Totals are unchanged.
+
 ## [0.6.4] — 2026-10-18
 
 ### Upgrade notes

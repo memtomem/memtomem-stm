@@ -16,25 +16,12 @@ from memtomem_stm.surfacing.feedback_store import (
     FeedbackStore,
     MemoryPathInput,
     OpportunityRow,
+    VALID_RATINGS,
     inspect_feedback_db,
 )
 from memtomem_stm.utils.json_out import require_utf8_identifier
 
 logger = logging.getLogger(__name__)
-
-# Canonical UX order: strong positive → weak positive → negative →
-# "I already had this". The formatter renders these in the same order
-# in the agent-facing rating spec, so the validator and the agent-visible
-# hint cannot drift (#350). ``partially_helpful`` (#353 part 2) sits
-# between ``helpful`` and the two negatives so the hint reads as a
-# strength gradient — agents pick the closest band rather than
-# defaulting to ``helpful`` when the memory only gave context.
-VALID_RATINGS: tuple[str, ...] = (
-    "helpful",
-    "partially_helpful",
-    "not_relevant",
-    "already_known",
-)
 
 
 def rating_error(rating: str) -> str | None:
