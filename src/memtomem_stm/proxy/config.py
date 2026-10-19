@@ -491,7 +491,9 @@ def validation_error_summary(exc: ValidationError) -> str:
     entry in it. For these callers the keys are config key names (such as
     server, env variable, header or tool names), the MCP client's own
     parameter keys, or, on the probe's ``invalid server response`` line, keys
-    the upstream wrote. None of them is a configured value (#1085). A caller
+    the upstream wrote. A config or parameter key is not a configured value
+    (#1085). An upstream's key can be a value it was sent, so the probe passes
+    its line through ``cli/proxy.py:_sanitize_probe_error``. A caller
     that validates data keyed by secrets must not use this helper;
     ``utils/redact.py:exception_summary`` renders error types only.
     """

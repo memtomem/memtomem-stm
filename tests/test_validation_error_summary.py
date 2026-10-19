@@ -138,7 +138,8 @@ def test_inventory_sees_each_reference_form(tmp_path, source, expected_refs, exp
 
 def test_references_are_the_reviewed_set():
     """Each caller validates STM's config, ``stm_admin`` parameters, or an
-    upstream's reply — none keyed by secrets. A new reference must be checked
+    upstream's reply — none keyed by secrets by design (an upstream can echo a
+    value it was sent as a key; the probe scrubs those). A new reference must be checked
     against the rule in the helper's docstring, then added here."""
     refs, renames = _references()
     assert renames == []

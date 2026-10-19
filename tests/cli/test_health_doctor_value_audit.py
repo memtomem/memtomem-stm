@@ -372,6 +372,105 @@ def test_probe_error_that_echoes_configured_values_is_scrubbed(
     _assert_clean(output, _ECHO_CANARIES, as_json=as_json)
 
 
+def _keyed_validation_error(*keys: str) -> Exception:
+    """An ``initialize`` reply that fails validation at keys the upstream wrote,
+    which a probe failure message renders as its location (#1085)."""
+    from mcp.types import InitializeResult
+    from pydantic import ValidationError
+
+    try:
+        InitializeResult.model_validate(
+            {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"experimental": dict.fromkeys(keys, 1)},
+                "serverInfo": {"name": "x", "version": "1"},
+            }
+        )
+    except ValidationError as exc:
+        return exc
+    raise AssertionError("expected a ValidationError")
+
+
+@pytest.mark.parametrize("command", ["health", "doctor"])
+@pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+def test_probe_error_location_that_echoes_configured_values_is_scrubbed(
+    tmp_path, monkeypatch, command, as_json
+):
+    """An upstream holds the values it was sent and can return them as keys.
+    Each transport connects; its server's ``initialize`` reply fails validation."""
+    from contextlib import asynccontextmanager
+
+    import mcp
+    import mcp.client.stdio
+
+    import memtomem_stm.utils.mcp_transport as transport_mod
+
+    def connecting(*keys: str):
+        @asynccontextmanager
+        async def transport(*args, **kwargs):
+            yield (keys, keys)
+
+        return transport
+
+    class FakeSession:
+        def __init__(self, read, write):
+            self._keys = read
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return None
+
+        async def initialize(self):
+            raise _keyed_validation_error(*self._keys)
+
+    monkeypatch.setenv("MEMTOMEM_STM_SURFACING__ENABLED", "false")
+    monkeypatch.setattr(
+        mcp.client.stdio, "stdio_client", connecting("localRow", "cnryEchoArg", "cnryEchoEnv")
+    )
+    monkeypatch.setattr(
+        transport_mod,
+        "streamable_http_transport",
+        connecting(
+            "remoteRow",
+            "http://cnryEchoUser:cnryEchoPass@127.0.0.1:9/mcp",
+            "cnryEchoHdr",
+            "cnryEchoPass",
+        ),
+    )
+    monkeypatch.setattr(mcp, "ClientSession", FakeSession)
+    config = tmp_path / "stm_proxy.json"
+    config.write_text(
+        json.dumps(
+            {
+                "upstream_servers": {
+                    "local": {
+                        "prefix": "local",
+                        "command": "echo",
+                        "args": ["--token", "cnryEchoArg"],
+                        "env": {"TOKEN": "cnryEchoEnv"},
+                    },
+                    "remote": {
+                        "prefix": "remote",
+                        "transport": "streamable_http",
+                        "url": "http://cnryEchoUser:cnryEchoPass@127.0.0.1:9/mcp",
+                        "headers": {"Authorization": "cnryEchoHdr"},
+                    },
+                }
+            }
+        )
+    )
+    extra = ["--json"] if as_json else []
+    output = _run([command, "--config", str(config), "--timeout", "3", *extra])
+    # Positive controls: each row's reply reached the rendered location, marked
+    # by a key of its own (doctor repeats a row's error, so counts prove nothing).
+    for row in ("localRow", "remoteRow"):
+        assert f"invalid server response: capabilities.experimental.{row} (dict_type)" in output
+    assert "invalid server entry" not in output
+    _assert_clean(output, _ECHO_CANARIES, as_json=as_json)
+
+
 def test_probe_unwraps_a_grouped_entry_validation_error(monkeypatch):
     """anyio task groups wrap transport failures; the label and the
     value-free rendering apply to the leaf."""
@@ -425,6 +524,60 @@ def test_ltm_probe_error_that_echoes_url_credentials_is_scrubbed(monkeypatch):
     status = proxy_mod._ltm_mcp_status(surfacing, 3.0)
     assert status["error"] == "http://***@127.0.0.1:9/mcp: RuntimeError"
     assert [c for c in _LTM_CANARIES if c in status["error"]] == []
+
+
+def test_ltm_probe_error_location_that_echoes_configured_values_is_scrubbed(monkeypatch):
+    from types import SimpleNamespace
+
+    from memtomem_stm.cli import proxy as proxy_mod
+
+    async def failing_probe(*args, **kwargs):
+        raise _keyed_validation_error(
+            "http://cnryLtmUser:cnryLtmPass@127.0.0.1:9/mcp", "cnryLtmHdr", "cnryLtmArg"
+        )
+
+    monkeypatch.setattr(proxy_mod, "_probe_ltm_mcp_server", failing_probe)
+    surfacing = SimpleNamespace(
+        enabled=True,
+        ltm_mcp_transport="streamable_http",
+        ltm_mcp_command="",
+        ltm_mcp_args=["--token", "cnryLtmArg"],
+        ltm_mcp_url="http://cnryLtmUser:cnryLtmPass@127.0.0.1:9/mcp",
+        ltm_mcp_headers={"Authorization": "cnryLtmHdr"},
+    )
+    status = proxy_mod._ltm_mcp_status(surfacing, 3.0)
+    assert status["error"] == (
+        "http://***@127.0.0.1:9/mcp: invalid server response: "
+        "capabilities.experimental.http://***@127.0.0.1:9/mcp (dict_type); "
+        "capabilities.experimental.<REDACTED> (dict_type); "
+        "capabilities.experimental.<REDACTED> (dict_type)"
+    )
+
+
+@pytest.mark.parametrize(
+    ("cfg", "shown"),
+    [
+        (
+            {"url": "https://cnryUser:pw@up.example/mcp", "headers": {"X": "https://cnryUser"}},
+            "https://***@up.example/mcp",
+        ),
+        ({"url": "https://cnryUser:cnryPass@[::1/mcp"}, "<unparseable url>"),
+    ],
+    ids=["userinfo-overlaps-a-header-value", "url-that-does-not-parse"],
+)
+def test_echoed_url_is_rewritten_whole_before_value_scrubbing(cfg, shown):
+    """The cases the value list alone gets wrong: a header value covering the
+    username leaves the short password behind it, and a URL ``urlsplit``
+    rejects yields no userinfo to scrub (#1093)."""
+    from memtomem_stm.cli.proxy import _probe_failure_message, _sanitize_probe_error
+    from memtomem_stm.proxy.staged_status import ProbeStage
+
+    message = _probe_failure_message(
+        _keyed_validation_error(cfg["url"]), ProbeStage.TRANSPORT_CONNECTED
+    )
+    assert _sanitize_probe_error(message, cfg) == (
+        f"invalid server response: capabilities.experimental.{shown} (dict_type)"
+    )
 
 
 # --- #1079: free-form exception text, URL query/fragment, malformed authority
