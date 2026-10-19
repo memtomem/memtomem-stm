@@ -73,6 +73,10 @@ class StagedProbeResult:
     transport: str = "stdio"
     error: str | None = None
     tools: int = 0
+    #: Listed tools whose names fall outside the MCP tool-name grammar (#1090).
+    #: Counted, never named, and excluded from ``tools`` and every per-tool
+    #: field below, matching what the proxy ingests.
+    nonconforming_tools: int = 0
     overflowing: tuple[str, ...] = ()
     #: ``(tool name, length of the text the advertisement would budget for it)``
     #: per discovered tool, with the override and name-fallback rules already
@@ -85,6 +89,15 @@ class StagedProbeResult:
     #: Names whose schemas contain removable descriptions/examples. No raw
     #: metadata is retained; the global/per-server strip flags are applied by doctor.
     schema_description_tools: tuple[str, ...] = ()
+
+    @property
+    def nonconforming_note(self) -> str:
+        """Suffix for a rendered tool count: the refused tools, by count only."""
+        if not self.nonconforming_tools:
+            return ""
+        return (
+            f"; {self.nonconforming_tools} more not proxied: name outside the MCP tool-name grammar"
+        )
 
     @property
     def connected(self) -> bool:
@@ -104,11 +117,13 @@ class StagedProbeResult:
 
         ``connected``/``tools``/``overflowing``/``error`` keep the shapes
         the pre-staged ``--json`` consumers scripted against; ``stage``,
-        ``failed_stage``, and ``transport`` are additive.
+        ``failed_stage``, ``transport`` and ``nonconforming_tools`` are
+        additive.
         """
         return {
             "connected": self.connected,
             "tools": self.tools,
+            "nonconforming_tools": self.nonconforming_tools,
             "overflowing": list(self.overflowing),
             "error": self.error,
             "stage": self.stage.value,

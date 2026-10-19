@@ -389,9 +389,24 @@ sibling ``reranker`` model-ID key). Enabled decay/access/importance
 modifiers multiply on top. The ``"rerank"`` label is derived by core from
 the returned results, not its decision flag, so silent rerank fallbacks
 still report the fused scale truthfully. Unknown labels are kept verbatim
-(telemetry reports what core said); this set only gates debug logging and
-scale-conditional diagnostics.
+in what STM stores (telemetry reports what core said); this set gates the
+scale-conditional diagnostics and every place a label is *rendered* — a log
+line, an MCP response, the webhook — where anything outside it shows as
+``unrecognized`` (:func:`render_score_scale`, #1090).
 """
+
+
+def render_score_scale(label: object) -> str | None:
+    """The form of a stored ``score_scale`` that may be shown (#1090).
+
+    ``None`` (Core did not report one) stays ``None``; a label in
+    :data:`KNOWN_SCORE_SCALES` is itself; anything else Core sent is
+    ``"unrecognized"``, since it is text STM did not write and cannot vouch
+    for. The reranker ID has no known set, so it is rendered by presence only.
+    """
+    if label is None:
+        return None
+    return label if isinstance(label, str) and label in KNOWN_SCORE_SCALES else "unrecognized"
 
 
 def read_score_scale_hint(raw: Any) -> str | None:
@@ -519,8 +534,9 @@ class StructuredResultParser(ResultParser):
         reranker = read_score_scale_hint(data.get("reranker"))
         if score_scale is not None and score_scale not in KNOWN_SCORE_SCALES:
             # Keep the label verbatim — telemetry wants the truth, and a
-            # renamed core label must surface as itself, not as ``None``.
-            logger.debug("StructuredResultParser: unknown score_scale label %r", score_scale)
+            # renamed core label must surface as itself, not as ``None``. The
+            # log line does not carry it: Core's text is not STM's to print.
+            logger.debug("StructuredResultParser: unrecognized score_scale label")
 
         raw_results = data.get("results", [])
         results: list[RemoteSearchResult] = []

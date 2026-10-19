@@ -36,6 +36,10 @@ loosens the budget to 52.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
+from typing import TypeVar
+
+_T = TypeVar("_T")
 
 # Anthropic / MCP spec — tool names must match ``^[a-zA-Z0-9_-]{1,64}$``.
 TOOL_NAME_LIMIT = 64
@@ -107,3 +111,39 @@ def prefix_warn_threshold() -> int:
     for ``mms`` (overhead 12), it relaxes to 30.
     """
     return TOOL_NAME_LIMIT - overhead() - _WARN_TOOL_NAME_BUDGET
+
+
+def is_conforming_tool_name(name: object) -> bool:
+    """Whether an upstream tool name matches the MCP tool-name grammar (#1090).
+
+    The grammar is SEP-986's (``[A-Za-z0-9._-]{1,128}``, whole string), read
+    from the SDK's own validator rather than restated. A name outside it is
+    untrusted text that STM would otherwise carry into log lines, MCP
+    responses, LTM frontmatter and telemetry, so the proxy does not ingest the
+    tool at all (:func:`conforming_tools`). This is not the 64-char budget
+    above: a conforming name can still overflow, and that stays an
+    advertisement-time verdict.
+
+    The import is deferred because this module is on the CLI's eager import
+    path, which must not pull in the SDK (``test_lazy_cli_imports``).
+    """
+    from mcp.shared.tool_name_validation import validate_tool_name
+
+    return isinstance(name, str) and validate_tool_name(name).is_valid
+
+
+def conforming_tools(tools: Iterable[_T]) -> tuple[list[_T], int]:
+    """Split an upstream ``tools/list`` result into the tools STM ingests
+    and the count it refuses.
+
+    Only the count leaves this function: a refused name is never rendered,
+    because rendering it is what the grammar check exists to prevent.
+    """
+    kept: list[_T] = []
+    refused = 0
+    for tool in tools:
+        if is_conforming_tool_name(getattr(tool, "name", None)):
+            kept.append(tool)
+        else:
+            refused += 1
+    return kept, refused

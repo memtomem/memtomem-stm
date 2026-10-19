@@ -185,6 +185,15 @@ class TestTruncation:
         stale = {"docs": StagedProbeResult(stage=ProbeStage.TOOLS_DISCOVERED, tools=2)}
         assert "no per-tool description lengths" in _check(config, stale)[3]
 
+        # #1090: an upstream whose every listed tool was refused by the
+        # grammar check lists tools, so "advertises no tools" would be false.
+        refused = {
+            "docs": StagedProbeResult(stage=ProbeStage.TOOLS_DISCOVERED, nonconforming_tools=3)
+        }
+        detail = _check(config, refused)[3]
+        assert "advertises no tools" not in detail
+        assert "named outside the MCP tool-name grammar" in detail
+
     def test_a_failed_discovery_names_the_stage_it_reached(self):
         """Connect and initialize can succeed while ``tools/list`` fails; calling
         that "unreachable" sends the operator after the wrong thing."""

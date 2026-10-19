@@ -51,6 +51,7 @@ from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
 from memtomem_stm.proxy.selection_log import aggregate_selection_log, rotation_lock
 from memtomem_stm.surfacing.engine import SurfacingEngine
+from memtomem_stm.surfacing.mcp_client import render_score_scale
 from memtomem_stm.surfacing.config import holdout_startup_warnings
 from memtomem_stm.surfacing.observability import (
     COMPLETED_OUTCOMES,
@@ -1473,10 +1474,17 @@ async def stm_proxy_health(
     lines = [*config_warning, "Upstream Server Health", "====================="]
     for name, info in health.items():
         status = "connected" if info["connected"] else "DISCONNECTED"
+        # "Discovered" stays the whole listing; the tools the grammar check
+        # refused (#1090) are part of it and get their own line, by count only.
+        nonconforming = info.get("nonconforming_tools", 0)
         lines.append(
-            f"  {name}: {status} "
-            f"({info['tools']} tools discovered, {info['advertised_tools']} advertised)"
+            f"  {name}: {status} ({info['tools'] + nonconforming} tools discovered, "
+            f"{info['advertised_tools']} advertised)"
         )
+        if nonconforming:
+            lines.append(
+                f"      {nonconforming} tool(s) not proxied: name outside the MCP tool-name grammar"
+            )
         # A startup-failed upstream (#580) carries the connect error so the
         # DISCONNECTED status is actionable, not just visible.
         error = info.get("error")
@@ -1537,8 +1545,9 @@ def _toolgraph_health_lines(status: dict | None) -> list[str]:
         )
     elif status["graph_generation"] is None:
         # Enabled, no failure, but no usable generation → the consult was
-        # skipped (no upstream tools discovered). Not "active" enforcement.
-        lines.append("  enabled, not consulted (no upstream tools discovered)")
+        # skipped (no upstream tools discovered — a tool refused by the
+        # grammar check of #1090 is not one). Not "active" enforcement.
+        lines.append("  enabled, not consulted (no grammar-conforming upstream tools discovered)")
     else:
         cache_note = ", from cache" if status.get("from_cache") else ""
         source_note = ", portable bundle" if status.get("source") == "bundle" else ""
@@ -2124,15 +2133,17 @@ async def stm_surfacing_stats(
             scale_info = snap.get("score_scale") or {}
             last_reported = scale_info.get("last_reported")
             if last_reported:
-                reranker_id = scale_info.get("reranker")
-                reranker_note = f"; reranker: {reranker_id}" if reranker_id else ""
+                # Core's text is shown only as a label STM knows; the reranker
+                # model ID has no known set, so only its presence (#1090).
+                shown_scale = render_score_scale(last_reported)
+                reranker_note = "; reranker reported" if scale_info.get("reranker") else ""
                 gate_note = (
                     "; min_score filter suspended for unpinned tools"
                     if scale_info.get("filter_suspended")
                     else ""
                 )
                 lines.append(
-                    f"Score scale:     {last_reported} (core-reported{reranker_note}{gate_note})"
+                    f"Score scale:     {shown_scale} (core-reported{reranker_note}{gate_note})"
                 )
             else:
                 lines.append("Score scale:     unknown (core did not report one)")

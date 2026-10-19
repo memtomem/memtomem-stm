@@ -3707,6 +3707,31 @@ class TestWebhookExceptionPaths:
             await asyncio.gather(*pending, return_exceptions=True)
         return engine, output
 
+    async def test_webhook_payload_folds_a_label_stm_does_not_know(self):
+        """#1090: the payload leaves the process, so Core's label is sent only
+        when STM knows it."""
+        captured: dict = {}
+
+        async def capture_fire(event, payload):
+            captured.update(payload)
+
+        results = [
+            FakeSearchResult(chunk=FakeChunk(content="mem"), score=0.5, score_scale="evil\x1b[31m")
+        ]
+        webhook_manager = MagicMock()
+        webhook_manager.fire = capture_fire
+        engine = SurfacingEngine(
+            config=_make_config(fire_webhook=True),
+            mcp_adapter=_make_mcp_adapter(results),
+            webhook_manager=webhook_manager,
+        )
+        await engine.surface("s", "read_file", VALID_ARGS, LONG_RESPONSE)
+        pending = list(engine._background_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        assert captured["score_scale"] == "unrecognized"
+
     async def test_webhook_payload_carries_score_scale(self):
         """#1781: the surface webhook payload names the core-reported scale."""
         captured: dict = {}
@@ -4370,7 +4395,9 @@ class TestReportedScoreScale:
         warnings = [r.message for r in caplog.records if "score-scale mismatch" in r.message]
         assert len(warnings) == 1  # once per episode, no streak of 5 needed
         assert "score_scale='rerank'" in warnings[0]
-        assert "reranker=BAAI/bge-reranker-v2-m3" in warnings[0]
+        # Presence only: the model ID is Core's text, not STM's (#1090).
+        assert "(reranker reported)" in warnings[0]
+        assert "BAAI" not in caplog.text
         # WARNS once, PERSISTS twice: the durable row is shared, so each
         # mismatched observation must reopen it (#944).
         await engine.drain_store_writes()

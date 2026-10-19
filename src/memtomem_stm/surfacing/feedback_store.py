@@ -1785,14 +1785,19 @@ class FeedbackStore:
             score_max: float | None = None
             # Per-event count of the core-reported scale label (#1781). NULL rows
             # (pre-#1781 cores, compose bundles, legacy events) bucket under
-            # "unknown" so the distribution always sums to events_total.
+            # "unknown" so the distribution always sums to events_total. A
+            # label Core sent that STM does not know is counted as
+            # "unrecognized" rather than shown (#1090) — including a literal
+            # "unknown", which would otherwise merge with the NULL bucket.
+            from memtomem_stm.surfacing.mcp_client import render_score_scale
+
             score_scale_distribution: dict[str, int] = {}
             for tool_name, memory_ids_json, scores_json, score_scale in rows:
                 scale_key = (
-                    escape_lone_surrogates(score_scale)
+                    render_score_scale(score_scale)
                     if isinstance(score_scale, str) and score_scale
-                    else "unknown"
-                )
+                    else None
+                ) or "unknown"
                 score_scale_distribution[scale_key] = score_scale_distribution.get(scale_key, 0) + 1
                 n = len(_load_safe_memory_ids(memory_ids_json))
                 bucket = per_tool.setdefault(tool_name, {"events": 0, "sum_memory_count": 0})
