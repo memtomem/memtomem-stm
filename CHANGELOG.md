@@ -13,7 +13,8 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
-- **Surfacing stats show only the decisions and ratings STM records** (#1091).
+- **Surfacing stats show only the decisions and ratings STM records** (#1091,
+  #1190).
   `mms stats`, the `feedback_summary` of `mms health --json` / `mms doctor
   --json`, and `stm_surfacing_stats` used to print every stored gate decision
   and rating as found. A feedback DB that cannot be opened read-only is now
