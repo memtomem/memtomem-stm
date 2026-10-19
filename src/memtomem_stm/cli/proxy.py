@@ -8303,10 +8303,6 @@ def _ltm_metadata_from_tool_result(result: Any) -> dict[str, Any]:
     }
 
 
-def _version_from_tool_result(result: Any) -> str | None:
-    return _ltm_metadata_from_tool_result(result)["version"]
-
-
 async def _probe_ltm_mcp_server(
     transport: str,
     command: str,
@@ -8511,10 +8507,9 @@ def _ltm_mcp_status(surfacing: Any, timeout: float) -> dict[str, Any]:
         if isinstance(root, TimeoutError):
             status["error"] = f"{display}: timeout ({probe_timeout:g}s)"
         else:
-            # Same scrub as an upstream probe error: httpx exceptions embed the
-            # full request URL (userinfo included), a 401 body can echo the
-            # Authorization header, and the launch args are hidden everywhere
-            # else in the status.
+            # Same scrub as an upstream probe error: a reply that fails
+            # validation is rendered with keys the LTM server wrote, and the
+            # launch args are hidden everywhere else in the status.
             message = _sanitize_probe_error(
                 _probe_failure_message(root, None),
                 {"url": url, "headers": headers, "args": args},
@@ -8772,11 +8767,19 @@ def _probe_secret_values(cfg: dict[str, Any]) -> list[str]:
 
 
 def _sanitize_probe_error(text: str, cfg: dict[str, Any]) -> str:
-    """Sanitize a probe failure message against *cfg*'s secret values.
+    """Scrub *cfg*'s secret values out of a ``_probe_failure_message`` result.
 
-    ``redact_exception_text`` first (it rewrites full-URL forms httpx embeds,
-    keeping the host readable), then ``sanitize_secrets`` for the raw
-    env/header values and string ``args`` themselves.
+    That message is fixed vocabulary except for a validation location's keys:
+    config key names on an ``invalid server entry`` line, and keys the upstream
+    wrote on an ``invalid server response`` line (#1085). An upstream holds the
+    URL and token it was sent, so it can echo one as a key.
+
+    ``redact_exception_text`` runs first: it rewrites the configured URL as a
+    whole (``***@``, or ``<unparseable url>`` when it does not parse), which the
+    value list below cannot do for a URL ``urlsplit`` rejects or a userinfo
+    that overlaps another secret. Then ``sanitize_secrets`` replaces the env
+    and header values, the URL userinfo and the string ``args``, except values
+    shorter than ``_MIN_REDACTABLE_SECRET_LEN``.
     """
     url = cfg.get("url", "")
     if isinstance(url, str) and url:
