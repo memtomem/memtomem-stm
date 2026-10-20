@@ -70,7 +70,8 @@ changes inline only. See the deprecation policy in
   name outside the MCP tool-name grammar is counted under `(unrecognized)`,
   and a nonconforming `tool` filter is shown as `(unrecognized)` in the
   "filtered by" line.
-- **Silent connections can no longer exhaust the surfacing daemon** (#1150).
+- **Silent connections can no longer exhaust the surfacing daemon** (#1150,
+  #1199).
   The daemon accepted any number of connections that had not sent their first
   frame, and the token is inside that frame. Under the 256-descriptor limit a
   launchd-started process gets on macOS, fewer than 250 such sockets ran it out
