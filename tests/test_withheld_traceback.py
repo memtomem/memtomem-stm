@@ -353,6 +353,39 @@ def test_a_deep_recursion_compressed_below_the_line_budget_still_marks_the_cut()
     assert "[traceback truncated]" not in out
 
 
+def _ping(n: int) -> None:
+    if n == 0:
+        raise ValueError(CANARY)
+    _pong(n - 1)
+
+
+def _pong(n: int) -> None:
+    if n == 0:
+        raise ValueError(CANARY)
+    _ping(n - 1)
+
+
+def test_frames_that_do_not_fold_still_leave_room_for_the_raise_site():
+    """1101 alternating frames never fold; they would fill the 2000-line budget
+    before the raise line and the exception's class printed."""
+    import sys as _sys
+
+    limit = _sys.getrecursionlimit()
+    _sys.setrecursionlimit(max(limit, 2500))
+    try:
+        exc = _caught(lambda: _ping(1100))
+    finally:
+        _sys.setrecursionlimit(limit)
+    out = render_withheld_traceback(exc)
+    lines = out.splitlines()
+
+    assert len(lines) <= 2000
+    assert "[traceback truncated]" not in out
+    assert re.search(r"^\[\d+ outer frames omitted\]$", out, re.MULTILINE)
+    assert lines[-2].strip() == "raise ValueError(CANARY)"
+    assert lines[-1] == "ValueError: [message withheld]"
+
+
 def test_an_explicit_none_traceback_renders_no_frames_like_the_stdlib():
     exc = _caught(raise_cause_marker)
     record = logging.LogRecord(

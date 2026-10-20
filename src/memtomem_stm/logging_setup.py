@@ -116,6 +116,9 @@ _MAX_GROUP_DEPTH = 10
 _MAX_EXCEPTIONS = 256
 _MAX_LINES = 2000
 _MAX_FRAMES = 1000
+_RESERVED_LINES = 3
+"""Kept free after an exception's frames: the omitted-frames marker, the
+exception line and the notes line, so the raise site's class always prints."""
 _OWN_TRACEBACK: Any = object()
 _CAUSE_SEPARATOR = "The above exception was the direct cause of the following exception:"
 _CONTEXT_SEPARATOR = "During handling of the above exception, another exception occurred:"
@@ -162,8 +165,9 @@ def render_withheld_traceback(exc: BaseException, tb: Any = _OWN_TRACEBACK) -> s
 
     Trusted, and so still shown: class, module and function names and the
     source of the frames — they come from code, not from the data that failed.
-    Bounded while it renders, not after: the innermost 1000 frames of each
-    traceback (the raise site stays), 32 chained exceptions per chain, 15
+    Bounded while it renders, not after: the innermost frames of each
+    traceback, at most 1000 and as many as the line budget still holds with
+    room for the exception's own line (the raise site stays), 32 chained exceptions per chain, 15
     members and 10 levels of exception groups, 256 exceptions and 2000 lines in
     all, each cut marked. If any step raises, the whole result is
     :data:`WITHHELD_RENDER_FAILED`; only ``KeyboardInterrupt`` and
@@ -250,8 +254,13 @@ def _render_exception(
                 walked += 1
                 yield item
 
+        # Each frame renders as at most two lines (no column positions are
+        # extracted, so no multi-line statements or carets).
+        room = (_MAX_LINES - len(out.lines) - _RESERVED_LINES) // 2
+        if room < 1:
+            raise _BudgetSpent
         frames = traceback.StackSummary.extract(
-            counted(traceback.walk_tb(tb)), limit=-_MAX_FRAMES, capture_locals=False
+            counted(traceback.walk_tb(tb)), limit=-min(_MAX_FRAMES, room), capture_locals=False
         )
         if walked > len(frames):
             out.add(f"[{walked - len(frames)} outer frames omitted]", margin)
