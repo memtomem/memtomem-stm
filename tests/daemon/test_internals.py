@@ -798,6 +798,10 @@ _SURFACE_OUTPUT = {"hookSpecificOutput": {"hookEventName": "PostToolUse"}}
         ({"v": protocol.PROTOCOL_VERSION, "ok": False, "status": "busy"}, {}),
         ({"v": protocol.PROTOCOL_VERSION, "ok": False, "status": "expired"}, {}),
         ({"v": protocol.PROTOCOL_VERSION, "ok": False, "status": "unavailable"}, None),
+        # Malformed acknowledgements are not a turn-away; they keep the
+        # recovery path.
+        ({"v": protocol.PROTOCOL_VERSION, "ok": True, "status": "busy"}, None),
+        ({"v": protocol.PROTOCOL_VERSION, "status": "expired"}, None),
         ({"v": protocol.PROTOCOL_VERSION, "ok": False, "status": "invalid"}, None),
         ({"v": protocol.PROTOCOL_VERSION, "ok": False, "error": "unsupported"}, None),
         (None, None),

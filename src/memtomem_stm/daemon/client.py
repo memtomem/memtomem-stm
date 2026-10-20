@@ -172,7 +172,7 @@ async def surface(
     )
     if resp is not None and resp.get("ok") and isinstance(resp.get("output"), dict):
         return resp["output"]
-    if resp is not None and resp.get("status") in ("busy", "expired"):
+    if resp is not None and resp.get("ok") is False and resp.get("status") in ("busy", "expired"):
         return {}
     return None
 

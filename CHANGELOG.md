@@ -88,8 +88,9 @@ changes inline only. See the deprecation policy in
   handled it like an unreachable daemon: it asked for a spawn, and with
   `hook.fallback = "cold"` it ran the search again in-process, adding load
   while the daemon was already overloaded. **Behavior change**: those two
-  replies now give the hook output `{}`, with no spawn request and no cold
-  fallback. Other daemon errors and an unreachable daemon behave as before.
+  replies now mean no surfacing for that call, with no spawn request and no
+  cold fallback; compression of the tool output is unaffected. Other daemon
+  errors and an unreachable daemon behave as before.
 
 ## [0.6.4] — 2026-10-18
 
