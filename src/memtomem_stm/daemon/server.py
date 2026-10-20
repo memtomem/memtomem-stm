@@ -88,6 +88,18 @@ _READ_TIMEOUT_SECONDS = 30.0
 # buffered response for the process lifetime.
 _WRITE_TIMEOUT_SECONDS = 30.0
 
+# Connections whose first frame has not been read yet. The token is inside that
+# frame, so until it arrives a peer is anonymous, and each one holds a file
+# descriptor and up to a frame's worth of buffer. When a new connection finds
+# the budget full, the oldest one is dropped rather than the newcomer: refusing
+# newcomers let idle sockets lock authenticated clients out, while a real client
+# sends its frame right after connecting and is read long before 64 newer
+# connections arrive behind it. A burst of more than this many simultaneous
+# connections loses the excess the same way, so the budget sits well above the
+# admission bound (``max_pending_requests``, 32 by default) and far below the
+# 256 descriptors a launchd-started process gets.
+_MAX_PRE_AUTH_CONNECTIONS = 64
+
 
 async def _quiet(coro: Any, what: str) -> None:
     """Await a cleanup coroutine, swallowing (and debug-logging) any error."""
@@ -200,6 +212,9 @@ class DaemonServer:
         self._pending_slots = asyncio.Semaphore(self._max_pending_requests)
         self._active_requests = 0
         self._busy_rejections = 0
+        # Insertion-ordered, so the first key is the oldest connection.
+        self._pre_auth: dict[asyncio.StreamWriter, None] = {}
+        self._pre_auth_evictions = 0
         self._latency = DaemonLatencyTracker()
         self._handshake_written = False
         self._engine: Any = None
@@ -429,11 +444,25 @@ class DaemonServer:
     async def _handle_conn(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        if len(self._pre_auth) >= _MAX_PRE_AUTH_CONNECTIONS:
+            victim = next(iter(self._pre_auth))
+            del self._pre_auth[victim]
+            self._pre_auth_evictions += 1
+            victim.transport.abort()
+        self._pre_auth[writer] = None
         try:
             try:
                 req = await asyncio.wait_for(read_message(reader), timeout=_READ_TIMEOUT_SECONDS)
             except (ProtocolError, asyncio.TimeoutError):
                 return  # malformed/oversized/slow → drop silently
+            finally:
+                evicted = writer not in self._pre_auth
+                self._pre_auth.pop(writer, None)
+            if evicted:
+                # abort() keeps what the reader had already buffered, so an
+                # evicted connection can still come back with a whole frame.
+                # Its reply has nowhere to go; don't start the work.
+                return
             if not token_matches(self._token, req.get("token")):
                 logger.debug("daemon rejected request with bad/missing token")
                 return  # never respond to an unauthenticated peer
@@ -957,6 +986,7 @@ class DaemonServer:
             "concurrency": self._max_concurrent_ltm_ops,
             "available": max(0, self._max_pending_requests - self._active_requests),
             "busy_rejections": self._busy_rejections,
+            "pre_auth_evictions": self._pre_auth_evictions,
         }
 
     @staticmethod
