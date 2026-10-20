@@ -73,8 +73,8 @@ changes inline only. See the deprecation policy in
 - **Silent connections can no longer exhaust the surfacing daemon** (#1150).
   The daemon accepted any number of connections that had not sent their first
   frame, and the token is inside that frame. Under the 256-descriptor limit a
-  launchd-started process gets on macOS, about 245 such sockets ran it out of
-  file descriptors: hook and proxy requests then failed as if the daemon were
+  launchd-started process gets on macOS, fewer than 250 such sockets ran it out
+  of file descriptors: hook and proxy requests then failed as if the daemon were
   dead, and asyncio logged a traceback for every refused accept.
   **Behavior change**: at most 64 connections may be waiting for their first
   frame; a new one closes the oldest of them, with no reply. A burst of more
