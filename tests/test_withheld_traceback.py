@@ -432,8 +432,10 @@ def test_a_non_exception_in_exc_info_gives_the_constant():
 
 
 def test_free_text_codes_are_not_used():
-    """``exception_summary`` keeps a ``ResponseShapeError``'s text and pydantic
-    error types; neither is fixed vocabulary, so tracebacks leave them out."""
+    """Tracebacks show only ``exception_code_label``'s codes, so they never
+    depend on how a ``ResponseShapeError`` message or a pydantic error type is
+    written — even an adversarial one, as here — whatever ``exception_summary``
+    shows of them."""
     from pydantic import BaseModel, ValidationError, field_validator
     from pydantic_core import PydanticCustomError
 

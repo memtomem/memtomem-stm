@@ -13,6 +13,16 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **Error summaries no longer pass provider-chosen values through** (#1206).
+  The fixed vocabulary that client-facing, health and metrics surfaces use
+  for an exception quoted an OpenAI-compatible embedding provider's
+  `data[].index` values and a non-finite vector component in its shape
+  errors, named any `context_compose` schema number the core advertised, and
+  showed any integer an `HTTPStatusError` reported as its status.
+  **Behavior change**: those shape errors now read `'data[].index' is not a
+  permutation of 0..N`, `'<field>[i]' is not a finite number` and
+  `(schema above 4)` for a schema STM does not speak, and an HTTP status
+  outside 100–599 leaves only the exception's type name.
 - **Logged tracebacks no longer repeat exception messages** (#1086,
   #1205).
   A site that logged an exception with its traceback printed the exception's

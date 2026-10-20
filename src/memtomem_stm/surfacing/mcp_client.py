@@ -21,6 +21,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.shared.exceptions import MCPError
 from mcp.types import CONNECTION_CLOSED, TextContent
 
+from memtomem_stm.daemon.protocol import MAX_CONTEXT_COMPOSE_SCHEMA
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.observability import record_search_rpc
 from memtomem_stm.surfacing.rrf_profile import is_schema_one, rrf_score_ceiling
@@ -192,14 +193,21 @@ def require_context_compose_lists(
     violation, not an empty result: name the negotiated schema in the error so
     the operator-facing WARNING says which side drifted.
     """
+    # The schema is the number the core advertised: named only when it is one
+    # STM knows, so the message carries no value the core chose (#1206).
+    label = (
+        f"schema {schema}"
+        if 0 <= schema <= MAX_CONTEXT_COMPOSE_SCHEMA
+        else f"schema above {MAX_CONTEXT_COMPOSE_SCHEMA}"
+    )
     missing = [key for key in _REQUIRED_COMPOSE_KEYS if key not in payload]
     if missing:
         raise ResponseShapeError(
-            f"{origin} (schema {schema}) is missing required key(s): {', '.join(missing)}"
+            f"{origin} ({label}) is missing required key(s): {', '.join(missing)}"
         )
     for key in _REQUIRED_COMPOSE_KEYS:
         if not isinstance(payload[key], list):
-            raise ResponseShapeError(f"{origin} (schema {schema}) key {key!r} is not an array")
+            raise ResponseShapeError(f"{origin} ({label}) key {key!r} is not an array")
     return payload["pinned"], payload["retrieved"]
 
 

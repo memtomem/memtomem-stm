@@ -223,6 +223,13 @@ def exception_summary(exc: BaseException) -> str:
     its error types. Not its locations: a location can be a key of the data that
     failed, and nothing marks which parts the schema owns. Not a JSON-RPC
     error's message either: an upstream can quote STM's request in it.
+
+    Each of those is fixed vocabulary (#1206): an HTTP status outside 100–599
+    did not come off a status line and leaves only the type name, and every
+    ``ResponseShapeError`` message is written from STM's text, type names,
+    counts and filtered key names, never a value the reply carried. A
+    pydantic error type is a string the validator's code chose, like a class
+    name, so it is shown as is.
     """
     from pydantic import ValidationError
 
@@ -240,13 +247,19 @@ def exception_summary(exc: BaseException) -> str:
             err["type"] for err in root.errors(include_url=False, include_input=False)
         )
         return f"ValidationError: {'; '.join(kinds)}"
-    code = http_status_code(root)
+    code = _status_line_code(root)
     if code is not None:
         return f"HTTP {code} ({type(root).__name__})"
     name = _sqlite_primary_code(root)
     if name is not None:
         return f"{type(root).__name__} ({name})"
     return type(root).__name__
+
+
+def _status_line_code(exc: BaseException) -> int | None:
+    """``http_status_code`` within a status line's range, 100–599, else ``None``."""
+    code = http_status_code(exc)
+    return code if code is not None and 100 <= code <= 599 else None
 
 
 def _reserved_jsonrpc_code(exc: BaseException) -> str | None:
@@ -273,14 +286,13 @@ def exception_code_label(exc: BaseException) -> str | None:
     The HTTP status of an httpx/httpx2 ``HTTPStatusError`` (``HTTP 500``), a
     reserved JSON-RPC code of an ``MCPError``, or a SQLite primary result-code
     name. Narrower than ``exception_summary``: no ``ResponseShapeError`` text
-    (some of it interpolates values a provider sent) and no pydantic error
-    types (a custom error type is free text). Logged tracebacks show this
+    and no pydantic error types, so a traceback never depends on how those
+    messages are written. Logged tracebacks show this
     beside each exception they withhold the message of (#1086).
     """
-    code = http_status_code(exc)
+    code = _status_line_code(exc)
     if code is not None:
-        # The status line's range: any other int did not come off the wire.
-        return f"HTTP {code}" if 100 <= code <= 599 else None
+        return f"HTTP {code}"
     return _reserved_jsonrpc_code(exc) or _sqlite_primary_code(exc)
 
 

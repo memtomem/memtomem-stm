@@ -610,6 +610,29 @@ def test_response_shape_errors_keep_their_stm_written_message():
     )
 
 
+@pytest.mark.parametrize(
+    ("schema", "label"), [(3, "schema 3"), (4, "schema 4"), (846219073351, "schema above 4")]
+)
+def test_compose_shape_errors_name_only_schemas_stm_knows(schema, label):
+    """The schema is what the core advertised in its capabilities; a number
+    above what STM speaks is described, not quoted (#1206)."""
+    from memtomem_stm.surfacing.mcp_client import require_context_compose_lists
+    from memtomem_stm.utils.redact import exception_summary
+
+    with pytest.raises(ValueError) as missing:
+        require_context_compose_lists(
+            {"retrieved": []}, origin="core context_compose", schema=schema
+        )
+    assert exception_summary(missing.value) == (
+        f"ResponseShapeError: core context_compose ({label}) is missing required key(s): pinned"
+    )
+    with pytest.raises(ValueError) as not_list:
+        require_context_compose_lists(
+            {"retrieved": [], "pinned": {}}, origin="core context_compose", schema=schema
+        )
+    assert f"({label}) key 'pinned' is not an array" in str(not_list.value)
+
+
 def test_a_plain_value_error_is_still_reduced_to_its_type():
     from memtomem_stm.utils.redact import exception_summary
 
@@ -625,6 +648,78 @@ def test_embedding_shape_error_counts_unknown_reply_keys():
     assert str(raised.value) == (
         "ollama embedding response has no 'embeddings' field; it holds: error (+1 other)"
     )
+
+
+def test_embedding_shape_errors_describe_provider_values_without_quoting_them(monkeypatch):
+    """The ``data[].index`` values and a non-finite component are what the
+    provider sent; the message says what is wrong with them, not what they
+    were (#1206)."""
+    from unittest.mock import MagicMock, patch
+
+    from memtomem_stm.proxy.relevance import EmbeddingScorer, _require_vector
+    from memtomem_stm.utils.redact import ResponseShapeError, exception_summary
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    resp = MagicMock()
+    resp.json = MagicMock(
+        return_value={
+            "data": [
+                {"index": 846219073351, "embedding": [0.0]},
+                {"index": 0, "embedding": [1.0]},
+            ]
+        }
+    )
+    scorer = EmbeddingScorer(provider="openai", model="m", base_url="https://api.openai.com")
+    with patch("httpx.post", return_value=resp), pytest.raises(ResponseShapeError) as perm:
+        scorer._embed_openai(None, ["a", "b"])
+    assert exception_summary(perm.value) == (
+        "ResponseShapeError: openai embedding response: 'data[].index' is not a permutation of 0..1"
+    )
+
+    with pytest.raises(ResponseShapeError) as finite:
+        _require_vector([1.0, float("inf")], provider="ollama", where="embeddings[0]")
+    assert str(finite.value) == (
+        "ollama embedding response: 'embeddings[0][1]' is not a finite number"
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (503, "HTTP 503 (HTTPStatusError)"),
+        (100, "HTTP 100 (HTTPStatusError)"),
+        (599, "HTTP 599 (HTTPStatusError)"),
+        (99, "HTTPStatusError"),
+        (600, "HTTPStatusError"),
+        (846219073351, "HTTPStatusError"),
+    ],
+)
+def test_http_status_outside_the_status_line_range_is_only_the_type(status, expected):
+    """A real response's status comes off the status line; any other number
+    is not vocabulary STM can vouch for (#1206)."""
+    import httpx2
+
+    from memtomem_stm.utils.redact import exception_summary
+
+    class Response:
+        status_code = status
+
+    exc = httpx2.HTTPStatusError("x", request=None, response=Response())  # type: ignore[arg-type]
+    assert exception_summary(exc) == expected
+
+
+def test_validation_error_types_from_stm_models_are_shown():
+    """Error types are strings the validator's code chose, shown as is; a
+    pydantic type outside pydantic-core's own list, such as ``path_type`` from
+    STM's ``Path`` fields, must survive (#1206 review)."""
+    from pydantic import ValidationError
+
+    from memtomem_stm.proxy.config import CacheConfig
+    from memtomem_stm.utils.redact import exception_summary
+
+    with pytest.raises(ValidationError) as raised:
+        CacheConfig(db_path=123)  # type: ignore[arg-type]
+    assert exception_summary(raised.value) == "ValidationError: path_type"
 
 
 def _sqlite_error(tmp_path: Path, kind: str) -> Exception:

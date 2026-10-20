@@ -236,7 +236,7 @@ def _require_vector(value: object, *, provider: str, where: str) -> list[float]:
             )
         if not math.isfinite(component):
             raise ResponseShapeError(
-                f"{provider} embedding response: '{where}[{i}]' is {component}"
+                f"{provider} embedding response: '{where}[{i}]' is not a finite number"
             )
     return value
 
@@ -541,8 +541,9 @@ class EmbeddingScorer:
                 )
             if sorted(indices) != list(range(len(data))):
                 raise ResponseShapeError(
-                    f"openai embedding response: 'data[].index' is {sorted(indices)}, "
-                    f"not a permutation of 0..{len(data) - 1}"
+                    # The indices are the provider's values: described, not quoted.
+                    f"openai embedding response: 'data[].index' is not a permutation "
+                    f"of 0..{len(data) - 1}"
                 )
             data.sort(key=lambda x: x["index"])
         vectors: list[list[float]] = []
