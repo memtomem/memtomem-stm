@@ -757,6 +757,7 @@ async def test_daemon_adapter_end_to_end_over_loopback(tmp_path: Path) -> None:
         token=server._token,
         config_fingerprint=fingerprint,
         created_at=time.time(),
+        idle_shutdown_seconds=900.0,
     )
     adapter = DaemonLtmAdapter(config)
     try:

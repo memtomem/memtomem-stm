@@ -105,10 +105,12 @@ def test_handshake_round_trip_and_mode(tmp_path: Path):
         token="secret",
         config_fingerprint="fp",
         created_at=1700000000.0,
+        idle_shutdown_seconds=900.0,
     )
     data = discovery.read_handshake(path)
     assert data is not None
     assert data["pid"] == 4321 and data["port"] == 5555 and data["token"] == "secret"
+    assert data["idle_shutdown_seconds"] == 900.0
     if sys.platform != "win32":
         assert oct(path.stat().st_mode & 0o777) == "0o600"
 
@@ -145,6 +147,7 @@ def _put_handshake(data_dir: Path, fingerprint: str, pid: int) -> None:
         token="t",
         config_fingerprint=fingerprint,
         created_at=0.0,
+        idle_shutdown_seconds=900.0,
     )
 
 
@@ -597,6 +600,7 @@ def test_start_coexists_with_different_config_daemon(
         token="t",
         config_fingerprint="a-different-fp",
         created_at=0.0,
+        idle_shutdown_seconds=900.0,
     )
 
     state = {"spawns": 0}
@@ -785,7 +789,14 @@ async def test_request_respects_single_wall_clock_budget(monkeypatch: pytest.Mon
 def test_remove_handshake_if_owner(tmp_path: Path):
     path = discovery.handshake_path(tmp_path, "fp")
     discovery.write_handshake(
-        path, pid=10, host="127.0.0.1", port=1, token="t", config_fingerprint="fp", created_at=0.0
+        path,
+        pid=10,
+        host="127.0.0.1",
+        port=1,
+        token="t",
+        config_fingerprint="fp",
+        created_at=0.0,
+        idle_shutdown_seconds=900.0,
     )
     # Wrong owner → kept.
     discovery.remove_handshake_if_owner(path, pid=999, token="t")
@@ -1621,9 +1632,10 @@ def _probe_all(monkeypatch: pytest.MonkeyPatch, listening: bool = True) -> None:
 
 
 class TestDaemonForeignOrphans:
-    """`#517` — daemons orphaned under a stale fingerprint (config/protocol drift)
+    """`#517` — daemons under another config fingerprint (config/protocol drift)
     must be visible to ``status`` and stoppable via ``stop --all``, even when
-    pinned with ``idle_timeout_seconds=0`` (so they never self-clear).
+    pinned with ``idle_timeout_seconds=0`` (so they never self-clear). `#1195` —
+    ``status`` must not call one that exits on its own once idle stale.
 
     Liveness is two-factor (#519): the recorded pid must be alive *and* its
     endpoint must accept a connect. These tests mock both factors
@@ -1633,8 +1645,16 @@ class TestDaemonForeignOrphans:
     ``test_recycled_pid_skipped_by_connect_probe`` pins the recycled-pid gate."""
 
     def _write_foreign(
-        self, tmp_path: Path, fingerprint: str, pid: int, *, port: int = 4242
+        self,
+        tmp_path: Path,
+        fingerprint: str,
+        pid: int,
+        *,
+        port: int = 4242,
+        idle_shutdown_seconds: float | None = None,
     ) -> None:
+        # Defaults to a daemon that never exits when idle: the #517 case these
+        # tests were written for.
         discovery.write_handshake(
             discovery.handshake_path(tmp_path, fingerprint),
             pid=pid,
@@ -1643,6 +1663,7 @@ class TestDaemonForeignOrphans:
             token="secret-token",
             config_fingerprint=fingerprint,
             created_at=0.0,
+            idle_shutdown_seconds=idle_shutdown_seconds,
         )
 
     def test_status_reports_foreign(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1663,7 +1684,14 @@ class TestDaemonForeignOrphans:
         assert result.exit_code == 0, result.output
         info = json.loads(result.output)
         assert info["foreign"] == [
-            {"fingerprint": "foreignfp000000", "pid": 98765, "host": "127.0.0.1", "port": 4242}
+            {
+                "fingerprint": "foreignfp000000",
+                "pid": 98765,
+                "host": "127.0.0.1",
+                "port": 4242,
+                "idle_shutdown_seconds": None,
+                "exits_when_idle": False,
+            }
         ]
         assert "secret-token" not in result.output
 
@@ -1672,6 +1700,160 @@ class TestDaemonForeignOrphans:
         assert result.exit_code == 0, result.output
         assert "pid=98765 fp=foreignfp000000" in result.output
         assert "stop --all" in result.output
+
+    @staticmethod
+    def _status_text(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("NO_COLOR", "1")
+        result = CliRunner().invoke(_cli(), ["daemon", "status"])
+        assert result.exit_code == 0, result.output
+        return result.output.splitlines()
+
+    @staticmethod
+    def _status_json(monkeypatch: pytest.MonkeyPatch) -> dict:
+        import json
+
+        from click.testing import CliRunner
+
+        result = CliRunner().invoke(_cli(), ["daemon", "status", "--json"])
+        assert result.exit_code == 0, result.output
+
+        def strict(token: str) -> None:
+            raise AssertionError(f"status --json emitted non-standard JSON {token}")
+
+        return json.loads(result.output, parse_constant=strict)
+
+    def test_status_does_not_call_a_self_expiring_foreign_daemon_stale(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#1195: a daemon that shuts down once idle cannot outlive its users, so
+        the status names its idle timeout and does not tell the operator to stop
+        it — one still in use may belong to an STM process with a different
+        environment, which may only start another."""
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        self._write_foreign(tmp_path, "foreignfp000000", pid=98765, idle_shutdown_seconds=900.0)
+        _no_daemon(monkeypatch)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        _probe_all(monkeypatch)
+
+        (entry,) = self._status_json(monkeypatch)["foreign"]
+        assert (entry["idle_shutdown_seconds"], entry["exits_when_idle"]) == (900.0, True)
+
+        lines = self._status_text(monkeypatch)
+        i = lines.index(
+            "1 daemon(s) running under a different config: "
+            "pid=98765 fp=foreignfp000000 (exits after 900s idle)"
+        )
+        assert lines[i + 1] == "each exits on its own once idle; nothing to stop"
+        assert not any("stop --all" in line or "orphan" in line for line in lines)
+
+    @pytest.mark.parametrize(
+        ("recorded", "expected"),
+        [
+            # What a daemon writes when its idle shutdown is off (0 or inf).
+            ({"idle_shutdown_seconds": None}, (None, False)),
+            # A build that predates the field.
+            ({}, (None, None)),
+            # Values no daemon writes: a hand-edited or corrupted handshake.
+            ({"idle_shutdown_seconds": True}, (None, None)),
+            ({"idle_shutdown_seconds": "900"}, (None, None)),
+            ({"idle_shutdown_seconds": -1}, (None, None)),
+            ({"idle_shutdown_seconds": 0}, (None, None)),
+            ({"idle_shutdown_seconds": float("inf")}, (None, None)),
+            ({"idle_shutdown_seconds": float("nan")}, (None, None)),
+            # Valid JSON, but no float can hold it.
+            ({"idle_shutdown_seconds": 10**400}, (None, None)),
+        ],
+        ids=["never", "absent", "bool", "string", "negative", "zero", "inf", "nan", "huge-int"],
+    )
+    def test_status_keeps_the_cleanup_hint_for_a_daemon_that_may_linger(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        recorded: dict,
+        expected: tuple,
+    ):
+        """The #517 case — a daemon that never exits when idle, or whose handshake
+        does not say — keeps the warning and the `stop --all` hint, and the JSON
+        stays standard even when the handshake holds `Infinity`/`NaN`."""
+        import json
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        payload = {
+            "v": discovery.HANDSHAKE_VERSION,
+            "pid": 98765,
+            "host": "127.0.0.1",
+            "port": 4242,
+            "token": "secret-token",
+            "created_at": 0.0,
+            "config_fingerprint": "foreignfp000000",
+            **recorded,
+        }
+        discovery.handshake_path(tmp_path, "foreignfp000000").write_text(json.dumps(payload))
+        _no_daemon(monkeypatch)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        _probe_all(monkeypatch)
+        monkeypatch.setattr("memtomem_stm.cli.daemon_cmd._can_force_terminate", lambda: True)
+
+        (entry,) = self._status_json(monkeypatch)["foreign"]
+        assert (entry["idle_shutdown_seconds"], entry["exits_when_idle"]) == expected
+
+        label = "never exits when idle" if expected[1] is False else "idle timeout unknown"
+        lines = self._status_text(monkeypatch)
+        i = lines.index(
+            f"1 daemon(s) running under a different config: pid=98765 fp=foreignfp000000 ({label})"
+        )
+        assert lines[i + 1] == (
+            "if no running STM process uses them, stop them with `mms daemon stop --all` "
+            "(it stops every daemon listed above)"
+        )
+
+    def test_status_mixed_foreign_daemons_label_each_and_keep_the_hint(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """One lingering daemon is enough for the hint, and the hint says `--all`
+        also stops the self-expiring one listed beside it."""
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        self._write_foreign(tmp_path, "aaaa000000000000", pid=1001, idle_shutdown_seconds=0.5)
+        self._write_foreign(tmp_path, "bbbb000000000000", pid=2002)
+        _no_daemon(monkeypatch)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        _probe_all(monkeypatch)
+        monkeypatch.setattr("memtomem_stm.cli.daemon_cmd._can_force_terminate", lambda: True)
+
+        lines = self._status_text(monkeypatch)
+        i = lines.index(
+            "2 daemon(s) running under a different config: "
+            "pid=1001 fp=aaaa000000000000 (exits after 0.5s idle), "
+            "pid=2002 fp=bbbb000000000000 (never exits when idle)"
+        )
+        assert lines[i + 1] == (
+            "if no running STM process uses them, stop them with `mms daemon stop --all` "
+            "(it stops every daemon listed above)"
+        )
+
+    def test_status_hint_does_not_point_windows_at_stop_all(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """`stop --all` refuses to signal by pid where there is no POSIX SIGTERM
+        fallback, so the hint there names the way that works."""
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        self._write_foreign(tmp_path, "foreignfp000000", pid=98765)
+        _no_daemon(monkeypatch)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        _probe_all(monkeypatch)
+        monkeypatch.setattr("memtomem_stm.cli.daemon_cmd._can_force_terminate", lambda: False)
+
+        lines = self._status_text(monkeypatch)
+        i = lines.index(
+            "1 daemon(s) running under a different config: "
+            "pid=98765 fp=foreignfp000000 (never exits when idle)"
+        )
+        assert lines[i + 1] == (
+            "if no running STM process uses them, end those daemon processes from "
+            "Task Manager (`mms daemon stop --all` cannot signal them on Windows)"
+        )
 
     def test_status_skips_an_undecodable_foreign_handshake(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1832,7 +2014,10 @@ class TestDaemonForeignOrphans:
         result = CliRunner().invoke(_cli(), ["daemon", "status"])
         assert result.exit_code == 0, result.output
         # Sorted listing in the text warning, dead one absent.
-        assert "pid=1001 fp=aaaa000000000000, pid=3003 fp=cccc000000000000" in result.output
+        assert (
+            "pid=1001 fp=aaaa000000000000 (never exits when idle), "
+            "pid=3003 fp=cccc000000000000 (never exits when idle)"
+        ) in result.output
         assert "2002" not in result.output
 
     @pytest.mark.skipif(os.name == "nt", reason="POSIX SIGTERM fallback")
@@ -1898,7 +2083,14 @@ class TestDaemonForeignOrphans:
         assert info["state"] == "running"
         assert info["pid"] == 11
         assert info["foreign"] == [
-            {"fingerprint": "foreignfp000000", "pid": 98765, "host": "127.0.0.1", "port": 4242}
+            {
+                "fingerprint": "foreignfp000000",
+                "pid": 98765,
+                "host": "127.0.0.1",
+                "port": 4242,
+                "idle_shutdown_seconds": None,
+                "exits_when_idle": False,
+            }
         ]
         assert "secret-token" not in result.output
 
@@ -1938,7 +2130,14 @@ class TestDaemonForeignOrphans:
         # Endpoint accepting → reported (previously [] on Windows).
         _probe_all(monkeypatch, listening=True)
         assert daemon_cmd._live_foreign_daemons(STMConfig()) == [
-            {"fingerprint": "foreignfp000000", "pid": 98765, "host": "127.0.0.1", "port": 4242}
+            {
+                "fingerprint": "foreignfp000000",
+                "pid": 98765,
+                "host": "127.0.0.1",
+                "port": 4242,
+                "idle_shutdown_seconds": None,
+                "exits_when_idle": False,
+            }
         ]
         # Endpoint gone → still nothing (no false positive from the always-True pid).
         _probe_all(monkeypatch, listening=False)
@@ -2022,6 +2221,8 @@ class TestDaemonForeignOrphans:
                     "pid": os.getpid(),
                     "host": "127.0.0.1",
                     "port": port,
+                    "idle_shutdown_seconds": None,
+                    "exits_when_idle": False,
                 }
             ]
         finally:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import signal
 import subprocess
 import sys
@@ -1213,6 +1214,41 @@ async def test_idle_shutdown_stops_daemon(tmp_path: Path) -> None:
     await _await_handshake(cfg)
     await asyncio.wait_for(task, timeout=5.0)  # self-terminates on idle
     assert not _hs_path(cfg).exists()
+
+
+@pytest.mark.parametrize(
+    ("idle_timeout", "published"),
+    # Finite values large enough that the daemon cannot idle out mid-test.
+    [(30.0, 30.0), (900.0, 900.0), (0.0, None), (math.inf, None)],
+    ids=["finite", "default", "zero", "inf"],
+)
+async def test_handshake_publishes_when_the_daemon_exits_on_idle(
+    tmp_path: Path, idle_timeout: float, published: float | None
+) -> None:
+    """#1195: `mms daemon status` reads this to tell a foreign daemon that clears
+    itself from one that lingers. `inf` passes config validation but the idle
+    watcher never fires on it, so it publishes `null` like 0."""
+    cfg = _config(tmp_path)
+    cfg.daemon.idle_timeout_seconds = idle_timeout
+    server, task = await _start(cfg, engine=_engine_with_result())
+    try:
+        hs = read_handshake(_hs_path(cfg))
+        assert hs is not None
+        assert hs["idle_shutdown_seconds"] == published
+        # The value the watcher acts on is the one published.
+        assert server._idle_shutdown_seconds() == published
+    finally:
+        await _stop(cfg, task)
+
+
+async def test_idle_watch_returns_at_once_when_idle_shutdown_is_off(tmp_path: Path) -> None:
+    """`inf` takes the same no-watch exit as 0 rather than polling a comparison
+    that can never succeed."""
+    cfg = _config(tmp_path)
+    cfg.daemon.idle_timeout_seconds = math.inf
+    server = DaemonServer(cfg)
+    await asyncio.wait_for(server._idle_watch(), timeout=1.0)
+    assert not server._shutdown_event.is_set()
 
 
 async def test_hook_run_hook_skips_when_daemon_absent(

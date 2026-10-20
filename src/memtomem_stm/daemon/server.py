@@ -264,6 +264,7 @@ class DaemonServer:
             token=self._token,
             config_fingerprint=self._fingerprint,
             created_at=self._started_at,
+            idle_shutdown_seconds=self._idle_shutdown_seconds(),
         )
         self._handshake_written = True
         logger.info("STM daemon listening on %s:%d (pid=%d)", self._host, self._port, os.getpid())
@@ -1011,14 +1012,26 @@ class DaemonServer:
 
     # ── idle + signals ────────────────────────────────────────────────────
 
+    def _idle_shutdown_seconds(self) -> float | None:
+        """Idle seconds after which :meth:`_idle_watch` shuts down; ``None`` if never.
+
+        Published in the handshake so ``mms daemon status`` can tell a daemon
+        that clears itself from one that lingers (#1195), and read here so the
+        two cannot disagree. ``inf`` passes config validation but never
+        satisfies the elapsed-time comparison, so it is "never", like 0.
+        """
+        timeout = self._idle_timeout
+        return timeout if 0 < timeout < math.inf else None
+
     async def _idle_watch(self) -> None:
-        if self._idle_timeout <= 0:
+        timeout = self._idle_shutdown_seconds()
+        if timeout is None:
             return
         # Poll at half the timeout, floored low enough that sub-second
         # idle_timeout values (tests, aggressive resource configs) shut down
         # near the configured threshold instead of ~1s late, and capped so a
         # huge timeout still notices the shutdown event reasonably often.
-        interval = min(30.0, max(0.05, self._idle_timeout / 2))
+        interval = min(30.0, max(0.05, timeout / 2))
         while not self._shutdown_event.is_set():
             try:
                 await asyncio.wait_for(self._shutdown_event.wait(), timeout=interval)
@@ -1026,11 +1039,8 @@ class DaemonServer:
                 pass
             if self._shutdown_event.is_set():
                 return
-            if (
-                self._active_requests == 0
-                and time.monotonic() - self._last_request >= self._idle_timeout
-            ):
-                logger.info("daemon idle for %.0fs — shutting down", self._idle_timeout)
+            if self._active_requests == 0 and time.monotonic() - self._last_request >= timeout:
+                logger.info("daemon idle for %.0fs — shutting down", timeout)
                 self._shutdown_event.set()
                 return
 

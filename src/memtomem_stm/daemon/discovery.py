@@ -18,27 +18,38 @@ primitive — preventing a second *same-config* daemon is the (likewise
 fingerprint-keyed) lock's job (see :mod:`~memtomem_stm.daemon.locking`).
 Liveness for a *current-config* daemon is proven by a successful ``ping`` over
 the socket — not by the recorded ``pid`` — so a recycled PID can't be mistaken
-for the daemon. The foreign-orphan path (:func:`iter_foreign_handshakes`) can't
+for the daemon. The foreign-daemon path (:func:`iter_foreign_handshakes`) can't
 ``ping`` a daemon at an incompatible ``PROTOCOL_VERSION``, so it cross-checks the
 recorded pid against a bare TCP connect-probe to the endpoint (``is_pid_alive``
 *and* something still accepting) — a stale handshake naming a recycled pid fails
 the connect because its port is unbound. See
 :func:`~memtomem_stm.cli.daemon_cmd._live_foreign_daemons`.
 
-A config change (or a ``PROTOCOL_VERSION`` bump) leaves the old fingerprint's
-handshake behind as an orphan. No reader keys to it anymore, so it is harmless
-to *new* callers, and a daemon with a finite ``idle_timeout_seconds`` removes
-its own handshake on graceful teardown / idle timeout. Caveat: a daemon pinned
-with ``idle_timeout_seconds=0`` never idle-shuts-down, so after a fingerprint
-change it lingers and is not reachable by ``mms daemon stop`` (which keys to the
-*current* fingerprint) — ``mms daemon status`` reports such a foreign-fingerprint
-daemon and ``mms daemon stop --all`` terminates it (see
-:func:`iter_foreign_handshakes`).
+A handshake under another fingerprint is not necessarily stale. Processes on
+one machine can run with different ``MEMTOMEM_STM_*`` environments on purpose —
+an MCP-launched server and a shell hook, say — and each then keys to its own
+live daemon (#1195). A config change (or a ``PROTOCOL_VERSION`` bump) is the
+other way to get one: the old fingerprint's handshake stays behind for as long
+as its daemon runs, and a daemon with an idle shutdown removes it on teardown
+once nothing uses it. Caveat: a daemon whose idle shutdown is off
+(``idle_timeout_seconds`` 0 or ``inf``) never exits on its own, so it can
+outlive every caller of its fingerprint, and ``mms daemon stop`` (which keys
+to the *current* fingerprint) cannot reach it — ``mms daemon status`` reports
+every foreign-fingerprint daemon, with ``idle_shutdown_seconds`` saying whether
+it can linger (not whether anything still uses it), and ``mms daemon stop
+--all`` terminates them (see :func:`iter_foreign_handshakes`).
 
 File shape::
 
     {"v": 1, "pid": 1234, "host": "127.0.0.1", "port": 53412,
-     "token": "<hex>", "created_at": 1716600000.0, "config_fingerprint": "<sha>"}
+     "token": "<hex>", "created_at": 1716600000.0, "config_fingerprint": "<sha>",
+     "idle_shutdown_seconds": 900.0}
+
+``idle_shutdown_seconds`` is ``null`` when the daemon never shuts down on idle,
+and absent from handshakes written by builds that predate it. It was added
+without bumping :data:`HANDSHAKE_VERSION`: readers select fields with ``.get``,
+and a bump would make an older hook at the same fingerprint reject a newer
+daemon's handshake.
 """
 
 from __future__ import annotations
@@ -105,10 +116,10 @@ def config_fingerprint(config: STMConfig) -> str:
     treated as a *different config*: a hook and a daemon built at different
     :data:`~memtomem_stm.daemon.protocol.PROTOCOL_VERSION` values key to distinct
     handshake/lock paths and coexist instead of exchanging frames one side can't
-    parse (the stale one idle-times-out under a finite ``idle_timeout_seconds``;
-    a pinned ``idle_timeout_seconds=0`` daemon is reported by ``mms daemon
-    status`` and stopped by ``mms daemon stop --all`` — see the module docstring
-    and :func:`iter_foreign_handshakes`). This is the structural half of the
+    parse (the other one idle-times-out once unused under a finite
+    ``idle_timeout_seconds``; a pinned ``idle_timeout_seconds=0`` daemon is
+    reported by ``mms daemon status`` and stopped by ``mms daemon stop --all``
+    — see the module docstring and :func:`iter_foreign_handshakes`). This is the structural half of the
     version guard; the explicit per-frame ``v`` check is the belt-and-suspenders.
     """
     material = {
@@ -149,6 +160,7 @@ def write_handshake(
     token: str,
     config_fingerprint: str,
     created_at: float,
+    idle_shutdown_seconds: float | None,
 ) -> None:
     """Atomically publish the handshake file at ``0o600`` (token is sensitive)."""
     payload = {
@@ -159,6 +171,7 @@ def write_handshake(
         "token": token,
         "created_at": created_at,
         "config_fingerprint": config_fingerprint,
+        "idle_shutdown_seconds": idle_shutdown_seconds,
     }
     atomic_write_text(path, json.dumps(payload), mode=0o600)
 

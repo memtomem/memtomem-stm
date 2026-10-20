@@ -988,8 +988,8 @@ Commands:
   start    Spawn the daemon detached if one is not already running.
   status   Report pid/port/uptime/LTM warmth; accepts --json.
   restart  Stop this config's daemon, then start a fresh one.
-  stop     Ask a running daemon to shut down gracefully (--all also reaps
-           orphans under a stale fingerprint).
+  stop     Ask a running daemon to shut down gracefully (--all also stops
+           daemons under other config fingerprints).
   run      Run the long-lived daemon server loop.
 ```
 
@@ -1007,13 +1007,30 @@ parse could belong to a daemon that declined the graceful shutdown, so it
 exits 1 and points at `status` rather than inviting a replacement.
 
 Daemons are keyed by config, so `start`/`stop`/`restart` for one config never
-touch a daemon serving another config. The one escape hatch is `stop --all`:
-when a config change — or a `PROTOCOL_VERSION` bump, which is folded into the
-key — leaves an old daemon stranded under a now-stale fingerprint (most visibly
-one pinned with `daemon.idle_timeout_seconds=0`, which never self-clears),
-`mms daemon status` reports it and `mms daemon stop --all` SIGTERMs it. `--all`
-is opt-in because a live daemon under another config may be intentional. Foreign
-daemon detection combines process liveness with a protocol-neutral TCP
+touch a daemon serving another config. `mms daemon status` lists every live
+daemon under a different config fingerprint, and a different fingerprint does
+not mean the daemon is stale. Processes on one machine can run with different
+`MEMTOMEM_STM_*` environments — an MCP client's server entry and the shell or
+hook, say — and each keeps its own daemon. So `status` labels each one with
+whether it can outlive the processes using it. The label does not say whether
+anything uses it now:
+
+- `exits after 900s idle` — it shuts itself down once nothing has used it for
+  that long. Nothing to do: unused, it goes away by itself, and stopping one
+  that an STM process still uses may only make that process start another.
+- `never exits when idle` — `daemon.idle_timeout_seconds` is `0` (or `inf`).
+  After a config change or a `PROTOCOL_VERSION` bump (folded into the key),
+  such a daemon can keep running when nothing uses its fingerprint any more.
+- `idle timeout unknown` — the handshake does not say, usually because an
+  earlier build that did not publish it started the daemon.
+
+Only the last two get the warning and the cleanup hint: if no running STM
+process uses them, `mms daemon stop --all` SIGTERMs them — and every other
+daemon in the list, so it stays opt-in. On Windows `stop --all` cannot signal by
+pid, and the hint names Task Manager instead. In `status --json`, each `foreign`
+entry carries `idle_shutdown_seconds` (a number, or `null` when there is none or
+it is unknown) and `exits_when_idle` (`true`, `false`, or `null` when unknown).
+Foreign daemon detection combines process liveness with a protocol-neutral TCP
 connect-probe, so older protocol generations are reported on supported POSIX
 and Windows hosts without sending them an incompatible frame.
 
