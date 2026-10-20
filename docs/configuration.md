@@ -204,7 +204,9 @@ export MEMTOMEM_STM_HOOK_SURFACE_TOOLS=read,grep,glob,shell
 
 `fallback=skip` returns `{}` immediately when the daemon is unavailable.
 `fallback=cold` runs the older in-process path, which can pay LTM startup cost
-inside the hook call. Surfacing (LTM context injection for read-like
+inside the hook call. Neither applies when the daemon answers that it is busy
+or that the request ran out of time: that call surfaces nothing, with no
+fallback and no spawn request. Surfacing (LTM context injection for read-like
 built-ins) is the only capability that ports to non-Claude hosts, and each
 host carries its own runtime caveat — see
 [docs/cli.md → `mms hook install`](cli.md#install--uninstall--per-host-registration)

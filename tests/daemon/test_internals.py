@@ -786,6 +786,48 @@ async def test_request_respects_single_wall_clock_budget(monkeypatch: pytest.Mon
     assert elapsed < 1.5  # bounded by the 0.2 budget, not multiplied per step
 
 
+_SURFACE_OUTPUT = {"hookSpecificOutput": {"hookEventName": "PostToolUse"}}
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [
+        ({"v": protocol.PROTOCOL_VERSION, "ok": True, "output": _SURFACE_OUTPUT}, _SURFACE_OUTPUT),
+        # A live daemon that turned the call away: nothing to inject, and
+        # nothing for the caller to spawn or redo cold (#1198).
+        ({"v": protocol.PROTOCOL_VERSION, "ok": False, "status": "busy"}, {}),
+        ({"v": protocol.PROTOCOL_VERSION, "ok": False, "status": "expired"}, {}),
+        ({"v": protocol.PROTOCOL_VERSION, "ok": False, "status": "unavailable"}, None),
+        # Malformed acknowledgements are not a turn-away; they keep the
+        # recovery path.
+        ({"v": protocol.PROTOCOL_VERSION, "ok": True, "status": "busy"}, None),
+        ({"v": protocol.PROTOCOL_VERSION, "status": "expired"}, None),
+        ({"v": protocol.PROTOCOL_VERSION, "ok": False, "status": "invalid"}, None),
+        ({"v": protocol.PROTOCOL_VERSION, "ok": False, "error": "unsupported"}, None),
+        (None, None),
+    ],
+)
+async def test_surface_maps_each_daemon_reply(
+    monkeypatch: pytest.MonkeyPatch, reply: dict | None, expected: dict | None
+) -> None:
+    from memtomem_stm.cli.hook_adapter import ClaudeHookAdapter
+    from memtomem_stm.daemon import client
+
+    sent: list[str] = []
+
+    async def _request(hs, op, payload, **kwargs):
+        sent.append(op)
+        return reply
+
+    monkeypatch.setattr(client, "_live_handshake_candidate", lambda config: {"token": "t"})
+    monkeypatch.setattr(client, "_request", _request)
+    call = ClaudeHookAdapter().parse(
+        {"hook_event_name": "PostToolUse", "tool_name": "Read", "tool_response": "x"}
+    )
+    assert await client.surface(STMConfig(), call, timeout=1.0) == expected
+    assert sent == [protocol.OP_SURFACE]
+
+
 def test_remove_handshake_if_owner(tmp_path: Path):
     path = discovery.handshake_path(tmp_path, "fp")
     discovery.write_handshake(
