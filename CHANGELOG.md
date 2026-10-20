@@ -82,6 +82,14 @@ changes inline only. See the deprecation policy in
   than 64 connections opened at the same moment loses its excess the same way.
   Requests past `daemon.max_pending_requests` still get `busy`. The `ping`
   queue snapshot (`mms daemon status --json`) gains `pre_auth_evictions`.
+- **The hook no longer treats a busy daemon as a missing one** (#1198).
+  When the daemon turned a surfacing request away as `busy` (over
+  `daemon.max_pending_requests`) or `expired` (out of deadline), `mms hook`
+  handled it like an unreachable daemon: it asked for a spawn, and with
+  `hook.fallback = "cold"` it ran the search again in-process, adding load
+  while the daemon was already overloaded. **Behavior change**: those two
+  replies now give the hook output `{}`, with no spawn request and no cold
+  fallback. Other daemon errors and an unreachable daemon behave as before.
 
 ## [0.6.4] — 2026-10-18
 

@@ -153,7 +153,14 @@ async def surface(
 
     Sends the call's host-agnostic wire form (``to_wire``) so the daemon needs no
     host knowledge. Returns the hook-output dict, or ``None`` if the daemon is
-    unavailable/stale/slow/version-mismatched (caller degrades)."""
+    unavailable/stale/slow/version-mismatched (caller degrades).
+
+    A daemon that answers ``busy`` or ``expired`` is alive and turned the call
+    away, so this returns ``{}`` — nothing to inject — rather than ``None``. The
+    hook treats ``None`` as unreachable: it asks for a spawn and, with
+    ``hook.fallback = "cold"``, redoes the search in-process, which adds load
+    at the moment the daemon reported too much, or starts after the deadline
+    has already gone (#1198)."""
     hs = _live_handshake_candidate(config)
     if hs is None:
         return None
@@ -165,6 +172,8 @@ async def surface(
     )
     if resp is not None and resp.get("ok") and isinstance(resp.get("output"), dict):
         return resp["output"]
+    if resp is not None and resp.get("status") in ("busy", "expired"):
+        return {}
     return None
 
 

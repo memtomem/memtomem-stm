@@ -49,6 +49,7 @@ from memtomem_stm.cli.hook_cmd import (
 )
 from memtomem_stm.cli.proxy import cli
 from memtomem_stm.config import HookCompressionConfig
+from memtomem_stm.daemon.protocol import OP_SURFACE, PROTOCOL_VERSION
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.engine import SurfacingEngine
 from helpers import set_home
@@ -794,6 +795,49 @@ def test_daemon_unavailable_cold_fallback(monkeypatch: pytest.MonkeyPatch):
     )
     out = asyncio.run(_run_hook(_canonical(_READ_PAYLOAD)))
     assert out == sentinel
+
+
+@pytest.mark.parametrize(
+    ("status", "turned_away"),
+    [("busy", True), ("expired", True), ("unavailable", False)],
+)
+def test_daemon_turning_a_call_away_is_a_skip_not_an_outage(
+    monkeypatch: pytest.MonkeyPatch, status: str, turned_away: bool
+):
+    # A daemon that answers busy or expired is alive. Treating it as
+    # unreachable asked for a spawn and, with fallback=cold, redid the search
+    # in-process -- more load at the moment the daemon reported too much
+    # (#1198). ``unavailable`` keeps the outage path as the positive control.
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__USE_DAEMON", "1")
+    monkeypatch.setenv("MEMTOMEM_STM_HOOK__FALLBACK", "cold")
+    monkeypatch.delenv("MEMTOMEM_STM_HOOK__AUTO_SPAWN", raising=False)
+    sent: list[str] = []
+
+    async def _request(hs, op, payload, **kwargs):
+        sent.append(op)
+        return {"v": PROTOCOL_VERSION, "ok": False, "status": status}
+
+    monkeypatch.setattr(
+        "memtomem_stm.daemon.client._live_handshake_candidate", lambda config: {"token": "t"}
+    )
+    monkeypatch.setattr("memtomem_stm.daemon.client._request", _request)
+    spawns: list[int] = []
+    monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", lambda cfg: spawns.append(1))
+    sentinel = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "cold"}}
+    cold = AsyncMock(return_value=sentinel)
+    monkeypatch.setattr("memtomem_stm.cli.hook_cmd.run_surfacing_hook", cold)
+
+    out = asyncio.run(_run_hook(_canonical(_READ_PAYLOAD)))
+
+    assert sent == [OP_SURFACE]
+    if turned_away:
+        assert out == {}
+        assert spawns == []
+        cold.assert_not_called()
+    else:
+        assert out == sentinel
+        assert spawns == [1]
+        cold.assert_awaited_once()
 
 
 # ── Bash output compression (P1a — updatedToolOutput) ─────────────────────────
