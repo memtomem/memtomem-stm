@@ -42,7 +42,7 @@ changes inline only. See the deprecation policy in
   longer merged with events Core did not label. The reranker model ID is
   shown only as `reranker reported`. Stored values are unchanged.
 - **Compression feedback is accepted only for a tool this proxy serves**
-  (#1192).
+  (#1192, #1194).
   The compression feedback DB is user-wide, and `stm_compression_stats` showed
   the tool name of every stored report as the client sent it, so one session
   could put arbitrary text in front of another. **Behavior change**:
