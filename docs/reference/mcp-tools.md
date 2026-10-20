@@ -13,7 +13,7 @@ All connected upstream tools are added as `{prefix}__{tool}`.
 | `stm_proxy_select_chunks` | `key`, `sections[]` | Retrieve selected TOC sections |
 | `stm_proxy_read_more` | `key`, `offset?=0`, `limit?` | Continue a progressive response |
 | `stm_surfacing_feedback` | `surfacing_id`, `rating?`, `memory_id?`, `ratings?` | Rate surfaced memories. Use either the legacy `rating`/`memory_id` shape or batched `ratings`, never both. |
-| `stm_compression_feedback` | `server`, `tool`, `missing`, `kind="other"`, `trace_id?` | Report missing compressed information |
+| `stm_compression_feedback` | `server`, `tool`, `missing`, `kind="other"`, `trace_id?` | Report missing compressed information. `server` and `tool` are the upstream names (not `prefix__tool`) of a tool this proxy serves; other reports are refused. |
 
 ## Full tool metadata
 

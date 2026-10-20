@@ -41,6 +41,18 @@ changes inline only. See the deprecation policy in
   scales" lines. A literal `unknown` from Core is counted there too, no
   longer merged with events Core did not label. The reranker model ID is
   shown only as `reranker reported`. Stored values are unchanged.
+- **Compression feedback is accepted only for a tool this proxy serves**
+  (#1192, #1194).
+  The compression feedback DB is user-wide, and `stm_compression_stats` showed
+  the tool name of every stored report as the client sent it, so one session
+  could put arbitrary text in front of another. **Behavior change**:
+  `stm_compression_feedback` refuses a report unless `server` and `tool` name
+  an upstream tool this server has registered (the upstream names, not the
+  client-side `prefix__tool` name), and the refusal does not repeat the
+  values. Reports already stored are kept; in `stm_compression_stats` a tool
+  name outside the MCP tool-name grammar is counted under `(unrecognized)`,
+  and a nonconforming `tool` filter is shown as `(unrecognized)` in the
+  "filtered by" line.
 
 ## [0.6.4] — 2026-10-18
 

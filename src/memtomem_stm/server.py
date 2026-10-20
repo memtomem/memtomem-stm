@@ -9,9 +9,9 @@ import json
 import logging
 import os
 import re
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
@@ -50,6 +50,7 @@ from memtomem_stm.proxy.metadata_recovery import (
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
 from memtomem_stm.proxy.selection_log import aggregate_selection_log, rotation_lock
+from memtomem_stm.proxy.tool_name_budget import is_conforming_tool_name
 from memtomem_stm.surfacing.engine import SurfacingEngine
 from memtomem_stm.surfacing.mcp_client import render_score_scale
 from memtomem_stm.surfacing.config import holdout_startup_warnings
@@ -159,6 +160,11 @@ class STMContext:
     startup (#611): the server is running env/default config — typically with
     the proxy off — and only a buried stderr warning says why. Surfaced by
     ``stm_proxy_health`` so the failure is visible from inside the client."""
+    registered_proxy_tools: Mapping[str, ProxyToolInfo] = field(default_factory=dict)
+    """The lifespan's own registry of proxied tools it registered, keyed by
+    advertised name (a live view, not a copy). It is the set a client can call:
+    re-advertisement removes an entry only once the tool is gone. Compression
+    feedback is accepted only for a tool listed here (#1192)."""
 
 
 # mcp 2.0 reordered the parameters: 1.x was ``Context[ServerSessionT,
@@ -693,6 +699,7 @@ async def app_lifespan(server: MCPServer) -> AsyncIterator[STMContext]:
             compression_feedback_tracker=compression_feedback_tracker,
             progressive_reads_tracker=progressive_reads_tracker,
             proxy_config_error=proxy_config_error,
+            registered_proxy_tools=registered_proxy_tools,
         )
         yield ctx
     finally:
@@ -2650,7 +2657,9 @@ async def stm_compression_feedback(
 
     Args:
         server: Upstream server name (e.g. ``"docfix"``).
-        tool:   Upstream tool name (e.g. ``"get_document"``).
+        tool:   Upstream tool name (e.g. ``"get_document"``), not the
+                prefixed name the client lists. The pair must name a tool
+                this proxy currently serves; other reports are refused.
         missing: Free-form description of what was missing
                  (e.g. ``"example code for Query.select"``).
         kind:   One of ``"truncated"``, ``"missing_example"``,
@@ -2663,6 +2672,20 @@ async def stm_compression_feedback(
     app = _get_ctx(ctx)
     if app.compression_feedback_tracker is None:
         return "Compression feedback tracking is not enabled."
+    # The feedback DB is user-wide and its tool names are shown back by
+    # ``stm_compression_stats``, so an arbitrary name would be text one session
+    # hands to another (#1192). Only a tool this server registered is accepted,
+    # and the refusal does not repeat what was sent. Empty values fall through
+    # to ``record``'s own "required" error.
+    if (
+        server
+        and tool
+        and not any(
+            info.server == server and info.original_name == tool
+            for info in app.registered_proxy_tools.values()
+        )
+    ):
+        return "Error: server and tool must name an upstream tool this proxy serves"
     return app.compression_feedback_tracker.record(
         server=server,
         tool=tool,
@@ -2684,7 +2707,7 @@ async def stm_compression_stats(
 ) -> str:
     """Show compression feedback counts.
 
-    Reports the total number of ``stm_compression_feedback`` calls, the
+    Reports the total number of recorded ``stm_compression_feedback`` reports, the
     breakdown by ``kind``, and (when no tool filter is passed) the
     breakdown by tool.
 
@@ -2714,14 +2737,20 @@ async def stm_compression_stats(
             lines.append(f"  {kind_name}: {count}")
 
     if not tool and stats["by_tool"]:
+        # Rows stored before #1192 hold whatever a client sent; a name outside
+        # the MCP tool-name grammar is counted, not shown. The bucket label is
+        # itself outside the grammar, so no real tool can share it.
+        by_tool: dict[str, int] = {}
+        for tool_name, count in stats["by_tool"].items():
+            key = tool_name if is_conforming_tool_name(tool_name) else "(unrecognized)"
+            by_tool[key] = by_tool.get(key, 0) + count
         lines.append("\nBy tool:")
-        for tool_name, count in sorted(
-            stats["by_tool"].items(), key=lambda kv: kv[1], reverse=True
-        ):
+        for tool_name, count in sorted(by_tool.items(), key=lambda kv: kv[1], reverse=True):
             lines.append(f"  {tool_name}: {count}")
 
     if tool:
-        lines.append(f"\n(filtered by tool: {tool})")
+        shown = tool if is_conforming_tool_name(tool) else "(unrecognized)"
+        lines.append(f"\n(filtered by tool: {shown})")
 
     return "\n".join(lines)
 
