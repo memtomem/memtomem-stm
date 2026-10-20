@@ -526,6 +526,15 @@ class STMConfig(BaseSettings):
     backups), file ``0o600`` / parent ``0o700`` per the data-at-rest
     convention. ``None`` (default) keeps stderr-only logging. Stored raw;
     ``expanduser()`` happens at the use site (like ``data_dir``)."""
+    log_dependencies: bool = False
+    """Let records below WARNING from loggers outside ``memtomem_stm`` — the
+    MCP SDK, ``httpx``/``httpx2``, ``httpcore``, ``urllib3`` and the rest —
+    through to the server's and the daemon's log handlers (#1086). Off by
+    default because those lines carry text no STM call site rendered: upstream
+    URLs with their query strings, the MCP session id, response headers and
+    reason phrases, exception text, and whole MCP messages in both directions
+    (tool arguments and results). Set via ``MEMTOMEM_STM_LOG_DEPENDENCIES``;
+    read at startup, so a running daemon keeps the value it started with."""
     teardown_watchdog_seconds: float = Field(default=60.0, ge=0.0, allow_inf_nan=False)
     """Ceiling on shutdown before the process exits the hard way (#906), set via
     ``MEMTOMEM_STM_TEARDOWN_WATCHDOG_SECONDS``; ``0`` disables the backstop.

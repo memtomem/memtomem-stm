@@ -48,6 +48,7 @@ Status meanings:
 |---|---|---|---|---|
 | `MEMTOMEM_STM_LOG_LEVEL` | `DEBUG / INFO / WARNING / ERROR / CRITICAL` | `WARNING` | Process log level. | Startup |
 | `MEMTOMEM_STM_LOG_FILE` | path or `null` | — | Optional rotating log file in addition to stderr. | Startup |
+| `MEMTOMEM_STM_LOG_DEPENDENCIES` | boolean | `false` | Let INFO/DEBUG records from loggers outside `memtomem_stm` (MCP SDK, HTTP clients) reach the server's and daemon's logs; they can carry upstream URLs with query strings, session ids and whole MCP messages. | Startup |
 | `MEMTOMEM_STM_TEARDOWN_WATCHDOG_SECONDS` | finite non-negative float | `60.0` | Ceiling on shutdown before the process exits the hard way; `0` disables the backstop. | Startup |
 | `MEMTOMEM_STM_PARENT_LIVENESS_POLL_SECONDS` | finite non-negative float | `0.0` | Poll interval for the parent-liveness backstop, which shuts down when the client goes away without closing stdin; `0` disables it. POSIX-only. | Startup |
 | `MEMTOMEM_STM_PARENT_LIVENESS_GRACE_SECONDS` | finite non-negative float | `900.0` | How long the connection must be silent before that backstop acts on a reparent; `0` acts on the reparent alone. | Startup |

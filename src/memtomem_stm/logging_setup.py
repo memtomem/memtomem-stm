@@ -20,6 +20,13 @@ that text can quote operator input a call site never saw — a pydantic
 handler STM installs formats through :class:`DisplayEscapingFormatter`, which
 escapes the exception and stack text line by line the way call sites escape
 values (#1173).
+
+Below ``WARNING``, the same handlers also refuse every record that does not
+come from STM's own ``memtomem_stm`` logger tree (:class:`DependencyRecordFilter`,
+#1086). The MCP SDK and the HTTP clients under it log at INFO and DEBUG what no
+STM call site rendered: the upstream URL with its query string on every
+request, the MCP session id, response headers and whole MCP messages. Those
+lines come back only when ``STMConfig.log_dependencies`` is set.
 """
 
 from __future__ import annotations
@@ -50,6 +57,41 @@ LOG_FILE_MAX_BYTES = 2 * 1024 * 1024
 LOG_FILE_BACKUP_COUNT = 3
 """2 MiB × (1 current + 3 backups) caps the worst-case footprint at 8 MiB
 while keeping enough history to cover a crash discovered a few days late."""
+
+
+STM_LOGGER_NAME = "memtomem_stm"
+"""Root of the logger tree whose records pass STM's handlers at every level."""
+
+
+class DependencyRecordFilter(logging.Filter):
+    """Pass a record below ``WARNING`` only if STM's own code logged it (#1086).
+
+    Third-party loggers — the MCP SDK (``mcp.*``, plus the top-level ``client``
+    logger its session module uses), ``httpx``/``httpx2``, ``httpcore*``,
+    ``urllib3`` under the OTLP exporter, and whatever else a dependency names —
+    render their own text at INFO and DEBUG: an upstream URL with its query
+    string, the MCP session id, response headers and reason phrases, exception
+    text, and complete MCP messages in both directions. An allowlist rather
+    than a list of those loggers, because a list is a coverage claim the next
+    dependency falsifies. ``WARNING`` and above pass from every logger.
+
+    This is a handler filter, not a logger level: dependency loggers keep
+    their levels, and a handler someone else installs (an embedding host,
+    pytest's capture) still receives the records. It protects only the
+    handlers STM installs, and only records that propagate to them.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.WARNING:
+            return True
+        name = record.name
+        return name == STM_LOGGER_NAME or name.startswith(STM_LOGGER_NAME + ".")
+
+
+def _screen_dependencies(handler: logging.Handler, dependency_records: bool) -> logging.Handler:
+    if not dependency_records:
+        handler.addFilter(DependencyRecordFilter())
+    return handler
 
 
 class DisplayEscapingFormatter(logging.Formatter):
@@ -96,15 +138,18 @@ def _escape_lines(text: str) -> str:
     return "\n".join(_disp(line) for line in text.split("\n"))
 
 
-def stderr_handler(fmt: str = STDERR_FORMAT) -> logging.Handler:
-    """A ``sys.stderr`` handler with the escaping formatter.
+def stderr_handler(
+    fmt: str = STDERR_FORMAT, *, dependency_records: bool = False
+) -> logging.Handler:
+    """A ``sys.stderr`` handler with the escaping formatter and, unless
+    *dependency_records*, the :class:`DependencyRecordFilter`.
 
     Binds the stream at creation, as ``logging.StreamHandler()`` and the
     ``basicConfig(format=...)`` calls it replaces always did.
     """
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(DisplayEscapingFormatter(fmt))
-    return handler
+    return _screen_dependencies(handler, dependency_records)
 
 
 class _CurrentStderrHandler(logging.StreamHandler):  # type: ignore[type-arg]
@@ -141,11 +186,12 @@ def configure_hook_logging() -> None:
     per record — and only adds the formatter. The root logger's level is left
     as it is (no ``level=``): a process that set it to ERROR before running
     the hook keeps that gating, as it did under the last resort. Same no-op
-    rule as ``basicConfig`` without ``force``.
+    rule as ``basicConfig`` without ``force``. The dependency filter is
+    attached too, for uniformity; at this handler's level it never decides.
     """
     handler = _CurrentStderrHandler(level=logging.WARNING)
     handler.setFormatter(DisplayEscapingFormatter(HOOK_STDERR_FORMAT))
-    logging.basicConfig(handlers=[handler])
+    logging.basicConfig(handlers=[_screen_dependencies(handler, False)])
 
 
 def configure_stderr_logging(
@@ -156,7 +202,9 @@ def configure_stderr_logging(
     Same no-op rule as ``basicConfig`` without ``force``: a root logger that
     already has handlers (an embedding process, pytest's capture) is left
     alone, so the early-failure sites that call this keep their pre-#1173
-    behavior of never replacing a host's logging.
+    behavior of never replacing a host's logging. The handler's own level is
+    ``NOTSET``, so the dependency filter is what keeps a dependency logger set
+    to DEBUG off it; there is no config yet to opt out with.
     """
     logging.basicConfig(level=level, handlers=[stderr_handler(fmt)], force=force)
 
@@ -216,8 +264,10 @@ def open_private_log_handler(
     *,
     max_bytes: int = LOG_FILE_MAX_BYTES,
     backup_count: int = LOG_FILE_BACKUP_COUNT,
+    dependency_records: bool = False,
 ) -> logging.Handler:
-    """Rotating 0o600 file handler at *path*, parent created 0o700.
+    """Rotating 0o600 file handler at *path*, parent created 0o700, with the
+    :class:`DependencyRecordFilter` unless *dependency_records*.
 
     Raises ``OSError`` when the file or directory cannot be created — the
     caller decides whether that is fatal (daemon detached mode: yes, the file
@@ -229,7 +279,7 @@ def open_private_log_handler(
         resolved, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
     )
     handler.setFormatter(DisplayEscapingFormatter(FILE_FORMAT))
-    return handler
+    return _screen_dependencies(handler, dependency_records)
 
 
 def configure_server_logging(config: STMConfig) -> Path | None:
@@ -240,12 +290,17 @@ def configure_server_logging(config: STMConfig) -> Path | None:
     diagnostic aid must not take the server down with it; the failure is
     logged to stderr instead).
     """
-    handlers: list[logging.Handler] = [stderr_handler(STDERR_FORMAT)]
+    dependency_records = config.log_dependencies
+    handlers: list[logging.Handler] = [
+        stderr_handler(STDERR_FORMAT, dependency_records=dependency_records)
+    ]
     active_path: Path | None = None
     file_error: str | None = None
     if config.log_file is not None:
         try:
-            handlers.append(open_private_log_handler(config.log_file))
+            handlers.append(
+                open_private_log_handler(config.log_file, dependency_records=dependency_records)
+            )
             active_path = config.log_file.expanduser()
         except OSError as exc:
             file_error = str(exc)  # logged once basicConfig installs stderr

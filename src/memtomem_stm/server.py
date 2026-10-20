@@ -89,7 +89,10 @@ from memtomem_stm.utils.teardown_watchdog import TeardownWatchdog
 from memtomem_stm.utils.json_out import escape_lone_surrogates, require_utf8_identifier
 from memtomem_stm.utils.redact import exception_summary
 
-logger = logging.getLogger(__name__)
+# Named, not ``__name__``: under ``python -m memtomem_stm.server`` that is
+# ``__main__``, and the handlers pass records below WARNING only from the
+# ``memtomem_stm`` tree (#1086).
+logger = logging.getLogger("memtomem_stm.server")
 
 # Per-step ceilings on the teardown. Each is far above a healthy stop() and far
 # below ``teardown_watchdog_seconds``, so the watchdog stays what it is meant to

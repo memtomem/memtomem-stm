@@ -13,6 +13,18 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **Dependency INFO/DEBUG log lines no longer reach STM's logs** (#1086).
+  At `MEMTOMEM_STM_LOG_LEVEL=INFO`, `httpx2` logged every upstream request with
+  its full URL, so a `?token=` in an upstream `url` reached stderr and the log
+  file once per request, and the MCP SDK logged the session id; at `DEBUG`,
+  `httpcore2` added response headers and the SDK whole MCP messages.
+  **Behavior change**: below `WARNING`, the server's, the daemon's and the
+  hook's handlers pass only records from loggers under `memtomem_stm`. Set
+  `MEMTOMEM_STM_LOG_DEPENDENCIES=true` to get the dependency lines back in the
+  server's and the daemon's logs; the hook and the stderr line printed when
+  the configuration itself fails to load always filter them.
+  Records at `WARNING` and above are unchanged. `python -m memtomem_stm.server`
+  now logs under `memtomem_stm.server` instead of `__main__`.
 - **Surfacing stats show only the decisions and ratings STM records** (#1091,
   #1190).
   `mms stats`, the `feedback_summary` of `mms health --json` / `mms doctor
