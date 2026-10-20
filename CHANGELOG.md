@@ -13,7 +13,8 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
-- **Logged tracebacks no longer repeat exception messages** (#1086).
+- **Logged tracebacks no longer repeat exception messages** (#1086,
+  #1205).
   A site that logged an exception with its traceback printed the exception's
   text on the traceback's last line, and an upstream, the LTM server, an LLM
   provider or the MCP SDK writes that text: an httpx `HTTPStatusError`, for

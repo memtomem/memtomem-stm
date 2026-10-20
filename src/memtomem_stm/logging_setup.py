@@ -169,7 +169,8 @@ def render_withheld_traceback(exc: BaseException, tb: Any = _OWN_TRACEBACK) -> s
     traceback, at most 1000 and as many as the line budget still holds with
     room for the exception's own line (the raise site stays), 32 chained exceptions per chain, 15
     members and 10 levels of exception groups, 256 exceptions and 2000 lines in
-    all, each cut marked. If any step raises, the whole result is
+    all, each cut marked (the ``[traceback truncated]`` marker is one line
+    past the 2000). If any step raises, the whole result is
     :data:`WITHHELD_RENDER_FAILED`; only ``KeyboardInterrupt`` and
     ``SystemExit`` pass through.
     """
