@@ -215,10 +215,14 @@ def _configure_logging(config: STMConfig, *, detached: bool) -> None:
     """
     level = getattr(logging, config.log_level, logging.WARNING)
     handler: logging.Handler
+    dependency_records = config.log_dependencies
     if detached:
-        handler = open_private_log_handler((config.data_dir / "stm-daemon.log").expanduser())
+        handler = open_private_log_handler(
+            (config.data_dir / "stm-daemon.log").expanduser(),
+            dependency_records=dependency_records,
+        )
     else:
-        handler = stderr_handler(FILE_FORMAT)
+        handler = stderr_handler(FILE_FORMAT, dependency_records=dependency_records)
     logging.basicConfig(level=level, handlers=[handler], force=True)
 
 

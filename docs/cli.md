@@ -1340,6 +1340,22 @@ the path is writable, or a `stderr only — configured log file <path> is not
 writable` warning when it isn't. If the file can't be opened at startup
 (read-only path), the server logs a warning to stderr and keeps running.
 
+Below `WARNING`, those handlers pass only STM's own records (loggers under
+`memtomem_stm`). INFO and DEBUG lines from the MCP SDK and the HTTP clients
+under it (`mcp.*`, `httpx2`, `httpcore2`, `urllib3`, …) are dropped, because
+they carry text STM never rendered: the upstream URL with its query string on
+every request, the MCP session id, response headers and reason phrases,
+exception text, and whole MCP messages in both directions (#1086). To debug a
+transport with them, opt in for that run:
+
+```bash
+export MEMTOMEM_STM_LOG_LEVEL=DEBUG
+export MEMTOMEM_STM_LOG_DEPENDENCIES=true   # dependency INFO/DEBUG lines too
+```
+
+The setting is read at startup, so restart a running daemon for it to apply.
+Records at `WARNING` and above pass from every logger either way.
+
 Every handler STM installs (stderr, the file, the daemon's log, `mms hook`'s
 stderr) escapes an attached traceback line by line: a bidi control, an escape
 sequence or another C0/C1 character inside it renders as `\uXXXX`, the same
