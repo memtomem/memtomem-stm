@@ -42,7 +42,7 @@ changes inline only. See the deprecation policy in
   longer merged with events Core did not label. The reranker model ID is
   shown only as `reranker reported`. Stored values are unchanged.
 - **`mms daemon status` no longer calls every daemon under another config
-  orphaned** (#1195).
+  orphaned** (#1195, #1196).
   It listed each live daemon under a different config fingerprint as
   "orphaned by a config/protocol change" and said to stop them with `mms daemon
   stop --all`. When the MCP-launched server and the shell or hook have
