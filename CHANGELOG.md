@@ -13,7 +13,8 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
-- **Dependency INFO/DEBUG log lines no longer reach STM's logs** (#1086).
+- **Dependency INFO/DEBUG log lines no longer reach STM's logs** (#1086,
+  #1203).
   At `MEMTOMEM_STM_LOG_LEVEL=INFO`, `httpx2` logged every upstream request with
   its full URL, so a `?token=` in an upstream `url` reached stderr and the log
   file once per request, and the MCP SDK logged the session id; at `DEBUG`,
