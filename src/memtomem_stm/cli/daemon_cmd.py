@@ -7,9 +7,10 @@ proxy surfacing, avoiding one private LTM child per client. Subcommands:
   a detached spawn via ``--detached``).
 - ``start``   — spawn the daemon detached if one isn't already running.
 - ``stop``    — ask a running daemon to shut down (SIGTERM by pid as fallback);
-  ``--all`` also reaps daemons orphaned under a stale config fingerprint.
+  ``--all`` also stops live daemons under any other config fingerprint.
 - ``status``  — running/stale/stopped, with pid/port/uptime/LTM warmth; also
-  surfaces live daemons left under a different (stale) config fingerprint.
+  lists live daemons under a different config fingerprint and whether each
+  exits on its own once idle.
 - ``restart`` — ``stop`` then ``start``.
 
 Color helpers are defined locally (not imported from ``cli.proxy``) so this
@@ -22,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import signal
 import time
@@ -109,15 +111,46 @@ def _as_float(value: Any, default: float) -> float:
         return default
 
 
+def _idle_shutdown(raw: dict[str, Any]) -> tuple[float | None, bool | None]:
+    """A foreign handshake's ``idle_shutdown_seconds`` as ``(seconds, exits_when_idle)``.
+
+    ``null`` is a daemon that never shuts down on idle: ``(None, False)``. A
+    missing field (a build that predates it) or a value no daemon writes — the
+    daemon writes a positive finite number or ``null``, and handshakes may be
+    hand-edited — is unknown: ``(None, None)``. ``bool`` is rejected for the
+    reason :func:`_as_int` gives; the range check also rejects NaN.
+    """
+    if "idle_shutdown_seconds" not in raw:
+        return None, None
+    value = raw["idle_shutdown_seconds"]
+    if value is None:
+        return None, False
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None, None
+    try:
+        # An integer too large for a float is still valid JSON.
+        seconds = float(value)
+    except OverflowError:
+        return None, None
+    if not 0 < seconds < math.inf:
+        return None, None
+    return seconds, True
+
+
 def _live_foreign_daemons(config: STMConfig) -> list[dict[str, Any]]:
     """Daemons running under a *different* config fingerprint than the current one.
 
-    These are orphans left when a fingerprinted field — or ``PROTOCOL_VERSION``,
-    which is folded into the fingerprint so *every* protocol bump counts — changes
-    while a daemon is running: the old daemon keeps its handshake under the old
-    fingerprint, where ``stop``/``status`` (keyed to the *current* fingerprint)
-    never look. A daemon with a finite ``idle_timeout_seconds`` clears itself, but
-    a pinned ``idle_timeout_seconds=0`` one lingers — this surfaces it.
+    ``stop``/``status`` key to the *current* fingerprint, so these are invisible
+    to them otherwise. A foreign daemon is not necessarily stale (#1195):
+    processes on one machine may run with different ``MEMTOMEM_STM_*``
+    environments on purpose, each with its own live daemon. The stale kind is
+    left when a fingerprinted field — or ``PROTOCOL_VERSION``, which is folded
+    into the fingerprint so *every* protocol bump counts — changes while a daemon
+    is running. A daemon with an idle shutdown clears itself once nothing uses
+    it; one without (``idle_timeout_seconds`` 0 or ``inf``) lingers. Each entry
+    carries ``exits_when_idle`` — ``True``/``False``, or ``None`` when the
+    handshake does not say (see :func:`_idle_shutdown`) — so callers can tell
+    which kind they may be looking at.
 
     Liveness is **two-factor**: the recorded pid must exist
     (:func:`is_pid_alive`) *and* a bare TCP connect to its endpoint must succeed
@@ -131,8 +164,8 @@ def _live_foreign_daemons(config: STMConfig) -> list[dict[str, Any]]:
     bound) — a strictly stronger check than pid alone (the residual is a double
     coincidence: the pid recycled *and* its ephemeral port reassigned to another
     listener). Each entry carries only non-sensitive fields
-    (``fingerprint``/``pid``/``host``/``port``) — never the auth ``token`` — so
-    callers can render them.
+    (``fingerprint``/``pid``/``host``/``port``/``idle_shutdown_seconds``/
+    ``exits_when_idle``) — never the auth ``token`` — so callers can render them.
 
     Cross-platform: the connect-probe is what makes Windows viable too, where
     :func:`is_pid_alive` is uninformative (returns ``True`` for any positive pid,
@@ -155,12 +188,15 @@ def _live_foreign_daemons(config: STMConfig) -> list[dict[str, Any]]:
         # bulk of stale handshakes without a connect); the probe then confirms
         # something still accepts on the recorded endpoint.
         if is_pid_alive(pid) and probe_listening(host, port):
+            idle_seconds, exits_when_idle = _idle_shutdown(hs)
             live.append(
                 {
                     "fingerprint": fingerprint,
                     "pid": pid,
                     "host": host,
                     "port": port,
+                    "idle_shutdown_seconds": idle_seconds,
+                    "exits_when_idle": exits_when_idle,
                 }
             )
     return live
@@ -300,18 +336,20 @@ def start_cmd() -> None:
     "--all",
     "stop_all",
     is_flag=True,
-    help="Also stop daemons running under a different config fingerprint "
-    "(orphans left after a config or PROTOCOL_VERSION change). Off by default: a "
-    "live daemon under another config may be intentional. Targets are gated by a "
+    help="Also stop every daemon running under a different config fingerprint, "
+    "e.g. one that never exits when idle, left after a config or PROTOCOL_VERSION "
+    "change. Off by default: a live daemon under another config may belong to an STM "
+    "process started with a different environment. Targets are gated by a "
     "connect-probe so a stale handshake naming a recycled pid is not signalled.",
 )
 def stop_cmd(stop_all: bool) -> None:
     """Ask a running daemon to shut down gracefully.
 
     By default acts only on the daemon for the *current* config. ``--all`` also
-    SIGTERMs daemons left under a different (stale) config fingerprint — e.g. a
-    pinned ``idle_timeout_seconds=0`` daemon orphaned by a config or
-    ``PROTOCOL_VERSION`` change, which is otherwise invisible to ``stop``/``status``.
+    SIGTERMs every live daemon under a different config fingerprint — e.g. a
+    pinned ``idle_timeout_seconds=0`` daemon left by a config or
+    ``PROTOCOL_VERSION`` change, which ``stop`` cannot otherwise reach. Not all
+    of them are stale: one may serve an STM process with a different environment.
     """
     config = _load_config()
     current_stop_error: SystemExit | None = None
@@ -473,7 +511,7 @@ def _stop_foreign_daemons(config: STMConfig) -> None:
 
     Targets come from :func:`_live_foreign_daemons`, whose two-factor check
     (recorded pid alive *and* its endpoint accepting a connect) already rejects a
-    crash-orphaned handshake naming a since-recycled pid — so ``--all`` does not
+    crash-left handshake naming a since-recycled pid — so ``--all`` does not
     signal an unrelated process in the common case. The residual is a double
     coincidence (pid recycled *and* its ephemeral port reassigned to another
     listener); ``--all`` stays opt-in for that narrow window.
@@ -591,9 +629,9 @@ def status_cmd(as_json: bool) -> None:
                 "standalone_will_use_daemon": standalone_use_daemon,
             }
 
-    # Orthogonal to the current-config state: daemons orphaned under a different
-    # fingerprint (config/protocol drift) are invisible to the keyed paths above,
-    # so surface them here regardless of running/stale/stopped.
+    # Orthogonal to the current-config state: daemons under a different
+    # fingerprint are invisible to the keyed paths above, so surface them here
+    # regardless of running/stale/stopped.
     foreign = _live_foreign_daemons(config)
 
     if as_json:
@@ -679,14 +717,50 @@ def status_cmd(as_json: bool) -> None:
     click.echo(f"standalone surfacing will use daemon: {standalone_hint}")
 
     if foreign:
-        listing = ", ".join(f"pid={d['pid']} fp={d['fingerprint']}" for d in foreign)
+        _render_foreign(foreign)
+
+
+def _foreign_idle_label(daemon: dict[str, Any]) -> str:
+    exits_when_idle = daemon["exits_when_idle"]
+    if exits_when_idle is True:
+        return f"exits after {daemon['idle_shutdown_seconds']:g}s idle"
+    if exits_when_idle is False:
+        return "never exits when idle"
+    return "idle timeout unknown"
+
+
+def _render_foreign(foreign: list[dict[str, Any]]) -> None:
+    """Text lines for daemons under another config fingerprint (#1195).
+
+    A different fingerprint is not evidence of staleness — an STM process with a
+    different environment keys to its own live daemon — so only a daemon that
+    may linger (never exits when idle, or does not say) earns a warning and the
+    cleanup hint. One that exits on its own once idle needs no action from the
+    operator: unused, it goes away by itself, and stopping one still in use may
+    only make its user start another. Neither label says whether anything uses
+    the daemon; they say whether it can outlive its users.
+    """
+    listing = ", ".join(
+        f"pid={d['pid']} fp={d['fingerprint']} ({_foreign_idle_label(d)})" for d in foreign
+    )
+    line = f"{len(foreign)} daemon(s) running under a different config: {listing}"
+    if all(d["exits_when_idle"] is True for d in foreign):
+        click.echo(line)
+        click.echo("each exits on its own once idle; nothing to stop")
+        return
+    click.echo(_warn(line))
+    if _can_force_terminate():
         click.echo(
-            _warn(
-                f"{len(foreign)} daemon(s) under a different config running "
-                f"(orphaned by a config/protocol change): {listing}"
-            )
+            "if no running STM process uses them, stop them with `mms daemon stop --all` "
+            "(it stops every daemon listed above)"
         )
-        click.echo("stop them with `mms daemon stop --all`")
+    else:
+        # ``stop --all`` refuses to signal by pid on Windows
+        # (``_stop_foreign_daemons``), so pointing there would be a dead end.
+        click.echo(
+            "if no running STM process uses them, end those daemon processes from "
+            "Task Manager (`mms daemon stop --all` cannot signal them on Windows)"
+        )
 
 
 @daemon_group.command(name="restart")

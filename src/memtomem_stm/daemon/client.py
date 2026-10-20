@@ -216,7 +216,7 @@ async def shutdown(config: STMConfig, *, timeout: float = 5.0) -> bool:
 
 
 # Bare connect-probe — the cross-platform liveness discriminator for the
-# foreign-orphan and same-config SIGTERM paths (see #519). Unlike ``ping``, it
+# foreign-daemon and same-config SIGTERM paths (see #519). Unlike ``ping``, it
 # sends no protocol frame and needs no token, so it tells a *listening* daemon
 # (any ``PROTOCOL_VERSION``) apart from a stale handshake naming a dead or
 # OS-recycled pid: the former still accepts a connect, the latter's port is not

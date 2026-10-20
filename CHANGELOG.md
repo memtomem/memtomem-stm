@@ -41,6 +41,23 @@ changes inline only. See the deprecation policy in
   scales" lines. A literal `unknown` from Core is counted there too, no
   longer merged with events Core did not label. The reranker model ID is
   shown only as `reranker reported`. Stored values are unchanged.
+- **`mms daemon status` no longer calls every daemon under another config
+  orphaned** (#1195).
+  It listed each live daemon under a different config fingerprint as
+  "orphaned by a config/protocol change" and said to stop them with `mms daemon
+  stop --all`. When the MCP-launched server and the shell or hook have
+  different `MEMTOMEM_STM_*` environments, those can be the daemons of running
+  STM processes, which may start replacements on their next eligible request.
+  A daemon now records in its handshake when it exits on its own
+  (`idle_shutdown_seconds`: seconds, or `null` when
+  `daemon.idle_timeout_seconds` is `0` or `inf`).
+  **Behavior change**: `status` labels each such daemon `exits after Ns idle`,
+  `never exits when idle`, or `idle timeout unknown` (e.g. a daemon started
+  by an earlier build), and gives the warning and the `stop --all` hint only when
+  one of the last two is present — on Windows, where `stop --all` cannot signal
+  by pid, the hint names Task Manager. `status --json` `foreign` entries gain
+  `idle_shutdown_seconds` and `exits_when_idle`. `stop --all` is unchanged and
+  still stops every daemon under another fingerprint.
 - **Compression feedback is accepted only for a tool this proxy serves**
   (#1192, #1194).
   The compression feedback DB is user-wide, and `stm_compression_stats` showed
