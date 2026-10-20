@@ -11,6 +11,44 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.6.5] — 2026-10-20
+
+### Upgrade notes
+
+- **An upstream tool named outside the MCP tool-name grammar is no longer
+  proxied** (#1090, #1191). A name holding a character outside
+  `[A-Za-z0-9._-]` (a space, for one) was advertised with only the MCP SDK's
+  warning, as long as the name the client composes
+  (`mcp__<server>__<prefix>__<tool>`) fit the 64-character budget STM
+  already enforced; such a tool now disappears from the client's tool list.
+  Look for `nonconforming_tools` in `mms health --json` or a doctor WARN on
+  that upstream.
+- **STM's logs say less by default** (#1086, #1203, #1205). Below
+  `WARNING`, only records from `memtomem_stm` loggers are written, so
+  `httpx2`'s request lines and the MCP SDK's INFO/DEBUG lines are gone, and a
+  logged traceback shows `[message withheld]` in place of each exception's
+  text. `MEMTOMEM_STM_LOG_DEPENDENCIES=true` and
+  `MEMTOMEM_STM_LOG_EXCEPTION_TEXT=true` restore them in the server's and the
+  daemon's logs.
+- **`stm_compression_feedback` refuses a report for a tool this proxy does
+  not serve** (#1192, #1194). `server` and `tool` must be the upstream names
+  (not the `prefix__tool` name the client sees). Reports already stored are
+  kept; `stm_compression_stats` counts a stored tool name outside the MCP
+  tool-name grammar under `(unrecognized)` and shows a nonconforming `tool`
+  filter as `(unrecognized)`.
+- **The hook no longer spawns or falls back on a `busy` or `expired` daemon
+  reply** (#1198, #1201). That call gets no surfacing; with
+  `hook.fallback = "cold"` it no longer runs the search in-process.
+- **The daemon keeps at most 64 connections waiting for their first frame**
+  (#1150, #1199). A new one closes the oldest of them, with no reply.
+- **Some displayed values change** (#1090, #1091, #1190, #1191, #1195,
+  #1196, #1206, #1207). An unknown Core `score_scale` reads `unrecognized`,
+  the reranker model ID reads `reranker reported`, stored surfacing decisions
+  and ratings STM never writes count under `other`, provider-chosen values
+  leave error summaries, and `mms daemon status` labels a daemon under another
+  config by its idle timeout instead of calling every one of them orphaned.
+  Stored data is unchanged.
+
 ### Fixed
 
 - **Error summaries no longer pass provider-chosen values through** (#1206,
