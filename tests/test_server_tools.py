@@ -4581,7 +4581,9 @@ class TestMainExceptionBarrier:
         [line] = [ln for ln in err.splitlines() if "environment configuration" in ln]
         assert "UPSTREAM_SERVERS__GH\\u000ASUCCESS\\u202E__COMMAND" in line
         assert "\u202e" not in err
-        assert "success\\u202E.prefix" in err
+        # Since #1086 the traceback withholds the location altogether.
+        assert ".prefix" not in err
+        assert "ValidationError: [message withheld]" in err
 
     def test_clean_exit_does_not_log_error(self, caplog):
         import logging

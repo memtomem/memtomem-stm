@@ -13,6 +13,19 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- **Logged tracebacks no longer repeat exception messages** (#1086).
+  A site that logged an exception with its traceback printed the exception's
+  text on the traceback's last line, and an upstream, the LTM server, an LLM
+  provider or the MCP SDK writes that text: an httpx `HTTPStatusError`, for
+  one, quotes the request URL with its query string. **Behavior change**: in
+  every handler STM installs, a traceback keeps its frames and each
+  exception's class, and the message becomes `[message withheld]`, with an
+  HTTP status, a reserved JSON-RPC code or a SQLite result-code name beside it
+  when there is one. Notes, a `SyntaxError`'s source text and the column
+  carets are left out, as is local detail such as an `OSError`'s path. Set
+  `MEMTOMEM_STM_LOG_EXCEPTION_TEXT=true` for the full text in the server's and
+  the daemon's logs; the hook and the configuration-failure stderr line always
+  withhold.
 - **Dependency INFO/DEBUG log lines no longer reach STM's logs** (#1086,
   #1203).
   At `MEMTOMEM_STM_LOG_LEVEL=INFO`, `httpx2` logged every upstream request with
