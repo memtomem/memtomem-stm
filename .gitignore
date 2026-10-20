@@ -55,3 +55,7 @@ node_modules/
 
 # bench_qa LLM judge cache (<hash>.json per scenario/model; regenerated on demand)
 tests/bench/.llm_judge_cache/
+
+# memtomem local artifacts (ADR-0011 project_local tier)
+.memtomem/*.local/
+.memtomem/.staging/
