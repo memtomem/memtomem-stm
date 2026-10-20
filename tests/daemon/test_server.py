@@ -38,6 +38,7 @@ from memtomem_stm.daemon.discovery import (
 from memtomem_stm.daemon.protocol import (
     MAX_MESSAGE_BYTES,
     OP_PING,
+    OP_SHUTDOWN,
     OP_SURFACE,
     PROTOCOL_VERSION,
     build_request,
@@ -186,6 +187,7 @@ async def test_ping_reports_ready_and_cold_ltm(tmp_path: Path) -> None:
             "concurrency": cfg.daemon.max_concurrent_ltm_ops,
             "available": cfg.daemon.max_pending_requests,
             "busy_rejections": 0,
+            "pre_auth_evictions": 0,
         }
     finally:
         await _stop(cfg, task)
@@ -260,7 +262,7 @@ async def test_surface_round_trip_carries_host_ids(tmp_path: Path) -> None:
     ids = {"session_id": "sess-1", "cwd": "/work", "tool_use_id": "toolu-1", "agent_id": "a-1"}
     cfg = _config(tmp_path)
     engine = _HostIdSpyEngine()
-    _, task = await _start(cfg, engine=engine)  # type: ignore[arg-type]
+    _, task = await _start(cfg, engine=engine)
     try:
         await client.surface(cfg, _canonical({**_READ_PAYLOAD, **ids}), timeout=3.0)
     finally:
@@ -1184,6 +1186,142 @@ async def test_handler_write_timeout_drops_stuck_consumer(
     writer = _StuckWriter()
     await asyncio.wait_for(server._handle_conn(reader, writer), timeout=5.0)
     assert writer.closed
+
+
+async def _until(predicate, timeout: float = 3.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("condition not reached in time")
+        await asyncio.sleep(0.01)
+
+
+async def _open_silent(cfg: STMConfig, count: int) -> list[asyncio.StreamWriter]:
+    """Connect ``count`` times without ever sending a frame."""
+    hs = read_handshake(_hs_path(cfg))
+    assert hs is not None
+    writers = []
+    for _ in range(count):
+        _, writer = await asyncio.open_connection(hs["host"], hs["port"])
+        writers.append(writer)
+    return writers
+
+
+async def test_silent_connections_past_the_pre_auth_budget_do_not_lock_out_ping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A budget that refused newcomers once full let silent sockets lock every
+    # authenticated client out (#1150). The oldest silent one makes room instead.
+    monkeypatch.setattr(daemon_server, "_MAX_PRE_AUTH_CONNECTIONS", 4)
+    cfg = _config(tmp_path)
+    server, task = await _start(cfg, _engine_with_result())
+    silent: list[asyncio.StreamWriter] = []
+    try:
+        # A connection leaves the budget once its frame is read, so served
+        # requests never count against it.
+        for _ in range(5):
+            assert await client.ping(cfg) is not None
+        assert server._pre_auth == {}
+        assert server._pre_auth_evictions == 0
+
+        silent = await _open_silent(cfg, 10)
+        await _until(lambda: server._pre_auth_evictions == 6)
+        assert len(server._pre_auth) == 4
+
+        pong = await client.ping(cfg)
+        assert pong is not None
+        assert pong["queue"]["pre_auth_evictions"] == 7
+    finally:
+        for writer in silent:
+            writer.close()
+        await _stop(cfg, task)
+
+
+async def test_authenticated_overload_is_busy_while_the_pre_auth_budget_is_full(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Overload must reach the client as ``busy`` -- which it treats as a skip --
+    # not as a dropped connection it would read as a dead daemon.
+    monkeypatch.setattr(daemon_server, "_MAX_PRE_AUTH_CONNECTIONS", 4)
+    cfg = _config(tmp_path)
+    cfg.daemon.max_pending_requests = 1
+    server, task = await _start(cfg, _engine_with_result())
+    silent: list[asyncio.StreamWriter] = []
+    await server._pending_slots.acquire()
+    try:
+        silent = await _open_silent(cfg, 4)
+        await _until(lambda: len(server._pre_auth) == 4)
+        hs = read_handshake(_hs_path(cfg))
+        assert hs is not None
+        response = await client._request(
+            hs,
+            OP_SURFACE,
+            _canonical(_READ_PAYLOAD).to_wire(),
+            timeout=3.0,
+            deadline_monotonic=asyncio.get_running_loop().time() + 3.0,
+        )
+        assert response == {"v": PROTOCOL_VERSION, "ok": False, "status": "busy"}
+
+        pong = await client.ping(cfg)
+        assert pong is not None
+        assert pong["queue"]["busy_rejections"] == 1
+    finally:
+        server._pending_slots.release()
+        for writer in silent:
+            writer.close()
+        await _stop(cfg, task)
+
+
+async def test_an_evicted_connection_is_not_served_from_its_buffered_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Eviction aborts the transport, but the reader keeps what it already
+    # buffered. A frame that landed just before eviction must not run: its
+    # reply has nowhere to go.
+    monkeypatch.setattr(daemon_server, "_MAX_PRE_AUTH_CONNECTIONS", 1)
+    server = DaemonServer(_config(tmp_path))
+
+    class _Transport:
+        aborted = False
+
+        def abort(self) -> None:
+            self.aborted = True
+
+    class _Writer:
+        def __init__(self) -> None:
+            self.transport = _Transport()
+            self.written: list[bytes] = []
+
+        def write(self, data: bytes) -> None:
+            self.written.append(data)
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            pass
+
+        async def wait_closed(self) -> None:
+            return None
+
+    first_reader, first = asyncio.StreamReader(), _Writer()
+    first_task = asyncio.create_task(server._handle_conn(first_reader, first))
+    await _until(lambda: first in server._pre_auth)
+
+    second_reader, second = asyncio.StreamReader(), _Writer()
+    second_task = asyncio.create_task(server._handle_conn(second_reader, second))
+    # The first frame arrives after the second handler is scheduled, so the
+    # second runs -- and evicts the first -- before the first reads it.
+    first_reader.feed_data(encode_line(build_request(server._token, OP_SHUTDOWN)))
+    first_reader.feed_eof()
+    await asyncio.wait_for(first_task, timeout=5.0)
+
+    assert first.transport.aborted
+    assert first.written == []
+    assert not server._shutdown_event.is_set()
+
+    second_reader.feed_eof()
+    await asyncio.wait_for(second_task, timeout=5.0)
 
 
 async def test_sub_second_idle_timeout_shuts_down_promptly(tmp_path: Path) -> None:
