@@ -115,6 +115,8 @@ _MAX_GROUP_WIDTH = 15
 _MAX_GROUP_DEPTH = 10
 _MAX_EXCEPTIONS = 256
 _MAX_LINES = 2000
+_MAX_FRAMES = 1000
+_OWN_TRACEBACK: Any = object()
 _CAUSE_SEPARATOR = "The above exception was the direct cause of the following exception:"
 _CONTEXT_SEPARATOR = "During handling of the above exception, another exception occurred:"
 
@@ -141,7 +143,7 @@ class _WithheldOutput:
         self.exceptions += 1
 
 
-def render_withheld_traceback(exc: BaseException, tb: types.TracebackType | None = None) -> str:
+def render_withheld_traceback(exc: BaseException, tb: Any = _OWN_TRACEBACK) -> str:
     """*exc*'s traceback with every message left out (#1086).
 
     Built only from what the code defines, never from what an exception was
@@ -155,11 +157,13 @@ def render_withheld_traceback(exc: BaseException, tb: types.TracebackType | None
     come from built-in types and fixed ranges, not from a subclass's override.
     *tb*, when given,
     stands in for *exc*'s own ``__traceback__``, as the third item of an
-    ``exc_info`` tuple does for the stdlib.
+    ``exc_info`` tuple does for the stdlib — ``None`` included, which renders
+    no frames for *exc*.
 
     Trusted, and so still shown: class, module and function names and the
     source of the frames — they come from code, not from the data that failed.
-    Bounded while it renders, not after: 32 chained exceptions per chain, 15
+    Bounded while it renders, not after: the innermost 1000 frames of each
+    traceback (the raise site stays), 32 chained exceptions per chain, 15
     members and 10 levels of exception groups, 256 exceptions and 2000 lines in
     all, each cut marked. If any step raises, the whole result is
     :data:`WITHHELD_RENDER_FAILED`; only ``KeyboardInterrupt`` and
@@ -183,7 +187,7 @@ def _render_chain(
     margin: str,
     depth: int,
     seen: set[int],
-    tb: types.TracebackType | None = None,
+    tb: Any = _OWN_TRACEBACK,
 ) -> None:
     # The chain, newest first, each entry with the sentence that links it to
     # the entry before it; the stdlib's cause/context precedence.
@@ -212,7 +216,7 @@ def _render_chain(
             out.add("", margin)
             out.add(ordered[index - 1][1] or "", margin)
             out.add("", margin)
-        own_tb = tb if item is exc and tb is not None else item.__traceback__
+        own_tb = tb if item is exc and tb is not _OWN_TRACEBACK else item.__traceback__
         _render_exception(item, own_tb, out, margin, depth, seen)
 
 
@@ -234,11 +238,23 @@ def _render_exception(
         if not isinstance(tb, types.TracebackType):
             raise TypeError("not a traceback")
         out.add("Traceback (most recent call last):", margin)
-        # Capped before extraction: the line budget alone would still walk,
-        # extract and format every frame first.
+        # The innermost frames, capped before extraction: the line budget
+        # alone would still extract and format every frame first, and a
+        # positive limit would keep the outermost ones and drop the raise
+        # site. Walking tb_next is bounded: the interpreter refuses a cycle.
+        walked = 0
+
+        def counted(frames_in: Any) -> Any:
+            nonlocal walked
+            for item in frames_in:
+                walked += 1
+                yield item
+
         frames = traceback.StackSummary.extract(
-            traceback.walk_tb(tb), limit=_MAX_LINES, capture_locals=False
+            counted(traceback.walk_tb(tb)), limit=-_MAX_FRAMES, capture_locals=False
         )
+        if walked > len(frames):
+            out.add(f"[{walked - len(frames)} outer frames omitted]", margin)
         for chunk in frames.format():
             for line in chunk.rstrip("\n").split("\n"):
                 out.add(line, margin)

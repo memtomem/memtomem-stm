@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 import sqlite3
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -313,32 +314,69 @@ def test_counts_come_from_built_in_types_not_overrides():
     assert "of 7" not in out
 
 
-def test_frames_are_capped_before_they_are_extracted(monkeypatch):
-    import sys as _sys
+def _deep(n: int) -> None:
+    if n == 0:
+        raise ValueError(CANARY)
+    _deep(n - 1)
 
+
+def test_frames_keep_the_raise_site_and_mark_what_was_cut(monkeypatch):
+    """Only the innermost frames are extracted and formatted; the cut is
+    marked, and the frame that raised is never the one dropped."""
     import memtomem_stm.logging_setup as setup
 
-    def deep(n: int) -> None:
-        if n == 0:
-            raise ValueError(CANARY)
-        deep(n - 1)
+    monkeypatch.setattr(setup, "_MAX_FRAMES", 5)
+    out = render_withheld_traceback(_caught(lambda: _deep(50)))
 
-    exc = _caught(lambda: deep(100))
-    consumed = 0
-    real_walk = setup.traceback.walk_tb
+    assert re.search(r"^\[\d+ outer frames omitted\]$", out, re.MULTILINE)
+    # Five frames at most; identical ones fold into "[Previous line repeated …]".
+    assert 1 <= out.count(", in _deep") <= 5
+    assert "raise ValueError(CANARY)" in out
+    assert out.rstrip().endswith("ValueError: [message withheld]")
 
-    def counting_walk(tb):
-        nonlocal consumed
-        for item in real_walk(tb):
-            consumed += 1
-            yield item
 
-    monkeypatch.setattr(setup, "_MAX_LINES", 5)
-    monkeypatch.setattr(setup.traceback, "walk_tb", counting_walk)
+def test_a_deep_recursion_compressed_below_the_line_budget_still_marks_the_cut():
+    """2100 recursive frames compress to a few lines ("Previous line repeated"),
+    so the line budget never trips; the frame cap must say what it dropped."""
+    import sys as _sys
+
+    limit = _sys.getrecursionlimit()
+    _sys.setrecursionlimit(max(limit, 2500))
+    try:
+        exc = _caught(lambda: _deep(2100))
+    finally:
+        _sys.setrecursionlimit(limit)
     out = render_withheld_traceback(exc)
-    assert consumed <= 6  # the cap, plus the one look-ahead islice takes
-    assert out.endswith("[traceback truncated]")
-    assert _sys.getrecursionlimit() > 100
+
+    assert re.search(r"^\[\d+ outer frames omitted\]$", out, re.MULTILINE)
+    assert "raise ValueError(CANARY)" in out
+    assert "[traceback truncated]" not in out
+
+
+def test_an_explicit_none_traceback_renders_no_frames_like_the_stdlib():
+    exc = _caught(raise_cause_marker)
+    record = logging.LogRecord(
+        "memtomem_stm.t", logging.WARNING, __file__, 1, "m", None, (type(exc), exc, None)
+    )
+    withheld = DisplayEscapingFormatter("%(message)s").format(record)
+    stdlib = logging.Formatter("%(message)s").format(_record_copy(record))
+    assert "Traceback (most recent call last)" not in stdlib
+    assert "Traceback (most recent call last)" not in withheld
+    assert withheld == "m\nKeyError: [message withheld]"
+    # Omitting the argument still uses the exception's own traceback.
+    assert "in raise_cause_marker" in render_withheld_traceback(exc)
+
+
+def _record_copy(record: logging.LogRecord) -> logging.LogRecord:
+    return logging.LogRecord(
+        record.name,
+        record.levelno,
+        record.pathname,
+        record.lineno,
+        record.msg,
+        None,
+        record.exc_info,
+    )
 
 
 def test_a_non_traceback_in_exc_info_gives_the_constant():
