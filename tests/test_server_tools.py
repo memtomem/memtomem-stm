@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from memtomem_stm.proxy.config import ConfigLoadResult, ProxyConfig, UpstreamServerConfig
-from memtomem_stm.proxy.manager import ProxyManager, UpstreamConnection
+from memtomem_stm.proxy.manager import ProxyManager, ProxyToolInfo, UpstreamConnection
 from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.server import (
     STMContext,
@@ -50,6 +50,7 @@ def _make_ctx(
     progressive_reads_tracker: object | None = None,
     config: STMConfig | None = None,
     proxy_config_error: str | None = None,
+    registered_proxy_tools: dict | None = None,
 ) -> SimpleNamespace:
     """Build a fake CtxType that _get_ctx() can unwrap.
 
@@ -73,8 +74,23 @@ def _make_ctx(
         compression_feedback_tracker=compression_feedback_tracker,
         progressive_reads_tracker=progressive_reads_tracker,
         proxy_config_error=proxy_config_error,
+        registered_proxy_tools=registered_proxy_tools or {},
     )
     return SimpleNamespace(request_context=SimpleNamespace(lifespan_context=app))
+
+
+def _registered(server: str, tool: str, prefix: str = "p") -> dict:
+    """A lifespan registry holding one proxied tool, keyed by its advertised name."""
+    name = f"{prefix}__{tool}"
+    return {
+        name: ProxyToolInfo(
+            prefixed_name=name,
+            description="",
+            input_schema={},
+            server=server,
+            original_name=tool,
+        )
+    }
 
 
 def _make_proxy_manager(tmp_path=None):
@@ -1632,7 +1648,10 @@ class TestCompressionFeedback:
         mock_tracker = MagicMock()
         mock_tracker.record.return_value = "Feedback recorded."
 
-        ctx = _make_ctx(compression_feedback_tracker=mock_tracker)
+        ctx = _make_ctx(
+            compression_feedback_tracker=mock_tracker,
+            registered_proxy_tools=_registered("srv", "t"),
+        )
         result = await stm_compression_feedback(
             server="srv",
             tool="t",
@@ -1650,6 +1669,71 @@ class TestCompressionFeedback:
             trace_id="abc123",
         )
 
+    @pytest.mark.parametrize(
+        ("server", "tool"),
+        [
+            ("other", "t"),  # unknown server
+            ("srv", "u"),  # a tool the server does not serve
+            ("srv", "p__t"),  # the client-side prefixed name, not the upstream one
+            ("srv", "evil\x1b[31m"),
+        ],
+    )
+    async def test_refuses_a_tool_this_proxy_does_not_serve(self, server, tool):
+        """#1192: the feedback DB is user-wide and its tool names are shown by
+        ``stm_compression_stats``; only a registered tool is accepted, and the
+        refusal does not repeat what was sent."""
+        mock_tracker = MagicMock()
+        ctx = _make_ctx(
+            compression_feedback_tracker=mock_tracker,
+            registered_proxy_tools=_registered("srv", "t"),
+        )
+        result = await stm_compression_feedback(
+            server=server, tool=tool, missing="example code", ctx=ctx
+        )
+        assert result == "Error: server and tool must name an upstream tool this proxy serves"
+        mock_tracker.record.assert_not_called()
+
+    async def test_refuses_a_discovered_tool_that_was_not_registered(self):
+        """The upstream lists ``u`` (it is in ``conn.tools``) but the server did
+        not register it — withheld by exposure or declined at registration.
+        Only the registry decides, so the report is refused."""
+        pm = _make_proxy_manager()
+        pm._connections["srv"] = UpstreamConnection(
+            name="srv",
+            config=UpstreamServerConfig(prefix="p"),
+            session=AsyncMock(),
+            tools=[SimpleNamespace(name="t"), SimpleNamespace(name="u")],
+        )
+        mock_tracker = MagicMock()
+        ctx = _make_ctx(
+            proxy_manager=pm,
+            compression_feedback_tracker=mock_tracker,
+            registered_proxy_tools=_registered("srv", "t"),
+        )
+        result = await stm_compression_feedback(server="srv", tool="u", missing="x", ctx=ctx)
+        assert result.startswith("Error: server and tool must name")
+        mock_tracker.record.assert_not_called()
+
+    async def test_refuses_everything_when_nothing_is_registered(self):
+        """Proxy off, or a context built outside the lifespan: no tool is served."""
+        mock_tracker = MagicMock()
+        ctx = _make_ctx(compression_feedback_tracker=mock_tracker)
+        result = await stm_compression_feedback(server="srv", tool="t", missing="x", ctx=ctx)
+        assert result.startswith("Error: server and tool must name")
+        mock_tracker.record.assert_not_called()
+
+    async def test_empty_values_keep_the_required_error(self, tmp_path):
+        """Compatibility: empty input still reaches ``record``'s own check."""
+        from memtomem_stm.proxy.compression_feedback import CompressionFeedbackTracker
+
+        tracker = CompressionFeedbackTracker(tmp_path / "cf.db", retention_days=1)
+        try:
+            ctx = _make_ctx(compression_feedback_tracker=tracker)
+            result = await stm_compression_feedback(server="", tool="t", missing="x", ctx=ctx)
+            assert result == "Error: server and tool are required"
+        finally:
+            tracker.close()
+
 
 # ── stm_compression_stats ────────────────────────────────────────────────
 
@@ -1660,6 +1744,42 @@ class TestCompressionStats:
         ctx = _make_ctx(compression_feedback_tracker=None)
         result = await stm_compression_stats(ctx=ctx)
         assert "not enabled" in result.lower()
+
+    async def test_names_outside_the_grammar_are_counted_not_shown(self):
+        """#1192: rows stored before the registry check hold whatever a client
+        sent. They are merged under a label no real tool can have."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = {
+            "total_feedback": 4,
+            "by_kind": {"other": 4},
+            "by_tool": {"get_doc": 2, "bad tool": 1, "evil\x1b[31m": 1},
+        }
+        ctx = _make_ctx(compression_feedback_tracker=mock_tracker)
+        result = await stm_compression_stats(ctx=ctx)
+
+        assert "  get_doc: 2" in result
+        assert "  (unrecognized): 2" in result
+        assert "bad tool" not in result
+        assert "evil" not in result
+
+    @pytest.mark.parametrize(
+        ("tool", "shown"),
+        [("evil\x1b[31m", "(unrecognized)"), ("unrecognized", "unrecognized")],
+    )
+    async def test_filter_echo_shows_only_a_conforming_name(self, tool, shown):
+        """A real tool may be named ``unrecognized``; the placeholder for a
+        nonconforming filter must not read like it."""
+        mock_tracker = MagicMock()
+        mock_tracker.get_stats.return_value = {
+            "total_feedback": 0,
+            "by_kind": {},
+            "by_tool": {},
+        }
+        ctx = _make_ctx(compression_feedback_tracker=mock_tracker)
+        result = await stm_compression_stats(tool=tool, ctx=ctx)
+
+        assert f"(filtered by tool: {shown})" in result
+        assert "evil" not in result
 
     async def test_with_data(self):
         """Returns formatted stats with breakdown."""
@@ -2739,6 +2859,63 @@ class TestLifespan:
                 # Server came up; the tracker just has no backing store.
                 assert ctx.tracker._metrics_store is None
                 mock_pm_instance.start.assert_awaited_once()
+
+    async def test_context_exposes_the_lifespan_registry_of_proxied_tools(self):
+        """#1192: compression feedback is checked against the tools this
+        lifespan actually registered, so the context must carry that registry
+        itself, filled by registration, not an empty default."""
+        from memtomem_stm.server import app_lifespan, mcp
+
+        info = ProxyToolInfo(
+            prefixed_name="p__feedback_probe_tool",
+            description="d",
+            input_schema={"type": "object"},
+            server="srv",
+            original_name="feedback_probe_tool",
+        )
+        mock_pm_instance = MagicMock()
+        mock_pm_instance.start = AsyncMock()
+        mock_pm_instance.stop = AsyncMock()
+        mock_pm_instance.get_proxy_tools.return_value = [info]
+
+        with (
+            patch("memtomem_stm.server.STMConfig") as MockConfig,
+            patch("memtomem_stm.server.ProxyManager", return_value=mock_pm_instance),
+        ):
+            mock_cfg = MockConfig.return_value
+            mock_cfg.proxy = MagicMock()
+            mock_cfg.proxy.enabled = True
+            mock_cfg.proxy.config_path = Path("/tmp/proxy.json")
+            mock_cfg.proxy.metrics.enabled = False
+            mock_cfg.proxy.compression_feedback.enabled = False
+            mock_cfg.proxy.progressive_reads.enabled = False
+            mock_cfg.proxy.selection_telemetry.enabled = False
+            mock_cfg.proxy.cache.enabled = False
+            mock_cfg.surfacing = MagicMock()
+            mock_cfg.surfacing.enabled = False
+            mock_cfg.langfuse = MagicMock()
+            mock_cfg.langfuse.enabled = False
+            mock_cfg.otlp = MagicMock()
+            mock_cfg.otlp.enabled = False
+            mock_cfg.parent_liveness_poll_seconds = 0.0
+            mock_cfg.parent_liveness_grace_seconds = 900.0
+
+            async with app_lifespan(mcp) as ctx:
+                assert dict(ctx.registered_proxy_tools) == {"p__feedback_probe_tool": info}
+
+                # A live view, not a copy: a re-advertisement after the context
+                # exists (tools/list_changed, reconnect) is what feedback sees.
+                (readvertise,) = mock_pm_instance.set_advertisement_listener.call_args.args
+                replacement = ProxyToolInfo(
+                    prefixed_name="p__feedback_probe_tool_2",
+                    description="d",
+                    input_schema={"type": "object"},
+                    server="srv",
+                    original_name="feedback_probe_tool_2",
+                )
+                mock_pm_instance.get_proxy_tools.return_value = [replacement]
+                await readvertise()
+                assert dict(ctx.registered_proxy_tools) == {"p__feedback_probe_tool_2": replacement}
 
     async def test_cache_init_failure_degrades_gracefully(self):
         """A corrupt/locked cache DB raising at init must degrade to
