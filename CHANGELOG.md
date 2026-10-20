@@ -168,6 +168,14 @@ changes inline only. See the deprecation policy in
   cold fallback; compression of the tool output is unaffected. Other daemon
   errors and an unreachable daemon behave as before.
 
+### Security
+
+- deps: the lockfile moves `certifi` from 2026.2.25 to 2026.10.19 for
+  GHSA-6q48-6c7w-9gw2 (bundled emSign root CAs whose intermediate CA keys were
+  compromised). STM declares no `certifi` floor; it arrives through the HTTP
+  client, so an environment that pins an older `certifi` must move it up
+  itself (#1210).
+
 ## [0.6.4] — 2026-10-18
 
 ### Upgrade notes
