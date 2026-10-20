@@ -231,8 +231,7 @@ def exception_summary(exc: BaseException) -> str:
     if isinstance(root, ResponseShapeError):
         return f"{type(root).__name__}: {root}"
     if mcp_error is not None and isinstance(root, mcp_error):
-        code = getattr(getattr(root, "error", None), "code", None)
-        reserved = _JSONRPC_STANDARD_ERRORS.get(code) if type(code) is int else None
+        reserved = _reserved_jsonrpc_code(root)
         if reserved is not None:
             return f"{type(root).__name__} {reserved}"
         return type(root).__name__
@@ -244,13 +243,45 @@ def exception_summary(exc: BaseException) -> str:
     code = http_status_code(root)
     if code is not None:
         return f"HTTP {code} ({type(root).__name__})"
-    sqlite_error = _loaded_class("sqlite3", "Error")
-    if sqlite_error is not None and isinstance(root, sqlite_error):
-        result = getattr(root, "sqlite_errorcode", None)
-        name = _SQLITE_PRIMARY_CODES.get(result & 0xFF) if type(result) is int else None
-        if name is not None:
-            return f"{type(root).__name__} ({name})"
+    name = _sqlite_primary_code(root)
+    if name is not None:
+        return f"{type(root).__name__} ({name})"
     return type(root).__name__
+
+
+def _reserved_jsonrpc_code(exc: BaseException) -> str | None:
+    """A reserved JSON-RPC code of an ``MCPError``, as ``_JSONRPC_STANDARD_ERRORS`` names it."""
+    mcp_error = _loaded_class("mcp.shared.exceptions", "MCPError")
+    if mcp_error is None or not isinstance(exc, mcp_error):
+        return None
+    code = getattr(getattr(exc, "error", None), "code", None)
+    return _JSONRPC_STANDARD_ERRORS.get(code) if type(code) is int else None
+
+
+def _sqlite_primary_code(exc: BaseException) -> str | None:
+    """A SQLite error's primary result-code name, from ``_SQLITE_PRIMARY_CODES``."""
+    sqlite_error = _loaded_class("sqlite3", "Error")
+    if sqlite_error is None or not isinstance(exc, sqlite_error):
+        return None
+    result = getattr(exc, "sqlite_errorcode", None)
+    return _SQLITE_PRIMARY_CODES.get(result & 0xFF) if type(result) is int else None
+
+
+def exception_code_label(exc: BaseException) -> str | None:
+    """A code *exc* itself carries, from a number or a table STM owns, else ``None``.
+
+    The HTTP status of an httpx/httpx2 ``HTTPStatusError`` (``HTTP 500``), a
+    reserved JSON-RPC code of an ``MCPError``, or a SQLite primary result-code
+    name. Narrower than ``exception_summary``: no ``ResponseShapeError`` text
+    (some of it interpolates values a provider sent) and no pydantic error
+    types (a custom error type is free text). Logged tracebacks show this
+    beside each exception they withhold the message of (#1086).
+    """
+    code = http_status_code(exc)
+    if code is not None:
+        # The status line's range: any other int did not come off the wire.
+        return f"HTTP {code}" if 100 <= code <= 599 else None
+    return _reserved_jsonrpc_code(exc) or _sqlite_primary_code(exc)
 
 
 def diagnostic_url(url: str) -> str:

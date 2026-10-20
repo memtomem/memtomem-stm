@@ -5,6 +5,12 @@ rendered the failing validation location raw, and part of that location is the
 operator's own variable name. Every handler STM installs now formats through
 ``DisplayEscapingFormatter``. These tests check the FORMATTED output, not
 ``record.getMessage()``: the traceback is not part of the message.
+
+Since #1086 those handlers also withhold every exception message by default, so
+the location never reaches them; the escaping is asserted on a formatter that
+keeps the text (``withhold_exception_text=False``, what
+``STMConfig.log_exception_text`` selects), and the default paths assert the
+location is gone while the env hint line stays escaped.
 """
 
 from __future__ import annotations
@@ -35,6 +41,8 @@ from memtomem_stm.logging_setup import (
 HOSTILE_VAR = "MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS__GH\nSUCCESS‮__COMMAND"
 RLO = "‮"
 ESCAPED_RLO = "\\u202E"
+ESCAPED_HINT = "GH\\u000ASUCCESS\\u202E__COMMAND"
+LOCATION_TEXT = "success"
 
 
 @pytest.fixture
@@ -63,10 +71,10 @@ def hostile_env(tmp_path, monkeypatch) -> ValidationError:
     return caught.value
 
 
-def _capture(fmt: str) -> tuple[logging.Logger, io.StringIO]:
+def _capture(fmt: str, *, withhold: bool = True) -> tuple[logging.Logger, io.StringIO]:
     buf = io.StringIO()
     handler = logging.StreamHandler(buf)
-    handler.setFormatter(DisplayEscapingFormatter(fmt))
+    handler.setFormatter(DisplayEscapingFormatter(fmt, withhold_exception_text=withhold))
     log = logging.getLogger(f"test.traceback_escaping.{id(buf)}")
     log.handlers[:] = [handler]
     log.propagate = False
@@ -80,7 +88,7 @@ def _capture(fmt: str) -> tuple[logging.Logger, io.StringIO]:
 
 
 def test_formatter_escapes_the_exception_text_line_by_line():
-    log, buf = _capture("%(levelname)s %(message)s")
+    log, buf = _capture("%(levelname)s %(message)s", withhold=False)
     try:
         raise ValueError(f"loc{RLO}ation\x1b[31m")
     except ValueError:
@@ -92,6 +100,21 @@ def test_formatter_escapes_the_exception_text_line_by_line():
     # Line structure is kept: the stack still reads as a stack.
     assert out.startswith("WARNING failed\nTraceback (most recent call last):\n")
     assert out.rstrip("\n").endswith(f"ValueError: loc{ESCAPED_RLO}ation\\u001B[31m")
+
+
+def test_default_formatter_withholds_the_exception_text():
+    log, buf = _capture("%(levelname)s %(message)s")
+    try:
+        raise ValueError(f"loc{RLO}ation\x1b[31m")
+    except ValueError:
+        log.warning("failed", exc_info=True)
+    out = buf.getvalue()
+
+    assert "ation" not in out.splitlines()[-1]
+    assert out.startswith("WARNING failed\nTraceback (most recent call last):\n")
+    assert out.rstrip("\n").endswith("ValueError: [message withheld]")
+    # The frame's source line is code, and is still escaped.
+    assert RLO not in out and "\x1b" not in out
 
 
 def test_formatter_escapes_stack_info_too():
@@ -109,10 +132,25 @@ def test_formatter_escapes_an_exception_text_another_formatter_cached():
     record.exc_text = f"Traceback\n  loc{RLO}ation\nValueError"
     record.exc_info = (ValueError, ValueError("x"), None)
 
-    out = DisplayEscapingFormatter("%(message)s").format(record)
+    out = DisplayEscapingFormatter("%(message)s", withhold_exception_text=False).format(record)
 
     assert RLO not in out
     assert f"  loc{ESCAPED_RLO}ation" in out
+
+
+def test_default_formatter_ignores_a_traceback_another_formatter_cached():
+    """The cache may hold the full text; the withholding formatter re-renders
+    from ``exc_info`` and leaves the cache as it found it."""
+    record = logging.LogRecord("t", logging.WARNING, __file__, 1, "msg", None, None)
+    cached = f"Traceback\n  loc{RLO}ation\nValueError: secret"
+    record.exc_text = cached
+    record.exc_info = (ValueError, ValueError("secret"), None)
+
+    out = DisplayEscapingFormatter("%(message)s").format(record)
+
+    assert "secret" not in out and "ation" not in out
+    assert out == "msg\nValueError: [message withheld]"
+    assert record.exc_text == cached
 
 
 def test_formatter_is_idempotent_on_an_already_escaped_message():
@@ -258,7 +296,7 @@ def test_configure_stderr_logging_leaves_a_configured_root_alone(_restore_root_l
 
 
 def test_log_stm_config_failure_traceback_is_escaped(hostile_env):
-    log, buf = _capture(STDERR_FORMAT)
+    log, buf = _capture(STDERR_FORMAT, withhold=False)
 
     log_stm_config_failure(hostile_env, logger=log, context="probing")
 
@@ -268,6 +306,19 @@ def test_log_stm_config_failure_traceback_is_escaped(hostile_env):
     assert "GH\\u000ASUCCESS\\u202E__COMMAND" in out
     assert f"success{ESCAPED_RLO}.prefix" in out
     assert "Traceback (most recent call last)" in out
+
+
+def test_log_stm_config_failure_traceback_withholds_the_location_by_default(hostile_env):
+    log, buf = _capture(STDERR_FORMAT)
+
+    log_stm_config_failure(hostile_env, logger=log, context="probing")
+
+    out = buf.getvalue()
+    assert RLO not in out
+    # The hint still names the variable to edit; the location is withheld.
+    assert ESCAPED_HINT in out
+    assert ".prefix" not in out and LOCATION_TEXT not in out
+    assert "ValidationError: [message withheld]" in out
 
 
 def _hostile_child_env(tmp_path) -> dict[str, str]:
@@ -311,7 +362,9 @@ def test_server_entry_point_prints_one_escaped_traceback_in_a_fresh_process(tmp_
     )
     assert proc.stderr.count("Traceback (most recent call last)") == 1
     assert RLO not in proc.stderr
-    assert f"success{ESCAPED_RLO}.prefix" in proc.stderr
+    assert ESCAPED_HINT in proc.stderr
+    assert ".prefix" not in proc.stderr
+    assert "ValidationError: [message withheld]" in proc.stderr
 
 
 def test_daemon_subcommand_prints_one_escaped_traceback(hostile_env, _restore_root_logging):
@@ -331,7 +384,9 @@ def test_daemon_subcommand_prints_one_escaped_traceback(hostile_env, _restore_ro
     )
     assert result.stderr.count("Traceback (most recent call last)") == 1
     assert RLO not in result.stderr
-    assert f"success{ESCAPED_RLO}.prefix" in result.stderr
+    assert ESCAPED_HINT in result.stderr
+    assert ".prefix" not in result.stderr
+    assert "ValidationError: [message withheld]" in result.stderr
 
 
 def test_server_main_takes_over_a_root_the_sdk_already_configured(
@@ -355,7 +410,8 @@ def test_server_main_takes_over_a_root_the_sdk_already_configured(
     assert isinstance(handler.formatter, DisplayEscapingFormatter)
     err = capsys.readouterr().err
     assert RLO not in err
-    assert f"success{ESCAPED_RLO}.prefix" in err
+    assert ESCAPED_HINT in err
+    assert ".prefix" not in err
 
 
 def test_hook_barrier_traceback_is_escaped(hostile_env, _restore_root_logging):
@@ -379,4 +435,5 @@ def test_hook_barrier_traceback_is_escaped(hostile_env, _restore_root_logging):
     assert "passing tool output through" in result.stderr
     assert "Traceback (most recent call last)" in result.stderr
     assert RLO not in result.stderr
-    assert f"success{ESCAPED_RLO}.prefix" in result.stderr
+    assert ".prefix" not in result.stderr
+    assert "ValidationError: [message withheld]" in result.stderr

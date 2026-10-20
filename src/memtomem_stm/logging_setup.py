@@ -27,6 +27,12 @@ come from STM's own ``memtomem_stm`` logger tree (:class:`DependencyRecordFilter
 STM call site rendered: the upstream URL with its query string on every
 request, the MCP session id, response headers and whole MCP messages. Those
 lines come back only when ``STMConfig.log_dependencies`` is set.
+
+At every level, a traceback those handlers render keeps its frames but not its
+messages (:func:`render_withheld_traceback`, #1086): the last line of each
+exception would repeat the exception's text, which an upstream, the LTM server
+or an LLM provider wrote and can fill with a URL query, a tool argument or part
+of a header. ``STMConfig.log_exception_text`` restores the stdlib rendering.
 """
 
 from __future__ import annotations
@@ -35,6 +41,8 @@ import errno
 import logging
 import os
 import sys
+import traceback
+import types
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -94,6 +102,202 @@ def _screen_dependencies(handler: logging.Handler, dependency_records: bool) -> 
     return handler
 
 
+WITHHELD_RENDER_FAILED = "Traceback withheld: it could not be rendered without its messages."
+"""The whole rendering when building the withheld form raised: a constant, so
+nothing about the exception that broke it can reach the line."""
+
+WITHHELD_CACHED_TRACEBACK = "[traceback withheld]"
+"""Stands in for a traceback another handler rendered and cached on the record
+(``exc_text``) when the exception itself is no longer attached."""
+
+_MAX_CHAIN = 32
+_MAX_GROUP_WIDTH = 15
+_MAX_GROUP_DEPTH = 10
+_MAX_EXCEPTIONS = 256
+_MAX_LINES = 2000
+_MAX_FRAMES = 1000
+_RESERVED_LINES = 3
+"""Kept free after an exception's frames: the omitted-frames marker, the
+exception line and the notes line, so the raise site's class always prints."""
+_OWN_TRACEBACK: Any = object()
+_CAUSE_SEPARATOR = "The above exception was the direct cause of the following exception:"
+_CONTEXT_SEPARATOR = "During handling of the above exception, another exception occurred:"
+
+
+class _BudgetSpent(Exception):
+    """Unwinds the render once the line or exception budget is used up."""
+
+
+class _WithheldOutput:
+    """Lines written so far, with the budgets every branch draws from."""
+
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+        self.exceptions = 0
+
+    def add(self, line: str, margin: str) -> None:
+        if len(self.lines) >= _MAX_LINES:
+            raise _BudgetSpent
+        self.lines.append(f"{margin}{line}" if line or not margin else margin.rstrip())
+
+    def count_exception(self) -> None:
+        if self.exceptions >= _MAX_EXCEPTIONS:
+            raise _BudgetSpent
+        self.exceptions += 1
+
+
+def render_withheld_traceback(exc: BaseException, tb: Any = _OWN_TRACEBACK) -> str:
+    """*exc*'s traceback with every message left out (#1086).
+
+    Built only from what the code defines, never from what an exception was
+    given: each exception's module-qualified class name, a code from
+    ``exception_code_label`` (an HTTP status, a reserved JSON-RPC code, a SQLite
+    result-code name), its frames — file names, line numbers, function names
+    and source lines, without locals or the column carets — and the chain and
+    group structure the stdlib prints. Notes are counted, not shown. Nothing
+    reads ``str(exc)``, ``args``, a ``SyntaxError``'s text or a note, so a field
+    the stdlib adds later cannot carry a message here either. Counts and codes
+    come from built-in types and fixed ranges, not from a subclass's override.
+    *tb*, when given,
+    stands in for *exc*'s own ``__traceback__``, as the third item of an
+    ``exc_info`` tuple does for the stdlib — ``None`` included, which renders
+    no frames for *exc*.
+
+    Trusted, and so still shown: class, module and function names and the
+    source of the frames — they come from code, not from the data that failed.
+    Bounded while it renders, not after: the innermost frames of each
+    traceback, at most 1000 and as many as the line budget still holds with
+    room for the exception's own line (the raise site stays), 32 chained exceptions per chain, 15
+    members and 10 levels of exception groups, 256 exceptions and 2000 lines in
+    all, each cut marked (the ``[traceback truncated]`` marker is one line
+    past the 2000). If any step raises, the whole result is
+    :data:`WITHHELD_RENDER_FAILED`; only ``KeyboardInterrupt`` and
+    ``SystemExit`` pass through.
+    """
+    out = _WithheldOutput()
+    try:
+        _render_chain(exc, out, "", 0, set(), tb)
+    except _BudgetSpent:
+        out.lines.append("[traceback truncated]")
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:
+        return WITHHELD_RENDER_FAILED
+    return "\n".join(out.lines)
+
+
+def _render_chain(
+    exc: BaseException,
+    out: _WithheldOutput,
+    margin: str,
+    depth: int,
+    seen: set[int],
+    tb: Any = _OWN_TRACEBACK,
+) -> None:
+    # The chain, newest first, each entry with the sentence that links it to
+    # the entry before it; the stdlib's cause/context precedence.
+    chain: list[tuple[BaseException, str | None]] = []
+    current: BaseException | None = exc
+    link: str | None = None
+    omitted = False
+    while current is not None and id(current) not in seen:
+        if len(chain) == _MAX_CHAIN:
+            omitted = True
+            break
+        seen.add(id(current))
+        chain.append((current, link))
+        if current.__cause__ is not None:
+            current, link = current.__cause__, _CAUSE_SEPARATOR
+        elif current.__context__ is not None and not current.__suppress_context__:
+            current, link = current.__context__, _CONTEXT_SEPARATOR
+        else:
+            current = None
+    if omitted:
+        out.add("[earlier exceptions in the chain omitted]", margin)
+    ordered = list(reversed(chain))
+    for index, (item, _) in enumerate(ordered):
+        if index:
+            # The sentence that links the previous (older) item to this one.
+            out.add("", margin)
+            out.add(ordered[index - 1][1] or "", margin)
+            out.add("", margin)
+        own_tb = tb if item is exc and tb is not _OWN_TRACEBACK else item.__traceback__
+        _render_exception(item, own_tb, out, margin, depth, seen)
+
+
+def _render_exception(
+    exc: BaseException,
+    tb: types.TracebackType | None,
+    out: _WithheldOutput,
+    margin: str,
+    depth: int,
+    seen: set[int],
+) -> None:
+    from memtomem_stm.utils.redact import exception_code_label
+
+    out.count_exception()
+    if isinstance(exc, BaseExceptionGroup) and depth >= _MAX_GROUP_DEPTH:
+        out.add("[nested exception groups omitted]", margin)
+        return
+    if tb is not None:
+        if not isinstance(tb, types.TracebackType):
+            raise TypeError("not a traceback")
+        out.add("Traceback (most recent call last):", margin)
+        # The innermost frames, capped before extraction: the line budget
+        # alone would still extract and format every frame first, and a
+        # positive limit would keep the outermost ones and drop the raise
+        # site. Walking tb_next is bounded: the interpreter refuses a cycle.
+        walked = 0
+
+        def counted(frames_in: Any) -> Any:
+            nonlocal walked
+            for item in frames_in:
+                walked += 1
+                yield item
+
+        # Each frame renders as at most two lines (no column positions are
+        # extracted, so no multi-line statements or carets).
+        room = (_MAX_LINES - len(out.lines) - _RESERVED_LINES) // 2
+        if room < 1:
+            raise _BudgetSpent
+        frames = traceback.StackSummary.extract(
+            counted(traceback.walk_tb(tb)), limit=-min(_MAX_FRAMES, room), capture_locals=False
+        )
+        if walked > len(frames):
+            out.add(f"[{walked - len(frames)} outer frames omitted]", margin)
+        for chunk in frames.format():
+            for line in chunk.rstrip("\n").split("\n"):
+                out.add(line, margin)
+    code = exception_code_label(exc)
+    detail = f"[message withheld; {code}]" if code else "[message withheld]"
+    out.add(f"{_exception_type_label(type(exc))}: {detail}", margin)
+    notes = exc.__dict__.get("__notes__")
+    if notes is not None:
+        # Counted only for the built-in types, whose len() no subclass overrides.
+        count = len(notes) if type(notes) in (list, tuple) else None
+        out.add(f"[{count} note(s) withheld]" if count else "[notes withheld]", margin)
+    if isinstance(exc, BaseExceptionGroup):
+        # The members the group was built with, through the base descriptor: a
+        # subclass's ``exceptions`` property could report any count.
+        members = BaseExceptionGroup.exceptions.__get__(exc)
+        for number, member in enumerate(members[:_MAX_GROUP_WIDTH], start=1):
+            out.add(f"+-- sub-exception {number} of {len(members)} --", margin)
+            if id(member) in seen:
+                out.add(f"{_exception_type_label(type(member))}: [shown above]", margin + "| ")
+            else:
+                _render_chain(member, out, margin + "| ", depth + 1, seen)
+        if len(members) > _MAX_GROUP_WIDTH:
+            out.add(f"+-- {len(members) - _MAX_GROUP_WIDTH} more sub-exceptions omitted --", margin)
+
+
+def _exception_type_label(cls: type[BaseException]) -> str:
+    """The stdlib's spelling: module-qualified unless builtin or ``__main__``."""
+    module, qualname = cls.__module__, cls.__qualname__
+    if not isinstance(module, str) or not isinstance(qualname, str):
+        raise TypeError("exception type without a string name")
+    return qualname if module in ("builtins", "__main__") else f"{module}.{qualname}"
+
+
 class DisplayEscapingFormatter(logging.Formatter):
     """A ``Formatter`` whose exception and stack text cannot carry a
     display-hostile character to the terminal or the log file (#1173).
@@ -118,18 +322,48 @@ class DisplayEscapingFormatter(logging.Formatter):
     caches the rendered exception on the record (``exc_text``) across handlers;
     ``format`` escapes that cache too, so the order handlers run in does not
     decide what the file gets.
+
+    By default it also withholds exception messages
+    (:func:`render_withheld_traceback`, #1086); *withhold_exception_text*
+    ``False`` keeps the stdlib rendering. A withholding formatter ignores a
+    cached ``exc_text`` — another handler may have rendered it in full — and
+    restores the record's cache after formatting, so a handler that runs
+    later sees the record as it would have without this one.
     """
 
+    def __init__(
+        self, fmt: str | None = None, *, withhold_exception_text: bool = True, **kwargs: Any
+    ) -> None:
+        super().__init__(fmt, **kwargs)
+        self._withhold_exception_text = withhold_exception_text
+
     def formatException(self, ei) -> str:  # type: ignore[no-untyped-def, override]
+        if self._withhold_exception_text:
+            exc = ei[1]
+            if isinstance(exc, BaseException):
+                return _escape_lines(render_withheld_traceback(exc, ei[2]))
+            if exc is not None:
+                # Not an exception: the stdlib would print whatever str() gives.
+                return WITHHELD_RENDER_FAILED
         return _escape_lines(super().formatException(ei))
 
     def formatStack(self, stack_info: str) -> str:
         return _escape_lines(super().formatStack(stack_info))
 
     def format(self, record: logging.LogRecord) -> str:
-        if record.exc_text:
-            record.exc_text = _escape_lines(record.exc_text)
-        return super().format(record)
+        if not self._withhold_exception_text:
+            if record.exc_text:
+                record.exc_text = _escape_lines(record.exc_text)
+            return super().format(record)
+        cached = record.exc_text
+        if record.exc_info:
+            record.exc_text = None
+        elif cached:
+            record.exc_text = WITHHELD_CACHED_TRACEBACK
+        try:
+            return super().format(record)
+        finally:
+            record.exc_text = cached
 
 
 def _escape_lines(text: str) -> str:
@@ -139,16 +373,17 @@ def _escape_lines(text: str) -> str:
 
 
 def stderr_handler(
-    fmt: str = STDERR_FORMAT, *, dependency_records: bool = False
+    fmt: str = STDERR_FORMAT, *, dependency_records: bool = False, exception_text: bool = False
 ) -> logging.Handler:
     """A ``sys.stderr`` handler with the escaping formatter and, unless
-    *dependency_records*, the :class:`DependencyRecordFilter`.
+    *dependency_records*, the :class:`DependencyRecordFilter`. Tracebacks are
+    withheld unless *exception_text*.
 
     Binds the stream at creation, as ``logging.StreamHandler()`` and the
     ``basicConfig(format=...)`` calls it replaces always did.
     """
     handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(DisplayEscapingFormatter(fmt))
+    handler.setFormatter(DisplayEscapingFormatter(fmt, withhold_exception_text=not exception_text))
     return _screen_dependencies(handler, dependency_records)
 
 
@@ -265,9 +500,11 @@ def open_private_log_handler(
     max_bytes: int = LOG_FILE_MAX_BYTES,
     backup_count: int = LOG_FILE_BACKUP_COUNT,
     dependency_records: bool = False,
+    exception_text: bool = False,
 ) -> logging.Handler:
     """Rotating 0o600 file handler at *path*, parent created 0o700, with the
-    :class:`DependencyRecordFilter` unless *dependency_records*.
+    :class:`DependencyRecordFilter` unless *dependency_records*, and tracebacks
+    withheld unless *exception_text*.
 
     Raises ``OSError`` when the file or directory cannot be created — the
     caller decides whether that is fatal (daemon detached mode: yes, the file
@@ -278,7 +515,9 @@ def open_private_log_handler(
     handler = PrivateRotatingFileHandler(
         resolved, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
     )
-    handler.setFormatter(DisplayEscapingFormatter(FILE_FORMAT))
+    handler.setFormatter(
+        DisplayEscapingFormatter(FILE_FORMAT, withhold_exception_text=not exception_text)
+    )
     return _screen_dependencies(handler, dependency_records)
 
 
@@ -291,15 +530,22 @@ def configure_server_logging(config: STMConfig) -> Path | None:
     logged to stderr instead).
     """
     dependency_records = config.log_dependencies
+    exception_text = config.log_exception_text
     handlers: list[logging.Handler] = [
-        stderr_handler(STDERR_FORMAT, dependency_records=dependency_records)
+        stderr_handler(
+            STDERR_FORMAT, dependency_records=dependency_records, exception_text=exception_text
+        )
     ]
     active_path: Path | None = None
     file_error: str | None = None
     if config.log_file is not None:
         try:
             handlers.append(
-                open_private_log_handler(config.log_file, dependency_records=dependency_records)
+                open_private_log_handler(
+                    config.log_file,
+                    dependency_records=dependency_records,
+                    exception_text=exception_text,
+                )
             )
             active_path = config.log_file.expanduser()
         except OSError as exc:

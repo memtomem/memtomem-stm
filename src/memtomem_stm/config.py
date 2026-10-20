@@ -535,6 +535,15 @@ class STMConfig(BaseSettings):
     reason phrases, exception text, and whole MCP messages in both directions
     (tool arguments and results). Set via ``MEMTOMEM_STM_LOG_DEPENDENCIES``;
     read at startup, so a running daemon keeps the value it started with."""
+    log_exception_text: bool = False
+    """Render logged tracebacks with their exception messages, as the stdlib
+    does, in the server's and the daemon's logs (#1086). Off by default: STM
+    logs the frames and each exception's class and code, and withholds the
+    text, because an upstream, the LTM server or an LLM provider writes it and
+    can quote a URL query, a tool argument or part of a header back in it.
+    The default also hides local detail — an ``OSError``'s path, a
+    ``KeyError``'s key, notes, a ``SyntaxError``'s source text. Set via
+    ``MEMTOMEM_STM_LOG_EXCEPTION_TEXT``; read at startup."""
     teardown_watchdog_seconds: float = Field(default=60.0, ge=0.0, allow_inf_nan=False)
     """Ceiling on shutdown before the process exits the hard way (#906), set via
     ``MEMTOMEM_STM_TEARDOWN_WATCHDOG_SECONDS``; ``0`` disables the backstop.

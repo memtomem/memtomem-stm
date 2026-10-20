@@ -1356,6 +1356,23 @@ export MEMTOMEM_STM_LOG_DEPENDENCIES=true   # dependency INFO/DEBUG lines too
 The setting is read at startup, so restart a running daemon for it to apply.
 Records at `WARNING` and above pass from every logger either way.
 
+A traceback in those logs keeps its frames (file, line, function, source line)
+and each exception's class, but not its message: the last line of each
+exception reads `ValueError: [message withheld]`, or
+`httpx2.HTTPStatusError: [message withheld; HTTP 500]` when a status code, a
+reserved JSON-RPC code or a SQLite result code is known. An upstream, the LTM
+server or an LLM provider writes those messages, and can quote a URL query, a
+tool argument or part of a header back in them (#1086). Local detail goes too —
+an `OSError`'s path, a `KeyError`'s key, notes, a `SyntaxError`'s source text —
+and the column carets are not drawn. To see the full text while debugging:
+
+```bash
+export MEMTOMEM_STM_LOG_EXCEPTION_TEXT=true   # server and daemon logs
+```
+
+`mms hook` and the stderr line printed when the configuration itself fails to
+load always withhold.
+
 Every handler STM installs (stderr, the file, the daemon's log, `mms hook`'s
 stderr) escapes an attached traceback line by line: a bidi control, an escape
 sequence or another C0/C1 character inside it renders as `\uXXXX`, the same
