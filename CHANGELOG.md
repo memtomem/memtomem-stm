@@ -13,7 +13,8 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
-- **Error summaries no longer pass provider-chosen values through** (#1206).
+- **Error summaries no longer pass provider-chosen values through** (#1206,
+  #1207).
   The fixed vocabulary that client-facing, health and metrics surfaces use
   for an exception quoted an OpenAI-compatible embedding provider's
   `data[].index` values and a non-finite vector component in its shape
