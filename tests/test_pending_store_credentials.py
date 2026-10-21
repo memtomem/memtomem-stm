@@ -244,6 +244,8 @@ def _manager(
     max_result_chars: int,
     server: str = "srv",
     max_stored: int = 200,
+    chunk_size: int = 500,
+    min_retention: float = 0.0,
 ):
     metrics = MetricsStore(tmp_path / "metrics.db")
     metrics.initialize()
@@ -253,7 +255,7 @@ def _manager(
         max_result_chars=max_result_chars,
         max_retries=0,
         reconnect_delay_seconds=0.0,
-        progressive=ProgressiveConfig(chunk_size=500, max_stored=max_stored),
+        progressive=ProgressiveConfig(chunk_size=chunk_size, max_stored=max_stored),
         selective=SelectiveConfig(
             pending_store="sqlite", pending_store_path=tmp_path / "pending.db"
         ),
@@ -262,7 +264,7 @@ def _manager(
         ProxyConfig(
             config_path=tmp_path / "proxy.json",
             upstream_servers={server: server_cfg},
-            min_result_retention=0.0,
+            min_result_retention=min_retention,
         ),
         TokenTracker(metrics_store=metrics),
     )
@@ -411,5 +413,47 @@ async def test_row_only_progressive_refusal_keeps_existing_keys(tmp_path):
     assert _strategy(metrics) == "progressive→passthrough_on_sensitive"
     assert _pending_rows(tmp_path) == 2
     assert cache.stats()["total_entries"] == 0
+    cache.close()
+    metrics.close()
+
+
+def _refuse(*args, **kwargs):
+    raise SensitivePayloadNotStored("refused")
+
+
+def _fail(*args, **kwargs):
+    raise RuntimeError("store down")
+
+
+@pytest.mark.parametrize(
+    ("tier", "refusal", "cached"),
+    [
+        ("hybrid", _refuse, 0),
+        ("progressive", _refuse, 0),
+        # control: an ordinary tier failure keeps the truncation cacheable
+        ("hybrid", _fail, 1),
+    ],
+)
+async def test_ratio_ladder_refusal_keeps_truncation_out_of_cache(tmp_path, tier, refusal, cached):
+    """A refusal inside the ratio-guard ladder falls through to truncation like
+    any tier failure, but that truncation must not be cached: the response
+    carried a credential the cache's own scan may not see (a row-only match)."""
+    mgr, metrics, cache = _manager(
+        tmp_path,
+        CompressionStrategy.TRUNCATE,
+        max_result_chars=2000,
+        chunk_size=500 if tier == "progressive" else 100_000,
+        min_retention=0.9,
+    )
+    body = "\n\n".join(f"## Section {i}\n" + "word " * 60 for i in range(10))
+    _respond(mgr, f"# Doc\n\n{body}")
+    mgr._apply_compression = AsyncMock(return_value=("tiny", None))
+    if tier == "hybrid":
+        mgr._apply_hybrid = AsyncMock(side_effect=refusal)
+    else:
+        mgr._apply_progressive = refusal
+    await mgr.call_tool("srv", "tool", {})
+    assert _strategy(metrics) == "truncate→truncate_fallback"
+    assert cache.stats()["total_entries"] == cached
     cache.close()
     metrics.close()

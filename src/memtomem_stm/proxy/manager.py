@@ -6438,6 +6438,10 @@ class ProxyManager:
         # flags' cache and ratio-ladder effects; only the label differs.
         progressive_sensitive = False
         selective_sensitive = False
+        # The same refusal inside the ratio-guard ladder (Tier 1 progressive or
+        # Tier 2 hybrid). The ladder falls through as for any tier failure; this
+        # only keeps its result out of the cache.
+        ladder_sensitive = False
         # Set True right after either ``_apply_progressive`` call below returns:
         # the response now names a live progressive key and must not be cached.
         # Carried out of band so this manager's own keys stay out of the cache
@@ -6738,7 +6742,9 @@ class ProxyManager:
                                     dynamic,
                                     int(pcfg.ttl_seconds),
                                 )
-                            except Exception:
+                            except Exception as exc:
+                                if isinstance(exc, SensitivePayloadNotStored):
+                                    ladder_sensitive = True
                                 logger.debug(
                                     "Progressive fallback failed for %s/%s, "
                                     "falling through to hybrid/truncate",
@@ -6785,7 +6791,9 @@ class ProxyManager:
                                             compressed_ratio,
                                             len(compressed) / cleaned_len,
                                         )
-                                except Exception:
+                                except Exception as exc:
+                                    if isinstance(exc, SensitivePayloadNotStored):
+                                        ladder_sensitive = True
                                     logger.debug(
                                         "Hybrid fallback failed for %s/%s, "
                                         "falling through to truncate",
@@ -6898,6 +6906,9 @@ class ProxyManager:
             compress_ms=_compress_ms,
             surface_ms=_surface_ms,
             selective_store_error=selective_store_error,
+            credential_store_refused=(
+                progressive_sensitive or selective_sensitive or ladder_sensitive
+            ),
             progressive_key_issued=progressive_key_issued,
             unicode_token_gate=unicode_token_gate,
         )
@@ -7462,6 +7473,14 @@ class ProxyManager:
             logger.debug(
                 "Skipping cache store for %s/%s: tool is not cache-eligible "
                 "(mutating tool under the annotation policy, or cache override=false)",
+                server,
+                tool,
+            )
+        elif comp.credential_store_refused:
+            self.tracker.record_cache_unstorable()
+            logger.debug(
+                "Skipping cache store for %s/%s: a persistent pending store "
+                "refused this credential-bearing response",
                 server,
                 tool,
             )
