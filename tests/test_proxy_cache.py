@@ -521,7 +521,7 @@ class TestPrivacyGate:
             db.set_trace_callback(statements.append)
             return db
 
-        def _scan_spy(text: str) -> bool:
+        def _scan_spy(text: str, *args: object) -> bool:
             scan_calls.append(text)
             return False
 
@@ -738,7 +738,7 @@ class TestPrivacyGate:
         real_scan = cache_module.privacy.contains_sensitive_content
         sweeps: list[str] = []
 
-        def _steal_the_token_once(text: str) -> bool:
+        def _steal_the_token_once(text: str, *args: object) -> bool:
             if text == "password=hunter2":
                 sweeps.append(text)
                 if len(sweeps) == 1:
@@ -753,7 +753,7 @@ class TestPrivacyGate:
                         peer.commit()
                     finally:
                         peer.close()
-            return real_scan(text)
+            return real_scan(text, *args)
 
         monkeypatch.setattr(
             cache_module.privacy, "contains_sensitive_content", _steal_the_token_once
@@ -802,7 +802,7 @@ class TestPrivacyGate:
         real_scan = cache_module.privacy.contains_sensitive_content
         steal_attempts: list[bool] = []
 
-        def _steal_the_token_whenever_possible(text: str) -> bool:
+        def _steal_the_token_whenever_possible(text: str, *args: object) -> bool:
             if text == "password=hunter2":
                 # A peer that publishes over every token it can reach. On the
                 # last attempt the reservation is already held, so its write
@@ -819,7 +819,7 @@ class TestPrivacyGate:
                     steal_attempts.append(False)
                 finally:
                     peer.close()
-            return real_scan(text)
+            return real_scan(text, *args)
 
         monkeypatch.setattr(
             cache_module.privacy, "contains_sensitive_content", _steal_the_token_whenever_possible
@@ -868,7 +868,7 @@ class TestPrivacyGate:
             older_build.setattr(
                 cache_module.privacy,
                 "contains_sensitive_content",
-                lambda text: False if "password=hunter2" in text else real_scan(text),
+                lambda text, *args: False if "password=hunter2" in text else real_scan(text, *args),
             )
             peer = ProxyCache(db_path, max_entries=100)
             peer.initialize()
@@ -932,7 +932,7 @@ class TestPrivacyGate:
         real_scan = cache_module.privacy.contains_sensitive_content
         swapped: list[str] = []
 
-        def _swap_triggers_mid_sweep(text: str) -> bool:
+        def _swap_triggers_mid_sweep(text: str, *args: object) -> bool:
             if text == "ordinary cached response" and not swapped:
                 swapped.append(text)
                 peer = sqlite3.connect(str(db_path), timeout=5.0)
@@ -957,7 +957,7 @@ class TestPrivacyGate:
                     )  # positive control: the write really went untracked
                 finally:
                     peer.close()
-            return real_scan(text)
+            return real_scan(text, *args)
 
         monkeypatch.setattr(
             cache_module.privacy, "contains_sensitive_content", _swap_triggers_mid_sweep
@@ -1136,9 +1136,9 @@ class TestPrivacyGate:
         scanned: list[str] = []
         real_scan = cache_module.privacy.contains_sensitive_content
 
-        def _recording_scan(text: str) -> bool:
+        def _recording_scan(text: str, *args: object) -> bool:
             scanned.append(text)
-            return real_scan(text)
+            return real_scan(text, *args)
 
         monkeypatch.setattr(cache_module.privacy, "contains_sensitive_content", _recording_scan)
 
@@ -1311,9 +1311,9 @@ class TestPrivacyGate:
         scan_calls: list[str] = []
         real_scan = cache_module.privacy.contains_sensitive_content
 
-        def _scan_spy(text: str) -> bool:
+        def _scan_spy(text: str, *args: object) -> bool:
             scan_calls.append(text)
-            return real_scan(text)
+            return real_scan(text, *args)
 
         monkeypatch.setattr(cache_module.privacy, "contains_sensitive_content", _scan_spy)
 
@@ -1375,7 +1375,7 @@ class TestPrivacyGate:
         monkeypatch.setattr(
             cache_module.privacy,
             "contains_sensitive_content",
-            lambda text: future_secret in text,
+            lambda text, *args: future_secret in text,
         )
 
         newer_process = ProxyCache(db_path, max_entries=100)
@@ -1425,11 +1425,11 @@ class TestPrivacyGate:
         errors: list[BaseException] = []
         real_scan = cache_module.privacy.contains_sensitive_content
 
-        def _blocking_scan(text: str) -> bool:
+        def _blocking_scan(text: str, *args: object) -> bool:
             if text == "ordinary cached response":
                 scan_started.set()
                 assert release_scan.wait(timeout=5.0)
-            return real_scan(text)
+            return real_scan(text, *args)
 
         def _initialize() -> None:
             cache = ProxyCache(db_path, max_entries=100)
@@ -1522,11 +1522,11 @@ class TestPrivacyGate:
         errors: list[BaseException] = []
         real_scan = cache_module.privacy.contains_sensitive_content
 
-        def _blocking_scan(text: str) -> bool:
+        def _blocking_scan(text: str, *args: object) -> bool:
             if text == "password=hunter2":
                 scan_started.set()
                 assert release_scan.wait(timeout=5.0)
-            return real_scan(text)
+            return real_scan(text, *args)
 
         def _initialize() -> None:
             cache = ProxyCache(db_path, max_entries=100)
@@ -1668,13 +1668,13 @@ class TestPrivacyGate:
                 return old_fingerprint
             return real_fingerprint
 
-        def _thread_local_scan(text: str) -> bool:
+        def _thread_local_scan(text: str, *args: object) -> bool:
             if threading.current_thread().name == writer_thread_name:
                 return False  # the older policy has no pattern for this body
             if text == "ordinary cached response":
                 scan_started.set()
                 assert release_scan.wait(timeout=5.0)
-            return real_scan(text)
+            return real_scan(text, *args)
 
         monkeypatch.setattr(cache_module, "_privacy_policy_fingerprint", _thread_local_fingerprint)
         monkeypatch.setattr(cache_module.privacy, "contains_sensitive_content", _thread_local_scan)

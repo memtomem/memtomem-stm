@@ -233,3 +233,55 @@ def contains_sensitive_content(text: str, patterns: list[str] | None = None) -> 
         return False
     compiled = _compile_patterns(tuple(effective))
     return any(p.search(text) for p in compiled)
+
+
+# One JSON string escape. An escaped backslash is consumed as a pair, left to
+# right, so ``\\u0070`` decodes to a literal backslash followed by ``u0070``.
+_JSON_ESCAPE = re.compile(r'\\(?:u([0-9a-fA-F]{4})|(["\\/bfnrt]))')
+_JSON_ESCAPE_CHARS = {
+    '"': '"',
+    "\\": "\\",
+    "/": "/",
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+}
+_MAX_UNESCAPE_PASSES = 3
+
+
+def _json_unescape(text: str) -> str:
+    return _JSON_ESCAPE.sub(
+        lambda m: chr(int(m.group(1), 16)) if m.group(1) else _JSON_ESCAPE_CHARS[m.group(2)],
+        text,
+    )
+
+
+def contains_sensitive_content_decoded(text: str, patterns: list[str] | None = None) -> bool:
+    """``contains_sensitive_content`` that also sees through JSON string escaping.
+
+    Scans *text*, then the text with its JSON string escapes replaced in place,
+    repeatedly, so a label written as ``\\u0070assword`` or a JSON document
+    carried inside a JSON string (``"{\\"password\\": …}"``) is seen as the
+    decoded text. Text that still decodes further after the last pass counts as
+    sensitive: the scan could not finish.
+
+    For storage gates whose false positive costs only a skipped write, such as
+    the response cache. The decoded text is synthesized, so it can match where
+    the input means something else (a literal backslash-u sequence, a quote pair
+    assembled from escapes); a gate whose false positive changes what a caller
+    receives should scan real text only.
+    """
+    if contains_sensitive_content(text, patterns):
+        return True
+    for _ in range(_MAX_UNESCAPE_PASSES):
+        if "\\" not in text:
+            return False
+        decoded = _json_unescape(text)
+        if decoded == text:
+            return False
+        if contains_sensitive_content(decoded, patterns):
+            return True
+        text = decoded
+    return "\\" in text and _json_unescape(text) != text
