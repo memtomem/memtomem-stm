@@ -104,6 +104,8 @@ Auto-detects format: JSON dicts (parsed by keys), JSON arrays (parsed by index),
 
 Pending selections are stored for 5 minutes (max 100 concurrent), then auto-evicted. For multi-instance deployments, switch to SQLite-backed pending storage via the `PendingStore` protocol.
 
+With `pending_store: "sqlite"`, a response that matches one of STM's credential patterns is not written to the file. Two texts are checked: the response as STM received it, and the row as it would be written. The call then degrades as it does when the store fails: SELECTIVE and HYBRID return a boundary-aware truncation (`selective→truncate_on_sensitive` / `hybrid→truncate_on_sensitive` in metrics), and PROGRESSIVE returns the full cleaned response (`progressive→passthrough_on_sensitive`). Neither is cached. Email addresses are not credential patterns and do not trigger this. A credential that matches only after decoding, and only in a form the compressor does not write, is not caught: for example a JSON-escaped label (`\u0070assword`) under a nested object, which the compressor writes under the flattened key `db.password`. The default `pending_store: "memory"` writes no file and is unaffected.
+
 ## Hybrid Compression
 
 Combines immediate access with selective retrieval:

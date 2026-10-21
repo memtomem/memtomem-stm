@@ -50,11 +50,13 @@ from memtomem_stm.proxy.compression import (
     LLMCompressor,
     SchemaPruningCompressor,
     SelectiveCompressor,
+    SensitivePayloadNotStored,
     SkeletonCompressor,
     TruncateCompressor,
     auto_select_strategy,
     count_markdown_headings,
     get_compressor,
+    payload_has_credentials,
 )
 from memtomem_stm.proxy.config import (
     CleaningConfig,
@@ -5045,7 +5047,17 @@ class ProxyManager:
         pin_is_live = self._pin_is_live_generation(cfg_snap)
         _publish_cfg, publish_sel = self._publication_pair(server, tool, sel_cfg, cfg_snap)
         store = self._get_progressive_store(publish_sel)
-        if pin_is_live:
+        # A refusal (#1148) must leave the store as it was, so neither check may
+        # follow the eviction. This is the response side, which the row's JSON
+        # escaping can hide (a quoted label inside the content is written with
+        # escaped quotes); the adapter has the store check the row itself
+        # before it runs ``evict`` below.
+        if store.persists_to_disk and payload_has_credentials(text):
+            raise SensitivePayloadNotStored(
+                "credential-bearing response not written to the persistent pending store"
+            )
+
+        def evict() -> None:
             # Eviction is STORE-WIDE, so it must never run on a superseded
             # policy: a stale pin carrying a smaller ``max_stored`` would delete keys
             # the CURRENT generation just handed to its clients. The pinned
@@ -5068,7 +5080,7 @@ class ProxyManager:
             chunk_size=cfg.chunk_size,
             include_structure_hint=cfg.include_structure_hint,
         )
-        store.put(key, resp)
+        store.put(key, resp, before_write=evict if pin_is_live else None)
 
         chunker = ProgressiveChunker(
             chunk_size=cfg.chunk_size,
@@ -6421,6 +6433,15 @@ class ProxyManager:
         # (not only in the else-branch) because the shared CompressionResult
         # construction at the end reads it on the PROGRESSIVE path too.
         selective_store_error = False
+        # The two degrades above were a credential-bearing response refused by
+        # a persistent pending store (#1148), not a store fault. They keep the
+        # flags' cache and ratio-ladder effects; only the label differs.
+        progressive_sensitive = False
+        selective_sensitive = False
+        # The same refusal inside the ratio-guard ladder (Tier 1 progressive or
+        # Tier 2 hybrid). The ladder falls through as for any tier failure; this
+        # only keeps its result out of the cache.
+        ladder_sensitive = False
         # Set True right after either ``_apply_progressive`` call below returns:
         # the response now names a live progressive key and must not be cached.
         # Carried out of band so this manager's own keys stay out of the cache
@@ -6452,7 +6473,7 @@ class ProxyManager:
                         cfg_snap=cfg_snap,
                     )
                     progressive_key_issued = True
-                except Exception:
+                except Exception as exc:
                     # Progressive build/store failed (e.g. a SQLite-backed
                     # pending/reads store I/O error inside ``_apply_progressive``).
                     # Degrade to a zero-loss passthrough of the full cleaned
@@ -6464,15 +6485,29 @@ class ProxyManager:
                     # mirrors that best-effort handling, but stays zero-loss
                     # (passthrough, not lossy hybrid/truncate) because the
                     # PROGRESSIVE strategy has no retention floor to satisfy.
-                    logger.warning(
-                        "Progressive delivery failed for %s/%s; returning full "
-                        "cleaned content (passthrough)",
-                        server,
-                        tool,
-                        exc_info=True,
-                    )
+                    # A credential-bearing response refused by a persistent
+                    # store (#1148) takes the same passthrough, but it is a
+                    # policy outcome rather than a fault: no traceback, and its
+                    # own label below.
+                    if isinstance(exc, SensitivePayloadNotStored):
+                        logger.info(
+                            "Credential-bearing response from %s/%s not written to the "
+                            "persistent pending store; returning full cleaned content "
+                            "(passthrough)",
+                            server,
+                            tool,
+                        )
+                    else:
+                        logger.warning(
+                            "Progressive delivery failed for %s/%s; returning full "
+                            "cleaned content (passthrough)",
+                            server,
+                            tool,
+                            exc_info=True,
+                        )
                     compressed = cleaned
                     progressive_passthrough_on_error = True
+                    progressive_sensitive = isinstance(exc, SensitivePayloadNotStored)
             _compress_ms = 0.0
             compressed_chars_for_metrics = len(compressed)
             # The metrics record at the bottom reads ``metrics_strategy`` on
@@ -6480,7 +6515,11 @@ class ProxyManager:
             # branch (pre-fix this branch left it unbound and every
             # PROGRESSIVE-strategy call died with UnboundLocalError).
             metrics_strategy = effective_compression.value
-            if progressive_passthrough_on_error:
+            if progressive_sensitive:
+                # Not ``→passthrough_on_error``: the degraded-store counter
+                # matches that suffix, and nothing failed here (#1148).
+                metrics_strategy = f"{effective_compression.value}→passthrough_on_sensitive"
+            elif progressive_passthrough_on_error:
                 # Surface the degradation in telemetry, consistent with the
                 # ``X→Y_fallback`` labels the ratio-guard ladder records below.
                 metrics_strategy = f"{effective_compression.value}→passthrough_on_error"
@@ -6580,7 +6619,7 @@ class ProxyManager:
                         min_chars=min_budget,
                         cfg_snap=cfg_snap,
                     )
-                except sqlite3.Error:
+                except (sqlite3.Error, SensitivePayloadNotStored) as exc:
                     # sqlite is reachable in this path ONLY via the
                     # SELECTIVE/HYBRID chunk-TOC pending-store write
                     # (``SQLitePendingStore``, opt-in). Scope the degrade to
@@ -6603,13 +6642,25 @@ class ProxyManager:
                     # boundary-aware truncation at the retention budget (the
                     # same terminal tier the ratio-guard ladder falls back to),
                     # mirroring the PROGRESSIVE passthrough guard above.
-                    logger.warning(
-                        "Selective/hybrid pending-store write failed for %s/%s; "
-                        "returning boundary-aware truncation (degraded)",
-                        server,
-                        tool,
-                        exc_info=True,
-                    )
+                    # A credential-bearing response the persistent store
+                    # refused (#1148) degrades the same way, logged as the
+                    # policy outcome it is.
+                    selective_sensitive = isinstance(exc, SensitivePayloadNotStored)
+                    if selective_sensitive:
+                        logger.info(
+                            "Credential-bearing response from %s/%s not written to the "
+                            "persistent pending store; returning boundary-aware truncation",
+                            server,
+                            tool,
+                        )
+                    else:
+                        logger.warning(
+                            "Selective/hybrid pending-store write failed for %s/%s; "
+                            "returning boundary-aware truncation (degraded)",
+                            server,
+                            tool,
+                            exc_info=True,
+                        )
                     _fb_scorer = self._relevance_scorer_for(cfg_snap)
                     compressed = await self._compress_maybe_offthread(
                         TruncateCompressor(scorer=_fb_scorer, min_chars=min_budget),
@@ -6635,7 +6686,11 @@ class ProxyManager:
                 # Terminal truncation already applied above — surface the
                 # degradation in telemetry and skip the ratio-guard ladder
                 # (truncate is the ladder's own terminal tier).
-                metrics_strategy = f"{effective_compression.value}→truncate_on_store_error"
+                metrics_strategy = (
+                    f"{effective_compression.value}→truncate_on_sensitive"
+                    if selective_sensitive
+                    else f"{effective_compression.value}→truncate_on_store_error"
+                )
             if llm_fallback:
                 metrics_strategy = f"llm_summary→{llm_fallback}_fallback"
             progressive_fallback = False  # set when progressive replaces the response
@@ -6687,7 +6742,9 @@ class ProxyManager:
                                     dynamic,
                                     int(pcfg.ttl_seconds),
                                 )
-                            except Exception:
+                            except Exception as exc:
+                                if isinstance(exc, SensitivePayloadNotStored):
+                                    ladder_sensitive = True
                                 logger.debug(
                                     "Progressive fallback failed for %s/%s, "
                                     "falling through to hybrid/truncate",
@@ -6734,7 +6791,9 @@ class ProxyManager:
                                             compressed_ratio,
                                             len(compressed) / cleaned_len,
                                         )
-                                except Exception:
+                                except Exception as exc:
+                                    if isinstance(exc, SensitivePayloadNotStored):
+                                        ladder_sensitive = True
                                     logger.debug(
                                         "Hybrid fallback failed for %s/%s, "
                                         "falling through to truncate",
@@ -6847,6 +6906,9 @@ class ProxyManager:
             compress_ms=_compress_ms,
             surface_ms=_surface_ms,
             selective_store_error=selective_store_error,
+            credential_store_refused=(
+                progressive_sensitive or selective_sensitive or ladder_sensitive
+            ),
             progressive_key_issued=progressive_key_issued,
             unicode_token_gate=unicode_token_gate,
         )
@@ -7411,6 +7473,14 @@ class ProxyManager:
             logger.debug(
                 "Skipping cache store for %s/%s: tool is not cache-eligible "
                 "(mutating tool under the annotation policy, or cache override=false)",
+                server,
+                tool,
+            )
+        elif comp.credential_store_refused:
+            self.tracker.record_cache_unstorable()
+            logger.debug(
+                "Skipping cache store for %s/%s: a persistent pending store "
+                "refused this credential-bearing response",
                 server,
                 tool,
             )

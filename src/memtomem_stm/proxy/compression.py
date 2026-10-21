@@ -29,6 +29,7 @@ from memtomem_stm.proxy.config import (
     LLMProvider,
     TailMode,
 )
+from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS, contains_sensitive_content
 from memtomem_stm.proxy.relevance import BM25Scorer, RelevanceScorer
 from memtomem_stm.utils.anyio_shutdown import (
     InFlightGate,
@@ -874,6 +875,28 @@ def _plain_truncate(text: str, *, max_chars: int, context_query: str | None = No
     return TruncateCompressor().compress(text, max_chars=max_chars, context_query=context_query)
 
 
+class SensitivePayloadNotStored(Exception):
+    """A credential-bearing payload was not written to a store that persists to disk.
+
+    Raised before anything is written, so the caller can degrade the response
+    the same way it does for a failed store write. The verdict runs
+    ``CREDENTIAL_PATTERNS`` over real bytes only: the response as received
+    (checked by the publisher) and the row as it would be written (checked by
+    the store). No decoded or re-serialized view is synthesized: each one tried
+    for this missed something the compressor's own decoding exposed or invented
+    matches that neither the response nor the file contains (#1148).
+    """
+
+
+def payload_has_credentials(text: str) -> bool:
+    """Whether *text* matches a credential pattern (the #1148 storage verdict)."""
+    return contains_sensitive_content(text, CREDENTIAL_PATTERNS)
+
+
+def _store_persists(store: object) -> bool:
+    return bool(getattr(store, "persists_to_disk", False))
+
+
 @dataclass
 class PendingSelection:
     """Stores original chunks while waiting for section selection."""
@@ -944,7 +967,17 @@ class SelectiveCompressor:
 
             self._store = InMemoryPendingStore()
 
-    def compress(self, text: str, *, max_chars: int, context_query: str | None = None) -> str:
+    def compress(
+        self,
+        text: str,
+        *,
+        max_chars: int,
+        context_query: str | None = None,
+        sensitivity_source: str | None = None,
+    ) -> str:
+        """``sensitivity_source`` is the unsliced response when *text* is only
+        part of it (HYBRID's tail): a label left in the head with its value in
+        the tail is visible only there."""
         if not text or len(text) <= max_chars:
             return text
 
@@ -959,17 +992,36 @@ class SelectiveCompressor:
                 # its retention fallback.
                 chunks = chunks or {"Content": text}
 
-        return self._store_and_build_toc(text, fmt, chunks, context_query, max_chars=max_chars)
+        return self._store_and_build_toc(
+            text,
+            fmt,
+            chunks,
+            context_query,
+            max_chars=max_chars,
+            sensitivity_source=sensitivity_source,
+        )
 
     def compress_full_toc(
-        self, text: str, *, max_chars: int, context_query: str | None = None
+        self,
+        text: str,
+        *,
+        max_chars: int,
+        context_query: str | None = None,
+        sensitivity_source: str | None = None,
     ) -> str | None:
         fmt, chunks = self._detect_and_parse(text)
         if len(chunks) <= 1:
             chunks = self._decompose_single_chunk(chunks, fmt)
             if len(chunks) <= 1:
                 return None
-        return self._store_and_build_toc(text, fmt, chunks, context_query, max_chars=max_chars)
+        return self._store_and_build_toc(
+            text,
+            fmt,
+            chunks,
+            context_query,
+            max_chars=max_chars,
+            sensitivity_source=sensitivity_source,
+        )
 
     # Largest per-entry preview length (the historical default).
     _MAX_PREVIEW = 80
@@ -981,8 +1033,26 @@ class SelectiveCompressor:
         chunks: dict[str, str],
         context_query: str | None = None,
         max_chars: int | None = None,
+        sensitivity_source: str | None = None,
     ) -> str:
         selection_key = uuid.uuid4().hex[:16]
+
+        # The response-side half of the #1148 verdict (the store checks the row
+        # it would write). Computed at most once, and only for a store that
+        # persists: the in-memory default pays nothing. The common case is
+        # evaluated here, before ``_publish`` takes the lock a config rebuild on
+        # the event loop waits for; a retarget onto a persisting store from a
+        # non-persisting one evaluates it under the lock instead.
+        sources = (text,) if sensitivity_source is None else (text, sensitivity_source)
+        verdict: list[bool] = []
+
+        def sensitive() -> bool:
+            if not verdict:
+                verdict.append(any(payload_has_credentials(s) for s in sources))
+            return verdict[0]
+
+        if _store_persists(self._store):
+            sensitive()
 
         # Query-aware ordering: when a context query is supplied, surface the
         # most relevant sections first so the agent sees them at the top of the
@@ -1014,6 +1084,7 @@ class SelectiveCompressor:
                 created_at=time.monotonic(),
                 total_chars=len(text),
             ),
+            sensitive,
         )
 
         def build(preview_cap: int) -> str:
@@ -1261,7 +1332,7 @@ class SelectiveCompressor:
             return "heading"
         return "paragraph"
 
-    def _publish(self, key: str, pending: PendingSelection) -> float:
+    def _publish(self, key: str, pending: PendingSelection, sensitive: Callable[[], bool]) -> float:
         """Store *key* where the readers will look for it, and evict under the
         policy of whoever owns that store. Returns the enforcing TTL.
 
@@ -1298,8 +1369,12 @@ class SelectiveCompressor:
         generation and this is the historical put-then-evict. The throwaway
         recovery/probe instances DO get a provider, but never reach this method
         — they only ``select()``.
+
+        Whether the response may be persisted (#1148) is decided against the
+        store actually written, so it is checked after the target is resolved.
         """
         if self._live_provider is None:
+            self._refuse_sensitive(self._store, sensitive)
             self._store.put(key, pending)
             self._evict()
             return self._ttl
@@ -1309,9 +1384,17 @@ class SelectiveCompressor:
             # its close defers to end_use). The key dies with the shutdown
             # either way.
             target = self._live_provider() or self
+            self._refuse_sensitive(target._store, sensitive)
             target._store.put(key, pending)
             target._evict()
             return target._ttl
+
+    @staticmethod
+    def _refuse_sensitive(store: object, sensitive: Callable[[], bool]) -> None:
+        if _store_persists(store) and sensitive():
+            raise SensitivePayloadNotStored(
+                "credential-bearing response not written to the persistent pending store"
+            )
 
     def _evict(self) -> None:
         self._store.evict_expired(self._ttl, exclude_format="progressive")
@@ -2435,8 +2518,6 @@ class LLMCompressor:
         if not text or len(text) <= max_chars:
             return LLMCompressionResult(text)
         if privacy_patterns:
-            from memtomem_stm.proxy.privacy import contains_sensitive_content
-
             if contains_sensitive_content(text, privacy_patterns):
                 logger.info(
                     "Sensitive content detected, skipping LLM compression (strategy=llm/%s)",
@@ -2748,7 +2829,10 @@ class HybridCompressor:
 
         if self._tail_mode == TailMode.TOC:
             tail_compressed = self._selective.compress(
-                tail_text, max_chars=toc_budget, context_query=context_query
+                tail_text,
+                max_chars=toc_budget,
+                context_query=context_query,
+                sensitivity_source=text,
             )
         else:
             tail_compressed = _plain_truncate(

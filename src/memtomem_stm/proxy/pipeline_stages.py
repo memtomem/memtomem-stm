@@ -109,6 +109,11 @@ class CompressionResult:
     # transient, and must not be pinned for the cache TTL. No default (the
     # module contract above): the compress branch always sets it explicitly.
     selective_store_error: bool
+    # A persistent pending store refused a credential-bearing response on this
+    # call (#1148): on the primary SELECTIVE/HYBRID/PROGRESSIVE path, or inside
+    # the ratio-guard ladder, whose terminal truncation would otherwise be
+    # cached. Gates the cache store. No default (the module contract above).
+    credential_store_refused: bool
     # ``_apply_progressive`` returned on this call, so ``compressed`` is a first
     # chunk whose footer names a key in the process-local progressive store. Gates
     # the cache store: that key dies long before the cache TTL. Set where the key

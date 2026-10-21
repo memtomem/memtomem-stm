@@ -71,9 +71,9 @@ class TestHybridForwardsQuery:
         sel = SelectiveCompressor()
         original = sel.compress
 
-        def spy(text, *, max_chars, context_query=None):
+        def spy(text, *, max_chars, context_query=None, **kwargs):
             received["context_query"] = context_query
-            return original(text, max_chars=max_chars, context_query=context_query)
+            return original(text, max_chars=max_chars, context_query=context_query, **kwargs)
 
         sel.compress = spy  # type: ignore[method-assign]
         HybridCompressor(head_chars=120, selective_compressor=sel).compress(
