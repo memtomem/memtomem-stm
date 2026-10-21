@@ -25,7 +25,7 @@ changes inline only. See the deprecation policy in
   default `pending_store: "memory"` is unaffected; rows already in the file
   expire by TTL.
 - **The response cache reads through JSON string escaping before its privacy
-  check** (#1211). A credential whose label or quotes were JSON-escaped was
+  check** (#1211, #1214). A credential whose label or quotes were JSON-escaped was
   cached: a `\u`-escaped label, or a JSON document carried inside a JSON
   string (`{"text": "{\"password\": …}"}`), which is common in tool results.
   The check now also scans the text with its JSON escapes decoded, up to three
