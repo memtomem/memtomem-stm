@@ -14,7 +14,7 @@ changes inline only. See the deprecation policy in
 ### Changed
 
 - **The SQLite pending store no longer writes credential-bearing responses**
-  (#1148). With `pending_store: "sqlite"`, a SELECTIVE, HYBRID or
+  (#1148, #1213). With `pending_store: "sqlite"`, a SELECTIVE, HYBRID or
   PROGRESSIVE response that matches STM's credential patterns is checked
   twice: as received, and as the row that would be written. A match in either
   means nothing is written to `pending_selections.db`. **Behavior change**: such a
