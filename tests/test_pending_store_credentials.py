@@ -64,6 +64,14 @@ ALLOWED = {
     "prefixed_key": json.dumps({"tools.api_key": "healthy", "pad": PAD}),
     "working_directory": json.dumps({"pwd": "/home/user", "pad": PAD}),
     "email_only": json.dumps({"author": "someone@example.com", "pad": PAD}),
+    # Only real bytes are scanned; no decoded view is synthesized. These match
+    # neither the response nor the written row, though a decoded view would.
+    # The first is the documented residual: the escaped label is written under
+    # the flattened key ``db.password``, with its value in another string.
+    "escaped_label_under_nested_object": '{"db": {"\\u0070assword": "%s"}, "pad": "%s"}'
+    % (SECRET, PAD),
+    # A literal backslash-u sequence in a value stays literal in the row too.
+    "literal_escape_text": json.dumps({"note": "\\u0070assword = example", "pad": PAD}),
 }
 
 
