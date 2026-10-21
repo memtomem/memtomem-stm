@@ -164,8 +164,9 @@ _PRIVACY_REPAIR_ATTEMPTS = 3
 # automatically; bump this only when the same pattern tuple would be evaluated
 # under a meaningfully different storage policy. Epoch 2 establishes the
 # trigger-backed unverified-key baseline, invalidating stamps created before
-# legacy writes could be tracked.
-_PRIVACY_POLICY_EPOCH = 2
+# legacy writes could be tracked. Epoch 3 scans through JSON string escaping
+# (#1211), so rows an earlier build cached as clean are swept once.
+_PRIVACY_POLICY_EPOCH = 3
 
 
 def _privacy_policy_fingerprint() -> str:
@@ -207,11 +208,20 @@ def _installed_triggers_are_current(db: sqlite3.Connection) -> bool:
     return installed == expected
 
 
+def _text_is_sensitive(text: str) -> bool:
+    """The cache's privacy rule, shared by every place that applies it.
+
+    Sees through JSON string escaping: tool results routinely carry a JSON
+    document inside a JSON string, where every quote around a label is escaped
+    and the raw text matches nothing (#1211). A false positive here costs one
+    uncached response.
+    """
+    return privacy.contains_sensitive_content_decoded(text)
+
+
 def _row_is_sensitive(result: str, envelope: str | None) -> bool:
     """True when a stored row's body or envelope matches the current policy."""
-    return privacy.contains_sensitive_content(result) or (
-        envelope is not None and privacy.contains_sensitive_content(envelope)
-    )
+    return _text_is_sensitive(result) or (envelope is not None and _text_is_sensitive(envelope))
 
 
 def _ensure_current_triggers(db: sqlite3.Connection) -> bool:
@@ -649,9 +659,7 @@ class ProxyCache:
             return None
         entry = CacheEntry(result=row[0], created_at=row[1], ttl_seconds=row[2])
         envelope_json = row[4]
-        if privacy.contains_sensitive_content(entry.result) or (
-            envelope_json is not None and privacy.contains_sensitive_content(envelope_json)
-        ):
+        if _row_is_sensitive(entry.result, envelope_json):
             # Read-side mirror of the ``set()`` gate: a row can land here
             # without passing ``set()`` — written by an older still-running
             # pre-gate process or an external SQL writer — and the startup
@@ -832,9 +840,7 @@ class ProxyCache:
         except (TypeError, ValueError):
             logger.debug("Skipping cache store for %s/%s: envelope is not JSON-safe", server, tool)
             return
-        if privacy.contains_sensitive_content(result) or privacy.contains_sensitive_content(
-            envelope_json
-        ):
+        if _row_is_sensitive(result, envelope_json):
             # SECURITY.md: responses that look like secrets are never
             # persisted to the response cache. Enforced at the store
             # chokepoint so no caller can bypass it (#453); a false positive

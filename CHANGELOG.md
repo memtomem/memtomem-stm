@@ -24,6 +24,16 @@ changes inline only. See the deprecation policy in
   uncached, with one INFO log line. Email addresses do not trigger it. The
   default `pending_store: "memory"` is unaffected; rows already in the file
   expire by TTL.
+- **The response cache reads through JSON string escaping before its privacy
+  check** (#1211, #1214). A credential whose label or quotes were JSON-escaped was
+  cached: a `\u`-escaped label, or a JSON document carried inside a JSON
+  string (`{"text": "{\"password\": …}"}`), which is common in tool results.
+  The check now also scans the text with its JSON escapes decoded, up to three
+  levels; text that still decodes further counts as sensitive. **Behavior
+  change**: such responses are no longer cached, and on the first start after
+  upgrading, the cache runs its one-time privacy sweep and drops rows already
+  cached that the new check rejects. A false positive costs one uncached
+  response.
 
 ## [0.6.5] — 2026-10-20
 

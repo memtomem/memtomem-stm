@@ -33,7 +33,7 @@ memtomem-stm is an MCP proxy gateway. Its threat surface differs from a server-f
   does not eliminate the residual risk that ordinary natural-language text may
   persuade a model; keep write-tool surfacing disabled and review retrieved
   context before consequential actions.
-- **Sensitive content auto-detection**: Responses containing patterns that look like secrets (API keys, tokens, private keys) are detected and excluded from the response cache. Index exclusion applies only when an embedder is explicitly supplied through the library-mode `ProxyManager(index_engine=...)` extension; the bundled `mms` server does not automatically index tool responses into LTM.
+- **Sensitive content auto-detection**: Responses containing patterns that look like secrets (API keys, tokens, private keys) are detected and excluded from the response cache. The cache's check also reads through JSON string escaping, so a JSON document carried inside a JSON string, or a label written with `\u` escapes, is checked as its decoded text. Index exclusion applies only when an embedder is explicitly supplied through the library-mode `ProxyManager(index_engine=...)` extension; the bundled `mms` server does not automatically index tool responses into LTM.
 - **Upstream tool errors**: When an upstream or its transport raises, or the
   upstream returns a JSON-RPC error, the client and the metrics DB get the
   type, HTTP status or reserved JSON-RPC code, never the message, which can
