@@ -11,6 +11,20 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Changed
+
+- **The SQLite pending store no longer writes credential-bearing responses**
+  (#1148). With `pending_store: "sqlite"`, a SELECTIVE, HYBRID or
+  PROGRESSIVE response that matches STM's credential patterns is checked
+  twice: as received, and as the row that would be written. A match in either
+  means nothing is written to `pending_selections.db`. **Behavior change**: such a
+  response now comes back as a boundary-aware truncation (SELECTIVE/HYBRID,
+  `selective→truncate_on_sensitive` / `hybrid→truncate_on_sensitive`) or as
+  the full cleaned response (PROGRESSIVE, `progressive→passthrough_on_sensitive`),
+  uncached, with one INFO log line. Email addresses do not trigger it. The
+  default `pending_store: "memory"` is unaffected; rows already in the file
+  expire by TTL.
+
 ## [0.6.5] — 2026-10-20
 
 ### Upgrade notes

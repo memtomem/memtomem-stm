@@ -13,7 +13,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 
-from memtomem_stm.proxy.compression import PendingSelection
+from memtomem_stm.proxy.compression import (
+    PendingSelection,
+    SensitivePayloadNotStored,
+    payload_has_credentials,
+)
 from memtomem_stm.proxy.heading_index import HeadingIndex, ensure_heading_index
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.utils.json_out import scrub_lone_surrogates
@@ -86,7 +90,14 @@ class PendingStore(Protocol):
     renewal are atomic with deletion/replacement, and use each entry's stored
     TTL. ``evict_progressive_expired`` applies that same policy store-wide.
     Generic get/touch/evict_expired retain SELECTIVE's separate policy.
+
+    ``persists_to_disk`` says whether ``put`` writes the payload to a file. A
+    store that does refuses a credential-bearing payload (#1148): publishers
+    check the response before ``put``, and the store checks the row it would
+    write.
     """
+
+    persists_to_disk: bool
 
     def put(self, key: str, selection: PendingSelection) -> None: ...
     def get(self, key: str) -> PendingSelection | None: ...
@@ -105,6 +116,8 @@ class PendingStore(Protocol):
 
 class InMemoryPendingStore:
     """In-memory pending store (default, single-instance)."""
+
+    persists_to_disk = False
 
     def __init__(self) -> None:
         self._data: dict[str, PendingSelection] = {}
@@ -227,7 +240,16 @@ class SQLitePendingStore:
     old processes also apply their publisher's TTL to unrelated rows; all
     processes sharing this file must upgrade/restart together for entry-local
     expiry to hold. No blanket purge of existing rows is needed.
+
+    A row whose serialized payload matches a credential pattern is never
+    written: ``put`` raises ``SensitivePayloadNotStored`` instead (#1148). The
+    serialized row is checked, not the chunks one by one, because it is what
+    lands in the file, and decomposition can create a match the response did
+    not have (a bare number under a ``password`` key is written as a quoted
+    string). Rows already in the file are left to expire by TTL.
     """
+
+    persists_to_disk = True
 
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
@@ -308,7 +330,25 @@ class SQLitePendingStore:
     # commit (#901).
     _NEXT_SEQ = "(SELECT IFNULL(MAX(seq), 0) + 1 FROM pending_selections)"
 
+    @staticmethod
+    def _row_payload(selection: PendingSelection) -> str:
+        chunks_json = _json_dumps(selection.chunks, ensure_ascii=False)
+        if payload_has_credentials(chunks_json):
+            raise SensitivePayloadNotStored(
+                "credential-bearing row not written to the persistent pending store"
+            )
+        return chunks_json
+
+    def check_persistable(self, selection: PendingSelection) -> None:
+        """Raise ``SensitivePayloadNotStored`` if ``put`` would refuse *selection*.
+
+        For a publisher that must not change the store before a refusal (the
+        progressive path evicts before it writes). ``put`` checks again.
+        """
+        self._row_payload(selection)
+
     def put(self, key: str, selection: PendingSelection) -> None:
+        chunks_json = self._row_payload(selection)
         with self._lock:
             self._get_db().execute(
                 "INSERT OR REPLACE INTO pending_selections "
@@ -316,7 +356,7 @@ class SQLitePendingStore:
                 f"VALUES (?, ?, ?, ?, ?, {self._NEXT_SEQ})",
                 (
                     key,
-                    _json_dumps(selection.chunks, ensure_ascii=False),
+                    chunks_json,
                     selection.format,
                     time.time(),
                     selection.total_chars,

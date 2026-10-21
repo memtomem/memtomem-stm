@@ -89,7 +89,7 @@ async def test_meta_progressive_round_trip_detects_corruption(tmp_path, monkeypa
 
     original_put = ProgressiveStoreAdapter.put
 
-    def lossy_put(self, key: str, resp: ProgressiveResponse) -> None:
+    def lossy_put(self, key: str, resp: ProgressiveResponse, **kwargs) -> None:
         new_content = resp.content[:-10] if len(resp.content) >= 10 else ""
         corrupted = ProgressiveResponse(
             content=new_content,
@@ -101,7 +101,7 @@ async def test_meta_progressive_round_trip_detects_corruption(tmp_path, monkeypa
             ttl_seconds=resp.ttl_seconds,
             access_count=resp.access_count,
         )
-        original_put(self, key, corrupted)
+        original_put(self, key, corrupted, **kwargs)
 
     monkeypatch.setattr(ProgressiveStoreAdapter, "put", lossy_put)
 

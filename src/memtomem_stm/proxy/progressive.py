@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from memtomem_stm.proxy.compression import PendingSelection
@@ -68,7 +69,23 @@ class ProgressiveStoreAdapter:
     def __init__(self, store: PendingStore) -> None:
         self._store = store
 
-    def put(self, key: str, resp: ProgressiveResponse) -> None:
+    @property
+    def persists_to_disk(self) -> bool:
+        return bool(getattr(self._store, "persists_to_disk", False))
+
+    def put(
+        self,
+        key: str,
+        resp: ProgressiveResponse,
+        *,
+        before_write: Callable[[], None] | None = None,
+    ) -> None:
+        """Store *resp* under *key*.
+
+        ``before_write`` runs after the store has accepted the row it would
+        write and before the write, so a refused row (#1148) leaves the store
+        exactly as it was.
+        """
         # Always derive from this publication's content, never reuse an index
         # supplied for a previous value of the same key.
         resp.heading_index = (
@@ -97,6 +114,11 @@ class ProgressiveStoreAdapter:
         )
         if resp.heading_index is not None:
             selection.chunks[INDEX_KEY] = encode_heading_index(resp.heading_index)
+        check = getattr(self._store, "check_persistable", None)
+        if check is not None:
+            check(selection)
+        if before_write is not None:
+            before_write()
         self._store.put(key, selection)
 
     def get(self, key: str, *, renew: bool = False) -> ProgressiveResponse | None:
