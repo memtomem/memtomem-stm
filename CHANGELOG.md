@@ -38,13 +38,14 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - **A deeply nested JSON response no longer fails the tool call** (#1212).
-  Valid JSON nested about a thousand levels deep made every strategy except
-  HYBRID and PROGRESSIVE raise `RecursionError` out of the call, so the client
-  got an error in place of the upstream's successful response; far deeper
-  input broke HYBRID too. Compression now treats JSON nested more than 512
-  levels deep as plain text. **Behavior change**: a response nested 513 or
-  more levels deep is compressed as text, not structurally, and AUTO may
-  route it to a different strategy.
+  Valid JSON nested about a thousand levels deep made AUTO, EXTRACT_FIELDS,
+  SCHEMA_PRUNING and SELECTIVE (and TRUNCATE and SKELETON, for an object)
+  raise `RecursionError` out of the call, so the client got an error in place
+  of the upstream's successful response; far deeper input broke HYBRID too.
+  Compression now treats JSON nested more than 512 levels deep as plain text.
+  **Behavior change**: a response nested 513 or more levels deep is
+  compressed as text, not structurally, and AUTO may route it to a different
+  strategy.
 
 ## [0.6.5] — 2026-10-20
 
