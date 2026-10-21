@@ -83,7 +83,16 @@ def count_markdown_headings(text: str) -> int:
     return len(_HEADINGS_RE.findall(text))
 
 
-def _sanitize_nonfinite(obj: object) -> object:
+# Deepest JSON nesting the compression tiers treat as structure. The tiers walk
+# a parsed tree recursively (pretty-printing, pruning, field extraction), so a
+# tree that only just parsed can still exhaust the interpreter's recursion limit
+# a few levels later — at a depth that moves with the Python version and the
+# caller's stack. Refusing at a fixed depth well below the limit makes every
+# deeper response plain text, deterministically.
+_MAX_JSON_DEPTH = 512
+
+
+def _sanitize_nonfinite(obj: object, _depth: int = 0) -> object:
     """Recursively make a parsed payload safe to re-serialize: non-finite floats
     become ``None``, and lone surrogates in strings are escaped to their
     ``\\udxxx`` literal.
@@ -113,15 +122,19 @@ def _sanitize_nonfinite(obj: object) -> object:
     Returns the input object UNCHANGED (same identity) when it contains
     neither, so the common case allocates nothing. ``bool`` is an
     ``int`` subclass (not ``float``) and is left untouched.
+
+    Raises ``ValueError`` for containers nested deeper than ``_MAX_JSON_DEPTH``.
     """
     if isinstance(obj, str):
         return escape_lone_surrogates(obj)
     if isinstance(obj, float):
         return None if not math.isfinite(obj) else obj
+    if isinstance(obj, (dict, list, tuple)) and _depth >= _MAX_JSON_DEPTH:
+        raise ValueError(f"JSON nested deeper than {_MAX_JSON_DEPTH} levels")
     if isinstance(obj, dict):
         replaced: dict | None = None
         for key, value in obj.items():
-            sanitized = _sanitize_nonfinite(value)
+            sanitized = _sanitize_nonfinite(value, _depth + 1)
             # A key encodes exactly as a value does, so a surrogate in one
             # breaks the same re-dump. Non-finite floats never needed this —
             # JSON object keys are strings — which is why the walk did not
@@ -137,7 +150,7 @@ def _sanitize_nonfinite(obj: object) -> object:
     if isinstance(obj, (list, tuple)):
         replaced_seq: list | None = None
         for index, value in enumerate(obj):
-            sanitized = _sanitize_nonfinite(value)
+            sanitized = _sanitize_nonfinite(value, _depth + 1)
             if sanitized is not value:
                 if replaced_seq is None:
                     replaced_seq = list(obj)
@@ -158,8 +171,17 @@ def _mm_json_loads(s: str, **kwargs: Any) -> object:
     which would later re-serialize as those same invalid tokens. Sanitizing here
     — the single ingest point for every JSON-handling compression tier — keeps
     all downstream output valid JSON without per-serialization overhead.
+
+    Text nested deeper than ``_MAX_JSON_DEPTH``, or deeper than ``json.loads``
+    itself can recurse, raises ``ValueError`` rather than parsing or raising
+    ``RecursionError``. Every caller already treats ``ValueError`` as "not
+    JSON" and falls back to its text path, so a too-deep response is
+    compressed like any other text instead of failing the whole call.
     """
-    return _sanitize_nonfinite(json.loads(s, **kwargs))
+    try:
+        return _sanitize_nonfinite(json.loads(s, **kwargs))
+    except RecursionError as exc:
+        raise ValueError("JSON nested too deeply to parse") from exc
 
 
 class Compressor(Protocol):
