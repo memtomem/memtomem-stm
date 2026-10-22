@@ -11,6 +11,26 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.6.6] — 2026-10-22
+
+### Upgrade notes
+
+- **Responses whose JSON-escaped text holds a credential are no longer
+  cached** (#1211, #1214). On the first start after upgrading, the cache's
+  one-time privacy sweep drops rows already cached that the new check
+  rejects.
+- **With `pending_store: "sqlite"`, a credential-bearing SELECTIVE, HYBRID or
+  PROGRESSIVE response is not written to `pending_selections.db`** (#1148,
+  #1213). SELECTIVE and HYBRID return a boundary-aware truncation and
+  PROGRESSIVE the full cleaned response, uncached. The default
+  `pending_store: "memory"` is unaffected.
+- **JSON nested more than 512 levels deep is compressed as plain text**
+  (#1212, #1215), and AUTO may route it to a different strategy. JSON about
+  a thousand levels deep used to fail the call with `RecursionError`.
+- **TRUNCATE's code-aware output can keep a different set of blocks**
+  ([GHSA-7jqx-w58w-8h4p](https://github.com/memtomem/memtomem-stm/security/advisories/GHSA-7jqx-w58w-8h4p)).
+  A code boundary preceded by blank lines now starts after them.
+
 ### Changed
 
 - **The SQLite pending store no longer writes credential-bearing responses**
@@ -37,7 +57,7 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
-- **A deeply nested JSON response no longer fails the tool call** (#1212).
+- **A deeply nested JSON response no longer fails the tool call** (#1212, #1215).
   Valid JSON nested about a thousand levels deep made AUTO, EXTRACT_FIELDS,
   SCHEMA_PRUNING and SELECTIVE (and TRUNCATE and SKELETON, for an object)
   raise `RecursionError` out of the call, so the client got an error in place
