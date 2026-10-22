@@ -11,12 +11,35 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.6.6] — 2026-10-22
+
+### Upgrade notes
+
+- **The response cache keeps fewer responses** (#1211, #1214). Its privacy
+  check now also scans text with its JSON escapes decoded; the entry under
+  Changed says what it rejects. On the first start after upgrading, the
+  cache's one-time privacy sweep drops rows already cached that the new check
+  rejects.
+- **With `pending_store: "sqlite"`, some SELECTIVE, HYBRID and PROGRESSIVE
+  responses are no longer written to `pending_selections.db`** (#1148,
+  #1213); the entry under Changed says which. SELECTIVE and HYBRID return a
+  boundary-aware truncation in their place and PROGRESSIVE the full cleaned
+  response. The default `pending_store: "memory"` is unaffected.
+- **JSON nested more than 512 levels deep is compressed as plain text**
+  (#1212, #1215), and AUTO may route it to a different strategy. JSON nested
+  near the interpreter's recursion limit (about a thousand levels, fewer on a
+  deeper call stack) used to fail the call with `RecursionError`.
+- **TRUNCATE's code-aware output can keep a different set of blocks**
+  ([GHSA-7jqx-w58w-8h4p](https://github.com/memtomem/memtomem-stm/security/advisories/GHSA-7jqx-w58w-8h4p)).
+  A code boundary preceded by blank lines now starts after them.
+
 ### Changed
 
 - **The SQLite pending store no longer writes credential-bearing responses**
   (#1148, #1213). With `pending_store: "sqlite"`, a SELECTIVE, HYBRID or
   PROGRESSIVE response that matches STM's credential patterns is checked
-  twice: as received, and as the row that would be written. A match in either
+  twice: as CLEAN hands it to compression, and as the row that would be
+  written. A match in either
   means nothing is written to `pending_selections.db`. **Behavior change**: such a
   response now comes back as a boundary-aware truncation (SELECTIVE/HYBRID,
   `selective→truncate_on_sensitive` / `hybrid→truncate_on_sensitive`) or as
@@ -37,7 +60,7 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
-- **A deeply nested JSON response no longer fails the tool call** (#1212).
+- **A deeply nested JSON response no longer fails the tool call** (#1212, #1215).
   Valid JSON nested about a thousand levels deep made AUTO, EXTRACT_FIELDS,
   SCHEMA_PRUNING and SELECTIVE (and TRUNCATE and SKELETON, for an object)
   raise `RecursionError` out of the call, so the client got an error in place
