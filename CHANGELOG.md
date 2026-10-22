@@ -15,17 +15,16 @@ changes inline only. See the deprecation policy in
 
 ### Upgrade notes
 
-- **Responses whose JSON-escaped text holds a credential are no longer
-  cached** (#1211, #1214). Text that still decodes after three passes is
-  not cached either, credential or not. On the first start after upgrading,
-  the cache's one-time privacy sweep drops rows already cached that the new
-  check rejects.
-- **With `pending_store: "sqlite"`, a SELECTIVE, HYBRID or PROGRESSIVE
-  response that matches STM's credential patterns, as received or as the row
-  to be written, is not written to `pending_selections.db`** (#1148, #1213).
-  SELECTIVE and HYBRID return a boundary-aware truncation and PROGRESSIVE the
-  full cleaned response, uncached. The default `pending_store: "memory"` is
-  unaffected.
+- **The response cache keeps fewer responses** (#1211, #1214). Its privacy
+  check now also scans text with its JSON escapes decoded; the entry under
+  Changed says what it rejects. On the first start after upgrading, the
+  cache's one-time privacy sweep drops rows already cached that the new check
+  rejects.
+- **With `pending_store: "sqlite"`, some SELECTIVE, HYBRID and PROGRESSIVE
+  responses are no longer written to `pending_selections.db`** (#1148,
+  #1213); the entry under Changed says which. SELECTIVE and HYBRID return a
+  boundary-aware truncation in their place and PROGRESSIVE the full cleaned
+  response. The default `pending_store: "memory"` is unaffected.
 - **JSON nested more than 512 levels deep is compressed as plain text**
   (#1212, #1215), and AUTO may route it to a different strategy. JSON nested
   near the interpreter's recursion limit (about a thousand levels, fewer on a
@@ -39,7 +38,8 @@ changes inline only. See the deprecation policy in
 - **The SQLite pending store no longer writes credential-bearing responses**
   (#1148, #1213). With `pending_store: "sqlite"`, a SELECTIVE, HYBRID or
   PROGRESSIVE response that matches STM's credential patterns is checked
-  twice: as received, and as the row that would be written. A match in either
+  twice: as CLEAN hands it to compression, and as the row that would be
+  written. A match in either
   means nothing is written to `pending_selections.db`. **Behavior change**: such a
   response now comes back as a boundary-aware truncation (SELECTIVE/HYBRID,
   `selective→truncate_on_sensitive` / `hybrid→truncate_on_sensitive`) or as
