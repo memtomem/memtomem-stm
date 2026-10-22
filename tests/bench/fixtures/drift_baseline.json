@@ -79,8 +79,8 @@
     {
       "metrics": {
         "cleaned_chars": 3244,
-        "compressed_chars": 2513,
-        "compression_ratio": 0.7747,
+        "compressed_chars": 2662,
+        "compression_ratio": 0.8206,
         "compression_strategy": "truncate",
         "original_chars": 3245,
         "ratio_violation": 0,
@@ -283,6 +283,6 @@
     "failing": 0.0,
     "passing": 10.0,
     "scenarios": 10.0,
-    "tokens_saved_approx": 5474.0
+    "tokens_saved_approx": 5437.0
   }
 }
