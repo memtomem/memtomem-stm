@@ -554,9 +554,10 @@ class TruncateCompressor(_PlainTextRetention):
         tail_lines: list[str] = []
         for line in reversed(lines):
             if _fp(line) != top_fp:
-                tail_lines.insert(0, line)
+                tail_lines.append(line)
             else:
                 break
+        tail_lines.reverse()
 
         if not tail_lines:
             return None
@@ -1293,14 +1294,15 @@ class SelectiveCompressor:
         self, data: dict[str, object], raw_text: str, prefix: str = "", depth: int = 0
     ) -> dict[str, str]:
         chunks: dict[str, str] = {}
+        next_suffix: dict[str, int] = {}
         for key, value in data.items():
             full_key = f"{prefix}{key}" if not prefix else f"{prefix}.{key}"
             if isinstance(value, dict) and depth < self._json_depth:
                 nested = self._parse_json_dict(value, "", prefix=full_key, depth=depth + 1)
                 for nested_key, nested_value in nested.items():
-                    chunks[self._unique_key(chunks, nested_key)] = nested_value
+                    chunks[self._unique_key(chunks, nested_key, next_suffix)] = nested_value
             else:
-                chunks[self._unique_key(chunks, full_key)] = json.dumps(
+                chunks[self._unique_key(chunks, full_key, next_suffix)] = json.dumps(
                     value, ensure_ascii=False, indent=2
                 )
         return chunks
@@ -1313,6 +1315,7 @@ class SelectiveCompressor:
 
     def _parse_markdown(self, text: str) -> dict[str, str]:
         chunks: dict[str, str] = {}
+        next_suffix: dict[str, int] = {}
         parts = re.split(r"(?:^|\n)(#{1,6}\s+.+)", text)
         current_heading = ""
         current_content: list[str] = []
@@ -1324,7 +1327,7 @@ class SelectiveCompressor:
                     content = "\n".join(current_content).strip()
                     if content:
                         key = current_heading or "Preamble"
-                        chunks[self._unique_key(chunks, key)] = content
+                        chunks[self._unique_key(chunks, key, next_suffix)] = content
                 current_heading = heading_match.group(2).strip()
                 current_content = []
             else:
@@ -1334,18 +1337,27 @@ class SelectiveCompressor:
             content = "\n".join(current_content).strip()
             if content:
                 key = current_heading or "Preamble"
-                chunks[self._unique_key(chunks, key)] = content
+                chunks[self._unique_key(chunks, key, next_suffix)] = content
 
         return chunks
 
     @staticmethod
-    def _unique_key(chunks: dict[str, str], key: str) -> str:
-        """Keep repeated headings and colliding dotted JSON paths addressable."""
+    def _unique_key(chunks: dict[str, str], key: str, next_suffix: dict[str, int]) -> str:
+        """Keep repeated headings and colliding dotted JSON paths addressable.
+
+        ``next_suffix`` belongs to ``chunks``. Every caller inserts the key this
+        returns and none removes one, so once ``key#s`` is handed out every
+        suffix up to ``s`` is taken, and the next search for ``key`` can start
+        at ``s + 1``. Starting each search at 2 instead made N copies of one
+        heading cost N²/2 probes. A literal ``key#n`` already in ``chunks`` is
+        still skipped by the probe.
+        """
         if key not in chunks:
             return key
-        suffix = 2
+        suffix = next_suffix.get(key, 2)
         while f"{key}#{suffix}" in chunks:
             suffix += 1
+        next_suffix[key] = suffix + 1
         return f"{key}#{suffix}"
 
     def _parse_text(self, text: str) -> dict[str, str]:
@@ -2928,7 +2940,11 @@ class HybridCompressor:
             candidate = dumps(toc)
             if len(candidate) >= max_chars or not source_text:
                 return candidate
-            lo, hi = 0, len(source_text)
+            # Serializing a string never makes it shorter, so no preview longer
+            # than the budget fits. The probe length grows with ``mid``, so
+            # capping the search there finds the same preview while keeping
+            # each probe near the budget rather than the whole tail.
+            lo, hi = 0, min(len(source_text), max_chars)
             best = candidate
             while lo <= hi:
                 mid = (lo + hi) // 2
@@ -2951,24 +2967,36 @@ class HybridCompressor:
         if len(candidate) <= max_chars:
             return fill_preview(parsed)
 
+        # Shrinking previews and dropping entries used to re-serialize the
+        # whole TOC for every probe and every dropped entry, which is quadratic
+        # in the entry count. The candidates are measured instead: with the
+        # compact separators a list costs its elements plus a comma between
+        # each pair, so the TOC's length is its envelope's (``entries`` empty)
+        # plus that. Only a TOC that fits is serialized, through fill_preview,
+        # from the same state as before, so the result is unchanged.
         toc = dict(parsed)
         entries = toc.get("entries")
         if isinstance(entries, list):
-            toc["entries"] = [dict(e) if isinstance(e, dict) else e for e in entries]
-            for entry in reversed(toc["entries"]):
+            kept: list[object] = [dict(e) if isinstance(e, dict) else e for e in entries]
+            toc["entries"] = kept
+            entry_lens = [len(dumps(e)) for e in kept]
+            envelope_len = len(dumps({**toc, "entries": []}))
+            total = envelope_len + sum(entry_lens) + max(0, len(kept) - 1)
+            for index in range(len(kept) - 1, -1, -1):
+                entry = kept[index]
                 if not isinstance(entry, dict):
                     continue
                 preview = entry.get("preview")
                 if not isinstance(preview, str) or not preview:
                     continue
+                rest = total - entry_lens[index]
                 original = preview
                 lo, hi = 0, len(original)
                 best: str | None = None
                 while lo <= hi:
                     mid = (lo + hi) // 2
                     entry["preview"] = original[:mid] + ("..." if mid < len(original) else "")
-                    probe = dumps(toc)
-                    if len(probe) <= max_chars:
+                    if rest + len(dumps(entry)) <= max_chars:
                         best = entry["preview"]
                         lo = mid + 1
                     else:
@@ -2977,8 +3005,9 @@ class HybridCompressor:
                     entry["preview"] = best
                     return fill_preview(toc)
                 entry["preview"] = "..."
-                candidate = dumps(toc)
-                if len(candidate) <= max_chars:
+                entry_lens[index] = len(dumps(entry))
+                total = rest + entry_lens[index]
+                if total <= max_chars:
                     return fill_preview(toc)
 
         hint = toc.get("hint")
@@ -2989,14 +3018,23 @@ class HybridCompressor:
             if len(candidate) <= max_chars:
                 return fill_preview(toc)
 
-        if isinstance(entries, list):
-            while toc["entries"]:
-                original_count = len(entries)
-                toc["entries"] = toc["entries"][:-1]
-                omitted = original_count - len(toc["entries"])
-                toc["truncated_entries"] = omitted
-                candidate = dumps(toc)
-                if len(candidate) <= max_chars:
+        if isinstance(entries, list) and kept:
+            # Drop entries from the end until the rest fits. The omitted count
+            # is the only envelope field that changes, and an int serializes
+            # as its digits, so the envelope is measured once with a
+            # one-digit count in place (which also fixes the key's position).
+            original_count = len(entries)
+            toc["truncated_entries"] = 0
+            envelope_len = len(dumps({**toc, "entries": []})) - 1
+            prefix = [0]
+            for length in entry_lens:
+                prefix.append(prefix[-1] + length)
+            for count in range(len(kept) - 1, -1, -1):
+                omitted = original_count - count
+                size = envelope_len + len(str(omitted)) + prefix[count] + max(0, count - 1)
+                if size <= max_chars:
+                    toc["entries"] = kept[:count]
+                    toc["truncated_entries"] = omitted
                     return fill_preview(toc)
 
         toc["entries"] = []

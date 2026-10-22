@@ -65,6 +65,16 @@ changes inline only. See the deprecation policy in
   set of blocks, and a block's signature snippet is no longer empty when three
   or more blank lines precede it.
   ([GHSA-7jqx-w58w-8h4p](https://github.com/memtomem/memtomem-stm/security/advisories/GHSA-7jqx-w58w-8h4p))
+- **Crafted upstream text no longer stalls the proxy while HYBRID, SELECTIVE
+  or TRUNCATE fit it to the budget.** Fitting HYBRID's table of contents
+  re-serialized the whole TOC for every candidate preview and every dropped
+  entry. SELECTIVE numbered repeated headings by probing from `#2` upward each
+  time. TRUNCATE's repeated-line path built its tail by inserting at the front
+  of a list. All three cost time quadratic in the response, on the event loop.
+  8,000 headings (86 KB) under the default AUTO strategy held every proxied
+  call for over half a minute. Each step now runs in linear time and returns
+  exactly what it did before.
+  ([GHSA-37r7-mcmj-h6c2](https://github.com/memtomem/memtomem-stm/security/advisories/GHSA-37r7-mcmj-h6c2))
 
 ## [0.6.5] — 2026-10-20
 
