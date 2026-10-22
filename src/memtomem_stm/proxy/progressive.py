@@ -365,7 +365,11 @@ class ProgressiveChunker:
                 pass
         if re.search(r"(?:^|\n)#{1,6}\s", text):
             return "markdown"
-        if re.search(r"(?:^|\n)\s*(?:def |class |async def |function |func |import |from )", text):
+        # Indentation does not cross a newline: ``\s*`` would rescan a run of
+        # blank lines from every newline in it.
+        if re.search(
+            r"(?:^|\n)[^\S\n]*(?:def |class |async def |function |func |import |from )", text
+        ):
             return "code"
         return "text"
 

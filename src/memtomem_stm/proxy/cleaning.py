@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging as _logging
 import re
 import unicodedata
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Protocol
 
 _CODE_FENCE_RE = re.compile(r"```[\s\S]*?```|`[^`\n]+`")
@@ -14,8 +14,14 @@ _SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>[\s\S]*?</\1>", re.I)
 _HTML_TAG_RE = re.compile(r"<[a-zA-Z][\w.-]*(?:\s[^>]*)?\s*/?>")
 _CLOSE_TAG_RE = re.compile(r"</[a-zA-Z][\w.-]*\s*>")
 _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
-_LINK_LINE_RE = re.compile(r"^\s*[-*]\s*\[.*?\]\(https?://\S+\)")
-_BARE_URL_LINE_RE = re.compile(r"^\s*[-*]?\s*https?://\S+\s*$")
+# A link-flood line is a list item opening on "[" (the head) whose text has a
+# "](http(s)://" target with a ")" somewhere after its first character in the
+# same non-space run (``_is_link_line``).
+_LINK_LINE_HEAD_RE = re.compile(r"^\s*[-*]\s*\[")
+_LINK_LINE_TARGET_RE = re.compile(r"\]\(https?://(\S+)")
+_BARE_URL_LINE_RE = re.compile(r"^\s*(?:[-*]\s*)?https?://\S+\s*$")
+# Opens every match of _SCRIPT_STYLE_RE; see _script_style_matches.
+_SCRIPT_STYLE_OPEN_RE = re.compile(r"<(script|style)\b", re.I)
 
 # Filler for a protected region while the removal patterns scan. It only ever
 # reaches a scan, never the result — every character of the output is sliced
@@ -39,15 +45,98 @@ _INJECTION_PATTERNS = [
 _logger = _logging.getLogger(__name__)
 
 
-def _find_spans(pattern: re.Pattern[str], text: str) -> list[int]:
-    """Every match of ``pattern`` as a flat ``[start, end, start, end, ...]``.
+def _gt_closed_matches(pattern: re.Pattern[str], text: str) -> Iterator[re.Match[str]]:
+    """``pattern.finditer(text)``, scanned only up to the last ``>``.
+
+    For ``_HTML_TAG_RE`` and ``_GENERIC_RE``, whose every match ends in ``>``.
+    Their ``[^>]*`` / ``[^>]+`` runs to the first ``>`` from each start, so a
+    start with no ``>`` after it scans to the end of the text and fails, and a
+    run of such starts (``<a <a <a …``) costs quadratic time. Before the last
+    ``>`` a start that gets that far succeeds at the next ``>`` instead, so no
+    region is scanned twice; after it no match can end. Stopping there finds
+    exactly the matches the full scan does.
+    """
+    return pattern.finditer(text, 0, text.rfind(">") + 1)
+
+
+def _script_style_matches(text: str) -> Iterator[re.Match[str]]:
+    r"""``_SCRIPT_STYLE_RE.finditer(text)`` without rescanning a failed tail.
+
+    A ``<script`` with no ``</script>`` after its first ``>`` scans to the end
+    of the text and fails, and so does every later opener with the same tag
+    text — the region it searches is a suffix of that one — so a run of
+    unclosed openers costs quadratic time.
+    Each opener is tried with the same regex, and once one fails, later openers
+    with the same key are skipped. The key is ``str.lower()`` of the tag text.
+    The case-insensitive ``\1`` backreference compares character by character,
+    so two openers that share a key close on the same tags (``<SCRIPT>`` and
+    ``<script>``). The converse need not hold: ``<scrİpt>`` closes on
+    ``</script>`` but its lower-cased text is a character longer, so it keeps
+    a key of its own and is merely skipped less. ``<ſcript>`` (long s) closes
+    only on ``</ſcript>`` and has its own key too.
+    """
+    dead: set[str] = set()
+    pos = 0
+    while (opener := _SCRIPT_STYLE_OPEN_RE.search(text, pos)) is not None:
+        start = opener.start()
+        key = opener.group(1).lower()
+        if key not in dead:
+            match = _SCRIPT_STYLE_RE.match(text, start)
+            if match is not None:
+                yield match
+                pos = match.end()
+                continue
+            dead.add(key)
+        pos = start + 1
+
+
+def _html_tag_matches(text: str) -> Iterator[re.Match[str]]:
+    return _gt_closed_matches(_HTML_TAG_RE, text)
+
+
+def _drop_matches(text: str, matches: Iterator[re.Match[str]]) -> str:
+    """``text`` without the spans ``matches`` reports — ``pattern.sub("", text)``."""
+    parts: list[str] = []
+    pos = 0
+    for match in matches:
+        parts.append(text[pos : match.start()])
+        pos = match.end()
+    if not pos:
+        return text
+    parts.append(text[pos:])
+    return "".join(parts)
+
+
+def _is_link_line(line: str) -> bool:
+    r"""Whether ``line`` matches ``^\s*[-*]\s*\[.*?\]\(https?://\S+\)``.
+
+    That regex tries every ``](`` after the ``[`` and, for each, backtracks
+    ``\S+`` across the rest of its non-space run looking for ``)`` —
+    quadratic on ``](http://x`` repeated with no ``)``. Here each run is read
+    once: the first ``](http(s)://`` in a run consumes the rest of it, and it
+    dominates any later one in the same run (a ``)`` after a later target is
+    also after the first). ``.`` stops at a newline, so the targets do too.
+    """
+    head = _LINK_LINE_HEAD_RE.match(line)
+    if head is None:
+        return False
+    newline = line.find("\n", head.end())
+    end = len(line) if newline < 0 else newline
+    for target in _LINK_LINE_TARGET_RE.finditer(line, head.end(), end):
+        if ")" in target.group(1)[1:]:
+            return True
+    return False
+
+
+def _find_spans(matches: Iterator[re.Match[str]]) -> list[int]:
+    """Every match in ``matches`` as a flat ``[start, end, start, end, ...]``.
 
     Flat rather than a list of pairs: a fence-dense response can hold hundreds
     of thousands of matches, and a tuple per match costs several times what two
     entries in one list do.
     """
     out: list[int] = []
-    for match in pattern.finditer(text):
+    for match in matches:
         out.append(match.start())
         out.append(match.end())
     return out
@@ -221,16 +310,17 @@ class DefaultContentCleaner:
         for — while the result is sliced from the original text by offset.
         Nothing an upstream can send is ever read back as a marker.
         """
-        fences = _find_spans(_CODE_FENCE_RE, text)
+        fences = _find_spans(_CODE_FENCE_RE.finditer(text))
         # Generics are found on a copy where fences are already opaque, so a
         # fence inside one (``Map<`K`, V>``) cannot end the `[^>]+` early.
         with_fences_hidden = _mask_spans(text, fences)
-        protected = _merge_spans(fences, _find_spans(_GENERIC_RE, with_fences_hidden))
+        generics = _find_spans(_gt_closed_matches(_GENERIC_RE, with_fences_hidden))
+        protected = _merge_spans(fences, generics)
         if not protected:
             # Nothing to keep out of the patterns' way, so there is nothing for
             # the offset bookkeeping below to preserve: remove in place.
-            stripped = _SCRIPT_STYLE_RE.sub("", text)
-            stripped = _HTML_TAG_RE.sub("", stripped)
+            stripped = _drop_matches(text, _script_style_matches(text))
+            stripped = _drop_matches(stripped, _html_tag_matches(stripped))
             return _CLOSE_TAG_RE.sub("", stripped)
 
         masked = _mask_spans(text, protected)
@@ -244,8 +334,8 @@ class DefaultContentCleaner:
         # k-th region and the originals splice straight back in order. Tags and
         # script blocks around them may well have been removed; that is the
         # point, and it does not disturb the alignment.
-        stripped = _SCRIPT_STYLE_RE.sub("", masked)
-        stripped = _HTML_TAG_RE.sub("", stripped)
+        stripped = _drop_matches(masked, _script_style_matches(masked))
+        stripped = _drop_matches(stripped, _html_tag_matches(stripped))
         stripped = _CLOSE_TAG_RE.sub("", stripped)
         if _MASK_CHAR not in text:
             # Checked and spliced in the same walk: a separate pass to validate
@@ -275,13 +365,17 @@ class DefaultContentCleaner:
         total = len(text)
         segments = [0, total]
         view = masked
-        patterns = (_SCRIPT_STYLE_RE, _HTML_TAG_RE, _CLOSE_TAG_RE)
-        for index, pattern in enumerate(patterns):
-            dropped = _drop_from_segments(segments, pattern.finditer(view))
+        finders: tuple[Callable[[str], Iterator[re.Match[str]]], ...] = (
+            _script_style_matches,
+            _html_tag_matches,
+            _CLOSE_TAG_RE.finditer,
+        )
+        for index, find in enumerate(finders):
+            dropped = _drop_from_segments(segments, find(view))
             if dropped is None:
                 continue
             segments = dropped
-            if index + 1 < len(patterns):
+            if index + 1 < len(finders):
                 view = "".join(
                     masked[segments[i] : segments[i + 1]] for i in range(0, len(segments), 2)
                 )
@@ -308,7 +402,7 @@ class DefaultContentCleaner:
             lines = p.strip().split("\n")
             if len(lines) >= 10:
                 link_count = sum(
-                    1 for ln in lines if _LINK_LINE_RE.match(ln) or _BARE_URL_LINE_RE.match(ln)
+                    1 for ln in lines if _is_link_line(ln) or _BARE_URL_LINE_RE.match(ln)
                 )
                 if link_count / len(lines) >= 0.8:
                     result.append(f"[{link_count} links omitted]")

@@ -48,8 +48,38 @@ QueryRelevanceScorer = BM25Scorer
 
 _HEADINGS_RE = re.compile(r"(?:^|\n)#{1,6}\s")
 _CODE_FENCE_RE = re.compile(r"```")
-_LIST_ITEM_RE = re.compile(r"(?:^|\n)\s*[-*]\s")
-_LINK_RE = re.compile(r"\[.*?\]\(.*?\)")
+# Indentation is matched without crossing a newline: a ``\s*`` there rescans a
+# whole run of blank lines from every newline in it (quadratic), and the item
+# count is the same either way.
+_LIST_ITEM_RE = re.compile(r"(?:^|\n)[^\S\n]*[-*]\s")
+
+
+def _count_links(text: str) -> int:
+    r"""``len(re.findall(r"\[.*?\]\(.*?\)", text))`` in linear time.
+
+    That regex, from each ``[``, scans to the first ``](`` and then the first
+    ``)`` on the same line, and a ``[`` without both rescans the rest of its
+    line — quadratic on ``[`` repeated, cubic on ``[](`` repeated. Here a
+    failing ``[`` ends the line: every later ``[`` on it would look for the
+    same ``](`` and ``)`` further along and fail too.
+    """
+    count = 0
+    pos = 0
+    line_end = -1
+    while (open_at := text.find("[", pos)) >= 0:
+        if open_at > line_end:
+            line_end = text.find("\n", open_at)
+            if line_end < 0:
+                line_end = len(text)
+        target_at = text.find("](", open_at + 1, line_end)
+        if target_at >= 0:
+            close_at = text.find(")", target_at + 2, line_end)
+            if close_at >= 0:
+                count += 1
+                pos = close_at + 1
+                continue
+        pos = line_end + 1
+    return count
 
 
 def _content_summary(text: str) -> str:
@@ -58,7 +88,7 @@ def _content_summary(text: str) -> str:
     headings = len(_HEADINGS_RE.findall(text))
     code_blocks = len(_CODE_FENCE_RE.findall(text)) // 2
     list_items = len(_LIST_ITEM_RE.findall(text))
-    links = len(_LINK_RE.findall(text))
+    links = _count_links(text)
     if headings:
         counts.append(f"{headings} headings")
     if code_blocks:
@@ -262,9 +292,12 @@ class TruncateCompressor(_PlainTextRetention):
         self._min_chars = min_chars
 
     # Patterns for code structure boundaries (function/class/method definitions)
+    # Indentation does not cross a newline (see _LIST_ITEM_RE), so a boundary
+    # after blank lines starts at the last of them; they stay with the block
+    # before it, whose body is rstripped.
     _CODE_BOUNDARY_RE = re.compile(
         r"(?:^|\n)"
-        r"(\s*(?:def |class |async def |function |func |export |pub fn )\S.*)",
+        r"([^\S\n]*(?:def |class |async def |function |func |export |pub fn )\S.*)",
     )
     # SQL top-level statement boundaries (non-indented only)
     _SQL_BOUNDARY_RE = re.compile(

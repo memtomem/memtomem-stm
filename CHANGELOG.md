@@ -47,6 +47,25 @@ changes inline only. See the deprecation policy in
   compressed as text, not structurally, and AUTO may route it to a different
   strategy.
 
+### Security
+
+- **Crafted upstream text no longer stalls the proxy in CLEAN and COMPRESS.**
+  Several scans of a tool response re-read the same text from every candidate
+  start whenever a match failed, at quadratic cost or worse, on the event
+  loop. A 31 KB response of repeated `- [](http://` held every proxied call
+  for about 150 s under the default AUTO strategy, and 31 KB of unclosed
+  `<a ` tags stalled CLEAN for about 3 s. The affected scans are the HTML,
+  `<script>`/`<style>` and generic-type stripping and the link-flood check in
+  CLEAN; the link and list-item counts in TRUNCATE's truncation note and its
+  code-boundary search; content-type detection for PROGRESSIVE; and the
+  heuristic fact extractor. All now run in linear time and find the same
+  matches as before. **Behavior change**: a code boundary preceded by blank
+  lines now starts after them. The blank lines stay with the block before it,
+  where they are trimmed, so TRUNCATE's code-aware output can keep a different
+  set of blocks, and a block's signature snippet is no longer empty when three
+  or more blank lines precede it.
+  ([GHSA-7jqx-w58w-8h4p](https://github.com/memtomem/memtomem-stm/security/advisories/GHSA-7jqx-w58w-8h4p))
+
 ## [0.6.5] — 2026-10-20
 
 ### Upgrade notes

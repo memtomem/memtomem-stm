@@ -119,15 +119,18 @@ _URL_RE = re.compile(r"https?://[^\s<>\"'`]+", re.IGNORECASE)
 
 _ISO_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 
+# Leading whitespace and bullets do not cross a newline: a class that does
+# rescans a run of blank lines from every line start in it (quadratic). The
+# captured groups and match ends are the same either way.
 _DECISION_RE = re.compile(
-    r"^[\s*\-]*"
+    r"^(?:[^\S\n]|[*\-])*"
     r"(?:Decision|Decided|Resolved|Conclusion|Agreed|We\s+will|We'll|We\s+chose)"
     r"[:\s]+(.+)$",
     re.MULTILINE | re.IGNORECASE,
 )
 
 _ACTION_RE = re.compile(
-    r"(?:^|\n)\s*"
+    r"(?:^|\n)[^\S\n]*"
     r"(?:"
     r"(?:TODO|FIXME|HACK|XXX|ACTION)[:\s]+(.+)|"
     r"[-*]\s*\[\s*\]\s+(.+)|"
