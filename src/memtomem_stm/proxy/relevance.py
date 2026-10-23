@@ -22,7 +22,7 @@ from memtomem_stm.utils.redact import ResponseShapeError, exception_summary
 
 logger = logging.getLogger(__name__)
 
-# Per-operation fallback signal (#P1-1). ``EmbeddingScorer.fallback_count`` is
+# Per-operation fallback signal (#1219). ``EmbeddingScorer.fallback_count`` is
 # a process-shared lifetime counter, so a before/after delta around an awaited
 # compression call mis-attributes a concurrent request's fallback and misses
 # ``SELECTIVE``/``HYBRID`` when their cached compressor holds an older scorer
