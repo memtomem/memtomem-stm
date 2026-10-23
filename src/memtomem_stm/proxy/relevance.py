@@ -7,6 +7,9 @@ when available, fall back to BM25.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+import contextlib
+import contextvars
 import logging
 import math
 import os
@@ -18,6 +21,36 @@ from memtomem_stm.utils.digest import framed_digest
 from memtomem_stm.utils.redact import ResponseShapeError, exception_summary
 
 logger = logging.getLogger(__name__)
+
+# Per-operation fallback signal (#P1-1). ``EmbeddingScorer.fallback_count`` is
+# a process-shared lifetime counter, so a before/after delta around an awaited
+# compression call mis-attributes a concurrent request's fallback and misses
+# ``SELECTIVE``/``HYBRID`` when their cached compressor holds an older scorer
+# generation. Binding a mutable ``list[bool]`` cell in a ``ContextVar`` keeps
+# attribution strictly per-operation across both inline calls and
+# ``asyncio.to_thread`` worker hops (which copy the caller's ``Context`` and
+# therefore share this request's cell reference, never a peer's).
+_SCORER_FALLBACK_CELL: contextvars.ContextVar[list[bool] | None] = contextvars.ContextVar(
+    "_SCORER_FALLBACK_CELL", default=None
+)
+
+
+def note_scorer_fallback() -> None:
+    """Mark the active compression scope as having fallen back to BM25."""
+    cell = _SCORER_FALLBACK_CELL.get()
+    if cell is not None:
+        cell[0] = True
+
+
+@contextlib.contextmanager
+def scorer_fallback_scope() -> Iterator[list[bool]]:
+    """Capture whether any relevance scorer fell back during this block."""
+    cell = [False]
+    token = _SCORER_FALLBACK_CELL.set(cell)
+    try:
+        yield cell
+    finally:
+        _SCORER_FALLBACK_CELL.reset(token)
 
 
 def _fifo_prune(d: dict[str, Any], cap: int) -> None:
@@ -344,6 +377,7 @@ class EmbeddingScorer:
             # message quotes the endpoint URL, query included (#1082).
             with self._fallback_lock:
                 self.fallback_count += 1
+            note_scorer_fallback()
             logger.warning(
                 "EmbeddingScorer failed, falling back to BM25: %s", exception_summary(exc)
             )

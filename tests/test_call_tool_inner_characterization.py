@@ -563,19 +563,19 @@ class TestEarlyReturnMetrics:
         assert row["compressed_chars"] == 0
 
 
-# ── scorer_fallback recorded around the compression call ─────────────────
+# ── scorer_fallback recorded per compression operation ───────────────────
 
 
 @pytest.mark.asyncio
 class TestScorerFallbackRecorded:
     async def test_true_when_scorer_falls_back_during_compression(self, make_mgr):
+        from memtomem_stm.proxy.relevance import note_scorer_fallback
+
         mgr, store, _ = make_mgr(compression=CompressionStrategy.TRUNCATE, min_retention=0.0)
-        # ``_relevance_scorer`` is a hot-reload property over this backing field.
-        mgr._relevance_scorer_instance = SimpleNamespace(fallback_count=0)
         mgr._connections["srv"].session.call_tool.return_value = fake_tool_result("some text")
 
         async def bump(*args, **kwargs):
-            mgr._relevance_scorer_instance.fallback_count += 1
+            note_scorer_fallback()
             return "compressed-out", None
 
         mgr._apply_compression = bump
@@ -585,7 +585,6 @@ class TestScorerFallbackRecorded:
 
     async def test_false_when_scorer_count_stable(self, make_mgr):
         mgr, store, _ = make_mgr(compression=CompressionStrategy.TRUNCATE, min_retention=0.0)
-        mgr._relevance_scorer_instance = SimpleNamespace(fallback_count=0)
         mgr._connections["srv"].session.call_tool.return_value = fake_tool_result("some text")
 
         async def no_bump(*args, **kwargs):
@@ -595,6 +594,168 @@ class TestScorerFallbackRecorded:
         await mgr.call_tool("srv", "tool", {})
         row = _latest(store, "scorer_fallback")
         assert row["scorer_fallback"] == 0
+
+    async def test_concurrent_calls_isolate_scorer_fallback(self, make_mgr):
+        """A concurrent request's embedding fallback must not taint a peer call."""
+        import asyncio
+        import threading
+        from memtomem_stm.proxy.relevance import EmbeddingScorer
+
+        mgr, store, _ = make_mgr(
+            compression=CompressionStrategy.TRUNCATE,
+            max_result_chars=300,
+            min_retention=0.0,
+        )
+        scorer = EmbeddingScorer(provider="ollama", model="m", base_url="http://127.0.0.1:9")
+        b_entered = threading.Event()
+        release_a = threading.Event()
+
+        def fake_score_via_embedding(query: str, sections: list[tuple[str, str]]) -> list[float]:
+            if query == "fail-query":
+                b_entered.set()
+                raise RuntimeError("embedding backend down")
+            b_entered.wait(timeout=2.0)
+            release_a.wait(timeout=2.0)
+            return [1.0] * len(sections)
+
+        scorer._score_via_embedding = fake_score_via_embedding  # type: ignore[method-assign]
+        mgr._relevance_scorer_instance = scorer
+        body = (
+            "# Alpha\nfirst line\n"
+            + ("alpha detail line\n" * 30)
+            + "\n# Beta\nfirst line\n"
+            + ("beta detail line\n" * 30)
+        )
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result(body)
+
+        async def run_b():
+            try:
+                await mgr.call_tool("srv", "tool_b", {"_context_query": "fail-query"})
+            finally:
+                release_a.set()
+
+        await asyncio.gather(
+            mgr.call_tool("srv", "tool_a", {"_context_query": "ok-query"}),
+            run_b(),
+        )
+        rows = {
+            tool: fb
+            for tool, fb in store._db.execute(
+                "SELECT tool, scorer_fallback FROM proxy_metrics"
+            ).fetchall()
+        }
+        assert rows["tool_a"] == 0
+        assert rows["tool_b"] == 1
+
+    async def test_selective_cached_scorer_fallback_recorded(self, make_mgr):
+        """SELECTIVE's cached compressor scorer fallback is recorded even when
+        the manager's live scorer slot holds a different instance."""
+        from memtomem_stm.proxy.compression import SelectiveCompressor
+        from memtomem_stm.proxy.relevance import BM25Scorer, EmbeddingScorer
+
+        mgr, store, _ = make_mgr(
+            compression=CompressionStrategy.SELECTIVE,
+            max_result_chars=200,
+            min_retention=0.0,
+        )
+        failing_scorer = EmbeddingScorer(
+            provider="ollama", model="m", base_url="http://127.0.0.1:9"
+        )
+
+        def fail_embed(query: str, sections: list[tuple[str, str]]) -> list[float]:
+            raise RuntimeError("ollama offline")
+
+        failing_scorer._score_via_embedding = fail_embed  # type: ignore[method-assign]
+        mgr._selective_compressor = SelectiveCompressor(scorer=failing_scorer)
+        mgr._selective_compressor_cfg = None
+        # Live manager scorer is a healthy BM25Scorer — old delta check missed
+        # the cached SelectiveCompressor's failing EmbeddingScorer.
+        mgr._relevance_scorer_instance = BM25Scorer()
+        md = "\n\n".join(f"## Section {i}\nlead line\n" + ("word line\n" * 30) for i in range(6))
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result(md)
+
+        await mgr.call_tool("srv", "tool_sel", {"_context_query": "section 2"})
+        row = _latest(store, "scorer_fallback")
+        assert row["scorer_fallback"] == 1
+
+    async def test_ratio_guard_ladder_scorer_fallback_recorded(self, make_mgr):
+        """A scorer fallback inside the ratio-guard Tier-3 truncate fallback is recorded."""
+        from memtomem_stm.proxy.relevance import EmbeddingScorer
+
+        mgr, store, _ = make_mgr(
+            compression=CompressionStrategy.EXTRACT_FIELDS,
+            max_result_chars=300,
+            min_retention=0.80,
+        )
+        failing_scorer = EmbeddingScorer(
+            provider="ollama", model="m", base_url="http://127.0.0.1:9"
+        )
+
+        def fail_embed(query: str, sections: list[tuple[str, str]]) -> list[float]:
+            raise RuntimeError("ollama offline")
+
+        failing_scorer._score_via_embedding = fail_embed  # type: ignore[method-assign]
+        mgr._relevance_scorer_instance = failing_scorer
+        # >10 lines of plain markdown with 2 headings (<3 headings skips hybrid
+        # Tier 2, <chunk_size skips progressive Tier 1). FieldExtractCompressor's
+        # text branch keeps only 5 head + 5 tail lines (violating the 0.80 floor),
+        # so the ratio guard falls back to Tier 3 TruncateCompressor, which scores
+        # the 2 sections against context_query.
+        body = (
+            "# Alpha\nlead a\n"
+            + ("detail line a\n" * 40)
+            + "\n# Beta\nlead b\n"
+            + ("detail line b\n" * 40)
+        )
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result(body)
+
+        await mgr.call_tool("srv", "tool_ladder", {"_context_query": "beta"})
+        row = _latest(store, "compression_strategy", "scorer_fallback")
+        assert row["compression_strategy"] == "extract_fields→truncate_fallback"
+        assert row["scorer_fallback"] == 1
+
+    async def test_ratio_guard_hybrid_store_error_preserves_scorer_fallback(self, make_mgr):
+        """If Tier-2 hybrid's cached scorer falls back and its pending-store
+        write then raises, falling through to a healthy Tier-3 truncate must
+        still preserve scorer_fallback=1."""
+        import sqlite3
+        from memtomem_stm.proxy.compression import SelectiveCompressor
+        from memtomem_stm.proxy.relevance import BM25Scorer, EmbeddingScorer
+
+        mgr, store, _ = make_mgr(
+            compression=CompressionStrategy.EXTRACT_FIELDS,
+            max_result_chars=300,
+            min_retention=0.80,
+        )
+        failing_scorer = EmbeddingScorer(
+            provider="ollama", model="m", base_url="http://127.0.0.1:9"
+        )
+
+        def fail_embed(query: str, sections: list[tuple[str, str]]) -> list[float]:
+            raise RuntimeError("ollama offline")
+
+        failing_scorer._score_via_embedding = fail_embed  # type: ignore[method-assign]
+        sel_compressor = SelectiveCompressor(scorer=failing_scorer)
+
+        def failing_put(*args, **kwargs):
+            raise sqlite3.OperationalError("pending store write failed")
+
+        sel_compressor._store.put = failing_put  # type: ignore[method-assign]
+        mgr._selective_compressor = sel_compressor
+        mgr._selective_compressor_cfg = None
+        # Healthy Tier-3 scorer: only Tier-2 hybrid's cached scorer falls back.
+        mgr._relevance_scorer_instance = BM25Scorer()
+
+        # 4 headings (>=3 triggers Tier 2 hybrid; <chunk_size skips Tier 1).
+        body = "\n\n".join(
+            f"## Heading {i}\nlead {i}\n" + (f"detail line {i}\n" * 20) for i in range(4)
+        )
+        mgr._connections["srv"].session.call_tool.return_value = fake_tool_result(body)
+
+        await mgr.call_tool("srv", "tool_hybrid_err", {"_context_query": "heading 2"})
+        row = _latest(store, "compression_strategy", "scorer_fallback")
+        assert row["compression_strategy"] == "extract_fields→truncate_fallback"
+        assert row["scorer_fallback"] == 1
 
 
 # ── #761: lone surrogates in upstream content ────────────────────────────
