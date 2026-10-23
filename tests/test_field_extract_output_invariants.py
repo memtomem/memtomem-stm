@@ -906,3 +906,77 @@ def test_dict_provenance_not_pattern_for_markers(data: object) -> None:
         leaves = _preserved_leaves(json.loads(out), data)
         assert leaves >= prev, f"@{budget}: regressed {prev} -> {leaves}"
         prev = leaves
+
+
+def _ref_scalar_or_str_prefix(s: str, max_chars: int) -> str:
+    for k in range(len(s), -1, -1):
+        cand = json.dumps(s[:k], ensure_ascii=False)
+        if len(cand) <= max_chars:
+            return cand
+    return '""'
+
+
+def test_fit_monotone_incremental_length_matches_reference_exhaustively() -> None:
+    """Incremental O(N) frame-length accounting in ``_fit_monotone`` and
+    binary-searched scalar/string prefix truncation in ``_fit_extracted`` must
+    stay within budget, preserve monotonicity, and match reference prefix
+    truncation across every budget."""
+    c = FieldExtractCompressor()
+    samples: list[object] = [
+        [{"id": i, "msg": f'item-{i}-"quoted"-한글'} for i in range(18)],
+        {
+            "_truncated": "real-val",
+            **{f"k_{i}": [i, i + 1, {"nested": "v" * (i * 5)}] for i in range(12)},
+        },
+        [1, 2, 3],
+        {"a": 1, "b": 2},
+    ]
+    for data in samples:
+        full_len = len(json.dumps(data, ensure_ascii=False))
+        prev_leaves = -1
+        for budget in range(2, full_len + 4):
+            fitted = c._fit_monotone(data, budget)
+            dumped = json.dumps(fitted, ensure_ascii=False)
+            assert len(dumped) <= budget
+            if isinstance(data, list):
+                assert c._fit_extracted(data, budget) == dumped
+            leaves = _preserved_leaves(fitted, data)
+            assert leaves >= prev_leaves, f"non-monotone at budget={budget}"
+            prev_leaves = leaves
+
+    # Reference comparison for scalar and string roots in _fit_extracted
+    big_num = int("9" * 60)
+    big_num_lit = json.dumps(big_num, ensure_ascii=False)
+    for budget in range(2, len(big_num_lit) + 3):
+        expected = (
+            big_num_lit
+            if len(big_num_lit) <= budget
+            else _ref_scalar_or_str_prefix(big_num_lit, budget)
+        )
+        assert c._fit_extracted(big_num, budget) == expected
+
+    tricky_str = '한글-"quote"-\\backslash-' * 3
+    for budget in range(2, 25):
+        out = c._fit_extracted(tricky_str, budget)
+        assert len(out) <= max(2, budget)
+        json.loads(out)
+
+
+def test_fit_monotone_linear_scaling_on_large_array() -> None:
+    """Fitting a large array with a proportional budget must not re-serialize
+    the growing prefix ``0..k`` in O(k^2) time."""
+    import time
+
+    c = FieldExtractCompressor()
+    items = [{"id": i, "name": f"record_{i}", "payload": "x" * 40} for i in range(1500)]
+    full = json.dumps(items, ensure_ascii=False)
+    # Budget fits ~1,200 of the 1,500 items — previously triggered ~1,200 full
+    # prefix builds + json.dumps calls over 0..k (~720,000 item serializations).
+    budget = int(len(full) * 0.8)
+    t0 = time.perf_counter()
+    out = c._fit_extracted(items, budget)
+    elapsed = time.perf_counter() - t0
+    parsed = json.loads(out)
+    assert len(out) <= budget
+    assert isinstance(parsed, list) and len(parsed) > 1000
+    assert elapsed < 1.0, f"_fit_extracted took {elapsed:.3f}s on 1500-item list"
