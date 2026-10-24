@@ -458,6 +458,183 @@ class TestLegacyTransientPurge:
         finally:
             reopened.close()
 
+    def test_epoch_upgrade_sweeps_unqueued_transient_rows_once(self, tmp_path, monkeypatch):
+        """A database last opened by an Epoch 3 build may hold a transient row
+        whose key that build dequeued (its ``set()`` and its privacy repair both
+        drain without a transient check). The first open here purges it across
+        the whole table; the next open purges from the queue alone (#1222)."""
+        db = tmp_path / "epoch3_transient.db"
+        transient_body = ProgressiveChunker(chunk_size=500).first_chunk(
+            _PROGRESSIVE_TEXT, "0123456789abcdef", ttl_seconds=1800
+        )
+        with monkeypatch.context() as old_build:
+            old_build.setattr(cache_module, "_PRIVACY_POLICY_EPOCH", 3)
+            seed = ProxyCache(db, max_entries=100)
+            seed.initialize()
+            try:
+                seed.set("s", "plain", {}, "ordinary cached response", ttl_seconds=None)
+                seed.set("s", "prog", {}, transient_body, ttl_seconds=None)
+                # What an Epoch 3 build leaves behind: the key dequeued.
+                seed._db.execute("DELETE FROM proxy_cache_privacy_unverified")
+                seed._db.commit()
+            finally:
+                seed.close()
+
+        # Spy on the purge itself: SQLite's statement trace repeats the outer
+        # DELETE each time a trigger fires, so counting trace lines overcounts.
+        full_purges: list[bool] = []
+        real_purge = cache_module._purge_transient_rows
+
+        def _spy_purge(conn: sqlite3.Connection, *, queued_only: bool) -> None:
+            if not queued_only:
+                full_purges.append(True)
+            real_purge(conn, queued_only=queued_only)
+
+        monkeypatch.setattr(cache_module, "_purge_transient_rows", _spy_purge)
+        reopened = ProxyCache(db, max_entries=100)
+        reopened.initialize()
+        try:
+            # Read the table before any get(), which could evict on its own.
+            remaining = {row[0] for row in reopened._db.execute("SELECT tool FROM proxy_cache")}
+        finally:
+            reopened.close()
+        assert remaining == {"plain"}
+        assert len(full_purges) == 1
+        assert _read_privacy_policy_stamp(db) == _privacy_policy_fingerprint()
+
+        full_purges.clear()
+        again = ProxyCache(db, max_entries=100)
+        again.initialize()
+        again.close()
+        assert full_purges == []
+
+    def test_matching_stamp_purges_transient_row_inserted_by_legacy_writer(self, tmp_path):
+        """An out-of-band SQL insert under a warm stamp is queued by the SQLite
+        trigger and purged by the queue-scoped fast path (#1222)."""
+        db = tmp_path / "warm_transient_insert.db"
+        seed = ProxyCache(db, max_entries=100)
+        seed.initialize()
+        try:
+            seed.set("s", "plain", {}, "ordinary cached response", ttl_seconds=None)
+        finally:
+            seed.close()
+
+        transient_body = SelectiveCompressor().compress(_TOC_TEXT, max_chars=600)
+        raw = sqlite3.connect(str(db))
+        try:
+            raw.execute(
+                "INSERT INTO proxy_cache "
+                "(cache_key, server, tool, result, created_at, ttl_seconds, envelope_safe) "
+                "VALUES (?, 's', 'sel', ?, ?, NULL, 1)",
+                (_make_key("s", "sel", {}), transient_body, time.time()),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+        reopened = ProxyCache(db, max_entries=100)
+        reopened.initialize()
+        try:
+            # Read the table before any get(): get() evicts this row by itself
+            # (it has no envelope_json), which would hide a missing purge.
+            remaining = {row[0] for row in reopened._db.execute("SELECT tool FROM proxy_cache")}
+            unverified = reopened._db.execute(
+                "SELECT COUNT(*) FROM proxy_cache_privacy_unverified"
+            ).fetchone()[0]
+            assert reopened.get("s", "plain", {}) == "ordinary cached response"
+        finally:
+            reopened.close()
+        assert remaining == {"plain"}
+        assert unverified == 0
+
+    def test_transient_row_racing_unlocked_privacy_sweep_is_purged(self, tmp_path, monkeypatch):
+        """A transient row inserted while the unlocked privacy sweep runs stays
+        queued under the repair token and is deleted in the post-sweep pass (#1222)."""
+        db_path = tmp_path / "transient_writer_race.db"
+        seed = ProxyCache(db_path, max_entries=100)
+        seed.initialize()
+        try:
+            seed.set("s", "clean", {}, "ordinary cached response", ttl_seconds=None)
+        finally:
+            seed.close()
+
+        raw = sqlite3.connect(str(db_path))
+        try:
+            raw.execute(
+                "UPDATE proxy_cache_meta SET value = 'stale' WHERE key = ?",
+                (cache_module._PRIVACY_POLICY_FINGERPRINT_KEY,),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+        scan_started = threading.Event()
+        release_scan = threading.Event()
+        writer_committed = threading.Event()
+        errors: list[BaseException] = []
+        real_scan = cache_module.privacy.contains_sensitive_content
+        transient_body = ProgressiveChunker(chunk_size=500).first_chunk(
+            _PROGRESSIVE_TEXT, "0123456789abcdef", ttl_seconds=1800
+        )
+
+        def _blocking_scan(text: str, *args: object) -> bool:
+            if text == "ordinary cached response":
+                scan_started.set()
+                assert release_scan.wait(timeout=5.0)
+            return real_scan(text, *args)
+
+        def _initialize() -> None:
+            cache = ProxyCache(db_path, max_entries=100)
+            try:
+                cache.initialize()
+            except BaseException as exc:  # pragma: no cover
+                errors.append(exc)
+            finally:
+                cache.close()
+
+        def _legacy_transient_write() -> None:
+            writer = sqlite3.connect(str(db_path), timeout=5.0)
+            try:
+                writer.execute(
+                    "INSERT INTO proxy_cache "
+                    "(cache_key, server, tool, result, created_at, ttl_seconds, envelope_safe) "
+                    "VALUES ('racing-transient-key', 's', 'prog', ?, ?, NULL, 1)",
+                    (transient_body, time.time()),
+                )
+                writer.commit()
+                writer_committed.set()
+            except BaseException as exc:  # pragma: no cover
+                errors.append(exc)
+            finally:
+                writer.close()
+
+        monkeypatch.setattr(cache_module.privacy, "contains_sensitive_content", _blocking_scan)
+        initializer = threading.Thread(target=_initialize)
+        initializer.start()
+        assert scan_started.wait(timeout=5.0)
+
+        legacy_writer = threading.Thread(target=_legacy_transient_write)
+        legacy_writer.start()
+        assert writer_committed.wait(timeout=5.0)
+
+        release_scan.set()
+        initializer.join(timeout=5.0)
+        legacy_writer.join(timeout=5.0)
+        assert not initializer.is_alive()
+        assert not legacy_writer.is_alive()
+        assert errors == []
+
+        check = sqlite3.connect(str(db_path))
+        try:
+            assert check.execute("SELECT tool FROM proxy_cache").fetchall() == [("clean",)]
+            assert (
+                check.execute("SELECT COUNT(*) FROM proxy_cache_privacy_unverified").fetchone()[0]
+                == 0
+            )
+        finally:
+            check.close()
+        assert _read_privacy_policy_stamp(db_path) == _privacy_policy_fingerprint()
+
 
 class TestPrivacyGate:
     """``set()`` refuses secret-looking results (SECURITY.md exclusion, #453)
@@ -498,7 +675,7 @@ class TestPrivacyGate:
         assert _read_privacy_policy_stamp(db_path) == _privacy_policy_fingerprint()
 
     def test_matching_stamp_skips_nonempty_body_query_and_scan(self, tmp_path, monkeypatch):
-        """The #872 hot path must be real, not an empty-cache false pass."""
+        """The #872/#1222 hot path must be real, not an empty-cache false pass."""
         db_path = tmp_path / "warm_privacy_stamp.db"
         seed = ProxyCache(db_path, max_entries=100)
         seed.initialize()
@@ -509,6 +686,16 @@ class TestPrivacyGate:
                 f"EXPLAIN QUERY PLAN {cache_module._SELECT_UNVERIFIED_PRIVACY_ROWS}"
             ).fetchall()
             assert not any("SCAN P" in str(row[3]).upper() for row in plan)
+            transient_plan = seed._db.execute(
+                f"EXPLAIN QUERY PLAN {cache_module._DELETE_UNVERIFIED_TRANSIENT_ROWS}",
+                (
+                    cache_module._PROGRESSIVE_MARKER,
+                    cache_module._READ_MORE_KEY_MARKER,
+                    cache_module._SELECTION_KEY_MARKER,
+                    cache_module._TOC_SHAPE_MARKER,
+                ),
+            ).fetchall()
+            assert not any("SCAN PROXY_CACHE" in str(row[3]).upper() for row in transient_plan)
         finally:
             seed.close()
 
@@ -535,6 +722,17 @@ class TestPrivacyGate:
         normalized = [" ".join(statement.split()) for statement in statements]
         assert not any(
             statement.startswith("SELECT cache_key, result, envelope_json FROM proxy_cache")
+            for statement in normalized
+        )
+        assert not any(
+            statement.startswith("DELETE FROM proxy_cache WHERE (instr(result,")
+            for statement in normalized
+        )
+        assert any(
+            statement.startswith(
+                "DELETE FROM proxy_cache WHERE cache_key IN "
+                "( SELECT cache_key FROM proxy_cache_privacy_unverified )"
+            )
             for statement in normalized
         )
         assert any(

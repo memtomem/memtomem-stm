@@ -129,6 +129,12 @@ class CompressionResult:
     # branch's estimator. No default: both
     # branches set it explicitly.
     unicode_token_gate: bool
+    # Whether a relevance scorer fell back to BM25 during THIS call's
+    # compression stage (primary compressor, pending-store degradation, or
+    # ratio-guard ladder), isolated via ``scorer_fallback_scope`` so concurrent
+    # requests and cached ``SelectiveCompressor`` scorers do not cross-talk.
+    # No default (the module contract above): both branches set it explicitly.
+    scorer_fallback: bool
 
 
 @dataclass(frozen=True, slots=True)
