@@ -11,6 +11,18 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Changed
+
+- **The response cache opens without reading every cached body** (#1222, #1225).
+  Each start used to scan the whole `proxy_cache.db` for rows carrying a
+  transient retrieval key. It now checks only rows written or changed since
+  the last start, which SQLite triggers already track. On a 99 MB cache a
+  warm open dropped from about 0.4 s to 5 ms. The first start after upgrading
+  runs the cache's one-time privacy sweep again, as 0.6.6 did (#1211); it
+  scales with cache size, about 16 ms per 32 KB row. While an older build
+  opens the same cache, each switch between the two repeats that sweep.
+  **Behavior change**: none external.
+
 ## [0.6.6] — 2026-10-22
 
 ### Upgrade notes
