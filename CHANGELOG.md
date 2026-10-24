@@ -13,7 +13,7 @@ changes inline only. See the deprecation policy in
 
 ### Changed
 
-- **The response cache opens without reading every cached body** (#1222).
+- **The response cache opens without reading every cached body** (#1222, #1225).
   Each start used to scan the whole `proxy_cache.db` for rows carrying a
   transient retrieval key. It now checks only rows written or changed since
   the last start, which SQLite triggers already track. On a 99 MB cache a
