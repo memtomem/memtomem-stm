@@ -36,7 +36,7 @@ changes inline only. See the deprecation policy in
   runs the cache's one-time privacy sweep again, as 0.6.6 did (#1211); it
   scales with cache size, about 16 ms per 32 KB row. While a 0.3.0–0.6.6
   build opens the same cache, each switch between the two repeats that sweep.
-  **Behavior change**: none external.
+  **Behavior change**: see the upgrade notes above.
 - **EXTRACT_FIELDS fits a large JSON array to its budget in linear time**
   (#1220, #1224). It re-serialized the kept prefix for every item it tried, so
   on 1,500 items it serialized about 480 times the input; it now serializes
