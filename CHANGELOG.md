@@ -11,6 +11,21 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.6.7] — 2026-10-24
+
+### Upgrade notes
+
+- **The first start after upgrading takes longer when the response cache is
+  large** (#1222, #1225). The cache runs its one-time privacy sweep again,
+  as it did on the upgrade to 0.6.6, at about 16 ms per 32 KB cached row.
+  While a 0.3.0–0.6.6 build opens the same `proxy_cache.db`, each switch
+  between the two builds repeats that sweep.
+- **`scorer_fallback` in the proxy metrics counts a call only for its own
+  fallback** (#1219, #1223). With an embedding relevance scorer configured, new
+  rows no longer pick up a concurrent call's fallback to BM25, and now record a
+  SELECTIVE or HYBRID call's fallback through a scorer held from before a
+  reload. Rows already recorded keep their values.
+
 ### Changed
 
 - **The response cache opens without reading every cached body** (#1222, #1225).
@@ -19,9 +34,25 @@ changes inline only. See the deprecation policy in
   the last start, which SQLite triggers already track. On a 99 MB cache a
   warm open dropped from about 0.4 s to 5 ms. The first start after upgrading
   runs the cache's one-time privacy sweep again, as 0.6.6 did (#1211); it
-  scales with cache size, about 16 ms per 32 KB row. While an older build
-  opens the same cache, each switch between the two repeats that sweep.
+  scales with cache size, about 16 ms per 32 KB row. While a 0.3.0–0.6.6
+  build opens the same cache, each switch between the two repeats that sweep.
   **Behavior change**: none external.
+- **EXTRACT_FIELDS fits a large JSON array to its budget in linear time**
+  (#1220, #1224). It re-serialized the kept prefix for every item it tried, so
+  on 1,500 items it serialized about 480 times the input; it now serializes
+  under 3 times. An oversized scalar or string root is cut by binary search
+  instead of a character-by-character scan. The output is byte-identical.
+  **Behavior change**: none external.
+
+### Fixed
+
+- **The `scorer_fallback` metric records only the call's own fallback**
+  (#1219, #1223). With an embedding relevance scorer configured, it was set by
+  comparing a process-wide fallback count before and after the call, so a
+  concurrent call's fallback to BM25 marked calls that did not fall back. A
+  SELECTIVE or HYBRID call whose compressor still held the scorer from before
+  a `relevance_scorer` reload was not marked when it fell back.
+  **Behavior change**: see the upgrade notes above.
 
 ## [0.6.6] — 2026-10-22
 

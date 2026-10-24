@@ -1,3 +1,3 @@
 """memtomem-stm — Short-term memory proxy gateway with proactive memory surfacing."""
 
-__version__ = "0.6.6"
+__version__ = "0.6.7"
