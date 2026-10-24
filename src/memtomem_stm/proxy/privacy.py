@@ -138,8 +138,20 @@ CREDENTIAL_PATTERNS = [
     r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
     # JWT-ish: three base64url segments separated by dots, anchored to the
     # canonical ``eyJ`` header prefix to limit false positives on arbitrary
-    # dotted identifiers.
-    r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+    # dotted identifiers. It finds the same tokens as
+    # ``\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`` —
+    # the same yes/no answer, match count and match ends — in linear time.
+    # That form tried a start after every ``-`` in a run of segment
+    # characters, and each start scanned to the end of the run, so ``eyJ-``
+    # repeated cost quadratic time. Here the first segment
+    # does not run past another start that has 8 characters after it: such
+    # a start shares the rest of the match, so it is left to decide. A match
+    # can therefore begin at a later ``eyJ`` in the same run, with the same
+    # end. The segment is consumed a word-character run at a time and
+    # possessively, so no backtracking state builds up. Only a ``.`` may
+    # follow it, and giving characters back never exposes one.
+    r"\beyJ(?=[A-Za-z0-9_-]{8})[A-Za-z0-9_]*+(?:-(?!eyJ[A-Za-z0-9_-]{8})[A-Za-z0-9_]*+)*+"
+    r"\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
     r"(?i)(BEGIN\s+(RSA|EC|OPENSSH|DSA|PGP)\s+PRIVATE\s+KEY)",
     # --- Secret-class patterns mirrored from memtomem LTM (issue #1488) -----
     # These provider-token patterns originated at the LTM trust boundary and

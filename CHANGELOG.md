@@ -11,6 +11,20 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Security
+
+- **Crafted upstream text no longer stalls the proxy in the credential
+  check.** The JWT rule in `CREDENTIAL_PATTERNS`, which the cache, the
+  pending store, tool eligibility, extraction and the LLM privacy scan all run
+  on responses, could start a match after every `-` in a run of base64url
+  characters and scan to the end of the run each time. 256 KB of `eyJ-`
+  repeated held every proxied call for about 8 s. The rule now finds the same
+  tokens in linear time and constant memory. **Behavior change**: none
+  external. Detection decisions are unchanged. Because the pattern text
+  changed, the response cache runs its one-time privacy sweep on the first
+  start after upgrading, and that sweep removes nothing the old rule allowed.
+  ([GHSA-3v6c-9qpg-gf63](https://github.com/memtomem/memtomem-stm/security/advisories/GHSA-3v6c-9qpg-gf63))
+
 ## [0.6.7] — 2026-10-24
 
 ### Upgrade notes

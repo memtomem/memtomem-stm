@@ -29,7 +29,7 @@ from memtomem_stm.proxy import privacy
 # divergence window (one side merged ahead of its sync), bump the leading
 # side's constant with a sync-tracking note, then re-align the trailing
 # side's constant when the sync lands.
-_SECRET_CLASS_SET_SHA256 = "237d505d119c08ba85fc4474aa85bd07c603439809d03915331fab6b435a9f65"
+_SECRET_CLASS_SET_SHA256 = "de210a7657f5caefd38765f3a5bff80e0d2c48ede1002b150dbe42324737fb0b"
 
 
 @pytest.fixture(autouse=True)
