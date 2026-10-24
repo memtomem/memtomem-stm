@@ -143,6 +143,23 @@ WHERE p.cache_key IN (
 );
 """
 
+_DELETE_ALL_TRANSIENT_ROWS = """
+DELETE FROM proxy_cache
+WHERE (instr(result, ?) > 0 AND instr(result, ?) > 0)
+   OR (instr(result, ?) > 0 AND instr(result, ?) > 0);
+"""
+
+_DELETE_UNVERIFIED_TRANSIENT_ROWS = """
+DELETE FROM proxy_cache
+WHERE cache_key IN (
+    SELECT cache_key FROM proxy_cache_privacy_unverified
+)
+AND (
+    (instr(result, ?) > 0 AND instr(result, ?) > 0)
+    OR (instr(result, ?) > 0 AND instr(result, ?) > 0)
+);
+"""
+
 _PRIVACY_POLICY_FINGERPRINT_KEY = "privacy_policy_fingerprint"
 
 # Written into the stamp slot for the duration of an unlocked sweep. It is not
@@ -165,8 +182,14 @@ _PRIVACY_REPAIR_ATTEMPTS = 3
 # under a meaningfully different storage policy. Epoch 2 establishes the
 # trigger-backed unverified-key baseline, invalidating stamps created before
 # legacy writes could be tracked. Epoch 3 scans through JSON string escaping
-# (#1211), so rows an earlier build cached as clean are swept once.
-_PRIVACY_POLICY_EPOCH = 3
+# (#1211), so rows an earlier build cached as clean are swept once. Epoch 4
+# lets a warm open purge transient-key rows from the unverified queue alone
+# (#1222). That is only sound while every opener keeps such rows queued, and an
+# older build does not: its ``set()`` dequeues without checking, and its
+# privacy repair drains the queue without a transient purge. A different
+# fingerprint is what makes the next opener here notice that an older build
+# published, and purge the whole table again.
+_PRIVACY_POLICY_EPOCH = 4
 
 
 def _privacy_policy_fingerprint() -> str:
@@ -302,7 +325,38 @@ class CacheEntry:
         return time.time() >= self.created_at + self.ttl_seconds
 
 
-def _purge_dead_rows(db: sqlite3.Connection) -> None:
+def _purge_transient_rows(db: sqlite3.Connection, *, queued_only: bool) -> None:
+    """Delete rows whose cached result embeds a transient retrieval key.
+
+    Startup purge of legacy or out-of-band rows whose cached result embeds a
+    transient retrieval key (progressive/SELECTIVE/HYBRID TOC). These pre-date
+    the store-side guard and would otherwise serve a dead key after restart/TTL
+    skew until they expire (or forever for no-TTL caches). ``instr`` is a
+    case-sensitive literal substring match, so the predicate mirrors
+    ``response_carries_transient_key`` exactly (the progressive footer +
+    read_more key call pair OR the selection_key + ttl_seconds_remaining pair)
+    — no LIKE wildcard/case-folding divergence.
+
+    When ``queued_only`` is True (the warm fast path and the post-sweep
+    reservation pass), the ``IN`` subquery drives the lookup from the small
+    ``proxy_cache_privacy_unverified`` queue and probes ``proxy_cache`` by its
+    primary-key index — touching zero rows when the queue is empty (#1222).
+    When False (missing/stale policy stamp or replaced triggers), the whole
+    ``proxy_cache`` table is scanned once before publishing the new stamp.
+    """
+    sql = _DELETE_UNVERIFIED_TRANSIENT_ROWS if queued_only else _DELETE_ALL_TRANSIENT_ROWS
+    db.execute(
+        sql,
+        (
+            _PROGRESSIVE_MARKER,
+            _READ_MORE_KEY_MARKER,
+            _SELECTION_KEY_MARKER,
+            _TOC_SHAPE_MARKER,
+        ),
+    )
+
+
+def _purge_dead_rows(db: sqlite3.Connection, *, queued_only: bool) -> None:
     """Delete rows no lookup can ever serve. Caller holds the write
     reservation, and calls this BEFORE anything reads a body.
 
@@ -322,19 +376,7 @@ def _purge_dead_rows(db: sqlite3.Connection) -> None:
         "DELETE FROM proxy_cache WHERE ttl_seconds IS NOT NULL AND created_at + ttl_seconds <= ?",
         (time.time(),),
     )
-    # Startup purge of legacy rows whose cached result embeds a
-    # transient retrieval key (progressive/SELECTIVE/HYBRID TOC). These
-    # pre-date the store-side guard and would otherwise serve a dead key
-    # after restart/TTL skew until they expire (or forever for no-TTL
-    # caches). ``instr`` is a case-sensitive literal substring match, so
-    # the predicate mirrors ``response_carries_transient_key`` exactly
-    # (the progressive footer + read_more key call pair OR the selection_key +
-    # ttl_seconds_remaining pair) — no LIKE wildcard/case-folding divergence.
-    db.execute(
-        "DELETE FROM proxy_cache WHERE (instr(result, ?) > 0 AND instr(result, ?) > 0) "
-        "OR (instr(result, ?) > 0 AND instr(result, ?) > 0)",
-        (_PROGRESSIVE_MARKER, _READ_MORE_KEY_MARKER, _SELECTION_KEY_MARKER, _TOC_SHAPE_MARKER),
-    )
+    _purge_transient_rows(db, queued_only=queued_only)
 
 
 def _repair_privacy_policy(db: sqlite3.Connection) -> None:
@@ -374,12 +416,15 @@ def _repair_privacy_policy(db: sqlite3.Connection) -> None:
     for attempt in range(_PRIVACY_REPAIR_ATTEMPTS):
         db.execute("BEGIN IMMEDIATE")
         triggers_were_current = _ensure_current_triggers(db)
-        _purge_dead_rows(db)
         stamp_row = db.execute(
             "SELECT value FROM proxy_cache_meta WHERE key = ?",
             (_PRIVACY_POLICY_FINGERPRINT_KEY,),
         ).fetchone()
-        if triggers_were_current and stamp_row is not None and stamp_row[0] == policy_fingerprint:
+        stamp_is_current = (
+            triggers_were_current and stamp_row is not None and stamp_row[0] == policy_fingerprint
+        )
+        _purge_dead_rows(db, queued_only=stamp_is_current)
+        if stamp_is_current:
             _purge_queued_rows(db, set())
             db.commit()
             return
@@ -420,6 +465,7 @@ def _repair_privacy_policy(db: sqlite3.Connection) -> None:
             db.rollback()
             logger.debug("Privacy repair superseded by a concurrent initializer; retrying")
             continue
+        _purge_transient_rows(db, queued_only=True)
         _purge_queued_rows(db, swept_stale_keys)
         _publish_privacy_stamp(db, policy_fingerprint)
         db.commit()
@@ -907,19 +953,23 @@ class ProxyCache:
             # the write became visible. ``set()`` checked the exact body and
             # envelope above, so dequeue this key in the same transaction only
             # when the database's published stamp matches this process's
-            # policy. During a rolling policy upgrade, an older process must
-            # leave its writes queued for the newer process to verify.
-            self._db.execute(
-                "DELETE FROM proxy_cache_privacy_unverified WHERE cache_key = ? "
-                "AND EXISTS ("
-                "SELECT 1 FROM proxy_cache_meta WHERE key = ? AND value = ?"
-                ")",
-                (
-                    key,
-                    _PRIVACY_POLICY_FINGERPRINT_KEY,
-                    _privacy_policy_fingerprint(),
-                ),
-            )
+            # policy and the body does not carry a transient retrieval key
+            # (which ``ProxyManager._store_cache`` skips, and which direct
+            # callers leave queued for the startup purge). During a rolling
+            # policy upgrade, an older process must leave its writes queued
+            # for the newer process to verify.
+            if not response_carries_transient_key(result):
+                self._db.execute(
+                    "DELETE FROM proxy_cache_privacy_unverified WHERE cache_key = ? "
+                    "AND EXISTS ("
+                    "SELECT 1 FROM proxy_cache_meta WHERE key = ? AND value = ?"
+                    ")",
+                    (
+                        key,
+                        _PRIVACY_POLICY_FINGERPRINT_KEY,
+                        _privacy_policy_fingerprint(),
+                    ),
+                )
             self._db.commit()
             self._trim()
 
