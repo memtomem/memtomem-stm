@@ -906,3 +906,238 @@ def test_dict_provenance_not_pattern_for_markers(data: object) -> None:
         leaves = _preserved_leaves(json.loads(out), data)
         assert leaves >= prev, f"@{budget}: regressed {prev} -> {leaves}"
         prev = leaves
+
+
+# ── E4. Linear fitting (#1220): same bytes as the prefix-rebuild algorithm ────
+
+
+def _ref_scalar_or_str_prefix(s: str, max_chars: int) -> str:
+    """The downward scan ``_fit_extracted`` used for oversized string/scalar roots."""
+    for k in range(len(s), -1, -1):
+        cand = json.dumps(s[:k], ensure_ascii=False)
+        if len(cand) <= max_chars:
+            return cand
+    return '""'
+
+
+class _PrefixRebuildReference(FieldExtractCompressor):
+    """``_fit_monotone`` as it was before #1220: every candidate frame is built and
+    re-serialized whole. It is the byte-for-byte oracle for the incremental length
+    accounting. The recursion goes through this override too, so nested boundary
+    items are fitted by the reference all the way down."""
+
+    def _fit_monotone(self, value: object, budget: int) -> object:
+        def dump(obj: object) -> str:
+            return json.dumps(obj, ensure_ascii=False)
+
+        if isinstance(value, str):
+            if len(dump(value)) <= budget:
+                return value
+            lo, hi, best = 0, len(value), ""
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                cand = value[:mid] + "..."
+                if len(dump(cand)) <= budget:
+                    best, lo = cand, mid + 1
+                else:
+                    hi = mid - 1
+            return best
+        if not isinstance(value, (dict, list)):
+            return value if len(dump(value)) <= budget else ""
+        if len(dump(value)) <= budget:
+            return value
+
+        marker_key = "_truncated"
+        if isinstance(value, dict):
+            is_dict = True
+            items: list = sorted(
+                value.items(),
+                key=lambda kv: not isinstance(kv[1], (dict, list)) and len(dump(kv[1])) > 80,
+            )
+            existing = set(value)
+            while marker_key in existing:
+                marker_key += "_"
+        else:
+            is_dict = False
+            items = list(enumerate(value))
+        n = len(items)
+        _MISSING = object()
+
+        def frame(full_count: int, boundary: object, omitted: int) -> object:
+            if is_dict:
+                out: dict = {items[i][0]: items[i][1] for i in range(full_count)}
+                if boundary is not _MISSING:
+                    out[items[full_count][0]] = boundary
+                if omitted > 0:
+                    out[marker_key] = f"{omitted} of {n} keys omitted"
+                return out
+            lst: list = [items[i][1] for i in range(full_count)]
+            if boundary is not _MISSING:
+                lst.append(boundary)
+            if omitted > 0:
+                lst.append(f"... ({omitted} of {n} items omitted)")
+            return lst
+
+        def starved(child: object, source: object) -> bool:
+            if child == "" and not isinstance(source, (dict, list, str)):
+                return False
+            return child in ({}, [], "") and source not in (None, {}, [], "", 0, False)
+
+        full_k = 0
+        for k in range(1, n + 1):
+            if len(dump(frame(k, _MISSING, n - k))) <= budget:
+                full_k = k
+            else:
+                break
+        if full_k >= n:
+            return value
+
+        boundary_item = items[full_k][1]
+        omitted_after = n - full_k - 1
+        base = frame(full_k, _MISSING, omitted_after)
+        base_empty = full_k == 0 and omitted_after == 0
+        if is_dict:
+            framing = len(dump(items[full_k][0])) + (2 if base_empty else 4)
+        else:
+            framing = 0 if base_empty else 2
+        room = budget - len(dump(base)) - framing
+        boundary_cand = self._fit_monotone(boundary_item, room) if room >= 0 else _MISSING
+        if (
+            boundary_cand is not _MISSING
+            and not starved(boundary_cand, boundary_item)
+            and len(dump(frame(full_k, boundary_cand, omitted_after))) <= budget
+        ):
+            return frame(full_k, boundary_cand, omitted_after)
+
+        if full_k > 0:
+            return frame(full_k, _MISSING, n - full_k)
+        marker_only = frame(0, _MISSING, n)
+        if len(dump(marker_only)) <= budget:
+            return marker_only
+        if len(dump(value)) <= len(dump(marker_only)):
+            markerless_k = 0
+            for k in range(1, n + 1):
+                if len(dump(frame(k, _MISSING, 0))) <= budget:
+                    markerless_k = k
+                else:
+                    break
+            if markerless_k > 0:
+                return frame(markerless_k, _MISSING, 0)
+        return {} if is_dict else []
+
+
+def _fit_corpus() -> list[object]:
+    """Hand-picked shapes plus a seeded random batch. The random values mix the
+    categories the length arithmetic has to get right: escaped and non-ASCII text,
+    oversized scalars (ranked last in dicts), a real ``_truncated`` key (marker
+    collision), empty containers, and nesting deep enough to recurse on a boundary."""
+    import random
+
+    rng = random.Random(1220)
+    texts = ["", "a", "한글", 'q"uote', "back\\slash", "\n\t", "_truncated", "🙂", "x" * 90]
+
+    def gen(depth: int) -> object:
+        roll = rng.random()
+        if depth <= 0 or roll < 0.35:
+            return rng.choice(
+                [
+                    None,
+                    True,
+                    rng.randint(-(10**6), 10**6),
+                    rng.choice(texts),
+                    int("9" * rng.randint(1, 90)),
+                    rng.choice(texts) * rng.randint(1, 4),
+                ]
+            )
+        if roll < 0.7:
+            return [gen(depth - 1) for _ in range(rng.randrange(0, 8))]
+        out: dict = {}
+        for _ in range(rng.randrange(0, 7)):
+            key = rng.choice(["k", "_truncated", "_truncated_", "한", 'q"', "id"])
+            out[key + str(rng.randrange(20))] = gen(depth - 1)
+        if rng.random() < 0.3:
+            out["_truncated"] = gen(0)
+        return out
+
+    hand: list[object] = [
+        [{"id": i, "msg": f'item-{i}-"quoted"-한글'} for i in range(18)],
+        {
+            "_truncated": "real-val",
+            **{f"k_{i}": [i, i + 1, {"nested": "v" * (i * 5)}] for i in range(12)},
+        },
+        [1, 2, 3],
+        {"a": 1, "b": 2},
+    ]
+    # Every budget is checked, so cap each value's size to keep the test fast.
+    batch: list[object] = []
+    while len(batch) < 40:
+        value = gen(rng.randrange(1, 5))
+        if len(json.dumps(value, ensure_ascii=False)) <= 600:
+            batch.append(value)
+    return hand + batch
+
+
+def test_fit_monotone_matches_prefix_rebuild_reference() -> None:
+    """The incremental frame-length accounting must reproduce the prefix-rebuild
+    algorithm byte for byte at every budget — ``json.dumps`` is compared rather
+    than the objects, because dict equality ignores key order."""
+    c, ref = FieldExtractCompressor(), _PrefixRebuildReference()
+    for data in _fit_corpus():
+        full_len = len(json.dumps(data, ensure_ascii=False))
+        for budget in range(0, full_len + 3):
+            got = json.dumps(c._fit_monotone(data, budget), ensure_ascii=False)
+            want = json.dumps(ref._fit_monotone(data, budget), ensure_ascii=False)
+            assert got == want, f"{data!r} @{budget}"
+            if isinstance(data, (dict, list)):
+                assert c._fit_extracted(data, budget) == ref._fit_extracted(data, budget)
+
+
+def test_string_and_scalar_roots_match_downward_scan_reference() -> None:
+    """Binary search over the root prefix must return what the downward scan did."""
+    c = FieldExtractCompressor()
+    big_num_lit = json.dumps(int("9" * 60), ensure_ascii=False)
+    for budget in range(0, len(big_num_lit) + 3):
+        want = (
+            big_num_lit
+            if len(big_num_lit) <= budget
+            else _ref_scalar_or_str_prefix(big_num_lit, budget)
+        )
+        assert c._fit_extracted(int("9" * 60), budget) == want
+
+    for s in ['한글-"quote"-\\backslash-' * 3, "\n\t" * 20, "🙂" * 30]:
+        for budget in range(0, len(json.dumps(s, ensure_ascii=False)) + 3):
+            take = json.dumps(c._take(s, budget), ensure_ascii=False)
+            want = take if len(take) <= budget else _ref_scalar_or_str_prefix(s, budget)
+            assert c._fit_extracted(s, budget) == want, f"{s!r} @{budget}"
+
+
+def test_fit_monotone_serializes_linearly_on_large_array(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fitting must not re-serialize the growing prefix ``0..k`` for every ``k``.
+    Counted in serialized characters rather than wall time so the check is
+    deterministic: on this input the prefix rebuild serializes ~480x the input,
+    the incremental path under 3x."""
+    import memtomem_stm.proxy.compression as compression
+
+    items = [{"id": i, "name": f"record_{i}", "payload": "x" * 40} for i in range(1500)]
+    full = json.dumps(items, ensure_ascii=False)
+    budget = int(len(full) * 0.8)  # ~1,200 of the 1,500 items fit in full
+
+    real_dumps = json.dumps
+    serialized = 0
+
+    def counting_dumps(*args, **kwargs) -> str:
+        nonlocal serialized
+        out = real_dumps(*args, **kwargs)
+        serialized += len(out)
+        return out
+
+    monkeypatch.setattr(compression.json, "dumps", counting_dumps)
+    out = FieldExtractCompressor()._fit_extracted(items, budget)
+    monkeypatch.undo()
+
+    assert len(out) <= budget
+    parsed = json.loads(out)
+    assert isinstance(parsed, list) and len(parsed) > 1000
+    assert serialized <= 8 * len(full), f"serialized {serialized / len(full):.0f}x the input"

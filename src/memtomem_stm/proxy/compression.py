@@ -1746,15 +1746,21 @@ class FieldExtractCompressor:
             # when it fits; otherwise degrade to a truncated STRING of the
             # literal. Nested oversized scalars degrade to the empty-string
             # stub, but root scalars should stay visibly truncated rather than
-            # disappearing behind an unlabelled empty value.
+            # disappearing behind an unlabelled empty value. Binary-search the
+            # largest fitting prefix (``len(dump(s[:k]))`` is monotone in ``k``)
+            # instead of re-serializing from ``len(literal)`` down in O(N^2).
             literal = json.dumps(data, ensure_ascii=False)
             if len(literal) <= max_chars:
                 return literal
-            for k in range(len(literal), -1, -1):
-                candidate = json.dumps(literal[:k], ensure_ascii=False)
+            lo, hi, best = 0, len(literal), '""'
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                candidate = json.dumps(literal[:mid], ensure_ascii=False)
                 if len(candidate) <= max_chars:
-                    return candidate
-            return '""'
+                    best, lo = candidate, mid + 1
+                else:
+                    hi = mid - 1
+            return best
 
         if isinstance(data, list):
             # List roots fill the budget MONOTONICALLY via ``_fit_monotone``;
@@ -1767,11 +1773,15 @@ class FieldExtractCompressor:
             candidate = dump(self._take(data, max_chars))
             if len(candidate) <= max_chars:
                 return candidate
-            for k in range(len(data), -1, -1):
-                candidate = json.dumps(data[:k], ensure_ascii=False)
+            lo, hi, best = 0, len(data), '""'
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                candidate = json.dumps(data[:mid], ensure_ascii=False)
                 if len(candidate) <= max_chars:
-                    return candidate
-            return '""'
+                    best, lo = candidate, mid + 1
+                else:
+                    hi = mid - 1
+            return best
 
         # Only an EMPTY dict reaches here (non-empty dict / list / str / scalar
         # roots are all handled above): floor it like the other empty roots.
@@ -1833,7 +1843,8 @@ class FieldExtractCompressor:
         if not isinstance(value, (dict, list)):
             literal = dump(value)
             return value if len(literal) <= budget else ""
-        if len(dump(value)) <= budget:
+        value_dump_len = len(dump(value))
+        if value_dump_len <= budget:
             return value  # whole value fits in full
 
         # Narrow ``value`` for both the type checker and key/index handling, and
@@ -1856,9 +1867,11 @@ class FieldExtractCompressor:
             existing = set(value)
             while marker_key in existing:
                 marker_key += "_"
+            marker_key_dump_len = len(dump(marker_key))
         else:
             is_dict = False
             items = list(enumerate(value))
+            marker_key_dump_len = 0
         n = len(items)
 
         _MISSING = object()  # "no boundary item" sentinel (``None`` is a valid value)
@@ -1880,6 +1893,20 @@ class FieldExtractCompressor:
                 lst.append(f"... ({omitted} of {n} items omitted)")
             return lst
 
+        def key_dump_len(k_obj: object) -> int:
+            return len(dump(k_obj)) if isinstance(k_obj, str) else len(dump({k_obj: None})) - 8
+
+        def item_entry_len(idx: int) -> int:
+            k_obj, v_obj = items[idx]
+            if is_dict:
+                return key_dump_len(k_obj) + 2 + len(dump(v_obj))
+            return len(dump(v_obj))
+
+        def marker_entry_len(omitted: int) -> int:
+            if is_dict:
+                return marker_key_dump_len + 2 + len(dump(f"{omitted} of {n} keys omitted"))
+            return len(dump(f"... ({omitted} of {n} items omitted)"))
+
         def starved(child: object, source: object) -> bool:
             # An empty container/string standing in for a non-empty source carries
             # no content; a scalar legitimately stubbed to "" is not starved.
@@ -1890,10 +1917,20 @@ class FieldExtractCompressor:
         # Full prefix: keep item ``k`` in FULL while ``[full 0..k] + marker`` fits.
         # Adding a full item strictly grows the frame (a marker's digit width
         # shrinks by at most a couple of chars), so the first overflow ends it.
+        # Track the serialized prefix length incrementally (like
+        # ``_enrich_dict_monotone``) so each fitting item is serialized ONCE in
+        # O(k) total rather than rebuilding and re-dumping ``0..k`` in O(k^2).
         full_k = 0
+        full_prefix_inner_len = 0
+        running_inner_len = 0
         for k in range(1, n + 1):
-            if len(dump(frame(k, _MISSING, n - k))) <= budget:
+            entry_len = item_entry_len(k - 1)
+            running_inner_len = entry_len if k == 1 else running_inner_len + 2 + entry_len
+            omitted = n - k
+            cand_len = 2 + running_inner_len + (2 + marker_entry_len(omitted) if omitted > 0 else 0)
+            if cand_len <= budget:
                 full_k = k
+                full_prefix_inner_len = running_inner_len
             else:
                 break
         if full_k >= n:
@@ -1911,18 +1948,25 @@ class FieldExtractCompressor:
         # — hence the boundary's content — is monotone in ``budget``.
         boundary_item = items[full_k][1]
         omitted_after = n - full_k - 1
-        base = frame(full_k, _MISSING, omitted_after)
         base_empty = full_k == 0 and omitted_after == 0  # leading "["/"{" with no element
+        if full_k == 0:
+            base_len = 2 + (marker_entry_len(omitted_after) if omitted_after > 0 else 0)
+        else:
+            base_len = (
+                2
+                + full_prefix_inner_len
+                + (2 + marker_entry_len(omitted_after) if omitted_after > 0 else 0)
+            )
         if is_dict:
-            framing = len(dump(items[full_k][0])) + (2 if base_empty else 4)
+            framing = key_dump_len(items[full_k][0]) + (2 if base_empty else 4)
         else:
             framing = 0 if base_empty else 2
-        room = budget - len(dump(base)) - framing
+        room = budget - base_len - framing
         boundary_cand = self._fit_monotone(boundary_item, room) if room >= 0 else _MISSING
         if (
             boundary_cand is not _MISSING
             and not starved(boundary_cand, boundary_item)
-            and len(dump(frame(full_k, boundary_cand, omitted_after))) <= budget
+            and base_len + framing + len(dump(boundary_cand)) <= budget
         ):
             return frame(full_k, boundary_cand, omitted_after)
 
@@ -1936,13 +1980,16 @@ class FieldExtractCompressor:
         # budget grows, so dropping the marker keeps the result monotone. For a
         # large value (marker cheaper than full) a markerless prefix would regress
         # against the marker-only tier just above it, so floor to an empty container.
-        marker_only = frame(0, _MISSING, n)
-        if len(dump(marker_only)) <= budget:
-            return marker_only
-        if len(dump(value)) <= len(dump(marker_only)):
+        marker_only_len = 2 + marker_entry_len(n)
+        if marker_only_len <= budget:
+            return frame(0, _MISSING, n)
+        if value_dump_len <= marker_only_len:
             markerless_k = 0
+            markerless_inner_len = 0
             for k in range(1, n + 1):
-                if len(dump(frame(k, _MISSING, 0))) <= budget:
+                entry_len = item_entry_len(k - 1)
+                markerless_inner_len = entry_len if k == 1 else markerless_inner_len + 2 + entry_len
+                if 2 + markerless_inner_len <= budget:
                     markerless_k = k
                 else:
                     break
