@@ -99,6 +99,7 @@ from memtomem_stm.proxy.pipeline_stages import (
     ShapePassthrough,
 )
 from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS as PRIVACY_CREDENTIAL_PATTERNS
+from memtomem_stm.proxy.relevance import scorer_fallback_scope
 from memtomem_stm.proxy.token_estimate import approx_tokens
 from memtomem_stm.proxy.tool_eligibility import (
     REASON_CONFIG_HIDDEN,
@@ -6401,9 +6402,8 @@ class ProxyManager:
         Returns a ``CompressionResult`` carrying both ``compressed`` (pre-surfacing,
         the cache payload) and ``surfaced`` (post-surfacing, the return/index
         input), the initial-response ``compressed_chars_for_metrics``, the
-        fully-mutated ``metrics_strategy`` label, and the surfacing outcome. The
-        scorer-fallback delta is computed by the caller (it brackets this call plus
-        the later index/extract stages), so it is intentionally not a field here.
+        fully-mutated ``metrics_strategy`` label, the surfacing outcome, and the
+        per-operation ``scorer_fallback`` flag captured via ``scorer_fallback_scope``.
         """
         # ``effective_compression`` is the strategy actually used (with AUTO
         # already resolved). ``ratio_violation`` is set by the post-compression
@@ -6452,6 +6452,7 @@ class ProxyManager:
         # Read by the metrics block in ``_call_tool_inner`` to pick the token
         # estimator, so it must track the gate exactly.
         unicode_token_gate = False
+        scorer_fallback = False
         if tc.compression == CompressionStrategy.PROGRESSIVE:
             # ``_resolve_tool_config`` already defaults the block on this
             # strategy (#830); the fallback keeps a directly-constructed
@@ -6595,14 +6596,17 @@ class ProxyManager:
                 # attributed to AUTO afterwards (#933).
                 strategy_auto_selected = True
 
-            with traced(
-                "proxy_call_compress",
-                metadata={
-                    "server": server,
-                    "tool": tool,
-                    "strategy": effective_compression.value,
-                    "max_chars": effective_max_chars,
-                },
+            with (
+                traced(
+                    "proxy_call_compress",
+                    metadata={
+                        "server": server,
+                        "tool": tool,
+                        "strategy": effective_compression.value,
+                        "max_chars": effective_max_chars,
+                    },
+                ),
+                scorer_fallback_scope() as _primary_scorer_fb,
             ):
                 _t0 = _time.monotonic()
                 try:
@@ -6672,6 +6676,7 @@ class ProxyManager:
                     llm_fallback = None
                     selective_store_error = True
                 _compress_ms = (_time.monotonic() - _t0) * 1000
+            scorer_fallback = _primary_scorer_fb[0]
 
             # ── Compression ratio guard (R4 defense + fallback ladder) ──
             # When the compressor cuts below the dynamic retention floor,
@@ -6769,50 +6774,57 @@ class ProxyManager:
                             # AUTO could disagree on whether content is "markdown".
                             heading_count = count_markdown_headings(cleaned)
                             if heading_count >= _MIN_HEADINGS_FOR_HYBRID:
-                                try:
-                                    compressed = await self._apply_hybrid(
-                                        cleaned,
-                                        effective_max_chars,
-                                        tc.hybrid,
-                                        tc.selective,
-                                        server=server,
-                                        tool=tool,
-                                        context_query=context_query,
-                                        cfg_snap=cfg_snap,
-                                    )
-                                    if len(compressed) / cleaned_len >= dynamic:
-                                        metrics_strategy = f"{original_strategy}→hybrid_fallback"
-                                        hybrid_fallback = True
-                                        logger.info(
-                                            "Hybrid fallback for %s/%s: %s (ratio %.3f→%.3f)",
+                                with scorer_fallback_scope() as _hybrid_scorer_fb:
+                                    try:
+                                        compressed = await self._apply_hybrid(
+                                            cleaned,
+                                            effective_max_chars,
+                                            tc.hybrid,
+                                            tc.selective,
+                                            server=server,
+                                            tool=tool,
+                                            context_query=context_query,
+                                            cfg_snap=cfg_snap,
+                                        )
+                                        if len(compressed) / cleaned_len >= dynamic:
+                                            metrics_strategy = (
+                                                f"{original_strategy}→hybrid_fallback"
+                                            )
+                                            hybrid_fallback = True
+                                            logger.info(
+                                                "Hybrid fallback for %s/%s: %s (ratio %.3f→%.3f)",
+                                                server,
+                                                tool,
+                                                metrics_strategy,
+                                                compressed_ratio,
+                                                len(compressed) / cleaned_len,
+                                            )
+                                    except Exception as exc:
+                                        if isinstance(exc, SensitivePayloadNotStored):
+                                            ladder_sensitive = True
+                                        logger.debug(
+                                            "Hybrid fallback failed for %s/%s, "
+                                            "falling through to truncate",
                                             server,
                                             tool,
-                                            metrics_strategy,
-                                            compressed_ratio,
-                                            len(compressed) / cleaned_len,
+                                            exc_info=True,
                                         )
-                                except Exception as exc:
-                                    if isinstance(exc, SensitivePayloadNotStored):
-                                        ladder_sensitive = True
-                                    logger.debug(
-                                        "Hybrid fallback failed for %s/%s, "
-                                        "falling through to truncate",
-                                        server,
-                                        tool,
-                                        exc_info=True,
-                                    )
+                                    finally:
+                                        scorer_fallback = scorer_fallback or _hybrid_scorer_fb[0]
                         # Tier 3: truncate (guaranteed floor) — also the
                         # direct path when content is too small for progressive
                         # and lacks structure for hybrid.
                         if not progressive_fallback and not hybrid_fallback:
                             _fb_scorer = self._relevance_scorer_for(cfg_snap)
-                            compressed = await self._compress_maybe_offthread(
-                                TruncateCompressor(scorer=_fb_scorer, min_chars=min_budget),
-                                cleaned,
-                                max_chars=effective_max_chars,
-                                context_query=context_query,
-                                scorer=_fb_scorer,
-                            )
+                            with scorer_fallback_scope() as _trunc_scorer_fb:
+                                compressed = await self._compress_maybe_offthread(
+                                    TruncateCompressor(scorer=_fb_scorer, min_chars=min_budget),
+                                    cleaned,
+                                    max_chars=effective_max_chars,
+                                    context_query=context_query,
+                                    scorer=_fb_scorer,
+                                )
+                            scorer_fallback = scorer_fallback or _trunc_scorer_fb[0]
                             metrics_strategy = f"{original_strategy}→truncate_fallback"
                             # Re-check the ratio symmetrically with the hybrid
                             # tier (which gates on the floor): truncate is the
@@ -6911,6 +6923,7 @@ class ProxyManager:
             ),
             progressive_key_issued=progressive_key_issued,
             unicode_token_gate=unicode_token_gate,
+            scorer_fallback=scorer_fallback,
         )
 
     async def _run_index_stage(
@@ -7911,21 +7924,10 @@ class ProxyManager:
             _clean_ms = (_time.monotonic() - _t0) * 1000
 
         # ── Stages 2+3: COMPRESS (or PROGRESSIVE) + SURFACE ──
-        # Capture the scorer INSTANCE (not just its counter) before compression
-        # so both ends of the delta read the same object: re-resolving after the
-        # await could hand back a different one, since a concurrent request
-        # pinned to another config generation can replace the manager's cached
-        # scorer mid-flight, and the delta would then be meaningless.
-        #
-        # This is a same-object delta, NOT full coverage of every compression
-        # path: SELECTIVE/HYBRID score through their cached compressor's own
-        # captured scorer, so a fallback there is not counted here. The counter
-        # is also process-shared, so a concurrent request incrementing it during
-        # this call's await is attributed here. Both gaps predate the snapshot
-        # work and are unchanged by it; a per-operation signal returned from
-        # compression is the real fix.
-        _scorer = self._relevance_scorer_for(cfg_snap)
-        _pre_scorer_fb = getattr(_scorer, "fallback_count", 0)
+        # ``comp.scorer_fallback`` is captured inside ``_compress_and_surface`` via
+        # ``scorer_fallback_scope``, isolating attribution to this request's own
+        # compression work (including cached SELECTIVE/HYBRID scorers and
+        # ratio-guard fallback tiers) without process-shared counter cross-talk.
         comp = await self._compress_and_surface(
             server=server,
             tool=tool,
@@ -8011,7 +8013,7 @@ class ProxyManager:
                 compression_accounting="initial_response_v1",
                 strategy_auto_selected=comp.strategy_auto_selected,
                 ratio_violation=ratio_violation,
-                scorer_fallback=getattr(_scorer, "fallback_count", 0) > _pre_scorer_fb,
+                scorer_fallback=comp.scorer_fallback,
                 index_ok=index_ok,
                 index_error=index_error,
                 chunks_indexed=chunks_indexed,
