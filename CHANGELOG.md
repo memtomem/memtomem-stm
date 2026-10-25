@@ -11,6 +11,19 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+## [0.6.9] — 2026-10-25
+
+### Upgrade notes
+
+- **The first start after upgrading takes longer when the response cache is
+  large**
+  ([GHSA-mf67-ghgq-cv54](https://github.com/memtomem/memtomem-stm/security/advisories/GHSA-mf67-ghgq-cv54)).
+  The credential pattern set gained the PKCS#8 private-key rule, so the cache
+  runs its one-time privacy sweep again, as it did on the upgrades to 0.6.7
+  and 0.6.8. The sweep removes cached responses that carry a PKCS#8 key and
+  keeps the rest. While a 0.3.0–0.6.8 build opens the same `proxy_cache.db`,
+  each switch between the two builds repeats that sweep.
+
 ### Security
 
 - **PKCS#8 private keys are now credentials to every privacy gate.** The PEM
@@ -24,9 +37,7 @@ changes inline only. See the deprecation policy in
   carried one. That is the form OpenSSL 3's `genrsa` and `genpkey` write by
   default, and the only PEM form an Ed25519 key has. The new rule also matches a
   header that a serializer folded across lines, as PyYAML does by default. It is
-  byte-identical to memtomem's. **Behavior change**: the pattern set changed, so
-  the response cache runs its one-time privacy sweep on the first start after
-  upgrading, and that sweep removes cached responses that carry such a key.
+  byte-identical to memtomem's. **Behavior change**: see the upgrade notes above.
   Rotate any key that reached a hosted provider.
   ([GHSA-mf67-ghgq-cv54](https://github.com/memtomem/memtomem-stm/security/advisories/GHSA-mf67-ghgq-cv54))
 
