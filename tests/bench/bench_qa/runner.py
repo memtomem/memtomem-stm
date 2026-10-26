@@ -145,7 +145,8 @@ def make_surfacing_proxy_manager(
 
     Spawns the stdio fake LTM server (``tests/_fake_memtomem_server.py``)
     in ``--seeds`` mode so ``mem_search`` emits the JSON array at
-    ``seeds_path`` with deterministic ``sha256(content)`` chunk IDs.
+    ``seeds_path``. The compact formatter omits Core IDs; STM assigns
+    versioned namespace/source/content IDs (see ``identity.compact_seed_id``).
     ``min_response_chars`` is pinned at 10 so the surfacing gate does not
     depend on the production default (5000) staying where it is.
 

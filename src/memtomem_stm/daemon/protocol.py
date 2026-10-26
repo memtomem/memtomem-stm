@@ -39,8 +39,9 @@ frames one side can't parse (the stale daemon idle-times-out under a finite
 stopped manually — see #517).
 
 **v9:** refuses invalid raw identities before content escaping in both directions.
-Non-finite JSON numbers are rejected. **v8:** the ``surface`` payload carries the host's ``session_id`` / ``cwd`` /
-``tool_use_id`` / ``agent_id`` (a v7 daemon would silently drop them). **v7:** adds max/selected context-compose schema negotiation and schema 3
+Non-finite JSON numbers are rejected. **v8:** the ``surface`` payload carries the
+host's ``session_id`` / ``cwd`` / ``tool_use_id`` / ``agent_id`` (a v7 daemon would
+silently drop them). **v7:** adds max/selected context-compose schema negotiation and schema 3
 adjacent-context payloads. **v6:** adds schema-bound context-compose scope fields. **v5:** adds
 context-compose and review-candidate LTM operations. **v4:** adds
 typed low-level LTM operations for issue #688. **v3:** adds

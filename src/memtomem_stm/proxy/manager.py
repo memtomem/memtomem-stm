@@ -2,27 +2,6 @@
 
 from __future__ import annotations
 
-from memtomem_stm.proxy.config import effective_delivery_format
-
-from memtomem_stm.proxy.delivery import (
-    DeliveryError,
-    DeliveryFormat,
-    DeliveryText,
-    DeliveryBudgetExceeded,
-    delivery_scope,
-    delivery_format,
-    delivery_budget,
-    continuation_budget,
-    require_progressive_continuation,
-    delivery_json,
-    delivery_size,
-    delivery_result,
-    envelope,
-    error_result,
-    fit_progressive,
-    wire_json,
-)
-
 import asyncio
 from copy import deepcopy
 import functools
@@ -62,6 +41,26 @@ from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from pydantic import BaseModel
 
+from memtomem_stm.proxy.delivery import (
+    DeliveryError,
+    DeliveryFormat,
+    DeliveryText,
+    DeliveryBudgetExceeded,
+    delivery_scope,
+    delivery_format,
+    delivery_budget,
+    continuation_budget,
+    require_progressive_continuation,
+    delivery_json,
+    delivery_size,
+    delivery_result,
+    envelope,
+    error_result,
+    fit_progressive,
+    wire_json,
+)
+
+
 from memtomem_stm.proxy import tool_name_budget
 from memtomem_stm.proxy.cache import _make_key as _cache_key
 from memtomem_stm.proxy.cache import response_carries_transient_key
@@ -80,6 +79,7 @@ from memtomem_stm.proxy.compression import (
     payload_has_credentials,
 )
 from memtomem_stm.proxy.config import (
+    effective_delivery_format,
     CleaningConfig,
     CompressionStrategy,
     EnvOverlayResult,
@@ -4475,35 +4475,30 @@ class ProxyManager:
 
         Returns ``(text, ok, error)``:
 
-        - ``ok=None`` — engine missing, or ``injection_mode == "prepend"``
-          which would shift offsets for ``stm_proxy_read_more``. The call
-          returns the compressed response unchanged.
+        - ``ok=None`` — engine missing/disabled, or legacy delivery with
+          ``injection_mode == "prepend"`` which would shift read offsets.
         - ``ok=True`` — surfacing injected successfully.
         - ``ok=False`` — surfacing raised; ``error`` carries the exception
           class name. The call still returns the compressed response.
 
-        ``"prepend"`` users keep pre-F6 behavior. See
+        Structured delivery returns only the separate supplement text; its
+        source envelope stays unchanged and supports every injection mode.
+        Legacy ``"prepend"`` users keep pre-F6 behavior. See
         ``tests/test_progressive.py::TestProgressiveContentIntegrity::
         test_concat_invariant_under_surfacing`` for the empirical proof of
         which modes are safe.
         """
-        if isinstance(text, DeliveryText) and delivery_format() == "structured":
-            surfaced = await self._apply_surfacing(
-                server,
-                tool,
-                arguments,
-                text,
-                trace_id=trace_id,
-                context_query=context_query,
-                cfg_snap=cfg_snap,
-            )
-            return surfaced, True, None
+        structured = isinstance(text, DeliveryText) and delivery_format() == "structured"
+        if structured:
+            # The envelope remains in comp.compressed. Surface only the separate
+            # supplement, while retaining the same tri-state outcome handling.
+            text = ""
         if self._surfacing_engine is None:
             return text, None, None
         if not self._surfacing_enabled_for(server, cfg_snap=cfg_snap):
             self._record_surfacing_skip(tool, "upstream_disabled")
             return text, None, None
-        if self._surfacing_engine.injection_mode == "prepend":
+        if not structured and self._surfacing_engine.injection_mode == "prepend":
             if not self._warned_prepend_on_progressive:
                 logger.warning(
                     "Progressive surfacing skipped: injection_mode='prepend' "
@@ -5119,7 +5114,7 @@ class ProxyManager:
                 key=key,
                 offset=0,
                 limit=cfg.chunk_size,
-                source_format=ProgressiveChunker.detect_content_type(text),
+                source_format=resp.content_type,
                 ttl=cfg.ttl_seconds,
                 budget=delivery_budget(),
                 owned=False,
@@ -5179,7 +5174,7 @@ class ProxyManager:
                 "progressive",
                 {
                     "key": key,
-                    "source_format": ProgressiveChunker.detect_content_type(text),
+                    "source_format": resp.content_type,
                     "content": text[: first.payload_chars],
                     "offset": 0,
                     "next_offset": first.payload_chars if first.payload_chars < len(text) else None,

@@ -179,7 +179,9 @@ class ProgressiveReadsStore:
             return
         with self._lock:
             self._db.execute(
-                "UPDATE progressive_reads SET wire_bytes = ? WHERE id = (SELECT MAX(id) FROM progressive_reads WHERE key = ? AND is_initial = ? AND offset = ?)",
+                "UPDATE progressive_reads SET wire_bytes = ? WHERE id = "
+                "(SELECT MAX(id) FROM progressive_reads "
+                "WHERE key = ? AND is_initial = ? AND offset = ?)",
                 (wire_bytes, key, int(initial), offset),
             )
             self._db.commit()

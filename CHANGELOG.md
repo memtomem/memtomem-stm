@@ -75,6 +75,14 @@ changes inline only. See the deprecation policy in
   Direct MCP context decoding rejects empty/unencodable adjacent IDs as the
   daemon wire path does. Heading scans skip ordinary lines and retain at most
   five displayed titles when the bounded index falls back to scanning.
+- Structured progressive surfacing now records skipped/failed attempts with the
+  same tri-state metrics as legacy delivery. Content-type detection is reused
+  instead of parsing the source again to build the initial envelope.
+- Bench replay, s10 recall and s11 sweep now share the compact v2 ID oracle.
+  The regenerated drift baseline changes only expected/returned IDs; s10 recall
+  remains 1.0 and the s11 threshold sweep recognizes surfaced positives again.
+- Declare the SDK wire serializer's direct `mcp-types` dependency and restore
+  strict search-parser type annotations.
 
 ## [0.6.9] — 2026-10-25
 

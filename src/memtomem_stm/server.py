@@ -38,7 +38,6 @@ from memtomem_stm.proxy.delivery import (
     error_result,
 )
 
-
 from memtomem_stm import __version__ as _stm_version
 from memtomem_stm.config import STMConfig
 from memtomem_stm.logging_setup import configure_server_logging, configure_stderr_logging

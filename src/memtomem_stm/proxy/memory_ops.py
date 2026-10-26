@@ -212,7 +212,8 @@ async def auto_index_response(
     md_content = (
         f"{chr(10).join(frontmatter_lines)}\n\n"
         f"# Proxy Response: {metadata_text(server)}/{metadata_text(tool)}\n\n"
-        f"- **Source**: `{metadata_text(server)}/{metadata_text(tool)}({metadata_text(args_str)})`\n"
+        f"- **Source**: `{metadata_text(server)}/{metadata_text(tool)}"
+        f"({metadata_text(args_str)})`\n"
         f"- **Original size**: {original_chars or len(text)} chars\n\n"
         f"{intent_section}"
         f"## Content\n\n{text}\n"

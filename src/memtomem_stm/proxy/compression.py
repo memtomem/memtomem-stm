@@ -2,26 +2,6 @@
 
 from __future__ import annotations
 
-from memtomem_stm.proxy.markdown_structure import (
-    headings as markdown_headings,
-    heading_matches,
-    Heading,
-)
-from memtomem_stm.proxy.delivery import (
-    DeliveryFormat,
-    DeliveryText,
-    DeliveryError,
-    DeliveryBudgetExceeded,
-    delivery_format,
-    delivery_budget,
-    continuation_budget,
-    envelope,
-    delivery_json,
-    fit_toc,
-    metadata_format,
-    delivery_size,
-)
-
 import asyncio
 import copy
 import json
@@ -42,6 +22,27 @@ try:
     import httpx
 except ImportError:
     httpx = None  # type: ignore[assignment]
+
+from memtomem_stm.proxy.markdown_structure import (
+    headings as markdown_headings,
+    heading_matches,
+    Heading,
+)
+from memtomem_stm.proxy.delivery import (
+    DeliveryFormat,
+    DeliveryText,
+    DeliveryError,
+    DeliveryBudgetExceeded,
+    delivery_format,
+    delivery_budget,
+    continuation_budget,
+    envelope,
+    delivery_json,
+    fit_toc,
+    metadata_format,
+    delivery_size,
+)
+
 
 from memtomem_stm.proxy.config import (
     CompressionStrategy,

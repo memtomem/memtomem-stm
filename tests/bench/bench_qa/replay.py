@@ -24,7 +24,6 @@ this module is the determinism gate's faithful, assertion-free replay.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from pathlib import Path
@@ -33,6 +32,7 @@ from unittest.mock import AsyncMock
 from .judge import qa_answerable_ratio, surfacing_recall_at_k
 from .loader import load_fixture
 from .progressive import reassemble
+from .identity import compact_seed_id
 from .report import BenchReportCollector
 from .runner import (
     deterministic_trace_id,
@@ -162,9 +162,7 @@ async def _record_surfacing(
     seeds_path = tmp_path / f"{scenario_id}_seeds.json"
     seeds_path.write_text(json.dumps(seeds), encoding="utf-8")
 
-    source_to_chunk_id = {
-        seed["source"]: hashlib.sha256(seed["content"].encode()).hexdigest()[:16] for seed in seeds
-    }
+    source_to_chunk_id = {seed["source"]: compact_seed_id(seed) for seed in seeds}
     expected_chunk_ids = [
         source_to_chunk_id[src] for src in fixture["surfacing_eval"]["expected_ids"]
     ]

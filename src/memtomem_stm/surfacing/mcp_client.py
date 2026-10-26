@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from memtomem_stm.utils.digest import framed_digest
-
 import asyncio
 import json
-import math
 import logging
+import math
 import re
 from collections.abc import Callable
 from contextlib import AsyncExitStack
@@ -33,6 +31,7 @@ from memtomem_stm.utils.json_out import (
     has_lone_surrogate,
     scrub_content_preserving_identity,
 )
+from memtomem_stm.utils.digest import framed_digest
 from memtomem_stm.utils.numeric import safe_float
 from memtomem_stm.utils.redact import ResponseShapeError, diagnostic_url, exception_summary
 
@@ -536,7 +535,7 @@ class StructuredResultParser(ResultParser):
     """
 
     @staticmethod
-    def _from_data(data, max_content_chars):
+    def _from_data(data: Any, max_content_chars: int) -> tuple[list[RemoteSearchResult], list[str]]:
         if (
             not isinstance(data, dict)
             or "results" not in data
@@ -592,11 +591,15 @@ class StructuredResultParser(ResultParser):
             results.append(result)
         return results, hints
 
-    def parse(self, text: str, *, max_content_chars: int = 500):
+    def parse(
+        self, text: str, *, max_content_chars: int = 500
+    ) -> tuple[list[RemoteSearchResult], list[str]]:
         results, hints, _ = self.parse_checked(text, max_content_chars=max_content_chars)
         return results, hints
 
-    def parse_checked(self, text: str, *, max_content_chars: int = 500):
+    def parse_checked(
+        self, text: str, *, max_content_chars: int = 500
+    ) -> tuple[list[RemoteSearchResult], list[str], bool]:
         if not text or not text.strip():
             return [], [], False
         try:

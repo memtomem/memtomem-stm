@@ -75,7 +75,9 @@ _BASE_COLUMNS = frozenset(
 # migration runs — adding an entry here cannot get out of sync with the
 # fingerprint, so there is no version number to forget to bump.
 _MIGRATIONS: dict[str, str] = {
-    "delivery_format": "ALTER TABLE proxy_metrics ADD COLUMN delivery_format TEXT NOT NULL DEFAULT 'legacy'",
+    "delivery_format": (
+        "ALTER TABLE proxy_metrics ADD COLUMN delivery_format TEXT NOT NULL DEFAULT 'legacy'"
+    ),
     "wire_bytes": "ALTER TABLE proxy_metrics ADD COLUMN wire_bytes INTEGER DEFAULT NULL",
     "compression_accounting": (
         "ALTER TABLE proxy_metrics ADD COLUMN compression_accounting TEXT DEFAULT NULL"
@@ -668,7 +670,8 @@ class MetricsStore:
                 "extract_ok, extract_error, "
                 "surfacing_on_progressive_ok, surface_error, source, created_at, "
                 "compression_accounting, delivery_format, wire_bytes) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     metrics.server,
                     metrics.tool,
