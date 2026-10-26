@@ -23,32 +23,32 @@ try:
 except ImportError:
     httpx = None  # type: ignore[assignment]
 
-from memtomem_stm.proxy.markdown_structure import (
-    headings as markdown_headings,
-    heading_matches,
-    Heading,
-)
-from memtomem_stm.proxy.delivery import (
-    DeliveryFormat,
-    DeliveryText,
-    DeliveryError,
-    DeliveryBudgetExceeded,
-    delivery_format,
-    delivery_budget,
-    continuation_budget,
-    envelope,
-    delivery_json,
-    fit_toc,
-    metadata_format,
-    delivery_size,
-)
-
-
 from memtomem_stm.proxy.config import (
     CompressionStrategy,
     LLMCompressorConfig,
     LLMProvider,
     TailMode,
+)
+from memtomem_stm.proxy.delivery import (
+    DeliveryBudgetExceeded,
+    DeliveryError,
+    DeliveryFormat,
+    DeliveryText,
+    continuation_budget,
+    delivery_budget,
+    delivery_format,
+    delivery_json,
+    delivery_size,
+    envelope,
+    fit_toc,
+    metadata_format,
+)
+from memtomem_stm.proxy.markdown_structure import (
+    Heading,
+    heading_matches,
+)
+from memtomem_stm.proxy.markdown_structure import (
+    headings as markdown_headings,
 )
 from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS, contains_sensitive_content
 from memtomem_stm.proxy.relevance import BM25Scorer, RelevanceScorer
@@ -1309,7 +1309,10 @@ class SelectiveCompressor:
 
         if not selected_parts:
             if mode == "structured":
-                raise DeliveryError("No matching sections found.", code="missing_or_expired")
+                raise DeliveryError(
+                    "No matching sections found; retry with exact TOC keys.",
+                    code="no_matching_sections",
+                )
             available = list(pending.chunks.keys())
             return f"No matching sections found. Available: {available}"
 
@@ -3151,6 +3154,8 @@ class HybridCompressor:
                 max_chars=toc_budget,
                 context_query=context_query,
                 sensitivity_source=text,
+                source_offset=head_end,
+                source_total_chars=len(text),
             )
         else:
             tail_compressed = _plain_truncate(

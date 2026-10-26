@@ -12,6 +12,7 @@ model so that:
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from pydantic import ConfigDict
@@ -26,6 +27,8 @@ from memtomem_stm.proxy.tool_metadata import (
     tag_title,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def install_delivery_wire_context(server: MCPServer) -> None:
     """Include negotiated SDK additions/sieving in STM delivery measurements.
@@ -33,11 +36,34 @@ def install_delivery_wire_context(server: MCPServer) -> None:
     This public middleware context also follows synchronous continuation tools
     into their worker threads. Keep SDK wire-surface knowledge in this adapter.
     """
-    from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
-    from mcp_types import Implementation, SERVER_INFO_META_KEY, methods
-    from mcp_types.version import MODERN_PROTOCOL_VERSIONS
+    from memtomem_stm.proxy.delivery import DeliveryError, wire_projection_scope
 
-    from memtomem_stm.proxy.delivery import wire_projection_scope
+    try:
+        from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
+        from mcp_types import Implementation, SERVER_INFO_META_KEY, methods
+        from mcp_types.version import MODERN_PROTOCOL_VERSIONS
+
+        serialize_result = methods.serialize_server_result
+    except (ImportError, AttributeError):
+        logger.warning(
+            "SDK wire projection unavailable; legacy delivery remains available, "
+            "structured requests report unsupported_sdk_wire_format"
+        )
+
+        def unsupported(data: dict[str, Any]) -> dict[str, Any]:
+            raise DeliveryError(
+                "This SDK cannot project the negotiated structured wire budget.",
+                code="unsupported_sdk_wire_format",
+            )
+
+        async def legacy_only(ctx: Any, call_next: Any) -> Any:
+            if ctx.method != "tools/call":
+                return await call_next(ctx)
+            with wire_projection_scope(unsupported):
+                return await call_next(ctx)
+
+        server.middleware.append(legacy_only)
+        return
 
     info = Implementation(
         name=server.name,
@@ -54,7 +80,7 @@ def install_delivery_wire_context(server: MCPServer) -> None:
         version = ctx.protocol_version
 
         def project(data: dict[str, Any]) -> dict[str, Any]:
-            value = methods.serialize_server_result("tools/call", version, data)
+            value = serialize_result("tools/call", version, data)
             if version in MODERN_PROTOCOL_VERSIONS:
                 value.setdefault("resultType", "complete")
                 meta = value.get("_meta")

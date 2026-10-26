@@ -14,12 +14,11 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast, Annotated
+from typing import Annotated, Any, cast
 
 from mcp.server.mcpserver import Context, MCPServer
-from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase, FuncMetadata, func_metadata
 from mcp.server.mcpserver.exceptions import ToolError
-from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr, ValidationError
+from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase, FuncMetadata, func_metadata
 
 # Module-level on purpose: the proxy handler's ``-> CallToolResult`` return
 # annotation is a STRING under ``from __future__ import annotations``, and
@@ -27,29 +26,29 @@ from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr, ValidationErro
 # ``add_tool`` time — a function-local import would NameError there and send
 # every proxied tool down the registration degradation path.
 from mcp.types import CallToolResult
-
-from memtomem_stm.proxy._fastmcp_compat import install_delivery_wire_context
-
-from memtomem_stm.proxy.delivery import (
-    DeliveryFormat,
-    DeliveryText,
-    DeliveryError,
-    delivery_result,
-    error_result,
-)
+from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr, ValidationError
 
 from memtomem_stm import __version__ as _stm_version
 from memtomem_stm.config import STMConfig
 from memtomem_stm.logging_setup import configure_server_logging, configure_stderr_logging
+from memtomem_stm.observability.tracing import traced
+from memtomem_stm.proxy._fastmcp_compat import install_delivery_wire_context
 from memtomem_stm.proxy.compression_feedback import CompressionFeedbackTracker
 from memtomem_stm.proxy.config import (
-    ProxyConfig,
     EnvOverlayResult,
+    ProxyConfig,
     collect_proxy_env_overrides,
     env_var_hint_for_validation_error,
     model_upstream_inert_state,
     validation_error_summary,
     warn_if_upstreams_inert,
+)
+from memtomem_stm.proxy.delivery import (
+    DeliveryError,
+    DeliveryFormat,
+    DeliveryText,
+    delivery_result,
+    error_result,
 )
 from memtomem_stm.proxy.manager import ProxyManager, ProxyToolInfo
 from memtomem_stm.proxy.metadata_recovery import (
@@ -61,9 +60,15 @@ from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
 from memtomem_stm.proxy.selection_log import aggregate_selection_log, rotation_lock
 from memtomem_stm.proxy.tool_name_budget import is_conforming_tool_name
-from memtomem_stm.surfacing.engine import SurfacingEngine
-from memtomem_stm.surfacing.mcp_client import render_score_scale
 from memtomem_stm.surfacing.config import holdout_startup_warnings
+from memtomem_stm.surfacing.engine import SurfacingEngine
+from memtomem_stm.surfacing.feedback import (
+    FEEDBACK_STORE_BUSY,
+    FEEDBACK_STORE_UNAVAILABLE,
+    FeedbackTracker,
+    record_feedback_batch,
+)
+from memtomem_stm.surfacing.mcp_client import render_score_scale
 from memtomem_stm.surfacing.observability import (
     COMPLETED_OUTCOMES,
     FAULT_OUTCOMES,
@@ -72,22 +77,17 @@ from memtomem_stm.surfacing.observability import (
     SEARCH_COMPLETED_SKIP_REASONS,
     SurfacingObservability,
 )
-from memtomem_stm.observability.tracing import traced
-from memtomem_stm.surfacing.feedback import (
-    FEEDBACK_STORE_BUSY,
-    FEEDBACK_STORE_UNAVAILABLE,
-    FeedbackTracker,
-    record_feedback_batch,
-)
 from memtomem_stm.surfacing.store_io import (
     StoreWriteQueueFull,
     await_store_write,
     close_store_on_worker,
 )
-from memtomem_stm.utils.anyio_shutdown import await_or_warn, is_clean_cancel_scope_shutdown
 from memtomem_stm.utils import child_reaper
+from memtomem_stm.utils.anyio_shutdown import await_or_warn, is_clean_cancel_scope_shutdown
 from memtomem_stm.utils.display import _disp
+from memtomem_stm.utils.json_out import escape_lone_surrogates, require_utf8_identifier
 from memtomem_stm.utils.parent_liveness import ParentLivenessWatcher
+from memtomem_stm.utils.redact import exception_summary
 from memtomem_stm.utils.signal_shutdown import (
     ShutdownSignals,
     exit_after_signal_shutdown,
@@ -96,8 +96,6 @@ from memtomem_stm.utils.signal_shutdown import (
     was_signal_shutdown,
 )
 from memtomem_stm.utils.teardown_watchdog import TeardownWatchdog
-from memtomem_stm.utils.json_out import escape_lone_surrogates, require_utf8_identifier
-from memtomem_stm.utils.redact import exception_summary
 
 
 class ContinuationOutput(BaseModel):
@@ -1345,9 +1343,7 @@ def _continuation_result(value: str, requested: DeliveryFormat | None) -> CallTo
     if isinstance(value, DeliveryText) and value.response_format == "structured":
         return delivery_result(value.descriptor)
     if requested == "structured":
-        return error_result(
-            "missing_or_expired", "Requested content is unavailable or no sections matched."
-        )
+        return error_result("missing_or_expired", "Requested key was not found or expired.")
     return CallToolResult(
         content=[TextContent(type="text", text=str(value))],
         structured_content={"result": str(value)},

@@ -72,6 +72,6 @@ async def test_progressive_detects_large_json_content_type_once(tmp_path, monkey
     monkeypatch.setattr(ProgressiveChunker, "detect_content_type", detect)
     result = to_call_tool_result(await proxy.call_tool("srv", "read", {}))
     assert not result.is_error
-    assert detect.call_count == 1
+    assert detect.call_count == (1 if format == "structured" else 0)
     if format == "structured":
         assert payload(result)["payload"]["source_format"] == "json"

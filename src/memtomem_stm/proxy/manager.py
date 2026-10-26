@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from copy import deepcopy
 import functools
 import hashlib
 import inspect
@@ -15,9 +14,10 @@ import threading
 import time as _time
 import uuid
 from collections import Counter
-from contextlib import AsyncExitStack
-from dataclasses import dataclass, field
 from collections.abc import Awaitable, Callable, Collection, Coroutine, Iterable, Mapping
+from contextlib import AsyncExitStack
+from copy import deepcopy
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -34,34 +34,15 @@ if TYPE_CHECKING:
     from memtomem_stm.surfacing.observability import SkipReason
 
 import httpx2
-
 from mcp import ClientSession
 from mcp import types as mcp_types
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from pydantic import BaseModel
 
-from memtomem_stm.proxy.delivery import (
-    DeliveryError,
-    DeliveryFormat,
-    DeliveryText,
-    DeliveryBudgetExceeded,
-    delivery_scope,
-    delivery_format,
-    delivery_budget,
-    continuation_budget,
-    require_progressive_continuation,
-    delivery_json,
-    delivery_size,
-    delivery_result,
-    envelope,
-    error_result,
-    fit_progressive,
-    wire_json,
-)
-
-
+from memtomem_stm.observability.tracing import traced
 from memtomem_stm.proxy import tool_name_budget
+from memtomem_stm.proxy._locks import LockTimeoutError, bounded_lock
 from memtomem_stm.proxy.cache import _make_key as _cache_key
 from memtomem_stm.proxy.cache import response_carries_transient_key
 from memtomem_stm.proxy.cleaning import DefaultContentCleaner
@@ -79,7 +60,6 @@ from memtomem_stm.proxy.compression import (
     payload_has_credentials,
 )
 from memtomem_stm.proxy.config import (
-    effective_delivery_format,
     CleaningConfig,
     CompressionStrategy,
     EnvOverlayResult,
@@ -99,7 +79,26 @@ from memtomem_stm.proxy.config import (
     TransportType,
     UpstreamServerConfig,
     effective_compression_pair,
+    effective_delivery_format,
     effective_max_result_chars,
+)
+from memtomem_stm.proxy.delivery import (
+    DeliveryBudgetExceeded,
+    DeliveryError,
+    DeliveryFormat,
+    DeliveryText,
+    continuation_budget,
+    delivery_budget,
+    delivery_format,
+    delivery_json,
+    delivery_result,
+    delivery_scope,
+    delivery_size,
+    envelope,
+    error_result,
+    fit_progressive,
+    require_progressive_continuation,
+    wire_json,
 )
 from memtomem_stm.proxy.extraction import FactExtractor
 from memtomem_stm.proxy.index_observability import IndexObservability
@@ -112,6 +111,22 @@ from memtomem_stm.proxy.memory_ops import (
     format_fact_md,
     index_content_matches_privacy,
 )
+from memtomem_stm.proxy.metadata_recovery import (
+    DEFAULT_RECOVERY_PAGE_CHARS,
+    RecoveryPage,
+    RecoveryPart,
+    RecoverySnapshot,
+    metadata_page,
+)
+from memtomem_stm.proxy.metrics import (
+    MAX_ERROR_MESSAGE_CHARS,
+    METADATA_BYPASS_STRATEGY,
+    STRUCTURED_BYPASS_STRATEGY,
+    CallMetrics,
+    ErrorCategory,
+    TokenTracker,
+    format_error_message_from_exc,
+)
 from memtomem_stm.proxy.pipeline_stages import (
     CompressionResult,
     ExtractResult,
@@ -121,6 +136,12 @@ from memtomem_stm.proxy.pipeline_stages import (
     ShapePassthrough,
 )
 from memtomem_stm.proxy.privacy import CREDENTIAL_PATTERNS as PRIVACY_CREDENTIAL_PATTERNS
+from memtomem_stm.proxy.progressive import (
+    ProgressiveChunker,
+    ProgressiveResponse,
+    ProgressiveStoreAdapter,
+)
+from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
 from memtomem_stm.proxy.relevance import scorer_fallback_scope
 from memtomem_stm.proxy.token_estimate import approx_tokens
 from memtomem_stm.proxy.tool_eligibility import (
@@ -141,21 +162,14 @@ from memtomem_stm.proxy.tool_eligibility import (
     parse_graph_features,
     sanitize_graph_facts_row,
 )
-from memtomem_stm.proxy.toolgraph_cache import GraphConsultCache
-from memtomem_stm.proxy.toolgraph_bundle import (
-    PolicyBundleError,
-    PolicySnapshot,
-    bundle_provenance_warnings,
-    load_policy_bundle,
-    tool_contract_digest,
-)
-from memtomem_stm.proxy.toolgraph_provider import (
-    TRANSPORT_ERRORS as TOOLGRAPH_TRANSPORT_ERRORS,
-    ToolgraphConsultAdapter,
-    ToolgraphConsultError,
-    ToolgraphProtocolError,
-    ToolgraphUnreachableError,
-    validate_toolgraph_identifier,
+from memtomem_stm.proxy.tool_metadata import (
+    DescriptionBudget,
+    advertised_source_text,
+    compose_description,
+    convention_suffix,
+    distill_schema,
+    hint_text,
+    truncate_description,
 )
 from memtomem_stm.proxy.tool_relevance import (
     PENALTY_SOURCE_BOTH,
@@ -169,53 +183,38 @@ from memtomem_stm.proxy.tool_relevance import (
     derive_query,
     penalty_source,
 )
-from memtomem_stm.proxy.tool_metadata import (
-    DescriptionBudget,
-    advertised_source_text,
-    compose_description,
-    convention_suffix,
-    distill_schema,
-    hint_text,
-    truncate_description,
+from memtomem_stm.proxy.toolgraph_bundle import (
+    PolicyBundleError,
+    PolicySnapshot,
+    bundle_provenance_warnings,
+    load_policy_bundle,
+    tool_contract_digest,
 )
-from memtomem_stm.proxy.metadata_recovery import (
-    DEFAULT_RECOVERY_PAGE_CHARS,
-    RecoveryPage,
-    RecoveryPart,
-    RecoverySnapshot,
-    metadata_page,
+from memtomem_stm.proxy.toolgraph_cache import GraphConsultCache
+from memtomem_stm.proxy.toolgraph_provider import (
+    TRANSPORT_ERRORS as TOOLGRAPH_TRANSPORT_ERRORS,
 )
-from memtomem_stm.proxy.progressive import (
-    ProgressiveChunker,
-    ProgressiveResponse,
-    ProgressiveStoreAdapter,
+from memtomem_stm.proxy.toolgraph_provider import (
+    ToolgraphConsultAdapter,
+    ToolgraphConsultError,
+    ToolgraphProtocolError,
+    ToolgraphUnreachableError,
+    validate_toolgraph_identifier,
 )
-from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
-from memtomem_stm.proxy._locks import LockTimeoutError, bounded_lock
-from memtomem_stm.proxy.metrics import (
-    MAX_ERROR_MESSAGE_CHARS,
-    METADATA_BYPASS_STRATEGY,
-    STRUCTURED_BYPASS_STRATEGY,
-    CallMetrics,
-    ErrorCategory,
-    TokenTracker,
-    format_error_message_from_exc,
-)
-from memtomem_stm.observability.tracing import traced
 from memtomem_stm.utils.circuit_breaker import CircuitBreaker
 from memtomem_stm.utils.json_out import escape_lone_surrogates, scrub_lone_surrogates
+from memtomem_stm.utils.json_size import json_utf8_size_async
 from memtomem_stm.utils.keyed_locks import KeyedLocks
 from memtomem_stm.utils.mcp_transport import (
+    SSE_READ_TIMEOUT_SECONDS,
     BoundedReadStream,
     CorrelatingWriteStream,
     ResponseCorrelator,
-    SSE_READ_TIMEOUT_SECONDS,
     current_response_size,
     is_inbound_message_too_large_error,
     measured_response,
     streamable_http_transport,
 )
-from memtomem_stm.utils.json_size import json_utf8_size_async
 from memtomem_stm.utils.redact import (
     diagnostic_url,
     exception_summary,
@@ -4939,6 +4938,12 @@ class ProxyManager:
         # ONE generation for the whole recovery: the configs probed, the one
         # chosen, and the scorer baked into the compressor cached below must
         # not come from separate loader reads that can straddle a re-load.
+        def inactive() -> str:
+            message = "Selective compression not active — no pending TOC selections."
+            if response_format == "structured":
+                raise DeliveryError(message, code="unavailable")
+            return message
+
         cfg_live = self._config
         cfgs = self._distinct_sqlite_selective_cfgs(cfg_live)
         if self._selective_compressor is None:
@@ -4968,10 +4973,10 @@ class ProxyManager:
             # opened here would outlive the teardown that already ran (#1128).
             # start() clears the flag, so restart recovery is unaffected.
             if self._stopped:
-                return "Selective compression not active — no pending TOC selections."
+                return inactive()
             sel_cfg = self._sqlite_cfg_holding_key(key, cfg_live) or (cfgs[0] if cfgs else None)
             if sel_cfg is None:
-                return "Selective compression not active — no pending TOC selections."
+                return inactive()
             try:
                 compressor = self._create_selective(sel_cfg, cfg=cfg_live)
             except Exception:
@@ -4979,7 +4984,7 @@ class ProxyManager:
                     "Could not open the configured SQLite pending store for select_chunks recovery",
                     exc_info=True,
                 )
-                return "Selective compression not active — no pending TOC selections."
+                return inactive()
             with self._selective_publish_mu:
                 installed = self._selective_compressor is None
                 if installed:
@@ -4996,7 +5001,7 @@ class ProxyManager:
         # the endpoint's own sentinel.
         active = self._selective_compressor
         if active is None:
-            return "Selective compression not active — no pending TOC selections."
+            return inactive()
         result = active.select(
             key,
             sections,
@@ -5088,14 +5093,15 @@ class ProxyManager:
         # the publication config and any rebuild is forward. Reusing whatever
         # is cached would let a superseded pin write into a store the next live
         # request is about to close — the key would be returned and then die.
+        structured = delivery_format() == "structured"
         key = uuid.uuid4().hex[:16]
         resp = ProgressiveResponse(
             content=text,
             total_chars=len(text),
-            total_lines=text.count("\n") + 1,
-            content_type=ProgressiveChunker.detect_content_type(text),
+            total_lines=text.count("\n") + 1 if structured else 0,
+            content_type=ProgressiveChunker.detect_content_type(text) if structured else "text",
             structure_hint=ProgressiveChunker.structure_hint(text)
-            if cfg.include_structure_hint
+            if structured and cfg.include_structure_hint
             else "",
             created_at=_time.monotonic(),
             ttl_seconds=cfg.ttl_seconds,
@@ -5369,18 +5375,20 @@ class ProxyManager:
                         total_chars=resp.total_chars,
                     )
                 if self._progressive_reads_tracker is not None and output.payload_chars > 0:
-                    from mcp.types import TextContent, CallToolResult
+                    from mcp.types import CallToolResult, TextContent
 
                     wire = CallToolResult(
                         content=[TextContent(type="text", text=output.text)],
                         structured_content={"result": output.text},
                     )
-                    self._progressive_reads_tracker.record_wire(
-                        key,
-                        len(wire_json(wire).encode("utf-8")),
-                        initial=False,
-                        offset=offset,
-                    )
+                    try:
+                        wire_bytes = len(wire_json(wire).encode("utf-8"))
+                    except (ValueError, TypeError):
+                        wire_bytes = None
+                    if wire_bytes is not None:
+                        self._progressive_reads_tracker.record_wire(
+                            key, wire_bytes, initial=False, offset=offset
+                        )
                 return output.text
         finally:
             if temp_store is not None:
@@ -6984,6 +6992,7 @@ class ProxyManager:
                         _MIN_HEADINGS_FOR_HYBRID = 3
                         if (
                             not progressive_fallback
+                            and tc.delivery_format != "structured"
                             and effective_compression != CompressionStrategy.HYBRID
                         ):
                             # Canonical heading count (shared with
@@ -8182,22 +8191,24 @@ class ProxyManager:
             # The fitter serializes a plain TextContent/CallToolResult. Reserve
             # any extra upstream text/result metadata retained by final assembly.
             # Owned continuations do not repeat that upstream metadata.
-            empty_base = mcp_types.CallToolResult(
-                content=[mcp_types.TextContent(type="text", text="")]
-            )
-            template = shaped.first_text_content
-            empty_preserved = mcp_types.CallToolResult(
-                content=[
-                    template.model_copy(update={"text": ""})
-                    if isinstance(template, mcp_types.TextContent)
-                    else mcp_types.TextContent(type="text", text="")
-                ],
-                _meta=result_meta,
-            )
-            metadata_overhead = max(
-                0,
-                len(wire_json(empty_preserved)) - len(wire_json(empty_base)),
-            )
+            metadata_overhead = 0
+            if tc.delivery_format == "structured":
+                empty_base = mcp_types.CallToolResult(
+                    content=[mcp_types.TextContent(type="text", text="")]
+                )
+                template = shaped.first_text_content
+                empty_preserved = mcp_types.CallToolResult(
+                    content=[
+                        template.model_copy(update={"text": ""})
+                        if isinstance(template, mcp_types.TextContent)
+                        else mcp_types.TextContent(type="text", text="")
+                    ],
+                    _meta=result_meta,
+                )
+                metadata_overhead = max(
+                    0,
+                    len(wire_json(empty_preserved)) - len(wire_json(empty_base)),
+                )
             with delivery_scope(
                 tc.delivery_format,
                 max(1, tc.max_chars - metadata_overhead),
@@ -8213,7 +8224,7 @@ class ProxyManager:
                     context_query=context_query,
                     trace_id=trace_id,
                 )
-        except DeliveryBudgetExceeded as exc:
+        except DeliveryError as exc:
             self.tracker.record_error(
                 CallMetrics(
                     server=server,
@@ -8244,6 +8255,17 @@ class ProxyManager:
         surface_error = comp.surface_error
         _compress_ms = comp.compress_ms
         _surface_ms = comp.surface_ms
+
+        structured_delivery = tc.delivery_format == "structured" and isinstance(
+            comp.compressed, DeliveryText
+        )
+        if structured_delivery:
+            assert isinstance(comp.compressed, DeliveryText)
+            # Index frontmatter/notices and metrics share the same serialized
+            # base-result basis, including retained upstream metadata.
+            compressed_chars_for_metrics = (
+                delivery_size(comp.compressed.descriptor, owned=False) + metadata_overhead
+            )
 
         # ── Stage 4: INDEX (optional) + Stage 4b: EXTRACT (optional) ──
         idx = await self._run_index_stage(
@@ -8276,9 +8298,6 @@ class ProxyManager:
         extract_error = ext.error
 
         prepared_output: str | list | mcp_types.CallToolResult
-        structured_delivery = tc.delivery_format == "structured" and isinstance(
-            comp.compressed, DeliveryText
-        )
         if structured_delivery:
             assert isinstance(comp.compressed, DeliveryText)
             descriptor = dict(comp.compressed.descriptor)
@@ -8294,21 +8313,22 @@ class ProxyManager:
                 prepared_output.content[0] = template.model_copy(
                     update={"text": delivery_json(descriptor)}
                 )
-            compressed_chars_for_metrics = (
-                delivery_size(comp.compressed.descriptor, owned=False) + metadata_overhead
-            )
         else:
             prepared_output = _assemble_result(
                 final_result, shaped, structured_content, result_meta
             )
         from memtomem_stm.proxy._fastmcp_compat import to_call_tool_result
 
-        try:
-            wire_bytes = len(wire_json(to_call_tool_result(prepared_output)).encode("utf-8"))
-        except (ValueError, TypeError):
-            # Duck-typed adapters may supply non-SDK blocks. Telemetry must
-            # not discard an otherwise successful upstream response.
-            wire_bytes = None
+        wire_bytes = None
+        if structured_delivery or (
+            comp.progressive_key_issued and self._progressive_reads_tracker is not None
+        ):
+            try:
+                wire_bytes = len(wire_json(to_call_tool_result(prepared_output)).encode("utf-8"))
+            except (ValueError, TypeError):
+                # Duck-typed adapters or an unsupported SDK projector must not
+                # discard a successful legacy response for optional telemetry.
+                pass
 
         if (
             isinstance(comp.compressed, DeliveryText)

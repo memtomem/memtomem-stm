@@ -557,6 +557,11 @@ This avoids relying on undocumented client choices between text and structured
 data. Surfacing and index notices
 are separate optional `stm.supplements` fields, never text appended outside JSON.
 
+If an SDK version cannot project its negotiated wire format, legacy service
+continues and structured requests return `unsupported_sdk_wire_format` rather
+than claiming an unmeasured serialized budget. Optional legacy wire metrics
+remain unmeasured in that case.
+
 The structured base budget measures the serialized MCP result before optional
 surfacing/index notices, including JSON escapes and both representations on
 continuations. It includes the negotiated SDK wire surface: modern clients'
@@ -580,8 +585,11 @@ Proxied-tool errors put the STM error envelope in text only, so they do not
 conflict with an upstream `outputSchema`. Owned continuation errors retain both
 representations. A live key's stored format also controls section-mismatch and
 invalid-cursor errors when `response_format` is omitted; invalid requests do not
-renew its TTL. With no live key and no explicit format, legacy errors remain
-the default. Explicit `response_format: "legacy"` preserves legacy errors.
+renew its TTL. A live-key mismatch reports `no_matching_sections`, while an
+inactive selection reader reports `unavailable`; neither means the key expired.
+Missing/expired keys report `missing_or_expired`. With no live key and no
+explicit format, legacy errors remain the default. Explicit
+`response_format: "legacy"` preserves legacy errors.
 
 ### Accounting and compatibility
 
@@ -612,25 +620,11 @@ Stop the old daemon for this configuration before upgrading, then start the
 new daemon: protocol v9 separates identity-safe peers from old scrubbers.
 Memory-backed keys do not survive restart; SQLite recovery retains valid keys.
 
-Installed-client smoke tests ran on 2026-10-26 against the modified worktree:
+Structured delivery puts the complete payload in JSON text. STM-owned
+continuations also provide the matching `structuredContent`, so consumers can
+use either representation. Native upstream fields are preserved separately;
+a field reaching the MCP wire does not establish that a client forwards it to
+its model. Consumers that need native structured data in text should arrange a
+matching text representation with the upstream server.
 
-| Client | Structured progressive/selective/hybrid | Upstream structured-content wire preservation | Actual payload visible through text |
-|---|---|---|---|
-| Claude Code 2.1.310 | PASS | PASS | PASS |
-| Codex CLI 0.164.0 | PASS | PASS | PASS |
-| Kimi Code 0.39.0 | PASS | PASS | PASS |
-
-All three also passed legacy progressive/selective continuation checks and exact
-Unicode reconstruction. The additional structured-only upstream probe exposed a
-Kimi limitation: the MCP wire retained the record, but Kimi gave its model only
-the text summary. Upstream servers targeting that client should put the actual
-JSON into a text block too. STM's structured chunk format already does this.
-The tests used temporary state and synthetic upstream documents, with 15 MCP
-calls per client. Captured responses stayed within the configured serialized
-budgets, and progressive wire-byte metrics matched the actual tool results.
-The structured-only probe passed on Claude Code and Codex CLI, while Kimi
-returned `UNAVAILABLE` despite the upstream field being intact on the wire.
-
-These bounded smoke tests do not establish GUI behavior, production readiness,
-or acceptable latency/volume across providers and workloads. The default remains
-legacy; a future default change is a separate release decision.
+The default remains legacy; a default change is a separate release decision.

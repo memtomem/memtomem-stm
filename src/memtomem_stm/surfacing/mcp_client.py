@@ -25,13 +25,13 @@ from memtomem_stm.daemon.protocol import MAX_CONTEXT_COMPOSE_SCHEMA
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.observability import record_search_rpc
 from memtomem_stm.surfacing.rrf_profile import is_schema_one, rrf_score_ceiling
-from memtomem_stm.utils.mcp_transport import streamable_http_transport
+from memtomem_stm.utils.digest import framed_digest
 from memtomem_stm.utils.json_out import (
     escape_lone_surrogates,
     has_lone_surrogate,
     scrub_content_preserving_identity,
 )
-from memtomem_stm.utils.digest import framed_digest
+from memtomem_stm.utils.mcp_transport import streamable_http_transport
 from memtomem_stm.utils.numeric import safe_float
 from memtomem_stm.utils.redact import ResponseShapeError, diagnostic_url, exception_summary
 

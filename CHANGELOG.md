@@ -36,53 +36,25 @@ changes inline only. See the deprecation policy in
 ### Added
 
 - Opt-in `delivery_format="structured"` with server/tool overrides and optional
-  `response_format` on STM-owned continuation tools. Required `result:string`
-  output remains compatible; structured replies add `stm` and typed errors.
-  Installed Claude Code, Codex CLI and Kimi Code smoke tests pass with actual
-  payloads in text. Kimi's structured-only upstream visibility is limited;
-  legacy remains the default. See compatibility notes in `docs/compression.md`.
-- Typed chunk metadata, exact code-point offsets, response-budget fitting, and
-  whole-MCP wire observations with separate structured compression accounting.
-  Negotiated SDK metadata and legacy field filtering count in the same budget
-  and wire measurements; installed-client tests verify the actual final wire.
-
-### Fixed
-
-- All locally issued progressive/selective/hybrid keys bypass the response cache
-  using an out-of-band publication signal. Upstream key detection and startup
-  cleanup recognize legacy and versioned structured delivery.
-- JSON storage/search validation, one-pass structured search parsing, and
-  bidirectional daemon identity validation before content escaping.
-- Structured progressive budget errors now remain typed errors, including when a
-  source fits `chunk_size` but exceeds the serialized delivery limit. Non-final
-  keys preflight owned continuation capacity, and follow-up budgets exclude
-  initial-only upstream metadata.
-- Selective/hybrid budget fallback handles store/privacy refusal through the
-  existing safe degradation path and records progressive surfacing/metrics.
-  Hybrid fits the complete head/TOC before publishing or evicting a pending key.
-- Daemon validation checks the actual `before`/`after` context wire keys and
-  normalizes nullable source/namespace fields without emitting empty chunk IDs.
-  Unicode whitespace in Markdown titles no longer shifts heading-index spans.
-- Native structured/non-text responses share the metadata preservation path:
-  text is cleaned and capped, cache refusal/invalidation is recorded, and tuner
-  profiles exclude bypass calls. Cache fingerprints include `delivery_format`.
-- Proxied-tool budget errors carry STM JSON in text only, retaining upstream
-  output-schema ownership. Omitted continuation formats also apply to errors
-  on live keys, and invalid reads do not renew their TTL.
-- Strict JSON losslessness checks run only in structured mode; legacy JSON TOCs
-  retain their previous handling of non-standard input. Markdown links and
-  reference prefixes no longer force otherwise valid Markdown into progressive.
-  Direct MCP context decoding rejects empty/unencodable adjacent IDs as the
-  daemon wire path does. Heading scans skip ordinary lines and retain at most
-  five displayed titles when the bounded index falls back to scanning.
-- Structured progressive surfacing now records skipped/failed attempts with the
-  same tri-state metrics as legacy delivery. Content-type detection is reused
-  instead of parsing the source again to build the initial envelope.
-- Bench replay, s10 recall and s11 sweep now share the compact v2 ID oracle.
-  The regenerated drift baseline changes only expected/returned IDs; s10 recall
-  remains 1.0 and the s11 threshold sweep recognizes surfaced positives again.
-- Declare the SDK wire serializer's direct `mcp-types` dependency and restore
-  strict search-parser type annotations.
+  `response_format` on continuation tools; legacy remains the default. Versioned
+  JSON includes exact chunk keys, Unicode code-point offsets, JSON paths/types,
+  Markdown source ranges and typed errors, including cross-format reads.
+- Serialized MCP-result budgets cover negotiated SDK additions and field
+  filtering. Complete progressive/hybrid frames and progressing continuation
+  capacity are checked before publication; storage/privacy failures use uncached
+  safe fallback. Transient keys stay out of the response cache.
+- Native upstream schemas, structured/non-text payloads and annotated text
+  boundaries are preserved. Text twins are cleaned and capped separately;
+  proxied errors carry STM JSON in text without replacing upstream output schemas.
+- Separate structured-wire accounting, progressive read measurements and matching
+  auto-index metadata. Tuner retention ratios exclude serialized-envelope and
+  native-bypass populations. Default legacy calls avoid unused wire projection
+  and source classification; structured overrides request metadata on demand.
+- Strict JSON and raw identity validation across storage, MCP and daemon formats,
+  finite TTL validation, fence-aware headings and source-preserving selection
+  metadata. SDK projection support is declared through the direct `mcp-types`
+  dependency; incompatible projectors keep legacy service available and report a
+  typed error for structured budgets that cannot be measured.
 
 ## [0.6.9] — 2026-10-25
 

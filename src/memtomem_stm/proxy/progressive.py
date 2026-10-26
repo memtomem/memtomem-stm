@@ -148,11 +148,22 @@ class ProgressiveStoreAdapter:
         budget = presentation.get("budget", 16000) if isinstance(presentation, dict) else 16000
         if type(budget) is not int or not 0 < budget < 2**63:
             budget = 16000
+        mode = response_format or progressive_metadata_format(meta)
+        content_type = meta.get("content_type", "text")
+        stored_mode = (
+            presentation.get("delivery_format", "legacy")
+            if isinstance(presentation, dict)
+            else "legacy"
+        )
+        if mode == "structured" and stored_mode == "legacy":
+            # Legacy publication avoids whole-document classification. An
+            # explicit structured read requests that metadata on demand.
+            content_type = ProgressiveChunker.detect_content_type(sel.chunks["__content__"])
         return ProgressiveResponse(
             content=sel.chunks["__content__"],
             total_chars=sel.total_chars,
             total_lines=meta.get("total_lines", 0),
-            content_type=meta.get("content_type", "text"),
+            content_type=content_type,
             structure_hint=meta.get("structure_hint", ""),
             created_at=sel.created_at,
             ttl_seconds=meta.get("ttl_seconds", 1800.0),
@@ -163,7 +174,7 @@ class ProgressiveStoreAdapter:
             chunk_size=meta.get("chunk_size", 4000),
             include_structure_hint=meta.get("include_structure_hint", True),
             heading_index=entry.heading_index,
-            delivery_format=response_format or progressive_metadata_format(meta),
+            delivery_format=mode,
             delivery_budget=budget,
         )
 

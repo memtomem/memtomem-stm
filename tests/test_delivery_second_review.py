@@ -135,7 +135,7 @@ async def test_selection_mismatch_follows_stored_format(tmp_path, monkeypatch, s
     result = await stm_proxy_select_chunks(key, ["missing"], response_format=override)
     assert bool(result.is_error) == (override != "legacy")
     if override != "legacy":
-        assert payload(result)["payload"]["code"] == "missing_or_expired"
+        assert payload(result)["payload"]["code"] == "no_matching_sections"
     else:
         assert "No matching sections" in result.content[0].text
 
