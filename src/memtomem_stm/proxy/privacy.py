@@ -153,6 +153,19 @@ CREDENTIAL_PATTERNS = [
     r"\beyJ(?=[A-Za-z0-9_-]{8})[A-Za-z0-9_]*+(?:-(?!eyJ[A-Za-z0-9_-]{8})[A-Za-z0-9_]*+)*+"
     r"\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
     r"(?i)(BEGIN\s+(RSA|EC|OPENSSH|DSA|PGP)\s+PRIVATE\s+KEY)",
+    # PKCS#8 private keys, plain and encrypted: the header carries no
+    # algorithm label, so the rule above never sees it. This is what OpenSSL 3
+    # ``genrsa``/``genpkey`` write by default, and the only PEM form an
+    # Ed25519 key has. "begin private key" is ordinary prose where the
+    # labelled forms are not, so this rule keeps the dashes and the case. The
+    # separators also take backslashes, because a serializer folds a long line
+    # at a space: PyYAML writes ``PRIVATE\n  KEY`` in plain style and
+    # ``PRIVATE\\\n  \ KEY`` in double-quoted style, its default for non-ASCII
+    # text, and both load back to the same key. Public keys and certificates
+    # do not match. Out of scope: PuTTY ``.ppk`` (not PEM), the ssh.com
+    # ``---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----`` form, and headers written
+    # with escaped dashes (``\u002d``) or in lowercase.
+    r"-----BEGIN[\s\\]+(?:ENCRYPTED[\s\\]+)?PRIVATE[\s\\]+KEY-----",
     # --- Secret-class patterns mirrored from memtomem LTM (issue #1488) -----
     # These provider-token patterns originated at the LTM trust boundary and
     # are mirrored back here for routing coherence (reverse sync, issue
