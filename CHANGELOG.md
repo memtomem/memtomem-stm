@@ -17,7 +17,8 @@ changes inline only. See the deprecation policy in
   compression, hints and indexes. Selection chunks preserve heading levels and
   original Markdown ranges; affected TOC keys/content may change.
 - **Behavior change**: non-finite pending/progressive/cache TTL settings are rejected;
-  malformed search responses are reported as parse errors instead of empty hits.
+  malformed search responses are reported as parse errors instead of skipping
+  malformed items and retaining the remaining hits.
 - **Behavior change**: generated memory metadata escapes Unicode line separators.
   Extracted tags now live in frontmatter, so new files participate in Core tag
   filtering. Existing Markdown files are not rewritten.
@@ -52,6 +53,28 @@ changes inline only. See the deprecation policy in
   cleanup recognize legacy and versioned structured delivery.
 - JSON storage/search validation, one-pass structured search parsing, and
   bidirectional daemon identity validation before content escaping.
+- Structured progressive budget errors now remain typed errors, including when a
+  source fits `chunk_size` but exceeds the serialized delivery limit. Non-final
+  keys preflight owned continuation capacity, and follow-up budgets exclude
+  initial-only upstream metadata.
+- Selective/hybrid budget fallback handles store/privacy refusal through the
+  existing safe degradation path and records progressive surfacing/metrics.
+  Hybrid fits the complete head/TOC before publishing or evicting a pending key.
+- Daemon validation checks the actual `before`/`after` context wire keys and
+  normalizes nullable source/namespace fields without emitting empty chunk IDs.
+  Unicode whitespace in Markdown titles no longer shifts heading-index spans.
+- Native structured/non-text responses share the metadata preservation path:
+  text is cleaned and capped, cache refusal/invalidation is recorded, and tuner
+  profiles exclude bypass calls. Cache fingerprints include `delivery_format`.
+- Proxied-tool budget errors carry STM JSON in text only, retaining upstream
+  output-schema ownership. Omitted continuation formats also apply to errors
+  on live keys, and invalid reads do not renew their TTL.
+- Strict JSON losslessness checks run only in structured mode; legacy JSON TOCs
+  retain their previous handling of non-standard input. Markdown links and
+  reference prefixes no longer force otherwise valid Markdown into progressive.
+  Direct MCP context decoding rejects empty/unencodable adjacent IDs as the
+  daemon wire path does. Heading scans skip ordinary lines and retain at most
+  five displayed titles when the bounded index falls back to scanning.
 
 ## [0.6.8] — 2026-10-24
 

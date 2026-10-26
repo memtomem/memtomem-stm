@@ -1410,14 +1410,6 @@ async def stm_proxy_read_more(
         limit: Max Unicode code points to return, subject to the serialized result budget.
         response_format: Omit to follow the stored key; legacy or structured overrides it.
     """
-    if offset < 0:
-        if response_format == "structured":
-            return error_result("invalid_request", "offset must be >= 0")
-        return _continuation_result("Error: offset must be >= 0", response_format)
-    if limit is not None and limit < 1:
-        if response_format == "structured":
-            return error_result("invalid_request", "limit must be >= 1")
-        return _continuation_result("Error: limit must be >= 1", response_format)
     app = _get_ctx(ctx)
     try:
         result = app.proxy_manager.read_more(

@@ -262,17 +262,13 @@ def decode_context_compose_context(
             raise ResponseShapeError("context compose adjacent chunk must be an object")
         if not all(isinstance(item.get(field), str) for field in ("id", "content", "source")):
             raise ResponseShapeError("context compose adjacent chunk has invalid shape")
+        if not item["id"] or has_lone_surrogate(item["id"]):
+            raise ResponseShapeError("context compose adjacent chunk has invalid identity")
         namespace = item.get("namespace", "default")
         if not isinstance(namespace, str):
             raise ResponseShapeError("context compose adjacent chunk namespace must be a string")
         return RemoteContextChunk(
-            # Escaped, not refused, unlike the retrieved/pinned ids above: an
-            # adjacent chunk's id is never exact-matched — the formatter reads
-            # only ``content`` and the daemon just re-encodes it — so it is
-            # content by destination. It arrives raw only because
-            # ``scrub_content_preserving_identity`` exempts the ``id`` key at
-            # every depth, so re-apply the ordinary ingest escape here (#783).
-            id=escape_lone_surrogates(item["id"]),
+            id=item["id"],
             content=item["content"][:max_content_chars],
             source=item["source"],
             namespace=namespace,

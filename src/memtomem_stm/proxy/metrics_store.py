@@ -8,7 +8,11 @@ import threading
 import time
 from pathlib import Path
 
-from memtomem_stm.proxy.metrics import METADATA_BYPASS_STRATEGY, CallMetrics
+from memtomem_stm.proxy.metrics import (
+    METADATA_BYPASS_STRATEGY,
+    STRUCTURED_BYPASS_STRATEGY,
+    CallMetrics,
+)
 from memtomem_stm.utils.json_out import (
     escape_lone_surrogates,
     has_lone_surrogate,
@@ -321,12 +325,15 @@ def read_compression_summary(
         )
         success = "is_error = 0" if has_is_error else "1"
         sized = "(original_chars > 0 OR compressed_chars > 0)"
-        # The calls the tuner's profiles count: every row but an annotated
+        # The calls the tuner's profiles count: every row but a metadata/native
         # bypass, which ``get_tool_profiles`` drops (#1122). A DB without the
         # column predates the label, so all of its rows count.
         if "compression_strategy" in cols:
-            tuner_expr = "SUM(CASE WHEN compression_strategy IS NOT ? THEN 1 ELSE 0 END)"
-            select_params: list[object] = [METADATA_BYPASS_STRATEGY]
+            tuner_expr = (
+                "SUM(CASE WHEN compression_strategy IS NOT ? "
+                "AND compression_strategy IS NOT ? THEN 1 ELSE 0 END)"
+            )
+            select_params: list[object] = [METADATA_BYPASS_STRATEGY, STRUCTURED_BYPASS_STRATEGY]
         else:
             tuner_expr = "COUNT(*)"
             select_params = []
@@ -875,6 +882,12 @@ class MetricsStore:
         calls that recorded the whole cleaned text as delivered (#1039), a
         ratio that would pass for "the budget always fits". With no such row
         the tool reports ``avg_ratio=None`` and ``ratio_count=0``.
+        Structured ``initial_structured_v1`` rows are also intentionally excluded:
+        their size counts a serialized MCP envelope (including metadata and the
+        text/structured twin), not retained source characters. Mixing that basis
+        into the content-retention ratio would mislead the tuner. Structured
+        delivery observations remain in ``read_compression_summary``'s separate
+        ``structured_delivery`` group.
         ``p95_original_chars`` is approximated by taking the value at the 95th
         percentile rank within each group.
 
@@ -896,8 +909,10 @@ class MetricsStore:
         happened (#933). ``call_count`` includes all of them, plus every error
         path and the success paths that bypass compression entirely.
 
-        The one exception is a response whose annotated text blocks were kept
-        apart instead of compressed (``METADATA_BYPASS_STRATEGY``, #1122).
+        Exceptions are responses whose annotated text blocks were kept
+        apart instead of compressed (``METADATA_BYPASS_STRATEGY``, #1122), or
+        that preserve native upstream structured/non-text payloads
+        (``STRUCTURED_BYPASS_STRATEGY``).
         Every statement here drops those rows: no compressor or retention
         floor ran on them, so counting them would dilute the violation rate
         and move ``p95_original_chars`` with calls the settings being tuned
@@ -946,10 +961,10 @@ class MetricsStore:
                     SUM(is_error)                                     AS error_count
                 FROM proxy_metrics
                 WHERE created_at >= ? AND source = 'mcp'
-                    AND compression_strategy IS NOT ?
+                    AND compression_strategy IS NOT ? AND compression_strategy IS NOT ?
                 GROUP BY server, tool
                 """,
-                (cutoff, METADATA_BYPASS_STRATEGY),
+                (cutoff, METADATA_BYPASS_STRATEGY, STRUCTURED_BYPASS_STRATEGY),
             ).fetchall()
 
             profiles: list[dict] = []
@@ -967,12 +982,12 @@ class MetricsStore:
                     """
                     SELECT original_chars FROM proxy_metrics
                     WHERE server = ? AND tool = ? AND created_at >= ? AND source = 'mcp'
-                        AND compression_strategy IS NOT ?
+                        AND compression_strategy IS NOT ? AND compression_strategy IS NOT ?
                     ORDER BY original_chars ASC
                     LIMIT 1 OFFSET MAX(0, CAST(
                         (SELECT COUNT(*) FROM proxy_metrics
                          WHERE server = ? AND tool = ? AND created_at >= ? AND source = 'mcp'
-                             AND compression_strategy IS NOT ?)
+                             AND compression_strategy IS NOT ? AND compression_strategy IS NOT ?)
                         * 0.95 AS INTEGER) - 1)
                     """,
                     (
@@ -980,10 +995,12 @@ class MetricsStore:
                         tool,
                         cutoff,
                         METADATA_BYPASS_STRATEGY,
+                        STRUCTURED_BYPASS_STRATEGY,
                         server,
                         tool,
                         cutoff,
                         METADATA_BYPASS_STRATEGY,
+                        STRUCTURED_BYPASS_STRATEGY,
                     ),
                 ).fetchone()
                 # The strategy AUTO chose most often, how often it chose it,
@@ -1020,12 +1037,12 @@ class MetricsStore:
                         (SELECT COUNT(*) FROM proxy_metrics
                          WHERE server = ? AND tool = ? AND created_at >= ?
                              AND compression_strategy IS NOT NULL
-                             AND compression_strategy IS NOT ?
+                             AND compression_strategy IS NOT ? AND compression_strategy IS NOT ?
                              AND strategy_auto_selected = 1 AND source = 'mcp')
                     FROM proxy_metrics
                     WHERE server = ? AND tool = ? AND created_at >= ?
                         AND compression_strategy IS NOT NULL
-                        AND compression_strategy IS NOT ?
+                        AND compression_strategy IS NOT ? AND compression_strategy IS NOT ?
                         AND strategy_auto_selected = 1 AND source = 'mcp'
                     GROUP BY selected_strategy
                     ORDER BY COUNT(*) DESC
@@ -1036,10 +1053,12 @@ class MetricsStore:
                         tool,
                         cutoff,
                         METADATA_BYPASS_STRATEGY,
+                        STRUCTURED_BYPASS_STRATEGY,
                         server,
                         tool,
                         cutoff,
                         METADATA_BYPASS_STRATEGY,
+                        STRUCTURED_BYPASS_STRATEGY,
                     ),
                 ).fetchone()
                 profiles.append(

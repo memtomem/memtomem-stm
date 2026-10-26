@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextvars
 import json
+import re
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any, Literal, TYPE_CHECKING
@@ -22,6 +23,9 @@ _FORMAT: contextvars.ContextVar[DeliveryFormat] = contextvars.ContextVar(
     "stm_delivery_format", default="legacy"
 )
 _BUDGET: contextvars.ContextVar[int] = contextvars.ContextVar("stm_delivery_budget", default=16000)
+_CONTINUATION_BUDGET: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "stm_continuation_budget", default=16000
+)
 _READ_FORMAT: contextvars.ContextVar[DeliveryFormat | None] = contextvars.ContextVar(
     "stm_read_format", default=None
 )
@@ -58,6 +62,11 @@ def wire_json(result: CallToolResult) -> str:
 class DeliveryError(ValueError):
     code = "invalid_delivery_metadata"
 
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        if code is not None:
+            self.code = code
+
 
 class UnsupportedDelivery(DeliveryError):
     code = "unsupported_delivery_version"
@@ -84,18 +93,29 @@ class DeliveryText(str):
 
 
 @contextmanager
-def delivery_scope(value: DeliveryFormat, budget: int = 16000) -> Iterator[None]:
+def delivery_scope(
+    value: DeliveryFormat, budget: int = 16000, *, continuation_budget: int | None = None
+) -> Iterator[None]:
     token = _FORMAT.set(value)
     budget_token = _BUDGET.set(budget)
+    continuation_token = _CONTINUATION_BUDGET.set(
+        budget if continuation_budget is None else continuation_budget
+    )
     try:
         yield
     finally:
         _FORMAT.reset(token)
         _BUDGET.reset(budget_token)
+        _CONTINUATION_BUDGET.reset(continuation_token)
 
 
 def delivery_budget() -> int:
     return _BUDGET.get()
+
+
+def continuation_budget() -> int:
+    """Full tool limit; initial upstream metadata is not repeated on owned reads."""
+    return _CONTINUATION_BUDGET.get()
 
 
 @contextmanager
@@ -220,8 +240,8 @@ def delivery_size(value: dict[str, Any], *, owned: bool) -> int:
     return len(wire_json(delivery_result(value, owned=owned)))
 
 
-def error_result(code: str, message: str) -> CallToolResult:
-    return delivery_result(envelope("error", {"code": code, "message": message}))
+def error_result(code: str, message: str, *, owned: bool = True) -> CallToolResult:
+    return delivery_result(envelope("error", {"code": code, "message": message}), owned=owned)
 
 
 def progressive_envelope(
@@ -273,6 +293,40 @@ def fit_progressive(
     if best is None:
         raise DeliveryBudgetExceeded("Budget cannot hold a progressing delivery envelope.")
     return best
+
+
+def require_progressive_continuation(
+    content: str, *, key: str, source_format: str, ttl: float, budget: int
+) -> None:
+    """Preflight a one-character owned reply before publishing a non-final key.
+
+    Use the source's worst JSON escaping cost and widest cursor fields. Checking
+    both final and non-final shapes avoids a key that works once but gets stuck
+    on a later newline, digit-width transition, or final null cursor.
+    """
+    if re.search(r"[\x00-\x07\x0b\x0e-\x1f]", content):
+        worst = "\x00"
+    elif '"' in content or "\\" in content:
+        worst = '"'
+    elif re.search(r"[\b\f\n\r\t]", content):
+        worst = "\n"
+    else:
+        worst = "x"
+    descriptor = progressive_envelope(
+        content,
+        key=key,
+        offset=len(content) - 1,
+        end=len(content),
+        source_format=source_format,
+        ttl=ttl,
+    )
+    payload = descriptor["payload"]
+    payload["content"] = worst
+    for has_more in (False, True):
+        payload["has_more"] = has_more
+        payload["next_offset"] = len(content) if has_more else None
+        if delivery_size(descriptor, owned=True) > budget:
+            raise DeliveryBudgetExceeded("Budget cannot hold a progressing continuation envelope.")
 
 
 def fit_toc(value: dict[str, Any], budget: int, *, owned: bool = False) -> dict[str, Any]:

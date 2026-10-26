@@ -2453,7 +2453,9 @@ def _render_compression_block(summary: dict[str, Any]) -> None:
     structured = summary.get("structured_delivery", {})
     if structured.get("calls"):
         click.echo(
-            f"Structured delivery: {structured['calls']} calls; {structured['serialized_base_chars']} serialized base chars; {structured['wire_bytes']} measured MCP bytes (separate accounting)"
+            f"  Structured delivery: {structured['calls']} calls; "
+            f"{structured['serialized_base_chars']} serialized base chars; "
+            f"{structured['wire_bytes']} measured MCP bytes (separate accounting)"
         )
     click.echo(f"  calls: {summary['total_calls']}  (errors: {summary['error_count']})")
     click.echo(f"  chars: {orig:,} -> {comp:,}  (saved {summary['saved_chars']:,}, {ratio:.1f}%)")

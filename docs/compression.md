@@ -546,8 +546,15 @@ no provenance is invented.
 
 Upstream `structuredContent`, non-text blocks and existing annotated-block
 preservation paths are not replaced by an STM envelope. They pass through their
-preservation path without a new STM key. This avoids relying on undocumented
-client choices between text and structured data. Surfacing and index notices
+preservation path without a new STM key. Each text block is cleaned separately,
+and the total text, including any truncation notice, is capped at the tool's
+character budget. Native structured/non-text fields and block metadata remain
+intact, subject to the whole-message `max_upstream_bytes` guard; their size is
+not covered by the STM envelope budget below. These preservation paths skip
+compression, surfacing, indexing and caching, and are excluded from tuner
+profiles. Changing `delivery_format` rotates the response-cache fingerprint.
+This avoids relying on undocumented client choices between text and structured
+data. Surfacing and index notices
 are separate optional `stm.supplements` fields, never text appended outside JSON.
 
 The structured base budget measures the serialized MCP result before optional
@@ -557,11 +564,24 @@ serverInfo metadata and resultType, and legacy clients' field filtering.
 `chunk_size`/`limit` are source-character upper bounds: a chunk
 can be shortened to fit. A TOC that cannot fit without dropping keys falls back
 to progressive delivery. A budget too small for one progressing envelope returns
-`budget_exceeded`. Selection continuations never truncate chosen sections: ask
+`budget_exceeded`. A non-final progressive key is published only when its owned
+continuation can also fit a progressing response. Initial upstream metadata uses
+the initial budget only; continuations retain the full configured tool budget.
+Hybrid TOCs are fitted with their head and complete key set before any pending
+store publication or eviction. Selection continuations never truncate chosen sections: ask
 for fewer keys or `response_format: "legacy"` if they exceed their stored budget.
 Raw/nonstandard JSON, duplicate keys and unrepresentable paths use progressive
-delivery in structured mode. Privacy refusal and store failure keep their
+delivery in structured mode. Explicit `hybrid.tail_mode: "truncate"` remains
+ordinary lossy compression without a TOC key, with its configured retention floor;
+`delivery_format` does not turn that choice into a chunk publisher.
+Privacy refusal and store failure keep their
 existing safe fallback behavior, and those degraded results remain uncached.
+Proxied-tool errors put the STM error envelope in text only, so they do not
+conflict with an upstream `outputSchema`. Owned continuation errors retain both
+representations. A live key's stored format also controls section-mismatch and
+invalid-cursor errors when `response_format` is omitted; invalid requests do not
+renew its TTL. With no live key and no explicit format, legacy errors remain
+the default. Explicit `response_format: "legacy"` preserves legacy errors.
 
 ### Accounting and compatibility
 
@@ -569,7 +589,10 @@ Legacy `initial_response_v1` rows keep their original measurement. Structured
 rows use `initial_structured_v1`, record `delivery_format`, and count serialized
 base-result characters. `mms stats` and runtime stats report a separate
 `structured_delivery` group; their byte/character totals are not combined into
-a single legacy saved ratio. Final `wire_bytes` count the complete MCP tool
+a single legacy saved ratio. The tuner's `avg_ratio`/`ratio_count` intentionally
+exclude structured-envelope rows as well: transport size is not retained source
+content. Structured-only profiles therefore have no content-retention ratio.
+Final `wire_bytes` count the complete MCP tool
 result, including supplements, text and structured representations, but exclude
 JSON-RPC framing. Progressive stats expose initial/follow-up wire bytes and a
 count of measured reads; NULL/older observations are not invented. These are

@@ -8,11 +8,13 @@ from memtomem_stm.proxy.markdown_structure import (
     Heading,
 )
 from memtomem_stm.proxy.delivery import (
+    DeliveryFormat,
     DeliveryText,
     DeliveryError,
     DeliveryBudgetExceeded,
     delivery_format,
     delivery_budget,
+    continuation_budget,
     envelope,
     delivery_json,
     fit_toc,
@@ -1056,11 +1058,13 @@ class SelectiveCompressor:
         context_query: str | None = None,
         sensitivity_source: str | None = None,
         source_offset: int = 0,
+        hybrid_head: str | None = None,
+        source_total_chars: int | None = None,
     ) -> str:
         """``sensitivity_source`` is the unsliced response when *text* is only
         part of it (HYBRID's tail): a label left in the head with its value in
         the tail is visible only there."""
-        if not text or len(text) <= max_chars:
+        if not text or (hybrid_head is None and len(text) <= max_chars):
             return text
 
         fmt, chunks = self._detect_and_parse(text)
@@ -1082,6 +1086,8 @@ class SelectiveCompressor:
             max_chars=max_chars,
             sensitivity_source=sensitivity_source,
             source_offset=source_offset,
+            hybrid_head=hybrid_head,
+            source_total_chars=source_total_chars,
         )
 
     def compress_full_toc(
@@ -1118,6 +1124,8 @@ class SelectiveCompressor:
         max_chars: int | None = None,
         sensitivity_source: str | None = None,
         source_offset: int = 0,
+        hybrid_head: str | None = None,
+        source_total_chars: int | None = None,
     ) -> str:
         selection_key = uuid.uuid4().hex[:16]
 
@@ -1175,7 +1183,7 @@ class SelectiveCompressor:
         metadata = {
             "schema_version": 1,
             "delivery_format": delivery_format(),
-            "budget": delivery_budget(),
+            "budget": continuation_budget(),
             "source_offset": source_offset,
             "chunks": records,
             "metadata_complete": bool(getattr(chunks, "records", {})),
@@ -1215,12 +1223,13 @@ class SelectiveCompressor:
                 ),
             }
             descriptor = envelope(
-                "selective",
+                "hybrid" if hybrid_head is not None else "selective",
                 {
                     "key": selection_key,
                     "source_format": fmt,
                     "source_offset": source_offset,
-                    "total_chars": len(text),
+                    "total_chars": len(text) if source_total_chars is None else source_total_chars,
+                    **({"head": hybrid_head} if hybrid_head is not None else {}),
                     "ttl_seconds_remaining": ttl,
                     "entries": [{**entry, **records[entry["key"]]} for entry in entries],
                     "metadata_complete": bool(getattr(chunks, "records", {})),
@@ -1231,10 +1240,15 @@ class SelectiveCompressor:
                 return DeliveryText(delivery_json(fitted), fitted)
             return DeliveryText(json.dumps(toc, ensure_ascii=False), descriptor)
 
-        # Prove the metadata floor fits before publishing a key or evicting
-        # another entry. Refit with the publication generation's authoritative TTL.
-        if delivery_format() == "structured":
-            build(0)
+        prepared: list[str] = []
+
+        def preflight(actual_ttl: float) -> None:
+            # The publication generation owns TTL. Fit the COMPLETE frame under
+            # its write barrier before put/eviction, including a hybrid head.
+            nonlocal ttl
+            ttl = actual_ttl
+            prepared.append(build(self._MAX_PREVIEW))
+
         ttl = self._publish(
             selection_key,
             PendingSelection(
@@ -1245,7 +1259,12 @@ class SelectiveCompressor:
                 metadata_json=json.dumps(metadata, ensure_ascii=True, allow_nan=False),
             ),
             sensitive,
+            before_write=preflight if delivery_format() == "structured" else None,
         )
+        if delivery_format() == "structured":
+            # fit_toc already budgeted the full serialized result. A legacy
+            # tail-character allowance must not erase its previews a second time.
+            return prepared[0]
 
         full = build(self._MAX_PREVIEW)
         if max_chars is None or len(full) <= max_chars:
@@ -1269,7 +1288,9 @@ class SelectiveCompressor:
                 hi = mid - 1
         return best
 
-    def select(self, key: str, sections: list[str], response_format=None) -> str:
+    def select(
+        self, key: str, sections: list[str], response_format: DeliveryFormat | None = None
+    ) -> str:
         self._store.evict_expired(self._ttl, exclude_format="progressive")
 
         pending = self._store.get(key)
@@ -1286,6 +1307,8 @@ class SelectiveCompressor:
                 selected_parts.append(pending.chunks[section])
 
         if not selected_parts:
+            if mode == "structured":
+                raise DeliveryError("No matching sections found.", code="missing_or_expired")
             available = list(pending.chunks.keys())
             return f"No matching sections found. Available: {available}"
 
@@ -1375,7 +1398,7 @@ class SelectiveCompressor:
     def _detect_and_parse(self, text: str) -> tuple[str, dict[str, str]]:
         try:
             data = _mm_json_loads(text)
-            if isinstance(data, (dict, list)):
+            if delivery_format() == "structured" and isinstance(data, (dict, list)):
 
                 def pairs(items):
                     result = {}
@@ -1400,6 +1423,10 @@ class SelectiveCompressor:
                 raise
             return "text", self._parse_text(text)
         except (json.JSONDecodeError, ValueError, RecursionError, OverflowError):
+            # A Markdown link/reference/badge can begin with '[' too. Recognize
+            # real headings before classifying an unparsed JSON-looking body.
+            if next(markdown_headings(text), None) is not None:
+                return "markdown", self._parse_markdown(text)
             if delivery_format() == "structured" and text.lstrip().startswith(("{", "[")):
                 raise DeliveryBudgetExceeded("Unparsed JSON requires progressive delivery.")
 
@@ -1547,7 +1574,14 @@ class SelectiveCompressor:
             return "heading"
         return "paragraph"
 
-    def _publish(self, key: str, pending: PendingSelection, sensitive: Callable[[], bool]) -> float:
+    def _publish(
+        self,
+        key: str,
+        pending: PendingSelection,
+        sensitive: Callable[[], bool],
+        *,
+        before_write: Callable[[float], None] | None = None,
+    ) -> float:
         """Store *key* where the readers will look for it, and evict under the
         policy of whoever owns that store. Returns the enforcing TTL.
 
@@ -1589,6 +1623,8 @@ class SelectiveCompressor:
         store actually written, so it is checked after the target is resolved.
         """
         if self._live_provider is None:
+            if before_write is not None:
+                before_write(self._ttl)
             self._refuse_sensitive(self._store, sensitive)
             self._store.put(key, pending)
             self._evict()
@@ -1599,6 +1635,8 @@ class SelectiveCompressor:
             # its close defers to end_use). The key dies with the shutdown
             # either way.
             target = self._live_provider() or self
+            if before_write is not None:
+                before_write(target._ttl)
             self._refuse_sensitive(target._store, sensitive)
             target._store.put(key, pending)
             target._evict()
@@ -3057,12 +3095,19 @@ class HybridCompressor:
         if not text or len(text) <= max_chars:
             return text
 
+        def small_budget_result() -> str:
+            if delivery_format() == "structured" and self._tail_mode == TailMode.TOC:
+                raise DeliveryBudgetExceeded("Budget cannot hold a complete hybrid table.")
+            # An explicit truncate tail is ordinary lossy compression, not a
+            # transient-key publisher. Keep that configured behavior in both modes.
+            return _plain_truncate(text, max_chars=max_chars, context_query=context_query)
+
         separator_overhead = 80
         _MIN_TAIL = 50
         available = max_chars - separator_overhead
 
         if available <= 0:
-            return _plain_truncate(text, max_chars=max_chars, context_query=context_query)
+            return small_budget_result()
 
         if self._head_chars + self._min_toc_budget <= available:
             head_budget = self._head_chars
@@ -3070,10 +3115,10 @@ class HybridCompressor:
             head_budget = max(self._min_head_chars, int(available * self._head_ratio))
 
         if head_budget > available or head_budget < self._min_head_chars:
-            return _plain_truncate(text, max_chars=max_chars, context_query=context_query)
+            return small_budget_result()
 
         if available - head_budget < _MIN_TAIL:
-            return _plain_truncate(text, max_chars=max_chars, context_query=context_query)
+            return small_budget_result()
 
         head_end = self._find_head_break(text, head_budget)
         head = text[:head_end]
@@ -3087,15 +3132,24 @@ class HybridCompressor:
 
         toc_budget = max_chars - len(head) - len(separator)
         if toc_budget < _MIN_TAIL:
-            return _plain_truncate(text, max_chars=max_chars, context_query=context_query)
+            return small_budget_result()
 
         if self._tail_mode == TailMode.TOC:
+            if delivery_format() == "structured":
+                return self._selective.compress(
+                    tail_text,
+                    max_chars=toc_budget,
+                    context_query=context_query,
+                    sensitivity_source=text,
+                    source_offset=head_end,
+                    hybrid_head=head,
+                    source_total_chars=len(text),
+                )
             tail_compressed = self._selective.compress(
                 tail_text,
                 max_chars=toc_budget,
                 context_query=context_query,
                 sensitivity_source=text,
-                **({"source_offset": head_end} if delivery_format() == "structured" else {}),
             )
         else:
             tail_compressed = _plain_truncate(
@@ -3109,9 +3163,6 @@ class HybridCompressor:
                 "hybrid",
                 {**tail_compressed.descriptor["payload"], "head": head, "total_chars": len(text)},
             )
-            if delivery_format() == "structured":
-                descriptor = fit_toc(descriptor, delivery_budget())
-                return DeliveryText(delivery_json(descriptor), descriptor)
         if len(result) > max_chars:
             # A sub-compressor can return more than its requested budget. Avoid
             # raw slicing because it can sever a JSON TOC mid-object, but keep

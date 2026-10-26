@@ -219,6 +219,8 @@ def _validate_wire_identities(obj: dict[str, Any]) -> None:
                     identity(item[name])
             ctx = item.get("context")
             if isinstance(ctx, dict):
+                items(ctx.get("before"))
+                items(ctx.get("after"))
                 items(ctx.get("window_before"))
                 items(ctx.get("window_after"))
 

@@ -30,6 +30,7 @@ MAX_ERROR_MESSAGE_CHARS = 500
 # ``none``, and the suffix names why. The tuner drops these rows by this exact
 # value, so the writer and that reader share this one definition.
 METADATA_BYPASS_STRATEGY = "none→metadata_bypass"
+STRUCTURED_BYPASS_STRATEGY = "none→structured_bypass"
 
 
 def format_error_message_from_exc(exc: BaseException) -> str:

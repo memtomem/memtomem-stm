@@ -1164,28 +1164,23 @@ class TestCoreIdentityIsNotAliasedAtIngest:
         assert bundle.retrieved[0].chunk.content == r"c\ud800"
         bundle.retrieved[0].chunk.content.encode("utf-8")
 
-    def test_adjacent_context_chunk_id_is_escaped_not_refused(self):
-        """An adjacent chunk's id is never exact-matched (the formatter reads
-        only ``content``, the daemon re-encodes it), so it is content by
-        destination and must not survive raw just because the key is ``id``."""
-        context = decode_context_compose_context(
-            {
-                "before": [
-                    {
-                        "id": "adj\ud800",
-                        "content": "before text",
-                        "source": "a.md",
-                        "namespace": "default",
-                    }
-                ],
-                "after": [],
-                "chunk_position": 1,
-                "total_chunks_in_file": 2,
-            },
-            max_content_chars=500,
-            context_window=2,
-        )
-
-        assert context is not None
-        assert context.window_before[0].id == r"adj\ud800"
-        context.window_before[0].id.encode("utf-8")
+    def test_adjacent_context_chunk_id_is_refused_before_reencoding(self):
+        """Direct MCP and daemon paths enforce the same raw identity contract."""
+        with pytest.raises(ValueError, match="invalid identity"):
+            decode_context_compose_context(
+                {
+                    "before": [
+                        {
+                            "id": "adj\ud800",
+                            "content": "before text",
+                            "source": "a.md",
+                            "namespace": "default",
+                        }
+                    ],
+                    "after": [],
+                    "chunk_position": 1,
+                    "total_chunks_in_file": 2,
+                },
+                max_content_chars=500,
+                context_window=2,
+            )

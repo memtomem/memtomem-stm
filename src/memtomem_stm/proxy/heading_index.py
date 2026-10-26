@@ -106,8 +106,14 @@ def ensure_heading_index(content: str, chunks: dict[str, str]) -> tuple[HeadingI
 
 def legacy_remaining_headings(content: str, offset: int) -> str:
     start = offset - 1 if offset > 0 and content[offset - 1] == "\n" else offset
-    titles = [h.title for h in headings(content) if h.start >= start]
-    return _render([title.strip() for title in titles[:5]], len(titles))
+    titles: list[str] = []
+    count = 0
+    for heading in headings(content):
+        if heading.start >= start:
+            count += 1
+            if len(titles) < 5:
+                titles.append(heading.title.strip(" \t"))
+    return _render(titles, count)
 
 
 def _render(titles: list[str], count: int) -> str:
@@ -140,6 +146,6 @@ def remaining_headings(content: str, offset: int, rows: HeadingIndex) -> str:
             and (nxt < n if remaining > 1 else nxt == n)
         ):
             return legacy_remaining_headings(content, offset)
-        titles.append(content[title:end].strip())
+        titles.append(content[title:end].strip(" \t"))
         start, i = end, nxt
     return _render(titles, count)

@@ -8,6 +8,9 @@ from collections.abc import Iterator
 
 _FENCE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})(.*)$")
 _HEADING = re.compile(r"^[ ]{0,3}(#{1,6})[ \t]+(.+?)[ \t]*$")
+# Skip ordinary lines in the regex engine; fallback hints must retain fence
+# state without running Python once per physical source line on every read.
+_CANDIDATE = re.compile(r"^[ ]{0,3}(?:`{3,}|~{3,}|#{1,6}[ \t]+)[^\n]*", re.MULTILINE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,9 +31,9 @@ def headings(text: str) -> Iterator[Heading]:
     """
     fence_char = ""
     fence_size = 0
-    offset = 0
-    for line in _lines(text):
-        body = line.rstrip("\r\n")
+    for candidate in _CANDIDATE.finditer(text):
+        offset = candidate.start()
+        body = candidate.group().rstrip("\r\n")
         fence = _FENCE.match(body)
         if fence:
             run, suffix = fence.groups()
@@ -42,24 +45,15 @@ def headings(text: str) -> Iterator[Heading]:
         elif not fence_char:
             match = _HEADING.match(body)
             if match:
-                title = re.sub(r"[ \t]+#+[ \t]*$", "", match.group(2)).strip()
-                yield Heading(
-                    offset,
-                    offset + match.start(2),
-                    offset + match.start(2) + len(title),
-                    len(match.group(1)),
-                    title,
-                )
-        offset += len(line)
-
-
-def _lines(text: str) -> Iterator[str]:
-    start = 0
-    while start < len(text):
-        end = text.find("\n", start)
-        end = len(text) if end < 0 else end + 1
-        yield text[start:end]
-        start = end
+                title = re.sub(r"[ \t]+#+[ \t]*$", "", match.group(2)).strip(" \t")
+                if title:
+                    yield Heading(
+                        offset,
+                        offset + match.start(2),
+                        offset + match.start(2) + len(title),
+                        len(match.group(1)),
+                        title,
+                    )
 
 
 def heading_matches(text: str) -> list[re.Match[str]]:

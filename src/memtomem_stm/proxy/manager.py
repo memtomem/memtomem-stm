@@ -5,12 +5,15 @@ from __future__ import annotations
 from memtomem_stm.proxy.config import effective_delivery_format
 
 from memtomem_stm.proxy.delivery import (
+    DeliveryError,
     DeliveryFormat,
     DeliveryText,
     DeliveryBudgetExceeded,
     delivery_scope,
     delivery_format,
     delivery_budget,
+    continuation_budget,
+    require_progressive_continuation,
     delivery_json,
     delivery_size,
     delivery_result,
@@ -90,6 +93,7 @@ from memtomem_stm.proxy.config import (
     ProxyConfigLoader,
     RelevanceScorerConfig,
     SelectiveConfig,
+    TailMode,
     TokenEstimationMode,
     ToolgraphConfig,
     TransportType,
@@ -191,6 +195,7 @@ from memtomem_stm.proxy._locks import LockTimeoutError, bounded_lock
 from memtomem_stm.proxy.metrics import (
     MAX_ERROR_MESSAGE_CHARS,
     METADATA_BYPASS_STRATEGY,
+    STRUCTURED_BYPASS_STRATEGY,
     CallMetrics,
     ErrorCategory,
     TokenTracker,
@@ -421,11 +426,10 @@ _FINGERPRINT_FIELDS = frozenset(
         "llm",
         "token_budget",
         "token_estimation_mode",
+        "delivery_format",
     }
 )
-_FINGERPRINT_EXCLUDED_FIELDS = frozenset(
-    {"auto_index_enabled", "extraction_enabled", "delivery_format"}
-)
+_FINGERPRINT_EXCLUDED_FIELDS = frozenset({"auto_index_enabled", "extraction_enabled"})
 
 
 def compression_fingerprint(
@@ -471,6 +475,7 @@ def compression_fingerprint(
     """
     payload: dict[str, Any] = {
         "compression": tc.compression.value,
+        "delivery_format": tc.delivery_format,
         "max_chars": tc.max_chars,
         "token_budget": tc.token_budget,
         "token_estimation_mode": tc.token_estimation_mode.value,
@@ -5088,6 +5093,45 @@ class ProxyManager:
         # the publication config and any rebuild is forward. Reusing whatever
         # is cached would let a superseded pin write into a store the next live
         # request is about to close — the key would be returned and then die.
+        key = uuid.uuid4().hex[:16]
+        resp = ProgressiveResponse(
+            content=text,
+            total_chars=len(text),
+            total_lines=text.count("\n") + 1,
+            content_type=ProgressiveChunker.detect_content_type(text),
+            structure_hint=ProgressiveChunker.structure_hint(text)
+            if cfg.include_structure_hint
+            else "",
+            created_at=_time.monotonic(),
+            ttl_seconds=cfg.ttl_seconds,
+            server=server,
+            tool=tool,
+            trace_id=trace_id,
+            chunk_size=cfg.chunk_size,
+            include_structure_hint=cfg.include_structure_hint,
+            delivery_format=delivery_format(),
+            delivery_budget=continuation_budget(),
+        )
+        descriptor = None
+        if delivery_format() == "structured":
+            descriptor = fit_progressive(
+                text,
+                key=key,
+                offset=0,
+                limit=cfg.chunk_size,
+                source_format=ProgressiveChunker.detect_content_type(text),
+                ttl=cfg.ttl_seconds,
+                budget=delivery_budget(),
+                owned=False,
+            )
+            if descriptor["payload"]["has_more"]:
+                require_progressive_continuation(
+                    text,
+                    key=key,
+                    source_format=resp.content_type,
+                    ttl=cfg.ttl_seconds,
+                    budget=resp.delivery_budget,
+                )
         pin_is_live = self._pin_is_live_generation(cfg_snap)
         _publish_cfg, publish_sel = self._publication_pair(server, tool, sel_cfg, cfg_snap)
         store = self._get_progressive_store(publish_sel)
@@ -5109,37 +5153,6 @@ class ProxyManager:
             # that part is scoped to this call and rides the snapshot.
             store.evict(cfg.ttl_seconds, cfg.max_stored)
 
-        key = uuid.uuid4().hex[:16]
-        resp = ProgressiveResponse(
-            content=text,
-            total_chars=len(text),
-            total_lines=text.count("\n") + 1,
-            content_type=ProgressiveChunker.detect_content_type(text),
-            structure_hint=ProgressiveChunker.structure_hint(text)
-            if cfg.include_structure_hint
-            else "",
-            created_at=_time.monotonic(),
-            ttl_seconds=cfg.ttl_seconds,
-            server=server,
-            tool=tool,
-            trace_id=trace_id,
-            chunk_size=cfg.chunk_size,
-            include_structure_hint=cfg.include_structure_hint,
-            delivery_format=delivery_format(),
-            delivery_budget=delivery_budget(),
-        )
-        descriptor = None
-        if delivery_format() == "structured":
-            descriptor = fit_progressive(
-                text,
-                key=key,
-                offset=0,
-                limit=cfg.chunk_size,
-                source_format=ProgressiveChunker.detect_content_type(text),
-                ttl=cfg.ttl_seconds,
-                budget=delivery_budget(),
-                owned=False,
-            )
         store.put(key, resp, before_write=evict if pin_is_live else None)
 
         chunker = ProgressiveChunker(
@@ -5211,6 +5224,26 @@ class ProxyManager:
         # succeeds, so nothing bad is pinned and the next call retries.
         # One generation for this recovery too — the stores probed and the one
         # opened must not come from reads that straddle a re-load.
+        invalid = (
+            "offset must be >= 0"
+            if offset < 0
+            else "limit must be >= 1"
+            if limit is not None and limit < 1
+            else None
+        )
+
+        def invalid_result(mode: DeliveryFormat) -> str:
+            if mode == "structured":
+                raise DeliveryError(str(invalid), code="invalid_request")
+            return f"Error: {invalid}"
+
+        if invalid and response_format is not None:
+            return invalid_result(response_format)
+        missing = (
+            f"Error: {invalid}"
+            if invalid
+            else f"Progressive delivery key '{key}' not found or expired."
+        )
         cfg_live = self._config
         cfgs = self._distinct_sqlite_selective_cfgs(cfg_live)
         temp_store: ProgressiveStoreAdapter | None = None
@@ -5218,7 +5251,7 @@ class ProxyManager:
             # As in select_chunks: after stop(), answer with the missing-key
             # sentinel rather than open or reopen a store (#1128).
             if self._stopped:
-                return f"Progressive delivery key '{key}' not found or expired."
+                return missing
             fallback = self._sqlite_cfg_holding_key(key, cfg_live) or (cfgs[0] if cfgs else None)
             if fallback is not None:
                 try:
@@ -5228,7 +5261,7 @@ class ProxyManager:
                         "Could not open the configured SQLite pending store for read_more recovery",
                         exc_info=True,
                     )
-                    return f"Progressive delivery key '{key}' not found or expired."
+                    return missing
             else:
                 store = self._get_progressive_store()
         else:
@@ -5236,7 +5269,7 @@ class ProxyManager:
         try:
             resp = store.get(
                 key,
-                renew=True,
+                renew=invalid is None,
                 **({"response_format": response_format} if response_format is not None else {}),
             )
             if resp is None and len(cfgs) > 1:
@@ -5258,7 +5291,7 @@ class ProxyManager:
                     if temp_store is not None:
                         alt_resp = temp_store.get(
                             key,
-                            renew=True,
+                            renew=invalid is None,
                             **(
                                 {"response_format": response_format}
                                 if response_format is not None
@@ -5268,7 +5301,9 @@ class ProxyManager:
                         if alt_resp is not None:
                             store, resp = temp_store, alt_resp
             if resp is None:
-                return f"Progressive delivery key '{key}' not found or expired."
+                return missing
+            if invalid:
+                return invalid_result(resp.delivery_format)
             with traced(
                 "proxy_call_read_more",
                 metadata={
@@ -6594,13 +6629,24 @@ class ProxyManager:
         # estimator, so it must track the gate exactly.
         unicode_token_gate = False
         scorer_fallback = False
+        progressive_fallback = False
         if tc.compression == CompressionStrategy.PROGRESSIVE:
             # ``_resolve_tool_config`` already defaults the block on this
             # strategy (#830); the fallback keeps a directly-constructed
             # ToolConfig off the silent-passthrough path, and mirrors the
             # ratio-guard Tier-1 call below.
             pcfg = tc.progressive or ProgressiveConfig()
-            if len(cleaned) <= pcfg.chunk_size:
+            if len(cleaned) <= pcfg.chunk_size and (
+                tc.delivery_format != "structured"
+                or len(
+                    wire_json(
+                        mcp_types.CallToolResult(
+                            content=[mcp_types.TextContent(type="text", text=cleaned)]
+                        )
+                    )
+                )
+                <= delivery_budget()
+            ):
                 # Content fits in one chunk — passthrough
                 compressed = cleaned
             else:
@@ -6615,6 +6661,8 @@ class ProxyManager:
                         cfg_snap=cfg_snap,
                     )
                     progressive_key_issued = True
+                except DeliveryBudgetExceeded:
+                    raise
                 except Exception as exc:
                     # Progressive build/store failed (e.g. a SQLite-backed
                     # pending/reads store I/O error inside ``_apply_progressive``).
@@ -6737,9 +6785,12 @@ class ProxyManager:
                 # attributed to AUTO afterwards (#933).
                 strategy_auto_selected = True
 
-            if tc.delivery_format == "structured" and effective_compression in (
-                CompressionStrategy.SELECTIVE,
-                CompressionStrategy.HYBRID,
+            if tc.delivery_format == "structured" and (
+                effective_compression == CompressionStrategy.SELECTIVE
+                or (
+                    effective_compression == CompressionStrategy.HYBRID
+                    and (tc.hybrid is None or tc.hybrid.tail_mode == TailMode.TOC)
+                )
             ):
                 # Recoverable keys retain the source in full. A lossy-content
                 # retention floor must not widen their serialized result limit.
@@ -6759,31 +6810,33 @@ class ProxyManager:
             ):
                 _t0 = _time.monotonic()
                 try:
-                    compressed, llm_fallback = await self._apply_compression(
-                        cleaned,
-                        effective_compression,
-                        effective_max_chars,
-                        tc.selective,
-                        tc.llm,
-                        tc.hybrid,
-                        server,
-                        tool,
-                        context_query=context_query,
-                        min_chars=min_budget,
-                        cfg_snap=cfg_snap,
-                    )
-                except DeliveryBudgetExceeded:
-                    compressed = self._apply_progressive(
-                        cleaned,
-                        tc.progressive or ProgressiveConfig(),
-                        server,
-                        tool,
-                        sel_cfg=tc.selective,
-                        trace_id=trace_id,
-                        cfg_snap=cfg_snap,
-                    )
-                    progressive_key_issued = True
-                    llm_fallback = None
+                    try:
+                        compressed, llm_fallback = await self._apply_compression(
+                            cleaned,
+                            effective_compression,
+                            effective_max_chars,
+                            tc.selective,
+                            tc.llm,
+                            tc.hybrid,
+                            server,
+                            tool,
+                            context_query=context_query,
+                            min_chars=min_budget,
+                            cfg_snap=cfg_snap,
+                        )
+                    except DeliveryBudgetExceeded:
+                        compressed = self._apply_progressive(
+                            cleaned,
+                            tc.progressive or ProgressiveConfig(),
+                            server,
+                            tool,
+                            sel_cfg=tc.selective,
+                            trace_id=trace_id,
+                            cfg_snap=cfg_snap,
+                        )
+                        progressive_key_issued = True
+                        progressive_fallback = True
+                        llm_fallback = None
                 except (sqlite3.Error, SensitivePayloadNotStored) as exc:
                     # sqlite is reachable in this path ONLY via the
                     # SELECTIVE/HYBRID chunk-TOC pending-store write
@@ -6859,7 +6912,8 @@ class ProxyManager:
                 )
             if llm_fallback:
                 metrics_strategy = f"llm_summary→{llm_fallback}_fallback"
-            progressive_fallback = False  # set when progressive replaces the response
+            if progressive_fallback:
+                metrics_strategy = f"{effective_compression.value}→progressive_fallback"
             if (
                 cleaned_len > 0
                 and dynamic > 0
@@ -6915,6 +6969,8 @@ class ProxyManager:
                                     dynamic,
                                     int(pcfg.ttl_seconds),
                                 )
+                            except DeliveryBudgetExceeded:
+                                raise
                             except Exception as exc:
                                 if isinstance(exc, SensitivePayloadNotStored):
                                     ladder_sensitive = True
@@ -7952,8 +8008,15 @@ class ProxyManager:
                 is_error=True,
             )
 
+        tc = self._resolve_tool_config(server, tool, proxy_cfg=cfg_snap)
         text_blocks = [block for block in result.content or [] if block.type == "text"]
-        if len(text_blocks) > 1 and any(_text_block_metadata(block) for block in text_blocks):
+        native_bypass = tc.delivery_format == "structured" and (
+            structured_content is not None or bool(non_text_content)
+        )
+        if text_blocks and (
+            native_bypass
+            or (len(text_blocks) > 1 and any(_text_block_metadata(block) for block in text_blocks))
+        ):
             # Combining blocks can assign one block's audience or metadata to
             # another's text. Preserve this response's boundaries instead of
             # compressing/surfacing/indexing it as a single string. Cleaning
@@ -7963,7 +8026,9 @@ class ProxyManager:
             # block may be addressed to another audience. As on the normal
             # path, max_upstream_chars bounds the raw text before the cleaner
             # reads it.
-            tc = self._resolve_tool_config(server, tool, proxy_cfg=cfg_snap)
+            # Native structured/non-text bodies likewise keep their upstream
+            # schema and blocks. Share the bounded-text path and cache accounting
+            # instead of maintaining a second unbounded early-return branch.
             upstream_left = cfg_snap.max_upstream_chars
             upstream_cut = False
             original_chars = 0
@@ -7995,8 +8060,13 @@ class ProxyManager:
                 budget_field = (
                     "max_result_tokens" if tc.token_budget is not None else "max_result_chars"
                 )
+                reason = (
+                    "upstream structured/non-text payloads"
+                    if native_bypass
+                    else "text blocks with metadata"
+                )
                 notice = (
-                    f"[response truncated to {cap} chars: text blocks with metadata "
+                    f"[response truncated to {cap} chars: {reason} "
                     f"are not compressed; raise {budget_field} for this tool to "
                     "receive more]"
                 )
@@ -8043,7 +8113,9 @@ class ProxyManager:
                     ),
                     clean_ms=_clean_ms,
                     trace_id=trace_id,
-                    compression_strategy=METADATA_BYPASS_STRATEGY,
+                    compression_strategy=(
+                        STRUCTURED_BYPASS_STRATEGY if native_bypass else METADATA_BYPASS_STRATEGY
+                    ),
                     strategy_auto_selected=False,
                     compression_accounting="initial_response_v1",
                 )
@@ -8097,42 +8169,6 @@ class ProxyManager:
                 return non_text_content
             return "[empty response]"
 
-        # Resolve effective settings (using config snapshot)
-        tc = self._resolve_tool_config(server, tool, proxy_cfg=cfg_snap)
-
-        if tc.delivery_format == "structured" and (
-            structured_content is not None or non_text_content
-        ):
-            # Preserve the upstream output schema and model-visible structured body.
-            # The inbound whole-message guard already bounds binary/structured fields.
-            blocks: list[Any] = []
-            remaining = cfg_snap.max_upstream_chars
-            for block in result.content or []:
-                if block.type == "text":
-                    text = (block.text or "")[:remaining]
-                    remaining -= len(text)
-                    blocks.append(
-                        block.model_copy(update={"text": text})
-                        if hasattr(block, "model_copy")
-                        else mcp_types.TextContent(type="text", text=text)
-                    )
-                else:
-                    blocks.append(block)
-            self.tracker.record(
-                CallMetrics(
-                    server=server,
-                    tool=tool,
-                    original_chars=len(original_text),
-                    compressed_chars=len(original_text),
-                    compression_strategy="none→structured_bypass",
-                    trace_id=trace_id,
-                    compression_accounting="initial_response_v1",
-                )
-            )
-            return mcp_types.CallToolResult(
-                content=blocks, structured_content=structured_content, _meta=result_meta
-            )
-
         # ── Stage 1: CLEAN ──
         with traced(
             "proxy_call_clean",
@@ -8150,7 +8186,7 @@ class ProxyManager:
         try:
             # The fitter serializes a plain TextContent/CallToolResult. Reserve
             # any extra upstream text/result metadata retained by final assembly.
-            # Keep the stored limit conservative for owned continuation replies.
+            # Owned continuations do not repeat that upstream metadata.
             empty_base = mcp_types.CallToolResult(
                 content=[mcp_types.TextContent(type="text", text="")]
             )
@@ -8167,7 +8203,11 @@ class ProxyManager:
                 0,
                 len(wire_json(empty_preserved)) - len(wire_json(empty_base)),
             )
-            with delivery_scope(tc.delivery_format, max(1, tc.max_chars - metadata_overhead)):
+            with delivery_scope(
+                tc.delivery_format,
+                max(1, tc.max_chars - metadata_overhead),
+                continuation_budget=tc.max_chars,
+            ):
                 comp = await self._compress_and_surface(
                     server=server,
                     tool=tool,
@@ -8191,7 +8231,12 @@ class ProxyManager:
                     trace_id=trace_id,
                 )
             )
-            return error_result(exc.code, str(exc))
+            self._invalidate_disabled_cache(
+                server, tool, cache_args, cfg_snap=cfg_snap, context_query=context_query
+            )
+            # Proxied tools advertise the upstream outputSchema. STM-owned
+            # errors must not supply a different structuredContent under it.
+            return error_result(exc.code, str(exc), owned=False)
 
         # Unpack the fields the metrics record and the INDEX stage read. The
         # cache store reads ``comp`` directly (compressed + the cache-skip flag),

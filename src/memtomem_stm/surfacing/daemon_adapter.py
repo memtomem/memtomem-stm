@@ -172,15 +172,15 @@ class DaemonLtmAdapter:
             result = RemoteSearchResult(
                 item["content"],
                 safe_float(item.get("score"), 1.0 if pinned else 0.0),
-                source=item.get("source", ""),
-                namespace=item.get("namespace", "default"),
+                source=item.get("source") or "",
+                namespace=item.get("namespace") or "default",
                 pinned=pinned,
                 context=context,
                 score_scale=None if pinned else score_scale,
                 reranker=None if pinned else reranker,
                 score_ceiling=None if pinned else score_ceiling,
             )
-            if isinstance(item.get("chunk_id"), str):
+            if isinstance(item.get("chunk_id"), str) and item["chunk_id"]:
                 result.chunk.id = item["chunk_id"]
             return result
 

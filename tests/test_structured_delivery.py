@@ -119,7 +119,9 @@ async def test_upstream_structured_payload_is_preserved_without_stm_pointer(tmp_
     session.call_tool.return_value = upstream
     result = await proxy.call_tool("srv", "read", {})
     assert result.structured_content == {"data": [1, 2]}
-    assert result.content[0].text == upstream.content[0].text
+    assert sum(len(block.text) for block in result.content if block.type == "text") <= 1600
+    assert result.content[0].text == upstream.content[0].text[:len(result.content[0].text)]
+    assert "truncated" in result.content[-1].text
     assert proxy._progressive_store is None
 
 
