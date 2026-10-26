@@ -2,6 +2,24 @@
 
 from __future__ import annotations
 
+from memtomem_stm.proxy.markdown_structure import (
+    headings as markdown_headings,
+    heading_matches,
+    Heading,
+)
+from memtomem_stm.proxy.delivery import (
+    DeliveryText,
+    DeliveryError,
+    DeliveryBudgetExceeded,
+    delivery_format,
+    delivery_budget,
+    envelope,
+    delivery_json,
+    fit_toc,
+    metadata_format,
+    delivery_size,
+)
+
 import asyncio
 import copy
 import json
@@ -85,7 +103,7 @@ def _count_links(text: str) -> int:
 def _content_summary(text: str) -> str:
     """Count structural elements in the original text for truncation metadata."""
     counts: list[str] = []
-    headings = len(_HEADINGS_RE.findall(text))
+    headings = count_markdown_headings(text)
     code_blocks = len(_CODE_FENCE_RE.findall(text)) // 2
     list_items = len(_LIST_ITEM_RE.findall(text))
     links = _count_links(text)
@@ -110,7 +128,7 @@ def count_markdown_headings(text: str) -> int:
     offset-0 heading and over-counts a ``#`` that is not a heading (e.g. a shell
     comment line, or ``#`` inside prose without a following space).
     """
-    return len(_HEADINGS_RE.findall(text))
+    return sum(1 for _ in markdown_headings(text))
 
 
 # Deepest JSON nesting the compression tiers treat as structure. The tiers walk
@@ -325,7 +343,7 @@ class TruncateCompressor(_PlainTextRetention):
                 pass
 
         # Try section-aware truncation for markdown with headings
-        headings = list(self._HEADING_RE.finditer(text))
+        headings = heading_matches(text)
         if len(headings) >= 2:
             return self._section_aware_truncate(text, max_chars, headings, context_query)
 
@@ -961,6 +979,13 @@ class PendingSelection:
     format: str
     created_at: float
     total_chars: int
+    metadata_json: str | None = None
+
+
+class ChunkMap(dict[str, str]):
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: dict[str, dict[str, Any]] = {}
 
 
 class SelectiveCompressor:
@@ -1030,6 +1055,7 @@ class SelectiveCompressor:
         max_chars: int,
         context_query: str | None = None,
         sensitivity_source: str | None = None,
+        source_offset: int = 0,
     ) -> str:
         """``sensitivity_source`` is the unsliced response when *text* is only
         part of it (HYBRID's tail): a label left in the head with its value in
@@ -1055,6 +1081,7 @@ class SelectiveCompressor:
             context_query,
             max_chars=max_chars,
             sensitivity_source=sensitivity_source,
+            source_offset=source_offset,
         )
 
     def compress_full_toc(
@@ -1090,6 +1117,7 @@ class SelectiveCompressor:
         context_query: str | None = None,
         max_chars: int | None = None,
         sensitivity_source: str | None = None,
+        source_offset: int = 0,
     ) -> str:
         selection_key = uuid.uuid4().hex[:16]
 
@@ -1132,19 +1160,30 @@ class SelectiveCompressor:
                 order = sorted(range(len(items)), key=lambda i: -scores[i])
                 items = [items[i] for i in order]
 
-        ttl = self._publish(
-            selection_key,
-            PendingSelection(
-                chunks=chunks,
-                format=fmt,
-                created_at=time.monotonic(),
-                total_chars=len(text),
-            ),
-            sensitive,
-        )
+        records = {
+            k: {
+                "chunk_id": f"stm:{selection_key}:{i}",
+                "label": k,
+                **getattr(chunks, "records", {}).get(k, {}),
+            }
+            for i, k in enumerate(chunks)
+        }
+        for record in records.values():
+            if "start" in record:
+                record["start"] += source_offset
+                record["end"] += source_offset
+        metadata = {
+            "schema_version": 1,
+            "delivery_format": delivery_format(),
+            "budget": delivery_budget(),
+            "source_offset": source_offset,
+            "chunks": records,
+            "metadata_complete": bool(getattr(chunks, "records", {})),
+        }
+        ttl = self._ttl
 
         def build(preview_cap: int) -> str:
-            entries = []
+            entries: list[dict[str, Any]] = []
             for key, content in items:
                 size = len(content)
                 is_inline = size < self._min_section_chars
@@ -1175,7 +1214,38 @@ class SelectiveCompressor:
                     "sections=[...]) to retrieve."
                 ),
             }
-            return json.dumps(toc, ensure_ascii=False)
+            descriptor = envelope(
+                "selective",
+                {
+                    "key": selection_key,
+                    "source_format": fmt,
+                    "source_offset": source_offset,
+                    "total_chars": len(text),
+                    "ttl_seconds_remaining": ttl,
+                    "entries": [{**entry, **records[entry["key"]]} for entry in entries],
+                    "metadata_complete": bool(getattr(chunks, "records", {})),
+                },
+            )
+            if delivery_format() == "structured":
+                fitted = fit_toc(descriptor, delivery_budget())
+                return DeliveryText(delivery_json(fitted), fitted)
+            return DeliveryText(json.dumps(toc, ensure_ascii=False), descriptor)
+
+        # Prove the metadata floor fits before publishing a key or evicting
+        # another entry. Refit with the publication generation's authoritative TTL.
+        if delivery_format() == "structured":
+            build(0)
+        ttl = self._publish(
+            selection_key,
+            PendingSelection(
+                chunks=chunks,
+                format=fmt,
+                created_at=time.monotonic(),
+                total_chars=len(text),
+                metadata_json=json.dumps(metadata, ensure_ascii=True, allow_nan=False),
+            ),
+            sensitive,
+        )
 
         full = build(self._MAX_PREVIEW)
         if max_chars is None or len(full) <= max_chars:
@@ -1199,7 +1269,7 @@ class SelectiveCompressor:
                 hi = mid - 1
         return best
 
-    def select(self, key: str, sections: list[str]) -> str:
+    def select(self, key: str, sections: list[str], response_format=None) -> str:
         self._store.evict_expired(self._ttl, exclude_format="progressive")
 
         pending = self._store.get(key)
@@ -1208,7 +1278,7 @@ class SelectiveCompressor:
         if pending is None or pending.format == "progressive":
             return f"Selection key '{key}' not found or expired."
 
-        self._store.touch(key)
+        mode = metadata_format(pending.metadata_json, response_format)
 
         selected_parts: list[str] = []
         for section in sections:
@@ -1219,7 +1289,34 @@ class SelectiveCompressor:
             available = list(pending.chunks.keys())
             return f"No matching sections found. Available: {available}"
 
-        return "\n\n".join(selected_parts)
+        raw = (
+            json.loads(pending.metadata_json)
+            if pending.metadata_json and mode == "structured"
+            else {}
+        )
+        records = raw.get("chunks", {})
+        descriptor = envelope(
+            "selection",
+            {
+                "key": key,
+                "source_format": pending.format,
+                "source_offset": raw.get("source_offset", 0),
+                "metadata_complete": raw.get("metadata_complete", False),
+                "chunks": [
+                    {"key": section, "content": pending.chunks[section], **records.get(section, {})}
+                    for section in sections
+                    if section in pending.chunks
+                ],
+            },
+        )
+        if mode == "structured" and delivery_size(descriptor, owned=True) > raw.get(
+            "budget", 16000
+        ):
+            raise DeliveryBudgetExceeded("Select fewer sections or request legacy output.")
+        self._store.touch(key)
+        result = DeliveryText("\n\n".join(selected_parts), descriptor)
+        result.response_format = mode
+        return result
 
     def begin_use(self) -> None:
         """Register an in-flight ``compress()`` before the manager lock drops.
@@ -1278,67 +1375,114 @@ class SelectiveCompressor:
     def _detect_and_parse(self, text: str) -> tuple[str, dict[str, str]]:
         try:
             data = _mm_json_loads(text)
+            if isinstance(data, (dict, list)):
+
+                def pairs(items):
+                    result = {}
+                    for k, v in items:
+                        if k in result or any(0xD800 <= ord(c) <= 0xDFFF for c in k):
+                            raise DeliveryBudgetExceeded("JSON paths require progressive delivery.")
+                        result[k] = v
+                    return result
+
+                def constant(value):
+                    raise DeliveryBudgetExceeded("Nonstandard JSON requires progressive delivery.")
+
+                original = json.loads(text, object_pairs_hook=pairs, parse_constant=constant)
+                if original != data:
+                    raise DeliveryBudgetExceeded("Normalized JSON requires progressive delivery.")
             if isinstance(data, dict):
                 return "json", self._parse_json_dict(data, text)
             if isinstance(data, list):
                 return "json", self._parse_json_array(data)
-        except (json.JSONDecodeError, ValueError):
-            pass
+        except DeliveryError:
+            if delivery_format() == "structured":
+                raise
+            return "text", self._parse_text(text)
+        except (json.JSONDecodeError, ValueError, RecursionError, OverflowError):
+            if delivery_format() == "structured" and text.lstrip().startswith(("{", "[")):
+                raise DeliveryBudgetExceeded("Unparsed JSON requires progressive delivery.")
 
-        if re.search(r"(?:^|\n)#{1,6}\s", text):
+        if next(markdown_headings(text), None) is not None:
             return "markdown", self._parse_markdown(text)
 
         return "text", self._parse_text(text)
 
     def _parse_json_dict(
-        self, data: dict[str, object], raw_text: str, prefix: str = "", depth: int = 0
-    ) -> dict[str, str]:
-        chunks: dict[str, str] = {}
-        next_suffix: dict[str, int] = {}
+        self,
+        data: dict[str, object],
+        raw_text: str,
+        prefix: str = "",
+        depth: int = 0,
+        path: tuple[str | int, ...] = (),
+    ) -> ChunkMap:
+        chunks = ChunkMap()
+        suffixes: dict[str, int] = {}
         for key, value in data.items():
-            full_key = f"{prefix}{key}" if not prefix else f"{prefix}.{key}"
-            if isinstance(value, dict) and depth < self._json_depth:
-                nested = self._parse_json_dict(value, "", prefix=full_key, depth=depth + 1)
-                for nested_key, nested_value in nested.items():
-                    chunks[self._unique_key(chunks, nested_key, next_suffix)] = nested_value
+            full_key = f"{prefix}.{key}" if prefix else key
+            item_path = (*path, key)
+            if isinstance(value, dict) and value and depth < self._json_depth:
+                nested = self._parse_json_dict(value, "", full_key, depth + 1, item_path)
+                for nk, nv in nested.items():
+                    unique = self._unique_key(chunks, nk, suffixes)
+                    chunks[unique] = nv
+                    chunks.records[unique] = nested.records[nk]
             else:
-                chunks[self._unique_key(chunks, full_key, next_suffix)] = json.dumps(
-                    value, ensure_ascii=False, indent=2
-                )
+                unique = self._unique_key(chunks, full_key, suffixes)
+                chunks[unique] = json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False)
+                chunks.records[unique] = {
+                    "json_path": list(item_path),
+                    "value_type": self._value_type(value),
+                }
         return chunks
 
-    def _parse_json_array(self, data: list[object]) -> dict[str, str]:
-        chunks: dict[str, str] = {}
+    @staticmethod
+    def _value_type(value: object) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, dict):
+            return "object"
+        if isinstance(value, list):
+            return "array"
+        if isinstance(value, (int, float)):
+            return "number"
+        return "string"
+
+    def _parse_json_array(self, data: list[object]) -> ChunkMap:
+        chunks = ChunkMap()
         for i, item in enumerate(data):
-            chunks[f"[{i}]"] = json.dumps(item, ensure_ascii=False, indent=2)
+            key = f"[{i}]"
+            chunks[key] = json.dumps(item, ensure_ascii=False, indent=2, allow_nan=False)
+            chunks.records[key] = {"json_path": [i], "value_type": self._value_type(item)}
         return chunks
 
-    def _parse_markdown(self, text: str) -> dict[str, str]:
-        chunks: dict[str, str] = {}
-        next_suffix: dict[str, int] = {}
-        parts = re.split(r"(?:^|\n)(#{1,6}\s+.+)", text)
-        current_heading = ""
-        current_content: list[str] = []
-
-        for part in parts:
-            heading_match = re.match(r"^(#{1,6})\s+(.+)$", part.strip())
-            if heading_match:
-                if current_heading or current_content:
-                    content = "\n".join(current_content).strip()
-                    if content:
-                        key = current_heading or "Preamble"
-                        chunks[self._unique_key(chunks, key, next_suffix)] = content
-                current_heading = heading_match.group(2).strip()
-                current_content = []
-            else:
-                current_content.append(part)
-
-        if current_heading or current_content:
-            content = "\n".join(current_content).strip()
-            if content:
-                key = current_heading or "Preamble"
-                chunks[self._unique_key(chunks, key, next_suffix)] = content
-
+    def _parse_markdown(self, text: str) -> ChunkMap:
+        chunks = ChunkMap()
+        suffixes: dict[str, int] = {}
+        hs = list(markdown_headings(text))
+        spans: list[tuple[str, int, int, Heading | None]] = []
+        if hs and hs[0].start:
+            spans.append(("Preamble", 0, hs[0].start, None))
+        for i, heading in enumerate(hs):
+            spans.append(
+                (
+                    heading.title,
+                    heading.start,
+                    hs[i + 1].start if i + 1 < len(hs) else len(text),
+                    heading,
+                )
+            )
+        for label, start, end, section_heading in spans:
+            if start == end:
+                continue
+            key = self._unique_key(chunks, label, suffixes)
+            chunks[key] = text[start:end]
+            record: dict[str, Any] = {"start": start, "end": end}
+            if section_heading:
+                record["heading"] = {"title": section_heading.title, "level": section_heading.level}
+            chunks.records[key] = record
         return chunks
 
     @staticmethod
@@ -1370,31 +1514,35 @@ class SelectiveCompressor:
         return chunks
 
     def _decompose_single_chunk(self, chunks: dict[str, str], fmt: str) -> dict[str, str]:
-        if not chunks:
+        if not chunks or fmt != "json":
             return chunks
         key, value = next(iter(chunks.items()))
         try:
             parsed = _mm_json_loads(value)
         except (json.JSONDecodeError, ValueError):
             return chunks
+        base = getattr(chunks, "records", {}).get(key, {}).get("json_path", [])
+        result = ChunkMap()
         if isinstance(parsed, dict) and len(parsed) > 1:
-            return {
-                f"{key}.{k}": json.dumps(v, ensure_ascii=False, indent=2) for k, v in parsed.items()
+            items = [(f"{key}.{k}", k, v) for k, v in parsed.items()]
+        elif isinstance(parsed, list) and len(parsed) > 1:
+            items = [(f"{key}[{i}]", i, v) for i, v in enumerate(parsed)]
+        else:
+            return chunks
+        for label, part, item in items:
+            result[label] = json.dumps(item, ensure_ascii=False, indent=2, allow_nan=False)
+            result.records[label] = {
+                "json_path": [*base, part],
+                "value_type": self._value_type(item),
             }
-        if isinstance(parsed, list) and len(parsed) > 1:
-            return {
-                f"{key}[{i}]": json.dumps(item, ensure_ascii=False, indent=2)
-                for i, item in enumerate(parsed)
-            }
-        return chunks
+        return result
 
     def _infer_type(self, key: str, content: str, fmt: str) -> str:
         if fmt == "json":
-            if content.startswith("{"):
-                return "object"
-            if content.startswith("["):
-                return "array"
-            return "string"
+            try:
+                return self._value_type(_mm_json_loads(content))
+            except ValueError:
+                return "string"
         if fmt == "markdown":
             return "heading"
         return "paragraph"
@@ -2340,7 +2488,7 @@ class SkeletonCompressor(_PlainTextRetention):
         if not text or len(text) <= max_chars:
             return text
 
-        headings = list(self._HEADING_RE.finditer(text))
+        headings = heading_matches(text)
         if len(headings) < 2:
             return TruncateCompressor(scorer=self._scorer, min_chars=self._min_chars).compress(
                 text, max_chars=max_chars, context_query=context_query
@@ -2947,6 +3095,7 @@ class HybridCompressor:
                 max_chars=toc_budget,
                 context_query=context_query,
                 sensitivity_source=text,
+                **({"source_offset": head_end} if delivery_format() == "structured" else {}),
             )
         else:
             tail_compressed = _plain_truncate(
@@ -2954,6 +3103,15 @@ class HybridCompressor:
             )
 
         result = head + separator + tail_compressed
+        descriptor = None
+        if isinstance(tail_compressed, DeliveryText):
+            descriptor = envelope(
+                "hybrid",
+                {**tail_compressed.descriptor["payload"], "head": head, "total_chars": len(text)},
+            )
+            if delivery_format() == "structured":
+                descriptor = fit_toc(descriptor, delivery_budget())
+                return DeliveryText(delivery_json(descriptor), descriptor)
         if len(result) > max_chars:
             # A sub-compressor can return more than its requested budget. Avoid
             # raw slicing because it can sever a JSON TOC mid-object, but keep
@@ -2962,11 +3120,15 @@ class HybridCompressor:
             tail_budget = max_chars - len(head) - len(separator)
             fitted_tail = self._fit_toc_tail(tail_compressed, tail_budget, tail_text)
             if fitted_tail is not None:
-                return head + separator + fitted_tail
+                return (
+                    DeliveryText(head + separator + fitted_tail, descriptor)
+                    if descriptor
+                    else head + separator + fitted_tail
+                )
 
             fallback = _plain_truncate(text, max_chars=max_chars, context_query=context_query)
             return fallback[:max_chars]
-        return result
+        return DeliveryText(result, descriptor) if descriptor else result
 
     @staticmethod
     def _fit_toc_tail(tail: str, max_chars: int, source_text: str) -> str | None:

@@ -50,9 +50,9 @@ def response(content, hints=True):
 def old_hint(content, offset):
     start = offset - 1 if offset > 0 and content[offset - 1] == "\n" else offset
     titles = (
-        re.findall(r"(?:^|\n)#{1,6}\s+(.+)", content[start:])
+        re.findall(r"(?:^|\n)#{1,6}[ \t]+(.+)", content[start:])
         if start == 0
-        else re.compile(r"(?:^|\n)#{1,6}\s+(.+)").findall(content, start)
+        else re.compile(r"(?:^|\n)#{1,6}[ \t]+(.+)").findall(content, start)
     )
     result = ", ".join(f'"{h.strip()}"' for h in titles[:5])
     if len(titles) > 5:

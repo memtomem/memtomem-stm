@@ -71,6 +71,8 @@ _BASE_COLUMNS = frozenset(
 # migration runs — adding an entry here cannot get out of sync with the
 # fingerprint, so there is no version number to forget to bump.
 _MIGRATIONS: dict[str, str] = {
+    "delivery_format": "ALTER TABLE proxy_metrics ADD COLUMN delivery_format TEXT NOT NULL DEFAULT 'legacy'",
+    "wire_bytes": "ALTER TABLE proxy_metrics ADD COLUMN wire_bytes INTEGER DEFAULT NULL",
     "compression_accounting": (
         "ALTER TABLE proxy_metrics ADD COLUMN compression_accounting TEXT DEFAULT NULL"
     ),
@@ -235,6 +237,12 @@ def read_compression_summary(
         "saved_ratio": 0.0,
         "by_tool": [],
         "error": None,
+        "structured_delivery": {
+            "calls": 0,
+            "original_chars": 0,
+            "serialized_base_chars": 0,
+            "wire_bytes": 0,
+        },
     }
     if not resolved.exists():
         return summary
@@ -291,6 +299,13 @@ def read_compression_summary(
             conditions.append("source = ?")
             params.append(source)
         where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+        structured = (
+            "COALESCE(compression_accounting = 'initial_structured_v1', 0)"
+            if "compression_accounting" in cols
+            else "0"
+        )
+        legacy = f"NOT ({structured})"
+        wire = "wire_bytes" if "wire_bytes" in cols else "0"
         # Old progressive writers used incompatible bases (#1039). Their values
         # stay in the totals, but rows of unknown basis are counted rather
         # than relabelled. "Unclassified" is limited to what can distort a
@@ -318,11 +333,16 @@ def read_compression_summary(
         # One statement, so the provenance counts and size totals share a
         # snapshot while the server appends rows.
         rows = db.execute(
-            "SELECT server, tool, COUNT(*), SUM(original_chars), "
-            f"SUM(compressed_chars), {error_expr}, "
+            f"SELECT server, tool, SUM(CASE WHEN {legacy} THEN 1 ELSE 0 END), "
+            f"SUM(CASE WHEN {legacy} THEN original_chars ELSE 0 END), "
+            f"SUM(CASE WHEN {legacy} THEN compressed_chars ELSE 0 END), {error_expr}, "
             f"SUM(CASE WHEN {mcp} AND {known} THEN 1 ELSE 0 END), "
-            f"SUM(CASE WHEN {mcp} AND NOT {known} AND {success} AND {sized} "
-            f"THEN 1 ELSE 0 END), {tuner_expr} "
+            f"SUM(CASE WHEN {mcp} AND {legacy} AND NOT {known} AND {success} AND {sized} "
+            f"THEN 1 ELSE 0 END), {tuner_expr}, "
+            f"SUM(CASE WHEN {structured} THEN 1 ELSE 0 END), "
+            f"SUM(CASE WHEN {structured} THEN original_chars ELSE 0 END), "
+            f"SUM(CASE WHEN {structured} THEN compressed_chars ELSE 0 END), "
+            f"SUM(CASE WHEN {structured} THEN {wire} ELSE 0 END) "
             f"FROM proxy_metrics{where} GROUP BY server, tool "
             "ORDER BY COUNT(*) DESC",
             [*select_params, *params],
@@ -336,6 +356,12 @@ def read_compression_summary(
     by_tool: list[dict[str, object]] = []
     total_calls = total_error = total_orig = total_comp = 0
     classified = unclassified = 0
+    structured_totals = {
+        "calls": 0,
+        "original_chars": 0,
+        "serialized_base_chars": 0,
+        "wire_bytes": 0,
+    }
     for (
         server,
         tool_name,
@@ -346,7 +372,15 @@ def read_compression_summary(
         known_calls,
         unknown_calls,
         tuner_calls,
+        structured_calls,
+        structured_orig,
+        structured_base,
+        structured_wire,
     ) in rows:
+        for k, v in zip(
+            structured_totals, (structured_calls, structured_orig, structured_base, structured_wire)
+        ):
+            structured_totals[k] += v or 0
         classified += known_calls or 0
         unclassified += unknown_calls or 0
         calls = calls or 0
@@ -374,7 +408,8 @@ def read_compression_summary(
     summary["unclassified_mcp_calls"] = unclassified
     if unclassified:
         summary["measurement"] = _MEASUREMENT_MIXED
-    summary["total_calls"] = total_calls
+    summary["structured_delivery"] = structured_totals
+    summary["total_calls"] = total_calls + structured_totals["calls"]
     summary["error_count"] = total_error
     summary["total_original_chars"] = total_orig
     summary["total_compressed_chars"] = total_comp
@@ -625,8 +660,8 @@ class MetricsStore:
                 "index_ok, index_error, chunks_indexed, "
                 "extract_ok, extract_error, "
                 "surfacing_on_progressive_ok, surface_error, source, created_at, "
-                "compression_accounting) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "compression_accounting, delivery_format, wire_bytes) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     metrics.server,
                     metrics.tool,
@@ -668,6 +703,8 @@ class MetricsStore:
                     metrics.source,
                     now,
                     metrics.compression_accounting,
+                    metrics.delivery_format,
+                    metrics.wire_bytes,
                 ),
             )
             # One transaction for the insert and the trim it may trigger. If the

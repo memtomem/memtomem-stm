@@ -316,7 +316,7 @@ class TestSelectChunks:
 
         ctx = _make_ctx(proxy_manager=pm)
         result = await stm_proxy_select_chunks(key="k1", sections=["a"], ctx=ctx)
-        assert result == "chunk data"
+        assert result.structured_content == {"result": "chunk data"}
 
 
 # ── stm_proxy_read_more ──────────────────────────────────────────────────
@@ -327,19 +327,19 @@ class TestReadMore:
         """Negative offset returns an error message."""
         ctx = _make_ctx()
         result = await stm_proxy_read_more(key="k1", offset=-1, ctx=ctx)
-        assert "offset must be >= 0" in result.lower()
+        assert "offset must be >= 0" in result.content[0].text.lower()
 
     async def test_negative_limit(self):
         """Negative limit returns an error message."""
         ctx = _make_ctx()
         result = await stm_proxy_read_more(key="k1", offset=0, limit=-1, ctx=ctx)
-        assert "limit must be >= 1" in result.lower()
+        assert "limit must be >= 1" in result.content[0].text.lower()
 
     async def test_zero_limit(self):
         """Zero limit returns an error message."""
         ctx = _make_ctx()
         result = await stm_proxy_read_more(key="k1", offset=0, limit=0, ctx=ctx)
-        assert "limit must be >= 1" in result.lower()
+        assert "limit must be >= 1" in result.content[0].text.lower()
 
     async def test_delegates(self):
         """stm_proxy_read_more delegates to proxy_manager.read_more."""
@@ -348,7 +348,7 @@ class TestReadMore:
             ctx = _make_ctx(proxy_manager=pm)
             result = await stm_proxy_read_more(key="k1", offset=100, limit=50, ctx=ctx)
 
-        assert result == "more content"
+        assert result.structured_content == {"result": "more content"}
         mock_rm.assert_called_once_with("k1", 100, 50)
 
 

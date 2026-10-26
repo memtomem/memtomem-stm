@@ -18,6 +18,7 @@ from memtomem_stm.proxy.compression import (
     SensitivePayloadNotStored,
     payload_has_credentials,
 )
+from memtomem_stm.proxy.delivery import progressive_metadata_format
 from memtomem_stm.proxy.heading_index import HeadingIndex, ensure_heading_index
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.utils.json_out import scrub_lone_surrogates
@@ -34,13 +35,30 @@ def _parse_progressive_metadata(raw: str | bytes | None) -> dict[str, Any] | Non
     A malformed object or an explicit invalid TTL is a miss, not a default.
     """
     try:
-        meta = scrub_lone_surrogates(json.loads(raw)) if raw is not None else None
+        meta = json.loads(raw) if raw is not None else None
+        if isinstance(meta, dict):
+            for identity in ("server", "tool", "trace_id"):
+                if isinstance(meta.get(identity), str):
+                    meta[identity].encode("utf-8")
+            meta = scrub_lone_surrogates(meta)
         if not isinstance(meta, dict):
             return None
         ttl = meta.get("ttl_seconds", 1800.0)
         if isinstance(ttl, bool) or not isinstance(ttl, (int, float)):
             return None
         if not math.isfinite(ttl) or ttl < 0:
+            return None
+        for name in ("total_lines", "access_count", "chunk_size"):
+            if name in meta and (
+                type(meta[name]) is not int or meta[name] < (1 if name == "chunk_size" else 0)
+            ):
+                return None
+        if "include_structure_hint" in meta and type(meta["include_structure_hint"]) is not bool:
+            return None
+        for name in ("server", "tool", "content_type", "structure_hint"):
+            if name in meta and not isinstance(meta[name], str):
+                return None
+        if meta.get("trace_id") is not None and not isinstance(meta["trace_id"], str):
             return None
     except (ValueError, TypeError, OverflowError, RecursionError):
         return None
@@ -155,6 +173,7 @@ class InMemoryPendingStore:
                 del self._data[key]
                 self._order.remove(key)
                 return None
+            progressive_metadata_format(meta)
             index = None
             if meta.get("include_structure_hint", True):
                 index, _ = ensure_heading_index(sel.chunks["__content__"], sel.chunks)
@@ -269,7 +288,8 @@ class SQLitePendingStore:
                     format TEXT NOT NULL,
                     created_at REAL NOT NULL,
                     total_chars INTEGER NOT NULL,
-                    seq INTEGER
+                    seq INTEGER,
+                    metadata_json TEXT
                 )"""
             )
             # ``seq`` is the eviction order (#901), added after the table
@@ -308,6 +328,20 @@ class SQLitePendingStore:
         except Exception:
             db.close()
             raise
+        try:
+            if not any(
+                r[1] == "metadata_json" for r in db.execute("PRAGMA table_info(pending_selections)")
+            ):
+                with db:
+                    db.execute("BEGIN IMMEDIATE")
+                    if not any(
+                        r[1] == "metadata_json"
+                        for r in db.execute("PRAGMA table_info(pending_selections)")
+                    ):
+                        db.execute("ALTER TABLE pending_selections ADD COLUMN metadata_json TEXT")
+        except Exception:
+            db.close()
+            raise
         self._db = db
 
     @staticmethod
@@ -333,7 +367,7 @@ class SQLitePendingStore:
     @staticmethod
     def _row_payload(selection: PendingSelection) -> str:
         chunks_json = _json_dumps(selection.chunks, ensure_ascii=False)
-        if payload_has_credentials(chunks_json):
+        if payload_has_credentials(chunks_json + (selection.metadata_json or "")):
             raise SensitivePayloadNotStored(
                 "credential-bearing row not written to the persistent pending store"
             )
@@ -352,14 +386,15 @@ class SQLitePendingStore:
         with self._lock:
             self._get_db().execute(
                 "INSERT OR REPLACE INTO pending_selections "
-                "(key, chunks_json, format, created_at, total_chars, seq) "
-                f"VALUES (?, ?, ?, ?, ?, {self._NEXT_SEQ})",
+                "(key, chunks_json, format, created_at, total_chars, metadata_json, seq) "
+                f"VALUES (?, ?, ?, ?, ?, ?, {self._NEXT_SEQ})",
                 (
                     key,
                     chunks_json,
                     selection.format,
                     time.time(),
                     selection.total_chars,
+                    selection.metadata_json,
                 ),
             )
             self._get_db().commit()
@@ -369,7 +404,7 @@ class SQLitePendingStore:
             row = (
                 self._get_db()
                 .execute(
-                    "SELECT chunks_json, format, created_at, total_chars "
+                    "SELECT chunks_json, format, created_at, total_chars, metadata_json "
                     "FROM pending_selections WHERE key = ?",
                     (key,),
                 )
@@ -387,18 +422,36 @@ class SQLitePendingStore:
             # some other writer (or a hand edit) put there decodes straight back
             # into the code unit, and would then raise at the next encode
             # downstream rather than here (#761).
-            chunks = scrub_lone_surrogates(json.loads(row[0]))
+            chunks = json.loads(row[0])
+            if isinstance(chunks, dict):
+                for identity in chunks:
+                    identity.encode("utf-8")
+            chunks = scrub_lone_surrogates(chunks)
         except (ValueError, TypeError, RecursionError):
             logger.warning(
                 "Corrupted chunks_json in pending_selections for key=%s; treating as miss",
                 key,
             )
             return None
+        if (
+            not isinstance(chunks, dict)
+            or not all(isinstance(k, str) and isinstance(v, str) for k, v in chunks.items())
+            or not isinstance(row[1], str)
+            or isinstance(row[2], bool)
+            or not isinstance(row[2], (int, float))
+            or not math.isfinite(row[2])
+            or row[2] < 0
+            or type(row[3]) is not int
+            or row[3] < 0
+        ):
+            logger.warning("Invalid pending selection fields; treating as miss")
+            return None
         return PendingSelection(
             chunks=chunks,
             format=row[1],
             created_at=row[2],
             total_chars=row[3],
+            metadata_json=row[4] if len(row) > 4 else None,
         )
 
     def get_progressive(self, key: str, *, renew: bool = False) -> ProgressiveEntry | None:
@@ -423,7 +476,7 @@ class SQLitePendingStore:
             with db:
                 db.execute("BEGIN IMMEDIATE")
                 row = db.execute(
-                    "SELECT chunks_json, format, created_at, total_chars "
+                    "SELECT chunks_json, format, created_at, total_chars, metadata_json "
                     "FROM pending_selections WHERE key = ? AND format = 'progressive'",
                     (key,),
                 ).fetchone()
@@ -435,6 +488,7 @@ class SQLitePendingStore:
                 if meta is None or sel is None:
                     db.execute("DELETE FROM pending_selections WHERE key = ?", (key,))
                     return None
+                progressive_metadata_format(meta)
                 index = None
                 repaired = False
                 if meta.get("include_structure_hint", True):

@@ -85,6 +85,10 @@ class ProgressiveReadsStore:
                 db.execute(
                     "ALTER TABLE progressive_reads ADD COLUMN is_initial INTEGER DEFAULT NULL"
                 )
+            if "wire_bytes" not in columns:
+                db.execute(
+                    "ALTER TABLE progressive_reads ADD COLUMN wire_bytes INTEGER DEFAULT NULL"
+                )
             # Startup purge of aged-out rows (#584) — the table is append-only
             # and otherwise unbounded. Runs once per process start, mirroring
             # ProxyCache's startup expiry purge. ``retention_days=0`` disables.
@@ -170,6 +174,16 @@ class ProgressiveReadsStore:
             )
             self._db.commit()
 
+    def record_wire(self, key: str, wire_bytes: int, *, initial: bool, offset: int = 0) -> None:
+        if self._db is None:
+            return
+        with self._lock:
+            self._db.execute(
+                "UPDATE progressive_reads SET wire_bytes = ? WHERE id = (SELECT MAX(id) FROM progressive_reads WHERE key = ? AND is_initial = ? AND offset = ?)",
+                (wire_bytes, key, int(initial), offset),
+            )
+            self._db.commit()
+
     def get_stats(self, tool: str | None = None) -> dict:
         """Return aggregate stats for ``stm_progressive_stats``.
 
@@ -205,6 +219,9 @@ class ProgressiveReadsStore:
             "avg_total_chars": 0.0,
             "avg_coverage": 0.0,
             "by_tool": {},
+            "initial_wire_bytes": 0,
+            "follow_up_wire_bytes": 0,
+            "wire_measured_reads": 0,
         }
         if self._db is None:
             return empty
@@ -228,7 +245,9 @@ class ProgressiveReadsStore:
             "SELECT key, MAX(served_to), MAX(total_chars), tool, COUNT(*), "
             "COALESCE(SUM(CASE WHEN is_initial = 1 THEN chars ELSE 0 END), 0), "
             "COALESCE(SUM(CASE WHEN is_initial = 0 THEN chars ELSE 0 END), 0), "
-            "SUM(CASE WHEN is_initial IS NULL THEN 1 ELSE 0 END) "
+            "SUM(CASE WHEN is_initial IS NULL THEN 1 ELSE 0 END), "
+            "COALESCE(SUM(CASE WHEN is_initial = 1 THEN wire_bytes END),0), "
+            "COALESCE(SUM(CASE WHEN is_initial = 0 THEN wire_bytes END),0), COUNT(wire_bytes) "
             f"FROM progressive_reads {where} GROUP BY key",
             params,
         ).fetchall()
@@ -263,7 +282,11 @@ class ProgressiveReadsStore:
                     "follow_up_rate": followed / responses if responses else 0.0,
                 }
 
+        wires = tuple(sum(r[i] for r in per_key_rows) for i in (8, 9, 10))
         return {
+            "initial_wire_bytes": wires[0],
+            "follow_up_wire_bytes": wires[1],
+            "wire_measured_reads": wires[2],
             "initial_payload_chars": sum(r[5] for r in per_key_rows),
             "follow_up_payload_chars": sum(r[6] for r in per_key_rows),
             "unclassified_reads": sum(r[7] for r in per_key_rows),

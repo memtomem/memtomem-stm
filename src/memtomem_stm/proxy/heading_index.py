@@ -2,15 +2,15 @@
 
 import base64
 import binascii
-import re
 import struct
 import zlib
 from typing import Any
 
-_CANDIDATES = re.compile(r"(?=((?:^|\n)#{1,6}\s+(.+)))")
-_HEADING_RE = re.compile(r"(?:^|\n)#{1,6}\s+(.+)")
-INDEX_KEY = "__heading_index__"
-# Binary records: regex start, title start, match end, next record, suffix count.
+from memtomem_stm.proxy.markdown_structure import headings
+
+INDEX_KEY = "__heading_index_v3__"
+LEGACY_INDEX_KEY = "__heading_index__"
+# Binary records: heading start, title start, title end, next record, suffix count.
 _RECORD = struct.Struct("<IIIII")
 MAX_ROWS = 100_000
 MAX_BYTES = MAX_ROWS * _RECORD.size
@@ -38,12 +38,11 @@ def build_heading_index(content: str) -> HeadingIndex:
     if len(content) >= 2**32:
         return FALLBACK
     rows = bytearray()
-    # Lookahead preserves overlapping candidates such as '# \n# title'.
     # Stop before a pathological response allocates an unbounded index.
-    for m in _CANDIDATES.finditer(content):
+    for m in headings(content):
         if len(rows) == MAX_BYTES:
             return FALLBACK
-        rows.extend(_RECORD.pack(m.start(1), m.start(2), m.end(1), 0, 0))
+        rows.extend(_RECORD.pack(m.start, m.title_start, m.end, 0, 0))
     n = len(rows) // _RECORD.size
     for i in range(n - 1, -1, -1):
         nxt = _lower_bound(rows, _field(rows, i, 2), i + 1)
@@ -67,13 +66,13 @@ def encode_heading_index(rows: HeadingIndex) -> str:
     # arrays or per-record JSON. Inverse uses 20 C-level extended slice copies.
     shuffled = b"".join(rows[i :: _RECORD.size] for i in range(_RECORD.size))
     encoded = base64.b64encode(zlib.compress(shuffled)).decode("ascii")
-    return "v2:" + encoded if len(encoded) + 3 <= MAX_ENCODED else "scan"
+    return "v3:" + encoded if len(encoded) + 3 <= MAX_ENCODED else "scan"
 
 
 def decode_heading_index(value: Any) -> HeadingIndex | None:
     if value == "scan":
         return FALLBACK
-    if not isinstance(value, str) or not value.startswith("v2:") or len(value) > MAX_ENCODED:
+    if not isinstance(value, str) or not value.startswith("v3:") or len(value) > MAX_ENCODED:
         return None
     try:
         packed = base64.b64decode(value[3:], validate=True)
@@ -107,7 +106,7 @@ def ensure_heading_index(content: str, chunks: dict[str, str]) -> tuple[HeadingI
 
 def legacy_remaining_headings(content: str, offset: int) -> str:
     start = offset - 1 if offset > 0 and content[offset - 1] == "\n" else offset
-    titles = _HEADING_RE.findall(content, start)
+    titles = [h.title for h in headings(content) if h.start >= start]
     return _render([title.strip() for title in titles[:5]], len(titles))
 
 

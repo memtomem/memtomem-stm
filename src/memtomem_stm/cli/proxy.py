@@ -2296,6 +2296,7 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
     servers: dict[str, Any] = data.get("upstream_servers", {})
     from memtomem_stm.proxy.config import (
         compression_source,
+        effective_delivery_format,
         effective_compression_pair,
     )
 
@@ -2324,6 +2325,11 @@ def list_servers(config_path: str | None, *, as_json: bool = False) -> None:
                 "prefix": server.prefix,
                 "transport": server.transport.value,
                 "surfacing_enabled": server.surfacing_enabled,
+                "delivery_format": effective_delivery_format(server, None, typed_config),
+                "tool_delivery_overrides": {
+                    tool: effective_delivery_format(server, override, typed_config)
+                    for tool, override in server.tool_overrides.items()
+                },
             }
             strategy, _ = effective_compression_pair(server, None, typed_config)
             compression_info[name] = {
@@ -2444,6 +2450,11 @@ def _render_compression_block(summary: dict[str, Any]) -> None:
     orig = summary["total_original_chars"]
     comp = summary["total_compressed_chars"]
     ratio = float(summary["saved_ratio"]) * 100
+    structured = summary.get("structured_delivery", {})
+    if structured.get("calls"):
+        click.echo(
+            f"Structured delivery: {structured['calls']} calls; {structured['serialized_base_chars']} serialized base chars; {structured['wire_bytes']} measured MCP bytes (separate accounting)"
+        )
     click.echo(f"  calls: {summary['total_calls']}  (errors: {summary['error_count']})")
     click.echo(f"  chars: {orig:,} -> {comp:,}  (saved {summary['saved_chars']:,}, {ratio:.1f}%)")
     click.echo("  MCP rows measure initial text before surfacing; follow-up reads are excluded.")

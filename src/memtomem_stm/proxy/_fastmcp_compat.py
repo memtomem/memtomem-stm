@@ -27,6 +27,49 @@ from memtomem_stm.proxy.tool_metadata import (
 )
 
 
+def install_delivery_wire_context(server: MCPServer) -> None:
+    """Include negotiated SDK additions/sieving in STM delivery measurements.
+
+    This public middleware context also follows synchronous continuation tools
+    into their worker threads. Keep SDK wire-surface knowledge in this adapter.
+    """
+    from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
+    from mcp_types import Implementation, SERVER_INFO_META_KEY, methods
+    from mcp_types.version import MODERN_PROTOCOL_VERSIONS
+
+    from memtomem_stm.proxy.delivery import wire_projection_scope
+
+    info = Implementation(
+        name=server.name,
+        version=server.version,
+        title=server.title,
+        description=server.description,
+        website_url=server.website_url,
+        icons=server.icons,
+    ).model_dump(by_alias=True, mode="json", exclude_none=True)
+
+    async def middleware(ctx: ServerRequestContext[Any], call_next: CallNext) -> HandlerResult:
+        if ctx.method != "tools/call":
+            return await call_next(ctx)
+        version = ctx.protocol_version
+
+        def project(data: dict[str, Any]) -> dict[str, Any]:
+            value = methods.serialize_server_result("tools/call", version, data)
+            if version in MODERN_PROTOCOL_VERSIONS:
+                value.setdefault("resultType", "complete")
+                meta = value.get("_meta")
+                if meta is None:
+                    value["_meta"] = {SERVER_INFO_META_KEY: info}
+                elif isinstance(meta, dict) and meta.get(SERVER_INFO_META_KEY) is None:
+                    value["_meta"] = {**meta, SERVER_INFO_META_KEY: info}
+            return value
+
+        with wire_projection_scope(project):
+            return await call_next(ctx)
+
+    server.middleware.append(middleware)
+
+
 def to_call_tool_result(result: str | list | CallToolResult) -> CallToolResult:
     """Normalize a ``ProxyManager.call_tool`` return into a ``CallToolResult``.
 

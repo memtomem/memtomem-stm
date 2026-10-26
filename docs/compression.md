@@ -515,3 +515,99 @@ A tool whose history is entirely unclassified reports no average and gets no
 ratio-based budget advice until new calls accumulate; its violation-rate and
 strategy advice are unchanged. The report states how many classified calls the
 average covers.
+
+
+## Structured chunk delivery
+
+Set `delivery_format: "structured"` globally, on an upstream, or on a tool
+(closest override wins). The default stays `legacy`. Progressive, selective and
+hybrid publishers remember this choice on the key; a later configuration reload
+does not change that key's default. Continuation tools can override it with
+`response_format`. Exact TOC keys select sections; displayed names and STM IDs
+do not participate in lookup.
+
+For an eligible text-only response, initial delivery places STM JSON in the text
+block. A continuation returns that JSON in text plus `structuredContent`:
+
+```json
+{"result":"STM progressive delivery","stm":{"schema_version":1,"kind":"progressive","offset_unit":"unicode_codepoint","payload":{"key":"example","source_format":"text","content":"actual content","offset":0,"next_offset":14,"total_chars":200,"has_more":true,"ttl_seconds_remaining":1800}}}
+```
+
+`stm.payload` contains the actual content and control fields. Body text may
+contain the legacy footer token without affecting structured reconstruction.
+Concatenate progressive `content` fields exactly and use each `next_offset`
+unmodified. Offsets, limits and Markdown source ranges count
+Unicode code points, not UTF-8 bytes or JavaScript UTF-16 code units. Selection
+records include exact keys, internal IDs, JSON paths/value types or Markdown
+heading/source ranges. Hybrid records add the tail's `source_offset` to source
+ranges so they still refer to the full document. JSON paths are arrays of object
+keys and integer array indexes. Old rows without those facts report incomplete metadata;
+no provenance is invented.
+
+Upstream `structuredContent`, non-text blocks and existing annotated-block
+preservation paths are not replaced by an STM envelope. They pass through their
+preservation path without a new STM key. This avoids relying on undocumented
+client choices between text and structured data. Surfacing and index notices
+are separate optional `stm.supplements` fields, never text appended outside JSON.
+
+The structured base budget measures the serialized MCP result before optional
+surfacing/index notices, including JSON escapes and both representations on
+continuations. It includes the negotiated SDK wire surface: modern clients'
+serverInfo metadata and resultType, and legacy clients' field filtering.
+`chunk_size`/`limit` are source-character upper bounds: a chunk
+can be shortened to fit. A TOC that cannot fit without dropping keys falls back
+to progressive delivery. A budget too small for one progressing envelope returns
+`budget_exceeded`. Selection continuations never truncate chosen sections: ask
+for fewer keys or `response_format: "legacy"` if they exceed their stored budget.
+Raw/nonstandard JSON, duplicate keys and unrepresentable paths use progressive
+delivery in structured mode. Privacy refusal and store failure keep their
+existing safe fallback behavior, and those degraded results remain uncached.
+
+### Accounting and compatibility
+
+Legacy `initial_response_v1` rows keep their original measurement. Structured
+rows use `initial_structured_v1`, record `delivery_format`, and count serialized
+base-result characters. `mms stats` and runtime stats report a separate
+`structured_delivery` group; their byte/character totals are not combined into
+a single legacy saved ratio. Final `wire_bytes` count the complete MCP tool
+result, including supplements, text and structured representations, but exclude
+JSON-RPC framing. Progressive stats expose initial/follow-up wire bytes and a
+count of measured reads; NULL/older observations are not invented. These are
+transport observations, not billed token savings.
+
+A nullable `metadata_json` column holds selective/hybrid metadata; progressive
+presentation metadata extends existing `__meta__`, keeping TTL authoritative
+there. Unsupported presentation metadata does not cause deletion or renewal.
+Explicit legacy reads can still use valid payloads. Only actual expiry or the
+existing invalid-body/invalid-TTL policy can remove a row.
+
+The v3 heading index uses `__heading_index_v3__`; the old key remains compatible
+(`scan` on new entries). Old and new readers therefore do not ping-pong one
+index between versions. Fallback scanning starts at the document beginning to
+recover fence state. Upgrade all processes sharing a pending DB together.
+Stop the old daemon for this configuration before upgrading, then start the
+new daemon: protocol v9 separates identity-safe peers from old scrubbers.
+Memory-backed keys do not survive restart; SQLite recovery retains valid keys.
+
+Installed-client smoke tests ran on 2026-10-26 against the modified worktree:
+
+| Client | Structured progressive/selective/hybrid | Upstream structured-content wire preservation | Actual payload visible through text |
+|---|---|---|---|
+| Claude Code 2.1.310 | PASS | PASS | PASS |
+| Codex CLI 0.164.0 | PASS | PASS | PASS |
+| Kimi Code 0.39.0 | PASS | PASS | PASS |
+
+All three also passed legacy progressive/selective continuation checks and exact
+Unicode reconstruction. The additional structured-only upstream probe exposed a
+Kimi limitation: the MCP wire retained the record, but Kimi gave its model only
+the text summary. Upstream servers targeting that client should put the actual
+JSON into a text block too. STM's structured chunk format already does this.
+The tests used temporary state and synthetic upstream documents, with 15 MCP
+calls per client. Captured responses stayed within the configured serialized
+budgets, and progressive wire-byte metrics matched the actual tool results.
+The structured-only probe passed on Claude Code and Codex CLI, while Kimi
+returned `UNAVAILABLE` despite the upstream field being intact on the wire.
+
+These bounded smoke tests do not establish GUI behavior, production readiness,
+or acceptable latency/volume across providers and workloads. The default remains
+legacy; a future default change is a separate release decision.

@@ -11,6 +11,48 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Behavior change**: Markdown heading detection now ignores fenced code across
+  compression, hints and indexes. Selection chunks preserve heading levels and
+  original Markdown ranges; affected TOC keys/content may change.
+- **Behavior change**: non-finite pending/progressive/cache TTL settings are rejected;
+  malformed search responses are reported as parse errors instead of empty hits.
+- **Behavior change**: generated memory metadata escapes Unicode line separators.
+  Extracted tags now live in frontmatter, so new files participate in Core tag
+  filtering. Existing Markdown files are not rewritten.
+- **Behavior change**: compact fallback IDs use a versioned namespace/source/content
+  digest. Old feedback/dedup history is retained but cannot be inferred onto new IDs.
+- Upgrade/restart processes sharing pending SQLite files together. Presentation
+  metadata adds a nullable column; valid old rows remain readable. Heading index
+  v3 has a separate key, avoiding old/new index rewrite loops. Stop the old scoped
+  daemon before upgrading; protocol v9 prevents an old peer from rewriting IDs.
+  Invalid raw chunk/correlation identities are refused before content escaping.
+- The first response-cache open runs a one-time sweep to remove structured STM
+  continuation keys. Switching between old and new cache policies repeats that
+  sweep; large caches can take longer to open.
+
+### Added
+
+- Opt-in `delivery_format="structured"` with server/tool overrides and optional
+  `response_format` on STM-owned continuation tools. Required `result:string`
+  output remains compatible; structured replies add `stm` and typed errors.
+  Installed Claude Code, Codex CLI and Kimi Code smoke tests pass with actual
+  payloads in text. Kimi's structured-only upstream visibility is limited;
+  legacy remains the default. See compatibility notes in `docs/compression.md`.
+- Typed chunk metadata, exact code-point offsets, response-budget fitting, and
+  whole-MCP wire observations with separate structured compression accounting.
+  Negotiated SDK metadata and legacy field filtering count in the same budget
+  and wire measurements; installed-client tests verify the actual final wire.
+
+### Fixed
+
+- All locally issued progressive/selective/hybrid keys bypass the response cache
+  using an out-of-band publication signal. Upstream key detection and startup
+  cleanup recognize legacy and versioned structured delivery.
+- JSON storage/search validation, one-pass structured search parsing, and
+  bidirectional daemon identity validation before content escaping.
+
 ## [0.6.8] — 2026-10-24
 
 ### Upgrade notes

@@ -27,9 +27,11 @@ from memtomem_stm.surfacing.mcp_client import (
     decode_context_compose_context,
     read_score_scale_hint,
     require_context_compose_lists,
+    validate_compose_item,
 )
 from memtomem_stm.surfacing.rrf_profile import read_score_ceiling_hint
 from memtomem_stm.utils.numeric import safe_float
+from memtomem_stm.utils.json_out import has_lone_surrogate
 
 logger = logging.getLogger(__name__)
 _SEARCH_OUTCOMES = frozenset(get_args(SearchOutcome))
@@ -154,8 +156,12 @@ class DaemonLtmAdapter:
         )
 
         def decode(item: Any, *, pinned: bool):
-            if not isinstance(item, dict) or not isinstance(item.get("content"), str):
-                raise ValueError("daemon context item malformed")
+            validate_compose_item(item, pinned=pinned)
+            if any(
+                has_lone_surrogate(item.get(name, "") or "")
+                for name in ("chunk_id", "id", "block_id")
+            ):
+                raise ValueError("daemon context item has invalid identity")
             context = None
             if not pinned and selected_schema >= 3 and "context" in item:
                 context = decode_context_compose_context(
@@ -166,8 +172,8 @@ class DaemonLtmAdapter:
             result = RemoteSearchResult(
                 item["content"],
                 safe_float(item.get("score"), 1.0 if pinned else 0.0),
-                source=str(item.get("source") or ""),
-                namespace=str(item.get("namespace") or "default"),
+                source=item.get("source", ""),
+                namespace=item.get("namespace", "default"),
                 pinned=pinned,
                 context=context,
                 score_scale=None if pinned else score_scale,
@@ -284,17 +290,26 @@ class DaemonLtmAdapter:
 
         results: list[RemoteSearchResult] = []
         for item in raw_results:
-            if not isinstance(item, dict) or not isinstance(item.get("content"), str):
-                continue
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("content"), str)
+                or not isinstance(item.get("source", ""), str)
+                or not isinstance(item.get("namespace", "default"), str)
+                or not isinstance(item.get("chunk_id", ""), str)
+                or has_lone_surrogate(item.get("chunk_id", ""))
+                or isinstance(item.get("score"), bool)
+                or not isinstance(item.get("score"), (int, float))
+            ):
+                return [], [], "parse_error"
             score = safe_float(item.get("score"), float("nan"))
             if not math.isfinite(score):
-                continue
+                return [], [], "parse_error"
             scale = read_score_scale_hint(item.get("score_scale"))
             result = RemoteSearchResult(
                 content=item["content"],
                 score=score,
-                source=str(item.get("source") or ""),
-                namespace=str(item.get("namespace") or "default"),
+                source=item.get("source") or "",
+                namespace=item.get("namespace") or "default",
                 score_scale=scale,
                 reranker=read_score_scale_hint(item.get("reranker")),
                 # Forwarded bucket ceiling (#1034); absent from an old daemon.

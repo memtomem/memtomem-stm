@@ -2,6 +2,24 @@
 
 from __future__ import annotations
 
+from memtomem_stm.proxy.config import effective_delivery_format
+
+from memtomem_stm.proxy.delivery import (
+    DeliveryFormat,
+    DeliveryText,
+    DeliveryBudgetExceeded,
+    delivery_scope,
+    delivery_format,
+    delivery_budget,
+    delivery_json,
+    delivery_size,
+    delivery_result,
+    envelope,
+    error_result,
+    fit_progressive,
+    wire_json,
+)
+
 import asyncio
 from copy import deepcopy
 import functools
@@ -378,6 +396,7 @@ class ToolConfig:
     retention_floor: float | None = None
     token_budget: int | None = None
     token_estimation_mode: TokenEstimationMode = TokenEstimationMode.STATIC
+    delivery_format: DeliveryFormat = "legacy"
 
 
 # Field classification for ``compression_fingerprint``. Every ``ToolConfig``
@@ -404,7 +423,9 @@ _FINGERPRINT_FIELDS = frozenset(
         "token_estimation_mode",
     }
 )
-_FINGERPRINT_EXCLUDED_FIELDS = frozenset({"auto_index_enabled", "extraction_enabled"})
+_FINGERPRINT_EXCLUDED_FIELDS = frozenset(
+    {"auto_index_enabled", "extraction_enabled", "delivery_format"}
+)
 
 
 def compression_fingerprint(
@@ -4053,6 +4074,8 @@ class ProxyManager:
         if compression == CompressionStrategy.PROGRESSIVE and progressive_cfg is None:
             progressive_cfg = ProgressiveConfig()
 
+        delivery_mode = effective_delivery_format(cfg, override, config)
+
         return ToolConfig(
             compression=compression,
             max_chars=max_chars,
@@ -4066,6 +4089,7 @@ class ProxyManager:
             retention_floor=retention_floor,
             token_budget=token_budget,
             token_estimation_mode=token_estimation_mode,
+            delivery_format=delivery_mode,
         )
 
     def _cache_key_fingerprint(self, server: str, tool: str, *, cfg_snap: ProxyConfig) -> str:
@@ -4388,6 +4412,8 @@ class ProxyManager:
         cfg_snap: ProxyConfig,
     ) -> str:
         """Apply proactive memory surfacing if eligible."""
+        if isinstance(text, DeliveryText) and delivery_format() == "structured":
+            text = ""
         if self._surfacing_engine is None:
             return text
         if not self._surfacing_enabled_for(server, cfg_snap=cfg_snap):
@@ -4456,6 +4482,17 @@ class ProxyManager:
         test_concat_invariant_under_surfacing`` for the empirical proof of
         which modes are safe.
         """
+        if isinstance(text, DeliveryText) and delivery_format() == "structured":
+            surfaced = await self._apply_surfacing(
+                server,
+                tool,
+                arguments,
+                text,
+                trace_id=trace_id,
+                context_query=context_query,
+                cfg_snap=cfg_snap,
+            )
+            return surfaced, True, None
         if self._surfacing_engine is None:
             return text, None, None
         if not self._surfacing_enabled_for(server, cfg_snap=cfg_snap):
@@ -4896,7 +4933,9 @@ class ProxyManager:
         configured SQLite stores for the key (#583)."""
         return "not found or expired" in text
 
-    def select_chunks(self, key: str, sections: list[str]) -> str:
+    def select_chunks(
+        self, key: str, sections: list[str], response_format: DeliveryFormat | None = None
+    ) -> str:
         # ONE generation for the whole recovery: the configs probed, the one
         # chosen, and the scorer baked into the compressor cached below must
         # not come from separate loader reads that can straddle a re-load.
@@ -4958,7 +4997,11 @@ class ProxyManager:
         active = self._selective_compressor
         if active is None:
             return "Selective compression not active — no pending TOC selections."
-        result = active.select(key, sections)
+        result = active.select(
+            key,
+            sections,
+            **({"response_format": response_format} if response_format is not None else {}),
+        )
         if len(cfgs) > 1 and self._is_recovery_miss(result):
             # The cached compressor's store did not hold the key, but with
             # multiple distinct stores configured an earlier call may have
@@ -4976,7 +5019,7 @@ class ProxyManager:
                     )
                     return result
                 try:
-                    return tmp.select(key, sections)
+                    return tmp.select(key, sections, response_format=response_format)
                 finally:
                     tmp.close()
         return result
@@ -5070,9 +5113,11 @@ class ProxyManager:
         resp = ProgressiveResponse(
             content=text,
             total_chars=len(text),
-            total_lines=0,
-            content_type="text",
-            structure_hint="",
+            total_lines=text.count("\n") + 1,
+            content_type=ProgressiveChunker.detect_content_type(text),
+            structure_hint=ProgressiveChunker.structure_hint(text)
+            if cfg.include_structure_hint
+            else "",
             created_at=_time.monotonic(),
             ttl_seconds=cfg.ttl_seconds,
             server=server,
@@ -5080,7 +5125,21 @@ class ProxyManager:
             trace_id=trace_id,
             chunk_size=cfg.chunk_size,
             include_structure_hint=cfg.include_structure_hint,
+            delivery_format=delivery_format(),
+            delivery_budget=delivery_budget(),
         )
+        descriptor = None
+        if delivery_format() == "structured":
+            descriptor = fit_progressive(
+                text,
+                key=key,
+                offset=0,
+                limit=cfg.chunk_size,
+                source_format=ProgressiveChunker.detect_content_type(text),
+                ttl=cfg.ttl_seconds,
+                budget=delivery_budget(),
+                owned=False,
+            )
         store.put(key, resp, before_write=evict if pin_is_live else None)
 
         chunker = ProgressiveChunker(
@@ -5097,12 +5156,37 @@ class ProxyManager:
                 trace_id=trace_id,
                 server=server,
                 tool=tool,
-                initial_chars=first.payload_chars,
+                initial_chars=len(descriptor["payload"]["content"])
+                if descriptor
+                else first.payload_chars,
                 total_chars=len(text),
             )
-        return first.text
+        if descriptor is None:
+            descriptor = envelope(
+                "progressive",
+                {
+                    "key": key,
+                    "source_format": ProgressiveChunker.detect_content_type(text),
+                    "content": text[: first.payload_chars],
+                    "offset": 0,
+                    "next_offset": first.payload_chars if first.payload_chars < len(text) else None,
+                    "total_chars": len(text),
+                    "has_more": first.payload_chars < len(text),
+                    "ttl_seconds_remaining": cfg.ttl_seconds,
+                },
+            )
+        return DeliveryText(
+            delivery_json(descriptor) if delivery_format() == "structured" else first.text,
+            descriptor,
+        )
 
-    def read_more(self, key: str, offset: int, limit: int | None = None) -> str:
+    def read_more(
+        self,
+        key: str,
+        offset: int,
+        limit: int | None = None,
+        response_format: DeliveryFormat | None = None,
+    ) -> str:
         """Return next chunk from a progressive delivery response.
 
         Wrapped in a ``proxy_call_read_more`` span (when Langfuse is
@@ -5149,28 +5233,40 @@ class ProxyManager:
                 store = self._get_progressive_store()
         else:
             store = self._get_progressive_store()
-        resp = store.get(key, renew=True)
-        if resp is None and len(cfgs) > 1:
-            # The cached store did not hold the key, but with multiple distinct
-            # stores configured an earlier call may have cached a *different*
-            # one (#583). Probe the others and, if one holds the key, serve it
-            # from a temporary adapter (closed below) without disturbing the
-            # cache or this session's in-memory progressive responses.
-            alt = self._sqlite_cfg_holding_key(key, cfg_live)
-            if alt is not None and alt != self._progressive_store_cfg:
-                try:
-                    temp_store = self._open_progressive_adapter(alt)
-                except Exception:
-                    logger.warning(
-                        "Could not open alternate SQLite pending store for read_more recovery",
-                        exc_info=True,
-                    )
-                    temp_store = None
-                if temp_store is not None:
-                    alt_resp = temp_store.get(key, renew=True)
-                    if alt_resp is not None:
-                        store, resp = temp_store, alt_resp
         try:
+            resp = store.get(
+                key,
+                renew=True,
+                **({"response_format": response_format} if response_format is not None else {}),
+            )
+            if resp is None and len(cfgs) > 1:
+                # The cached store did not hold the key, but with multiple distinct
+                # stores configured an earlier call may have cached a *different*
+                # one (#583). Probe the others and, if one holds the key, serve it
+                # from a temporary adapter (closed below) without disturbing the
+                # cache or this session's in-memory progressive responses.
+                alt = self._sqlite_cfg_holding_key(key, cfg_live)
+                if alt is not None and alt != self._progressive_store_cfg:
+                    try:
+                        temp_store = self._open_progressive_adapter(alt)
+                    except Exception:
+                        logger.warning(
+                            "Could not open alternate SQLite pending store for read_more recovery",
+                            exc_info=True,
+                        )
+                        temp_store = None
+                    if temp_store is not None:
+                        alt_resp = temp_store.get(
+                            key,
+                            renew=True,
+                            **(
+                                {"response_format": response_format}
+                                if response_format is not None
+                                else {}
+                            ),
+                        )
+                        if alt_resp is not None:
+                            store, resp = temp_store, alt_resp
             if resp is None:
                 return f"Progressive delivery key '{key}' not found or expired."
             with traced(
@@ -5182,6 +5278,38 @@ class ProxyManager:
                     "key": key,
                 },
             ):
+                if getattr(resp, "delivery_format", "legacy") == "structured":
+                    descriptor = fit_progressive(
+                        resp.content,
+                        key=key,
+                        offset=min(offset, len(resp.content)),
+                        limit=limit or resp.chunk_size,
+                        source_format=resp.content_type,
+                        ttl=resp.ttl_seconds,
+                        budget=resp.delivery_budget,
+                        owned=True,
+                    )
+                    chars = len(descriptor["payload"]["content"])
+                    if self._progressive_reads_tracker is not None and chars:
+                        self._progressive_reads_tracker.record_follow_up(
+                            key=key,
+                            trace_id=resp.trace_id,
+                            server=resp.server,
+                            tool=resp.tool,
+                            offset=offset,
+                            chars=chars,
+                            total_chars=resp.total_chars,
+                        )
+                    response = DeliveryText(delivery_json(descriptor), descriptor)
+                    response.response_format = "structured"
+                    if self._progressive_reads_tracker is not None and chars:
+                        self._progressive_reads_tracker.record_wire(
+                            key,
+                            len(wire_json(delivery_result(descriptor)).encode("utf-8")),
+                            initial=False,
+                            offset=offset,
+                        )
+                    return response
                 # Continue with the chunking the first chunk used (persisted on
                 # the ProgressiveResponse) — an explicit ``limit`` from the agent
                 # still wins. Hardcoding ``4000`` here made follow-ups diverge
@@ -5209,6 +5337,19 @@ class ProxyManager:
                         offset=offset,
                         chars=output.payload_chars,
                         total_chars=resp.total_chars,
+                    )
+                if self._progressive_reads_tracker is not None and output.payload_chars > 0:
+                    from mcp.types import TextContent, CallToolResult
+
+                    wire = CallToolResult(
+                        content=[TextContent(type="text", text=output.text)],
+                        structured_content={"result": output.text},
+                    )
+                    self._progressive_reads_tracker.record_wire(
+                        key,
+                        len(wire_json(wire).encode("utf-8")),
+                        initial=False,
+                        offset=offset,
                     )
                 return output.text
         finally:
@@ -6596,6 +6737,14 @@ class ProxyManager:
                 # attributed to AUTO afterwards (#933).
                 strategy_auto_selected = True
 
+            if tc.delivery_format == "structured" and effective_compression in (
+                CompressionStrategy.SELECTIVE,
+                CompressionStrategy.HYBRID,
+            ):
+                # Recoverable keys retain the source in full. A lossy-content
+                # retention floor must not widen their serialized result limit.
+                effective_max_chars, min_budget, dynamic = tc.max_chars, 0, 0.0
+
             with (
                 traced(
                     "proxy_call_compress",
@@ -6623,6 +6772,18 @@ class ProxyManager:
                         min_chars=min_budget,
                         cfg_snap=cfg_snap,
                     )
+                except DeliveryBudgetExceeded:
+                    compressed = self._apply_progressive(
+                        cleaned,
+                        tc.progressive or ProgressiveConfig(),
+                        server,
+                        tool,
+                        sel_cfg=tc.selective,
+                        trace_id=trace_id,
+                        cfg_snap=cfg_snap,
+                    )
+                    progressive_key_issued = True
+                    llm_fallback = None
                 except (sqlite3.Error, SensitivePayloadNotStored) as exc:
                     # sqlite is reachable in this path ONLY via the
                     # SELECTIVE/HYBRID chunk-TOC pending-store write
@@ -6699,7 +6860,14 @@ class ProxyManager:
             if llm_fallback:
                 metrics_strategy = f"llm_summary→{llm_fallback}_fallback"
             progressive_fallback = False  # set when progressive replaces the response
-            if cleaned_len > 0 and dynamic > 0 and not selective_store_error:
+            if (
+                cleaned_len > 0
+                and dynamic > 0
+                and not selective_store_error
+                and not (
+                    tc.delivery_format == "structured" and isinstance(compressed, DeliveryText)
+                )
+            ):
                 compressed_ratio = len(compressed) / cleaned_len
                 if compressed_ratio < dynamic:
                     ratio_violation = True
@@ -6922,6 +7090,7 @@ class ProxyManager:
                 progressive_sensitive or selective_sensitive or ladder_sensitive
             ),
             progressive_key_issued=progressive_key_issued,
+            transient_key_issued=isinstance(compressed, DeliveryText),
             unicode_token_gate=unicode_token_gate,
             scorer_fallback=scorer_fallback,
         )
@@ -6951,6 +7120,7 @@ class ProxyManager:
         index_ok: bool | None = None
         index_error: str | None = None
         chunks_indexed = 0
+        notice = None
         ai_cfg = cfg_snap.auto_index
         if (
             tc.auto_index_enabled
@@ -7022,6 +7192,16 @@ class ProxyManager:
                     index_ok = False
                     index_error = "background_shed"
                 else:
+                    notice = compose_index_footer(
+                        server,
+                        tool,
+                        len(original_text),
+                        compressed_chars_for_metrics,
+                        cleaned,
+                        "",
+                        ns,
+                        None,
+                    ).rstrip()
                     final_result = compose_index_footer(
                         server=server,
                         tool=tool,
@@ -7062,6 +7242,7 @@ class ProxyManager:
                             cfg_snap=cfg_snap,
                         )
                         final_result = outcome.summary
+                        notice = getattr(outcome, "notice", None)
                         index_ok = outcome.ok
                         index_error = outcome.error
                         chunks_indexed = outcome.chunks_indexed
@@ -7087,6 +7268,7 @@ class ProxyManager:
             index_ok=index_ok,
             index_error=index_error,
             chunks_indexed=chunks_indexed,
+            notice=notice,
         )
 
     async def _run_extract_stage(
@@ -7513,7 +7695,11 @@ class ProxyManager:
                 server,
                 tool,
             )
-        elif comp.progressive_key_issued or response_carries_transient_key(comp.compressed):
+        elif (
+            comp.transient_key_issued
+            or comp.progressive_key_issued
+            or response_carries_transient_key(comp.compressed)
+        ):
             self.tracker.record_cache_unstorable()
             logger.debug(
                 "Skipping cache store for %s/%s: response carries a transient "
@@ -7914,6 +8100,39 @@ class ProxyManager:
         # Resolve effective settings (using config snapshot)
         tc = self._resolve_tool_config(server, tool, proxy_cfg=cfg_snap)
 
+        if tc.delivery_format == "structured" and (
+            structured_content is not None or non_text_content
+        ):
+            # Preserve the upstream output schema and model-visible structured body.
+            # The inbound whole-message guard already bounds binary/structured fields.
+            blocks: list[Any] = []
+            remaining = cfg_snap.max_upstream_chars
+            for block in result.content or []:
+                if block.type == "text":
+                    text = (block.text or "")[:remaining]
+                    remaining -= len(text)
+                    blocks.append(
+                        block.model_copy(update={"text": text})
+                        if hasattr(block, "model_copy")
+                        else mcp_types.TextContent(type="text", text=text)
+                    )
+                else:
+                    blocks.append(block)
+            self.tracker.record(
+                CallMetrics(
+                    server=server,
+                    tool=tool,
+                    original_chars=len(original_text),
+                    compressed_chars=len(original_text),
+                    compression_strategy="none→structured_bypass",
+                    trace_id=trace_id,
+                    compression_accounting="initial_response_v1",
+                )
+            )
+            return mcp_types.CallToolResult(
+                content=blocks, structured_content=structured_content, _meta=result_meta
+            )
+
         # ── Stage 1: CLEAN ──
         with traced(
             "proxy_call_clean",
@@ -7928,16 +8147,52 @@ class ProxyManager:
         # ``scorer_fallback_scope``, isolating attribution to this request's own
         # compression work (including cached SELECTIVE/HYBRID scorers and
         # ratio-guard fallback tiers) without process-shared counter cross-talk.
-        comp = await self._compress_and_surface(
-            server=server,
-            tool=tool,
-            upstream_args=upstream_args,
-            cleaned=cleaned,
-            tc=tc,
-            cfg_snap=cfg_snap,
-            context_query=context_query,
-            trace_id=trace_id,
-        )
+        try:
+            # The fitter serializes a plain TextContent/CallToolResult. Reserve
+            # any extra upstream text/result metadata retained by final assembly.
+            # Keep the stored limit conservative for owned continuation replies.
+            empty_base = mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(type="text", text="")]
+            )
+            template = shaped.first_text_content
+            empty_preserved = mcp_types.CallToolResult(
+                content=[
+                    template.model_copy(update={"text": ""})
+                    if isinstance(template, mcp_types.TextContent)
+                    else mcp_types.TextContent(type="text", text="")
+                ],
+                _meta=result_meta,
+            )
+            metadata_overhead = max(
+                0,
+                len(wire_json(empty_preserved)) - len(wire_json(empty_base)),
+            )
+            with delivery_scope(tc.delivery_format, max(1, tc.max_chars - metadata_overhead)):
+                comp = await self._compress_and_surface(
+                    server=server,
+                    tool=tool,
+                    upstream_args=upstream_args,
+                    cleaned=cleaned,
+                    tc=tc,
+                    cfg_snap=cfg_snap,
+                    context_query=context_query,
+                    trace_id=trace_id,
+                )
+        except DeliveryBudgetExceeded as exc:
+            self.tracker.record_error(
+                CallMetrics(
+                    server=server,
+                    tool=tool,
+                    original_chars=len(original_text),
+                    compressed_chars=0,
+                    is_error=True,
+                    error_category=ErrorCategory.DELIVERY,
+                    error_message=exc.code,
+                    trace_id=trace_id,
+                )
+            )
+            return error_result(exc.code, str(exc))
+
         # Unpack the fields the metrics record and the INDEX stage read. The
         # cache store reads ``comp`` directly (compressed + the cache-skip flag),
         # so those two are not unpacked here.
@@ -7980,6 +8235,51 @@ class ProxyManager:
         extract_ok = ext.ok
         extract_error = ext.error
 
+        prepared_output: str | list | mcp_types.CallToolResult
+        structured_delivery = tc.delivery_format == "structured" and isinstance(
+            comp.compressed, DeliveryText
+        )
+        if structured_delivery:
+            assert isinstance(comp.compressed, DeliveryText)
+            descriptor = dict(comp.compressed.descriptor)
+            supplements = {
+                k: v for k, v in {"surfacing": comp.surfaced, "indexing": idx.notice}.items() if v
+            }
+            if supplements:
+                descriptor["supplements"] = supplements
+            prepared_output = delivery_result(descriptor, owned=False)
+            prepared_output.meta = result_meta
+            template = shaped.first_text_content
+            if template is not None and hasattr(template, "model_copy"):
+                prepared_output.content[0] = template.model_copy(
+                    update={"text": delivery_json(descriptor)}
+                )
+            compressed_chars_for_metrics = (
+                delivery_size(comp.compressed.descriptor, owned=False) + metadata_overhead
+            )
+        else:
+            prepared_output = _assemble_result(
+                final_result, shaped, structured_content, result_meta
+            )
+        from memtomem_stm.proxy._fastmcp_compat import to_call_tool_result
+
+        try:
+            wire_bytes = len(wire_json(to_call_tool_result(prepared_output)).encode("utf-8"))
+        except (ValueError, TypeError):
+            # Duck-typed adapters may supply non-SDK blocks. Telemetry must
+            # not discard an otherwise successful upstream response.
+            wire_bytes = None
+
+        if (
+            isinstance(comp.compressed, DeliveryText)
+            and comp.compressed.descriptor["kind"] == "progressive"
+            and self._progressive_reads_tracker is not None
+            and wire_bytes is not None
+        ):
+            self._progressive_reads_tracker.record_wire(
+                comp.compressed.descriptor["payload"]["key"], wire_bytes, initial=True
+            )
+
         # Record metrics (using pre-surfacing compressed size)
         # When the unicode gate evaluated THIS response, report token counts
         # from the same estimator so the recorded decision and the counts
@@ -8010,7 +8310,16 @@ class ProxyManager:
                 surface_ms=_surface_ms,
                 surfaced_chars=len(surfaced),
                 compression_strategy=metrics_strategy,
-                compression_accounting="initial_response_v1",
+                compression_accounting=(
+                    "initial_structured_v1"
+                    if tc.delivery_format == "structured"
+                    and isinstance(comp.compressed, DeliveryText)
+                    else "initial_response_v1"
+                ),
+                delivery_format=tc.delivery_format
+                if isinstance(comp.compressed, DeliveryText)
+                else "legacy",
+                wire_bytes=wire_bytes,
                 strategy_auto_selected=comp.strategy_auto_selected,
                 ratio_violation=ratio_violation,
                 scorer_fallback=comp.scorer_fallback,
@@ -8059,39 +8368,41 @@ class ProxyManager:
             ),
         )
 
-        # Final return shape. The processed text (single, merged block) is
-        # reinserted at the upstream's first-text position so non-text blocks
-        # keep their relative order. When the result carries envelope fields
-        # the shape is a full ``CallToolResult`` — the text twin is the
-        # compressed, token-budgeted view while ``structuredContent``/``_meta``
-        # pass verbatim (clients consuming structuredContent get full
-        # fidelity). Progressive/selective continuations
-        # (``stm_proxy_read_more`` / ``stm_proxy_select_chunks``) return plain
-        # text and do not re-carry the envelope.
-        template = shaped.first_text_content
-        if template is not None and hasattr(template, "model_copy"):
-            processed_text = template.model_copy(update={"text": final_result})
-        else:
-            processed_text = mcp_types.TextContent(type="text", text=final_result)
-        if non_text_content:
-            k = shaped.non_text_before_first_text
-            content_blocks: list = [
-                *non_text_content[:k],
-                processed_text,
-                *non_text_content[k:],
-            ]
-            if has_result_envelope:
-                return mcp_types.CallToolResult(
-                    content=content_blocks,
-                    structured_content=structured_content,
-                    _meta=result_meta,
-                )
-            return content_blocks
+        return prepared_output
 
-        if has_result_envelope or _text_block_metadata(template):
+
+def _assemble_result(
+    final_result: str,
+    shaped: ShapedResponse,
+    structured_content: dict[str, Any] | None,
+    result_meta: dict[str, Any] | None,
+) -> str | list | mcp_types.CallToolResult:
+    non_text_content = shaped.non_text_content
+    has_result_envelope = structured_content is not None or result_meta is not None
+    template = shaped.first_text_content
+    if template is not None and hasattr(template, "model_copy"):
+        processed_text = template.model_copy(update={"text": final_result})
+    else:
+        processed_text = mcp_types.TextContent(type="text", text=final_result)
+    if non_text_content:
+        k = shaped.non_text_before_first_text
+        content_blocks: list = [
+            *non_text_content[:k],
+            processed_text,
+            *non_text_content[k:],
+        ]
+        if has_result_envelope:
             return mcp_types.CallToolResult(
-                content=[processed_text],
+                content=content_blocks,
                 structured_content=structured_content,
                 _meta=result_meta,
             )
-        return final_result
+        return content_blocks
+
+    if has_result_envelope or _text_block_metadata(template):
+        return mcp_types.CallToolResult(
+            content=[processed_text],
+            structured_content=structured_content,
+            _meta=result_meta,
+        )
+    return final_result

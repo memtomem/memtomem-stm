@@ -531,6 +531,7 @@ def test_public_markdown_json_fences_are_valid() -> None:
 def test_public_proxy_config_examples_match_runtime_schema() -> None:
     """Representative config examples use real nesting and known fields."""
     from memtomem_stm.proxy.config import ProxyConfig, find_unknown_keys
+    from memtomem_stm.server import ContinuationOutput
 
     proxy_reference = _json_fences("docs/reference/proxy-config.md")[0]
     assert find_unknown_keys(ProxyConfig, proxy_reference) == []
@@ -543,14 +544,22 @@ def test_public_proxy_config_examples_match_runtime_schema() -> None:
         response_payloads = [
             example
             for example in examples
-            if example.get("type") == "toc"
-            and {"selection_key", "entries", "hint"} <= example.keys()
+            if (
+                example.get("type") == "toc"
+                and {"selection_key", "entries", "hint"} <= example.keys()
+            )
+            or {"result", "stm"} <= example.keys()
         ]
-        expected_payloads = 1 if relative == "docs/compression.md" else 0
+        expected_payloads = 2 if relative == "docs/compression.md" else 0
         assert len(response_payloads) == expected_payloads, relative
 
         for example in examples:
             if example in response_payloads:
+                if "stm" in example:
+                    response = ContinuationOutput.model_validate(example)
+                    assert response.stm is not None
+                    assert response.stm["schema_version"] == 1
+                    assert response.stm["kind"] == "progressive"
                 continue
             assert find_unknown_keys(ProxyConfig, example) == [], relative
             ProxyConfig.model_validate(example)

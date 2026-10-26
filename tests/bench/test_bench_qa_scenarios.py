@@ -314,8 +314,11 @@ async def test_s10_surfacing_recall_at_k(tmp_path, bench_qa_report):
     seeds_path = tmp_path / "s10_seeds.json"
     seeds_path.write_text(json.dumps(fixture["surfacing_seeds"]), encoding="utf-8")
 
+    from memtomem_stm.utils.digest import framed_digest
+
     source_to_chunk_id = {
-        seed["source"]: hashlib.sha256(seed["content"].encode()).hexdigest()[:16]
+        seed["source"]: "stm:compact:v2:"
+        + framed_digest((seed.get("namespace", "default"), seed["source"], seed["content"]))
         for seed in fixture["surfacing_seeds"]
     }
     expected_chunk_ids = [
