@@ -68,7 +68,9 @@ Responses that already fit the budget still pass through unchanged.
 }
 ```
 
-The `ttl_seconds_remaining` field tells the agent how many seconds it has to retrieve sections before the stored content expires. Each call to `stm_proxy_select_chunks` resets the TTL.
+The `ttl_seconds_remaining` field tells the agent how many seconds it has to retrieve sections before the stored content expires. Each successful call to `stm_proxy_select_chunks` resets the TTL; a selection that
+matches no section, or that does not fit the structured delivery budget, leaves it
+unchanged.
 
 When `compression` resolves to `selective` — set on the tool, on the server, or through a global `default_compression` the server does not override — the proxied tool description includes a convention suffix (`| TOC response: use stm_proxy_select_chunks`) so the agent knows to expect a TOC and which tool to call. The suffix is part of the advertised description and is budgeted with it: under a `max_description_chars` too small to hold it — below 54 for this suffix — it is dropped whole rather than cut. See [Advertised tool descriptions](reference/proxy-config.md#advertised-tool-descriptions).
 

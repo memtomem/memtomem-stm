@@ -58,7 +58,11 @@ export MEMTOMEM_STM_LOG_LEVEL=WARNING   # DEBUG | INFO | WARNING | ERROR | CRITI
 
 Controls `logging.basicConfig()` level for all `memtomem_stm.*`
 loggers.  Default `WARNING`.  Read once at startup — restart to
-apply changes.
+apply changes. Below `WARNING`, INFO/DEBUG records from other loggers
+(MCP SDK, HTTP clients) are kept out of the server's and daemon's logs
+unless `MEMTOMEM_STM_LOG_DEPENDENCIES` is set, and logged tracebacks
+withhold exception messages unless `MEMTOMEM_STM_LOG_EXCEPTION_TEXT` is
+set; see [Environment variables](reference/environment-variables.md).
 
 ```bash
 export MEMTOMEM_STM_LOG_FILE=~/.memtomem/stm.log   # opt-in rotating file log
@@ -97,6 +101,7 @@ clients that lack a per-server `disabled_tools` filter of their own.
 export MEMTOMEM_STM_PROXY__ENABLED=true
 export MEMTOMEM_STM_PROXY__DEFAULT_COMPRESSION=auto
 export MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS=16000
+export MEMTOMEM_STM_PROXY__DELIVERY_FORMAT=legacy   # or "structured": see compression.md#structured-chunk-delivery
 export MEMTOMEM_STM_PROXY__MAX_UPSTREAM_CHARS=10000000   # OOM guard before compression
 export MEMTOMEM_STM_PROXY__MAX_UPSTREAM_BYTES=41943040   # whole MCP result envelope (40 MiB)
 export MEMTOMEM_STM_PROXY__MIN_RESULT_RETENTION=0.65
@@ -715,7 +720,7 @@ Three opt-in fields make budgets token-aware without breaking existing char-base
 
 - **`chars_per_token`** — chars-per-token ratio used to convert a token budget to a char budget. Configurable at `ProxyConfig` (default `3.5`), per upstream server, or per tool. Lower it for non-Latin content (`~2.0` for Korean, `~1.3` for Chinese). Cascading resolution: tool override → server → proxy default, resolved independently of where the token budget comes from — a tool that states only its ratio still converts the budget it inherits from the server. A per-tool `max_result_chars` with no per-tool `max_result_tokens` beside it ends the question first: a char budget is absolute, so no ratio applies under it. The value must be **finite** at every level — a JSON `Infinity` is rejected when the config loads, rather than accepted and then failing, at conversion time, every call whose budget it would have converted. When a token budget converts to less than one character, the resolved budget is one character, never zero; the separate model-scaled budget below answers the same situation by falling back to `default_max_result_chars` instead, since a degenerate model budget means "scaling off" rather than "no output".
 - **`max_result_tokens`** — token-equivalent budget on `UpstreamServerConfig` and `ToolOverrideConfig`. When set, takes precedence over `max_result_chars` and is converted to a char budget at gate time via the resolved `chars_per_token`. Bounded above by the largest signed-64-bit integer, so the token budget and the char budget it converts to share one domain — an unbounded value would break the response-cache fingerprint rather than the conversion.
-- **`token_estimation_mode`** — `static` (default) keeps the conversion above. `unicode` estimates the actual response at runtime, passes through responses that fit the token budget, and derives a response-specific character budget when they do not. Resolution is tool → server → proxy. Tools on the zero-loss `progressive` strategy are unaffected: chunked delivery has no result-size gate, so their budgets and metrics keep the static behavior.
+- **`token_estimation_mode`** — `static` (default) keeps the conversion above. `unicode` estimates the actual response at runtime, passes through responses that fit the token budget, and derives a response-specific character budget when they do not. Resolution is tool → server → proxy. Tools on the zero-loss `progressive` strategy are unaffected under the default legacy delivery: chunked delivery has no result-size gate, so their budgets and metrics keep the static behavior. Under `delivery_format: "structured"` the Unicode estimate applies to them too, because the initial structured frame and its continuations share one budget (see [Structured chunk delivery](compression.md#structured-chunk-delivery)).
 
 Example — a Korean-content upstream (e.g. a Korean documentation MCP server):
 
@@ -810,7 +815,7 @@ The config file is **hot-reloaded** — changes take effect on the next tool cal
 
 | Setting group | Hot-reload? | Notes |
 |---------------|-------------|-------|
-| Per-server compression, cleaning, response-path `tool_overrides` | Yes | `compression`, `max_result_chars`, `retention_floor`, `cleaning.*`, and the per-tool budget/cache/compression fields take effect on the next tool call — for how a **response** is compressed. The `tool_overrides` fields that shape what is **advertised** instead (`description_override`, `hidden`, `expose_in_profiles`, and the `compression`/`hybrid` values that decide the convention suffix) are covered by the row below, not this one. |
+| Per-server compression, cleaning, response-path `tool_overrides` | Yes | `compression`, `delivery_format`, `max_result_chars`, `retention_floor`, `cleaning.*`, and the per-tool budget/cache/compression fields take effect on the next tool call — for how a **response** is compressed. The `tool_overrides` fields that shape what is **advertised** instead (`description_override`, `hidden`, `expose_in_profiles`, and the `compression`/`hybrid` values that decide the convention suffix) are covered by the row below, not this one. |
 | Per-server retry/timeout/cache knobs | Yes | `max_retries`, `call_timeout_seconds`, `overall_deadline_seconds`, `reconnect_delay_seconds`, `max_reconnect_delay_seconds`, `cache`, `cache_ttl_seconds` are read per call |
 | Connection-affecting fields (`transport`, `url`, `headers`, `command`, `args`, `env`; `connect_timeout_seconds` on `sse`/`streamable_http`) | Yes (live reconnect) | Applied on the next call that misses the requested connection identity's cache: a connection edit isolates prior entries, and the replacement connection is prepared first, then swapped in. If it can't connect, the old connection keeps serving without caching its replies under the new identity, and the failed edit isn't retried until the config changes again. |
 | `relevance_scorer.*` | Yes | All six fields (`scorer`, `embedding_provider`, `embedding_model`, `embedding_base_url`, `embedding_timeout`, `embedding_cache_size`). A change in any field rebuilds the scorer instance in place, which discards the embedding cache with it. The SELECTIVE and HYBRID compressors capture the scorer they were built with and are keyed on `selective`, so on that path a scorer-only edit arrives at the next selective rebuild. |

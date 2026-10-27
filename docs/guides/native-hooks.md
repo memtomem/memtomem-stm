@@ -102,6 +102,9 @@ export MEMTOMEM_STM_HOOK__FALLBACK=skip  # skip | cold
 
 `skip` returns immediately when the daemon is unavailable. `cold` runs the
 legacy in-process path and may pay the LTM startup cost inside the hook call.
+Neither applies when the daemon answers that it is busy or that the request
+ran out of time: that call surfaces nothing, with no fallback and no spawn
+request.
 Keep the hook-to-daemon deadline above the surfacing deadline; managed installs
 enforce a one-second margin automatically.
 

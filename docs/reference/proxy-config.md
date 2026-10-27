@@ -86,7 +86,8 @@ it, and `mms list --json` reports effective server and tool delivery settings.
 This selects transient chunk delivery, not a wrapper for ordinary cached text.
 It adds no arguments to upstream tools. See [structured delivery](../compression.md#structured-chunk-delivery).
 
-All TTLs must be finite. Existing `Infinity` or `NaN` TTL settings are rejected;
+All proxy TTLs must be finite (the surfacing cache and dedup TTLs are separate
+settings). Existing `Infinity` or `NaN` TTL settings are rejected;
 fix the setting and run `mms config validate` before restarting.
 
 ## Advertised tool descriptions

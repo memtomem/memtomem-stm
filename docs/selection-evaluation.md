@@ -47,7 +47,9 @@ The bundled `selection-eval-v1-synthetic-30` corpus contains 18 training, six
 validation, and six held-out test cases. Cases cover name, description, input
 schema, Korean and multi-intent matching, distractors, abstention, and the
 strict/review/tool-graph safety paths. Group IDs may not cross splits, and the
-loader rejects credential-shaped content.
+loader rejects credential-shaped content and email addresses, a non-string
+`dataset_id`, and non-finite numbers (`NaN`, `Infinity`, or a literal too large
+for a float).
 
 Every replay executes the production `filter_tools` and
 `ToolRelevanceRanker`. It tests the existing knobs only:

@@ -202,6 +202,8 @@ selected stdio definitions into the proxy with provenance and conflict checks. S
 | [OTLP span export](https://github.com/memtomem/memtomem-stm/blob/main/docs/otlp-export.md) | Opt-in OpenTelemetry span export with body-free attributes |
 | [Use cases](https://github.com/memtomem/memtomem-stm/blob/main/docs/use-cases.md) | Reproducible scenarios and honest measurement boundaries |
 | [Reviewed project resume](https://github.com/memtomem/memtomem-stm/blob/main/docs/guides/reviewed-memory-resume.md) | Project-local Pinned Context, visible adjacent context, and optional review-first memory |
+| [Project-scoped MCPs](https://github.com/memtomem/memtomem-stm/blob/main/docs/guides/project-scoped-mcps.md) | Route selected project MCP definitions through STM |
+| [Toolgraph policy gateway](https://github.com/memtomem/memtomem-stm/blob/main/docs/guides/toolgraph-policy-gateway.md) | Enforce a reviewed tool-eligibility bundle |
 | [CLI](https://github.com/memtomem/memtomem-stm/blob/main/docs/cli.md) | Command-family and MCP-tool reference map |
 | [MCP tools](https://github.com/memtomem/memtomem-stm/blob/main/docs/reference/mcp-tools.md) | Default, operator, and review-first tool arguments and metadata |
 | [Proxy JSON](https://github.com/memtomem/memtomem-stm/blob/main/docs/reference/proxy-config.md) | File-backed upstream, compression, and cache configuration |
