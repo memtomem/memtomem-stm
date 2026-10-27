@@ -7,7 +7,10 @@ They do not assume that client-native tools pass through the MCP proxy.
 ## Read only the useful parts of a large response
 
 Use a deterministic document MCP server and compare the same query under
-`compression=none`, `selective`, and `progressive`.
+`compression=none`, `selective`, and `progressive`. Hold `delivery_format`
+fixed across the comparison, or measure `legacy` and `structured` as separate
+arms: [structured delivery](compression.md#structured-chunk-delivery) changes
+the TOC and continuation output and is counted separately in `mms stats`.
 
 Measure exact response characters, a named tokenizer's input tokens, whether
 the question remains answerable, additional `stm_proxy_select_chunks` or
@@ -72,7 +75,8 @@ step rather than a guess.
 ## Common evidence rules
 
 - Compare direct upstream, STM passthrough, and STM feature-on separately.
-- Record core and STM versions, fixture hashes, tokenizer identity, and config.
+- Record core and STM versions, fixture hashes, tokenizer identity, and config,
+  including `delivery_format`.
 - Report answer quality and additional round trips beside any size reduction.
 - Label examples as MCP-routed; built-in `Read`, `Bash`, or editor tools may
   bypass the proxy.

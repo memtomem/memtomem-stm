@@ -2497,10 +2497,17 @@ def test_list_json_keys_are_documented(tmp_path: Path) -> None:
     from memtomem_stm.cli.proxy import cli as mms_cli
 
     config = tmp_path / "stm_proxy.json"
-    config.write_text(json.dumps({"enabled": True, "upstream_servers": {}}), encoding="utf-8")
+    # One server, so `effective_servers` has an entry whose keys can be checked:
+    # 0.7.0 added `delivery_format` / `tool_delivery_overrides` there while the
+    # top-level check passed.
+    servers = {"demo": {"prefix": "demo", "command": "python"}}
+    config.write_text(json.dumps({"enabled": True, "upstream_servers": servers}), encoding="utf-8")
     result = CliRunner().invoke(mms_cli, ["list", "--json", "--config", str(config)])
     assert result.exit_code == 0, result.output
-    emitted = set(json.loads(result.stdout))
+    document = json.loads(result.stdout)
+    entry = document["effective_servers"]["demo"]
+    assert entry, "fixture must produce an effective_servers entry"
+    emitted = set(document) | set(entry)
 
     cli_md = _read("docs/cli.md")
     section_match = re.search(r"### `list`\n(.*?)(?=\n### |\n## |\Z)", cli_md, re.DOTALL)
@@ -2516,6 +2523,39 @@ def test_list_json_keys_are_documented(tmp_path: Path) -> None:
         f"docs/cli.md `list` section does not mention {undocumented} — "
         "`mms list --json` emits them; document the key alongside the change."
     )
+
+
+def test_cli_md_tool_table_matches_advertised_input_schemas() -> None:
+    """Each default tool's Arguments cell in ``docs/cli.md`` names every property
+    of the input schema the server advertises, marking optional ones with ``?``.
+
+    Read from the advertised schema rather than ``inspect.signature`` so the
+    injected ``ctx`` stays out. 0.7.0 added ``response_format`` to both
+    continuation tools; ``reference/mcp-tools.md`` gained it and this table did
+    not.
+    """
+    from memtomem_stm import server
+
+    tools = asyncio.run(server.mcp.list_tools())
+    cli_md = _read("docs/cli.md")
+    for tool in tools:
+        row = next(
+            (line for line in cli_md.splitlines() if line.startswith(f"| `{tool.name}` |")),
+            None,
+        )
+        assert row is not None, f"docs/cli.md MCP tools table has no row for {tool.name}"
+        cell = row.split("|")[2]
+        documented: dict[str, bool] = {}
+        for token in re.findall(r"`([^`]+)`", cell):
+            name = re.match(r"[A-Za-z_]+", token)
+            assert name, f"docs/cli.md {tool.name}: unreadable argument {token!r}"
+            documented[name.group(0)] = "?" in token
+        required = set(tool.input_schema.get("required", []))
+        expected = {prop: prop not in required for prop in tool.input_schema["properties"]}
+        assert documented == expected, (
+            f"docs/cli.md {tool.name} arguments {documented} != advertised {expected} "
+            "(name → optional)"
+        )
 
 
 def test_uninstall_runbook_puts_hook_backups_where_the_writer_puts_them() -> None:

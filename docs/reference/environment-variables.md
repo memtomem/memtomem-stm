@@ -80,7 +80,7 @@ Status meanings:
 | `MEMTOMEM_STM_PROXY__TOKEN_ESTIMATION_MODE` | `static / unicode` | `static` | Response token-estimation mode. | Bundled |
 | `MEMTOMEM_STM_PROXY__CACHE__ENABLED` | boolean | `true` | Enable response caching. | Bundled |
 | `MEMTOMEM_STM_PROXY__CACHE__DB_PATH` | path | `~/.memtomem/proxy_cache.db` | Response-cache SQLite file. | Bundled |
-| `MEMTOMEM_STM_PROXY__CACHE__DEFAULT_TTL_SECONDS` | non-negative float or `null` | `3600.0` | Default cache TTL. | Bundled |
+| `MEMTOMEM_STM_PROXY__CACHE__DEFAULT_TTL_SECONDS` | finite non-negative float or `null` | `3600.0` | Default cache TTL. | Bundled |
 | `MEMTOMEM_STM_PROXY__CACHE__MAX_ENTRIES` | positive integer | `10000` | Maximum cache rows. | Bundled |
 | `MEMTOMEM_STM_PROXY__CACHE__TOOL_ANNOTATION_POLICY` | `conservative / strict / ignore` | `conservative` | Cache behavior for missing/read-only annotations. | Bundled |
 | `MEMTOMEM_STM_PROXY__AUTO_INDEX__ENABLED` | boolean | `false` | Enable library-mode response indexing. | Library |
@@ -212,7 +212,7 @@ Status meanings:
 | `MEMTOMEM_STM_OTLP__FLUSH_TIMEOUT_SECONDS` | positive float | `5.0` | Whole OTLP shutdown budget. | Startup |
 | `MEMTOMEM_STM_HOOK__USE_DAEMON` | boolean | `true` | Use the shared warm surfacing daemon. | Bundled |
 | `MEMTOMEM_STM_HOOK__DAEMON_TIMEOUT_SECONDS` | positive float | `2.5` | Outer hook-to-daemon deadline. | Bundled |
-| `MEMTOMEM_STM_HOOK__FALLBACK` | `skip / cold` | `skip` | Behavior when the daemon is unavailable. | Bundled |
+| `MEMTOMEM_STM_HOOK__FALLBACK` | `skip / cold` | `skip` | Behavior when the daemon is unavailable; a daemon that answers busy or out of time skips either way. | Bundled |
 | `MEMTOMEM_STM_HOOK__AUTO_SPAWN` | boolean | `true` | Start a missing daemon. | Bundled |
 | `MEMTOMEM_STM_HOOK__RECORD_FEEDBACK_EVENTS` | boolean | `false` | Enable rating prompts, durable-demotion reads, and auto-tune feedback processing. Surfacing telemetry rows still persist when false. | Bundled |
 | `MEMTOMEM_STM_HOOK__COMPRESSION__ENABLED` | boolean | `false` | Enable guarded Claude Bash output replacement. | Bundled |

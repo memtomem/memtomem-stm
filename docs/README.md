@@ -40,7 +40,9 @@ long-term-memory server is configured.
 
 - [Compression](compression.md) and [caching](caching.md)
 - [Proactive memory surfacing](surfacing.md)
-- [MCP tools](reference/mcp-tools.md) and [CLI](cli.md)
+- [MCP tools](reference/mcp-tools.md) and [CLI](cli.md), with the CLI's
+  [gateway](reference/cli-gateway.md), [hook and daemon](reference/cli-hooks.md),
+  and [project and host](reference/cli-projects.md) references
 - [Selection telemetry](selection-telemetry.md) and
   [selection evaluation](selection-evaluation.md)
 

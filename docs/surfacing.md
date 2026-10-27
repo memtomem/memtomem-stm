@@ -71,7 +71,10 @@ continue through legacy `mem_search`.
 
 Capability absence is the only fallback trigger. Once a core advertises schema
 2 or later, a compose transport or response failure remains visible as an LTM
-dependency fault; STM does not hide it with a second legacy search.
+dependency fault; STM does not hide it with a second legacy search. That
+includes a composed item of the wrong shape (a `source` that is neither a
+string nor null, or a retrieved item's non-numeric or non-finite `score`, …):
+it fails the whole compose call instead of being coerced.
 
 When schema 3 context windows are enabled, STM expands the core wire budget to
 `max_injection_chars * (1 + 2 * min(context_window_size, 10))`. This lets whole
@@ -191,7 +194,7 @@ memories must still be treated as reference data rather than instructions.
 
 Each result line shows a relevance bucket (`[weak]`, `[related]`, or `[strong]`) instead of the raw search score. The bucket splits the band from `min_score` up to a top value into thirds, so changing `min_score` also shifts the boundaries. For results the core stamped `rrf` (the default hybrid search), the top is the score of a result both retrieval legs rank first, `sum(rrf_weights) / (rrf_k + 1)`. The LTM adapter computes it from the `runtime_profile` of the core session that served the search and stamps it on each result, so a cache hit uses the ceiling its search was scored under; with `surfacing.use_daemon`, the shared daemon forwards the stamp to the proxy. It falls back to `2/61` (the core's defaults, `rrf_k=60` and weights `[1, 1]`) when the profile is missing, describes a single-leg or zero-weight fusion, or is malformed, and when an older daemon omits the stamp. This top is a two-leg reference, not a maximum: the core's session-summary rescue leg and its decay/boost stages can lift a score above it, and such a result shows as `[strong]`, as does every result when `min_score` is at or above the top. Results without a `score_scale` stamp (compact format, older cores) and unrecognized labels keep the band `[min_score, 1.0]`, so compact-format RRF results, whose scores sit far below 1.0, typically still show `[weak]`. The tag is suppressed for results stamped with a known non-RRF `score_scale` (`bm25` / `dense` / `none` / `rerank`), where no band applies (rerank logits can be negative). Suppression keys on each result's own stamp, so cache hits render the same way the original miss did. Exact raw-score distributions remain available through `stm_admin(action="surfacing_stats")`.
 
-Each bullet also carries its memory's id as a backticked token (e.g. `` `a1b2c3d4e5f6a7b8` ``). Pass it as a `memory_id` in the batched `stm_surfacing_feedback(ratings=[...])` call to rate individual memories — `not_relevant` / `already_known` then invalidate exactly those memories on the next cache hit. Under the default `result_format="structured"` this id is the real LTM `chunk_id`, carried end to end, so `helpful` boosts reach the underlying chunk. Under `result_format="compact"` (legacy fallback, auto-selected when the core doesn't advertise structured support) the id is a content-derived surrogate (`sha256(content)[:16]`): it drives STM-side cache invalidation but not the LTM `increment_access` boost, and two memories with identical content collide on one id. Compact also renders scores rounded to two decimals, which collapses the RRF score distribution onto the two values above `min_score` (`0.02` and `0.03`) — the reason structured is the default (#560). It also erases the single-leg/two-leg distinction the default `min_score` is drawn on: a single-leg `0.0164` arrives as `0.02` and passes (#875).
+Each bullet also carries its memory's id as a backticked token (e.g. `` `a1b2c3d4e5f6a7b8` ``). Pass it as a `memory_id` in the batched `stm_surfacing_feedback(ratings=[...])` call to rate individual memories — `not_relevant` / `already_known` then invalidate exactly those memories on the next cache hit. Under the default `result_format="structured"` this id is the real LTM `chunk_id`, carried end to end, so `helpful` boosts reach the underlying chunk. Under `result_format="compact"` (legacy fallback, auto-selected when the core doesn't advertise structured support) the id is a surrogate, `stm:compact:v2:` followed by a digest of the memory's namespace, source and content: it drives STM-side cache invalidation but not the LTM `increment_access` boost. Before 0.7.0 the surrogate was the first 16 hex digits of the content's SHA-256; feedback recorded under those ids is kept but does not carry over to the new ones. Compact also renders scores rounded to two decimals, which collapses the RRF score distribution onto the two values above `min_score` (`0.02` and `0.03`) — the reason structured is the default (#560). It also erases the single-leg/two-leg distinction the default `min_score` is drawn on: a single-leg `0.0164` arrives as `0.02` and passes (#875).
 
 The injection mode is configurable: `append` (default), `prepend`, or `section`. `prepend` is skipped on the progressive-delivery path because it would shift character offsets and break `stm_proxy_read_more` — the skip is counted as `progressive_mode_conflict` in `stm_admin(action="surfacing_stats")`.
 
@@ -860,6 +863,17 @@ hit:
   operations finish; a persistent count means the LTM is not
   releasing cancelled calls. Refused calls give their rate-limit
   slot back and warn once per episode.
+- `ltm_unavailable` / `ltm_call_failed` / `ltm_parse_empty` — the LTM
+  search failed: the session never opened or the transport is down, core
+  raised mid-call, or the reply could not be used. A reply STM cannot use
+  includes one that fails validation: an item of the wrong shape (not an
+  object, a non-string `content`, `source` or `namespace`, a `chunk_id`
+  that is neither a string nor null, a
+  non-numeric or non-finite score), `{}` or a reply without a `results`
+  key, and a whitespace-only reply. Each of those makes the whole search a
+  fault with no hits, recorded as `ltm_parse_empty` and as a circuit-breaker
+  failure. `{"results": []}` is a healthy empty result, and an item with empty
+  `content` is dropped on its own.
 - `no_query` — `ContextExtractor` could not synthesize a query
   from the tool arguments and fell below `min_query_tokens`.
 - `no_results_score` — LTM returned results, none above
@@ -896,7 +910,8 @@ hit:
   threshold is drawn on the RRF scale) and records a
   `score_scale_mismatch` diagnostic on every such observation. The `surfacing_stats` action shows the last
   core-reported scale as a `Score scale:` line (annotated when the filter
-  is suspended), the reranker model ID when one is active, and each event
+  is suspended) and whether a reranker was reported (not its model ID, which
+  has no known set of values to check against), and each event
   row records its scale in `stm_feedback.db`. The compact format and the
   legacy `mem_search` path on a pre-#1781 core carry no scale, as does a
   compose bundle from a pre-#1796 core, so those paths keep unconditional

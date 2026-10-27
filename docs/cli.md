@@ -336,7 +336,11 @@ uses and keeps the file error warning. The table removes URL userinfo, query str
 and fragments, and hides arguments on rows supplied by the environment.
 `--json` retains the raw redacted `servers` file
 map and adds `effective_servers` (a safe summary of the runtime upstreams),
-`server_sources`, and `effective_compression`. The latter reports each server's
+`server_sources`, and `effective_compression`. Each `effective_servers` entry
+carries `prefix`, `transport`, `surfacing_enabled`, the server's resolved
+`delivery_format` (`"legacy"` unless the server or the proxy sets
+`"structured"`), and `tool_delivery_overrides`, the resolved format of each
+tool that has a `tool_overrides` entry. `effective_compression` reports each server's
 resolved strategy, its `global`/`server` source, and explicit tool overrides.
 `server` means the server level supplied `compression`, from the file or from an
 environment variable addressing that server. Override lines quote both names as
@@ -426,7 +430,7 @@ mms add --import --select filesystem,github
 
 # List configured upstreams (per-server detail: prefix, transport, surfacing, origin)
 mms list
-mms list --json            # machine-readable: {config_path, config_valid, config_error, servers}
+mms list --json            # machine-readable: {config_path, config_valid, config_error, servers, effective_servers, …}
 
 # Config summary (path, enabled flag, server count)
 mms status
@@ -701,6 +705,12 @@ pinned threshold. STM never changes `min_score` in response to this diagnostic.
 `--json` exposes the same signal under the additive `surfacing.diagnostics`,
 `diagnostics_last_at`, and `diagnostics_window_days` fields.
 
+When any recorded call used structured delivery, the compression block adds a
+`Structured delivery:` line (calls, serialized base characters, measured MCP
+bytes). Those totals are kept apart from the legacy saved ratio; `--json` carries
+them as `compression.structured_delivery`. See
+[Structured chunk delivery](compression.md#accounting-and-compatibility).
+
 ### `tune`
 
 ```
@@ -715,7 +725,7 @@ Options:
   --json               Preview as JSON for scripting.
 ```
 
-Runs the same analysis as the `stm_admin` MCP tool's `tuning_recommendations` action against the on-disk metrics/feedback stores (no running server needed) and renders the per-tool `tool_overrides` diff it suggests — `max_result_chars` budget changes and `compression` strategy pins, with the reason and a confidence level per tool. Budget changes are suppressed where they would have no effect: a per-tool token budget outranks them, and the `none` and explicitly configured `progressive` strategies never read `max_result_chars` at all (#1042). Feedback-driven `compression` changes remain eligible for those tools; an AUTO pin is not, because a tool already pinned to `none` or `progressive` is not running AUTO.
+Runs the same analysis as the `stm_admin` MCP tool's `tuning_recommendations` action against the on-disk metrics/feedback stores (no running server needed) and renders the per-tool `tool_overrides` diff it suggests — `max_result_chars` budget changes and `compression` strategy pins, with the reason and a confidence level per tool. Budget changes are suppressed for a tool whose per-tool token budget outranks them and for the `none` and explicitly configured `progressive` strategies, which under the default legacy delivery never read `max_result_chars` (#1042). The suppression does not look at `delivery_format`: under `"structured"` a progressive tool's initial frame is sized by that budget, yet no budget change is suggested for it. Feedback-driven `compression` changes remain eligible for those tools; an AUTO pin is not, because a tool already pinned to `none` or `progressive` is not running AUTO.
 
 Three modes:
 
@@ -1255,10 +1265,10 @@ The five model-facing tools are advertised by default:
 | Tool | Arguments | Description |
 |------|-----------|-------------|
 | `stm_proxy_describe_tool` | `name`, `part?`, `offset?`, `limit?`, `generation?` | Read bounded metadata pages; defaults to instructions, use `part="input_schema"` for schema recovery and the STM `prefix__tool` name without a host prefix |
-| `stm_proxy_select_chunks` | `key`, `sections[]` | Retrieve sections from a selective/hybrid TOC response |
-| `stm_proxy_read_more` | `key`, `offset?=0`, `limit?` | Read next chunk from a progressive delivery response |
+| `stm_proxy_select_chunks` | `key`, `sections[]`, `response_format?` | Retrieve sections from a selective/hybrid TOC response |
+| `stm_proxy_read_more` | `key`, `offset?=0`, `limit?`, `response_format?` | Read next chunk from a progressive delivery response |
 | `stm_surfacing_feedback` | `surfacing_id`, `rating?`, `memory_id?`, `ratings?` | Rate surfaced memories (`helpful` / `partially_helpful` / `not_relevant` / `already_known`); `ratings=[{memory_id, rating}]` for batched per-memory feedback |
-| `stm_compression_feedback` | `server`, `tool`, `missing`, `kind?`, `trace_id?` | Report missing info from a compressed response (learning signal) |
+| `stm_compression_feedback` | `server`, `tool`, `missing`, `kind?`, `trace_id?` | Report missing info from a compressed response (learning signal); `server`/`tool` must name a tool this proxy serves, by its upstream names |
 
 Eight observability/admin actions are reached through one tool,
 `stm_admin(action, params?)`, which is advertised only when

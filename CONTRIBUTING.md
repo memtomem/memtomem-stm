@@ -143,7 +143,7 @@ patterns, not automatic cleanup for unrelated sessions.
   - `utils/` — Circuit breaker and shared helpers
 - `tests/` — pytest suite
   - `tests/bench/` — `bench_qa` scenario harness (see "Adding a bench_qa scenario" below)
-- `docs/` — User-facing guides (surfacing, compression, caching, configuration, cli, selection-telemetry)
+- `docs/` — User-facing guides, `guides/` task walkthroughs, `reference/` pages and `adr/` decision records; `docs/README.md` indexes them
   - `docs/README.md` — Canonical task-oriented documentation hub
   - `docs/reference/environment-variables.md` — Complete environment inventory; keep it synchronized with `STMConfig`
 
