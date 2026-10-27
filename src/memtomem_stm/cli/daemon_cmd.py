@@ -6,8 +6,9 @@ proxy surfacing, avoiding one private LTM child per client. Subcommands:
 - ``run``     — the actual long-lived server loop (foreground, or the target of
   a detached spawn via ``--detached``).
 - ``start``   — spawn the daemon detached if one isn't already running.
-- ``stop``    — ask a running daemon to shut down (SIGTERM by pid as fallback);
-  ``--all`` also stops live daemons under any other config fingerprint.
+- ``stop``    — ask a running daemon to shut down (SIGTERM by pid as fallback)
+  and wait for it to finish; ``--all`` also stops live daemons under any other
+  config fingerprint. Exits nonzero when a stop it started is not confirmed.
 - ``status``  — running/stale/stopped, with pid/port/uptime/LTM warmth; also
   lists live daemons under a different config fingerprint and whether each
   exits on its own once idle.
@@ -358,6 +359,11 @@ def stop_cmd(stop_all: bool) -> None:
     pinned ``idle_timeout_seconds=0`` daemon left by a config or
     ``PROTOCOL_VERSION`` change, which ``stop`` cannot otherwise reach. Not all
     of them are stale: one may serve an STM process with a different environment.
+
+    Exits 1 when a stop it started is not confirmed (its handshake not
+    removed) or could not be started. Exit 0 also covers a record cleaned up
+    as stale, which does not confirm a teardown: a daemon already shutting down
+    on its own has closed its listener and lands there too.
     """
     config = _load_config()
     current_stop_error: SystemExit | None = None
@@ -366,6 +372,8 @@ def stop_cmd(stop_all: bool) -> None:
     except SystemExit as exc:
         current_stop_error = exc
     if stop_all:
+        # Runs even after a failed current-config stop; either half failing
+        # fails the command.
         _stop_foreign_daemons(config)
     if current_stop_error is not None:
         raise current_stop_error
@@ -417,6 +425,29 @@ def _handshake_removed(path: Path) -> bool:
     return False
 
 
+# How long ``stop`` waits for a daemon it asked or signalled to finish its
+# teardown. One budget for every daemon in a call, not one each.
+_STOP_WAIT_SECONDS = 5.0
+
+
+def _wait_handshakes_removed(paths: list[Path]) -> list[Path]:
+    """Poll until every handshake in *paths* is removed or the budget runs out.
+
+    Returns the ones still present — empty means every daemon confirmed its
+    stop. The handshake is the terminal condition for the SIGTERM paths too:
+    the signal handler sets the same shutdown event the graceful op does, and
+    teardown removes the handshake after the engine, stores and LTM child are
+    down (every build since the daemon was introduced does this last).
+    """
+    pending = list(paths)
+    deadline = time.time() + _STOP_WAIT_SECONDS
+    while True:
+        pending = [p for p in pending if not _handshake_removed(p)]
+        if not pending or time.time() >= deadline:
+            return pending
+        time.sleep(0.05)
+
+
 def _stop_current_config_daemon(config: STMConfig) -> None:
     """Stop the daemon for *this* config (graceful, then SIGTERM-by-pid fallback)."""
     from memtomem_stm.daemon import client
@@ -443,12 +474,9 @@ def _stop_current_config_daemon(config: STMConfig) -> None:
         # an ephemeral port the OS reassigned to an unrelated listener inside
         # this window kept the probe true forever and reported a clean stop as
         # a failure.
-        deadline = time.time() + 5.0
-        while time.time() < deadline:
-            if _handshake_removed(hs_path):
-                click.echo(_ok("daemon stopped"))
-                return
-            time.sleep(0.05)
+        if not _wait_handshakes_removed([hs_path]):
+            click.echo(_ok("daemon stopped"))
+            return
         click.echo(
             _warn(
                 "daemon accepted shutdown but is still cleaning up — "
@@ -492,20 +520,44 @@ def _stop_current_config_daemon(config: STMConfig) -> None:
                     "daemon endpoint is still listening but rejected graceful shutdown; "
                     "Windows does not provide the POSIX SIGTERM fallback. Close the owning "
                     "terminal/process, then run `mms daemon status`."
-                )
+                ),
+                err=True,
             )
-            return
+            raise SystemExit(1)
         try:
             os.kill(pid, signal.SIGTERM)
-            click.echo(_ok(f"sent SIGTERM to daemon pid={pid}"))
-            return
-        except OSError:
-            pass
+        except ProcessLookupError:
+            pass  # exited between the probe and the signal: the stale case below
+        except OSError as exc:
+            # Alive (``is_pid_alive`` counts EPERM as alive) and listening, but
+            # not ours to signal: the record is not stale, so keep it.
+            click.echo(
+                _warn(f"could not signal daemon pid={pid} ({type(exc).__name__})"),
+                err=True,
+            )
+            raise SystemExit(1)
+        else:
+            # The signal only starts the same teardown the graceful path waits
+            # for, so wait for the same terminal condition before saying so.
+            click.echo(f"sent SIGTERM to daemon pid={pid}")
+            if not _wait_handshakes_removed([hs_path]):
+                click.echo(_ok("daemon stopped"))
+                return
+            click.echo(
+                _warn(
+                    f"daemon pid={pid} did not finish shutting down after SIGTERM — "
+                    "run `mms daemon status` before starting a replacement"
+                ),
+                err=True,
+            )
+            raise SystemExit(1)
     try:
         hs_path.unlink(missing_ok=True)
     except OSError:
         pass
-    click.echo(_warn("no responsive daemon; cleaned stale handshake"))
+    # Names the pid: a daemon already shutting down on its own has closed its
+    # listener too, and this record is gone once we return.
+    click.echo(_warn(f"no responsive daemon pid={pid}; cleaned stale handshake"))
 
 
 def _stop_foreign_daemons(config: STMConfig) -> None:
@@ -515,7 +567,10 @@ def _stop_foreign_daemons(config: STMConfig) -> None:
     older protocol the graceful path can't negotiate; the daemon's signal handler
     sets its shutdown event regardless of ``idle_timeout_seconds``, so even a
     pinned daemon exits. The daemon removes its own handshake on teardown, so we
-    do not unlink it here (that could hide a survivor that ignored the signal).
+    do not unlink it here (that could hide a survivor that ignored the signal) —
+    its removal is what the wait after signalling counts as the stop. Exits 1
+    when any target could not be signalled or did not finish within the budget,
+    and on Windows, which cannot signal them at all.
 
     Targets come from :func:`_live_foreign_daemons`, whose two-factor check
     (recorded pid alive *and* its endpoint accepting a connect) already rejects a
@@ -525,7 +580,7 @@ def _stop_foreign_daemons(config: STMConfig) -> None:
     listener); ``--all`` stays opt-in for that narrow window.
     """
     from memtomem_stm.daemon import client
-    from memtomem_stm.daemon.discovery import is_pid_alive
+    from memtomem_stm.daemon.discovery import handshake_path, is_pid_alive
 
     foreign = _live_foreign_daemons(config)
     if not foreign:
@@ -537,9 +592,13 @@ def _stop_foreign_daemons(config: STMConfig) -> None:
                 "found daemon(s) under a different config, but Windows cannot safely "
                 "SIGTERM them by pid. Stop the owning processes from Task Manager or "
                 "restart Windows, then run `mms daemon status`."
-            )
+            ),
+            err=True,
         )
-        return
+        raise SystemExit(1)
+    # Signal every target first, then wait on all of them against one budget.
+    waiting: dict[Path, dict[str, Any]] = {}
+    failed = False
     for d in foreign:
         pid = d["pid"]
         # Re-confirm the *same* two-factor gate at action time, not just
@@ -549,11 +608,36 @@ def _stop_foreign_daemons(config: STMConfig) -> None:
         # True), so re-run the connect-probe — a recycled pid's endpoint is gone.
         if not (is_pid_alive(pid) and client.probe_listening(d["host"], d["port"])):
             continue  # raced to exit / pid recycled between enumeration and now
+        hs_path = handshake_path(config.data_dir, d["fingerprint"])
         try:
             os.kill(pid, signal.SIGTERM)
-            click.echo(_ok(f"sent SIGTERM to daemon pid={pid} (fp={d['fingerprint']})"))
+        except ProcessLookupError:
+            # Gone before the signal, but its handshake may still be there:
+            # a daemon that crashed leaves it, so it joins the wait rather
+            # than counting as stopped.
+            waiting[hs_path] = d
         except OSError:
-            click.echo(_warn(f"could not signal daemon pid={pid} (fp={d['fingerprint']})"))
+            click.echo(
+                _warn(f"could not signal daemon pid={pid} (fp={d['fingerprint']})"), err=True
+            )
+            failed = True
+        else:
+            click.echo(f"sent SIGTERM to daemon pid={pid} (fp={d['fingerprint']})")
+            waiting[hs_path] = d
+    remaining = set(_wait_handshakes_removed(list(waiting)))
+    for path, d in waiting.items():
+        if path in remaining:
+            click.echo(
+                _warn(
+                    f"daemon pid={d['pid']} (fp={d['fingerprint']}) did not finish "
+                    "shutting down after SIGTERM"
+                ),
+                err=True,
+            )
+        else:
+            click.echo(_ok(f"daemon pid={d['pid']} stopped (fp={d['fingerprint']})"))
+    if failed or remaining:
+        raise SystemExit(1)
 
 
 # (snapshot key, status-line label) for every surface-series counter. The
