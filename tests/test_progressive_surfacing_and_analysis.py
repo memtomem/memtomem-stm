@@ -1,4 +1,4 @@
-"""Observable metrics and parsing-work regressions from the PR 1232 review."""
+"""Progressive surfacing outcomes and deferred source-analysis work."""
 
 from unittest.mock import Mock
 from types import SimpleNamespace

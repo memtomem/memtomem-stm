@@ -1,4 +1,4 @@
-"""Boundary cases from the agy and Claude review of 4214b1ba."""
+"""Native payload preservation, format selection and typed error contracts."""
 
 from __future__ import annotations
 

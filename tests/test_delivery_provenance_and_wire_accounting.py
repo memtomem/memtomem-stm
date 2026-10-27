@@ -1,4 +1,4 @@
-"""Cross-format provenance, default-path work and publication regressions."""
+"""Source provenance, wire accounting and SDK compatibility."""
 
 import builtins
 import json

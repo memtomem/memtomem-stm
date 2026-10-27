@@ -1,4 +1,4 @@
-"""Lossy fallback availability and bounded cross-format read regressions."""
+"""Lossy fallbacks, read lifetimes and cross-format metadata."""
 
 import time
 from unittest.mock import AsyncMock, Mock

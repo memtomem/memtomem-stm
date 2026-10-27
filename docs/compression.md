@@ -597,8 +597,12 @@ of section selection.
 
 Selection continuations never truncate chosen sections: ask
 for fewer keys or `response_format: "legacy"` if they exceed their stored budget.
-Raw/nonstandard JSON, duplicate keys and unrepresentable paths use progressive
-delivery in structured mode. Explicit `hybrid.tail_mode: "truncate"` remains
+Nonstandard JSON values, duplicate keys and unrepresentable JSON paths use
+progressive delivery in structured mode. Documents that do not parse as JSON
+follow ordinary Markdown or paragraph detection, including logs and badge-led
+text starting with `[` or templates starting with `{`. Paragraph selections
+report `metadata_complete: false` and do not invent JSON paths or source ranges.
+Explicit `hybrid.tail_mode: "truncate"` remains
 ordinary lossy compression without a TOC key, with its configured retention floor;
 `delivery_format` does not turn that choice into a chunk publisher.
 Privacy refusal and store failure keep their

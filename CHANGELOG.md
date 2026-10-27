@@ -59,6 +59,8 @@ changes inline only. See the deprecation policy in
   metadata. SDK projection support is declared through the direct `mcp-types`
   dependency; incompatible projectors keep legacy service available and report a
   typed error for structured budgets that cannot be measured.
+  Non-JSON logs, links and templates retain paragraph selection without claiming
+  JSON paths or exact source ranges.
 
 ## [0.6.9] — 2026-10-25
 

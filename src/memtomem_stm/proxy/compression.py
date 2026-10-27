@@ -1427,12 +1427,10 @@ class SelectiveCompressor:
                 raise
             return "text", self._parse_text(text)
         except (json.JSONDecodeError, ValueError, RecursionError, OverflowError):
-            # A Markdown link/reference/badge can begin with '[' too. Recognize
-            # real headings before classifying an unparsed JSON-looking body.
-            if next(markdown_headings(text), None) is not None:
-                return "markdown", self._parse_markdown(text)
-            if delivery_format() == "structured" and text.lstrip().startswith(("{", "[")):
-                raise DeliveryBudgetExceeded("Unparsed JSON requires progressive delivery.")
+            # Logs, links and templates can begin with '[' or '{'. A failed
+            # JSON parse follows ordinary format detection below; paragraph
+            # chunks do not claim JSON paths or exact source-range metadata.
+            pass
 
         if next(markdown_headings(text), None) is not None:
             return "markdown", self._parse_markdown(text)

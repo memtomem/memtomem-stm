@@ -1,4 +1,4 @@
-"""Reproductions from the independent review of 4214b1ba."""
+"""Pre-publication fitting, safe fallbacks and delivery accounting guards."""
 
 from __future__ import annotations
 
