@@ -9,66 +9,144 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
-## [Unreleased]
+## [0.7.0] — 2026-10-27
 
 ### Upgrade notes
 
-- **Behavior change**: Markdown heading detection now ignores fenced code across
-  compression, hints and indexes. Selection chunks preserve heading levels and
-  original Markdown ranges; affected TOC keys/content may change.
-- **Behavior change**: non-finite pending/progressive/cache TTL settings are rejected;
-  malformed search responses are reported as parse errors instead of skipping
-  malformed items and retaining the remaining hits.
-- **Behavior change**: generated memory metadata escapes Unicode line separators.
-  Extracted tags now live in frontmatter, so new files participate in Core tag
-  filtering. Existing Markdown files are not rewritten.
-- **Behavior change**: compact fallback IDs use a versioned namespace/source/content
-  digest. Old feedback/dedup history is retained but cannot be inferred onto new IDs.
-- Upgrade/restart processes sharing pending SQLite files together. Presentation
-  metadata adds a nullable column; valid old rows remain readable. Heading index
-  v3 has a separate key, avoiding old/new index rewrite loops. Stop the old scoped
-  daemon before upgrading; protocol v9 prevents an old peer from rewriting IDs.
-  Invalid raw chunk/correlation identities are refused before content escaping.
-  Invalid adjacent context IDs drop only that neighbor, preserving valid hits.
-- The first response-cache open runs a one-time sweep to remove structured STM
-  continuation keys. Switching between old and new cache policies repeats that
-  sweep; large caches can take longer to open.
+- **Stop the old scoped daemon before upgrading, and restart every process
+  that shares the pending SQLite files together.** The daemon protocol moves to
+  v9. (#1232)
+- **The response cache starts cold.** Cache keys now include the delivery
+  format, so responses cached by 0.6.9 are not reused, and the first open
+  re-checks every cached row for privacy. (#1232)
+- **Selective TOCs change shape.** Markdown sections split differently and keep
+  their heading lines; JSON entries report their real type. (#1232)
+- **LTM responses are validated strictly.** An item of the wrong shape, `{}`,
+  a missing `results` key or a whitespace-only reply is now a fault that counts
+  against the circuit breaker instead of being partly used or treated as
+  empty. (#1232)
+- **An infinite TTL fails config validation.** (#1232)
+- **Generated memory files and compact fallback IDs change format.** Existing
+  files are not rewritten; feedback under old IDs does not carry over. (#1232)
+- **The continuation tools advertise a new output schema,**
+  `ContinuationOutput`, and a failed `select` no longer extends a key's TTL.
+  (#1232)
 
 ### Added
 
 - Opt-in `delivery_format="structured"` with server/tool overrides and optional
   `response_format` on continuation tools; legacy remains the default. Versioned
   JSON includes exact chunk keys, Unicode code-point offsets, JSON paths/types,
-  Markdown source ranges and typed errors, including cross-format reads.
+  Markdown source ranges and typed errors, including cross-format reads. (#1232)
 - Serialized MCP-result budgets cover negotiated SDK additions and field
   filtering. Complete progressive/hybrid frames and progressing continuation
   capacity are checked before publication; storage/privacy failures use uncached
   safe fallback. Transient keys stay out of the response cache.
   Unicode token budgets share one density-derived cap across compression,
   initial structured frames and owned continuations. Inline TOC contents stay
-  complete; tables that cannot fit fall back to progressive delivery.
+  complete; tables that cannot fit fall back to progressive delivery. (#1232)
 - Native upstream schemas, structured/non-text payloads and annotated text
   boundaries are preserved. Text twins are cleaned and capped separately;
-  proxied errors carry STM JSON in text without replacing upstream output schemas.
+  proxied errors carry STM JSON in text without replacing upstream output
+  schemas. (#1232)
 - Separate structured-wire accounting, progressive read measurements and matching
   auto-index metadata. Tuner retention ratios exclude serialized-envelope and
   native-bypass populations. Default legacy calls avoid unused wire projection
-  and source classification; structured overrides cache derived metadata on demand.
+  and source classification; structured overrides cache derived metadata on
+  demand. (#1232)
 - Strict JSON and raw identity validation across storage, MCP and daemon formats,
   finite TTL validation, fence-aware headings and source-preserving selection
   metadata. SDK projection support is declared through the direct `mcp-types`
   dependency; incompatible projectors keep legacy service available and report a
   typed error for structured budgets that cannot be measured.
   Non-JSON logs, links and templates retain paragraph selection without claiming
-  JSON paths or exact source ranges.
+  JSON paths or exact source ranges. (#1232)
+- `mms list --json` reports each server's `delivery_format` and
+  `tool_delivery_overrides`, with legacy delivery too. These are additive
+  keys under the README's compatibility policy. (#1232)
 
 ### Changed
 
+- Daemon protocol v9 keeps an old peer from rewriting chunk IDs. The pending
+  store gains a nullable presentation-metadata column; rows written by 0.6.9
+  stay readable. The heading index moves to a separate v3 key, so old and new
+  builds do not rewrite each other's index. **Behavior change**: an old scoped
+  daemon must be stopped before upgrading, and every process that shares a
+  pending SQLite file must be restarted on 0.7.0 together, since instances
+  sharing one file must run the same version. A 0.6.9 process can still read
+  rows this release writes, but only as legacy delivery, without their
+  presentation metadata. (#1232)
+- The response-cache key now includes `delivery_format`, which is `"legacy"`
+  by default. The cache privacy-policy epoch moves from 4 to 5, so the first
+  open re-checks every cached row (credential scan plus removal of transient
+  STM continuation keys), as on the upgrades to 0.6.7–0.6.9.
+  **Behavior change**: no response cached by 0.6.9 is served after upgrading,
+  so the first repeat of each call goes to the upstream again; while a
+  0.3.0–0.6.9 build opens the same `proxy_cache.db`, each switch between
+  builds repeats the privacy sweep. (#1232)
+- Markdown heading detection ignores fenced code across compression, hints and
+  indexes, drops closing `#` sequences, and accepts headings indented by up to
+  three spaces. **Behavior change**: a `# comment` line inside a code fence no
+  longer starts a section in the middle of the block, and a response whose only
+  `#` lines are fenced is split into paragraphs as text; `## Title ##` is keyed
+  `Title` (it was `Title ##`); a response whose only headings are indented by
+  1–3 spaces is now Markdown (it was text). Every Markdown selection chunk
+  keeps its heading line and trailing whitespace (it held the stripped body),
+  and a heading with no body gets its own key, so TOC keys, sizes, previews
+  and `select` output change for most Markdown responses. (#1232)
+- JSON selective TOC entries report their type. **Behavior change**: scalar
+  entries were all listed as `"string"` and are now `number`, `boolean` or
+  `null`; an empty nested object, which used to be dropped, is listed under its
+  own key. (#1232)
+- LTM search and `context_compose` responses are validated before use. In
+  0.6.9 an item whose content was missing or falsy (`null`, `""`, `0`,
+  `false`) was dropped, a numeric-string score such as `"0.75"` was read as a
+  number and any other string or NaN score as 0.0, and a non-object item or
+  other non-string content (such as `5`) raised, which recorded an
+  `error_other` fault on the direct path and, through the daemon, an
+  `ltm_unavailable` fault. **Behavior change**: an item of the wrong shape
+  (not an object; a non-string `content`, `source`, `namespace` or `chunk_id`; a
+  non-numeric or non-finite score) now makes the whole response a
+  `parse_error` with no hits, while an item with empty `content` or a
+  `chunk_id` that is not UTF-8-encodable is still dropped on its own, as
+  before; `{}` and a response without a `results` key, which were healthy
+  empty results, are parse errors too, and a whitespace-only reply is an
+  `empty_content` fault (`{"results": []}` is still healthy). Both record an
+  `ltm_parse_empty` fault and a circuit-breaker failure, so an LTM server that
+  answers `{}` now opens the breaker.
+  `context_compose` items that used to be coerced (a non-string `source`
+  passed through `str()`, a non-numeric or non-finite `score` set to 0.0) now
+  fail the whole compose call. The hook's reader of daemon replies, which
+  skipped malformed items, applies the same rule, and invalid raw chunk or
+  correlation IDs on the daemon wire are refused. An invalid adjacent context
+  ID drops only that neighbor. (#1232)
+- TTL settings must be finite. **Behavior change**: `pending_ttl_seconds`,
+  `ttl_seconds`, both `cache_ttl_seconds` fields and `default_ttl_seconds`
+  accepted `inf` in 0.6.9 and now fail validation (NaN was already rejected).
+  (#1232)
+- Generated memory files put extracted tags in the frontmatter, so new files
+  take part in Core's tag filtering. **Behavior change**: tags were a
+  `tags: [...]` line at the end of the body; frontmatter string values are now
+  JSON quoted (`source: "extracted/srv/tool"`), and titles, `extracted_from`,
+  auto-index headers and agent intent escape line breaks, Unicode line
+  separators, `` ` ``, `<` and `>` as `\uXXXX`. Fact bodies are not escaped.
+  Existing files are not rewritten. (#1232)
+- Compact fallback IDs, used only when Core returns no `chunk_id`, are a
+  versioned digest of namespace, source and content. **Behavior change**: IDs
+  change from the first 16 hex digits of the content's SHA-256 to
+  `stm:compact:v2:…`; feedback and dedup history recorded under the old IDs is
+  kept but does not carry over. (#1232)
+- The continuation tools share one output model. **Behavior change**:
+  `stm_proxy_read_more` and `stm_proxy_select_chunks` declare
+  `ContinuationOutput` (it was one `<tool>Output` per tool) with an optional
+  `stm` object beside `result`, and their descriptions changed. A selection
+  key's TTL is renewed only when a selection succeeds; a failed `select` used
+  to renew it too. (#1232)
 - **The project status moves from alpha to beta.** The README banner and the
   PyPI classifier (`Development Status :: 4 - Beta`) now say beta, and a new
   Feature maturity section in the README names the beta core and lists the
   features that are still experimental, each with its reason. The
-  compatibility policy is unchanged.
+  compatibility policy is unchanged. (#1234)
 
 ## [0.6.9] — 2026-10-25
 

@@ -8,8 +8,8 @@ Please report security issues via [GitHub private vulnerability advisory](https:
 
 | Version | Supported |
 |---------|-----------|
-| 0.6.x   | Yes       |
-| < 0.6.0 | No        |
+| 0.7.x   | Yes       |
+| < 0.7.0 | No        |
 
 ## Threat Model
 
