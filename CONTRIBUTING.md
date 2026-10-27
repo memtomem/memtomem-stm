@@ -175,6 +175,58 @@ and absolute, while pages under `docs/` should use relative links.
 We do not accept third-party automated promotional or badge PRs (for example,
 vendor security-scan badges); these will be closed.
 
+## Advisory-fork pre-merge checklist
+
+GitHub's temporary private security-advisory forks do not run this repository's
+CI. Missing checks are not passing checks: the default test filter above also
+excludes the drift and performance suites. Before merging an advisory-fork fix:
+
+1. Check out the exact candidate commit in a private working copy. Keep the fix,
+   reproducer and verification output in the private advisory until disclosure;
+   do not open a public PR just to obtain CI.
+2. Compare the commands below with [the current CI workflow](.github/workflows/ci.yml).
+   Use its uv version (currently 0.12.5), run from the repository root, and start
+   with `uv sync --frozen --python 3.12`. Run the checks below, then switch with
+   `uv sync --frozen --python 3.13` and repeat the `test` row as CI does.
+   `--frozen` keeps verification on the committed lockfile.
+
+   | CI job | Local command(s) |
+   | --- | --- |
+   | `lint` | `uv run --frozen ruff check src` and `uv run --frozen ruff format --check src` |
+   | `typecheck` | `uv run --frozen mypy src` |
+   | `test` | `uv run --frozen pytest -m "not bench_qa_meta and not bench_qa_llm_judge and not bench_qa_sweep and not bench_qa_drift and not bench_qa_perf" --tb=short -q` |
+   | `test` — Ubuntu, Python 3.12 coverage | Same test command with `--cov=memtomem_stm --cov-branch --cov-fail-under=90` |
+   | `notebooks` | `uv run --frozen pytest --nbmake notebooks/01_quickstart_proxy_setup.ipynb --nbmake-timeout=180 --tb=short -q` |
+   | `audit` | `scripts/audit-dependencies.sh runtime` |
+   | `audit_extras` | `scripts/audit-dependencies.sh extras` |
+   | `audit_dev` (advisory) | `scripts/audit-dependencies.sh dev` |
+   | `bench_qa` | `BENCH_QA_REPORT_DIR=bench-qa-report uv run --frozen pytest -m "bench_qa and not bench_qa_sweep" --tb=short -q` |
+   | `bench_qa_drift` (advisory) | `BENCH_QA_REPORT_DIR=bench-qa-drift-report uv run --frozen pytest -m bench_qa_drift --tb=short -q` |
+   | `bench_qa_perf` (advisory) | `BENCH_QA_REPORT_DIR=bench-qa-perf-report uv run --frozen pytest -m bench_qa_perf --tb=short -q` |
+
+   The report-directory assignments use POSIX shell syntax. In PowerShell, set
+   `$env:BENCH_QA_REPORT_DIR` before the corresponding command. The
+   `bench_qa_pr_comment` job only publishes the bench summary; it has no extra
+   test command. Retain `summary.md` and the reports privately instead of
+   posting that comment publicly.
+3. Inspect any drift failure. For an intended output change, follow
+   [the cross-version drift gate](#the-cross-version-drift-gate): regenerate the
+   baseline, review every moved field and include the baseline with the fix.
+   Re-run affected checks after any edit. The advisory status of `audit_dev`,
+   `bench_qa_drift` and `bench_qa_perf` is unchanged; record and explain failures
+   rather than treating them as passes.
+4. Record the candidate SHA, OS, Python and uv versions, commands, exit codes,
+   report locations, and any failures or `NOT RUN` checks in the private
+   advisory. A macOS run does not verify Ubuntu or Windows. In particular,
+   **Windows is unverified until the post-merge CI matrix runs**, unless that
+   exact candidate was separately tested on Windows before merging. The Windows
+   matrix covers `lint`, `typecheck` and `test` on Python 3.12; retain separate
+   results for each platform and Python version.
+5. After merging, inspect the main-branch CI run, including advisory jobs and
+   the Windows matrix. Record its commit and results; resolve failures before
+   cutting the release. A successful local run is pre-merge evidence, not a
+   substitute for that post-merge verification.
+
 ## Changelog and upgrade notes
 
 Every user-visible change gets a `CHANGELOG.md` bullet under `## [Unreleased]`,

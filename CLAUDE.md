@@ -22,6 +22,10 @@ uv run pytest --nbmake notebooks/01_quickstart_proxy_setup.ipynb --nbmake-timeou
 Live-Ollama tests are out of scope: Ollama paths are tested with mocked
 transport / dead ports only (#637).
 
+For private security-advisory forks, follow the
+[advisory-fork pre-merge checklist](CONTRIBUTING.md#advisory-fork-pre-merge-checklist);
+the commands above do not cover every CI job.
+
 ## Invariants when editing
 
 - **No Python-level dependency on `memtomem` core.** Don't `import memtomem`
