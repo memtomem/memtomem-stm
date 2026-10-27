@@ -62,6 +62,14 @@ changes inline only. See the deprecation policy in
   Non-JSON logs, links and templates retain paragraph selection without claiming
   JSON paths or exact source ranges.
 
+### Changed
+
+- **The project status moves from alpha to beta.** The README banner and the
+  PyPI classifier (`Development Status :: 4 - Beta`) now say beta, and a new
+  Feature maturity section in the README names the beta core and lists the
+  features that are still experimental, each with its reason. The
+  compatibility policy is unchanged.
+
 ## [0.6.9] — 2026-10-25
 
 ### Upgrade notes

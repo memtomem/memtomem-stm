@@ -7,7 +7,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![CLA](https://img.shields.io/badge/CLA-required-green)](CLA.md)
 
-> 🚧 **Alpha** — APIs and defaults may change between 0.x minor releases. Feedback and issue reports are especially welcome: [Issues](https://github.com/memtomem/memtomem-stm/issues) · [Discussions](https://github.com/memtomem/memtomem-stm/discussions).
+> 🧪 **Beta** — the core proxy path (compression, caching, surfacing) is ready for everyday use. APIs and defaults may still change between 0.x minor releases, always with an Upgrade notes entry, and a few features are marked [experimental](https://github.com/memtomem/memtomem-stm/blob/main/README.md#feature-maturity). Feedback and issue reports are especially welcome: [Issues](https://github.com/memtomem/memtomem-stm/issues) · [Discussions](https://github.com/memtomem/memtomem-stm/discussions).
 
 Spend fewer tokens. Remember more. Ship faster.
 
@@ -227,7 +227,7 @@ Projects and hosts: `mms project`, `mms host`. Policy and telemetry:
 
 ## Compatibility & deprecation policy
 
-memtomem-stm is alpha (0.x): behavior and defaults may change between minor
+memtomem-stm is beta (0.x): behavior and defaults may change between minor
 releases while the design settles — defaults have flipped before (e.g.
 `injection_mode` `prepend` → `append` in 0.1.24). Every such change is flagged
 inline in [CHANGELOG.md](https://github.com/memtomem/memtomem-stm/blob/main/CHANGELOG.md)
@@ -238,6 +238,23 @@ Machine-readable surfaces (`--json` output shapes, exit codes) only change
 with an Upgrade notes entry; additive keys may appear at any time, so parse by
 key, not by shape equality. Deprecated CLI commands or flags keep working with
 a warning for at least one minor release before removal.
+
+### Feature maturity
+
+The beta core is the proxy path itself: proxying upstream MCP servers,
+compressing and caching their responses, surfacing LTM memories, and the `mms`
+commands that set this up. The features below are **experimental**: they work
+and are tested, but have not yet seen enough real-world use to settle their
+behavior, so expect larger changes there.
+
+| Feature | Default | Why experimental |
+|---------|---------|------------------|
+| [Structured chunk delivery](https://github.com/memtomem/memtomem-stm/blob/main/docs/compression.md#structured-chunk-delivery) (`delivery_format="structured"`) | off | New in 0.7.0. |
+| [Surfacing feedback and auto-tuning](https://github.com/memtomem/memtomem-stm/blob/main/docs/surfacing.md#feedback--auto-tuning) | on | The tuner acts only on ratings the model submits, and models have not been seen to submit them ([#1033](https://github.com/memtomem/memtomem-stm/issues/1033)), so it has not yet adjusted a threshold in practice ([#875](https://github.com/memtomem/memtomem-stm/issues/875)). |
+| [Review-first memory formation](https://github.com/memtomem/memtomem-stm/blob/main/docs/surfacing.md#review-first-formation-experimental) (`stm_memory_propose`) | off | Usable only against a Core that advertises the versioned `candidate_propose` capability; already marked experimental in the surfacing guide. |
+| [Toolgraph policy gateway](https://github.com/memtomem/memtomem-stm/blob/main/docs/guides/toolgraph-policy-gateway.md) | off | How `strict` treats an unprotected policy bundle is still undecided ([#707](https://github.com/memtomem/memtomem-stm/issues/707)). |
+| [Selection telemetry](https://github.com/memtomem/memtomem-stm/blob/main/docs/selection-telemetry.md) and [offline tool-selection evaluation](https://github.com/memtomem/memtomem-stm/blob/main/docs/selection-evaluation.md) | off | Inputs for a ranking model that is not built yet ([#469](https://github.com/memtomem/memtomem-stm/issues/469)); the log format may change with it. |
+| [Langfuse tracing](https://github.com/memtomem/memtomem-stm/blob/main/docs/configuration.md#langfuse-tracing-optional) (`[langfuse]` extra) | off | CI runs without the extra, so new Langfuse SDK releases are not exercised by the test suite. OTLP export is part of the core. |
 
 ## Development
 
