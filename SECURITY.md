@@ -4,6 +4,10 @@
 
 Please report security issues via [GitHub private vulnerability advisory](https://github.com/memtomem/memtomem-stm/security/advisories/new). Do NOT open public issues for vulnerabilities.
 
+Maintainers merging a fix from a temporary private advisory fork must follow
+the [advisory-fork pre-merge checklist](CONTRIBUTING.md#advisory-fork-pre-merge-checklist),
+which covers local CI equivalents and the remaining platform verification.
+
 ## Supported Versions
 
 | Version | Supported |
