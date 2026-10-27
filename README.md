@@ -76,6 +76,12 @@ covers Core 0.3.13, 0.3.14, 0.4.0, 0.5.0 and the current Core 0.6.5 release.
 
 ## Upgrade
 
+Read the target release's [Upgrade notes](https://github.com/memtomem/memtomem-stm/blob/main/CHANGELOG.md)
+before upgrading. When a note says the daemon protocol changes, quit the MCP
+hosts and run `mms daemon stop` with the old build **first**: the new build
+cannot reach a daemon the old one started. The full sequence is in
+[Upgrading](https://github.com/memtomem/memtomem-stm/blob/main/docs/guides/operations.md#upgrading).
+
 ```bash
 uv tool upgrade memtomem-stm                 # uv tool installation
 python -m pip install --upgrade memtomem-stm # virtualenv / pip installation
@@ -83,11 +89,9 @@ mms version
 mms doctor
 ```
 
-Read the target release's [Upgrade notes](https://github.com/memtomem/memtomem-stm/blob/main/CHANGELOG.md)
-before upgrading. Restart only the daemon for the current configuration with
-`mms daemon restart` when an upgrade note requires it. Client registration is
-kept unchanged by default; use `mms register --replace-registration` only when
-you intentionally want to refresh it.
+Client registration is kept unchanged by default; use
+`mms register --replace-registration` only when you intentionally want to
+refresh it.
 
 ## Quick Start
 
