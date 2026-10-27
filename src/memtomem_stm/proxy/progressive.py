@@ -140,7 +140,15 @@ class ProgressiveStoreAdapter:
         self, key: str, *, renew: bool = False, response_format: DeliveryFormat | None = None
     ) -> ProgressiveResponse | None:
         with read_delivery_scope(response_format):
-            entry = self._store.get_progressive(key, renew=renew)
+            entry = self._store.get_progressive(
+                key,
+                renew=renew,
+                classify_content=(
+                    ProgressiveChunker.detect_content_type
+                    if response_format == "structured"
+                    else None
+                ),
+            )
         if entry is None:
             return None
         sel, meta = entry.selection, entry.metadata
@@ -157,8 +165,8 @@ class ProgressiveStoreAdapter:
         )
         if mode == "structured" and stored_mode == "legacy":
             # Legacy publication avoids whole-document classification. An
-            # explicit structured read requests that metadata on demand.
-            content_type = ProgressiveChunker.detect_content_type(sel.chunks["__content__"])
+            # explicit structured read requests that metadata once per row.
+            content_type = meta["structured_content_type"]
         return ProgressiveResponse(
             content=sel.chunks["__content__"],
             total_chars=sel.total_chars,

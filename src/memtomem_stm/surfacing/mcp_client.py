@@ -256,13 +256,14 @@ def decode_context_compose_context(
     bounded_before = before[-limit:] if limit else []
     bounded_after = after[:limit] if limit else []
 
-    def decode_chunk(item: Any) -> RemoteContextChunk:
+    def decode_chunk(item: Any) -> RemoteContextChunk | None:
         if not isinstance(item, dict):
             raise ResponseShapeError("context compose adjacent chunk must be an object")
         if not all(isinstance(item.get(field), str) for field in ("id", "content", "source")):
             raise ResponseShapeError("context compose adjacent chunk has invalid shape")
         if not item["id"] or has_lone_surrogate(item["id"]):
-            raise ResponseShapeError("context compose adjacent chunk has invalid identity")
+            logger.warning("Dropping a core context_compose adjacent chunk with invalid identity")
+            return None
         namespace = item.get("namespace", "default")
         if not isinstance(namespace, str):
             raise ResponseShapeError("context compose adjacent chunk namespace must be a string")
@@ -285,8 +286,12 @@ def decode_context_compose_context(
     ):
         raise ResponseShapeError("context compose chunk positions must be non-negative integers")
     return RemoteContextInfo(
-        window_before=tuple(decode_chunk(item) for item in bounded_before),
-        window_after=tuple(decode_chunk(item) for item in bounded_after),
+        window_before=tuple(
+            chunk for item in bounded_before if (chunk := decode_chunk(item)) is not None
+        ),
+        window_after=tuple(
+            chunk for item in bounded_after if (chunk := decode_chunk(item)) is not None
+        ),
         chunk_position=chunk_position,
         total_chunks_in_file=total_chunks,
     )

@@ -9,6 +9,7 @@ import sqlite3
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
@@ -82,6 +83,33 @@ def _live_progressive_metadata(selection: PendingSelection, now: float) -> dict[
     return meta
 
 
+def _classify_progressive_content(
+    selection: PendingSelection,
+    meta: dict[str, Any],
+    classify_content: Callable[[str], str] | None,
+) -> bool:
+    """Cache optional cross-format classification under the row's mutation lock.
+
+    Keep the legacy presentation/type intact. The optional derived field is
+    replaced with the row, survives SQLite restarts, and never renews its TTL.
+    """
+    presentation = meta.get("delivery")
+    stored_mode = (
+        presentation.get("delivery_format", "legacy")
+        if isinstance(presentation, dict)
+        else "legacy"
+    )
+    if (
+        classify_content is None
+        or stored_mode != "legacy"
+        or meta.get("structured_content_type") in ("json", "markdown", "text", "code")
+    ):
+        return False
+    meta["structured_content_type"] = classify_content(selection.chunks["__content__"])
+    selection.chunks["__meta__"] = _json_dumps(meta, ensure_ascii=False)
+    return True
+
+
 @dataclass(frozen=True)
 class ProgressiveEntry:
     """A live snapshot with metadata validated under the backend's lock."""
@@ -119,7 +147,13 @@ class PendingStore(Protocol):
 
     def put(self, key: str, selection: PendingSelection) -> None: ...
     def get(self, key: str) -> PendingSelection | None: ...
-    def get_progressive(self, key: str, *, renew: bool = False) -> ProgressiveEntry | None: ...
+    def get_progressive(
+        self,
+        key: str,
+        *,
+        renew: bool = False,
+        classify_content: Callable[[str], str] | None = None,
+    ) -> ProgressiveEntry | None: ...
     def evict_progressive_expired(self) -> None: ...
     def touch(self, key: str) -> None: ...
     def delete(self, key: str) -> None: ...
@@ -161,7 +195,13 @@ class InMemoryPendingStore:
         with self._lock:
             return self._data.get(key)
 
-    def get_progressive(self, key: str, *, renew: bool = False) -> ProgressiveEntry | None:
+    def get_progressive(
+        self,
+        key: str,
+        *,
+        renew: bool = False,
+        classify_content: Callable[[str], str] | None = None,
+    ) -> ProgressiveEntry | None:
         """Check expiry and optionally renew under the same mutation lock."""
         with self._lock:
             sel = self._data.get(key)
@@ -174,6 +214,7 @@ class InMemoryPendingStore:
                 self._order.remove(key)
                 return None
             progressive_metadata_format(meta)
+            _classify_progressive_content(sel, meta, classify_content)
             index = None
             if meta.get("include_structure_hint", True):
                 index, _ = ensure_heading_index(sel.chunks["__content__"], sel.chunks)
@@ -454,14 +495,20 @@ class SQLitePendingStore:
             metadata_json=row[4] if len(row) > 4 else None,
         )
 
-    def get_progressive(self, key: str, *, renew: bool = False) -> ProgressiveEntry | None:
+    def get_progressive(
+        self,
+        key: str,
+        *,
+        renew: bool = False,
+        classify_content: Callable[[str], str] | None = None,
+    ) -> ProgressiveEntry | None:
         """Read-only miss probe, then atomic validation/deletion/renewal.
 
         A miss must not wait on another writer before alternate-store recovery.
         A hit is authoritatively re-read after taking the write lock, so a
         concurrent refresh or replacement cannot be deleted using a stale read.
         Only timestamp and recency rank are written on renewal, except for a
-        one-time heading-index repair of legacy or malformed optional metadata.
+        one-time repair or enrichment of optional derived metadata.
         """
         with self._lock:
             db = self._get_db()
@@ -490,9 +537,12 @@ class SQLitePendingStore:
                     return None
                 progressive_metadata_format(meta)
                 index = None
-                repaired = False
+                repaired = _classify_progressive_content(sel, meta, classify_content)
                 if meta.get("include_structure_hint", True):
-                    index, repaired = ensure_heading_index(sel.chunks["__content__"], sel.chunks)
+                    index, index_repaired = ensure_heading_index(
+                        sel.chunks["__content__"], sel.chunks
+                    )
+                    repaired = repaired or index_repaired
                 if repaired:
                     db.execute(
                         "UPDATE pending_selections SET chunks_json = ? WHERE key = ?",

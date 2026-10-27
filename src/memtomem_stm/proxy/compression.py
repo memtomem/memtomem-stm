@@ -1494,7 +1494,7 @@ class SelectiveCompressor:
         suffixes: dict[str, int] = {}
         hs = list(markdown_headings(text))
         spans: list[tuple[str, int, int, Heading | None]] = []
-        if hs and hs[0].start:
+        if hs and text[: hs[0].start].strip():
             spans.append(("Preamble", 0, hs[0].start, None))
         for i, heading in enumerate(hs):
             spans.append(

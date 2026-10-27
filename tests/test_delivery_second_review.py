@@ -18,7 +18,6 @@ from memtomem_stm.proxy.metrics import CallMetrics
 from memtomem_stm.proxy.metrics_store import MetricsStore
 from memtomem_stm.server import stm_proxy_read_more, stm_proxy_select_chunks
 from memtomem_stm.surfacing.mcp_client import decode_context_compose_context
-from memtomem_stm.utils.redact import ResponseShapeError
 
 
 @pytest.mark.asyncio
@@ -190,10 +189,10 @@ def test_markdown_prefix_does_not_force_json_progressive(prefix):
 
 @pytest.mark.parametrize("identity", ["", "bad\ud800"])
 @pytest.mark.parametrize("side", ["before", "after"])
-def test_adjacent_chunk_ids_rejected_in_direct_mcp_decode(identity, side):
+def test_adjacent_chunk_ids_dropped_in_direct_mcp_decode(identity, side):
     raw = {"before": [], "after": [], side: [{"id": identity, "content": "body", "source": "doc"}]}
-    with pytest.raises(ResponseShapeError):
-        decode_context_compose_context(raw, max_content_chars=100, context_window=1)
+    context = decode_context_compose_context(raw, max_content_chars=100, context_window=1)
+    assert context.window_before == context.window_after == ()
 
 
 def test_historical_structured_bypass_does_not_dilute_tuner(tmp_path):

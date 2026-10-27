@@ -6972,8 +6972,6 @@ class ProxyManager:
                                     dynamic,
                                     int(pcfg.ttl_seconds),
                                 )
-                            except DeliveryBudgetExceeded:
-                                raise
                             except Exception as exc:
                                 if isinstance(exc, SensitivePayloadNotStored):
                                     ladder_sensitive = True

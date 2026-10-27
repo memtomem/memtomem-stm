@@ -29,6 +29,7 @@ changes inline only. See the deprecation policy in
   v3 has a separate key, avoiding old/new index rewrite loops. Stop the old scoped
   daemon before upgrading; protocol v9 prevents an old peer from rewriting IDs.
   Invalid raw chunk/correlation identities are refused before content escaping.
+  Invalid adjacent context IDs drop only that neighbor, preserving valid hits.
 - The first response-cache open runs a one-time sweep to remove structured STM
   continuation keys. Switching between old and new cache policies repeats that
   sweep; large caches can take longer to open.
@@ -49,7 +50,7 @@ changes inline only. See the deprecation policy in
 - Separate structured-wire accounting, progressive read measurements and matching
   auto-index metadata. Tuner retention ratios exclude serialized-envelope and
   native-bypass populations. Default legacy calls avoid unused wire projection
-  and source classification; structured overrides request metadata on demand.
+  and source classification; structured overrides cache derived metadata on demand.
 - Strict JSON and raw identity validation across storage, MCP and daemon formats,
   finite TTL validation, fence-aware headings and source-preserving selection
   metadata. SDK projection support is declared through the direct `mcp-types`
