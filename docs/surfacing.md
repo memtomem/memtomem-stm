@@ -72,9 +72,9 @@ continue through legacy `mem_search`.
 Capability absence is the only fallback trigger. Once a core advertises schema
 2 or later, a compose transport or response failure remains visible as an LTM
 dependency fault; STM does not hide it with a second legacy search. That
-includes a composed item of the wrong shape (a non-string `source`, a
-non-numeric or non-finite `score`, …): it fails the whole compose call instead
-of being coerced.
+includes a composed item of the wrong shape (a `source` that is neither a
+string nor null, or a retrieved item's non-numeric or non-finite `score`, …):
+it fails the whole compose call instead of being coerced.
 
 When schema 3 context windows are enabled, STM expands the core wire budget to
 `max_injection_chars * (1 + 2 * min(context_window_size, 10))`. This lets whole
@@ -867,7 +867,8 @@ hit:
   search failed: the session never opened or the transport is down, core
   raised mid-call, or the reply could not be used. A reply STM cannot use
   includes one that fails validation: an item of the wrong shape (not an
-  object, a non-string `content`, `source`, `namespace` or `chunk_id`, a
+  object, a non-string `content`, `source` or `namespace`, a `chunk_id`
+  that is neither a string nor null, a
   non-numeric or non-finite score), `{}` or a reply without a `results`
   key, and a whitespace-only reply. Each of those makes the whole search a
   fault with no hits, recorded as `ltm_parse_empty` and as a circuit-breaker
