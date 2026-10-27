@@ -1164,10 +1164,8 @@ class TestCoreIdentityIsNotAliasedAtIngest:
         assert bundle.retrieved[0].chunk.content == r"c\ud800"
         bundle.retrieved[0].chunk.content.encode("utf-8")
 
-    def test_adjacent_context_chunk_id_is_escaped_not_refused(self):
-        """An adjacent chunk's id is never exact-matched (the formatter reads
-        only ``content``, the daemon re-encodes it), so it is content by
-        destination and must not survive raw just because the key is ``id``."""
+    def test_adjacent_context_chunk_id_is_dropped_before_reencoding(self):
+        """Keep invalid adjacent identities out without losing the whole result."""
         context = decode_context_compose_context(
             {
                 "before": [
@@ -1185,7 +1183,33 @@ class TestCoreIdentityIsNotAliasedAtIngest:
             max_content_chars=500,
             context_window=2,
         )
+        assert context.window_before == ()
+        assert context.chunk_position == 1
 
-        assert context is not None
-        assert context.window_before[0].id == r"adj\ud800"
-        context.window_before[0].id.encode("utf-8")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("identity", ["", "adj\ud800"])
+    async def test_compose_invalid_neighbor_preserves_retrieved_hit(self, monkeypatch, identity):
+        adapter = self._compose_adapter(
+            monkeypatch,
+            {
+                "pinned": [],
+                "retrieved": [
+                    {
+                        "id": "hit",
+                        "content": "main body",
+                        "source": "doc",
+                        "context": {
+                            "before": [{"id": identity, "content": "bad", "source": "doc"}],
+                            "after": [{"id": "next", "content": "good", "source": "doc"}],
+                        },
+                    }
+                ],
+            },
+        )
+        bundle = await adapter.context_compose("q", context_window=1)
+        assert bundle is not None
+        assert len(bundle.retrieved) == 1
+        hit = bundle.retrieved[0]
+        assert hit.chunk.id == "hit"
+        assert hit.context.window_before == ()
+        assert [chunk.id for chunk in hit.context.window_after] == ["next"]

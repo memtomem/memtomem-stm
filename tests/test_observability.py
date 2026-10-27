@@ -313,25 +313,26 @@ class TestProgressiveTraceIdPropagation:
         assert "not found or expired" not in out
         assert out.startswith("legacy-")
 
-    def test_both_apply_progressive_call_sites_pass_trace_id_kwarg(self):
-        # manager.py has two _apply_progressive call sites: the normal
-        # PROGRESSIVE branch and the ratio-guard Tier-1 fallback branch. Both
-        # must pass trace_id=trace_id. Both live in _compress_and_surface since
-        # the A1 PR3 stage extraction. This test source-inspects that helper,
-        # pins the count of call sites at 2, and asserts each call contains
-        # the trace_id= kwarg — cheap regression insurance against a future
-        # refactor that drops the kwarg at one site (functionally tight:
-        # both sites are currently shape-identical, so a unit-level spy
-        # cannot distinguish them).
+    def test_all_apply_progressive_call_sites_pass_trace_id_kwarg(self):
+        # Normal delivery, retention fallback, and structured-budget fallback
+        # must preserve trace correlation. AST inspection also handles nested
+        # argument expressions without prematurely ending at an inner ')'.
+        import ast
         import inspect
+        import textwrap
 
         from memtomem_stm.proxy import manager as manager_module
 
         src = inspect.getsource(manager_module.ProxyManager._compress_and_surface)
-        calls = re.findall(r"self\._apply_progressive\(\s*.*?\)", src, re.DOTALL)
-        assert len(calls) == 2, f"expected 2 _apply_progressive call sites, found {len(calls)}"
-        for call in calls:
-            assert "trace_id=" in call, f"call site missing trace_id kwarg: {call}"
+        calls = [
+            node
+            for node in ast.walk(ast.parse(textwrap.dedent(src)))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_apply_progressive"
+        ]
+        assert len(calls) == 3
+        assert all(any(kw.arg == "trace_id" for kw in call.keywords) for call in calls)
 
     def test_read_more_behavior_byte_identical_on_success(self):
         # Pin the chunker construction params (chunk_size=<limit or 4000>,

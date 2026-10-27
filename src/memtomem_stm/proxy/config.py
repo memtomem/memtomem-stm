@@ -1328,7 +1328,7 @@ class HybridConfig(BaseModel):
 
 class SelectiveConfig(BaseModel):
     max_pending: int = Field(default=100, gt=0)
-    pending_ttl_seconds: float = Field(default=300.0, ge=0.0)
+    pending_ttl_seconds: float = Field(default=300.0, ge=0.0, allow_inf_nan=False)
     json_depth: int = Field(default=1, gt=0)
     min_section_chars: int = Field(default=50, ge=0)
     pending_store: Literal["memory", "sqlite"] = "memory"
@@ -1404,13 +1404,14 @@ class ProgressiveConfig(BaseModel):
     """Characters per chunk delivered to the agent."""
     max_stored: int = Field(default=200, gt=0)
     """Maximum concurrent stored progressive responses."""
-    ttl_seconds: float = Field(default=1800.0, ge=0.0)
+    ttl_seconds: float = Field(default=1800.0, ge=0.0, allow_inf_nan=False)
     """Time-to-live for stored responses (seconds)."""
     include_structure_hint: bool = True
     """Include remaining headings/structure hint in every non-final chunk footer."""
 
 
 class ToolOverrideConfig(BaseModel):
+    delivery_format: Literal["legacy", "structured"] | None = None
     compression: CompressionStrategy | None = None
     max_result_chars: int | None = Field(default=None, gt=0)
     max_result_tokens: int | None = Field(default=None, gt=0, le=MAX_CHAR_BUDGET)
@@ -1465,7 +1466,7 @@ class ToolOverrideConfig(BaseModel):
     is the supported allowlist for a known-read-only tool whose upstream omits
     annotations. The privacy / transient-key store guards still apply when
     ``True``."""
-    cache_ttl_seconds: float | None = Field(default=None, ge=0.0)
+    cache_ttl_seconds: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
     """Per-tool override for the response-cache TTL (seconds). ``None`` (default)
     defers to the server-level ``cache_ttl_seconds``, then to the global
     ``CacheConfig.default_ttl_seconds``. A positive value caches this tool's
@@ -1540,6 +1541,8 @@ class UpstreamOrigin(BaseModel):
 class UpstreamServerConfig(BaseModel):
     model_config = ConfigDict(hide_input_in_errors=True)
 
+    delivery_format: Literal["legacy", "structured"] | None = None
+
     command: str = ""
     args: list[str] = []
     env: dict[str, str] | None = None
@@ -1582,7 +1585,7 @@ class UpstreamServerConfig(BaseModel):
     ``True`` is the server-wide strict-mode allowlist for a trusted read-only
     upstream that omits annotations. A per-tool ``cache`` override wins over
     this."""
-    cache_ttl_seconds: float | None = Field(default=None, ge=0.0)
+    cache_ttl_seconds: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
     """Per-server response-cache TTL override (see
     ``ToolOverrideConfig.cache_ttl_seconds``). ``None`` (default) defers to the
     global ``CacheConfig.default_ttl_seconds``; a positive value sets the TTL for
@@ -1696,7 +1699,7 @@ class UpstreamServerConfig(BaseModel):
 class CacheConfig(BaseModel):
     enabled: bool = True
     db_path: Path = Path("~/.memtomem/proxy_cache.db")
-    default_ttl_seconds: float | None = Field(default=3600.0, ge=0.0)
+    default_ttl_seconds: float | None = Field(default=3600.0, ge=0.0, allow_inf_nan=False)
     max_entries: int = Field(default=10000, gt=0)
     tool_annotation_policy: Literal["conservative", "strict", "ignore"] = "conservative"
     """Which proxied tool responses are eligible for the response cache, based on
@@ -2233,6 +2236,7 @@ class ProxyConfig(BaseModel):
     enabled: bool = False
     config_path: Path = Path("~/.memtomem/stm_proxy.json")
     upstream_servers: dict[str, UpstreamServerConfig] = {}
+    delivery_format: Literal["legacy", "structured"] = "legacy"
     default_compression: CompressionStrategy = CompressionStrategy.AUTO
     default_max_result_chars: int = Field(default=16000, gt=0)
     max_upstream_chars: int = Field(default=10_000_000, gt=0)
@@ -2663,6 +2667,14 @@ def effective_compression_pair(
         if override.hybrid is not None:
             hybrid = override.hybrid
     return compression, hybrid
+
+
+def effective_delivery_format(
+    server: UpstreamServerConfig, override: ToolOverrideConfig | None, config: ProxyConfig
+) -> Literal["legacy", "structured"]:
+    if override is not None and override.delivery_format is not None:
+        return override.delivery_format
+    return server.delivery_format or config.delivery_format
 
 
 def effective_max_result_chars(

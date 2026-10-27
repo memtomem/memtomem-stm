@@ -56,6 +56,7 @@ Status meanings:
 | `MEMTOMEM_STM_PROXY__ENABLED` | boolean | `false` | Enable proxy serving; new CLI configs normally persist this in JSON. | Bundled |
 | `MEMTOMEM_STM_PROXY__CONFIG_PATH` | path | `~/.memtomem/stm_proxy.json` | Proxy JSON location; CLI commands honor it too when `--config` is not typed. | Bundled |
 | `MEMTOMEM_STM_PROXY__UPSTREAM_SERVERS` | JSON object | `{}` | Complete map of upstream MCP definitions. | Bundled |
+| `MEMTOMEM_STM_PROXY__DELIVERY_FORMAT` | `legacy / structured` | `legacy` | Default chunk delivery representation; server and tool overrides take precedence. | Bundled |
 | `MEMTOMEM_STM_PROXY__DEFAULT_COMPRESSION` | compression strategy | `auto` | Default strategy when an upstream does not override it. | Bundled |
 | `MEMTOMEM_STM_PROXY__DEFAULT_MAX_RESULT_CHARS` | positive integer | `16000` | Configured response-size ceiling. | Bundled |
 | `MEMTOMEM_STM_PROXY__MAX_UPSTREAM_CHARS` | positive integer | `10000000` | Pre-compression OOM guard for upstream content. | Bundled |

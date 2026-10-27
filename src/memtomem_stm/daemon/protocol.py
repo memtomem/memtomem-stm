@@ -8,12 +8,12 @@ session state). ``json.dumps`` escapes any newline inside string values as
 
 Request  (client → daemon)::
 
-    {"v": 8, "token": "<hex>", "op": "surface", "payload": {<CanonicalHookCall wire>}}
+    {"v": 9, "token": "<hex>", "op": "surface", "payload": {<CanonicalHookCall wire>}}
 
 Response (daemon → hook)::
 
-    {"v": 8, "ok": true, "output": {<hook-output JSON, possibly {}>}}      # surface
-    {"v": 8, "ok": true, "status": "ready", "ltm": "warm",
+    {"v": 9, "ok": true, "output": {<hook-output JSON, possibly {}>}}      # surface
+    {"v": 9, "ok": true, "status": "ready", "ltm": "warm",
      "latency": {<bounded numeric telemetry>}}                               # ping
     # ping "ltm" is one of warm | warming | down | cold (#664); clients
     # treat it as an opaque display string.
@@ -38,8 +38,10 @@ frames one side can't parse (the stale daemon idle-times-out under a finite
 ``idle_timeout_seconds``; a pinned ``idle_timeout_seconds=0`` daemon must be
 stopped manually — see #517).
 
-**v8:** the ``surface`` payload carries the host's ``session_id`` / ``cwd`` /
-``tool_use_id`` / ``agent_id`` (a v7 daemon would silently drop them). **v7:** adds max/selected context-compose schema negotiation and schema 3
+**v9:** refuses invalid raw identities before content escaping in both directions.
+Non-finite JSON numbers are rejected. **v8:** the ``surface`` payload carries the
+host's ``session_id`` / ``cwd`` / ``tool_use_id`` / ``agent_id`` (a v7 daemon would
+silently drop them). **v7:** adds max/selected context-compose schema negotiation and schema 3
 adjacent-context payloads. **v6:** adds schema-bound context-compose scope fields. **v5:** adds
 context-compose and review-candidate LTM operations. **v4:** adds
 typed low-level LTM operations for issue #688. **v3:** adds
@@ -53,13 +55,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import secrets
 from typing import Any
 
 from memtomem_stm.utils.json_out import dumps as _json_dumps
-from memtomem_stm.utils.json_out import scrub_lone_surrogates
+from memtomem_stm.utils.json_out import scrub_lone_surrogates, has_lone_surrogate
 
-PROTOCOL_VERSION = 8
+PROTOCOL_VERSION = 9
 
 # Upper bound on a single framed message. A ``surface`` request embeds the
 # built-in tool's output (a large ``Read`` can be hundreds of KB), so this sits
@@ -98,7 +101,21 @@ def encode_line(obj: dict[str, Any]) -> bytes:
     on the daemon side the client just sees the socket close with no response
     (#761). Compact separators are inside that writer's documented contract.
     """
-    return (_json_dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    _validate_wire_identities(obj)
+    return (
+        _json_dumps(obj, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _finite_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("non-finite JSON number")
+    return parsed
+
+
+def _reject_constant(value: str) -> None:
+    raise ValueError("non-standard JSON constant")
 
 
 async def read_message(reader: asyncio.StreamReader) -> dict[str, Any]:
@@ -121,13 +138,19 @@ async def read_message(reader: asyncio.StreamReader) -> dict[str, Any]:
         raise ProtocolError(f"frame read failed: {exc}") from exc
     if not line:
         raise ProtocolError("connection closed before a frame was read")
+    if len(line) > MAX_MESSAGE_BYTES:
+        raise ProtocolError("frame exceeds message limit")
     try:
-        obj = json.loads(line)
-    except (json.JSONDecodeError, ValueError) as exc:
+        obj = json.loads(line, parse_float=_finite_float, parse_constant=_reject_constant)
+    except (ValueError, TypeError, RecursionError, OverflowError) as exc:
         raise ProtocolError("malformed JSON frame") from exc
     if not isinstance(obj, dict):
         raise ProtocolError("frame is not a JSON object")
-    scrubbed: dict[str, Any] = scrub_lone_surrogates(obj)
+    try:
+        _validate_wire_identities(obj)
+        scrubbed: dict[str, Any] = scrub_lone_surrogates(obj)
+    except RecursionError as exc:
+        raise ProtocolError("JSON frame is too deeply nested") from exc
     return scrubbed
 
 
@@ -154,6 +177,57 @@ def surface_response(output: dict[str, Any]) -> dict[str, Any]:
 
 def token_matches(expected: str, received: Any) -> bool:
     """Constant-time token check tolerant of a missing/wrong-typed value."""
-    if not isinstance(received, str) or not expected:
+    if not isinstance(received, str) or not received.isascii() or not expected:
         return False
     return secrets.compare_digest(expected, received)
+
+
+def _validate_wire_identities(obj: dict[str, Any]) -> None:
+    """Refuse raw invalid IDs BEFORE content scrubbing, in both directions.
+
+    Only fields used as identities by the typed daemon operations are examined;
+    an arbitrary tool_input.id remains ordinary content.
+    """
+
+    def identity(value: Any) -> None:
+        if not isinstance(value, str) or not value or has_lone_surrogate(value):
+            raise ProtocolError("Invalid wire identity")
+
+    payload = obj.get("payload")
+    if isinstance(payload, dict):
+        op = obj.get("op")
+        if op == OP_LTM_INCREMENT_ACCESS:
+            ids = payload.get("chunk_ids")
+            if not isinstance(ids, list):
+                raise ProtocolError("Invalid wire identities")
+            for value in ids:
+                identity(value)
+        if op == OP_LTM_CANDIDATE_PROPOSE:
+            identity(payload.get("idempotency_key"))
+        if op == OP_SURFACE:
+            for name in ("session_id", "tool_use_id", "agent_id"):
+                if payload.get(name) is not None:
+                    identity(payload[name])
+
+    def items(values: Any) -> None:
+        if not isinstance(values, list):
+            return
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            for name in ("id", "chunk_id", "block_id"):
+                if name in item:
+                    identity(item[name])
+            ctx = item.get("context")
+            if isinstance(ctx, dict):
+                items(ctx.get("before"))
+                items(ctx.get("after"))
+                items(ctx.get("window_before"))
+                items(ctx.get("window_after"))
+
+    for name in ("results", "pinned", "retrieved"):
+        items(obj.get(name))
+    bundle = obj.get("bundle")
+    if isinstance(bundle, dict):
+        items(bundle.get("pinned"))
+        items(bundle.get("retrieved"))

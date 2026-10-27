@@ -689,11 +689,8 @@ class TestTextNoneTolerance:
 
         results, _, outcome = await adapter.search("test query")
         assert results == []
-        # All-None text → ``text_parts`` was non-empty but stringified to
-        # empty content; the parser still ran and returned ``[]`` →
-        # ``empty_results`` (#295). The all-None-string case is parser-empty,
-        # not adapter-empty.
-        assert outcome == "empty_results"
+        # No model-visible text is distinct from a malformed JSON envelope.
+        assert outcome == "empty_content"
 
 
 # ── Outer wait_for cancellation (#290) ──────────────────────────────────

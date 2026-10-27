@@ -20,7 +20,6 @@ can't share the happy-path parametrize body.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 
@@ -34,6 +33,7 @@ from bench.bench_qa import (
     qa_answerable_ratio,
     surfacing_recall_at_k,
 )
+from bench.bench_qa.identity import compact_seed_id
 from bench.bench_qa.runner import make_surfacing_proxy_manager, make_tool_result
 from bench.bench_qa.schema import SurfacingResult
 
@@ -315,8 +315,7 @@ async def test_s10_surfacing_recall_at_k(tmp_path, bench_qa_report):
     seeds_path.write_text(json.dumps(fixture["surfacing_seeds"]), encoding="utf-8")
 
     source_to_chunk_id = {
-        seed["source"]: hashlib.sha256(seed["content"].encode()).hexdigest()[:16]
-        for seed in fixture["surfacing_seeds"]
+        seed["source"]: compact_seed_id(seed) for seed in fixture["surfacing_seeds"]
     }
     expected_chunk_ids = [
         source_to_chunk_id[src] for src in fixture["surfacing_eval"]["expected_ids"]
@@ -438,9 +437,7 @@ async def test_s11_min_score_sweep(tmp_path, bench_qa_report):
     seed_count = len(seeds)
     assert seed_count >= 4, "s11: sweep needs at least 4 labeled seeds"
 
-    source_to_chunk_id = {
-        seed["source"]: hashlib.sha256(seed["content"].encode()).hexdigest()[:16] for seed in seeds
-    }
+    source_to_chunk_id = {seed["source"]: compact_seed_id(seed) for seed in seeds}
     chunk_id_to_source = {chunk_id: src for src, chunk_id in source_to_chunk_id.items()}
     positives = set(fixture["surfacing_eval"]["expected_ids"])
     positive_count = len(positives)

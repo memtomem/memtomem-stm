@@ -28,7 +28,10 @@ class TestProgressiveReadsStore:
         try:
             stats = store.get_stats()
             assert stats == {
-                "initial_payload_chars": 0,
+                "initial_wire_bytes": 0,
+            "follow_up_wire_bytes": 0,
+            "wire_measured_reads": 0,
+            "initial_payload_chars": 0,
                 "follow_up_payload_chars": 0,
                 "unclassified_reads": 0,
                 "total_reads": 0,

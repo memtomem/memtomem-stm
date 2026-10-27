@@ -11,6 +11,57 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Behavior change**: Markdown heading detection now ignores fenced code across
+  compression, hints and indexes. Selection chunks preserve heading levels and
+  original Markdown ranges; affected TOC keys/content may change.
+- **Behavior change**: non-finite pending/progressive/cache TTL settings are rejected;
+  malformed search responses are reported as parse errors instead of skipping
+  malformed items and retaining the remaining hits.
+- **Behavior change**: generated memory metadata escapes Unicode line separators.
+  Extracted tags now live in frontmatter, so new files participate in Core tag
+  filtering. Existing Markdown files are not rewritten.
+- **Behavior change**: compact fallback IDs use a versioned namespace/source/content
+  digest. Old feedback/dedup history is retained but cannot be inferred onto new IDs.
+- Upgrade/restart processes sharing pending SQLite files together. Presentation
+  metadata adds a nullable column; valid old rows remain readable. Heading index
+  v3 has a separate key, avoiding old/new index rewrite loops. Stop the old scoped
+  daemon before upgrading; protocol v9 prevents an old peer from rewriting IDs.
+  Invalid raw chunk/correlation identities are refused before content escaping.
+  Invalid adjacent context IDs drop only that neighbor, preserving valid hits.
+- The first response-cache open runs a one-time sweep to remove structured STM
+  continuation keys. Switching between old and new cache policies repeats that
+  sweep; large caches can take longer to open.
+
+### Added
+
+- Opt-in `delivery_format="structured"` with server/tool overrides and optional
+  `response_format` on continuation tools; legacy remains the default. Versioned
+  JSON includes exact chunk keys, Unicode code-point offsets, JSON paths/types,
+  Markdown source ranges and typed errors, including cross-format reads.
+- Serialized MCP-result budgets cover negotiated SDK additions and field
+  filtering. Complete progressive/hybrid frames and progressing continuation
+  capacity are checked before publication; storage/privacy failures use uncached
+  safe fallback. Transient keys stay out of the response cache.
+  Unicode token budgets share one density-derived cap across compression,
+  initial structured frames and owned continuations. Inline TOC contents stay
+  complete; tables that cannot fit fall back to progressive delivery.
+- Native upstream schemas, structured/non-text payloads and annotated text
+  boundaries are preserved. Text twins are cleaned and capped separately;
+  proxied errors carry STM JSON in text without replacing upstream output schemas.
+- Separate structured-wire accounting, progressive read measurements and matching
+  auto-index metadata. Tuner retention ratios exclude serialized-envelope and
+  native-bypass populations. Default legacy calls avoid unused wire projection
+  and source classification; structured overrides cache derived metadata on demand.
+- Strict JSON and raw identity validation across storage, MCP and daemon formats,
+  finite TTL validation, fence-aware headings and source-preserving selection
+  metadata. SDK projection support is declared through the direct `mcp-types`
+  dependency; incompatible projectors keep legacy service available and report a
+  typed error for structured budgets that cannot be measured.
+  Non-JSON logs, links and templates retain paragraph selection without claiming
+  JSON paths or exact source ranges.
+
 ## [0.6.9] — 2026-10-25
 
 ### Upgrade notes

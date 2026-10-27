@@ -30,6 +30,7 @@ MAX_ERROR_MESSAGE_CHARS = 500
 # ``none``, and the suffix names why. The tuner drops these rows by this exact
 # value, so the writer and that reader share this one definition.
 METADATA_BYPASS_STRATEGY = "none→metadata_bypass"
+STRUCTURED_BYPASS_STRATEGY = "none→structured_bypass"
 
 
 def format_error_message_from_exc(exc: BaseException) -> str:
@@ -95,6 +96,7 @@ class ErrorCategory(StrEnum):
     TIMEOUT = "timeout"  # asyncio.TimeoutError on upstream call_tool (#206)
     PROTOCOL = "protocol"  # JSON-RPC errors (-32600..-32603)
     UPSTREAM_ERROR = "upstream_error"  # result.isError=True from upstream
+    DELIVERY = "delivery"  # configured structured output budget cannot make progress
     OVERSIZE = "oversize"  # inbound MCP message/result exceeded byte budget
     PROGRAMMING = "programming"  # TypeError, AttributeError, etc.
     INTERNAL_ERROR = "internal_error"  # raised inside COMPRESS/SURFACE/INDEX pipeline
@@ -263,6 +265,8 @@ class CallMetrics:
     source: str = "mcp"
     # None marks old/unclassified writers; never infer their accounting basis.
     compression_accounting: str | None = None
+    delivery_format: str = "legacy"
+    wire_bytes: int | None = None
 
 
 class RPSTracker:
@@ -323,6 +327,12 @@ class TokenTracker:
             lambda: {"calls": 0, "original_chars": 0, "compressed_chars": 0},
             max_size=max_tracked_keys,
         )
+        self._structured = {
+            "calls": 0,
+            "original_chars": 0,
+            "serialized_base_chars": 0,
+            "wire_bytes": 0,
+        }
         self._rps_tracker = RPSTracker()
         # Error tracking
         self._total_errors = 0
@@ -358,11 +368,19 @@ class TokenTracker:
     def record(self, metrics: CallMetrics) -> None:
         self._rps_tracker.record()
         self._total_calls += 1
-        self._total_original += metrics.original_chars
-        self._total_compressed += metrics.compressed_chars
+        is_structured = metrics.compression_accounting == "initial_structured_v1"
+        if is_structured:
+            self._structured["calls"] += 1
+            self._structured["original_chars"] += metrics.original_chars
+            self._structured["serialized_base_chars"] += metrics.compressed_chars
+            self._structured["wire_bytes"] += metrics.wire_bytes or 0
+        original = 0 if is_structured else metrics.original_chars
+        compressed = 0 if is_structured else metrics.compressed_chars
+        self._total_original += original
+        self._total_compressed += compressed
         self._total_surfaced += metrics.surfaced_chars
-        self._total_original_tokens += metrics.original_tokens
-        self._total_compressed_tokens += metrics.compressed_tokens
+        self._total_original_tokens += 0 if is_structured else metrics.original_tokens
+        self._total_compressed_tokens += 0 if is_structured else metrics.compressed_tokens
         self._total_clean_ms += metrics.clean_ms
         self._total_compress_ms += metrics.compress_ms
         self._total_surface_ms += metrics.surface_ms
@@ -374,13 +392,13 @@ class TokenTracker:
 
         s = self._by_server[metrics.server]
         s["calls"] += 1
-        s["original_chars"] += metrics.original_chars
-        s["compressed_chars"] += metrics.compressed_chars
+        s["original_chars"] += original
+        s["compressed_chars"] += compressed
 
         t = self._by_tool[f"{metrics.server}/{metrics.tool}"]
         t["calls"] += 1
-        t["original_chars"] += metrics.original_chars
-        t["compressed_chars"] += metrics.compressed_chars
+        t["original_chars"] += original
+        t["compressed_chars"] += compressed
 
         # Persist to SQLite
         if self._metrics_store is not None:
@@ -488,6 +506,7 @@ class TokenTracker:
         n = self._total_calls or 1
         return {
             "total_calls": self._total_calls,
+            "structured_delivery": dict(self._structured),
             # ``total_calls`` counts successful live pipeline calls only: cache
             # hits never reach ``record()``, and a failed call only reaches
             # ``record_error()`` (every pre-``record()`` stage failure raises,

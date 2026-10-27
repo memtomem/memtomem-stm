@@ -11,9 +11,17 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from memtomem_stm.proxy.compression import PendingSelection
+from memtomem_stm.proxy.delivery import (
+    DeliveryFormat,
+    read_delivery_scope,
+    progressive_metadata_format,
+    stored_progressive_format,
+)
+from memtomem_stm.proxy.markdown_structure import headings
+from memtomem_stm.proxy.compression import PendingSelection, _mm_json_loads
 from memtomem_stm.proxy.heading_index import (
     INDEX_KEY,
+    LEGACY_INDEX_KEY,
     HeadingIndex,
     build_heading_index,
     remaining_headings,
@@ -57,6 +65,8 @@ class ProgressiveResponse:
     chunk_size: int = 4000
     include_structure_hint: bool = True
     heading_index: HeadingIndex | None = None
+    delivery_format: DeliveryFormat = "legacy"
+    delivery_budget: int = 16000
 
 
 class ProgressiveStoreAdapter:
@@ -103,6 +113,11 @@ class ProgressiveStoreAdapter:
                 "trace_id": resp.trace_id,
                 "chunk_size": resp.chunk_size,
                 "include_structure_hint": resp.include_structure_hint,
+                "delivery": {
+                    "schema_version": 1,
+                    "delivery_format": resp.delivery_format,
+                    "budget": resp.delivery_budget,
+                },
             },
             ensure_ascii=False,
         )
@@ -114,6 +129,7 @@ class ProgressiveStoreAdapter:
         )
         if resp.heading_index is not None:
             selection.chunks[INDEX_KEY] = encode_heading_index(resp.heading_index)
+            selection.chunks[LEGACY_INDEX_KEY] = "scan"
         check = getattr(self._store, "check_persistable", None)
         if check is not None:
             check(selection)
@@ -121,16 +137,37 @@ class ProgressiveStoreAdapter:
             before_write()
         self._store.put(key, selection)
 
-    def get(self, key: str, *, renew: bool = False) -> ProgressiveResponse | None:
-        entry = self._store.get_progressive(key, renew=renew)
+    def get(
+        self, key: str, *, renew: bool = False, response_format: DeliveryFormat | None = None
+    ) -> ProgressiveResponse | None:
+        with read_delivery_scope(response_format):
+            entry = self._store.get_progressive(
+                key,
+                renew=renew,
+                classify_content=(
+                    ProgressiveChunker.detect_content_type
+                    if response_format == "structured"
+                    else None
+                ),
+            )
         if entry is None:
             return None
         sel, meta = entry.selection, entry.metadata
+        presentation = meta.get("delivery")
+        budget = presentation.get("budget", 16000) if isinstance(presentation, dict) else 16000
+        if type(budget) is not int or not 0 < budget < 2**63:
+            budget = 16000
+        mode = response_format or progressive_metadata_format(meta)
+        content_type = meta.get("content_type", "text")
+        if mode == "structured" and stored_progressive_format(meta) == "legacy":
+            # Legacy publication avoids whole-document classification. An
+            # explicit structured read requests that metadata once per row.
+            content_type = meta["structured_content_type"]
         return ProgressiveResponse(
             content=sel.chunks["__content__"],
             total_chars=sel.total_chars,
             total_lines=meta.get("total_lines", 0),
-            content_type=meta.get("content_type", "text"),
+            content_type=content_type,
             structure_hint=meta.get("structure_hint", ""),
             created_at=sel.created_at,
             ttl_seconds=meta.get("ttl_seconds", 1800.0),
@@ -141,6 +178,8 @@ class ProgressiveStoreAdapter:
             chunk_size=meta.get("chunk_size", 4000),
             include_structure_hint=meta.get("include_structure_hint", True),
             heading_index=entry.heading_index,
+            delivery_format=mode,
+            delivery_budget=budget,
         )
 
     def touch(self, key: str) -> None:
@@ -359,11 +398,11 @@ class ProgressiveChunker:
         stripped = text.strip()
         if stripped and stripped[0] in "{[":
             try:
-                json.loads(stripped)
+                _mm_json_loads(stripped)
                 return "json"
             except (json.JSONDecodeError, ValueError):
                 pass
-        if re.search(r"(?:^|\n)#{1,6}\s", text):
+        if next(headings(text), None) is not None:
             return "markdown"
         # Indentation does not cross a newline: ``\s*`` would rescan a run of
         # blank lines from every newline in it.
@@ -377,11 +416,11 @@ class ProgressiveChunker:
     def structure_hint(text: str) -> str:
         """Summarize structural elements in the content."""
         counts: list[str] = []
-        headings = len(re.findall(r"(?:^|\n)#{1,6}\s", text))
+        heading_count = sum(1 for _ in headings(text))
         code_blocks = text.count("```") // 2
         lines = text.count("\n") + 1
-        if headings:
-            counts.append(f"{headings} headings")
+        if heading_count:
+            counts.append(f"{heading_count} headings")
         if code_blocks:
             counts.append(f"{code_blocks} code blocks")
         counts.append(f"{lines} lines")

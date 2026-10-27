@@ -34,6 +34,8 @@ dependencies = [
     # deserves a deliberate look, not a silent resolve.
     # Security floor: 2.2 fixes CVE-2026-59951 (unbounded HTTP sessions).
     "mcp[cli]>=2.2.0,<3",
+    # Direct SDK wire-serialization imports in proxy/_fastmcp_compat.py.
+    "mcp-types>=2.2.0,<3",
     "pydantic>=2.10",
     "pydantic-settings>=2.7",
     "httpx>=0.28",

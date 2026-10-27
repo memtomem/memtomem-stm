@@ -100,6 +100,7 @@ def _mutate(field: str) -> ToolConfig:
         "llm": _tc(llm=LLMCompressorConfig(model="gpt-x", api_key="sk-test")),
         "token_budget": _tc(token_budget=1000),
         "token_estimation_mode": _tc(token_estimation_mode=TokenEstimationMode.UNICODE),
+        "delivery_format": _tc(delivery_format="structured"),
     }
     return values[field]
 

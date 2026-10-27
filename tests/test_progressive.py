@@ -888,16 +888,10 @@ _SURROGATES = ["\ud800", "\udbff", "\udc00", "\udfff"]
 
 
 class TestProgressiveStoreSurrogateRoundTrip:
-    """``__meta__`` is read with a plain ``json.loads`` (#781).
-
-    The backing pending store scrubs its own chunk payload, but the adapter
-    parses a JSON document nested *inside* one of those chunks, and a
-    ``\\ud800`` escape surviving that outer scrub decodes back into the code
-    unit here.
-    """
+    """Exact metadata identities are checked before nested content escaping."""
 
     @pytest.mark.parametrize("surrogate", _SURROGATES)
-    def test_meta_survives_the_round_trip(self, surrogate: str):
+    def test_invalid_exact_metadata_identities_are_refused(self, surrogate: str):
         store = ProgressiveStoreAdapter(InMemoryPendingStore())
         resp = ProgressiveResponse(
             content="body",
@@ -913,7 +907,6 @@ class TestProgressiveStoreSurrogateRoundTrip:
 
         out = store.get("k")
 
-        assert out is not None
-        assert surrogate not in out.server and surrogate not in out.tool
-        out.server.encode("utf-8")  # the call that used to raise
-        out.tool.encode("utf-8")
+        # Escaping these exact identities would alias a raw surrogate and
+        # the literal escape text. Stored invalid identities are a miss.
+        assert out is None
