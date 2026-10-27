@@ -340,7 +340,7 @@ map and adds `effective_servers` (a safe summary of the runtime upstreams),
 carries `prefix`, `transport`, `surfacing_enabled`, the server's resolved
 `delivery_format` (`"legacy"` unless the server or the proxy sets
 `"structured"`), and `tool_delivery_overrides`, the resolved format of each
-tool that has a `tool_overrides` entry. The latter reports each server's
+tool that has a `tool_overrides` entry. `effective_compression` reports each server's
 resolved strategy, its `global`/`server` source, and explicit tool overrides.
 `server` means the server level supplied `compression`, from the file or from an
 environment variable addressing that server. Override lines quote both names as
