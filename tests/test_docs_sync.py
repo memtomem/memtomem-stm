@@ -2962,6 +2962,54 @@ def test_operations_recovery_says_status_and_list_count_every_schema_error() -> 
             pytest.fail(f"docs/guides/operations.md recovery step 1 lost {needed!r}")
 
 
+def test_upgrade_guidance_stops_the_old_daemon_before_the_upgrade() -> None:
+    """The daemon fingerprint includes ``PROTOCOL_VERSION``, so once a release
+    bumps it, the new build's ``mms daemon stop``/``restart`` cannot address the
+    daemon the old build started. Every upgrade entry point therefore has to put
+    the stop before the package upgrade; they used to say "upgrade, then restart".
+    """
+    ops = _heading_section(
+        _read("docs/guides/operations.md"), "Upgrading", "docs/guides/operations.md"
+    )
+    steps = re.findall(r"^\d+\. (.*?)(?=^\d+\. |\n\n(?!   )|\Z)", ops, re.MULTILINE | re.DOTALL)
+    quit_at = next((i for i, s in enumerate(steps) if s.startswith("Quit every MCP host")), None)
+    stop_at = next(
+        (i for i, s in enumerate(steps) if "old build" in s and "`mms daemon stop`" in s), None
+    )
+    upgrade_at = next((i for i, s in enumerate(steps) if s.startswith("Upgrade every")), None)
+    assert None not in (quit_at, stop_at, upgrade_at), (
+        f"docs/guides/operations.md Upgrading lost a step: quit={quit_at} "
+        f"stop={stop_at} upgrade={upgrade_at}"
+    )
+    assert quit_at < stop_at < upgrade_at, (
+        "docs/guides/operations.md Upgrading must quit hosts, then stop the daemon "
+        "with the old build, then upgrade"
+    )
+
+    entries = {
+        "README.md": ("## Upgrade\n", "\n## "),
+        "docs/getting-started.md": ("For an existing installation", "\n## "),
+        "docs/guides/vibe-coding-getting-started-ko.md": ("기존 설치를 업그레이드할 때는", "\n## "),
+    }
+    for path, (start, end) in entries.items():
+        body = _read(path)
+        begin = body.find(start)
+        assert begin != -1, f"{path}: upgrade guidance starting {start!r} is gone"
+        stop = body.find(end, begin + len(start))
+        guidance = body[begin : stop if stop != -1 else None]
+        assert "operations.md#upgrading" in guidance, f"{path}: link the Upgrading runbook"
+        assert "mms daemon restart" not in guidance, (
+            f"{path}: a post-upgrade `mms daemon restart` cannot reach the old daemon"
+        )
+        stop_at_text = guidance.find("`mms daemon stop`")
+        upgrade_at_text = guidance.find("uv tool upgrade memtomem-stm")
+        assert stop_at_text != -1, f"{path}: name `mms daemon stop` in the upgrade guidance"
+        assert upgrade_at_text != -1, f"{path}: the upgrade command block is gone"
+        assert stop_at_text < upgrade_at_text, (
+            f"{path}: put the stop-first instruction above the upgrade command block"
+        )
+
+
 def test_unreadable_config_contracts_are_documented_per_command() -> None:
     """#1095: each command renders an unreadable or non-UTF-8 file its own way.
 

@@ -51,8 +51,12 @@ PowerShell에서 `python`이나 `pip`가 보이지 않으면 `py --version`과
 사람이 실행하는 관리 명령은 짧은 `mms`를 사용하고, MCP 클라이언트에는
 서버 명령인 `memtomem-stm`을 등록합니다.
 
-기존 설치를 업그레이드할 때는 등록부터 교체하지 말고 다음 순서로
-확인합니다.
+기존 설치를 업그레이드할 때는 등록부터 교체하지 말고, 먼저
+[CHANGELOG의 Upgrade notes](../../CHANGELOG.md)를 읽습니다. daemon 프로토콜이
+바뀐다는 안내가 있으면 업그레이드 **전에** MCP 호스트를 종료하고 이전 빌드로
+`mms daemon stop`을 실행하세요. 새 빌드는 이전 빌드가 띄운 daemon을 찾지
+못합니다. 전체 순서는 [Upgrading](operations.md#upgrading)에 있습니다. 그다음
+아래 순서로 확인합니다.
 
 ```bash
 uv tool upgrade memtomem-stm
@@ -61,9 +65,8 @@ mms doctor
 ```
 
 `pip` 설치였다면 `python -m pip install --upgrade memtomem-stm`을 사용합니다.
-먼저 [CHANGELOG의 Upgrade notes](../../CHANGELOG.md)를 읽고, 안내가 있는
-경우에만 현재 설정의 daemon을 재시작하세요. 기존 MCP 등록은 유지되며
-의도적으로 갱신할 때만 `--replace-registration`을 사용합니다.
+기존 MCP 등록은 유지되며 의도적으로 갱신할 때만 `--replace-registration`을
+사용합니다.
 
 ## 2. STM이 감쌀 MCP 서버 정하기
 
