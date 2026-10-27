@@ -948,6 +948,25 @@ def _no_daemon(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
 
 
+def _fake_stop_clock(monkeypatch: pytest.MonkeyPatch, on_sleep=None) -> dict[str, float]:
+    """Drive ``stop``'s wait with a fake clock: each ``sleep`` advances it and
+    calls ``on_sleep(polls)``, so a test can remove a handshake mid-wait."""
+    from types import SimpleNamespace
+
+    clock = {"t": 0.0, "polls": 0}
+
+    def sleep(seconds: float) -> None:
+        clock["t"] += seconds
+        clock["polls"] += 1
+        if on_sleep is not None:
+            on_sleep(clock["polls"])
+
+    monkeypatch.setattr(
+        "memtomem_stm.cli.daemon_cmd.time", SimpleNamespace(time=lambda: clock["t"], sleep=sleep)
+    )
+    return clock
+
+
 class TestHandshakeRemovedPredicate:
     """``_handshake_removed`` decides when ``mms daemon stop`` may report a stop.
 
@@ -1277,26 +1296,112 @@ class TestDaemonStopCli:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         """Graceful shutdown declined but the endpoint still accepts a connect →
-        the daemon is there-but-unresponsive, so SIGTERM its recorded pid."""
+        the daemon is there-but-unresponsive, so SIGTERM its recorded pid, then
+        report the stop only once teardown has removed the handshake (#1238)."""
+        import signal as _signal
+
         from click.testing import CliRunner
 
         monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
         _no_daemon(monkeypatch)
-        _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 1, "token": "t"})
+        hs = _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 1, "token": "t"})
         monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
         monkeypatch.setattr(
             "memtomem_stm.daemon.client.probe_listening", lambda host, port, **kw: True
         )
         killed: list[tuple[int, int]] = []
         monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+        # Teardown finishes a few polls into the wait, not at signal time.
+        _fake_stop_clock(monkeypatch, on_sleep=lambda polls: polls == 3 and hs.unlink())
 
         result = CliRunner().invoke(_cli(), ["daemon", "stop"])
 
         assert result.exit_code == 0, result.output
-        assert "sent SIGTERM" in result.output
-        import signal as _signal
-
+        assert "sent SIGTERM to daemon pid=12345" in result.output
+        assert "daemon stopped" in result.output
         assert killed == [(12345, _signal.SIGTERM)]
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX SIGTERM fallback")
+    def test_sigterm_without_teardown_exits_nonzero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#1238: a signalled daemon whose handshake is still there when the
+        budget runs out is not confirmed stopped — exit 1, naming the pid."""
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        hs = _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 1, "token": "t"})
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        monkeypatch.setattr(
+            "memtomem_stm.daemon.client.probe_listening", lambda host, port, **kw: True
+        )
+        monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+        clock = _fake_stop_clock(monkeypatch)
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+
+        assert result.exit_code == 1, result.output
+        assert "daemon pid=12345 did not finish shutting down after SIGTERM" in result.stderr
+        assert "daemon stopped" not in result.output
+        assert hs.exists()  # never treated as stale
+        assert clock["t"] >= 5.0  # the whole budget was spent
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX SIGTERM fallback")
+    def test_sigterm_permission_error_keeps_handshake_and_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#1238: ``is_pid_alive`` counts EPERM as alive, and the endpoint
+        listens — a daemon we may not signal is not a stale record. It used to
+        be unlinked and reported as cleaned up with exit 0."""
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        hs = _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 1, "token": "t"})
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        monkeypatch.setattr(
+            "memtomem_stm.daemon.client.probe_listening", lambda host, port, **kw: True
+        )
+
+        def fake_kill(pid: int, sig: int) -> None:
+            raise PermissionError("EPERM")
+
+        monkeypatch.setattr(os, "kill", fake_kill)
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+
+        assert result.exit_code == 1, result.output
+        assert "could not signal daemon pid=12345 (PermissionError)" in result.stderr
+        assert "cleaned stale handshake" not in result.output
+        assert hs.exists()
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX SIGTERM fallback")
+    def test_sigterm_process_gone_is_stale_cleanup(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The daemon exited between the probe and the signal: nothing is left
+        running, so the record is stale and cleaned up as before (exit 0)."""
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        hs = _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 1, "token": "t"})
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        monkeypatch.setattr(
+            "memtomem_stm.daemon.client.probe_listening", lambda host, port, **kw: True
+        )
+
+        def fake_kill(pid: int, sig: int) -> None:
+            raise ProcessLookupError("ESRCH")
+
+        monkeypatch.setattr(os, "kill", fake_kill)
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+
+        assert result.exit_code == 0, result.output
+        assert "cleaned stale handshake" in result.output
+        assert not hs.exists()
 
     def test_stale_handshake_recycled_pid_not_sigtermed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1319,7 +1424,9 @@ class TestDaemonStopCli:
         result = CliRunner().invoke(_cli(), ["daemon", "stop"])
 
         assert result.exit_code == 0, result.output
-        assert "cleaned stale handshake" in result.output
+        # The pid is named: the record is gone after this, and a daemon already
+        # shutting down on its own lands here too (#1238).
+        assert "no responsive daemon pid=12345; cleaned stale handshake" in result.output
         assert killed == []  # recycled pid never signalled
         assert not hs.exists()
 
@@ -1340,8 +1447,9 @@ class TestDaemonStopCli:
         monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
 
         result = CliRunner().invoke(_cli(), ["daemon", "stop"])
-        assert result.exit_code == 0, result.output
-        assert "Windows does not provide the POSIX SIGTERM fallback" in result.output
+        # #1238: nothing stopped it, so this is not a success.
+        assert result.exit_code == 1, result.output
+        assert "Windows does not provide the POSIX SIGTERM fallback" in result.stderr
         assert killed == []
 
 
@@ -1962,13 +2070,19 @@ class TestDaemonForeignOrphans:
         monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
         _probe_all(monkeypatch)
         killed: list[tuple[int, int]] = []
-        monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+        def fake_kill(pid: int, sig: int) -> None:
+            killed.append((pid, sig))
+            discovery.handshake_path(tmp_path, "foreignfp000000").unlink()  # teardown done
+
+        monkeypatch.setattr(os, "kill", fake_kill)
 
         result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
 
         assert result.exit_code == 0, result.output
         assert killed == [(98765, _signal.SIGTERM)]
         assert "sent SIGTERM to daemon pid=98765 (fp=foreignfp000000)" in result.output
+        assert "daemon pid=98765 stopped (fp=foreignfp000000)" in result.output
 
     def test_stop_all_continues_foreign_cleanup_after_current_stop_timeout(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2017,7 +2131,12 @@ class TestDaemonForeignOrphans:
         monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
         _probe_all(monkeypatch)
         killed: list[tuple[int, int]] = []
-        monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+        def fake_kill(pid: int, sig: int) -> None:
+            killed.append((pid, sig))
+            discovery.handshake_path(tmp_path, old_fp).unlink()  # teardown done
+
+        monkeypatch.setattr(os, "kill", fake_kill)
 
         result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
 
@@ -2067,7 +2186,9 @@ class TestDaemonForeignOrphans:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         """`stop --all` must (a) never signal a dead-pid orphan, (b) keep going
-        when one SIGTERM raises OSError, and (c) still exit 0 (fail-open)."""
+        when one SIGTERM raises OSError, and (c) exit 1 for that failure alone
+        (#1238) — the daemon it did signal is confirmed stopped, so the timeout
+        cannot be what fails the command."""
         import signal as _signal
 
         from click.testing import CliRunner
@@ -2083,17 +2204,20 @@ class TestDaemonForeignOrphans:
 
         def fake_kill(pid: int, sig: int) -> None:
             if pid == 1001:
-                raise OSError("ESRCH")
+                raise OSError("EPERM")
             killed.append((pid, sig))
+            discovery.handshake_path(tmp_path, "cccc000000000000").unlink()  # teardown done
 
         monkeypatch.setattr(os, "kill", fake_kill)
 
         result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
 
-        assert result.exit_code == 0, result.output
+        assert result.exit_code == 1, result.output
         assert killed == [(3003, _signal.SIGTERM)]  # 2002 never tried, loop continued past 1001
-        assert "could not signal daemon pid=1001" in result.output
+        assert "could not signal daemon pid=1001" in result.stderr
         assert "sent SIGTERM to daemon pid=3003" in result.output
+        assert "daemon pid=3003 stopped" in result.output
+        assert "did not finish" not in result.output
 
     def test_status_running_with_foreign(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """A live current daemon AND a foreign orphan: the running-branch `info`
@@ -2141,6 +2265,146 @@ class TestDaemonForeignOrphans:
         assert "running  pid=11" in result.output  # current daemon line
         assert "pid=98765 fp=foreignfp000000" in result.output  # foreign warning
         assert "secret-token" not in result.output
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX SIGTERM fallback")
+    def test_stop_all_signals_every_target_before_one_shared_wait(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#1238: every foreign daemon is signalled before the wait starts, and
+        they share one budget — staggered teardowns all confirm, exit 0."""
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        self._write_foreign(tmp_path, "aaaa000000000000", pid=1001)
+        self._write_foreign(tmp_path, "cccc000000000000", pid=3003)
+        _no_daemon(monkeypatch)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        _probe_all(monkeypatch)
+        killed: list[int] = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append(pid))
+        signalled_at_first_poll: list[int] = []
+
+        def on_sleep(polls: int) -> None:
+            if polls == 1:
+                signalled_at_first_poll.extend(killed)
+            if polls == 2:
+                discovery.handshake_path(tmp_path, "aaaa000000000000").unlink()
+            if polls == 5:
+                discovery.handshake_path(tmp_path, "cccc000000000000").unlink()
+
+        _fake_stop_clock(monkeypatch, on_sleep=on_sleep)
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+
+        assert result.exit_code == 0, result.output
+        assert signalled_at_first_poll == [1001, 3003]
+        assert "daemon pid=1001 stopped (fp=aaaa000000000000)" in result.output
+        assert "daemon pid=3003 stopped (fp=cccc000000000000)" in result.output
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX SIGTERM fallback")
+    def test_stop_all_names_the_daemon_that_did_not_finish(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#1238: one target confirms and one does not → exit 1 naming only the
+        survivor, after a single budget rather than one per daemon. The first
+        confirms halfway through, so a fresh budget per daemon would run past
+        7 s instead of ending at 5 s."""
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        self._write_foreign(tmp_path, "aaaa000000000000", pid=1001)
+        self._write_foreign(tmp_path, "cccc000000000000", pid=3003)
+        _no_daemon(monkeypatch)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        _probe_all(monkeypatch)
+        monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+        clock = _fake_stop_clock(
+            monkeypatch,
+            on_sleep=lambda polls: (
+                polls == 50 and discovery.handshake_path(tmp_path, "aaaa000000000000").unlink()
+            ),
+        )
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+
+        assert result.exit_code == 1, result.output
+        assert "daemon pid=1001 stopped (fp=aaaa000000000000)" in result.output
+        assert (
+            "daemon pid=3003 (fp=cccc000000000000) did not finish shutting down after SIGTERM"
+        ) in result.stderr
+        assert "pid=1001 (fp=aaaa000000000000) did not finish" not in result.output
+        assert 5.0 <= clock["t"] < 5.2  # one shared budget
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX SIGTERM fallback")
+    def test_stop_all_target_gone_before_signal_still_needs_its_handshake_removed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#1238: ESRCH means the process went away, not that it finished its
+        teardown — a crashed daemon leaves its handshake, and that must not
+        count as a confirmed stop."""
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        self._write_foreign(tmp_path, "aaaa000000000000", pid=1001)
+        _no_daemon(monkeypatch)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        _probe_all(monkeypatch)
+
+        def fake_kill(pid: int, sig: int) -> None:
+            raise ProcessLookupError("ESRCH")
+
+        monkeypatch.setattr(os, "kill", fake_kill)
+        _fake_stop_clock(monkeypatch)
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+
+        assert result.exit_code == 1, result.output
+        assert "daemon pid=1001 (fp=aaaa000000000000) did not finish" in result.stderr
+        assert "could not signal" not in result.output
+
+    def test_stop_all_on_windows_exits_nonzero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#1238: Windows cannot signal them, so nothing was stopped."""
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        self._write_foreign(tmp_path, "aaaa000000000000", pid=1001)
+        _no_daemon(monkeypatch)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        _probe_all(monkeypatch)
+        monkeypatch.setattr("memtomem_stm.cli.daemon_cmd._can_force_terminate", lambda: False)
+        killed: list[int] = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append(pid))
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+
+        assert result.exit_code == 1, result.output
+        assert "Windows cannot safely" in result.stderr
+        assert killed == []
+
+    def test_stop_all_foreign_failure_fails_after_current_success(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The reverse of the current-timeout case: the current config stopped
+        cleanly, but a foreign daemon did not — the command still fails."""
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        current: list[STMConfig] = []
+
+        def foreign_timeout(_config: STMConfig) -> None:
+            raise SystemExit(1)
+
+        monkeypatch.setattr(
+            "memtomem_stm.cli.daemon_cmd._stop_current_config_daemon", current.append
+        )
+        monkeypatch.setattr("memtomem_stm.cli.daemon_cmd._stop_foreign_daemons", foreign_timeout)
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+
+        assert result.exit_code == 1
+        assert len(current) == 1
 
     def test_stop_all_no_foreign(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         from click.testing import CliRunner
@@ -2344,6 +2608,35 @@ class TestDaemonRestartCli:
         assert result.exit_code == 1, result.output
         assert "NOT restarted" in result.output
         assert "still shutting down" in result.output
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX SIGTERM fallback")
+    def test_unconfirmed_sigterm_stop_does_not_start_a_replacement(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#1238: a SIGTERMed daemon still tearing down when the wait ends must
+        stop ``restart`` before it spawns a second daemon beside it."""
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 1, "token": "t"})
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        monkeypatch.setattr(
+            "memtomem_stm.daemon.client.probe_listening", lambda host, port, **kw: True
+        )
+        monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+        spawns: list[object] = []
+        monkeypatch.setattr(
+            "memtomem_stm.daemon.spawn.request_spawn",
+            lambda config, *, propagate_errors=False: spawns.append(config) or True,
+        )
+        _fake_stop_clock(monkeypatch)
+
+        result = CliRunner().invoke(_cli(), ["daemon", "restart"])
+
+        assert result.exit_code == 1, result.output
+        assert "did not finish shutting down after SIGTERM" in result.stderr
+        assert spawns == []
 
 
 # ── daemon run + handshake coercion helpers ─────────────────────────────────

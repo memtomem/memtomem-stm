@@ -1014,7 +1014,15 @@ running exits 1 instead of claiming the daemon has stopped, as does one whose
 handshake is still present but unreadable. `stop` reports "no running daemon"
 only when there is really no handshake for this config — a record it cannot
 parse could belong to a daemon that declined the graceful shutdown, so it
-exits 1 and points at `status` rather than inviting a replacement.
+exits 1 and points at `status` rather than inviting a replacement. When the
+graceful request is declined but the endpoint still accepts a connection,
+`stop` sends the recorded pid SIGTERM and waits for the same handshake removal,
+exiting 1 if teardown has not finished within 5 seconds or the pid cannot be
+signalled; on Windows, which has no such fallback, it exits 1 straight away.
+A handshake whose endpoint no longer accepts is removed as stale ("no
+responsive daemon pid=N; cleaned stale handshake", exit 0) without that wait, and a
+daemon already shutting down on its own has closed its listener too, so that
+message does not confirm a finished teardown.
 
 Daemons are keyed by config, so `start`/`stop`/`restart` for one config never
 touch a daemon serving another config. `mms daemon status` lists every live
@@ -1036,8 +1044,10 @@ anything uses it now:
 
 Only the last two get the warning and the cleanup hint: if no running STM
 process uses them, `mms daemon stop --all` SIGTERMs them — and every other
-daemon in the list, so it stays opt-in. On Windows `stop --all` cannot signal by
-pid, and the hint names Task Manager instead. In `status --json`, each `foreign`
+daemon in the list, so it stays opt-in — then waits up to 5 seconds, shared
+across all of them, for each to remove its handshake, and exits 1 if any did
+not or could not be signalled. On Windows `stop --all` cannot signal by pid, so
+it exits 1, and the hint names Task Manager instead. In `status --json`, each `foreign`
 entry carries `idle_shutdown_seconds` (a number, or `null` when there is none or
 it is unknown) and `exits_when_idle` (`true`, `false`, or `null` when unknown).
 Foreign daemon detection combines process liveness with a protocol-neutral TCP

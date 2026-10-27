@@ -9,6 +9,30 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
+## [Unreleased]
+
+### Upgrade notes
+
+- **`mms daemon stop` exits 1 when it cannot confirm a stop, and can wait up
+  to 5 seconds longer for a signalled daemon (10 with `--all`).** After `sent SIGTERM`, scripts now get exit 0 only
+  once that daemon finished shutting down. (#1238)
+
+### Changed
+
+- `mms daemon stop` exits 0 only when every daemon it acted on removed its
+  handshake, none was running, or the record it found was stale. After a
+  SIGTERM fallback it now waits for the same handshake removal the graceful
+  path waits for; `--all` signals every foreign daemon first, then waits for
+  all of them on one shared 5-second budget. A pid that cannot be signalled
+  keeps its handshake instead of having it removed as stale, and the stale
+  cleanup message names the pid. **Behavior change**: exit 1, with the message
+  on stderr, when a signalled daemon has not finished within the budget, when
+  a pid cannot be signalled, and on Windows when a daemon is still listening
+  or `--all` finds a foreign daemon, since Windows has no signal fallback.
+  With `--all`, the current config's wait and the foreign wait run one after
+  the other, so it waits up to 10 seconds for teardown. `mms daemon restart`
+  no longer starts a replacement after such a stop. (#1238)
+
 ## [0.7.0] — 2026-10-27
 
 ### Upgrade notes
