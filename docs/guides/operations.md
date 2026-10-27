@@ -149,20 +149,25 @@ build started.
 
 1. Quit every MCP host that runs STM (Claude Code, Codex, …). A running proxy
    or hook starts a daemon again on its next call.
-2. With the old build still installed, run `mms daemon stop`. It exits 0 once
-   the daemon has finished shutting down (`daemon stopped`) or when none was
-   running (`no running daemon`); on exit 1, follow its message before going
-   on.
+2. With the old build still installed, run `mms daemon stop`. `daemon stopped`
+   means the daemon finished shutting down, and `no running daemon` that none
+   was running for this config. `sent SIGTERM to daemon pid=N` means it only
+   signalled the process: check that the pid is gone (for example
+   `ps -p N`) before going on. On exit 1, or a warning that the endpoint is
+   still listening (Windows), follow the message.
 3. Run `mms daemon status`. A daemon a host started usually runs under a
    different config fingerprint than your shell, because `mms register` pins
    host-specific settings in the host's environment, and `status` lists it as
    running under a different config. With the hosts quit, nothing uses it: on
-   macOS and Linux, `mms daemon stop --all` sends each one SIGTERM without
-   waiting, so re-run `mms daemon status` until none is listed. On Windows,
-   `--all` does not signal them; stop the owning processes from Task Manager.
-4. Upgrade every installation that shares the data directory (`~/.memtomem`
-   by default) before any of them starts again, then run `mms version` and
-   `mms doctor`.
+   macOS and Linux, `mms daemon stop --all` sends each listed daemon SIGTERM
+   without waiting, so note their pids and check that those processes are
+   gone. On Windows, `--all` does not signal them; stop the owning processes
+   from Task Manager. A daemon leaves the `status` listing when it stops
+   listening, which is before it finishes shutting down, so an empty listing
+   is not that check.
+4. Upgrade every installation whose processes share a pending store
+   (`pending_store_path`, `~/.memtomem/pending_selections.db` by default)
+   before any of them starts again, then run `mms version` and `mms doctor`.
 5. Start the hosts again.
 
 Each check covers the data directory of the config and `MEMTOMEM_STM_*`
