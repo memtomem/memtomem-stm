@@ -2774,7 +2774,7 @@ def test_release_publish_steps_scope_skip_existing_to_the_dry_run_lane() -> None
     # ...and both must be the pinned publisher itself. Without this a refactor
     # to a composite or reusable action would carry the inputs somewhere this
     # test cannot see, and pass by looking unchanged.
-    action = "        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33"
+    action = "        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086"
     for step, label in ((production, "PyPI"), (dry_run, "TestPyPI")):
         assert any(line.startswith(action) for line in step), (
             f"the {label} step must call the pinned publisher action directly"
