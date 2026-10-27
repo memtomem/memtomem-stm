@@ -19,7 +19,7 @@ from memtomem_stm.proxy.compression import (
     SensitivePayloadNotStored,
     payload_has_credentials,
 )
-from memtomem_stm.proxy.delivery import progressive_metadata_format
+from memtomem_stm.proxy.delivery import progressive_metadata_format, stored_progressive_format
 from memtomem_stm.proxy.heading_index import HeadingIndex, ensure_heading_index
 from memtomem_stm.utils.json_out import dumps as _json_dumps
 from memtomem_stm.utils.json_out import scrub_lone_surrogates
@@ -93,15 +93,9 @@ def _classify_progressive_content(
     Keep the legacy presentation/type intact. The optional derived field is
     replaced with the row, survives SQLite restarts, and never renews its TTL.
     """
-    presentation = meta.get("delivery")
-    stored_mode = (
-        presentation.get("delivery_format", "legacy")
-        if isinstance(presentation, dict)
-        else "legacy"
-    )
     if (
         classify_content is None
-        or stored_mode != "legacy"
+        or stored_progressive_format(meta) != "legacy"
         or meta.get("structured_content_type") in ("json", "markdown", "text", "code")
     ):
         return False

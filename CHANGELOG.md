@@ -44,6 +44,9 @@ changes inline only. See the deprecation policy in
   filtering. Complete progressive/hybrid frames and progressing continuation
   capacity are checked before publication; storage/privacy failures use uncached
   safe fallback. Transient keys stay out of the response cache.
+  Unicode token budgets share one density-derived cap across compression,
+  initial structured frames and owned continuations. Inline TOC contents stay
+  complete; tables that cannot fit fall back to progressive delivery.
 - Native upstream schemas, structured/non-text payloads and annotated text
   boundaries are preserved. Text twins are cleaned and capped separately;
   proxied errors carry STM JSON in text without replacing upstream output schemas.

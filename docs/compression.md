@@ -571,9 +571,31 @@ can be shortened to fit. A TOC that cannot fit without dropping keys falls back
 to progressive delivery. A budget too small for one progressing envelope returns
 `budget_exceeded`. A non-final progressive key is published only when its owned
 continuation can also fit a progressing response. Initial upstream metadata uses
-the initial budget only; continuations retain the full configured tool budget.
+the initial budget only; continuations retain the full derived tool budget.
+With `max_result_tokens` and `token_estimation_mode: "unicode"`, the cleaned
+response's estimated token density derives one character cap before any retention
+floor. Structured frames use the smaller of that cap and the configured static
+character conversion, both for compression and serialized-result fitting. Initial
+upstream metadata is reserved from that cap; the full cap is stored for owned
+continuations. Lossless TOC/progressive delivery does not widen this limit to
+meet a lossy-content retention floor. This is an estimated token budget, not a
+model-specific tokenizer guarantee.
 Hybrid TOCs are fitted with their head and complete key set before any pending
-store publication or eviction. Selection continuations never truncate chosen sections: ask
+store publication or eviction. Entries marked `inline: true` contain their full
+section; fitting shortens only non-inline previews. If the complete inline
+contents and all keys cannot fit, publication falls back to progressive delivery.
+
+Structured TOCs have more per-entry overhead than legacy TOCs because they carry
+chunk identity and source metadata. Capacity therefore depends on section count,
+key lengths and head size, not only document length. For example, at a 16,000
+character budget with retention disabled, 5,000 head characters and short section
+labels with 30 lines of `body text line` each, structured hybrid switches to
+progressive delivery at 60 sections and structured selective at 70; legacy TOCs
+still fit at 120 sections. These are fixture examples, not fixed section limits.
+The fallback keeps the source recoverable, but clients use cursor reads instead
+of section selection.
+
+Selection continuations never truncate chosen sections: ask
 for fewer keys or `response_format: "legacy"` if they exceed their stored budget.
 Raw/nonstandard JSON, duplicate keys and unrepresentable paths use progressive
 delivery in structured mode. Explicit `hybrid.tail_mode: "truncate"` remains

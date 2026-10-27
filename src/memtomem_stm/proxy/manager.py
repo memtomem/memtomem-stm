@@ -94,9 +94,9 @@ from memtomem_stm.proxy.delivery import (
     delivery_result,
     delivery_scope,
     delivery_size,
-    envelope,
     error_result,
     fit_progressive,
+    progressive_envelope,
     require_progressive_continuation,
     wire_json,
 )
@@ -401,6 +401,28 @@ class ToolConfig:
     token_budget: int | None = None
     token_estimation_mode: TokenEstimationMode = TokenEstimationMode.STATIC
     delivery_format: DeliveryFormat = "legacy"
+
+
+def _response_budget(cleaned: str, tc: ToolConfig) -> tuple[int, int | None]:
+    """Resolve the pre-retention char cap and optional Unicode token estimate.
+
+    The same cap drives compression and structured frames, including stored
+    continuation budgets. Legacy progressive keeps its chunk-only size policy.
+    """
+    chars, estimated_tokens = tc.max_chars, None
+    if (
+        tc.token_budget is not None
+        and tc.token_estimation_mode == TokenEstimationMode.UNICODE
+        and (
+            tc.compression != CompressionStrategy.PROGRESSIVE or tc.delivery_format == "structured"
+        )
+    ):
+        estimated_tokens = approx_tokens(cleaned)
+        if estimated_tokens > tc.token_budget:
+            chars = max(1, int(len(cleaned) * tc.token_budget / estimated_tokens))
+    if tc.delivery_format == "structured":
+        chars = min(chars, tc.max_chars)
+    return chars, estimated_tokens
 
 
 # Field classification for ``compression_fingerprint``. Every ``ToolConfig``
@@ -5176,18 +5198,13 @@ class ProxyManager:
                 total_chars=len(text),
             )
         if descriptor is None:
-            descriptor = envelope(
-                "progressive",
-                {
-                    "key": key,
-                    "source_format": resp.content_type,
-                    "content": text[: first.payload_chars],
-                    "offset": 0,
-                    "next_offset": first.payload_chars if first.payload_chars < len(text) else None,
-                    "total_chars": len(text),
-                    "has_more": first.payload_chars < len(text),
-                    "ttl_seconds_remaining": cfg.ttl_seconds,
-                },
+            descriptor = progressive_envelope(
+                text,
+                key=key,
+                offset=0,
+                end=first.payload_chars,
+                source_format=resp.content_type,
+                ttl=cfg.ttl_seconds,
             )
         return DeliveryText(
             delivery_json(descriptor) if delivery_format() == "structured" else first.text,
@@ -6569,6 +6586,7 @@ class ProxyManager:
         cfg_snap: ProxyConfig,
         context_query: str | None,
         trace_id: str | None,
+        response_budget: tuple[int, int | None] | None = None,
     ) -> CompressionResult:
         """Stages 2+3: compress (or build a progressive first chunk), then surface.
 
@@ -6626,11 +6644,10 @@ class ProxyManager:
         # Carried out of band so this manager's own keys stay out of the cache
         # regardless of how the footer is worded (#1046).
         progressive_key_issued = False
-        # Set True when the opt-in unicode token gate evaluates this response
-        # (else-branch only — PROGRESSIVE is zero-loss and has no size gate).
-        # Read by the metrics block in ``_call_tool_inner`` to pick the token
-        # estimator, so it must track the gate exactly.
-        unicode_token_gate = False
+        base_max_chars, estimated_tokens = response_budget or _response_budget(cleaned, tc)
+        # Structured progressive frames also use the density-derived cap;
+        # legacy progressive retains its historical chunk-only policy.
+        unicode_token_gate = estimated_tokens is not None
         scorer_fallback = False
         progressive_fallback = False
         if tc.compression == CompressionStrategy.PROGRESSIVE:
@@ -6738,27 +6755,15 @@ class ProxyManager:
             # Enforce minimum retention: budget must preserve at least N% of cleaned content.
             # Dynamic scaling: shorter content → higher retention (less to gain from cutting).
             # This is the SINGLE place where retention is enforced — compressors trust max_chars.
-            effective_max_chars = tc.max_chars
+            effective_max_chars = base_max_chars
             if (
-                tc.token_budget is not None
-                and tc.token_estimation_mode == TokenEstimationMode.UNICODE
+                estimated_tokens is not None
+                and tc.token_budget is not None
+                and estimated_tokens <= tc.token_budget
             ):
-                unicode_token_gate = True
-                estimated_tokens = approx_tokens(cleaned)
-                if estimated_tokens <= tc.token_budget:
-                    # The actual response fits the requested token budget even
-                    # when its character count would have crossed the static
-                    # gate. Preserve it byte-for-byte.
-                    effective_compression = CompressionStrategy.NONE
-                elif estimated_tokens > 0:
-                    # Convert THIS response's observed token density back into
-                    # a char budget for the existing compressors. The retention
-                    # floor below may deliberately widen it to protect answer
-                    # quality, matching the static path's contract.
-                    effective_max_chars = max(
-                        1,
-                        int(len(cleaned) * tc.token_budget / estimated_tokens),
-                    )
+                # A response already within the token budget stays intact,
+                # even if it crossed the operator's static char conversion.
+                effective_compression = CompressionStrategy.NONE
             min_retention = getattr(cfg_snap, "min_result_retention", 0.65)
             min_budget = 0
             dynamic = 0.0  # effective retention floor applied to this call (0 = unset)
@@ -6797,7 +6802,7 @@ class ProxyManager:
             ):
                 # Recoverable keys retain the source in full. A lossy-content
                 # retention floor must not widen their serialized result limit.
-                effective_max_chars, min_budget, dynamic = tc.max_chars, 0, 0.0
+                effective_max_chars, min_budget, dynamic = base_max_chars, 0, 0.0
 
             with (
                 traced(
@@ -8186,6 +8191,10 @@ class ProxyManager:
         # compression work (including cached SELECTIVE/HYBRID scorers and
         # ratio-guard fallback tiers) without process-shared counter cross-talk.
         try:
+            response_budget = _response_budget(cleaned, tc)
+            frame_budget = (
+                response_budget[0] if tc.delivery_format == "structured" else tc.max_chars
+            )
             # The fitter serializes a plain TextContent/CallToolResult. Reserve
             # any extra upstream text/result metadata retained by final assembly.
             # Owned continuations do not repeat that upstream metadata.
@@ -8209,8 +8218,8 @@ class ProxyManager:
                 )
             with delivery_scope(
                 tc.delivery_format,
-                max(1, tc.max_chars - metadata_overhead),
-                continuation_budget=tc.max_chars,
+                max(1, frame_budget - metadata_overhead),
+                continuation_budget=frame_budget,
             ):
                 comp = await self._compress_and_surface(
                     server=server,
@@ -8221,6 +8230,7 @@ class ProxyManager:
                     cfg_snap=cfg_snap,
                     context_query=context_query,
                     trace_id=trace_id,
+                    response_budget=response_budget,
                 )
         except DeliveryError as exc:
             self.tracker.record_error(
@@ -8341,11 +8351,9 @@ class ProxyManager:
         # Record metrics (using pre-surfacing compressed size)
         # When the unicode gate evaluated THIS response, report token counts
         # from the same estimator so the recorded decision and the counts
-        # reconcile. Keyed on the gate having RUN (not on the mode alone):
-        # mode without a token budget, and the PROGRESSIVE branch with its
-        # static estimation mode, keep the static path.
-        # On the gated (non-progressive) branch ``comp.compressed`` is exactly
-        # the text whose length static mode measures.
+        # reconcile. Without a token budget, or for legacy progressive's
+        # chunk-only policy, keep static accounting. Structured progressive
+        # frames share the density-derived cap with the other strategies.
         if comp.unicode_token_gate:
             _orig_tokens = max(1, approx_tokens(original_text))
             _comp_tokens = max(1, approx_tokens(comp.compressed))

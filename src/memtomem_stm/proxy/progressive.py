@@ -15,6 +15,7 @@ from memtomem_stm.proxy.delivery import (
     DeliveryFormat,
     read_delivery_scope,
     progressive_metadata_format,
+    stored_progressive_format,
 )
 from memtomem_stm.proxy.markdown_structure import headings
 from memtomem_stm.proxy.compression import PendingSelection, _mm_json_loads
@@ -158,12 +159,7 @@ class ProgressiveStoreAdapter:
             budget = 16000
         mode = response_format or progressive_metadata_format(meta)
         content_type = meta.get("content_type", "text")
-        stored_mode = (
-            presentation.get("delivery_format", "legacy")
-            if isinstance(presentation, dict)
-            else "legacy"
-        )
-        if mode == "structured" and stored_mode == "legacy":
+        if mode == "structured" and stored_progressive_format(meta) == "legacy":
             # Legacy publication avoids whole-document classification. An
             # explicit structured read requests that metadata once per row.
             content_type = meta["structured_content_type"]

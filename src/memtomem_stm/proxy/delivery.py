@@ -141,6 +141,19 @@ def progressive_metadata_format(meta: dict[str, Any]) -> DeliveryFormat:
     return metadata_format(raw, _READ_FORMAT.get())
 
 
+def stored_progressive_format(meta: dict[str, Any]) -> object:
+    """Read the stored declaration without applying a per-read override.
+
+    Validation remains the responsibility of ``progressive_metadata_format``.
+    """
+    presentation = meta.get("delivery")
+    return (
+        presentation.get("delivery_format", "legacy")
+        if isinstance(presentation, dict)
+        else "legacy"
+    )
+
+
 def delivery_format() -> DeliveryFormat:
     return _FORMAT.get()
 
@@ -330,16 +343,22 @@ def require_progressive_continuation(
 
 
 def fit_toc(value: dict[str, Any], budget: int, *, owned: bool = False) -> dict[str, Any]:
-    """Shrink only previews. Never silently omit keys or truncate JSON."""
+    """Shrink non-inline previews; keep complete inline contents and all keys."""
     if delivery_size(value, owned=owned) <= budget:
         return value
     entries = value["payload"]["entries"]
-    lo, hi, best = 0, max((len(e["preview"]) for e in entries), default=0), None
+    lo, hi, best = (
+        0,
+        max((len(e["preview"]) for e in entries if not e.get("inline")), default=0),
+        None,
+    )
     while lo <= hi:
         cap = (lo + hi) // 2
         payload = {
             **value["payload"],
-            "entries": [{**e, "preview": e["preview"][:cap]} for e in entries],
+            "entries": [
+                e if e.get("inline") else {**e, "preview": e["preview"][:cap]} for e in entries
+            ],
         }
         candidate = {**value, "payload": payload}
         if delivery_size(candidate, owned=owned) <= budget:
