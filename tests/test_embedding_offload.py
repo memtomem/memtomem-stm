@@ -471,7 +471,7 @@ class TestSelectiveWriteBarrier:
 
         live = stub._selective_compressor
         assert live is not gated, "the swap did not happen"
-        assert live.select(key, ["Alpha"]) == "a" * 400, (
+        assert live.select(key, ["Alpha"]) == "## Alpha\n" + "a" * 400 + "\n\n", (
             "the key was minted into the retired store — the client holds a "
             "key that was never reachable (#898)"
         )
@@ -486,7 +486,7 @@ class TestSelectiveWriteBarrier:
 
         key = _key_of(self._swap_during_compress(stub, gated, gate, swaps=2))
 
-        assert stub._selective_compressor.select(key, ["Beta"]) == "b" * 400
+        assert stub._selective_compressor.select(key, ["Beta"]) == "## Beta\n" + "b" * 400
 
     def test_a_rebuild_cannot_interleave_with_the_write(self):
         """The window the scorer gate cannot reach: a rebuild arriving AFTER the
@@ -626,7 +626,7 @@ class TestSelectiveWriteBarrier:
         # Same configured path, so the recovered generation serves the key the
         # worker published while the slot was cold.
         assert stub._selective_compressor is not None
-        assert stub._selective_compressor.select(published[0], ["Alpha"]) == "a" * 400
+        assert stub._selective_compressor.select(published[0], ["Alpha"]) == "## Alpha\n" + "a" * 400 + "\n\n"
 
     def test_hybrid_tail_write_follows_the_live_generation(self):
         """HYBRID compresses its tail through the SAME shared selective
@@ -686,7 +686,7 @@ class TestSelectiveWriteBarrier:
         t.join(timeout=10)
 
         key = _key_of(result[0])
-        assert gated.select(key, ["Alpha"]) == "a" * 400
+        assert gated.select(key, ["Alpha"]) == "## Alpha\n" + "a" * 400 + "\n\n"
         gated.end_use()
 
     def test_single_generation_writes_to_its_own_store(self):

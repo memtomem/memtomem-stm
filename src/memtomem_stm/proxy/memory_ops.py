@@ -19,6 +19,7 @@ from memtomem_stm.proxy.index_observability import (
     _NoOpIndexObservability,
 )
 from memtomem_stm.proxy.privacy import contains_sensitive_content
+from memtomem_stm.utils.document_metadata import metadata_json, metadata_text
 from memtomem_stm.utils.fileio import atomic_write_text
 from memtomem_stm.utils.redact import exception_summary
 
@@ -92,6 +93,7 @@ class AutoIndexOutcome:
     ok: bool
     chunks_indexed: int
     error: str | None = None
+    notice: str | None = None
 
 
 def compose_index_footer(
@@ -192,11 +194,11 @@ async def auto_index_response(
 
     frontmatter_lines = [
         "---",
-        f"source: proxy/{server}/{tool}",
+        f"source: {metadata_json(f'proxy/{server}/{tool}')}",
         f"timestamp: {datetime.now(timezone.utc).isoformat()}",
     ]
     if compression_strategy is not None:
-        frontmatter_lines.append(f"compression: {compression_strategy}")
+        frontmatter_lines.append(f"compression: {metadata_json(compression_strategy)}")
     if original_chars is not None:
         frontmatter_lines.append(f"original_chars: {original_chars}")
     if compressed_chars is not None:
@@ -205,12 +207,13 @@ async def auto_index_response(
 
     intent_section = ""
     if context_query:
-        intent_section = f"## Agent Intent\n\n> {context_query}\n\n"
+        intent_section = f"## Agent Intent\n\n> {metadata_text(context_query)}\n\n"
 
     md_content = (
         f"{chr(10).join(frontmatter_lines)}\n\n"
-        f"# Proxy Response: {server}/{tool}\n\n"
-        f"- **Source**: `{server}/{tool}({args_str})`\n"
+        f"# Proxy Response: {metadata_text(server)}/{metadata_text(tool)}\n\n"
+        f"- **Source**: `{metadata_text(server)}/{metadata_text(tool)}"
+        f"({metadata_text(args_str)})`\n"
         f"- **Original size**: {original_chars or len(text)} chars\n\n"
         f"{intent_section}"
         f"## Content\n\n{text}\n"
@@ -257,7 +260,12 @@ async def auto_index_response(
         ns=ns,
         chunks=chunks,
     )
-    return AutoIndexOutcome(summary=summary, ok=ok, chunks_indexed=chunks, error=error)
+    notice = compose_index_footer(
+        server, tool, original_chars, compressed_chars, text, "", ns, chunks
+    ).rstrip()
+    return AutoIndexOutcome(
+        summary=summary, ok=ok, chunks_indexed=chunks, error=error, notice=notice
+    )
 
 
 async def extract_and_store(
@@ -393,15 +401,15 @@ def format_fact_md(
     arguments: dict[str, Any],
 ) -> str:
     """Format an extracted fact as a Markdown file with frontmatter."""
-    tags_str = ", ".join(fact.tags) if fact.tags else ""
     args_str = _render_args(arguments)
-    title = fact.content[:80].rstrip(".")
+    title = metadata_text(fact.content[:80].rstrip("."))
     lines = [
         "---",
-        f"source: extracted/{server}/{tool}",
+        f"source: {metadata_json(f'extracted/{server}/{tool}')}",
         f"timestamp: {datetime.now(timezone.utc).isoformat()}",
-        f"category: {fact.category}",
-        f"confidence: {fact.confidence}",
+        f"category: {metadata_json(fact.category)}",
+        f"confidence: {metadata_json(fact.confidence)}",
+        *([f"tags: {metadata_json(fact.tags)}"] if fact.tags else []),
         "---",
         "",
         f"## {title}",
@@ -409,8 +417,8 @@ def format_fact_md(
         fact.content,
         "",
     ]
-    if tags_str:
-        lines.append(f"tags: [{tags_str}]")
-    lines.append(f"extracted_from: {server}/{tool}({args_str})")
+    lines.append(
+        f"extracted_from: {metadata_text(server)}/{metadata_text(tool)}({metadata_text(args_str)})"
+    )
     lines.append("")
     return "\n".join(lines)

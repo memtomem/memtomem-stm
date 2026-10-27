@@ -143,13 +143,27 @@ WHERE p.cache_key IN (
 );
 """
 
-_DELETE_ALL_TRANSIENT_ROWS = """
-DELETE FROM proxy_cache
-WHERE (instr(result, ?) > 0 AND instr(result, ?) > 0)
-   OR (instr(result, ?) > 0 AND instr(result, ?) > 0);
+# CASE keeps JSON functions away from invalid/ordinary text. Match the same
+# versioned envelope as response_carries_transient_key, including JSON spacing.
+_STRUCTURED_TRANSIENT_SQL = """
+CASE WHEN json_valid(result) THEN
+    json_type(result, '$.stm') = 'object'
+    AND json_type(result, '$.stm.schema_version') = 'integer'
+    AND json_extract(result, '$.stm.schema_version') = 1
+    AND json_extract(result, '$.stm.kind') IN ('progressive', 'selective', 'hybrid', 'selection')
+    AND json_type(result, '$.stm.payload.key') = 'text'
+    AND length(json_extract(result, '$.stm.payload.key')) > 0
+ELSE 0 END
 """
 
-_DELETE_UNVERIFIED_TRANSIENT_ROWS = """
+_DELETE_ALL_TRANSIENT_ROWS = f"""
+DELETE FROM proxy_cache
+WHERE (instr(result, ?) > 0 AND instr(result, ?) > 0)
+   OR (instr(result, ?) > 0 AND instr(result, ?) > 0)
+   OR ({_STRUCTURED_TRANSIENT_SQL});
+"""
+
+_DELETE_UNVERIFIED_TRANSIENT_ROWS = f"""
 DELETE FROM proxy_cache
 WHERE cache_key IN (
     SELECT cache_key FROM proxy_cache_privacy_unverified
@@ -157,6 +171,7 @@ WHERE cache_key IN (
 AND (
     (instr(result, ?) > 0 AND instr(result, ?) > 0)
     OR (instr(result, ?) > 0 AND instr(result, ?) > 0)
+    OR ({_STRUCTURED_TRANSIENT_SQL})
 );
 """
 
@@ -189,7 +204,8 @@ _PRIVACY_REPAIR_ATTEMPTS = 3
 # privacy repair drains the queue without a transient purge. A different
 # fingerprint is what makes the next opener here notice that an older build
 # published, and purge the whole table again.
-_PRIVACY_POLICY_EPOCH = 4
+# Epoch 5 also purges versioned structured STM transient deliveries.
+_PRIVACY_POLICY_EPOCH = 5
 
 
 def _privacy_policy_fingerprint() -> str:
@@ -600,7 +616,26 @@ def response_carries_transient_key(text: str) -> bool:
     """
     if _PROGRESSIVE_MARKER in text and _READ_MORE_KEY_MARKER in text:
         return True
-    return _SELECTION_KEY_MARKER in text and _TOC_SHAPE_MARKER in text
+    if _SELECTION_KEY_MARKER in text and _TOC_SHAPE_MARKER in text:
+        return True
+    if '"stm"' not in text:
+        return False
+    try:
+        obj = json.loads(text)
+    except (ValueError, TypeError, RecursionError, OverflowError):
+        return False
+    stm = obj.get("stm") if isinstance(obj, dict) else None
+    if not isinstance(stm, dict):
+        return False
+    payload = stm.get("payload")
+    return (
+        type(stm.get("schema_version")) is int
+        and stm["schema_version"] == 1
+        and stm.get("kind") in ("progressive", "selective", "hybrid", "selection")
+        and isinstance(payload, dict)
+        and isinstance(payload.get("key"), str)
+        and bool(payload["key"])
+    )
 
 
 class ProxyCache:

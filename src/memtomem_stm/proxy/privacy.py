@@ -138,9 +138,34 @@ CREDENTIAL_PATTERNS = [
     r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
     # JWT-ish: three base64url segments separated by dots, anchored to the
     # canonical ``eyJ`` header prefix to limit false positives on arbitrary
-    # dotted identifiers.
-    r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+    # dotted identifiers. It finds the same tokens as
+    # ``\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`` —
+    # the same yes/no answer, match count and match ends — in linear time.
+    # That form tried a start after every ``-`` in a run of segment
+    # characters, and each start scanned to the end of the run, so ``eyJ-``
+    # repeated cost quadratic time. Here the first segment
+    # does not run past another start that has 8 characters after it: such
+    # a start shares the rest of the match, so it is left to decide. A match
+    # can therefore begin at a later ``eyJ`` in the same run, with the same
+    # end. The segment is consumed a word-character run at a time and
+    # possessively, so no backtracking state builds up. Only a ``.`` may
+    # follow it, and giving characters back never exposes one.
+    r"\beyJ(?=[A-Za-z0-9_-]{8})[A-Za-z0-9_]*+(?:-(?!eyJ[A-Za-z0-9_-]{8})[A-Za-z0-9_]*+)*+"
+    r"\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
     r"(?i)(BEGIN\s+(RSA|EC|OPENSSH|DSA|PGP)\s+PRIVATE\s+KEY)",
+    # PKCS#8 private keys, plain and encrypted: the header carries no
+    # algorithm label, so the rule above never sees it. This is what OpenSSL 3
+    # ``genrsa``/``genpkey`` write by default, and the only PEM form an
+    # Ed25519 key has. "begin private key" is ordinary prose where the
+    # labelled forms are not, so this rule keeps the dashes and the case. The
+    # separators also take backslashes, because a serializer folds a long line
+    # at a space: PyYAML writes ``PRIVATE\n  KEY`` in plain style and
+    # ``PRIVATE\\\n  \ KEY`` in double-quoted style, its default for non-ASCII
+    # text, and both load back to the same key. Public keys and certificates
+    # do not match. Out of scope: PuTTY ``.ppk`` (not PEM), the ssh.com
+    # ``---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----`` form, and headers written
+    # with escaped dashes (``\u002d``) or in lowercase.
+    r"-----BEGIN[\s\\]+(?:ENCRYPTED[\s\\]+)?PRIVATE[\s\\]+KEY-----",
     # --- Secret-class patterns mirrored from memtomem LTM (issue #1488) -----
     # These provider-token patterns originated at the LTM trust boundary and
     # are mirrored back here for routing coherence (reverse sync, issue

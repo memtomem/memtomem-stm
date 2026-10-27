@@ -135,6 +135,7 @@ class CompressionResult:
     # requests and cached ``SelectiveCompressor`` scorers do not cross-talk.
     # No default (the module contract above): both branches set it explicitly.
     scorer_fallback: bool
+    transient_key_issued: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +152,7 @@ class IndexResult:
     index_ok: bool | None
     index_error: str | None
     chunks_indexed: int
+    notice: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -29,7 +29,7 @@ from memtomem_stm.proxy import privacy
 # divergence window (one side merged ahead of its sync), bump the leading
 # side's constant with a sync-tracking note, then re-align the trailing
 # side's constant when the sync lands.
-_SECRET_CLASS_SET_SHA256 = "237d505d119c08ba85fc4474aa85bd07c603439809d03915331fab6b435a9f65"
+_SECRET_CLASS_SET_SHA256 = "631d79e538a2000424dd3493737bb60580f7516a20bdacddd12df9432caa99d8"
 
 
 @pytest.fixture(autouse=True)
@@ -209,6 +209,9 @@ class TestDefaultPatternCoverage:
             "-----BEGIN RSA PRIVATE KEY-----",
             "-----BEGIN DSA PRIVATE KEY-----",
             "-----BEGIN PGP PRIVATE KEY-----",
+            # PKCS#8, plain and encrypted (GHSA-mf67-ghgq-cv54).
+            "-----BEGIN PRIVATE KEY-----",
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----",
             # --- #1488 LTM-origin mirror (all examples are FAKE; assembled at
             #     runtime so no contiguous realistic token literal trips GitHub
             #     push protection) -----------------------------------------
@@ -321,14 +324,15 @@ class TestCredentialPiiSplit:
         # 9 original secret-class patterns + 3 STM-origin label rules
         # (#553 AWS secret-material labels, #562 the general quoted-label
         # rule, #561 x-amz-security-token — forward-synced into LTM as
-        # memtomem#1533 and memtomem#1541) + 7 mirrored from memtomem LTM
-        # (#1488 / reverse sync #1491). Bump deliberately when adding a
-        # pattern so a silent add/drop surfaces here. LTM's matching pin
-        # also sits at 19; the content-hash pin below guards the pattern
-        # BODIES on both sides (#559).
-        assert len(privacy.CREDENTIAL_PATTERNS) == 19
+        # memtomem#1533 and memtomem#1541) + the PKCS#8 private-key rule
+        # (GHSA-mf67-ghgq-cv54) + 7 mirrored from memtomem LTM (#1488 /
+        # reverse sync #1491). Bump deliberately when adding a pattern so a
+        # silent add/drop surfaces here. LTM's matching pin also sits at 20;
+        # the content-hash pin below guards the pattern BODIES on both sides
+        # (#559).
+        assert len(privacy.CREDENTIAL_PATTERNS) == 20
         assert len(privacy.PII_PATTERNS) == 1
-        assert len(privacy.DEFAULT_PATTERNS) == 20
+        assert len(privacy.DEFAULT_PATTERNS) == 21
 
     def test_credential_set_content_pinned_for_ltm_sync(self):
         joined = "\n".join(privacy.CREDENTIAL_PATTERNS).encode("utf-8")

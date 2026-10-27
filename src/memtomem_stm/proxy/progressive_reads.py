@@ -95,5 +95,11 @@ class ProgressiveReadsTracker:
         except Exception:
             logger.debug("progressive_reads record_follow_up failed", exc_info=True)
 
+    def record_wire(self, key: str, wire_bytes: int, *, initial: bool, offset: int = 0) -> None:
+        try:
+            self._store.record_wire(key, wire_bytes, initial=initial, offset=offset)
+        except Exception:
+            logger.debug("progressive wire observation failed", exc_info=True)
+
     def get_stats(self, tool: str | None = None) -> dict:
         return self._store.get_stats(tool)

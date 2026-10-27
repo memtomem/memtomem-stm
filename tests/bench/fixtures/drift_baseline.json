@@ -254,13 +254,13 @@
       "scenario_id": "s10",
       "surfacing": {
         "expected_ids": [
-          "6b358287b37ef447",
-          "4eee90bb62974036"
+          "stm:compact:v2:23fe4c22964afe8e440bfc64ad7e3c6744f2372b19521ec57b2f6c354adab21b",
+          "stm:compact:v2:0c3253ef520ee142a3ca9e1b336d4cfaae1d7c5ddbe27a738c0dca72b1bef563"
         ],
         "recall_at_k": 1.0,
         "returned_ids": [
-          "6b358287b37ef447",
-          "4eee90bb62974036"
+          "stm:compact:v2:23fe4c22964afe8e440bfc64ad7e3c6744f2372b19521ec57b2f6c354adab21b",
+          "stm:compact:v2:0c3253ef520ee142a3ca9e1b336d4cfaae1d7c5ddbe27a738c0dca72b1bef563"
         ]
       },
       "tier": "none",

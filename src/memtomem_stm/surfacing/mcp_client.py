@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
+import math
 import re
 from collections.abc import Callable
 from contextlib import AsyncExitStack
@@ -25,12 +25,13 @@ from memtomem_stm.daemon.protocol import MAX_CONTEXT_COMPOSE_SCHEMA
 from memtomem_stm.surfacing.config import SurfacingConfig
 from memtomem_stm.surfacing.observability import record_search_rpc
 from memtomem_stm.surfacing.rrf_profile import is_schema_one, rrf_score_ceiling
-from memtomem_stm.utils.mcp_transport import streamable_http_transport
+from memtomem_stm.utils.digest import framed_digest
 from memtomem_stm.utils.json_out import (
     escape_lone_surrogates,
     has_lone_surrogate,
     scrub_content_preserving_identity,
 )
+from memtomem_stm.utils.mcp_transport import streamable_http_transport
 from memtomem_stm.utils.numeric import safe_float
 from memtomem_stm.utils.redact import ResponseShapeError, diagnostic_url, exception_summary
 
@@ -142,7 +143,7 @@ class RemoteSearchResult:
             # the real ``chunk_id`` from core (see ResultParser). The surrogate
             # is good enough for STM-side invalidation but cannot drive the LTM
             # ``increment_access`` boost — see ``SurfacingConfig.result_format``.
-            self.id = hashlib.sha256(content.encode()).hexdigest()[:16]
+            self.id = "stm:compact:v2:" + framed_digest((namespace, source, content))
 
     def __init__(
         self,
@@ -211,6 +212,25 @@ def require_context_compose_lists(
     return payload["pinned"], payload["retrieved"]
 
 
+def validate_compose_item(item: Any, *, pinned: bool) -> None:
+    """Validate shared direct/daemon item fields without coercing identities."""
+    if not isinstance(item, dict) or not isinstance(item.get("content"), str):
+        raise ResponseShapeError("context compose item has invalid shape")
+    for field in ("source", "source_path", "namespace", "scope", "id", "chunk_id", "block_id"):
+        if field in item and item[field] is not None and not isinstance(item[field], str):
+            raise ResponseShapeError("context compose item has invalid string field")
+    if not pinned:
+        score = item.get("score", 0.0)
+        if isinstance(score, bool) or not isinstance(score, (int, float)):
+            raise ResponseShapeError("context compose score must be a finite number")
+        try:
+            finite = math.isfinite(score)
+        except OverflowError:
+            finite = False
+        if not finite:
+            raise ResponseShapeError("context compose score must be a finite number")
+
+
 def decode_context_compose_context(
     raw: Any,
     *,
@@ -236,22 +256,19 @@ def decode_context_compose_context(
     bounded_before = before[-limit:] if limit else []
     bounded_after = after[:limit] if limit else []
 
-    def decode_chunk(item: Any) -> RemoteContextChunk:
+    def decode_chunk(item: Any) -> RemoteContextChunk | None:
         if not isinstance(item, dict):
             raise ResponseShapeError("context compose adjacent chunk must be an object")
         if not all(isinstance(item.get(field), str) for field in ("id", "content", "source")):
             raise ResponseShapeError("context compose adjacent chunk has invalid shape")
+        if not item["id"] or has_lone_surrogate(item["id"]):
+            logger.warning("Dropping a core context_compose adjacent chunk with invalid identity")
+            return None
         namespace = item.get("namespace", "default")
         if not isinstance(namespace, str):
             raise ResponseShapeError("context compose adjacent chunk namespace must be a string")
         return RemoteContextChunk(
-            # Escaped, not refused, unlike the retrieved/pinned ids above: an
-            # adjacent chunk's id is never exact-matched — the formatter reads
-            # only ``content`` and the daemon just re-encodes it — so it is
-            # content by destination. It arrives raw only because
-            # ``scrub_content_preserving_identity`` exempts the ``id`` key at
-            # every depth, so re-apply the ordinary ingest escape here (#783).
-            id=escape_lone_surrogates(item["id"]),
+            id=item["id"],
             content=item["content"][:max_content_chars],
             source=item["source"],
             namespace=namespace,
@@ -269,8 +286,12 @@ def decode_context_compose_context(
     ):
         raise ResponseShapeError("context compose chunk positions must be non-negative integers")
     return RemoteContextInfo(
-        window_before=tuple(decode_chunk(item) for item in bounded_before),
-        window_after=tuple(decode_chunk(item) for item in bounded_after),
+        window_before=tuple(
+            chunk for item in bounded_before if (chunk := decode_chunk(item)) is not None
+        ),
+        window_after=tuple(
+            chunk for item in bounded_after if (chunk := decode_chunk(item)) is not None
+        ),
         chunk_position=chunk_position,
         total_chunks_in_file=total_chunks,
     )
@@ -518,38 +539,41 @@ class StructuredResultParser(ResultParser):
     contract as ``hints`` and stamped onto every parsed result.
     """
 
-    def parse(
-        self,
-        text: str,
-        *,
-        max_content_chars: int = 500,
-    ) -> tuple[list[RemoteSearchResult], list[str]]:
-        if not text or not text.strip():
-            return [], []
-
-        try:
-            data = _core_json_loads(text)
-        except (json.JSONDecodeError, TypeError):
-            logger.warning("StructuredResultParser: invalid JSON, falling back to empty")
-            return [], []
-
+    @staticmethod
+    def _from_data(data: Any, max_content_chars: int) -> tuple[list[RemoteSearchResult], list[str]]:
+        if (
+            not isinstance(data, dict)
+            or "results" not in data
+            or not isinstance(data["results"], list)
+        ):
+            raise ValueError("Invalid search result envelope")
         raw_hints = data.get("hints", [])
-        hints: list[str] = (
-            [str(h) for h in raw_hints if isinstance(h, str)] if isinstance(raw_hints, list) else []
-        )
-
-        score_scale = read_score_scale_hint(data.get("score_scale"))
+        hints = [h for h in raw_hints if isinstance(h, str)] if isinstance(raw_hints, list) else []
+        scale = read_score_scale_hint(data.get("score_scale"))
         reranker = read_score_scale_hint(data.get("reranker"))
-        if score_scale is not None and score_scale not in KNOWN_SCORE_SCALES:
-            # Keep the label verbatim — telemetry wants the truth, and a
-            # renamed core label must surface as itself, not as ``None``. The
-            # log line does not carry it: Core's text is not STM's to print.
+        if scale is not None and scale not in KNOWN_SCORE_SCALES:
             logger.debug("StructuredResultParser: unrecognized score_scale label")
-
-        raw_results = data.get("results", [])
-        results: list[RemoteSearchResult] = []
-        for item in raw_results:
-            content = item.get("content", "")
+        results = []
+        for item in data["results"]:
+            if not isinstance(item, dict) or not isinstance(item.get("content"), str):
+                raise ValueError("Invalid search result item")
+            content = item["content"]
+            source, namespace = item.get("source", "unknown"), item.get("namespace", "default")
+            chunk_id, score = item.get("chunk_id"), item.get("score", 0.0)
+            if (
+                not isinstance(source, str)
+                or not isinstance(namespace, str)
+                or isinstance(score, bool)
+                or not isinstance(score, (int, float))
+                or not math.isfinite(score)
+                or (chunk_id is not None and not isinstance(chunk_id, str))
+            ):
+                raise ValueError("Invalid search result fields")
+            if isinstance(chunk_id, str) and has_lone_surrogate(chunk_id):
+                logger.warning(
+                    "Dropping a core search result whose chunk_id is not UTF-8-encodable"
+                )
+                continue
             if not content:
                 continue
             if len(content) > max_content_chars:
@@ -557,47 +581,37 @@ class StructuredResultParser(ResultParser):
                     "Truncating search result content from %d to %d chars (source=%s)",
                     len(content),
                     max_content_chars,
-                    item.get("source", "unknown"),
+                    source,
                 )
             result = RemoteSearchResult(
-                content=content[:max_content_chars],
-                score=safe_float(item.get("score", 0.0), 0.0),
-                source=item.get("source", "unknown"),
-                namespace=item.get("namespace", "default"),
-                score_scale=score_scale,
+                content[:max_content_chars],
+                score,
+                source,
+                namespace,
+                score_scale=scale,
                 reranker=reranker,
             )
-            # Preserve chunk_id from core instead of sha256(content)
-            chunk_id = item.get("chunk_id")
-            if isinstance(chunk_id, str) and has_lone_surrogate(chunk_id):
-                # Refuse the result, not just the id (#783). Falling back to the
-                # content hash would mint a *different* identity for a chunk core
-                # can still name, and keeping the raw value would carry an
-                # unencodable id into dedup, persistence and increment_access.
-                # One dropped result beats a memory STM cannot honestly track.
-                logger.warning(
-                    "Dropping a core search result whose chunk_id is not UTF-8-encodable"
-                )
-                continue
             if chunk_id:
                 result.chunk.id = chunk_id
             results.append(result)
+        return results, hints
 
+    def parse(
+        self, text: str, *, max_content_chars: int = 500
+    ) -> tuple[list[RemoteSearchResult], list[str]]:
+        results, hints, _ = self.parse_checked(text, max_content_chars=max_content_chars)
         return results, hints
 
     def parse_checked(
         self, text: str, *, max_content_chars: int = 500
     ) -> tuple[list[RemoteSearchResult], list[str], bool]:
-        """Parse while distinguishing malformed JSON from a healthy empty set."""
         if not text or not text.strip():
-            return [], [], True
+            return [], [], False
         try:
-            data = _core_json_loads(text)
-        except (json.JSONDecodeError, TypeError):
+            results, hints = self._from_data(_core_json_loads(text), max_content_chars)
+        except (ValueError, TypeError, RecursionError, OverflowError):
+            logger.warning("StructuredResultParser: invalid JSON or result shape")
             return [], [], False
-        if not isinstance(data, dict) or not isinstance(data.get("results", []), list):
-            return [], [], False
-        results, hints = self.parse(text, max_content_chars=max_content_chars)
         return results, hints, True
 
 
@@ -1559,6 +1573,8 @@ class McpClientSearchAdapter:
             return [], [], "empty_content"
 
         text = "\n".join(text_parts)
+        if not text.strip():
+            return [], [], "empty_content"
         if isinstance(parser, StructuredResultParser):
             results, hints, valid = parser.parse_checked(
                 text, max_content_chars=self._config.result_content_max_chars
@@ -1685,7 +1701,7 @@ class McpClientSearchAdapter:
             raise RuntimeError("core context_compose returned isError=true")
         try:
             payload = _core_json_loads(self._result_text(result))
-        except (json.JSONDecodeError, TypeError) as exc:
+        except (ValueError, TypeError, RecursionError) as exc:
             raise ResponseShapeError("core context_compose returned malformed JSON") from exc
         if not isinstance(payload, dict):
             raise ResponseShapeError("core context_compose result is not an object")
@@ -1705,8 +1721,7 @@ class McpClientSearchAdapter:
 
         pinned: list[RemoteSearchResult] = []
         for item in raw_pinned:
-            if not isinstance(item, dict) or not isinstance(item.get("content"), str):
-                raise ResponseShapeError("core context_compose pinned item has invalid shape")
+            validate_compose_item(item, pinned=True)
             if _has_unencodable_identity(item, "block_id", "id"):
                 logger.warning(
                     "Dropping a core context_compose pinned item whose id is not UTF-8-encodable"
@@ -1715,8 +1730,8 @@ class McpClientSearchAdapter:
             entry = RemoteSearchResult(
                 item["content"][: self._config.result_content_max_chars],
                 1.0,
-                source=str(item.get("source_path") or item.get("block_id") or "pinned"),
-                namespace=str(item.get("scope") or "default"),
+                source=item.get("source_path") or item.get("block_id") or "pinned",
+                namespace=item.get("scope") or "default",
                 pinned=True,
             )
             block_id = item.get("block_id") or item.get("id")
@@ -1726,8 +1741,7 @@ class McpClientSearchAdapter:
 
         retrieved: list[RemoteSearchResult] = []
         for item in raw_retrieved:
-            if not isinstance(item, dict) or not isinstance(item.get("content"), str):
-                raise ResponseShapeError("core context_compose retrieved item has invalid shape")
+            validate_compose_item(item, pinned=False)
             if _has_unencodable_identity(item, "id", "chunk_id"):
                 logger.warning(
                     "Dropping a core context_compose retrieved item whose id is not UTF-8-encodable"
@@ -1743,8 +1757,8 @@ class McpClientSearchAdapter:
             entry = RemoteSearchResult(
                 item["content"][: self._config.result_content_max_chars],
                 safe_float(item.get("score"), 0.0),
-                source=str(item.get("source") or "unknown"),
-                namespace=str(item.get("namespace") or "default"),
+                source=item.get("source") or "unknown",
+                namespace=item.get("namespace") or "default",
                 context=context,
                 score_scale=score_scale,
                 reranker=reranker,
@@ -1797,7 +1811,7 @@ class McpClientSearchAdapter:
             raise RuntimeError("core candidate_propose returned isError=true")
         try:
             payload = _core_json_loads(self._result_text(result))
-        except (json.JSONDecodeError, TypeError) as exc:
+        except (ValueError, TypeError, RecursionError) as exc:
             raise ResponseShapeError("core candidate_propose returned malformed JSON") from exc
         if not isinstance(payload, dict):
             raise ResponseShapeError("core candidate_propose result is not an object")

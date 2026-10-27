@@ -8,7 +8,11 @@ import threading
 import time
 from pathlib import Path
 
-from memtomem_stm.proxy.metrics import METADATA_BYPASS_STRATEGY, CallMetrics
+from memtomem_stm.proxy.metrics import (
+    METADATA_BYPASS_STRATEGY,
+    STRUCTURED_BYPASS_STRATEGY,
+    CallMetrics,
+)
 from memtomem_stm.utils.json_out import (
     escape_lone_surrogates,
     has_lone_surrogate,
@@ -71,6 +75,10 @@ _BASE_COLUMNS = frozenset(
 # migration runs — adding an entry here cannot get out of sync with the
 # fingerprint, so there is no version number to forget to bump.
 _MIGRATIONS: dict[str, str] = {
+    "delivery_format": (
+        "ALTER TABLE proxy_metrics ADD COLUMN delivery_format TEXT NOT NULL DEFAULT 'legacy'"
+    ),
+    "wire_bytes": "ALTER TABLE proxy_metrics ADD COLUMN wire_bytes INTEGER DEFAULT NULL",
     "compression_accounting": (
         "ALTER TABLE proxy_metrics ADD COLUMN compression_accounting TEXT DEFAULT NULL"
     ),
@@ -235,6 +243,12 @@ def read_compression_summary(
         "saved_ratio": 0.0,
         "by_tool": [],
         "error": None,
+        "structured_delivery": {
+            "calls": 0,
+            "original_chars": 0,
+            "serialized_base_chars": 0,
+            "wire_bytes": 0,
+        },
     }
     if not resolved.exists():
         return summary
@@ -291,6 +305,13 @@ def read_compression_summary(
             conditions.append("source = ?")
             params.append(source)
         where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+        structured = (
+            "COALESCE(compression_accounting = 'initial_structured_v1', 0)"
+            if "compression_accounting" in cols
+            else "0"
+        )
+        legacy = f"NOT ({structured})"
+        wire = "wire_bytes" if "wire_bytes" in cols else "0"
         # Old progressive writers used incompatible bases (#1039). Their values
         # stay in the totals, but rows of unknown basis are counted rather
         # than relabelled. "Unclassified" is limited to what can distort a
@@ -306,23 +327,31 @@ def read_compression_summary(
         )
         success = "is_error = 0" if has_is_error else "1"
         sized = "(original_chars > 0 OR compressed_chars > 0)"
-        # The calls the tuner's profiles count: every row but an annotated
+        # The calls the tuner's profiles count: every row but a metadata/native
         # bypass, which ``get_tool_profiles`` drops (#1122). A DB without the
         # column predates the label, so all of its rows count.
         if "compression_strategy" in cols:
-            tuner_expr = "SUM(CASE WHEN compression_strategy IS NOT ? THEN 1 ELSE 0 END)"
-            select_params: list[object] = [METADATA_BYPASS_STRATEGY]
+            tuner_expr = (
+                "SUM(CASE WHEN compression_strategy IS NOT ? "
+                "AND compression_strategy IS NOT ? THEN 1 ELSE 0 END)"
+            )
+            select_params: list[object] = [METADATA_BYPASS_STRATEGY, STRUCTURED_BYPASS_STRATEGY]
         else:
             tuner_expr = "COUNT(*)"
             select_params = []
         # One statement, so the provenance counts and size totals share a
         # snapshot while the server appends rows.
         rows = db.execute(
-            "SELECT server, tool, COUNT(*), SUM(original_chars), "
-            f"SUM(compressed_chars), {error_expr}, "
+            f"SELECT server, tool, SUM(CASE WHEN {legacy} THEN 1 ELSE 0 END), "
+            f"SUM(CASE WHEN {legacy} THEN original_chars ELSE 0 END), "
+            f"SUM(CASE WHEN {legacy} THEN compressed_chars ELSE 0 END), {error_expr}, "
             f"SUM(CASE WHEN {mcp} AND {known} THEN 1 ELSE 0 END), "
-            f"SUM(CASE WHEN {mcp} AND NOT {known} AND {success} AND {sized} "
-            f"THEN 1 ELSE 0 END), {tuner_expr} "
+            f"SUM(CASE WHEN {mcp} AND {legacy} AND NOT {known} AND {success} AND {sized} "
+            f"THEN 1 ELSE 0 END), {tuner_expr}, "
+            f"SUM(CASE WHEN {structured} THEN 1 ELSE 0 END), "
+            f"SUM(CASE WHEN {structured} THEN original_chars ELSE 0 END), "
+            f"SUM(CASE WHEN {structured} THEN compressed_chars ELSE 0 END), "
+            f"SUM(CASE WHEN {structured} THEN {wire} ELSE 0 END) "
             f"FROM proxy_metrics{where} GROUP BY server, tool "
             "ORDER BY COUNT(*) DESC",
             [*select_params, *params],
@@ -336,6 +365,12 @@ def read_compression_summary(
     by_tool: list[dict[str, object]] = []
     total_calls = total_error = total_orig = total_comp = 0
     classified = unclassified = 0
+    structured_totals = {
+        "calls": 0,
+        "original_chars": 0,
+        "serialized_base_chars": 0,
+        "wire_bytes": 0,
+    }
     for (
         server,
         tool_name,
@@ -346,7 +381,15 @@ def read_compression_summary(
         known_calls,
         unknown_calls,
         tuner_calls,
+        structured_calls,
+        structured_orig,
+        structured_base,
+        structured_wire,
     ) in rows:
+        for k, v in zip(
+            structured_totals, (structured_calls, structured_orig, structured_base, structured_wire)
+        ):
+            structured_totals[k] += v or 0
         classified += known_calls or 0
         unclassified += unknown_calls or 0
         calls = calls or 0
@@ -374,7 +417,8 @@ def read_compression_summary(
     summary["unclassified_mcp_calls"] = unclassified
     if unclassified:
         summary["measurement"] = _MEASUREMENT_MIXED
-    summary["total_calls"] = total_calls
+    summary["structured_delivery"] = structured_totals
+    summary["total_calls"] = total_calls + structured_totals["calls"]
     summary["error_count"] = total_error
     summary["total_original_chars"] = total_orig
     summary["total_compressed_chars"] = total_comp
@@ -625,8 +669,9 @@ class MetricsStore:
                 "index_ok, index_error, chunks_indexed, "
                 "extract_ok, extract_error, "
                 "surfacing_on_progressive_ok, surface_error, source, created_at, "
-                "compression_accounting) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "compression_accounting, delivery_format, wire_bytes) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     metrics.server,
                     metrics.tool,
@@ -668,6 +713,8 @@ class MetricsStore:
                     metrics.source,
                     now,
                     metrics.compression_accounting,
+                    metrics.delivery_format,
+                    metrics.wire_bytes,
                 ),
             )
             # One transaction for the insert and the trim it may trigger. If the
@@ -838,6 +885,12 @@ class MetricsStore:
         calls that recorded the whole cleaned text as delivered (#1039), a
         ratio that would pass for "the budget always fits". With no such row
         the tool reports ``avg_ratio=None`` and ``ratio_count=0``.
+        Structured ``initial_structured_v1`` rows are also intentionally excluded:
+        their size counts a serialized MCP envelope (including metadata and the
+        text/structured twin), not retained source characters. Mixing that basis
+        into the content-retention ratio would mislead the tuner. Structured
+        delivery observations remain in ``read_compression_summary``'s separate
+        ``structured_delivery`` group.
         ``p95_original_chars`` is approximated by taking the value at the 95th
         percentile rank within each group.
 
@@ -859,8 +912,10 @@ class MetricsStore:
         happened (#933). ``call_count`` includes all of them, plus every error
         path and the success paths that bypass compression entirely.
 
-        The one exception is a response whose annotated text blocks were kept
-        apart instead of compressed (``METADATA_BYPASS_STRATEGY``, #1122).
+        Exceptions are responses whose annotated text blocks were kept
+        apart instead of compressed (``METADATA_BYPASS_STRATEGY``, #1122), or
+        that preserve native upstream structured/non-text payloads
+        (``STRUCTURED_BYPASS_STRATEGY``).
         Every statement here drops those rows: no compressor or retention
         floor ran on them, so counting them would dilute the violation rate
         and move ``p95_original_chars`` with calls the settings being tuned
@@ -909,10 +964,10 @@ class MetricsStore:
                     SUM(is_error)                                     AS error_count
                 FROM proxy_metrics
                 WHERE created_at >= ? AND source = 'mcp'
-                    AND compression_strategy IS NOT ?
+                    AND compression_strategy IS NOT ? AND compression_strategy IS NOT ?
                 GROUP BY server, tool
                 """,
-                (cutoff, METADATA_BYPASS_STRATEGY),
+                (cutoff, METADATA_BYPASS_STRATEGY, STRUCTURED_BYPASS_STRATEGY),
             ).fetchall()
 
             profiles: list[dict] = []
@@ -930,12 +985,12 @@ class MetricsStore:
                     """
                     SELECT original_chars FROM proxy_metrics
                     WHERE server = ? AND tool = ? AND created_at >= ? AND source = 'mcp'
-                        AND compression_strategy IS NOT ?
+                        AND compression_strategy IS NOT ? AND compression_strategy IS NOT ?
                     ORDER BY original_chars ASC
                     LIMIT 1 OFFSET MAX(0, CAST(
                         (SELECT COUNT(*) FROM proxy_metrics
                          WHERE server = ? AND tool = ? AND created_at >= ? AND source = 'mcp'
-                             AND compression_strategy IS NOT ?)
+                             AND compression_strategy IS NOT ? AND compression_strategy IS NOT ?)
                         * 0.95 AS INTEGER) - 1)
                     """,
                     (
@@ -943,10 +998,12 @@ class MetricsStore:
                         tool,
                         cutoff,
                         METADATA_BYPASS_STRATEGY,
+                        STRUCTURED_BYPASS_STRATEGY,
                         server,
                         tool,
                         cutoff,
                         METADATA_BYPASS_STRATEGY,
+                        STRUCTURED_BYPASS_STRATEGY,
                     ),
                 ).fetchone()
                 # The strategy AUTO chose most often, how often it chose it,
@@ -983,12 +1040,12 @@ class MetricsStore:
                         (SELECT COUNT(*) FROM proxy_metrics
                          WHERE server = ? AND tool = ? AND created_at >= ?
                              AND compression_strategy IS NOT NULL
-                             AND compression_strategy IS NOT ?
+                             AND compression_strategy IS NOT ? AND compression_strategy IS NOT ?
                              AND strategy_auto_selected = 1 AND source = 'mcp')
                     FROM proxy_metrics
                     WHERE server = ? AND tool = ? AND created_at >= ?
                         AND compression_strategy IS NOT NULL
-                        AND compression_strategy IS NOT ?
+                        AND compression_strategy IS NOT ? AND compression_strategy IS NOT ?
                         AND strategy_auto_selected = 1 AND source = 'mcp'
                     GROUP BY selected_strategy
                     ORDER BY COUNT(*) DESC
@@ -999,10 +1056,12 @@ class MetricsStore:
                         tool,
                         cutoff,
                         METADATA_BYPASS_STRATEGY,
+                        STRUCTURED_BYPASS_STRATEGY,
                         server,
                         tool,
                         cutoff,
                         METADATA_BYPASS_STRATEGY,
+                        STRUCTURED_BYPASS_STRATEGY,
                     ),
                 ).fetchone()
                 profiles.append(

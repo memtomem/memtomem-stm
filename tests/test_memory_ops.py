@@ -122,8 +122,8 @@ class TestAutoIndexResponse:
         body = written_path.read_text(encoding="utf-8")
         # Frontmatter present with the compression metadata the call passed in.
         assert body.startswith("---\n")
-        assert "source: proxy/gh/read_file" in body
-        assert "compression: selective" in body
+        assert 'source: "proxy/gh/read_file"' in body
+        assert 'compression: "selective"' in body
         assert "original_chars: 12000" in body
         assert "compressed_chars: 3000" in body
         # Context query rendered as a blockquote in the Agent Intent section.
@@ -644,9 +644,9 @@ class TestFormatFactMd:
             tags=["redis", "cache"],
         )
         md = format_fact_md(fact, "s", "t", {"key": "val"})
-        assert "category: technical" in md
+        assert 'category: "technical"' in md
         assert "confidence: 0.85" in md
-        assert "tags: [redis, cache]" in md
+        assert 'tags: ["redis", "cache"]' in md
         assert "Redis is used as a cache layer" in md
         assert "extracted_from: s/t(key='val')" in md
 

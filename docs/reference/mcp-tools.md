@@ -10,10 +10,22 @@ All connected upstream tools are added as `{prefix}__{tool}`.
 | Tool | Arguments | Purpose |
 |---|---|---|
 | `stm_proxy_describe_tool` | `name`, `part?`, `offset?=0`, `limit?=4000`, `generation?` | Read bounded pages of instructions or input schema for an advertised `prefix__tool` |
-| `stm_proxy_select_chunks` | `key`, `sections[]` | Retrieve selected TOC sections |
-| `stm_proxy_read_more` | `key`, `offset?=0`, `limit?` | Continue a progressive response |
+| `stm_proxy_select_chunks` | `key`, `sections[]`, `response_format?` | Retrieve selected TOC sections |
+| `stm_proxy_read_more` | `key`, `offset?=0`, `limit?`, `response_format?` | Continue a progressive response |
 | `stm_surfacing_feedback` | `surfacing_id`, `rating?`, `memory_id?`, `ratings?` | Rate surfaced memories. Use either the legacy `rating`/`memory_id` shape or batched `ratings`, never both. |
 | `stm_compression_feedback` | `server`, `tool`, `missing`, `kind="other"`, `trace_id?` | Report missing compressed information. `server` and `tool` are the upstream names (not `prefix__tool`) of a tool this proxy serves; other reports are refused. |
+
+The continuation tools keep their required `result: string` output contract.
+Legacy replies have `structuredContent = {"result": text}`. Structured replies
+add `stm` with version, kind, payload and `offset_unit: "unicode_codepoint"`;
+the short `result` is an instruction, and the actual content is in `stm.payload`.
+Their text block contains the same structured object as JSON. `response_format`
+accepts `legacy` or `structured`; omitting it follows the live stored key.
+For an unknown/expired key request `structured` explicitly to receive a typed
+error. `sections` matches exact TOC entry keys only, not internal IDs or labels.
+Use `next_offset` unchanged; JavaScript UTF-16 string indices are not these offsets.
+A selection too large for the stored structured budget returns `budget_exceeded`:
+select fewer sections or explicitly request legacy output rather than losing data.
 
 ## Full tool metadata
 

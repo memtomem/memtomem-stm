@@ -11,6 +11,115 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Behavior change**: Markdown heading detection now ignores fenced code across
+  compression, hints and indexes. Selection chunks preserve heading levels and
+  original Markdown ranges; affected TOC keys/content may change.
+- **Behavior change**: non-finite pending/progressive/cache TTL settings are rejected;
+  malformed search responses are reported as parse errors instead of skipping
+  malformed items and retaining the remaining hits.
+- **Behavior change**: generated memory metadata escapes Unicode line separators.
+  Extracted tags now live in frontmatter, so new files participate in Core tag
+  filtering. Existing Markdown files are not rewritten.
+- **Behavior change**: compact fallback IDs use a versioned namespace/source/content
+  digest. Old feedback/dedup history is retained but cannot be inferred onto new IDs.
+- Upgrade/restart processes sharing pending SQLite files together. Presentation
+  metadata adds a nullable column; valid old rows remain readable. Heading index
+  v3 has a separate key, avoiding old/new index rewrite loops. Stop the old scoped
+  daemon before upgrading; protocol v9 prevents an old peer from rewriting IDs.
+  Invalid raw chunk/correlation identities are refused before content escaping.
+  Invalid adjacent context IDs drop only that neighbor, preserving valid hits.
+- The first response-cache open runs a one-time sweep to remove structured STM
+  continuation keys. Switching between old and new cache policies repeats that
+  sweep; large caches can take longer to open.
+
+### Added
+
+- Opt-in `delivery_format="structured"` with server/tool overrides and optional
+  `response_format` on continuation tools; legacy remains the default. Versioned
+  JSON includes exact chunk keys, Unicode code-point offsets, JSON paths/types,
+  Markdown source ranges and typed errors, including cross-format reads.
+- Serialized MCP-result budgets cover negotiated SDK additions and field
+  filtering. Complete progressive/hybrid frames and progressing continuation
+  capacity are checked before publication; storage/privacy failures use uncached
+  safe fallback. Transient keys stay out of the response cache.
+  Unicode token budgets share one density-derived cap across compression,
+  initial structured frames and owned continuations. Inline TOC contents stay
+  complete; tables that cannot fit fall back to progressive delivery.
+- Native upstream schemas, structured/non-text payloads and annotated text
+  boundaries are preserved. Text twins are cleaned and capped separately;
+  proxied errors carry STM JSON in text without replacing upstream output schemas.
+- Separate structured-wire accounting, progressive read measurements and matching
+  auto-index metadata. Tuner retention ratios exclude serialized-envelope and
+  native-bypass populations. Default legacy calls avoid unused wire projection
+  and source classification; structured overrides cache derived metadata on demand.
+- Strict JSON and raw identity validation across storage, MCP and daemon formats,
+  finite TTL validation, fence-aware headings and source-preserving selection
+  metadata. SDK projection support is declared through the direct `mcp-types`
+  dependency; incompatible projectors keep legacy service available and report a
+  typed error for structured budgets that cannot be measured.
+  Non-JSON logs, links and templates retain paragraph selection without claiming
+  JSON paths or exact source ranges.
+
+## [0.6.9] — 2026-10-25
+
+### Upgrade notes
+
+- **The first start after upgrading takes longer when the response cache is
+  large**
+  ([GHSA-mf67-ghgq-cv54](https://github.com/memtomem/memtomem-stm/security/advisories/GHSA-mf67-ghgq-cv54)).
+  The credential pattern set gained the PKCS#8 private-key rule, so the cache
+  runs its one-time privacy sweep again, as it did on the upgrades to 0.6.7
+  and 0.6.8. The sweep removes cached responses that carry a PKCS#8 key and
+  keeps the rest. While a 0.3.0–0.6.8 build opens the same `proxy_cache.db`,
+  each switch between the two builds repeats that sweep.
+
+### Security
+
+- **PKCS#8 private keys are now credentials to every privacy gate.** The PEM
+  rule in `CREDENTIAL_PATTERNS` matched only algorithm-labelled headers such as
+  `BEGIN RSA PRIVATE KEY`, so `-----BEGIN PRIVATE KEY-----` and
+  `-----BEGIN ENCRYPTED PRIVATE KEY-----` passed every privacy gate. With a
+  hosted LLM compressor or extractor configured, a response carrying one could
+  be sent to it even with `privacy_scan_enabled` at its default; the response
+  cache stored and replayed it; with auto-indexing or extraction on, it could be
+  written to memory files; and selection telemetry kept a record whose metadata
+  carried one. That is the form OpenSSL 3's `genrsa` and `genpkey` write by
+  default, and the only PEM form an Ed25519 key has. The new rule also matches a
+  header that a serializer folded across lines, as PyYAML does by default. It is
+  byte-identical to memtomem's. **Behavior change**: see the upgrade notes above.
+  Rotate any key that reached a hosted provider.
+  ([GHSA-mf67-ghgq-cv54](https://github.com/memtomem/memtomem-stm/security/advisories/GHSA-mf67-ghgq-cv54))
+
+## [0.6.8] — 2026-10-24
+
+### Upgrade notes
+
+- **The first start after upgrading takes longer when the response cache is
+  large**
+  ([GHSA-3v6c-9qpg-gf63](https://github.com/memtomem/memtomem-stm/security/advisories/GHSA-3v6c-9qpg-gf63)).
+  The JWT rule's pattern text changed, so the cache runs its one-time privacy
+  sweep again, as it did on the upgrade to 0.6.7 (measured then at about 16 ms
+  per 32 KB cached row). The sweep removes nothing the old rule allowed. While
+  a 0.3.0–0.6.7 build opens the same `proxy_cache.db`, each switch between the
+  two builds repeats that sweep.
+
+### Security
+
+- **Crafted upstream text no longer stalls the proxy in the credential
+  check.** The JWT rule in `CREDENTIAL_PATTERNS`, which the cache, the pending
+  store, extraction and the LLM privacy scan run on responses and tool
+  eligibility runs on tool metadata, could start a match after every `-` in a
+  run of base64url characters and scan to the end of the run each time. 256 KB
+  of `eyJ-` repeated held every proxied call for about 8 s. The rule now finds
+  the same tokens in linear time and constant memory. Detection decisions are
+  unchanged. Because the pattern text changed, the response cache runs its
+  one-time privacy sweep on the first start after upgrading, and that sweep
+  removes nothing the old rule allowed. **Behavior change**: see the upgrade
+  notes above.
+  ([GHSA-3v6c-9qpg-gf63](https://github.com/memtomem/memtomem-stm/security/advisories/GHSA-3v6c-9qpg-gf63))
+
 ## [0.6.7] — 2026-10-24
 
 ### Upgrade notes

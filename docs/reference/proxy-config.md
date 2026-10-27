@@ -11,6 +11,7 @@ daemon, Langfuse, or OTLP settings; those are covered by the
 ```json
 {
   "enabled": true,
+  "delivery_format": "legacy",
   "advertise_context_query": true,
   "max_upstream_bytes": 41943040,
   "token_estimation_mode": "unicode",
@@ -74,6 +75,19 @@ actual response; the backwards-compatible default is `static`.
 `advertise_context_query=true` is a proxy-level opt-in that adds the optional
 proxy-only `_context_query` field to object input schemas without forwarding it
 or mutating the upstream contract.
+
+## Chunk delivery format
+
+`delivery_format` accepts `legacy` (default) or `structured`, with tool overrides
+winning over server settings and then the proxy default. For example, set
+`upstream_servers.fs.tool_overrides.read_file.delivery_format` to `structured`.
+The normal `MEMTOMEM_STM_PROXY__...` overlay applies; `mms config validate` checks
+it, and `mms list --json` reports effective server and tool delivery settings.
+This selects transient chunk delivery, not a wrapper for ordinary cached text.
+It adds no arguments to upstream tools. See [structured delivery](../compression.md#structured-chunk-delivery).
+
+All TTLs must be finite. Existing `Infinity` or `NaN` TTL settings are rejected;
+fix the setting and run `mms config validate` before restarting.
 
 ## Advertised tool descriptions
 

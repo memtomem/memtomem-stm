@@ -515,3 +515,142 @@ A tool whose history is entirely unclassified reports no average and gets no
 ratio-based budget advice until new calls accumulate; its violation-rate and
 strategy advice are unchanged. The report states how many classified calls the
 average covers.
+
+
+## Structured chunk delivery
+
+Set `delivery_format: "structured"` globally, on an upstream, or on a tool
+(closest override wins). The default stays `legacy`. Progressive, selective and
+hybrid publishers remember this choice on the key; a later configuration reload
+does not change that key's default. Continuation tools can override it with
+`response_format`. Exact TOC keys select sections; displayed names and STM IDs
+do not participate in lookup.
+
+For an eligible text-only response, initial delivery places STM JSON in the text
+block. A continuation returns that JSON in text plus `structuredContent`:
+
+```json
+{"result":"STM progressive delivery","stm":{"schema_version":1,"kind":"progressive","offset_unit":"unicode_codepoint","payload":{"key":"example","source_format":"text","content":"actual content","offset":0,"next_offset":14,"total_chars":200,"has_more":true,"ttl_seconds_remaining":1800}}}
+```
+
+`stm.payload` contains the actual content and control fields. Body text may
+contain the legacy footer token without affecting structured reconstruction.
+Concatenate progressive `content` fields exactly and use each `next_offset`
+unmodified. Offsets, limits and Markdown source ranges count
+Unicode code points, not UTF-8 bytes or JavaScript UTF-16 code units. Selection
+records include exact keys, internal IDs, JSON paths/value types or Markdown
+heading/source ranges. Hybrid records add the tail's `source_offset` to source
+ranges so they still refer to the full document. JSON paths are arrays of object
+keys and integer array indexes. Old rows without those facts report incomplete metadata;
+no provenance is invented.
+
+Upstream `structuredContent`, non-text blocks and existing annotated-block
+preservation paths are not replaced by an STM envelope. They pass through their
+preservation path without a new STM key. Each text block is cleaned separately,
+and the total text, including any truncation notice, is capped at the tool's
+character budget. Native structured/non-text fields and block metadata remain
+intact, subject to the whole-message `max_upstream_bytes` guard; their size is
+not covered by the STM envelope budget below. These preservation paths skip
+compression, surfacing, indexing and caching, and are excluded from tuner
+profiles. Changing `delivery_format` rotates the response-cache fingerprint.
+This avoids relying on undocumented client choices between text and structured
+data. Surfacing and index notices
+are separate optional `stm.supplements` fields, never text appended outside JSON.
+
+If an SDK version cannot project its negotiated wire format, legacy service
+continues and structured requests return `unsupported_sdk_wire_format` rather
+than claiming an unmeasured serialized budget. Optional legacy wire metrics
+remain unmeasured in that case.
+
+The structured base budget measures the serialized MCP result before optional
+surfacing/index notices, including JSON escapes and both representations on
+continuations. It includes the negotiated SDK wire surface: modern clients'
+serverInfo metadata and resultType, and legacy clients' field filtering.
+`chunk_size`/`limit` are source-character upper bounds: a chunk
+can be shortened to fit. A TOC that cannot fit without dropping keys falls back
+to progressive delivery. A budget too small for one progressing envelope returns
+`budget_exceeded`. A non-final progressive key is published only when its owned
+continuation can also fit a progressing response. Initial upstream metadata uses
+the initial budget only; continuations retain the full derived tool budget.
+With `max_result_tokens` and `token_estimation_mode: "unicode"`, the cleaned
+response's estimated token density derives one character cap before any retention
+floor. Structured frames use the smaller of that cap and the configured static
+character conversion, both for compression and serialized-result fitting. Initial
+upstream metadata is reserved from that cap; the full cap is stored for owned
+continuations. Lossless TOC/progressive delivery does not widen this limit to
+meet a lossy-content retention floor. This is an estimated token budget, not a
+model-specific tokenizer guarantee.
+Hybrid TOCs are fitted with their head and complete key set before any pending
+store publication or eviction. Entries marked `inline: true` contain their full
+section; fitting shortens only non-inline previews. If the complete inline
+contents and all keys cannot fit, publication falls back to progressive delivery.
+
+Structured TOCs have more per-entry overhead than legacy TOCs because they carry
+chunk identity and source metadata. Capacity therefore depends on section count,
+key lengths and head size, not only document length. For example, at a 16,000
+character budget with retention disabled, 5,000 head characters and short section
+labels with 30 lines of `body text line` each, structured hybrid switches to
+progressive delivery at 60 sections and structured selective at 70; legacy TOCs
+still fit at 120 sections. These are fixture examples, not fixed section limits.
+The fallback keeps the source recoverable, but clients use cursor reads instead
+of section selection.
+
+Selection continuations never truncate chosen sections: ask
+for fewer keys or `response_format: "legacy"` if they exceed their stored budget.
+Nonstandard JSON values, duplicate keys and unrepresentable JSON paths use
+progressive delivery in structured mode. Documents that do not parse as JSON
+follow ordinary Markdown or paragraph detection, including logs and badge-led
+text starting with `[` or templates starting with `{`. Paragraph selections
+report `metadata_complete: false` and do not invent JSON paths or source ranges.
+Explicit `hybrid.tail_mode: "truncate"` remains
+ordinary lossy compression without a TOC key, with its configured retention floor;
+`delivery_format` does not turn that choice into a chunk publisher.
+Privacy refusal and store failure keep their
+existing safe fallback behavior, and those degraded results remain uncached.
+Proxied-tool errors put the STM error envelope in text only, so they do not
+conflict with an upstream `outputSchema`. Owned continuation errors retain both
+representations. A live key's stored format also controls section-mismatch and
+invalid-cursor errors when `response_format` is omitted; invalid requests do not
+renew its TTL. A live-key mismatch reports `no_matching_sections`, while an
+inactive selection reader reports `unavailable`; neither means the key expired.
+Missing/expired keys report `missing_or_expired`. With no live key and no
+explicit format, legacy errors remain the default. Explicit
+`response_format: "legacy"` preserves legacy errors.
+
+### Accounting and compatibility
+
+Legacy `initial_response_v1` rows keep their original measurement. Structured
+rows use `initial_structured_v1`, record `delivery_format`, and count serialized
+base-result characters. `mms stats` and runtime stats report a separate
+`structured_delivery` group; their byte/character totals are not combined into
+a single legacy saved ratio. The tuner's `avg_ratio`/`ratio_count` intentionally
+exclude structured-envelope rows as well: transport size is not retained source
+content. Structured-only profiles therefore have no content-retention ratio.
+Final `wire_bytes` count the complete MCP tool
+result, including supplements, text and structured representations, but exclude
+JSON-RPC framing. Progressive stats expose initial/follow-up wire bytes and a
+count of measured reads; NULL/older observations are not invented. These are
+transport observations, not billed token savings.
+
+A nullable `metadata_json` column holds selective/hybrid metadata; progressive
+presentation metadata extends existing `__meta__`, keeping TTL authoritative
+there. Unsupported presentation metadata does not cause deletion or renewal.
+Explicit legacy reads can still use valid payloads. Only actual expiry or the
+existing invalid-body/invalid-TTL policy can remove a row.
+
+The v3 heading index uses `__heading_index_v3__`; the old key remains compatible
+(`scan` on new entries). Old and new readers therefore do not ping-pong one
+index between versions. Fallback scanning starts at the document beginning to
+recover fence state. Upgrade all processes sharing a pending DB together.
+Stop the old daemon for this configuration before upgrading, then start the
+new daemon: protocol v9 separates identity-safe peers from old scrubbers.
+Memory-backed keys do not survive restart; SQLite recovery retains valid keys.
+
+Structured delivery puts the complete payload in JSON text. STM-owned
+continuations also provide the matching `structuredContent`, so consumers can
+use either representation. Native upstream fields are preserved separately;
+a field reaching the MCP wire does not establish that a client forwards it to
+its model. Consumers that need native structured data in text should arrange a
+matching text representation with the upstream server.
+
+The default remains legacy; a default change is a separate release decision.

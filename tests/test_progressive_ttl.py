@@ -221,7 +221,7 @@ def test_sqlite_expiry_serializes_with_other_instance(tmp_path, monkeypatch, ope
             db.execute("DELETE FROM pending_selections WHERE key='key'")
             chunks = json.dumps({"__content__": "replacement", "__meta__": '{"ttl_seconds": 50}'})
             db.execute(
-                "INSERT INTO pending_selections VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO pending_selections (key, chunks_json, format, created_at, total_chars, seq) VALUES (?, ?, ?, ?, ?, ?)",
                 ("key", chunks, "progressive", clock.now + 100_000, 11, 2),
             )
         begin = threading.Event()
@@ -427,7 +427,7 @@ def test_sqlite_eviction_guards_malformed_outer_json(tmp_path, chunks):
         db = backend._get_db()
         with db:
             db.execute(
-                "INSERT INTO pending_selections VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO pending_selections (key, chunks_json, format, created_at, total_chars, seq) VALUES (?, ?, ?, ?, ?, ?)",
                 ("invalid", chunks, "progressive", time.time(), 1, 2),
             )
         ProgressiveStoreAdapter(backend).evict(1800, 200)

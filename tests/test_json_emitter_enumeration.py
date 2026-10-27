@@ -42,12 +42,12 @@ SRC = Path(__file__).resolve().parent.parent / "src" / "memtomem_stm"
 # - "Guarded at the call site": it can raise, and the caller handles that.
 ALLOWLIST: dict[str, tuple[int, str]] = {
     "proxy/compression.py": (
-        26,
+        25,
         "Reshapes an upstream response for the model. Safe as of #761, but "
         "by INGEST rather than by routing: ``_sanitize_nonfinite`` (behind "
         "``_mm_json_loads``) escapes lone surrogates in every parsed string, "
         "and ``manager._scrub_result_surrogates`` covers the tiers that never "
-        "parse. Routing these 26 individually would have been worse — the "
+        "parse. Routing these 25 individually would have been worse — the "
         "budget probes measure ``len`` of a re-dumped tree, so they would "
         "count a form six characters shorter per surrogate than the one "
         "delivered, and the non-JSON tiers reach ``TextContent`` unparsed.",

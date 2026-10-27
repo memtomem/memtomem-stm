@@ -14,12 +14,11 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Annotated, Any, cast
 
 from mcp.server.mcpserver import Context, MCPServer
-from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase, FuncMetadata, func_metadata
 from mcp.server.mcpserver.exceptions import ToolError
-from pydantic import ConfigDict, StrictInt, ValidationError
+from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase, FuncMetadata, func_metadata
 
 # Module-level on purpose: the proxy handler's ``-> CallToolResult`` return
 # annotation is a STRING under ``from __future__ import annotations``, and
@@ -27,19 +26,29 @@ from pydantic import ConfigDict, StrictInt, ValidationError
 # ``add_tool`` time — a function-local import would NameError there and send
 # every proxied tool down the registration degradation path.
 from mcp.types import CallToolResult
+from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr, ValidationError
 
 from memtomem_stm import __version__ as _stm_version
 from memtomem_stm.config import STMConfig
 from memtomem_stm.logging_setup import configure_server_logging, configure_stderr_logging
+from memtomem_stm.observability.tracing import traced
+from memtomem_stm.proxy._fastmcp_compat import install_delivery_wire_context
 from memtomem_stm.proxy.compression_feedback import CompressionFeedbackTracker
 from memtomem_stm.proxy.config import (
-    ProxyConfig,
     EnvOverlayResult,
+    ProxyConfig,
     collect_proxy_env_overrides,
     env_var_hint_for_validation_error,
     model_upstream_inert_state,
     validation_error_summary,
     warn_if_upstreams_inert,
+)
+from memtomem_stm.proxy.delivery import (
+    DeliveryError,
+    DeliveryFormat,
+    DeliveryText,
+    delivery_result,
+    error_result,
 )
 from memtomem_stm.proxy.manager import ProxyManager, ProxyToolInfo
 from memtomem_stm.proxy.metadata_recovery import (
@@ -51,9 +60,15 @@ from memtomem_stm.proxy.metrics import TokenTracker
 from memtomem_stm.proxy.progressive_reads import ProgressiveReadsTracker
 from memtomem_stm.proxy.selection_log import aggregate_selection_log, rotation_lock
 from memtomem_stm.proxy.tool_name_budget import is_conforming_tool_name
-from memtomem_stm.surfacing.engine import SurfacingEngine
-from memtomem_stm.surfacing.mcp_client import render_score_scale
 from memtomem_stm.surfacing.config import holdout_startup_warnings
+from memtomem_stm.surfacing.engine import SurfacingEngine
+from memtomem_stm.surfacing.feedback import (
+    FEEDBACK_STORE_BUSY,
+    FEEDBACK_STORE_UNAVAILABLE,
+    FeedbackTracker,
+    record_feedback_batch,
+)
+from memtomem_stm.surfacing.mcp_client import render_score_scale
 from memtomem_stm.surfacing.observability import (
     COMPLETED_OUTCOMES,
     FAULT_OUTCOMES,
@@ -62,22 +77,17 @@ from memtomem_stm.surfacing.observability import (
     SEARCH_COMPLETED_SKIP_REASONS,
     SurfacingObservability,
 )
-from memtomem_stm.observability.tracing import traced
-from memtomem_stm.surfacing.feedback import (
-    FEEDBACK_STORE_BUSY,
-    FEEDBACK_STORE_UNAVAILABLE,
-    FeedbackTracker,
-    record_feedback_batch,
-)
 from memtomem_stm.surfacing.store_io import (
     StoreWriteQueueFull,
     await_store_write,
     close_store_on_worker,
 )
-from memtomem_stm.utils.anyio_shutdown import await_or_warn, is_clean_cancel_scope_shutdown
 from memtomem_stm.utils import child_reaper
+from memtomem_stm.utils.anyio_shutdown import await_or_warn, is_clean_cancel_scope_shutdown
 from memtomem_stm.utils.display import _disp
+from memtomem_stm.utils.json_out import escape_lone_surrogates, require_utf8_identifier
 from memtomem_stm.utils.parent_liveness import ParentLivenessWatcher
+from memtomem_stm.utils.redact import exception_summary
 from memtomem_stm.utils.signal_shutdown import (
     ShutdownSignals,
     exit_after_signal_shutdown,
@@ -86,8 +96,12 @@ from memtomem_stm.utils.signal_shutdown import (
     was_signal_shutdown,
 )
 from memtomem_stm.utils.teardown_watchdog import TeardownWatchdog
-from memtomem_stm.utils.json_out import escape_lone_surrogates, require_utf8_identifier
-from memtomem_stm.utils.redact import exception_summary
+
+
+class ContinuationOutput(BaseModel):
+    result: StrictStr
+    stm: dict[str, Any] | None = None
+
 
 # Named, not ``__name__``: under ``python -m memtomem_stm.server`` that is
 # ``__main__``, and the handlers pass records below WARNING only from the
@@ -878,6 +892,9 @@ mcp = MCPServer(
 )
 
 
+install_delivery_wire_context(mcp)
+
+
 def _should_advertise_obs_tools() -> bool:
     """Read the ``MEMTOMEM_STM_ADVERTISE_OBSERVABILITY_TOOLS`` env-var flag.
 
@@ -1320,12 +1337,27 @@ async def stm_proxy_describe_tool(
 # ---------------------------------------------------------------------------
 
 
+def _continuation_result(value: str, requested: DeliveryFormat | None) -> CallToolResult:
+    from mcp.types import TextContent
+
+    if isinstance(value, DeliveryText) and value.response_format == "structured":
+        return delivery_result(value.descriptor)
+    if requested == "structured":
+        return error_result("missing_or_expired", "Requested key was not found or expired.")
+    return CallToolResult(
+        content=[TextContent(type="text", text=str(value))],
+        structured_content={"result": str(value)},
+    )
+
+
 @mcp.tool()
 async def stm_proxy_select_chunks(
     key: str,
     sections: list[str],
     ctx: CtxType = None,  # type: ignore[assignment]
-) -> str:
+    *,
+    response_format: DeliveryFormat | None = None,
+) -> Annotated[CallToolResult, ContinuationOutput]:
     """Retrieve selected sections from a TOC response.
 
     When a proxied tool returns a TOC (selective compression), use this tool
@@ -1333,10 +1365,19 @@ async def stm_proxy_select_chunks(
 
     Args:
         key: The selection_key from the TOC response.
-        sections: List of section keys to retrieve.
+        sections: Exact TOC entry keys, never internal chunk IDs or display labels.
+        response_format: Omit to follow the stored key; legacy or structured overrides it.
     """
     app = _get_ctx(ctx)
-    return app.proxy_manager.select_chunks(key, sections)
+    try:
+        result = app.proxy_manager.select_chunks(
+            key,
+            sections,
+            **({"response_format": response_format} if response_format is not None else {}),
+        )
+        return _continuation_result(result, response_format)
+    except DeliveryError as exc:
+        return error_result(exc.code, str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -1350,7 +1391,9 @@ async def stm_proxy_read_more(
     offset: int = 0,
     limit: int | None = None,
     ctx: CtxType = None,  # type: ignore[assignment]
-) -> str:
+    *,
+    response_format: DeliveryFormat | None = None,
+) -> Annotated[CallToolResult, ContinuationOutput]:
     """Read more content from a progressive delivery response.
 
     When a proxied tool response includes progressive delivery metadata
@@ -1359,14 +1402,20 @@ async def stm_proxy_read_more(
     Args:
         key: The continuation key from the progressive response footer.
         offset: Character offset to start reading from (use next_offset from footer).
-        limit: Max characters to return. Defaults to the configured chunk_size.
+        limit: Max Unicode code points to return, subject to the serialized result budget.
+        response_format: Omit to follow the stored key; legacy or structured overrides it.
     """
-    if offset < 0:
-        return "Error: offset must be >= 0"
-    if limit is not None and limit < 1:
-        return "Error: limit must be >= 1"
     app = _get_ctx(ctx)
-    return app.proxy_manager.read_more(key, offset, limit)
+    try:
+        result = app.proxy_manager.read_more(
+            key,
+            offset,
+            limit,
+            **({"response_format": response_format} if response_format is not None else {}),
+        )
+        return _continuation_result(result, response_format)
+    except DeliveryError as exc:
+        return error_result(exc.code, str(exc))
 
 
 # ---------------------------------------------------------------------------
