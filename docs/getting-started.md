@@ -19,7 +19,11 @@ guide uses `mms` for operator commands and the explicit `memtomem-stm` server
 command in MCP client registrations.
 
 For an existing installation, upgrade and validate it before changing any
-client registration:
+client registration. Read the target release's [Upgrade notes](../CHANGELOG.md)
+first. When a note says the daemon protocol changes, quit the MCP hosts and run
+`mms daemon stop` with the old build before upgrading, following
+[Upgrading](guides/operations.md#upgrading); the new build cannot reach a daemon
+the old one started.
 
 ```bash
 uv tool upgrade memtomem-stm                 # uv tool installation
@@ -28,9 +32,8 @@ mms version
 mms doctor
 ```
 
-Read the target release's [Upgrade notes](../CHANGELOG.md) first. Restart the
-current config's daemon only when an upgrade note requires it. Existing client
-registrations are preserved unless `--replace-registration` is explicit.
+Existing client registrations are preserved unless `--replace-registration` is
+explicit.
 
 ## 2. Add an upstream
 

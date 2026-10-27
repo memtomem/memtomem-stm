@@ -128,6 +128,51 @@ Recovery order:
 4. If the file is beyond repair, delete it and re-run `mms init` (or
    `mms add --from-clients` to re-import from host configs).
 
+## Upgrading
+
+Read the target release's [Upgrade notes](../../CHANGELOG.md) first. Most
+releases need only the package upgrade and a check:
+
+```bash
+uv tool upgrade memtomem-stm                 # uv tool installation
+python -m pip install --upgrade memtomem-stm # virtualenv / pip installation
+mms version
+mms doctor
+```
+
+When a note says the daemon protocol changes, or that processes sharing the
+pending store must be restarted together (0.7.0 says both), stop the old
+processes **before** upgrading. A daemon is found by a fingerprint that
+includes the protocol version, so after the upgrade the new build's
+`mms daemon stop` and `mms daemon restart` no longer reach a daemon the old
+build started.
+
+1. Quit every MCP host that runs STM (Claude Code, Codex, …). A running proxy
+   or hook starts a daemon again on its next call.
+2. With the old build still installed, run `mms daemon stop`. It exits 0 once
+   the daemon has finished shutting down (`daemon stopped`) or when none was
+   running (`no running daemon`); on exit 1, follow its message before going
+   on.
+3. Run `mms daemon status`. A daemon a host started usually runs under a
+   different config fingerprint than your shell, because `mms register` pins
+   host-specific settings in the host's environment, and `status` lists it as
+   running under a different config. With the hosts quit, nothing uses it: on
+   macOS and Linux, `mms daemon stop --all` sends each one SIGTERM without
+   waiting, so re-run `mms daemon status` until none is listed. On Windows,
+   `--all` does not signal them; stop the owning processes from Task Manager.
+4. Upgrade every installation that shares the data directory (`~/.memtomem`
+   by default) before any of them starts again, then run `mms version` and
+   `mms doctor`.
+5. Start the hosts again.
+
+Each check covers the data directory of the config and `MEMTOMEM_STM_*`
+environment it runs under; repeat it for any other you use. Do not count on
+idle shutdown instead: a daemon exits after `daemon.idle_timeout_seconds`
+(900 by default) without requests, and `0` disables it.
+
+Client registration is kept across upgrades; use
+`mms register --replace-registration` only when you intend to refresh it.
+
 ## Uninstalling completely
 
 There is no single wipe command; the pieces are independent and each step is
