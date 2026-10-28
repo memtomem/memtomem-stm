@@ -3281,6 +3281,88 @@ class TestDaemonRestartCli:
         assert calls["spawns"] >= 1
         assert "daemon started" in result.output
 
+    def test_unopenable_lock_file_fails_without_a_traceback_or_a_start(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#1247: a confirmed stop need not have opened the lock file, so
+        restart's own probe can be the first to fail on it. That is UNKNOWN —
+        not free, and not an uncaught ``OSError``."""
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _fake_stop_clock(monkeypatch)
+        spawns: list[object] = []
+
+        async def fake_shutdown(config):
+            return True  # graceful ack, no handshake: stop confirms without a probe
+
+        def refuse(path):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr("memtomem_stm.daemon.client.shutdown", fake_shutdown)
+        monkeypatch.setattr("memtomem_stm.daemon.locking._open_lock_fd", refuse)
+        monkeypatch.setattr(
+            "memtomem_stm.daemon.spawn.request_spawn",
+            lambda config, *, propagate_errors=False: spawns.append(config) or True,
+        )
+
+        result = CliRunner().invoke(_cli(), ["daemon", "restart"])
+
+        assert result.exit_code == 1, result.output
+        assert isinstance(result.exception, SystemExit)
+        assert "daemon stopped" in result.output
+        assert "could not check the previous daemon's lock" in result.output
+        assert "still shutting down" not in result.output
+        assert spawns == []
+
+    def test_transient_lock_open_error_starts_only_after_a_free_probe(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from click.testing import CliRunner
+
+        from memtomem_stm.cli import daemon_cmd
+        from memtomem_stm.daemon import locking as daemon_locking
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _fake_stop_clock(monkeypatch)
+        log: list[str] = []
+        real_open = daemon_locking._open_lock_fd
+        failures = iter([True, True])
+
+        def flaky_open(path):
+            if next(failures, False):
+                raise PermissionError(13, "Permission denied")
+            return real_open(path)
+
+        real_probe = daemon_cmd._probe_lock
+
+        def logging_probe(path):
+            state = real_probe(path)
+            log.append(state.value)
+            return state
+
+        async def fake_shutdown(config):
+            return True
+
+        async def fake_ping(config, *, timeout=2.0):
+            return {"pid": 7, "port": 9} if "spawn" in log else None
+
+        def fake_request_spawn(config, *, propagate_errors=False):
+            log.append("spawn")
+            return True
+
+        monkeypatch.setattr("memtomem_stm.daemon.client.shutdown", fake_shutdown)
+        monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
+        monkeypatch.setattr("memtomem_stm.daemon.locking._open_lock_fd", flaky_open)
+        monkeypatch.setattr("memtomem_stm.cli.daemon_cmd._probe_lock", logging_probe)
+        monkeypatch.setattr("memtomem_stm.daemon.spawn.request_spawn", fake_request_spawn)
+
+        result = CliRunner().invoke(_cli(), ["daemon", "restart"])
+
+        assert result.exit_code == 0, result.output
+        assert log == ["unknown", "unknown", "free", "spawn"]
+        assert "daemon started" in result.output
+
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock semantics")
     def test_wedged_teardown_reports_clearly(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """When the old daemon never frees its lifetime lock, restart must

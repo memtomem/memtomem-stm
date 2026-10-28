@@ -1039,6 +1039,11 @@ is starting or shutting down, `free` that the record is left over, `unknown`
 that the lock could not be checked), `starting` (no handshake yet, lock held),
 `unknown` (no handshake, lock could not be checked) or `stopped`.
 
+`restart` runs `stop`, then waits up to 5 seconds for the config's lifetime lock
+to be free before it starts a replacement, and exits 1 without starting one if
+the lock is still held ("previous daemon still shutting down") or could not be
+checked ("could not check the previous daemon's lock").
+
 Daemons are keyed by config, so `start`/`stop`/`restart` for one config never
 touch a daemon serving another config. `mms daemon status` lists every live
 daemon under a different config fingerprint, and a different fingerprint does

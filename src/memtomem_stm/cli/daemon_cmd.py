@@ -1149,7 +1149,7 @@ def restart_cmd(ctx: click.Context) -> None:
     free. Daemons under other configs are left running (config-drift coexistence).
     """
     from memtomem_stm.daemon.discovery import config_fingerprint
-    from memtomem_stm.daemon.locking import lock_path, single_owner_lock
+    from memtomem_stm.daemon.locking import lock_path
 
     config = _load_config()
     ctx.invoke(stop_cmd)
@@ -1157,22 +1157,35 @@ def restart_cmd(ctx: click.Context) -> None:
     # fixed sleep could race: _teardown() awaits the warm LTM child's stop and
     # has no hard timeout. Bounded so a wedged teardown reports clearly instead
     # of letting start_cmd produce a misleading readiness timeout.
-    fp = config_fingerprint(config)
+    #
+    # Only FREE starts. A lock file that cannot be opened is UNKNOWN, not free,
+    # and it can reach this probe first: a successful ``stop`` need not have
+    # opened it (#1247). Retried inside the same deadline, since the error may
+    # be transient.
+    lp = lock_path(config.data_dir, config_fingerprint(config))
     deadline = time.time() + 5.0
+    state = LockProbe.HELD
     while time.time() < deadline:
-        with single_owner_lock(lock_path(config.data_dir, fp)) as acquired:
-            free = acquired
-        if free:
+        state = _probe_lock(lp)
+        if state is LockProbe.FREE:
             ctx.invoke(start_cmd)
             return
         time.sleep(0.2)
     # Exit nonzero: the docs recommend `mms daemon restart` after an upgrade,
     # and a script (or a user skimming the output) must not read "stopped and
     # never came back" as success.
-    click.echo(
-        _warn(
-            "daemon NOT restarted: previous daemon still shutting down — "
-            "run `mms daemon start` again shortly"
+    if state is LockProbe.UNKNOWN:
+        click.echo(
+            _warn(
+                "daemon NOT restarted: could not check the previous daemon's lock — "
+                "run `mms daemon status`"
+            )
         )
-    )
+    else:
+        click.echo(
+            _warn(
+                "daemon NOT restarted: previous daemon still shutting down — "
+                "run `mms daemon start` again shortly"
+            )
+        )
     raise SystemExit(1)
