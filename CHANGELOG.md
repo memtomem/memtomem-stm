@@ -59,6 +59,11 @@ changes inline only. See the deprecation policy in
   held, including one whose listener closed after the listing, which it used
   to skip; foreign entries in `status --json` gain `listening` and `lock`.
   (#1245)
+- `mms daemon restart` no longer ends in a traceback when the lifetime lock
+  file cannot be opened after the stop (an unwritable data dir, say). That
+  probe now counts as "could not be checked": restart retries it within its
+  5-second wait, starts a replacement only once the lock is free, and
+  otherwise exits 1 with a message instead. (#1247)
 
 ## [0.7.0] — 2026-10-27
 
