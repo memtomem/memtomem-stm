@@ -9,29 +9,36 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
-## [Unreleased]
+## [0.7.1] — 2026-10-28
 
 ### Upgrade notes
 
 - **`mms daemon stop` exits 1 when it cannot confirm a stop, and can wait up
   to 5 seconds longer for a signalled daemon (10 with `--all`).** After `sent SIGTERM`, scripts now get exit 0 only
   once that daemon finished shutting down. (#1238)
-- **`mms daemon stop` and `mms daemon restart` exit 1 when this config's daemon
-  lock is still held after a 5-second wait** — a daemon starting or shutting
-  down — where they used to remove its record as stale and exit 0. (#1245)
+- **`mms daemon stop` exits 1 when this config's daemon lock is still held
+  after a 5-second wait** — a daemon starting or shutting down — where it used
+  to remove its record as stale and exit 0. `mms daemon restart` already
+  exited 1 in that case; it now does so from the stop step. (#1245)
+- **`mms daemon status --json` has new values.** This config's daemon can be
+  `starting` or `unknown`, and a foreign daemon with an unreadable record is
+  listed, with `pid`, `host` and `port` set to `null`, while its lock is held
+  or cannot be checked. (#1245)
 
 ### Changed
 
 - `mms daemon stop` exits 0 only when every daemon it acted on removed its
   handshake, none was running, or the record it found was stale. After a
   SIGTERM fallback it now waits for the same handshake removal the graceful
-  path waits for; `--all` signals every foreign daemon first, then waits for
-  all of them on one shared 5-second budget. A pid that cannot be signalled
+  path waits for; `--all` signals every foreign daemon that is still
+  accepting first, then waits for all of them on one shared 5-second budget
+  (#1245 adds the foreign daemons it does not signal to that wait). A pid that cannot be signalled
   keeps its handshake instead of having it removed as stale, and the stale
   cleanup message names the pid. **Behavior change**: exit 1, with the message
   on stderr, when a signalled daemon has not finished within the budget, when
-  a pid cannot be signalled, and on Windows when a daemon is still listening
-  or `--all` finds a foreign daemon, since Windows has no signal fallback.
+  a pid cannot be signalled, and on Windows when a daemon that would need the
+  signal fallback is still listening (this config's or, with `--all`, a
+  foreign one), since Windows has no signal fallback.
   With `--all`, the current config's wait and the foreign wait run one after
   the other, so it waits up to 10 seconds for teardown. `mms daemon restart`
   no longer starts a replacement after such a stop. (#1238)
@@ -53,17 +60,29 @@ changes inline only. See the deprecation policy in
   lock, never signal it, and `--all` waits for its lock instead; `status`
   reports this config's daemon as `starting` or `unknown` when there is no
   handshake but the lock is held or cannot be checked, and adds `lock` to a
-  `stale` one. **Behavior change**: `stop`, and `restart` through it, exit 1
-  instead of 0 when this config's lock is still held, or cannot be checked,
-  after the wait; `stop --all` exits 1 for a foreign daemon whose lock is still
+  `stale` one. **Behavior change**: `stop` exits 1 instead of 0 when this
+  config's lock is still held, or cannot be checked, after the wait (for a
+  held lock `restart` already exited 1, after its own wait, and now exits
+  from the stop step); `stop --all` exits 1 for a foreign daemon whose lock is still
   held, including one whose listener closed after the listing, which it used
-  to skip; foreign entries in `status --json` gain `listening` and `lock`.
-  (#1245)
+  to skip; foreign entries in `status --json` gain `listening` and `lock`, and
+  one whose record cannot be read is listed, while its lock is held or cannot
+  be checked, with `handshake_unreadable: true` and `null` `pid`, `host`,
+  `port` and idle fields. (#1245)
 - `mms daemon restart` no longer ends in a traceback when the lifetime lock
   file cannot be opened after the stop (an unwritable data dir, say). That
   probe now counts as "could not be checked": restart retries it within its
   5-second wait, starts a replacement only once the lock is free, and
   otherwise exits 1 with a message instead. (#1247)
+
+### Docs
+
+- README, getting-started and the Korean guide say to stop the daemon with
+  the old build before an upgrade that changes the daemon protocol, and
+  `docs/guides/operations.md` gains an Upgrading runbook. (#1243)
+- The reference docs describe 0.7.0's structured delivery: the cache key's
+  `delivery_format`, the one-time privacy sweep, strict LTM validation, and
+  the `delivery_format` settings and stats line. (#1244)
 
 ## [0.7.0] — 2026-10-27
 
