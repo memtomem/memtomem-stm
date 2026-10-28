@@ -2551,6 +2551,215 @@ class TestDaemonForeignOrphans:
         assert daemon_cmd._live_foreign_daemons(STMConfig()) == []
 
 
+_LISTING_ERRORS = [PermissionError(13, "denied"), NotADirectoryError(20, "not a directory")]
+
+
+def _unlistable(data_dir: Path) -> None:
+    """Make ``data_dir`` writable and searchable but not listable (#1249)."""
+    os.chmod(data_dir, 0o300)
+
+
+def _skip_unless_permission_bits_bind() -> None:
+    if os.name == "nt":
+        pytest.skip("POSIX permission bits")
+    if os.geteuid() == 0:
+        pytest.skip("root lists any directory")
+
+
+def test_iter_foreign_handshakes_unlistable_dir_raises(tmp_path: Path):
+    """#1249: ``Path.glob`` returned ``[]`` for a directory it could not list, so
+    a published foreign handshake read as "no daemons"."""
+    _skip_unless_permission_bits_bind()
+    _put_handshake(tmp_path, "aaaa0000", pid=30)
+    _unlistable(tmp_path)
+    try:
+        assert (tmp_path / "stm-daemon-aaaa0000.json").exists()
+        with pytest.raises(PermissionError):
+            discovery.iter_foreign_handshakes(tmp_path, "cur00000")
+    finally:
+        os.chmod(tmp_path, 0o700)
+
+
+@pytest.mark.parametrize("error", _LISTING_ERRORS, ids=lambda e: type(e).__name__)
+def test_iter_foreign_handshakes_listing_error_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: OSError
+):
+    real_listdir = os.listdir
+
+    def listdir(path):
+        if Path(path) == tmp_path:
+            raise error
+        return real_listdir(path)
+
+    monkeypatch.setattr(discovery.os, "listdir", listdir)
+    with pytest.raises(type(error)):
+        discovery.iter_foreign_handshakes(tmp_path, "cur00000")
+
+
+class TestForeignListingFailure:
+    """#1249: a data dir that cannot be listed leaves the daemons under other
+    configs unknown — ``stop --all`` fails and ``status`` says so, instead of
+    both reporting that there are none."""
+
+    @staticmethod
+    def _fail_listing(monkeypatch: pytest.MonkeyPatch, error: OSError) -> None:
+        def iter_foreign_handshakes(*args, **kwargs):
+            raise error
+
+        monkeypatch.setattr(
+            "memtomem_stm.daemon.discovery.iter_foreign_handshakes", iter_foreign_handshakes
+        )
+
+    @pytest.mark.parametrize("error", _LISTING_ERRORS, ids=lambda e: type(e).__name__)
+    def test_stop_all_fails_when_listing_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: OSError
+    ):
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        self._fail_listing(monkeypatch, error)
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+
+        assert result.exit_code == 1, result.output
+        kind = type(error).__name__
+        assert (
+            f"could not list data_dir ({kind}) — daemons under a different config are "
+            "unknown; no foreign daemons were stopped"
+        ) in result.stderr
+        assert "no daemons running under a different config" not in result.output
+        assert str(tmp_path) not in result.output
+
+    def test_stop_all_fails_on_a_real_unlistable_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from click.testing import CliRunner
+
+        _skip_unless_permission_bits_bind()
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        _put_handshake(tmp_path, "foreignfp000000", pid=98765)
+        _unlistable(tmp_path)
+        try:
+            result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+        finally:
+            os.chmod(tmp_path, 0o700)
+
+        assert result.exit_code == 1, result.output
+        assert "could not list data_dir (PermissionError)" in result.stderr
+        assert "no daemons running under a different config" not in result.output
+
+    def test_stop_all_reports_both_failures(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        import click
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+
+        def current_fails(_config: STMConfig) -> None:
+            click.echo("current-config stop not confirmed", err=True)
+            raise SystemExit(1)
+
+        monkeypatch.setattr(
+            "memtomem_stm.cli.daemon_cmd._stop_current_config_daemon", current_fails
+        )
+        self._fail_listing(monkeypatch, PermissionError(13, "denied"))
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+
+        assert result.exit_code == 1, result.output
+        assert "current-config stop not confirmed" in result.stderr
+        assert "could not list data_dir (PermissionError)" in result.stderr
+
+    @pytest.mark.parametrize("error", _LISTING_ERRORS, ids=lambda e: type(e).__name__)
+    def test_status_reports_foreign_unknown(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: OSError
+    ):
+        import json
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("NO_COLOR", "1")
+        _no_daemon(monkeypatch)
+        self._fail_listing(monkeypatch, error)
+        kind = type(error).__name__
+
+        result = CliRunner().invoke(_cli(), ["daemon", "status", "--json"])
+        assert result.exit_code == 0, result.output
+        info = json.loads(result.output)
+        assert info["state"] == "stopped"
+        assert info["foreign"] is None
+        assert info["foreign_error"] == kind
+
+        result = CliRunner().invoke(_cli(), ["daemon", "status"])
+        assert result.exit_code == 0, result.output
+        assert (
+            f"could not list data_dir ({kind}) — daemons under a different config are unknown"
+        ) in result.output.splitlines()
+        assert "under a different config:" not in result.output
+        assert str(tmp_path) not in result.output
+
+    def test_status_on_a_real_unlistable_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        import json
+
+        from click.testing import CliRunner
+
+        _skip_unless_permission_bits_bind()
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        _put_handshake(tmp_path, "foreignfp000000", pid=98765)
+        _unlistable(tmp_path)
+        try:
+            result = CliRunner().invoke(_cli(), ["daemon", "status", "--json"])
+        finally:
+            os.chmod(tmp_path, 0o700)
+
+        assert result.exit_code == 0, result.output
+        info = json.loads(result.output)
+        assert (info["foreign"], info["foreign_error"]) == (None, "PermissionError")
+
+    def test_listable_empty_dir_still_reports_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        import json
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+
+        result = CliRunner().invoke(_cli(), ["daemon", "status", "--json"])
+        assert result.exit_code == 0, result.output
+        info = json.loads(result.output)
+        assert info["foreign"] == []
+        assert "foreign_error" not in info
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+        assert result.exit_code == 0, result.output
+        assert "no daemons running under a different config" in result.output
+
+    def test_a_probe_error_is_not_reported_as_a_listing_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Only the enumeration is translated: an ``OSError`` from a per-entry
+        probe must not come back as "could not list data_dir"."""
+        from memtomem_stm.cli import daemon_cmd
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _put_handshake(tmp_path, "foreignfp000000", pid=98765)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: False)
+
+        def probe_lock(_path: Path):
+            raise OSError("probe failed")
+
+        monkeypatch.setattr(daemon_cmd, "_probe_lock", probe_lock)
+
+        with pytest.raises(OSError, match="probe failed") as excinfo:
+            daemon_cmd._live_foreign_daemons(STMConfig())
+        assert not isinstance(excinfo.value, daemon_cmd._ForeignListingError)
+
+
 class _LockHolder:
     """Hold a lifetime lock on a second fd, as a daemon (or prober) would.
 

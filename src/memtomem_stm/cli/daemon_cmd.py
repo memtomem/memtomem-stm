@@ -141,6 +141,22 @@ def _idle_shutdown(raw: dict[str, Any]) -> tuple[float | None, bool | None]:
     return seconds, True
 
 
+class _ForeignListingError(Exception):
+    """``data_dir`` could not be listed, so the foreign daemons are unknown.
+
+    ``kind`` is the ``OSError`` subclass name — the only detail rendered; the
+    path and ``strerror`` stay out of the output.
+    """
+
+    def __init__(self, kind: str) -> None:
+        super().__init__(kind)
+        self.kind = kind
+
+
+def _foreign_unknown(kind: str) -> str:
+    return f"could not list data_dir ({kind}) — daemons under a different config are unknown"
+
+
 def _live_foreign_daemons(config: STMConfig) -> list[dict[str, Any]]:
     """Daemons running under a *different* config fingerprint than the current one.
 
@@ -186,6 +202,10 @@ def _live_foreign_daemons(config: STMConfig) -> list[dict[str, Any]]:
     the fingerprint, not that the recorded pid does, so nothing signals them.
     Accepting entries carry ``listening: True`` and ``lock: None`` (not
     checked).
+
+    Raises :class:`_ForeignListingError` when ``data_dir`` cannot be listed, so
+    no caller reads "could not look" as "none" (#1249). Only the enumeration is
+    translated; the per-entry probes report their own failures.
     """
     from memtomem_stm.daemon.client import probe_listening
     from memtomem_stm.daemon.discovery import (
@@ -196,10 +216,12 @@ def _live_foreign_daemons(config: STMConfig) -> list[dict[str, Any]]:
     from memtomem_stm.daemon.locking import lock_path
 
     current = config_fingerprint(config)
+    try:
+        handshakes = iter_foreign_handshakes(config.data_dir, current, include_unreadable=True)
+    except OSError as exc:
+        raise _ForeignListingError(type(exc).__name__) from exc
     live: list[dict[str, Any]] = []
-    for fingerprint, hs in iter_foreign_handshakes(
-        config.data_dir, current, include_unreadable=True
-    ):
+    for fingerprint, hs in handshakes:
         if hs is None:
             state = _probe_lock(lock_path(config.data_dir, fingerprint))
             if state is not LockProbe.FREE:
@@ -744,7 +766,13 @@ def _stop_foreign_daemons(config: STMConfig) -> None:
     from memtomem_stm.daemon.discovery import handshake_path, is_pid_alive
     from memtomem_stm.daemon.locking import lock_path
 
-    foreign = _live_foreign_daemons(config)
+    try:
+        foreign = _live_foreign_daemons(config)
+    except _ForeignListingError as exc:
+        click.echo(
+            _warn(f"{_foreign_unknown(exc.kind)}; no foreign daemons were stopped"), err=True
+        )
+        raise SystemExit(1) from None
     if not foreign:
         click.echo("no daemons running under a different config")
         return
@@ -970,11 +998,19 @@ def status_cmd(as_json: bool) -> None:
 
     # Orthogonal to the current-config state: daemons under a different
     # fingerprint are invisible to the keyed paths above, so surface them here
-    # regardless of running/stale/stopped.
-    foreign = _live_foreign_daemons(config)
+    # regardless of running/stale/stopped. ``None`` when they could not be
+    # listed — unknown, which an empty list would misreport as none (#1249).
+    foreign: list[dict[str, Any]] | None
+    foreign_error: str | None = None
+    try:
+        foreign = _live_foreign_daemons(config)
+    except _ForeignListingError as exc:
+        foreign, foreign_error = None, exc.kind
 
     if as_json:
         info["foreign"] = foreign
+        if foreign_error is not None:
+            info["foreign_error"] = foreign_error
         click.echo(json.dumps(info, indent=2))
         return
 
@@ -1073,7 +1109,9 @@ def status_cmd(as_json: bool) -> None:
         standalone_hint = "no (set MEMTOMEM_STM_SURFACING__USE_DAEMON=true to opt in)"
     click.echo(f"standalone surfacing will use daemon: {standalone_hint}")
 
-    if foreign:
+    if foreign_error is not None:
+        click.echo(_warn(_foreign_unknown(foreign_error)))
+    elif foreign:
         _render_foreign(foreign)
 
 
