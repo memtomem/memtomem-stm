@@ -54,7 +54,6 @@ daemon's handshake.
 
 from __future__ import annotations
 
-import fnmatch
 import hashlib
 import json
 import logging
@@ -229,21 +228,19 @@ def iter_foreign_handshakes(
 
     A missing ``data_dir`` returns an empty list. Any other failure to list it
     (no read permission, not a directory, …) raises ``OSError``: those leave the
-    foreign daemons unknown, not absent (#1249).
-    ``os.listdir`` rather than ``Path.glob``, which returns nothing for a
-    directory it cannot list; ``fnmatch`` keeps glob's matching, which ignores
-    case on Windows.
+    foreign daemons unknown, not absent (#1249). ``Path.glob`` returns nothing
+    for a directory it cannot list, so ``os.listdir`` checks that first; the
+    matching and order stay glob's.
     """
     base = data_dir.expanduser()
     try:
-        names = os.listdir(base)
+        os.listdir(base)
     except FileNotFoundError:
         return []
-    prefix = f"{HANDSHAKE_PREFIX}-"
+    paths = sorted(base.glob(f"{HANDSHAKE_PREFIX}-*.json"))
     out: list[tuple[str, dict[str, Any] | None]] = []
-    for name in sorted(fnmatch.filter(names, f"{prefix}*.json")):
-        path = base / name
-        fingerprint = path.stem.removeprefix(prefix)
+    for path in paths:
+        fingerprint = path.stem.removeprefix(f"{HANDSHAKE_PREFIX}-")
         if fingerprint == current_fingerprint:
             continue
         data = read_handshake(path)
