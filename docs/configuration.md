@@ -240,17 +240,18 @@ daemon admits at once. A request beyond it is answered `busy` straight away and
 surfaces nothing; `queue.busy_rejections` in `mms daemon status` counts them.
 
 Ahead of admission sits a fixed budget that is not configurable: the daemon
-holds at most 64 connections that have not yet sent their first frame, the one
-carrying the auth token. When a connection arrives with 64 already waiting, the
-oldest of them is closed without a reply. A real client sends its frame as soon
-as it connects, so this only drops requests under a burst of more than 64
-simultaneous connections, or when idle sockets are holding the slots. A dropped
-request is not told `busy`: the hook treats it as an unreachable daemon, so
-`hook.fallback` applies (`skip` surfaces nothing, `cold` searches in-process),
-and the spawn `hook.auto_spawn` requests does nothing while the daemon holds its
-lock; standalone surfacing returns no results for that call, as for any failed
-round trip. `mms daemon status --json` counts these as `queue.pre_auth_evictions`;
-the text `queue:` line does not show it.
+holds at most 64 connections whose first frame, the one carrying the auth token,
+it has not finished reading. When a connection arrives with 64 already in that
+state, the oldest of them is closed without a reply, even if its client has
+already sent the frame. A real client sends its frame as soon as it connects, so
+this takes a burst of more than 64 simultaneous connections, idle sockets
+holding the slots, or a daemon too busy to read frames as fast as they arrive. A
+dropped request is not told `busy`: the hook treats it as an unreachable daemon,
+so `hook.fallback` applies (`skip` surfaces nothing, `cold` searches
+in-process), and the spawn `hook.auto_spawn` requests does nothing while the
+daemon holds its lock; standalone surfacing returns no results for that call, as
+for any failed round trip. `mms daemon status --json` counts these as
+`queue.pre_auth_evictions`; the text `queue:` line does not show it.
 
 `max_concurrent_ltm_ops` is how many admitted requests may hold the LTM session
 at once. Requests beyond it wait while their client deadline runs, so a low

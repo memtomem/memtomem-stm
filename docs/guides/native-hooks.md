@@ -105,10 +105,10 @@ legacy in-process path and may pay the LTM startup cost inside the hook call.
 Neither applies when the daemon answers that it is busy or that the request
 ran out of time: that call surfaces nothing, with no fallback and no spawn
 request. A burst of more than 64 simultaneous connections is different: the
-daemon closes the oldest unauthenticated ones without answering, so those
-calls take the unreachable path above. `daemon.max_pending_requests` and that
-fixed 64-connection budget are described under
-[Surfacing Daemon](../configuration.md#surfacing-daemon).
+daemon closes the oldest ones whose first frame it has not yet read, without
+answering, so those calls take the unreachable path above.
+`daemon.max_pending_requests` and that fixed 64-connection budget are described
+under [Surfacing Daemon](../configuration.md#surfacing-daemon).
 Keep the hook-to-daemon deadline above the surfacing deadline; managed installs
 enforce a one-second margin automatically.
 
