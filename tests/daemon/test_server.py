@@ -1927,6 +1927,32 @@ async def test_lifetime_lock_retry_acquires_after_incumbent_releases(
         await _stop(cfg, task)
 
 
+async def test_daemon_losing_a_fresh_lock_file_retries_instead_of_exiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # On Windows the holder has locked byte 0 of a still-empty file, so this
+    # daemon's initialising write fails; it must reach the acquire retry rather
+    # than exit as if the lock file could not be opened (#1248).
+    from helpers import held_empty_lock
+
+    cfg = _config(tmp_path)
+    monkeypatch.setattr(DaemonServer, "_LOCK_ACQUIRE_RETRY_SECONDS", 0.3)
+    server = DaemonServer(cfg)
+
+    def _no_engine() -> None:
+        raise AssertionError("the losing daemon built an engine")
+
+    server._build_engine = _no_engine  # type: ignore[method-assign]
+    caplog.set_level(logging.WARNING, logger="memtomem_stm.daemon.server")
+    with held_empty_lock(_lock_path(cfg)):
+        rc = await asyncio.wait_for(server.serve(), timeout=10.0)
+    assert rc == 0
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("another daemon already owns the lock" in m for m in messages)
+    assert not any("could not open the lock file" in m for m in messages)
+    assert server._handshake_written is False
+
+
 # ── run() top-level exception barrier (#581) ─────────────────────────────
 
 

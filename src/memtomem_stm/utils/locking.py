@@ -1,9 +1,12 @@
 """Small cross-platform advisory file-lock primitives.
 
-Windows ``msvcrt.locking`` locks bytes from the current file position, so the
-lock file must contain at least one byte and every operation must seek back to
-offset zero.  Keeping that detail here prevents the daemon and ``mms`` state
-writers from drifting into subtly different implementations.
+Windows ``msvcrt.locking`` locks bytes from the current file position, so every
+operation seeks back to offset zero and locks one byte.  The opener writes that
+byte into an empty file when it can; a file can still be empty while another
+handle holds byte 0 (locking past the end of a file is allowed), and the
+opener then skips the write, which locking does not need.  Keeping that
+detail here prevents the daemon and ``mms`` state writers from drifting into
+subtly different implementations.
 """
 
 from __future__ import annotations
@@ -24,7 +27,14 @@ def open_lock_fd(path: Path) -> int:
     if os.name == "nt":  # pragma: no cover - Windows CI
         try:
             if os.fstat(fd).st_size == 0:
-                os.write(fd, b"\0")
+                try:
+                    os.write(fd, b"\0")
+                except PermissionError:
+                    # Another handle wrote and locked the byte after our size
+                    # check (or locked it without writing). The file is in use
+                    # as a lock; whether we get it is try_lock's question. An
+                    # access denial would have failed the O_RDWR open instead.
+                    pass
             os.lseek(fd, 0, os.SEEK_SET)
         except Exception:
             os.close(fd)

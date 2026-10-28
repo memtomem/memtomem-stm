@@ -6,6 +6,12 @@ holds plain functions that are easier to grep for and call inline.
 
 from __future__ import annotations
 
+import queue
+import subprocess
+import sys
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -200,3 +206,56 @@ def seed_foreign_feedback_vocabulary(db_path: Path) -> None:
         db.commit()
     finally:
         db.close()
+
+
+_EMPTY_LOCK_HOLDER = """
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
+if os.name == "nt":
+    import msvcrt
+    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+else:
+    import fcntl
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+sys.stdout.write("ready\\n")
+sys.stdout.flush()
+sys.stdin.read()
+"""
+
+
+@contextmanager
+def held_empty_lock(path: Path, *, timeout: float = 10.0) -> Iterator[None]:
+    """Hold ``path``'s lock from another process without writing to the file.
+
+    On Windows the child locks byte 0 of a zero-length file, which is what an
+    opener sees when it loses the race to initialise a fresh lock file (and
+    what a pre-byte build left behind). Elsewhere it takes a plain ``flock``.
+    The lock is released when the block exits; the child is always reaped,
+    since the autouse child-sweep guard in ``conftest.py`` cleans up nothing.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-I", "-c", _EMPTY_LOCK_HOLDER, str(path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None
+        lines: queue.Queue[str] = queue.Queue()
+        threading.Thread(target=lambda: lines.put(proc.stdout.readline()), daemon=True).start()
+        try:
+            line = lines.get(timeout=timeout)
+        except queue.Empty:
+            raise AssertionError("lock holder did not become ready") from None
+        assert line == "ready\n", f"lock holder failed to start (rc={proc.poll()})"
+        yield
+    finally:
+        if proc.stdin is not None:
+            proc.stdin.close()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        if proc.stdout is not None:
+            proc.stdout.close()

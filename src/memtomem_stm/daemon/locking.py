@@ -68,7 +68,9 @@ def lock_path(data_dir: Path, fingerprint: str) -> Path:
 def open_lock_fd(path: Path) -> int:
     """Open (creating) the lock file and return its fd. Caller owns the fd and
     must :func:`release_lock` it. Raises ``OSError`` only if the file can't be
-    opened at all (which a caller may treat as "don't run / don't spawn")."""
+    opened or prepared (which a caller may treat as "don't run / don't spawn").
+    Another process holding the lock is not an error here; :func:`try_lock`
+    reports it."""
     return _open_lock_fd(path)
 
 
@@ -112,20 +114,20 @@ class LockProbe(enum.Enum):
     """Someone holds it: a daemon (running, starting or tearing down) or a
     short-lived prober. Not proof that any *recorded* pid is the holder."""
     UNKNOWN = "unknown"
-    """The lock file could not be opened (``OSError``), so the question went
-    unanswered. Callers treat it like ``HELD`` wherever "free" would license a
-    cleanup or a "stopped" report."""
+    """The lock file could not be opened or prepared for locking (``OSError``),
+    so the question went unanswered. Callers treat it like ``HELD`` wherever
+    "free" would license a cleanup or a "stopped" report."""
 
 
 @contextmanager
 def probe_lifetime_lock(path: Path) -> Iterator[LockProbe]:
     """Take ``path``'s lock without blocking and yield what that found.
 
-    Unlike :func:`single_owner_lock`, an ``OSError`` opening the file is
-    yielded as :attr:`LockProbe.UNKNOWN` instead of raised. On Windows that
-    includes ``open_lock_fd`` failing to initialise a zero-length file whose
-    first byte another handle has locked — an older build that never wrote that
-    byte — so such a holder never reads as free.
+    Unlike :func:`single_owner_lock`, an ``OSError`` opening or preparing the
+    file is yielded as :attr:`LockProbe.UNKNOWN` instead of raised. A
+    zero-length file whose first byte another handle has locked (on Windows: an
+    opener that has not written it yet, or an older build that never did) opens
+    normally and reads as ``HELD``.
 
     On ``FREE`` the lock is held for the whole ``with`` block: work that must
     not race a successor (removing a stale handshake) goes inside it. Keep the
