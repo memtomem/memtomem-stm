@@ -224,14 +224,20 @@ def iter_foreign_handshakes(
     a long-dead pid). The caller decides how to confirm a daemon is alive — for a
     foreign daemon that may speak an older :data:`PROTOCOL_VERSION` a socket
     ``ping`` would fail the version gate, so :func:`is_pid_alive` is the
-    available signal. Sorted by fingerprint for deterministic output. Returns an
-    empty list if ``data_dir`` is absent or unreadable (ops callers degrade).
+    available signal. Sorted by fingerprint for deterministic output.
+
+    A missing ``data_dir`` returns an empty list. Any other failure to list it
+    (no read permission, not a directory, …) raises ``OSError``: those leave the
+    foreign daemons unknown, not absent (#1249). ``Path.glob`` returns nothing
+    for a directory it cannot list, so ``os.listdir`` checks that first; the
+    matching and order stay glob's.
     """
     base = data_dir.expanduser()
     try:
-        paths = sorted(base.glob(f"{HANDSHAKE_PREFIX}-*.json"))
-    except OSError:
+        os.listdir(base)
+    except FileNotFoundError:
         return []
+    paths = sorted(base.glob(f"{HANDSHAKE_PREFIX}-*.json"))
     out: list[tuple[str, dict[str, Any] | None]] = []
     for path in paths:
         fingerprint = path.stem.removeprefix(f"{HANDSHAKE_PREFIX}-")

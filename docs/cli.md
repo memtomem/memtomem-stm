@@ -1088,6 +1088,12 @@ it is unknown), `exits_when_idle` (`true`, `false`, or `null` when unknown),
 `"unknown"` for one that does not accept, `null` when not checked); an entry
 whose record is unreadable also has `handshake_unreadable: true` and `null`
 pid, host and port.
+When `data_dir` exists but cannot be listed (no read permission, say), the
+daemons under other configs are unknown rather than absent: `status` prints a
+warning naming the error class instead of a list, `status --json` reports
+`"foreign": null` with `"foreign_error"` set to that class (e.g.
+`"PermissionError"`), and `stop --all` exits 1 without stopping any of them. A
+`data_dir` that does not exist still counts as none.
 Foreign daemon detection combines process liveness with a protocol-neutral TCP
 connect-probe, so older protocol generations are reported on supported POSIX
 and Windows hosts without sending them an incompatible frame.

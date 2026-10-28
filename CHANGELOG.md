@@ -25,6 +25,15 @@ changes inline only. See the deprecation policy in
   reports it the same way. A daemon that answers is not probed and is listed
   as before. Exit codes are unchanged, and neither state lets `stop` remove its
   record.
+- `mms daemon status` and `mms daemon stop --all` no longer report "no daemons
+  under a different config" when `data_dir` exists but cannot be listed (for
+  example, no read permission); the daemons there are reported as unknown.
+  (#1249)
+  **Behavior change**: in that case `mms daemon stop --all` exits 1 (it exited
+  0) and stops none of them, `mms daemon status --json` reports `"foreign":
+  null` with `"foreign_error"` naming the error class (it reported `[]`), and
+  `mms daemon status` prints a warning instead of no list. A `data_dir` that
+  does not exist still reports none.
 
 ## [0.7.1] — 2026-10-28
 
