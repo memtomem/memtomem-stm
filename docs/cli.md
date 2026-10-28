@@ -1072,7 +1072,9 @@ not or could not be signalled. A listed daemon that is not accepting is never
 signalled — its lock shows that some process owns the fingerprint, not that the
 recorded pid does — so `stop --all` waits on the same budget for its lock to be
 released instead, and exits 1 if it is not; the same goes for one that closes
-its listener between the listing and the signal. On Windows `stop --all` cannot
+its listener between the listing and the signal. One that was starting rather
+than stopping keeps its lock and may begin accepting during the wait; it is
+still not signalled, so `stop --all` exits 1 and a second run reaches it. On Windows `stop --all` cannot
 signal by pid, so it exits 1 when any listed daemon is accepting, still waits on
 the others, and the hint names Task Manager instead. In `status --json`, each `foreign`
 entry carries `idle_shutdown_seconds` (a number, or `null` when there is none or

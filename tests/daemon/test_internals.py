@@ -3038,6 +3038,38 @@ class TestForeignStopJudgesByLifetimeLock:
         assert result.exit_code == 1, result.output
         assert "still holds its lock" in result.output
 
+    def test_windows_reclassifies_a_closed_listener_before_refusing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A target that stopped accepting since the listing no longer needs a
+        signal, so Windows' refusal must not fire for it."""
+        from click.testing import CliRunner
+
+        hs = self._foreign(tmp_path, monkeypatch, listening=True)
+        answers = iter([True])  # enumeration sees it accepting, the re-probe does not
+        monkeypatch.setattr(
+            "memtomem_stm.daemon.client.probe_listening",
+            lambda host, port, **kw: next(answers, False),
+        )
+        monkeypatch.setattr("memtomem_stm.cli.daemon_cmd._can_force_terminate", lambda: False)
+        monkeypatch.setattr(os, "kill", lambda pid, sig: pytest.fail("must not signal"))
+        holder = _LockHolder(lock_path(tmp_path, self.FP))
+
+        def on_sleep(polls: int) -> None:
+            if polls == 2:
+                hs.unlink()
+                holder.release()
+
+        _fake_stop_clock(monkeypatch, on_sleep)
+        try:
+            result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+        finally:
+            holder.release()
+
+        assert result.exit_code == 0, result.output
+        assert "Windows cannot safely" not in result.output
+        assert f"daemon pid=98765 stopped (fp={self.FP})" in result.output
+
     def test_mixed_targets_each_resolve(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         import signal as _signal
 
