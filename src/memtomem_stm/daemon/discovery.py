@@ -54,6 +54,7 @@ daemon's handshake.
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import logging
@@ -226,11 +227,12 @@ def iter_foreign_handshakes(
     ``ping`` would fail the version gate, so :func:`is_pid_alive` is the
     available signal. Sorted by fingerprint for deterministic output.
 
-    Returns an empty list only when ``data_dir`` does not exist. Any other
-    failure to list it (no read permission, not a directory, …) raises
-    ``OSError``: those leave the foreign daemons unknown, not absent (#1249).
+    A missing ``data_dir`` returns an empty list. Any other failure to list it
+    (no read permission, not a directory, …) raises ``OSError``: those leave the
+    foreign daemons unknown, not absent (#1249).
     ``os.listdir`` rather than ``Path.glob``, which returns nothing for a
-    directory it cannot list.
+    directory it cannot list; ``fnmatch`` keeps glob's matching, which ignores
+    case on Windows.
     """
     base = data_dir.expanduser()
     try:
@@ -239,7 +241,7 @@ def iter_foreign_handshakes(
         return []
     prefix = f"{HANDSHAKE_PREFIX}-"
     out: list[tuple[str, dict[str, Any] | None]] = []
-    for name in sorted(n for n in names if n.startswith(prefix) and n.endswith(".json")):
+    for name in sorted(fnmatch.filter(names, f"{prefix}*.json")):
         path = base / name
         fingerprint = path.stem.removeprefix(prefix)
         if fingerprint == current_fingerprint:

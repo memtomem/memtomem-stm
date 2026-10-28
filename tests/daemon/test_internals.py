@@ -178,6 +178,32 @@ def test_iter_foreign_handshakes_missing_dir(tmp_path: Path):
     assert discovery.iter_foreign_handshakes(tmp_path / "nope", "cur") == []
 
 
+def test_iter_foreign_handshakes_matches_what_glob_matched(tmp_path: Path):
+    """#1249 replaced ``Path.glob`` with ``os.listdir``; the names it picks must
+    stay the ones glob picked on this platform — on Windows that includes a
+    ``.JSON`` extension, which glob matched case-insensitively."""
+    names = [
+        "stm-daemon-aaaa0000.json",
+        "stm-daemon-bbbb1111.JSON",
+        "STM-DAEMON-cccc2222.json",
+        "stm-daemon-dddd3333.json.tmp",
+        "stm-daemon.json",
+        "stm-daemon.log",
+        ".stm-daemon-eeee4444.json",
+    ]
+    for name in names:
+        (tmp_path / name).write_text("{}", encoding="utf-8")
+    (tmp_path / "stm-daemon-ffff5555.json").mkdir()
+
+    globbed = sorted(p.name for p in tmp_path.glob("stm-daemon-*.json"))
+    out = discovery.iter_foreign_handshakes(tmp_path, "cur00000", include_unreadable=True)
+
+    assert [fp for fp, _ in out] == [Path(n).stem.removeprefix("stm-daemon-") for n in globbed]
+    assert "stm-daemon-aaaa0000.json" in globbed
+    if os.name == "nt":
+        assert "stm-daemon-bbbb1111.JSON" in globbed
+
+
 # ── daemon logging (#612 convergence) ─────────────────────────────────────
 
 
