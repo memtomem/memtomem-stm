@@ -14,9 +14,10 @@ changes inline only. See the deprecation policy in
 ### Fixed
 
 - On Windows, a process that opens a fresh lock file just after another one
-  has initialised and locked it now waits for the lock instead of failing to
-  open it. A daemon that lost this race exited instead of retrying for the
-  lock; `mms` writers reported the lock file as unopenable. (#1248, #1253)
+  has initialised and locked it now goes on to its usual lock-contention
+  handling instead of failing to open it. A daemon that lost this race exited
+  instead of retrying for the lock; `mms` writers reported the lock file as
+  unopenable. (#1248, #1253)
   **Behavior change**: on Windows, when a daemon from 0.1.38 or earlier (which
   never writes that byte) is not answering on its recorded port, `mms daemon
   status` now shows it as holding its lock (`--json` `"lock": "held"`) instead

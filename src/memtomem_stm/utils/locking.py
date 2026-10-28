@@ -4,9 +4,9 @@ Windows ``msvcrt.locking`` locks bytes from the current file position, so every
 operation seeks back to offset zero and locks one byte.  The opener writes that
 byte into an empty file when it can; a file can still be empty while another
 handle holds byte 0 (locking past the end of a file is allowed), and the
-opener then leaves the write to the holder.  Keeping that detail here prevents
-the daemon and ``mms`` state writers from drifting into subtly different
-implementations.
+opener then skips the write, which locking does not need.  Keeping that
+detail here prevents the daemon and ``mms`` state writers from drifting into
+subtly different implementations.
 """
 
 from __future__ import annotations
