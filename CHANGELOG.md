@@ -9,6 +9,22 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
+## [Unreleased]
+
+### Fixed
+
+- On Windows, a process that opens a fresh lock file just after another one
+  has initialised and locked it now waits for the lock instead of failing to
+  open it. A daemon that lost this race exited instead of retrying for the
+  lock; `mms` writers reported the lock file as unopenable. (#1248, #1253)
+  **Behavior change**: on Windows, when a daemon from 0.1.38 or earlier (which
+  never writes that byte) is not answering on its recorded port, `mms daemon
+  status` now shows it as holding its lock (`--json` `"lock": "held"`) instead
+  of its lock not being checkable (`"unknown"`), and `mms daemon stop --all`
+  reports it the same way. A daemon that answers is not probed and is listed
+  as before. Exit codes are unchanged, and neither state lets `stop` remove its
+  record.
+
 ## [0.7.1] — 2026-10-28
 
 ### Upgrade notes
