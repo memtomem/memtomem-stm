@@ -3179,3 +3179,45 @@ def test_readme_command_map_matches_the_click_group() -> None:
             "README.md command map is out of sync with the `mms` click group: "
             f"missing {sorted(registered - documented)}, stale {sorted(documented - registered)}"
         )
+
+
+def test_daemon_docs_state_the_admission_and_pre_auth_budgets() -> None:
+    """#1242: the fixed pre-auth connection budget and ``max_pending_requests``
+    are documented with their current values and the counters that show them."""
+    from memtomem_stm.config import DaemonConfig, STMConfig
+    from memtomem_stm.daemon import server as daemon_server
+
+    pre_auth = daemon_server._MAX_PRE_AUTH_CONNECTIONS
+    pending = DaemonConfig().max_pending_requests
+    counters = daemon_server.DaemonServer(STMConfig())._queue_snapshot()
+    assert {"busy_rejections", "pre_auth_evictions"} <= set(counters)
+
+    def flat(body: str) -> str:
+        return " ".join(body.split())
+
+    section = flat(
+        _heading_section(
+            _read("docs/configuration.md"), "Surfacing Daemon", "docs/configuration.md"
+        )
+    )
+    for needed in (
+        f"MEMTOMEM_STM_DAEMON__MAX_PENDING_REQUESTS={pending}",
+        f"at most {pre_auth} connections",
+        "`queue.busy_rejections`",
+        "`queue.pre_auth_evictions`",
+    ):
+        assert needed in section, f"docs/configuration.md Surfacing Daemon lost {needed!r}"
+
+    ops = flat(
+        _heading_section(
+            _read("docs/guides/operations.md"), "A native hook is quiet", "operations.md"
+        )
+    )
+    assert f"({pending} by default)" in ops
+    assert f"more than {pre_auth} were waiting" in ops
+    hooks = flat(
+        _heading_section(
+            _read("docs/guides/native-hooks.md"), "Daemon and fallback", "native-hooks.md"
+        )
+    )
+    assert f"more than {pre_auth} simultaneous connections" in hooks
