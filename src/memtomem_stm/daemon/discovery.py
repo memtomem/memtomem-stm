@@ -59,7 +59,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 from memtomem_stm.daemon.protocol import PROTOCOL_VERSION
 from memtomem_stm.utils import child_reaper
@@ -191,15 +191,30 @@ def read_handshake(path: Path) -> dict[str, Any] | None:
     return data
 
 
+@overload
 def iter_foreign_handshakes(
-    data_dir: Path, current_fingerprint: str
-) -> list[tuple[str, dict[str, Any]]]:
+    data_dir: Path, current_fingerprint: str, *, include_unreadable: Literal[False] = False
+) -> list[tuple[str, dict[str, Any]]]: ...
+
+
+@overload
+def iter_foreign_handshakes(
+    data_dir: Path, current_fingerprint: str, *, include_unreadable: Literal[True]
+) -> list[tuple[str, dict[str, Any] | None]]: ...
+
+
+def iter_foreign_handshakes(
+    data_dir: Path, current_fingerprint: str, *, include_unreadable: bool = False
+) -> list[tuple[str, dict[str, Any]]] | list[tuple[str, dict[str, Any] | None]]:
     """``(fingerprint, handshake)`` for every published daemon under a config
     fingerprint *other than* ``current_fingerprint``.
 
     Globs the per-config handshake files (``stm-daemon-<fp>.json``) under
     ``data_dir`` and parses each with :func:`read_handshake`, skipping the
-    current config's own file and any that are missing/unreadable/malformed. The
+    current config's own file and any that are missing/unreadable/malformed —
+    or, with ``include_unreadable``, yielding ``(fingerprint, None)`` for an
+    unreadable/malformed one, so a caller can still ask whether a daemon holds
+    that fingerprint's lock (#1245). The
     fingerprint is taken from the *filename* — the authoritative routing key that
     ``mms daemon status``/``stop`` derive from the config — so a corrupted
     in-file ``config_fingerprint`` that disagrees does not change which file a
@@ -217,13 +232,13 @@ def iter_foreign_handshakes(
         paths = sorted(base.glob(f"{HANDSHAKE_PREFIX}-*.json"))
     except OSError:
         return []
-    out: list[tuple[str, dict[str, Any]]] = []
+    out: list[tuple[str, dict[str, Any] | None]] = []
     for path in paths:
         fingerprint = path.stem.removeprefix(f"{HANDSHAKE_PREFIX}-")
         if fingerprint == current_fingerprint:
             continue
         data = read_handshake(path)
-        if data is None:
+        if data is None and not include_unreadable:
             continue
         out.append((fingerprint, data))
     return out

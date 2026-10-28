@@ -19,9 +19,12 @@ blocks a config-B hook from spawning the daemon it actually needs (config-drift
 coexistence). "Single owner" is therefore per-config — exactly one daemon *per
 distinct config*.
 
-Two access shapes:
+Three access shapes:
 - :func:`single_owner_lock` — a context manager for the *probe* (acquire,
   yield, release). Used by ``request_spawn`` and ``mms daemon start``.
+- :func:`probe_lifetime_lock` — the same probe for callers that must not read
+  "could not open the lock file" as "free": ``mms daemon stop``/``status``
+  judge whether a daemon is still running by it (#1245).
 - :func:`open_lock_fd` / :func:`try_lock` / :func:`release_lock` — the daemon
   holds an fd across its whole asyncio run, retrying ``try_lock`` with
   ``await asyncio.sleep`` and releasing on teardown.
@@ -33,6 +36,7 @@ the lock (the next probe finds it free and self-heals).
 
 from __future__ import annotations
 
+import enum
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -93,6 +97,50 @@ def single_owner_lock(path: Path) -> Iterator[bool]:
     try:
         acquired = _try_lock(fd)
         yield acquired
+    finally:
+        if acquired:
+            _unlock(fd)
+        os.close(fd)
+
+
+class LockProbe(enum.Enum):
+    """What one non-blocking look at a lifetime lock found."""
+
+    FREE = "free"
+    """Nobody held it. The probe holds it until its ``with`` block exits."""
+    HELD = "held"
+    """Someone holds it: a daemon (running, starting or tearing down) or a
+    short-lived prober. Not proof that any *recorded* pid is the holder."""
+    UNKNOWN = "unknown"
+    """The lock file could not be opened (``OSError``), so the question went
+    unanswered. Callers treat it like ``HELD`` wherever "free" would license a
+    cleanup or a "stopped" report."""
+
+
+@contextmanager
+def probe_lifetime_lock(path: Path) -> Iterator[LockProbe]:
+    """Take ``path``'s lock without blocking and yield what that found.
+
+    Unlike :func:`single_owner_lock`, an ``OSError`` opening the file is
+    yielded as :attr:`LockProbe.UNKNOWN` instead of raised. On Windows that
+    includes ``open_lock_fd`` failing to initialise a zero-length file whose
+    first byte another handle has locked — an older build that never wrote that
+    byte — so such a holder never reads as free.
+
+    On ``FREE`` the lock is held for the whole ``with`` block: work that must
+    not race a successor (removing a stale handshake) goes inside it. Keep the
+    block short — a daemon starting meanwhile only retries for
+    ``DaemonServer._LOCK_ACQUIRE_RETRY_SECONDS``.
+    """
+    try:
+        fd = _open_lock_fd(path)
+    except OSError:
+        yield LockProbe.UNKNOWN
+        return
+    acquired = False
+    try:
+        acquired = _try_lock(fd)
+        yield LockProbe.FREE if acquired else LockProbe.HELD
     finally:
         if acquired:
             _unlock(fd)

@@ -12,7 +12,13 @@ import pytest
 
 from memtomem_stm.config import STMConfig
 from memtomem_stm.daemon import discovery, protocol
-from memtomem_stm.daemon.locking import single_owner_lock
+from memtomem_stm.daemon.locking import (
+    lock_path,
+    open_lock_fd,
+    release_lock,
+    single_owner_lock,
+    try_lock,
+)
 
 
 # ── protocol ──────────────────────────────────────────────────────────────
@@ -1841,6 +1847,8 @@ class TestDaemonForeignOrphans:
                 "port": 4242,
                 "idle_shutdown_seconds": None,
                 "exits_when_idle": False,
+                "listening": True,
+                "lock": None,
             }
         ]
         assert "secret-token" not in result.output
@@ -2256,6 +2264,8 @@ class TestDaemonForeignOrphans:
                 "port": 4242,
                 "idle_shutdown_seconds": None,
                 "exits_when_idle": False,
+                "listening": True,
+                "lock": None,
             }
         ]
         assert "secret-token" not in result.output
@@ -2443,6 +2453,8 @@ class TestDaemonForeignOrphans:
                 "port": 4242,
                 "idle_shutdown_seconds": None,
                 "exits_when_idle": False,
+                "listening": True,
+                "lock": None,
             }
         ]
         # Endpoint gone → still nothing (no false positive from the always-True pid).
@@ -2529,12 +2541,713 @@ class TestDaemonForeignOrphans:
                     "port": port,
                     "idle_shutdown_seconds": None,
                     "exits_when_idle": False,
+                    "listening": True,
+                    "lock": None,
                 }
             ]
         finally:
             srv.close()
         # Endpoint now closed → the alive pid alone is not enough to report it.
         assert daemon_cmd._live_foreign_daemons(STMConfig()) == []
+
+
+class _LockHolder:
+    """Hold a lifetime lock on a second fd, as a daemon (or prober) would.
+
+    flock locks belong to the open file description, so this process's own
+    probe on another fd sees it as held."""
+
+    def __init__(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._fd: int | None = open_lock_fd(path)
+        assert try_lock(self._fd) is True
+
+    def release(self) -> None:
+        if self._fd is not None:
+            release_lock(self._fd)
+            self._fd = None
+
+
+def _current_lock_path() -> Path:
+    config = STMConfig()
+    return lock_path(config.data_dir.expanduser(), discovery.config_fingerprint(config))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock semantics")
+class TestStopJudgesByLifetimeLock:
+    """#1245 — ``stop`` must not take a daemon that has closed its listener for a
+    stale record while its lifetime lock is held: teardown removes the handshake
+    and only then releases the lock, and a starting daemon holds the lock before
+    it publishes."""
+
+    def _stale_current(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, alive=True):
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        _probe_all(monkeypatch, listening=False)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: alive)
+        monkeypatch.setattr(os, "kill", lambda pid, sig: pytest.fail("must not signal"))
+        return _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 1, "token": "t"})
+
+    def test_held_lock_keeps_the_record_and_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from click.testing import CliRunner
+
+        hs = self._stale_current(tmp_path, monkeypatch)
+        clock = _fake_stop_clock(monkeypatch)
+        holder = _LockHolder(_current_lock_path())
+        try:
+            result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+        finally:
+            holder.release()
+
+        assert result.exit_code == 1, result.output
+        assert hs.exists()
+        assert clock["polls"] > 0  # it waited
+        assert "recorded daemon pid=12345 is not accepting" in result.output
+        assert "lock is still held" in result.output
+        assert "cleaned stale handshake" not in result.output
+
+    def test_teardown_finishing_mid_wait_reports_stopped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from click.testing import CliRunner
+
+        hs = self._stale_current(tmp_path, monkeypatch)
+        holder = _LockHolder(_current_lock_path())
+        seen: list[bool] = []
+
+        def on_sleep(polls: int) -> None:
+            if polls == 3:
+                seen.append(hs.exists())  # not unlinked by stop while held
+                hs.unlink()  # the daemon's teardown...
+                holder.release()  # ...then serve() releases the lock
+
+        clock = _fake_stop_clock(monkeypatch, on_sleep)
+        try:
+            result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+        finally:
+            holder.release()
+
+        assert result.exit_code == 0, result.output
+        assert seen == [True]
+        assert clock["polls"] >= 3
+        assert "daemon stopped" in result.output
+        assert "cleaned stale handshake" not in result.output
+
+    def test_lock_released_with_record_left_cleans_it_after_release(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A daemon that died mid-start releases the lock and leaves the
+        predecessor's record: stale, but only once the lock is free."""
+        from click.testing import CliRunner
+
+        hs = self._stale_current(tmp_path, monkeypatch)
+        holder = _LockHolder(_current_lock_path())
+        seen: list[bool] = []
+
+        def on_sleep(polls: int) -> None:
+            if polls == 3:
+                seen.append(hs.exists())
+                holder.release()
+
+        _fake_stop_clock(monkeypatch, on_sleep)
+        try:
+            result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+        finally:
+            holder.release()
+
+        assert result.exit_code == 0, result.output
+        assert seen == [True]
+        assert not hs.exists()
+        assert "no responsive daemon pid=12345; cleaned stale handshake" in result.output
+
+    def test_handshake_gone_but_lock_held_keeps_waiting(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The lock is the terminal condition: a handshake already removed while
+        the lock is held is a teardown still running, not a stop."""
+        from click.testing import CliRunner
+
+        hs = self._stale_current(tmp_path, monkeypatch)
+        holder = _LockHolder(_current_lock_path())
+
+        def on_sleep(polls: int) -> None:
+            if polls == 1:
+                hs.unlink()
+
+        _fake_stop_clock(monkeypatch, on_sleep)
+        try:
+            result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+        finally:
+            holder.release()
+
+        assert result.exit_code == 1, result.output
+        assert "lock is still held" in result.output
+        assert "daemon stopped" not in result.output
+
+    def test_free_lock_unlinks_while_holding_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from pathlib import Path as _Path
+
+        from click.testing import CliRunner
+
+        hs = self._stale_current(tmp_path, monkeypatch)
+        lp = _current_lock_path()
+        real_unlink = _Path.unlink
+        observed: list[bool] = []
+
+        def spying_unlink(self, missing_ok=False):
+            if self == hs:
+                fd = open_lock_fd(lp)
+                try:
+                    observed.append(try_lock(fd))
+                finally:
+                    release_lock(fd)
+            return real_unlink(self, missing_ok=missing_ok)
+
+        monkeypatch.setattr(_Path, "unlink", spying_unlink)
+        result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+
+        assert result.exit_code == 0, result.output
+        assert observed == [False]  # a successor could not have taken the lock
+        assert not hs.exists()
+        assert "cleaned stale handshake" in result.output
+
+    def test_unopenable_lock_is_unknown_not_free(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from click.testing import CliRunner
+
+        hs = self._stale_current(tmp_path, monkeypatch)
+        _fake_stop_clock(monkeypatch)
+
+        def refuse(path):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr("memtomem_stm.daemon.locking._open_lock_fd", refuse)
+        result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+
+        assert result.exit_code == 1, result.output
+        assert hs.exists()
+        assert "lock could not be checked" in result.output
+        assert "still held" not in result.output
+
+    def test_dead_recorded_pid_does_not_skip_the_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A successor may own the fingerprint while its predecessor's record,
+        naming a dead pid, is still on disk."""
+        from click.testing import CliRunner
+
+        hs = self._stale_current(tmp_path, monkeypatch, alive=False)
+        _fake_stop_clock(monkeypatch)
+        holder = _LockHolder(_current_lock_path())
+        try:
+            result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+        finally:
+            holder.release()
+
+        assert result.exit_code == 1, result.output
+        assert hs.exists()
+
+    def test_no_handshake_waits_for_a_held_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        holder = _LockHolder(_current_lock_path())
+
+        def on_sleep(polls: int) -> None:
+            if polls == 2:
+                holder.release()
+
+        clock = _fake_stop_clock(monkeypatch, on_sleep)
+        try:
+            result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+        finally:
+            holder.release()
+
+        assert result.exit_code == 0, result.output
+        assert clock["polls"] >= 2
+        assert "no running daemon" in result.output
+
+    def test_no_handshake_and_no_lock_file_creates_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from click.testing import CliRunner
+
+        data_dir = tmp_path / "never-created"
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(data_dir))
+        _no_daemon(monkeypatch)
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+
+        assert result.exit_code == 0, result.output
+        assert "no running daemon" in result.output
+        assert not data_dir.exists()
+
+    def test_broken_lock_link_is_unknown_not_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """``exists`` reads a dangling or looping link as absent; the entry is
+        there, so the probe answers — and cannot open it."""
+        import json
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        _fake_stop_clock(monkeypatch)
+        lp = _current_lock_path()
+        lp.parent.mkdir(parents=True, exist_ok=True)
+        lp.symlink_to(lp)  # self-referential: open() raises ELOOP
+
+        result = CliRunner().invoke(_cli(), ["daemon", "stop"])
+        assert result.exit_code == 1, result.output
+        assert "lock could not be" in result.output
+        assert "no running daemon" not in result.output
+
+        status = CliRunner().invoke(_cli(), ["daemon", "status", "--json"])
+        assert (json.loads(status.output)["state"], json.loads(status.output)["lock"]) == (
+            "unknown",
+            "unknown",
+        )
+
+    def test_status_reports_lock_states(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        import json
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        _probe_all(monkeypatch, listening=False)
+
+        def status() -> dict:
+            result = CliRunner().invoke(_cli(), ["daemon", "status", "--json"])
+            assert result.exit_code == 0, result.output
+            return json.loads(result.output)
+
+        assert status()["state"] == "stopped"
+        holder = _LockHolder(_current_lock_path())
+        try:
+            assert (status()["state"], status()["lock"]) == ("starting", "held")
+            text = CliRunner().invoke(_cli(), ["daemon", "status"]).output
+            assert "no handshake yet, lock held" in text
+            _write_handshake({"pid": 12345, "host": "127.0.0.1", "port": 1, "token": "t"})
+            assert (status()["state"], status()["lock"]) == ("stale", "held")
+            text = CliRunner().invoke(_cli(), ["daemon", "status"]).output
+            assert "starting or shutting down" in text
+            assert "stale handshake" not in text
+        finally:
+            holder.release()
+        assert (status()["state"], status()["lock"]) == ("stale", "free")
+
+    def test_status_unreadable_handshake_reports_the_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        import json
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        current = discovery.config_fingerprint(STMConfig())
+        discovery.handshake_path(tmp_path, current).write_bytes(b'{"pid": "\xff"}')
+
+        def status() -> dict:
+            result = CliRunner().invoke(_cli(), ["daemon", "status", "--json"])
+            assert result.exit_code == 0, result.output
+            return json.loads(result.output)
+
+        assert (status()["handshake_unreadable"], status()["lock"]) == (True, "free")
+        holder = _LockHolder(_current_lock_path())
+        try:
+            assert status()["lock"] == "held"
+        finally:
+            holder.release()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock semantics")
+class TestForeignStopJudgesByLifetimeLock:
+    """#1245 — the foreign side: a daemon under another fingerprint that has
+    closed its listener but holds its lock is listed, never signalled, and
+    waited on."""
+
+    FP = "foreignfp000000"
+
+    def _foreign(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, listening=False):
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        _probe_all(monkeypatch, listening=listening)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        _put_handshake(tmp_path, self.FP, pid=98765)
+        return discovery.handshake_path(tmp_path, self.FP)
+
+    def test_lock_only_daemon_is_listed(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        import json
+
+        from click.testing import CliRunner
+
+        from memtomem_stm.cli import daemon_cmd
+
+        self._foreign(tmp_path, monkeypatch)
+        assert daemon_cmd._live_foreign_daemons(STMConfig()) == []  # lock free → stale
+        holder = _LockHolder(lock_path(tmp_path, self.FP))
+        try:
+            [entry] = daemon_cmd._live_foreign_daemons(STMConfig())
+            assert (entry["pid"], entry["listening"], entry["lock"]) == (98765, False, "held")
+            info = json.loads(CliRunner().invoke(_cli(), ["daemon", "status", "--json"]).output)
+            assert [d["fingerprint"] for d in info["foreign"]] == [self.FP]
+            text = CliRunner().invoke(_cli(), ["daemon", "status"]).output
+        finally:
+            holder.release()
+        assert "1 daemon(s) under a different config" in text
+        assert "running under a different config" not in text
+        assert "not accepting; lock held — starting or shutting down" in text
+        assert "nothing to stop" not in text
+        assert "waits for the others to finish" in text
+
+    def test_unreadable_record_with_held_lock_is_listed_without_a_pid(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from click.testing import CliRunner
+
+        from memtomem_stm.cli import daemon_cmd
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        discovery.handshake_path(tmp_path, self.FP).write_bytes(b'{"pid": "\xff"}')
+        holder = _LockHolder(lock_path(tmp_path, self.FP))
+        try:
+            [entry] = daemon_cmd._live_foreign_daemons(STMConfig())
+            text = CliRunner().invoke(_cli(), ["daemon", "status"]).output
+        finally:
+            holder.release()
+        assert (entry["pid"], entry["handshake_unreadable"], entry["lock"]) == (None, True, "held")
+        assert f"pid=? fp={self.FP} (handshake unreadable; lock held" in text
+
+    def test_unknown_lock_is_listed_as_unchecked(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from click.testing import CliRunner
+
+        self._foreign(tmp_path, monkeypatch)
+
+        def refuse(path):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr("memtomem_stm.daemon.locking._open_lock_fd", refuse)
+        text = CliRunner().invoke(_cli(), ["daemon", "status"]).output
+        assert "not accepting; lock could not be checked" in text
+
+    def test_stop_all_waits_on_lock_only_without_signalling(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from click.testing import CliRunner
+
+        hs = self._foreign(tmp_path, monkeypatch)
+        monkeypatch.setattr(os, "kill", lambda pid, sig: pytest.fail("must not signal"))
+        holder = _LockHolder(lock_path(tmp_path, self.FP))
+
+        def on_sleep(polls: int) -> None:
+            if polls == 2:
+                hs.unlink()
+                holder.release()
+
+        _fake_stop_clock(monkeypatch, on_sleep)
+        try:
+            result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+        finally:
+            holder.release()
+
+        assert result.exit_code == 0, result.output
+        assert "waiting for it without a signal" in result.output
+        assert f"daemon pid=98765 stopped (fp={self.FP})" in result.output
+
+    def test_lock_only_handshake_gone_but_lock_held_times_out(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The lock, not the handshake, ends a lock-only wait."""
+        from click.testing import CliRunner
+
+        hs = self._foreign(tmp_path, monkeypatch)
+        monkeypatch.setattr(os, "kill", lambda pid, sig: pytest.fail("must not signal"))
+        holder = _LockHolder(lock_path(tmp_path, self.FP))
+
+        def on_sleep(polls: int) -> None:
+            if polls == 1:
+                hs.unlink()
+
+        _fake_stop_clock(monkeypatch, on_sleep)
+        try:
+            result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+        finally:
+            holder.release()
+
+        assert result.exit_code == 1, result.output
+        assert "still holds its lock" in result.output
+        assert "stopped (fp=" not in result.output
+
+    def test_lock_only_lock_freed_with_record_left_succeeds_without_unlinking(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from click.testing import CliRunner
+
+        hs = self._foreign(tmp_path, monkeypatch)
+        monkeypatch.setattr(os, "kill", lambda pid, sig: pytest.fail("must not signal"))
+        holder = _LockHolder(lock_path(tmp_path, self.FP))
+
+        def on_sleep(polls: int) -> None:
+            if polls == 2:
+                holder.release()
+
+        _fake_stop_clock(monkeypatch, on_sleep)
+        try:
+            result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+        finally:
+            holder.release()
+
+        assert result.exit_code == 0, result.output
+        assert f"daemon pid=98765 stopped (fp={self.FP})" in result.output
+        assert hs.exists()  # foreign records are never unlinked
+
+    def test_listener_closing_after_enumeration_joins_the_wait(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The action-time re-probe used to ``continue`` silently and exit 0."""
+        from click.testing import CliRunner
+
+        self._foreign(tmp_path, monkeypatch, listening=True)
+        answers = iter([True])  # enumeration sees it accepting, the re-probe does not
+        monkeypatch.setattr(
+            "memtomem_stm.daemon.client.probe_listening",
+            lambda host, port, **kw: next(answers, False),
+        )
+        monkeypatch.setattr(os, "kill", lambda pid, sig: pytest.fail("must not signal"))
+        _fake_stop_clock(monkeypatch)
+        holder = _LockHolder(lock_path(tmp_path, self.FP))
+        try:
+            result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+        finally:
+            holder.release()
+
+        assert result.exit_code == 1, result.output
+        assert "still holds its lock" in result.output
+
+    def test_windows_reclassifies_a_closed_listener_before_refusing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A target that stopped accepting since the listing no longer needs a
+        signal, so Windows' refusal must not fire for it."""
+        from click.testing import CliRunner
+
+        hs = self._foreign(tmp_path, monkeypatch, listening=True)
+        answers = iter([True])  # enumeration sees it accepting, the re-probe does not
+        monkeypatch.setattr(
+            "memtomem_stm.daemon.client.probe_listening",
+            lambda host, port, **kw: next(answers, False),
+        )
+        monkeypatch.setattr("memtomem_stm.cli.daemon_cmd._can_force_terminate", lambda: False)
+        monkeypatch.setattr(os, "kill", lambda pid, sig: pytest.fail("must not signal"))
+        holder = _LockHolder(lock_path(tmp_path, self.FP))
+
+        def on_sleep(polls: int) -> None:
+            if polls == 2:
+                hs.unlink()
+                holder.release()
+
+        _fake_stop_clock(monkeypatch, on_sleep)
+        try:
+            result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+        finally:
+            holder.release()
+
+        assert result.exit_code == 0, result.output
+        assert "Windows cannot safely" not in result.output
+        assert f"daemon pid=98765 stopped (fp={self.FP})" in result.output
+
+    def test_mixed_targets_each_resolve(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        import signal as _signal
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        # aaaa accepts on port 7; bbbb (port 1) holds its lock only.
+        _put_handshake(tmp_path, "bbbb000000000000", pid=22222)
+        discovery.write_handshake(
+            discovery.handshake_path(tmp_path, "aaaa000000000000"),
+            pid=11111,
+            host="127.0.0.1",
+            port=7,
+            token="t",
+            config_fingerprint="aaaa000000000000",
+            created_at=0.0,
+            idle_shutdown_seconds=None,
+        )
+        monkeypatch.setattr(
+            "memtomem_stm.daemon.client.probe_listening", lambda host, port, **kw: port == 7
+        )
+        killed: list[tuple[int, int]] = []
+
+        def fake_kill(pid: int, sig: int) -> None:
+            killed.append((pid, sig))
+            discovery.handshake_path(tmp_path, "aaaa000000000000").unlink()
+
+        monkeypatch.setattr(os, "kill", fake_kill)
+        holder = _LockHolder(lock_path(tmp_path, "bbbb000000000000"))
+
+        def on_sleep(polls: int) -> None:
+            if polls == 3:
+                discovery.handshake_path(tmp_path, "bbbb000000000000").unlink()
+                holder.release()
+
+        _fake_stop_clock(monkeypatch, on_sleep)
+        try:
+            result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+        finally:
+            holder.release()
+
+        assert result.exit_code == 0, result.output
+        assert killed == [(11111, _signal.SIGTERM)]
+        assert "daemon pid=11111 stopped (fp=aaaa000000000000)" in result.output
+        assert "daemon pid=22222 stopped (fp=bbbb000000000000)" in result.output
+
+    def test_mixed_targets_share_one_budget(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """The signalled target finishes at 4 s; the lock-only one releases at
+        6 s. One shared 5 s budget times the second out — a wait that restarted
+        the budget for lock-only targets would report both stopped."""
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        _put_handshake(tmp_path, "bbbb000000000000", pid=22222)  # port 1: lock-only
+        discovery.write_handshake(
+            discovery.handshake_path(tmp_path, "aaaa000000000000"),
+            pid=11111,
+            host="127.0.0.1",
+            port=7,
+            token="t",
+            config_fingerprint="aaaa000000000000",
+            created_at=0.0,
+            idle_shutdown_seconds=None,
+        )
+        monkeypatch.setattr(
+            "memtomem_stm.daemon.client.probe_listening", lambda host, port, **kw: port == 7
+        )
+        monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+        holder = _LockHolder(lock_path(tmp_path, "bbbb000000000000"))
+        box: dict[str, dict[str, float]] = {}
+
+        def on_sleep(polls: int) -> None:
+            now = box["clock"]["t"]
+            if now >= 4.0:
+                discovery.handshake_path(tmp_path, "aaaa000000000000").unlink(missing_ok=True)
+            if now >= 6.0:
+                holder.release()
+
+        box["clock"] = _fake_stop_clock(monkeypatch, on_sleep)
+        try:
+            result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+        finally:
+            holder.release()
+
+        assert result.exit_code == 1, result.output
+        assert "daemon pid=11111 stopped (fp=aaaa000000000000)" in result.output
+        assert "pid=22222 (fp=bbbb000000000000) still holds its lock" in result.output
+        assert box["clock"]["t"] <= 5.1
+
+    def test_unknown_lock_timeout_says_unchecked(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from click.testing import CliRunner
+
+        self._foreign(tmp_path, monkeypatch)
+        monkeypatch.setattr(os, "kill", lambda pid, sig: pytest.fail("must not signal"))
+        _fake_stop_clock(monkeypatch)
+
+        def refuse(path):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr("memtomem_stm.daemon.locking._open_lock_fd", refuse)
+        result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+
+        assert result.exit_code == 1, result.output
+        assert "its lock could not be checked" in result.output
+        assert "still holds its lock" not in result.output
+
+    def test_windows_still_waits_on_lock_only(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from click.testing import CliRunner
+
+        hs = self._foreign(tmp_path, monkeypatch)
+        monkeypatch.setattr("memtomem_stm.cli.daemon_cmd._can_force_terminate", lambda: False)
+        monkeypatch.setattr(os, "kill", lambda pid, sig: pytest.fail("must not signal"))
+        holder = _LockHolder(lock_path(tmp_path, self.FP))
+
+        def on_sleep(polls: int) -> None:
+            if polls == 2:
+                hs.unlink()
+                holder.release()
+
+        _fake_stop_clock(monkeypatch, on_sleep)
+        try:
+            result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+        finally:
+            holder.release()
+
+        assert result.exit_code == 0, result.output
+        assert "Windows cannot safely" not in result.output
+        assert f"daemon pid=98765 stopped (fp={self.FP})" in result.output
+
+    def test_windows_mixed_reports_the_unsignallable_and_waits_on_the_rest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        monkeypatch.setattr("memtomem_stm.daemon.discovery.is_pid_alive", lambda pid: True)
+        monkeypatch.setattr("memtomem_stm.cli.daemon_cmd._can_force_terminate", lambda: False)
+        monkeypatch.setattr(os, "kill", lambda pid, sig: pytest.fail("must not signal"))
+        _put_handshake(tmp_path, "bbbb000000000000", pid=22222)  # port 1: lock-only
+        discovery.write_handshake(
+            discovery.handshake_path(tmp_path, "aaaa000000000000"),
+            pid=11111,
+            host="127.0.0.1",
+            port=7,
+            token="t",
+            config_fingerprint="aaaa000000000000",
+            created_at=0.0,
+            idle_shutdown_seconds=None,
+        )
+        monkeypatch.setattr(
+            "memtomem_stm.daemon.client.probe_listening", lambda host, port, **kw: port == 7
+        )
+        holder = _LockHolder(lock_path(tmp_path, "bbbb000000000000"))
+
+        def on_sleep(polls: int) -> None:
+            if polls == 2:
+                discovery.handshake_path(tmp_path, "bbbb000000000000").unlink()
+                holder.release()
+
+        _fake_stop_clock(monkeypatch, on_sleep)
+        try:
+            result = CliRunner().invoke(_cli(), ["daemon", "stop", "--all"])
+        finally:
+            holder.release()
+
+        assert result.exit_code == 1, result.output
+        assert "Windows cannot safely" in result.output
+        assert "daemon pid=22222 stopped (fp=bbbb000000000000)" in result.output
+        assert "pid=11111 stopped" not in result.output
 
 
 class TestDaemonRestartCli:
@@ -2599,15 +3312,66 @@ class TestDaemonRestartCli:
         config = STMConfig()
         lp = lock_path(config.data_dir.expanduser(), discovery.config_fingerprint(config))
         lp.parent.mkdir(parents=True, exist_ok=True)
-        with single_owner_lock(lp) as held:
-            assert held is True
+        spawns: list[object] = []
+        monkeypatch.setattr(
+            "memtomem_stm.daemon.spawn.request_spawn",
+            lambda config, *, propagate_errors=False: spawns.append(config) or True,
+        )
+        # The daemon accepted the shutdown and removed its handshake, but has
+        # not released its lifetime lock yet: ``stop`` is confirmed, and the
+        # wait that follows is restart's own.
+        held_fd: list[int] = []
+
+        async def fake_shutdown(config):
+            fd = open_lock_fd(lp)
+            assert try_lock(fd) is True
+            held_fd.append(fd)
+            return True
+
+        monkeypatch.setattr("memtomem_stm.daemon.client.shutdown", fake_shutdown)
+        try:
             result = CliRunner().invoke(_cli(), ["daemon", "restart"])
+        finally:
+            for fd in held_fd:
+                release_lock(fd)
 
         # Exit 1: the daemon is down and did not come back — a script driving
         # the documented upgrade flow must see the failure (was exit 0).
         assert result.exit_code == 1, result.output
+        assert "daemon stopped" in result.output
         assert "NOT restarted" in result.output
         assert "still shutting down" in result.output
+        assert spawns == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock semantics")
+    def test_held_lock_without_handshake_fails_stop_before_restart(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """#1245: no handshake but a held lifetime lock is a daemon starting or
+        finishing its teardown, so ``stop`` itself fails and ``restart`` never
+        reaches its own wait — and never spawns beside it."""
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+        _no_daemon(monkeypatch)
+        _fake_stop_clock(monkeypatch)
+        spawns: list[object] = []
+        monkeypatch.setattr(
+            "memtomem_stm.daemon.spawn.request_spawn",
+            lambda config, *, propagate_errors=False: spawns.append(config) or True,
+        )
+        config = STMConfig()
+        lp = lock_path(config.data_dir.expanduser(), discovery.config_fingerprint(config))
+        lp.parent.mkdir(parents=True, exist_ok=True)
+        with single_owner_lock(lp) as held:
+            assert held is True
+            result = CliRunner().invoke(_cli(), ["daemon", "restart"])
+
+        assert result.exit_code == 1, result.output
+        assert "daemon lock is held" in result.output
+        assert "no running daemon" not in result.output
+        assert "NOT restarted" not in result.output
+        assert spawns == []
 
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX SIGTERM fallback")
     def test_unconfirmed_sigterm_stop_does_not_start_a_replacement(
