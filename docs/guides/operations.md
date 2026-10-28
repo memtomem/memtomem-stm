@@ -152,13 +152,13 @@ build started.
 2. With the old build still installed, run `mms daemon stop`. `daemon stopped`
    means the daemon finished shutting down, and `no running daemon` that none
    was running for this config; in builds after 0.7.0 every other outcome
-   that is not confirmed exits 1, so follow its message. One exit-0 message
-   still needs a check: `no responsive daemon pid=N; cleaned stale handshake` is
-   also what a daemon already shutting down on its own (an idle timeout, say)
-   produces, so if you see it, check that the pid it names is gone (for
-   example `ps -p N`). 0.7.0 and earlier print that message without the pid
+   that is not confirmed exits 1, so follow its message, and
+   `no responsive daemon pid=N; cleaned stale handshake` means no daemon held
+   this config's lock. 0.7.0 and earlier also print that message for a daemon
+   already shutting down on its own (an idle timeout, say), without the pid,
    and remove the record it came from, so on those builds run
-   `mms daemon status` first and note the pid. They also exit 0 in two cases
+   `mms daemon status` first, note the pid, and check that it is gone (for
+   example `ps -p N`). They also exit 0 in two cases
    that are not confirmed: `sent SIGTERM to daemon pid=N` means it only
    signalled the process, so check that the pid is gone before going on; and
    a warning that the endpoint is still listening (Windows) means nothing was
@@ -167,14 +167,17 @@ build started.
    different config fingerprint than your shell, because `mms register` pins
    host-specific settings in the host's environment, and `status` lists it as
    running under a different config. With the hosts quit, nothing uses it: on
-   macOS and Linux, `mms daemon stop --all` sends each listed daemon SIGTERM.
-   In builds after 0.7.0 it then waits for each to finish shutting down and
-   exits 0 only if all of them did; 0.7.0 and earlier do not wait, so note
-   their pids and check that those processes are gone. On Windows, `--all`
-   does not signal them (and exits 1 in builds after 0.7.0); stop the owning
-   processes from Task Manager. A daemon leaves the `status` listing when it
-   stops listening, which is before it finishes shutting down, so an empty
-   listing is not that check.
+   macOS and Linux, `mms daemon stop --all` sends each listed daemon that
+   still accepts connections SIGTERM. In builds after 0.7.0 it then waits for
+   each to finish shutting down — and for one listed as not accepting, which
+   it never signals, to release its lock — and exits 0 only if all of them
+   did; 0.7.0 and earlier do not wait, so note their pids and check that those
+   processes are gone. On Windows, `--all` does not signal them (and exits 1
+   in builds after 0.7.0 when any listed daemon still accepts connections);
+   stop the owning processes from Task Manager. In builds after 0.7.0 a daemon stays in the
+   `status` listing until its teardown has removed its handshake, the last
+   step of shutting down; in 0.7.0 and earlier it leaves the listing when it
+   stops listening, before that, so there an empty listing is not that check.
 4. Upgrade every installation whose processes share a pending store
    (`pending_store_path`, `~/.memtomem/pending_selections.db` by default)
    before any of them starts again, then run `mms version` and `mms doctor`.

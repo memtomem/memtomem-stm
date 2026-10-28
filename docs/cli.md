@@ -1014,15 +1014,30 @@ running exits 1 instead of claiming the daemon has stopped, as does one whose
 handshake is still present but unreadable. `stop` reports "no running daemon"
 only when there is really no handshake for this config — a record it cannot
 parse could belong to a daemon that declined the graceful shutdown, so it
-exits 1 and points at `status` rather than inviting a replacement. When the
+exits 1 and points at `status` rather than inviting a replacement. With no
+handshake at all, `stop` still checks the config's lifetime lock: a daemon
+holds it from before it publishes its handshake until after its teardown
+removed it, so a held lock means one is starting or finishing, and `stop`
+waits up to 5 seconds for the lock to be released before it says "no running
+daemon", exiting 1 if it is not. When the
 graceful request is declined but the endpoint still accepts a connection,
 `stop` sends the recorded pid SIGTERM and waits for the same handshake removal,
 exiting 1 if teardown has not finished within 5 seconds or the pid cannot be
 signalled; on Windows, which has no such fallback, it exits 1 straight away.
-A handshake whose endpoint no longer accepts is removed as stale ("no
-responsive daemon pid=N; cleaned stale handshake", exit 0) without that wait, and a
-daemon already shutting down on its own has closed its listener too, so that
-message does not confirm a finished teardown.
+A handshake whose endpoint no longer accepts is stale only when no daemon holds
+the lock: a daemon shutting down on its own closes its listener before its
+teardown finishes. So `stop` waits up to 5 seconds for the lock. Once it is
+free, a handshake the daemon removed reports `daemon stopped`; one still there
+is removed while `stop` holds the lock, so a daemon starting at that moment
+cannot publish in between, and reported as "no responsive daemon pid=N;
+cleaned stale handshake" (exit 0). If the lock is still held, or cannot be
+checked, `stop` keeps the handshake and exits 1.
+
+`mms daemon status` reports this config's daemon as `running` (it answered a
+ping), `stale` (a handshake but no answer; `--json` adds `lock`: `held` means it
+is starting or shutting down, `free` that the record is left over, `unknown`
+that the lock could not be checked), `starting` (no handshake yet, lock held),
+`unknown` (no handshake, lock could not be checked) or `stopped`.
 
 Daemons are keyed by config, so `start`/`stop`/`restart` for one config never
 touch a daemon serving another config. `mms daemon status` lists every live
@@ -1042,14 +1057,30 @@ anything uses it now:
 - `idle timeout unknown` — the handshake does not say, usually because an
   earlier build that did not publish it started the daemon.
 
-Only the last two get the warning and the cleanup hint: if no running STM
+A daemon whose endpoint no longer accepts but whose lifetime lock is held is
+listed too, labelled `not accepting; lock held — starting or shutting down`
+(or `handshake unreadable; …` with `pid=?` when its record cannot be parsed,
+and `lock could not be checked` when the lock file cannot be opened). Such a
+list is never headed "running", and never answered with "nothing to stop".
+
+Only `never exits when idle`, `idle timeout unknown` and those entries get the
+warning and the cleanup hint: if no running STM
 process uses them, `mms daemon stop --all` SIGTERMs them — and every other
 daemon in the list, so it stays opt-in — then waits up to 5 seconds, shared
 across all of them, for each to remove its handshake, and exits 1 if any did
-not or could not be signalled. On Windows `stop --all` cannot signal by pid, so
-it exits 1, and the hint names Task Manager instead. In `status --json`, each `foreign`
+not or could not be signalled. A listed daemon that is not accepting is never
+signalled — its lock shows that some process owns the fingerprint, not that the
+recorded pid does — so `stop --all` waits on the same budget for its lock to be
+released instead, and exits 1 if it is not; the same goes for one that closes
+its listener between the listing and the signal. On Windows `stop --all` cannot
+signal by pid, so it exits 1 when any listed daemon is accepting, still waits on
+the others, and the hint names Task Manager instead. In `status --json`, each `foreign`
 entry carries `idle_shutdown_seconds` (a number, or `null` when there is none or
-it is unknown) and `exits_when_idle` (`true`, `false`, or `null` when unknown).
+it is unknown), `exits_when_idle` (`true`, `false`, or `null` when unknown),
+`listening` (`true` when its endpoint accepts), and `lock` (`"held"` or
+`"unknown"` for one that does not accept, `null` when not checked); an entry
+whose record is unreadable also has `handshake_unreadable: true` and `null`
+pid, host and port.
 Foreign daemon detection combines process liveness with a protocol-neutral TCP
 connect-probe, so older protocol generations are reported on supported POSIX
 and Windows hosts without sending them an incompatible frame.

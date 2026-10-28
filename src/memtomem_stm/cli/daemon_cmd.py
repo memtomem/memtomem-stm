@@ -9,7 +9,8 @@ proxy surfacing, avoiding one private LTM child per client. Subcommands:
 - ``stop``    — ask a running daemon to shut down (SIGTERM by pid as fallback)
   and wait for it to finish; ``--all`` also stops live daemons under any other
   config fingerprint. Exits nonzero when a stop it started is not confirmed.
-- ``status``  — running/stale/stopped, with pid/port/uptime/LTM warmth; also
+- ``status``  — running/stale/starting/unknown/stopped, with pid/port/uptime/LTM
+  warmth; ``stale`` and ``starting`` also say whether the lifetime lock is held; also
   lists live daemons under a different config fingerprint and whether each
   exits on its own once idle.
 - ``restart`` — ``stop`` then ``start``.
@@ -32,6 +33,7 @@ from typing import TYPE_CHECKING, Any
 
 import click
 
+from memtomem_stm.daemon.locking import LockProbe
 from memtomem_stm.logging_setup import (
     FILE_FORMAT,
     configure_stderr_logging,
@@ -40,6 +42,7 @@ from memtomem_stm.logging_setup import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from memtomem_stm.config import STMConfig
@@ -171,6 +174,18 @@ def _live_foreign_daemons(config: STMConfig) -> list[dict[str, Any]]:
     Cross-platform: the connect-probe is what makes Windows viable too, where
     :func:`is_pid_alive` is uninformative (returns ``True`` for any positive pid,
     no signal-0) — there the connect carries the whole signal (#519).
+
+    A record that fails the two-factor check is still listed when its
+    fingerprint's lifetime lock is not free (#1245): a daemon shutting down has
+    closed its listener before its teardown removes the handshake, and one
+    starting holds the lock before it publishes over a predecessor's record —
+    so this covers dead, alive and unreadable recorded pids alike. Those
+    entries carry ``listening: False`` and ``lock`` (``"held"``/``"unknown"``);
+    an unreadable record also has ``handshake_unreadable: True`` and ``None``
+    for every field it would have supplied. The lock proves *some* process owns
+    the fingerprint, not that the recorded pid does, so nothing signals them.
+    Accepting entries carry ``listening: True`` and ``lock: None`` (not
+    checked).
     """
     from memtomem_stm.daemon.client import probe_listening
     from memtomem_stm.daemon.discovery import (
@@ -178,28 +193,51 @@ def _live_foreign_daemons(config: STMConfig) -> list[dict[str, Any]]:
         is_pid_alive,
         iter_foreign_handshakes,
     )
+    from memtomem_stm.daemon.locking import lock_path
 
     current = config_fingerprint(config)
     live: list[dict[str, Any]] = []
-    for fingerprint, hs in iter_foreign_handshakes(config.data_dir, current):
+    for fingerprint, hs in iter_foreign_handshakes(
+        config.data_dir, current, include_unreadable=True
+    ):
+        if hs is None:
+            state = _probe_lock(lock_path(config.data_dir, fingerprint))
+            if state is not LockProbe.FREE:
+                live.append(
+                    {
+                        "fingerprint": fingerprint,
+                        "pid": None,
+                        "host": None,
+                        "port": None,
+                        "idle_shutdown_seconds": None,
+                        "exits_when_idle": None,
+                        "listening": False,
+                        "lock": state.value,
+                        "handshake_unreadable": True,
+                    }
+                )
+            continue
         pid = _as_int(hs.get("pid", -1))
         host = hs.get("host")
         port = hs.get("port")
+        idle_seconds, exits_when_idle = _idle_shutdown(hs)
+        entry: dict[str, Any] = {
+            "fingerprint": fingerprint,
+            "pid": pid,
+            "host": host,
+            "port": port,
+            "idle_shutdown_seconds": idle_seconds,
+            "exits_when_idle": exits_when_idle,
+        }
         # Cheap pid filter first (drops dead/garbage pids and, on POSIX, the
         # bulk of stale handshakes without a connect); the probe then confirms
         # something still accepts on the recorded endpoint.
         if is_pid_alive(pid) and probe_listening(host, port):
-            idle_seconds, exits_when_idle = _idle_shutdown(hs)
-            live.append(
-                {
-                    "fingerprint": fingerprint,
-                    "pid": pid,
-                    "host": host,
-                    "port": port,
-                    "idle_shutdown_seconds": idle_seconds,
-                    "exits_when_idle": exits_when_idle,
-                }
-            )
+            live.append({**entry, "listening": True, "lock": None})
+            continue
+        state = _probe_lock(lock_path(config.data_dir, fingerprint))
+        if state is not LockProbe.FREE:
+            live.append({**entry, "listening": False, "lock": state.value})
     return live
 
 
@@ -361,9 +399,10 @@ def stop_cmd(stop_all: bool) -> None:
     of them are stale: one may serve an STM process with a different environment.
 
     Exits 1 when a stop it started is not confirmed (its handshake not
-    removed) or could not be started. Exit 0 also covers a record cleaned up
-    as stale, which does not confirm a teardown: a daemon already shutting down
-    on its own has closed its listener and lands there too.
+    removed) or could not be started, and when a daemon of this config holds
+    its lifetime lock without accepting (starting, or shutting down past the
+    wait). A record is cleaned up as stale only while that lock is free, so a
+    daemon already shutting down on its own is waited for, not reported gone.
     """
     config = _load_config()
     current_stop_error: SystemExit | None = None
@@ -381,6 +420,8 @@ def stop_cmd(stop_all: bool) -> None:
 
 def _handshake_removed(path: Path) -> bool:
     """``True`` only when the handshake file is really gone.
+
+    Also asked of a lifetime lock file, before probing it would create one.
 
     ``read_handshake`` folds absent, unreadable and malformed into ``None``,
     which is what its readers want but the wrong question for a terminal
@@ -448,6 +489,41 @@ def _wait_handshakes_removed(paths: list[Path]) -> list[Path]:
         time.sleep(0.05)
 
 
+def _probe_lock(path: Path) -> LockProbe:
+    """One instantaneous look at a lifetime lock, released before returning."""
+    from memtomem_stm.daemon.locking import probe_lifetime_lock
+
+    with probe_lifetime_lock(path) as state:
+        return state
+
+
+def _wait_lock_free(path: Path, on_free: Callable[[], None] | None = None) -> LockProbe:
+    """Poll the lifetime lock at *path* until it is free or the stop budget runs out.
+
+    Returns :attr:`LockProbe.FREE`, or the last non-free answer on timeout.
+    ``on_free`` runs while the lock is held, so whatever it does to the
+    handshake cannot race a successor: one starting meanwhile waits for the
+    lock before it publishes. Never sleeps while holding it.
+
+    The lock, not the handshake, is the terminal condition here: a daemon
+    releases its lifetime lock only once ``serve`` has returned, after
+    teardown, so a handshake already gone while the lock is held is a daemon
+    still finishing — or one that has not published yet (#1245).
+    """
+    from memtomem_stm.daemon.locking import probe_lifetime_lock
+
+    deadline = time.time() + _STOP_WAIT_SECONDS
+    while True:
+        with probe_lifetime_lock(path) as state:
+            if state is LockProbe.FREE:
+                if on_free is not None:
+                    on_free()
+                return state
+        if time.time() >= deadline:
+            return state
+        time.sleep(0.05)
+
+
 def _stop_current_config_daemon(config: STMConfig) -> None:
     """Stop the daemon for *this* config (graceful, then SIGTERM-by-pid fallback)."""
     from memtomem_stm.daemon import client
@@ -457,8 +533,11 @@ def _stop_current_config_daemon(config: STMConfig) -> None:
         is_pid_alive,
         read_handshake,
     )
+    from memtomem_stm.daemon.locking import lock_path
 
-    hs_path = handshake_path(config.data_dir, config_fingerprint(config))
+    fp = config_fingerprint(config)
+    hs_path = handshake_path(config.data_dir, fp)
+    lock = lock_path(config.data_dir, fp)
     raw = read_handshake(hs_path)
     if asyncio.run(client.shutdown(config)):
         # The wire response means only "shutdown accepted". Teardown still has
@@ -504,6 +583,34 @@ def _stop_current_config_daemon(config: STMConfig) -> None:
                 err=True,
             )
             raise SystemExit(1)
+        # No handshake is not yet no daemon: one starting holds its lifetime
+        # lock while it builds the engine, before it publishes, and one
+        # finishing its teardown holds it until after the handshake is gone
+        # (#1245). A lock file that does not exist has no holder; checking
+        # first keeps a bare ``stop`` from creating the data dir. Asked with
+        # ``_handshake_removed`` (an ``lstat`` of the entry) rather than
+        # ``exists``, which reads a broken link as absent: that entry is there,
+        # and the probe — not this check — must answer for it.
+        if not _handshake_removed(lock):
+            state = _wait_lock_free(lock)
+            if state is LockProbe.HELD:
+                click.echo(
+                    _warn(
+                        "no handshake, but this config's daemon lock is held — a daemon "
+                        "is starting or shutting down; run `mms daemon status`"
+                    ),
+                    err=True,
+                )
+                raise SystemExit(1)
+            if state is LockProbe.UNKNOWN:
+                click.echo(
+                    _warn(
+                        "no handshake, and this config's daemon lock could not be "
+                        "checked — run `mms daemon status`"
+                    ),
+                    err=True,
+                )
+                raise SystemExit(1)
         click.echo("no running daemon")
         return
     pid = _as_int(raw.get("pid", -1))
@@ -551,13 +658,60 @@ def _stop_current_config_daemon(config: STMConfig) -> None:
                 err=True,
             )
             raise SystemExit(1)
-    try:
-        hs_path.unlink(missing_ok=True)
-    except OSError:
-        pass
-    # Names the pid: a daemon already shutting down on its own has closed its
-    # listener too, and this record is gone once we return.
+    # Not accepting is not stale: a daemon shutting down on its own has closed
+    # its listener before its teardown removes the handshake, and one starting
+    # holds the lock before it publishes over a predecessor's record. Only a
+    # free lifetime lock says no daemon owns this config, and the record goes
+    # while we hold it, so a successor cannot publish in between (#1245).
+    outcome: list[str] = []
+
+    def settle() -> None:
+        if _handshake_removed(hs_path):
+            outcome.append("stopped")
+            return
+        try:
+            hs_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        outcome.append("stale")
+
+    state = _wait_lock_free(lock, settle)
+    if state is LockProbe.HELD:
+        click.echo(
+            _warn(
+                f"recorded daemon pid={pid} is not accepting, but this config's daemon lock "
+                "is still held — a daemon is starting or shutting down; run "
+                "`mms daemon status`"
+            ),
+            err=True,
+        )
+        raise SystemExit(1)
+    if state is LockProbe.UNKNOWN:
+        click.echo(
+            _warn(
+                f"recorded daemon pid={pid} is not accepting, and this config's daemon lock "
+                "could not be checked — run `mms daemon status`"
+            ),
+            err=True,
+        )
+        raise SystemExit(1)
+    if outcome == ["stopped"]:
+        # It was finishing a teardown of its own; the daemon removed its
+        # record and released the lock.
+        click.echo(_ok("daemon stopped"))
+        return
     click.echo(_warn(f"no responsive daemon pid={pid}; cleaned stale handshake"))
+
+
+def _foreign_name(d: dict[str, Any]) -> str:
+    """``pid=N (fp=…)`` for a foreign entry; ``pid=?`` when its record is unreadable."""
+    pid = "?" if d["pid"] is None else d["pid"]
+    return f"pid={pid} (fp={d['fingerprint']})"
+
+
+def _foreign_stopped(d: dict[str, Any]) -> str:
+    pid = "?" if d["pid"] is None else d["pid"]
+    return f"daemon pid={pid} stopped (fp={d['fingerprint']})"
 
 
 def _stop_foreign_daemons(config: STMConfig) -> None:
@@ -570,7 +724,7 @@ def _stop_foreign_daemons(config: STMConfig) -> None:
     do not unlink it here (that could hide a survivor that ignored the signal) —
     its removal is what the wait after signalling counts as the stop. Exits 1
     when any target could not be signalled or did not finish within the budget,
-    and on Windows, which cannot signal them at all.
+    and on Windows for every target that would need a signal.
 
     Targets come from :func:`_live_foreign_daemons`, whose two-factor check
     (recorded pid alive *and* its endpoint accepting a connect) already rejects a
@@ -578,15 +732,82 @@ def _stop_foreign_daemons(config: STMConfig) -> None:
     signal an unrelated process in the common case. The residual is a double
     coincidence (pid recycled *and* its ephemeral port reassigned to another
     listener); ``--all`` stays opt-in for that narrow window.
+
+    A target that is not accepting but whose fingerprint's lifetime lock is
+    held — listed that way, or found that way by the action-time re-probe — is
+    never signalled: the lock does not say the recorded pid is its holder. It is
+    waited on instead, and it counts as stopped once that lock is free (#1245).
+    A daemon that was starting rather than stopping keeps the lock, so the wait
+    times out and the command exits 1 rather than signal it.
     """
     from memtomem_stm.daemon import client
     from memtomem_stm.daemon.discovery import handshake_path, is_pid_alive
+    from memtomem_stm.daemon.locking import lock_path
 
     foreign = _live_foreign_daemons(config)
     if not foreign:
         click.echo("no daemons running under a different config")
         return
-    if not _can_force_terminate():
+    can_signal = _can_force_terminate()
+    # Signal every target first, then wait on all of them against one budget:
+    # signalled ones until their handshake is removed, the others until their
+    # lifetime lock is free.
+    signalled: dict[Path, dict[str, Any]] = {}
+    lock_waits: dict[Path, dict[str, Any]] = {}
+    failed = False
+    unsignallable = False
+    for d in foreign:
+        fingerprint = d["fingerprint"]
+        hs_path = handshake_path(config.data_dir, fingerprint)
+        lp = lock_path(config.data_dir, fingerprint)
+        if d["listening"]:
+            pid = d["pid"]
+            # Re-confirm the *same* two-factor gate at action time, not just
+            # `is_pid_alive`: the daemon may have exited since enumeration and the
+            # OS recycled its pid onto an unrelated process. A pid-only recheck is
+            # too weak for that race (and a no-op on Windows, where is_pid_alive
+            # is always True), so re-run the connect-probe — a recycled pid's
+            # endpoint is gone. Runs before the platform check, so a target that
+            # no longer needs a signal is not reported as one Windows cannot send.
+            if not (is_pid_alive(pid) and client.probe_listening(d["host"], d["port"])):
+                state = _probe_lock(lp)
+                if state is LockProbe.FREE:
+                    if _handshake_removed(hs_path):
+                        click.echo(_ok(_foreign_stopped(d)))
+                    else:
+                        click.echo(
+                            f"daemon {_foreign_name(d)} is no longer accepting and its "
+                            "lock is free; left its record as stale"
+                        )
+                    continue
+                # Closed its listener since enumeration but still owns the
+                # fingerprint: shutting down (or a successor starting).
+                lock_waits[lp] = d
+                continue
+            if not can_signal:
+                unsignallable = True
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                # Gone before the signal, but its handshake may still be there:
+                # a daemon that crashed leaves it, so it joins the wait rather
+                # than counting as stopped.
+                signalled[hs_path] = d
+            except OSError:
+                click.echo(_warn(f"could not signal daemon {_foreign_name(d)}"), err=True)
+                failed = True
+            else:
+                click.echo(f"sent SIGTERM to daemon {_foreign_name(d)}")
+                signalled[hs_path] = d
+        else:
+            lock_waits[lp] = d
+    for d in lock_waits.values():
+        click.echo(
+            f"daemon {_foreign_name(d)} is not accepting but its lock is not free — "
+            "waiting for it without a signal"
+        )
+    if unsignallable:
         click.echo(
             _warn(
                 "found daemon(s) under a different config, but Windows cannot safely "
@@ -595,49 +816,60 @@ def _stop_foreign_daemons(config: STMConfig) -> None:
             ),
             err=True,
         )
-        raise SystemExit(1)
-    # Signal every target first, then wait on all of them against one budget.
-    waiting: dict[Path, dict[str, Any]] = {}
-    failed = False
-    for d in foreign:
-        pid = d["pid"]
-        # Re-confirm the *same* two-factor gate at action time, not just
-        # `is_pid_alive`: the daemon may have exited since enumeration and the OS
-        # recycled its pid onto an unrelated process. A pid-only recheck is too
-        # weak for that race (and a no-op on Windows, where is_pid_alive is always
-        # True), so re-run the connect-probe — a recycled pid's endpoint is gone.
-        if not (is_pid_alive(pid) and client.probe_listening(d["host"], d["port"])):
-            continue  # raced to exit / pid recycled between enumeration and now
-        hs_path = handshake_path(config.data_dir, d["fingerprint"])
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            # Gone before the signal, but its handshake may still be there:
-            # a daemon that crashed leaves it, so it joins the wait rather
-            # than counting as stopped.
-            waiting[hs_path] = d
-        except OSError:
+        failed = True
+    remaining_hs, remaining_locks = _wait_foreign_stops(list(signalled), list(lock_waits))
+    for path, d in signalled.items():
+        if path in remaining_hs:
             click.echo(
-                _warn(f"could not signal daemon pid={pid} (fp={d['fingerprint']})"), err=True
+                _warn(f"daemon {_foreign_name(d)} did not finish shutting down after SIGTERM"),
+                err=True,
             )
-            failed = True
         else:
-            click.echo(f"sent SIGTERM to daemon pid={pid} (fp={d['fingerprint']})")
-            waiting[hs_path] = d
-    remaining = set(_wait_handshakes_removed(list(waiting)))
-    for path, d in waiting.items():
-        if path in remaining:
+            click.echo(_ok(_foreign_stopped(d)))
+    for path, d in lock_waits.items():
+        if remaining_locks.get(path) is LockProbe.UNKNOWN:
             click.echo(
                 _warn(
-                    f"daemon pid={d['pid']} (fp={d['fingerprint']}) did not finish "
-                    "shutting down after SIGTERM"
+                    f"daemon {_foreign_name(d)} is not accepting and its lock could not be "
+                    "checked — run `mms daemon status`"
+                ),
+                err=True,
+            )
+        elif path in remaining_locks:
+            click.echo(
+                _warn(
+                    f"daemon {_foreign_name(d)} still holds its lock — it is starting or "
+                    "shutting down; run `mms daemon status`"
                 ),
                 err=True,
             )
         else:
-            click.echo(_ok(f"daemon pid={d['pid']} stopped (fp={d['fingerprint']})"))
-    if failed or remaining:
+            click.echo(_ok(_foreign_stopped(d)))
+    if failed or remaining_hs or remaining_locks:
         raise SystemExit(1)
+
+
+def _wait_foreign_stops(
+    handshakes: list[Path], locks: list[Path]
+) -> tuple[set[Path], dict[Path, LockProbe]]:
+    """One shared budget: wait until every handshake is removed and every lock
+    is free. Returns the handshakes still present and, for each lock still not
+    free, its last answer (``HELD`` or ``UNKNOWN``) — both empty when every
+    target confirmed."""
+    pending_hs = list(handshakes)
+    pending_locks = {p: LockProbe.HELD for p in locks}
+    deadline = time.time() + _STOP_WAIT_SECONDS
+    while True:
+        pending_hs = [p for p in pending_hs if not _handshake_removed(p)]
+        for p in list(pending_locks):
+            state = _probe_lock(p)
+            if state is LockProbe.FREE:
+                del pending_locks[p]
+            else:
+                pending_locks[p] = state
+        if (not pending_hs and not pending_locks) or time.time() >= deadline:
+            return set(pending_hs), pending_locks
+        time.sleep(0.05)
 
 
 # (snapshot key, status-line label) for every surface-series counter. The
@@ -664,6 +896,7 @@ def status_cmd(as_json: bool) -> None:
         is_pid_alive,
         read_handshake,
     )
+    from memtomem_stm.daemon.locking import lock_path
 
     config = _load_config()
     # The hook only reaches the daemon for eligible surfacing calls, so global
@@ -691,13 +924,18 @@ def status_cmd(as_json: bool) -> None:
             "standalone_will_use_daemon": standalone_use_daemon,
         }
     else:
-        hs_path = handshake_path(config.data_dir, config_fingerprint(config))
+        fp = config_fingerprint(config)
+        hs_path = handshake_path(config.data_dir, fp)
+        lp = lock_path(config.data_dir, fp)
         raw = read_handshake(hs_path)
         if raw is not None:
+            # Not answering a ping is not stale on its own: a daemon starting
+            # or finishing its teardown holds its lifetime lock (#1245).
             info = {
                 "state": "stale",
                 "pid": raw.get("pid"),
                 "pid_alive": is_pid_alive(_as_int(raw.get("pid", -1))),
+                "lock": _probe_lock(lp).value,
                 "hook_will_use_daemon": use_daemon,
                 "standalone_will_use_daemon": standalone_use_daemon,
             }
@@ -711,15 +949,24 @@ def status_cmd(as_json: bool) -> None:
             info = {
                 "state": "stale",
                 "handshake_unreadable": True,
+                "lock": _probe_lock(lp).value,
                 "hook_will_use_daemon": use_daemon,
                 "standalone_will_use_daemon": standalone_use_daemon,
             }
         else:
-            info = {
-                "state": "stopped",
-                "hook_will_use_daemon": use_daemon,
-                "standalone_will_use_daemon": standalone_use_daemon,
-            }
+            # No handshake: a daemon that has not published yet, or one past
+            # removing it, still holds the lock. A lock file that does not
+            # exist has no holder, and probing it would create it (see the
+            # same check in ``_stop_current_config_daemon``).
+            lock_state = LockProbe.FREE if _handshake_removed(lp) else _probe_lock(lp)
+            if lock_state is LockProbe.FREE:
+                info = {"state": "stopped"}
+            elif lock_state is LockProbe.HELD:
+                info = {"state": "starting", "lock": lock_state.value}
+            else:
+                info = {"state": "unknown", "lock": lock_state.value}
+            info["hook_will_use_daemon"] = use_daemon
+            info["standalone_will_use_daemon"] = standalone_use_daemon
 
     # Orthogonal to the current-config state: daemons under a different
     # fingerprint are invisible to the keyed paths above, so surface them here
@@ -784,6 +1031,20 @@ def status_cmd(as_json: bool) -> None:
     elif state == "stale" and info.get("handshake_unreadable"):
         # No pid line: reading the record is what failed.
         click.echo(_warn("handshake present but unreadable — daemon state unknown"))
+    elif state == "stale" and info["lock"] == LockProbe.HELD.value:
+        click.echo(
+            _warn(
+                f"daemon not answering (recorded pid={info['pid']}), lock held — "
+                "starting or shutting down"
+            )
+        )
+    elif state == "stale" and info["lock"] == LockProbe.UNKNOWN.value:
+        click.echo(
+            _warn(
+                f"daemon not answering (recorded pid={info['pid']}), and its lock could "
+                "not be checked — state unknown"
+            )
+        )
     elif state == "stale":
         click.echo(
             _warn(
@@ -791,6 +1052,10 @@ def status_cmd(as_json: bool) -> None:
                 "daemon not answering"
             )
         )
+    elif state == "starting":
+        click.echo(_warn("no handshake yet, lock held — a daemon is starting or shutting down"))
+    elif state == "unknown":
+        click.echo(_warn("no handshake, and the daemon lock could not be checked — state unknown"))
     else:
         click.echo("stopped")
     if use_daemon:
@@ -813,6 +1078,14 @@ def status_cmd(as_json: bool) -> None:
 
 
 def _foreign_idle_label(daemon: dict[str, Any]) -> str:
+    if not daemon["listening"]:
+        if daemon.get("handshake_unreadable"):
+            prefix = "handshake unreadable"
+        else:
+            prefix = "not accepting"
+        if daemon["lock"] == LockProbe.UNKNOWN.value:
+            return f"{prefix}; lock could not be checked"
+        return f"{prefix}; lock held — starting or shutting down"
     exits_when_idle = daemon["exits_when_idle"]
     if exits_when_idle is True:
         return f"exits after {daemon['idle_shutdown_seconds']:g}s idle"
@@ -833,18 +1106,32 @@ def _render_foreign(foreign: list[dict[str, Any]]) -> None:
     the daemon; they say whether it can outlive its users.
     """
     listing = ", ".join(
-        f"pid={d['pid']} fp={d['fingerprint']} ({_foreign_idle_label(d)})" for d in foreign
+        f"pid={'?' if d['pid'] is None else d['pid']} fp={d['fingerprint']} "
+        f"({_foreign_idle_label(d)})"
+        for d in foreign
     )
-    line = f"{len(foreign)} daemon(s) running under a different config: {listing}"
-    if all(d["exits_when_idle"] is True for d in foreign):
+    # One not accepting may be a daemon still starting, so the ones that are
+    # neither listen nor promise to exit get neither "running" nor "nothing to
+    # stop" (#1245).
+    all_listening = all(d["listening"] for d in foreign)
+    if all_listening:
+        line = f"{len(foreign)} daemon(s) running under a different config: {listing}"
+    else:
+        line = f"{len(foreign)} daemon(s) under a different config: {listing}"
+    if all_listening and all(d["exits_when_idle"] is True for d in foreign):
         click.echo(line)
         click.echo("each exits on its own once idle; nothing to stop")
         return
     click.echo(_warn(line))
-    if _can_force_terminate():
+    if _can_force_terminate() and all_listening:
         click.echo(
             "if no running STM process uses them, stop them with `mms daemon stop --all` "
             "(it stops every daemon listed above)"
+        )
+    elif _can_force_terminate():
+        click.echo(
+            "if no running STM process uses them, `mms daemon stop --all` signals the "
+            "accepting ones and waits for the others to finish"
         )
     else:
         # ``stop --all`` refuses to signal by pid on Windows

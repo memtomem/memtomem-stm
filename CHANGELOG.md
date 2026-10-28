@@ -16,6 +16,9 @@ changes inline only. See the deprecation policy in
 - **`mms daemon stop` exits 1 when it cannot confirm a stop, and can wait up
   to 5 seconds longer for a signalled daemon (10 with `--all`).** After `sent SIGTERM`, scripts now get exit 0 only
   once that daemon finished shutting down. (#1238)
+- **`mms daemon stop` and `mms daemon restart` exit 1 when this config's daemon
+  lock is still held after a 5-second wait** — a daemon starting or shutting
+  down — where they used to remove its record as stale and exit 0. (#1245)
 
 ### Changed
 
@@ -32,6 +35,30 @@ changes inline only. See the deprecation policy in
   With `--all`, the current config's wait and the foreign wait run one after
   the other, so it waits up to 10 seconds for teardown. `mms daemon restart`
   no longer starts a replacement after such a stop. (#1238)
+
+### Fixed
+
+- `mms daemon stop` no longer takes a daemon that is already shutting down for
+  a stale record. It decided "stale" from the listener, which a daemon closes
+  before its teardown finishes, so it reported success mid-teardown and deleted
+  the handshake a concurrent `stop` was waiting on. It now judges by the
+  config's lifetime lock, which a daemon holds from before it publishes its
+  handshake until after its teardown: a record is removed as stale only while
+  that lock is free, and with `stop` holding it, so a starting daemon cannot
+  publish in between; a held lock is waited on for up to 5 seconds, and
+  `daemon stopped` is reported once it is released with the handshake gone.
+  The same check runs with no handshake
+  at all, for a daemon that has not published one yet. `stop --all` and
+  `status` list a foreign daemon that has closed its listener but holds its
+  lock, never signal it, and `--all` waits for its lock instead; `status`
+  reports this config's daemon as `starting` or `unknown` when there is no
+  handshake but the lock is held or cannot be checked, and adds `lock` to a
+  `stale` one. **Behavior change**: `stop`, and `restart` through it, exit 1
+  instead of 0 when this config's lock is still held, or cannot be checked,
+  after the wait; `stop --all` exits 1 for a foreign daemon whose lock is still
+  held, including one whose listener closed after the listing, which it used
+  to skip; foreign entries in `status --json` gain `listening` and `lock`.
+  (#1245)
 
 ## [0.7.0] — 2026-10-27
 
