@@ -20,6 +20,10 @@ changes inline only. See the deprecation policy in
   dedup then held its match back for `surfacing.dedup_ttl_seconds`. The call
   now waits for that report, within the existing surfacing timeout. Calls
   through the shared daemon were not affected. (#1257)
+- The text `queue:` line of `mms daemon status` now shows
+  `pre_auth_evictions=`, the connections the daemon closed before reading
+  their auth frame. Only `--json` showed it, and those drops reach the hook as
+  an unreachable daemon rather than `busy`. (#1256)
 - On Windows, a process that opens a fresh lock file just after another one
   has initialised and locked it now goes on to its usual lock-contention
   handling instead of failing to open it. A daemon that lost this race exited

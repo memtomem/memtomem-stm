@@ -3268,6 +3268,8 @@ def test_daemon_docs_state_the_admission_and_pre_auth_budgets() -> None:
         f"at most {pre_auth} connections",
         "`queue.busy_rejections`",
         "`queue.pre_auth_evictions`",
+        "`mms daemon status` counts these as `queue.pre_auth_evictions` "
+        "(`pre_auth_evictions=` on the text `queue:` line).",
     ):
         assert needed in section, f"docs/configuration.md Surfacing Daemon lost {needed!r}"
 
@@ -3278,6 +3280,9 @@ def test_daemon_docs_state_the_admission_and_pre_auth_budgets() -> None:
     )
     assert f"({pending} by default)" in ops
     assert f"more than {pre_auth} were waiting" in ops
+    assert (
+        "(the text `queue:` line shows both as `busy_rejections=` and `pre_auth_evictions=`)" in ops
+    )
     hooks = flat(
         _heading_section(
             _read("docs/guides/native-hooks.md"), "Daemon and fallback", "native-hooks.md"
