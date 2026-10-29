@@ -9,7 +9,35 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
-## [Unreleased]
+## [0.7.2] — 2026-10-29
+
+### Upgrade notes
+
+- **`mms selection replay` refuses a dataset that is sensitive once decoded**
+  (`dataset matched sensitive-content patterns`, exit 1), such as a label
+  written as `\u0070assword`; 0.7.1 ran it. Remove the matching text from the
+  dataset. (#1240)
+- **`mms daemon stop --all` exits 1 when `data_dir` exists but cannot be
+  listed,** and stops none of the foreign daemons there; this config's own
+  daemon is handled as before. `mms daemon status --json` reports
+  `"foreign": null` with `"foreign_error"` there instead of `[]`. (#1249)
+- **On Windows, a daemon from 0.1.38 or earlier that is not answering is shown
+  as holding its lock** (`"lock": "held"`) instead of `"unknown"`. Exit codes
+  are unchanged. (#1248, #1253)
+- **The text `mms daemon status` `queue:` line ends with
+  `pre_auth_evictions=<n>`.** Scripts parsing that line should allow the new
+  field; `--json` is unchanged. (#1256)
+- **A call made while the LTM connection is still starting waits for it,**
+  within the surfacing timeout. From a Core that supports composition, it
+  then gets Pinned Context and the adjacent window instead of legacy
+  search. Calls through the shared daemon are unchanged. (#1257)
+- **`mms tune` and `stm_admin` `tuning_recommendations` suggest different
+  `max_result_chars` changes.** From `missing_example` feedback, they can now
+  suggest a raise for a `progressive` tool under `delivery_format:
+  "structured"`. They no longer suggest a cut for a tool whose dominant
+  feedback, over three or more reports, is `missing_example`, nor any budget
+  change for a tool inheriting a server token budget under
+  `token_estimation_mode: "unicode"`. (#1239, #1262)
 
 ### Changed
 
@@ -54,6 +82,9 @@ changes inline only. See the deprecation policy in
   value by value. It checked only the file's raw text, so a label written with
   JSON escapes (`\u0070assword`) passed the check and reached the evaluator
   decoded. (#1240)
+  **Behavior change**: `mms selection replay` refuses a `--dataset` whose
+  decoded text matches those patterns (`dataset matched sensitive-content
+  patterns`, exit 1), where 0.7.1 ran it.
 - A proxied call that arrives while the LTM connection is still starting now
   gets Pinned Context and the adjacent context window. Surfacing chose between
   Core's context composition and legacy search before the LTM had reported
@@ -61,10 +92,15 @@ changes inline only. See the deprecation policy in
   dedup then held its match back for `surfacing.dedup_ttl_seconds`. The call
   now waits for that report, within the existing surfacing timeout. Calls
   through the shared daemon were not affected. (#1257)
+  **Behavior change**: such a call waits for the LTM to finish starting,
+  within the surfacing timeout, and then gets the composed context Core
+  supports instead of legacy search results.
 - The text `queue:` line of `mms daemon status` now shows
   `pre_auth_evictions=`, the connections the daemon closed before reading
   their auth frame. Only `--json` showed it, and those drops reach the hook as
   an unreachable daemon rather than `busy`. (#1256)
+  **Behavior change**: the text `queue:` line gains a trailing
+  `pre_auth_evictions=<n>` field; `--json` is unchanged.
 - On Windows, a process that opens a fresh lock file just after another one
   has initialised and locked it now goes on to its usual lock-contention
   handling instead of failing to open it. A daemon that lost this race exited
@@ -82,8 +118,8 @@ changes inline only. See the deprecation policy in
   example, no read permission); the daemons there are reported as unknown.
   (#1249)
   **Behavior change**: in that case `mms daemon stop --all` exits 1 (it exited
-  0) and stops none of them, `mms daemon status --json` reports `"foreign":
-  null` with `"foreign_error"` naming the error class (it reported `[]`), and
+  0) and stops none of the foreign ones, `mms daemon status --json` reports
+  `"foreign": null` with `"foreign_error"` naming the error class (it reported `[]`), and
   `mms daemon status` prints a warning instead of no list. A `data_dir` that
   does not exist still reports none.
 
