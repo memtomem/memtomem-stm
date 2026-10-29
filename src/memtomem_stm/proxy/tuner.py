@@ -17,6 +17,7 @@ from memtomem_stm.proxy.config import (
     ProxyConfig,
     TokenEstimationMode,
     effective_compression_pair,
+    effective_delivery_format,
     effective_max_result_chars,
     effective_token_estimation_mode,
 )
@@ -230,6 +231,22 @@ class CompressionTuner:
         # passthrough nor explicit progressive delivery consumes it (#1042).
         # Consult current configuration: the samples may predate a strategy edit.
         budget_applies = not token_governed and current_strategy not in ("none", "progressive")
+        # Structured progressive delivery does read it: the budget caps the
+        # serialized frames, the first one before optional supplements (#1239).
+        # Only H4 may advise on that cap. H1 rests on violations, which an
+        # explicitly progressive call never records, so it would fire only on
+        # rows from an earlier strategy. H2's ratio leaves out every call that
+        # produced a frame, so its "responses fit" is measured on the calls the
+        # budget did not shape, and its reduction would shrink frames it never
+        # saw. H4 rests on agent reports, and its raise takes effect wherever
+        # the cap binds, as it can on heavily JSON-escaped text. Whether the cap
+        # or ``progressive.chunk_size`` binds depends on the payload, so a raise
+        # can leave the first frame unchanged; tune cannot tell from a profile.
+        feedback_budget_applies = budget_applies or (
+            not token_governed
+            and current_strategy == "progressive"
+            and self._current_delivery_format(p.server, p.tool) == "structured"
+        )
 
         # H1: High violation rate → increase budget
         if p.violation_rate > VIOLATION_RATE_THRESHOLD and budget_applies:
@@ -335,10 +352,12 @@ class CompressionTuner:
         if p.feedback_count >= MIN_FEEDBACK_REPORTS and p.feedback_dominant_kind:
             fb_action = _feedback_recommendation(p, current_max)
             # Its "missing_example" branch recommends a budget, so it is subject
-            # to the same rule as H1/H2 (``_current_budget``: a token budget the
-            # per-tool ``max_result_chars`` that ``--apply`` writes cannot be
-            # judged against). Its ``compression`` recommendation is unaffected.
-            if fb_action and (fb_action.field != "max_result_chars" or budget_applies):
+            # to the same token rule as H1/H2 (``_current_budget``: a token
+            # budget the per-tool ``max_result_chars`` that ``--apply`` writes
+            # cannot be judged against), and to their strategy rule except for
+            # structured progressive (above). Its ``compression``
+            # recommendation is unaffected.
+            if fb_action and (fb_action.field != "max_result_chars" or feedback_budget_applies):
                 actions.append(fb_action)
                 # Its reason reports the feedback count, and that is what it
                 # rests on: three reports against twenty-five calls are three
@@ -386,6 +405,15 @@ class CompressionTuner:
             return max_chars, True
         mode = effective_token_estimation_mode(srv, override, self._config)
         return max_chars, mode == TokenEstimationMode.UNICODE
+
+    def _current_delivery_format(self, server: str, tool: str) -> str | None:
+        """The delivery format this tool's calls run under, tool → server → global."""
+        if not self._config:
+            return None
+        srv = self._config.upstream_servers.get(server)
+        if not srv:
+            return None
+        return effective_delivery_format(srv, srv.tool_overrides.get(tool), self._config)
 
     def _current_strategy(self, server: str, tool: str) -> str | None:
         """The strategy this tool's calls actually run under.

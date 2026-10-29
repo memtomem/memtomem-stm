@@ -11,6 +11,24 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Changed
+
+- `mms tune` can now suggest a `max_result_chars` raise for a tool on the
+  `progressive` strategy under `delivery_format: "structured"`, from
+  `missing_example` feedback. Under structured delivery that budget caps the
+  serialized size of each frame (the first one before optional supplements):
+  on heavily JSON-escaped text, a first frame delivered 1898 of a 4000-char
+  chunk under an 8000 budget and 3898 under 16000.
+  The violation and ratio heuristics stay suppressed for such a tool: an
+  explicitly progressive call records no violations, and the ratio leaves out
+  every call that produced a frame, so a reduction would shrink frames it
+  never measured. (#1239)
+  **Behavior change**: `mms tune` and `stm_admin` `tuning_recommendations`
+  can suggest a budget change for structured progressive tools, which they
+  never did before. When `progressive.chunk_size` is what limits the first
+  frame, applying it leaves that frame unchanged; continuations can still
+  grow.
+
 ### Fixed
 
 - `mms tune` no longer suggests cutting a budget under a reason that says to
