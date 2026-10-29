@@ -15,8 +15,10 @@ from memtomem_stm.proxy.compression_feedback_store import CompressionFeedbackSto
 from memtomem_stm.proxy.config import (
     CompressionStrategy,
     ProxyConfig,
+    TokenEstimationMode,
     effective_compression_pair,
     effective_max_result_chars,
+    effective_token_estimation_mode,
 )
 from memtomem_stm.proxy.metrics_store import MetricsStore
 
@@ -36,6 +38,12 @@ OVER_GENEROUS_RATIO = 0.95
 
 STRATEGY_PIN_THRESHOLD = 0.80
 """Recommend pinning strategy when one dominates above this fraction."""
+
+MIN_FEEDBACK_REPORTS = 3
+"""Feedback reports needed before their dominant kind informs a recommendation."""
+
+FEEDBACK_EXAMPLE_BUDGET = 16000
+"""Smallest budget the missing-example heuristic recommends."""
 
 SETTABLE_STRATEGIES = frozenset(s.value for s in CompressionStrategy)
 """Labels a ``compression`` key accepts.
@@ -242,12 +250,22 @@ class CompressionTuner:
                     )
                 )
 
+        # Reports that examples are missing contradict "responses nearly
+        # always fit", whether or not H4 below still has a raise to offer: a
+        # budget that already covers p95 leaves H4 silent, and the reduction
+        # would then be the only budget advice left.
+        missing_example_reported = (
+            p.feedback_count >= MIN_FEEDBACK_REPORTS
+            and p.feedback_dominant_kind == "missing_example"
+        )
+
         # H2: Over-generous budget → reduce budget
         if (
             p.avg_ratio is not None
             and p.avg_ratio > OVER_GENEROUS_RATIO
             and p.violation_count == 0
             and budget_applies
+            and not missing_example_reported
         ):
             recommended = max(
                 int(p.p95_original_chars * 1.1),
@@ -314,12 +332,12 @@ class CompressionTuner:
                 evidence = min(evidence, p.auto_strategy_count)
 
         # H4: Feedback-driven — dominant kind informs strategy
-        if p.feedback_count >= 3 and p.feedback_dominant_kind:
-            fb_action = _feedback_recommendation(p)
+        if p.feedback_count >= MIN_FEEDBACK_REPORTS and p.feedback_dominant_kind:
+            fb_action = _feedback_recommendation(p, current_max)
             # Its "missing_example" branch recommends a budget, so it is subject
-            # to the same rule as H1/H2: a per-tool token budget outranks the
-            # per-tool ``max_result_chars`` that ``--apply`` writes. Its
-            # ``compression`` recommendation is unaffected.
+            # to the same rule as H1/H2 (``_current_budget``: a token budget the
+            # per-tool ``max_result_chars`` that ``--apply`` writes cannot be
+            # judged against). Its ``compression`` recommendation is unaffected.
             if fb_action and (fb_action.field != "max_result_chars" or budget_applies):
                 actions.append(fb_action)
                 # Its reason reports the feedback count, and that is what it
@@ -339,10 +357,21 @@ class CompressionTuner:
         the model-aware global, so H1 could "increase" a budget to less than it
         already was, and H2 "reduce" it to more.
 
-        The flag is true when a PER-TOOL token budget is in force. H1 and H2
-        recommend a per-tool `max_result_chars`, which that budget outranks, so
-        their advice would be an edit with no effect — they skip instead. A
-        server-level token budget does not count: the per-tool write clears it.
+        The flag is true when tokens rule in a way a per-tool
+        ``max_result_chars`` cannot be judged against, and every budget
+        heuristic skips then:
+
+        - A PER-TOOL token budget outranks the field being written, so the
+          advice would be an edit with no effect.
+        - An inherited server token budget under ``unicode`` estimation derives
+          each response's char budget from that response, so the returned
+          number is not the budget calls ran under. The write clears the token
+          budget, and a "raise" from the nominal value can cut the budget a
+          long response actually had.
+
+        An inherited server token budget under ``static`` estimation does not
+        count: it converts to this fixed char budget, and the per-tool write
+        supersedes it.
         """
         if not self._config:
             return None, False
@@ -350,14 +379,13 @@ class CompressionTuner:
         if not srv:
             return None, False
         override = srv.tool_overrides.get(tool)
-        max_chars, _ = effective_max_result_chars(srv, override, self._config)
-        # ``mms tune --apply`` writes recommendations as PER-TOOL overrides, and
-        # a per-tool ``max_result_chars`` clears an inherited server token
-        # budget — so an action is a no-op only against a per-tool token
-        # budget, which outranks the field being written. A server-level one is
-        # superseded by the write, and suppressing there would withhold advice
-        # that works.
-        return max_chars, override is not None and override.max_result_tokens is not None
+        max_chars, token_budget = effective_max_result_chars(srv, override, self._config)
+        if token_budget is None:
+            return max_chars, False
+        if override is not None and override.max_result_tokens is not None:
+            return max_chars, True
+        mode = effective_token_estimation_mode(srv, override, self._config)
+        return max_chars, mode == TokenEstimationMode.UNICODE
 
     def _current_strategy(self, server: str, tool: str) -> str | None:
         """The strategy this tool's calls actually run under.
@@ -396,7 +424,7 @@ def _confidence(observations: int) -> str:
     return "low"
 
 
-def _feedback_recommendation(p: ToolProfile) -> TuningAction | None:
+def _feedback_recommendation(p: ToolProfile, current_max: int | None) -> TuningAction | None:
     kind = p.feedback_dominant_kind
     if kind == "truncated":
         return TuningAction(
@@ -419,10 +447,15 @@ def _feedback_recommendation(p: ToolProfile) -> TuningAction | None:
             ),
         )
     if kind == "missing_example":
+        recommended = max(p.p95_original_chars, FEEDBACK_EXAMPLE_BUDGET)
+        # The advice is a raise. Against a budget already at or above it, the
+        # per-tool write would cut the budget the reports say is too small.
+        if current_max is not None and recommended <= current_max:
+            return None
         return TuningAction(
             field="max_result_chars",
-            current=None,
-            recommended=str(max(p.p95_original_chars, 16000)),
+            current=str(current_max) if current_max else None,
+            recommended=str(recommended),
             reason=(
                 f"{p.feedback_count} feedback reports, dominant kind "
                 f'"{kind}" — increase budget to preserve examples'

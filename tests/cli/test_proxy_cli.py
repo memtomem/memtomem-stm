@@ -18975,6 +18975,90 @@ class TestTune:
             assert (backups[0].stat().st_mode & 0o777) == 0o600
         assert str(backups[0]) in result.output  # restore hint names the backup
 
+    @staticmethod
+    def _seed_missing_example(config: Path, tmp_path: Path, budget: int) -> None:
+        """Ten 2000-char calls kept whole, and three missing-example reports."""
+        from memtomem_stm.proxy.compression_feedback_store import CompressionFeedbackStore
+        from memtomem_stm.proxy.metrics import CallMetrics
+        from memtomem_stm.proxy.metrics_store import MetricsStore
+
+        metrics_db = tmp_path / "metrics.db"
+        feedback_db = tmp_path / "cfb.db"
+        config.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "upstream_servers": {
+                        "srv": {
+                            "prefix": "s",
+                            "command": "npx",
+                            "compression": "truncate",
+                            "max_result_chars": budget,
+                        }
+                    },
+                    "metrics": {"db_path": str(metrics_db)},
+                    "compression_feedback": {"db_path": str(feedback_db), "retention_days": 30},
+                }
+            ),
+            encoding="utf-8",
+        )
+        metrics = MetricsStore(metrics_db)
+        metrics.initialize()
+        try:
+            for _ in range(10):
+                metrics.record(
+                    CallMetrics(
+                        server="srv",
+                        tool="t",
+                        original_chars=2000,
+                        compressed_chars=2000,
+                        cleaned_chars=2000,
+                        compression_strategy="truncate",
+                        compression_accounting="initial_response_v1",
+                    )
+                )
+        finally:
+            metrics.close()
+        feedback = CompressionFeedbackStore(feedback_db, retention_days=0)
+        feedback.initialize()
+        try:
+            for i in range(3):
+                feedback.record("srv", "t", "missing_example", f"report {i}", None)
+        finally:
+            feedback.close()
+
+    def test_missing_example_feedback_does_not_apply_a_cut(self, runner, config, tmp_path):
+        """A 50000 budget was written down to 16000 under an "increase" reason.
+
+        The tuner emitted H2's 2200 and H4's 16000; the merge kept the larger,
+        which was still a cut.
+        """
+        self._seed_missing_example(config, tmp_path, budget=50000)
+        before = config.read_bytes()
+
+        preview = runner.invoke(cli, ["tune", "--json", *_cfg_args(config)])
+        assert preview.exit_code == 0, preview.output
+        assert json.loads(preview.output)["changes"] == []
+
+        result = runner.invoke(cli, ["tune", "--apply", "--yes", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        assert config.read_bytes() == before
+        assert not list(config.parent.glob("stm_proxy.json.bak-*"))
+
+    def test_missing_example_feedback_applies_a_raise(self, runner, config, tmp_path):
+        """Positive control: below the recommendation the raise is written."""
+        self._seed_missing_example(config, tmp_path, budget=8000)
+
+        preview = runner.invoke(cli, ["tune", "--json", *_cfg_args(config)])
+        assert preview.exit_code == 0, preview.output
+        (change,) = json.loads(preview.output)["changes"]
+        assert (change["current"], change["recommended"]) == ("8000", "16000")
+
+        result = runner.invoke(cli, ["tune", "--apply", "--yes", *_cfg_args(config)])
+        assert result.exit_code == 0, result.output
+        saved = json.loads(config.read_text())
+        assert saved["upstream_servers"]["srv"]["tool_overrides"]["t"]["max_result_chars"] == 16000
+
     def test_restore_hint_is_shell_safe_for_whitespace_paths(self, runner, tmp_path):
         """The `restore with: cp ...` hint must survive paste-back when the
         config path contains whitespace (easy on macOS). Round-trip the printed

@@ -2677,6 +2677,14 @@ def effective_delivery_format(
     return server.delivery_format or config.delivery_format
 
 
+def effective_token_estimation_mode(
+    server: UpstreamServerConfig, override: ToolOverrideConfig | None, config: ProxyConfig
+) -> TokenEstimationMode:
+    if override is not None and override.token_estimation_mode is not None:
+        return override.token_estimation_mode
+    return server.token_estimation_mode or config.token_estimation_mode
+
+
 def effective_max_result_chars(
     cfg: UpstreamServerConfig,
     override: ToolOverrideConfig | None,

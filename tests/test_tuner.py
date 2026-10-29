@@ -742,11 +742,15 @@ class TestAnalyze:
         budget = [a for rec in recs for a in rec.actions if a.field == "max_result_chars"]
         assert budget == []
 
-    def test_a_server_token_budget_does_not_suppress_advice(self, metrics_store: MetricsStore):
+    def test_a_static_server_token_budget_does_not_suppress_advice(
+        self, metrics_store: MetricsStore
+    ):
         """`--apply` writes a per-tool override, which CLEARS a server token budget.
 
-        So the advice takes effect and must not be withheld — and it is measured
-        against the chars that token budget currently yields (400 × 2.5).
+        Under the default ``static`` estimation the advice takes effect and
+        must not be withheld — and it is measured against the chars that token
+        budget currently yields (400 × 2.5). Under ``unicode`` there is no such
+        fixed value, and the advice is withheld (tested below).
         """
         cfg = ProxyConfig(
             upstream_servers={
@@ -823,8 +827,13 @@ class TestAnalyze:
         # 400 x 4.0 = 1600, not 400 x 1.0 = 400.
         assert budget[0].current == "1600"
 
-    def test_h2_skips_only_against_a_per_tool_token_budget(self, tmp_path: Path):
+    def test_h2_skips_against_a_per_tool_not_a_static_server_token_budget(
+        self, tmp_path: Path
+    ):
         """The same rule on the reduction side, which H1's cases cannot reach.
+
+        All budgets here use the default ``static`` estimation; an inherited
+        ``unicode`` server budget suppresses H2 too (tested below).
 
         H2 requires zero violations, so a violation-seeded test exercises H1
         alone and would stay green with H2's gate removed.
@@ -1138,3 +1147,156 @@ def test_budget_advice_survives_for_every_budget_reading_strategy(metrics_store,
     _seed_metrics(metrics_store, "srv", "t", 10, original_chars=10000, compressed_chars=10000)
     actions = [a for r in CompressionTuner(metrics_store, config=cfg).analyze() for a in r.actions]
     assert [a.field for a in actions] == ["max_result_chars"]
+
+
+# ── Budget advice never moves the budget against its own reason ─────────
+
+
+def _budget_actions(metrics_store, feedback_store, cfg):
+    recs = CompressionTuner(metrics_store, feedback_store, config=cfg).analyze()
+    return [a for r in recs for a in r.actions if a.field == "max_result_chars"]
+
+
+def _report(feedback_store, kind, n=3):
+    for i in range(n):
+        feedback_store.record("srv", "t", kind, f"report {i}", None)
+
+
+@pytest.mark.parametrize("budget", [16000, 50000])
+def test_missing_example_feedback_never_cuts_the_budget(metrics_store, feedback_store, budget):
+    """At or above H4's recommendation, its "increase" was a cut.
+
+    H4 recommended ``max(p95, 16000)`` without reading the budget, and H2
+    recommended its reduction beside it; ``--apply`` merges the two by max,
+    so a 50000 budget was written down to 16000 for a tool whose agent said
+    examples were missing. With H4 silent there, H2 has to be held back too,
+    or its reduction becomes the only budget advice left.
+    """
+    cfg = ProxyConfig(
+        upstream_servers={
+            "srv": UpstreamServerConfig(prefix="s", compression="truncate", max_result_chars=budget)
+        }
+    )
+    _seed_metrics(metrics_store, "srv", "t", 10, original_chars=2000, compressed_chars=2000)
+    _report(feedback_store, "missing_example")
+    assert _budget_actions(metrics_store, feedback_store, cfg) == []
+
+
+def test_missing_example_raise_reports_the_budget_it_replaces(metrics_store, feedback_store):
+    cfg = ProxyConfig(
+        upstream_servers={
+            "srv": UpstreamServerConfig(prefix="s", compression="truncate", max_result_chars=8000)
+        }
+    )
+    _seed_metrics(metrics_store, "srv", "t", 10, original_chars=2000, compressed_chars=2000)
+    _report(feedback_store, "missing_example")
+    (action,) = _budget_actions(metrics_store, feedback_store, cfg)
+    assert (action.current, action.recommended) == ("8000", "16000")
+    assert "missing_example" in action.reason
+
+
+def test_missing_example_raise_follows_a_p95_above_the_budget(metrics_store, feedback_store):
+    cfg = ProxyConfig(
+        upstream_servers={
+            "srv": UpstreamServerConfig(prefix="s", compression="truncate", max_result_chars=50000)
+        }
+    )
+    _seed_metrics(metrics_store, "srv", "t", 10, original_chars=60000, compressed_chars=50000)
+    _report(feedback_store, "missing_example")
+    (action,) = _budget_actions(metrics_store, feedback_store, cfg)
+    assert (action.current, action.recommended) == ("50000", "60000")
+
+
+@pytest.mark.parametrize("kind", [None, "truncated"])
+def test_other_feedback_leaves_the_ratio_reduction_alone(metrics_store, feedback_store, kind):
+    """Positive control for the H2 hold-back: the same rows still reduce."""
+    cfg = ProxyConfig(
+        upstream_servers={
+            "srv": UpstreamServerConfig(prefix="s", compression="truncate", max_result_chars=50000)
+        }
+    )
+    _seed_metrics(metrics_store, "srv", "t", 10, original_chars=2000, compressed_chars=2000)
+    if kind:
+        _report(feedback_store, kind)
+    (action,) = _budget_actions(metrics_store, feedback_store, cfg)
+    assert (action.current, action.recommended) == ("50000", "2200")
+
+
+def _unicode_cfg(mode_level: str, *, mode: str = "unicode") -> ProxyConfig:
+    srv = UpstreamServerConfig(
+        prefix="s", compression="truncate", max_result_tokens=10000, chars_per_token=0.5
+    )
+    cfg = ProxyConfig(upstream_servers={"srv": srv})
+    if mode_level == "global":
+        cfg.token_estimation_mode = mode
+    elif mode_level == "server":
+        srv.token_estimation_mode = mode
+    else:
+        srv.tool_overrides = {"t": ToolOverrideConfig(token_estimation_mode=mode)}
+    return cfg
+
+
+@pytest.mark.parametrize("mode_level", ["global", "server", "tool"])
+@pytest.mark.parametrize("heuristic", ["h1", "h2", "h4"])
+def test_inherited_unicode_token_budget_gets_no_budget_advice(
+    metrics_store, feedback_store, mode_level, heuristic
+):
+    """The nominal budget is not what a unicode-estimated call ran under.
+
+    Server tokens 10000 at 0.5 chars/token are a nominal 5000 chars, but a
+    40000-char ASCII response is measured at 12000 tokens and gets 33333.
+    H1 recommended 32000 as an "increase"; the per-tool write clears the
+    token budget, so applying it cut that response's budget.
+    """
+    cfg = _unicode_cfg(mode_level)
+    if heuristic == "h1":
+        _seed_metrics(
+            metrics_store,
+            "srv",
+            "t",
+            10,
+            original_chars=40000,
+            compressed_chars=33333,
+            violation=True,
+        )
+    elif heuristic == "h2":
+        _seed_metrics(metrics_store, "srv", "t", 10, original_chars=2000, compressed_chars=2000)
+    else:
+        _seed_metrics(metrics_store, "srv", "t", 10, original_chars=2000, compressed_chars=1000)
+        _report(feedback_store, "missing_example")
+    assert _budget_actions(metrics_store, feedback_store, cfg) == []
+
+
+@pytest.mark.parametrize("mode_level", ["global", "server", "tool"])
+def test_static_token_budget_still_gets_budget_advice(metrics_store, feedback_store, mode_level):
+    """Positive control: under static estimation the nominal budget is the
+    budget, so the same violating rows still produce H1's raise."""
+    cfg = _unicode_cfg(mode_level, mode="static")
+    _seed_metrics(
+        metrics_store,
+        "srv",
+        "t",
+        10,
+        original_chars=40000,
+        compressed_chars=5000,
+        violation=True,
+    )
+    (action,) = _budget_actions(metrics_store, feedback_store, cfg)
+    assert (action.current, action.recommended) == ("5000", "32000")
+
+
+def test_tool_static_mode_outranks_a_unicode_server(metrics_store, feedback_store):
+    cfg = _unicode_cfg("server")
+    cfg.upstream_servers["srv"].tool_overrides = {
+        "t": ToolOverrideConfig(token_estimation_mode="static")
+    }
+    _seed_metrics(
+        metrics_store,
+        "srv",
+        "t",
+        10,
+        original_chars=40000,
+        compressed_chars=5000,
+        violation=True,
+    )
+    assert [a.recommended for a in _budget_actions(metrics_store, feedback_store, cfg)] == ["32000"]
