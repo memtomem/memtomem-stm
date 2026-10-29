@@ -47,9 +47,11 @@ The bundled `selection-eval-v1-synthetic-30` corpus contains 18 training, six
 validation, and six held-out test cases. Cases cover name, description, input
 schema, Korean and multi-intent matching, distractors, abstention, and the
 strict/review/tool-graph safety paths. Group IDs may not cross splits, and the
-loader rejects a file whose raw text matches the credential or email patterns,
-a non-string `dataset_id`, and non-finite numbers (`NaN`, `Infinity`, or a
-literal too large for a float).
+loader rejects a file in which the credential or email patterns match the raw
+text, the decoded document re-serialized with non-ASCII left unescaped, or any
+single decoded key or string value (so writing a label with `\u` escapes does
+not get it past the check). It also rejects a non-string `dataset_id` and
+non-finite numbers (`NaN`, `Infinity`, or a literal too large for a float).
 
 Every replay executes the production `filter_tools` and
 `ToolRelevanceRanker`. It tests the existing knobs only:

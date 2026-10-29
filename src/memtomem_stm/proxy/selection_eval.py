@@ -159,6 +159,39 @@ def _dataset_bytes(path: Path) -> bytes:
     return raw
 
 
+def _reject_sensitive_decoded(data: Any) -> None:
+    """Scan the decoded dataset, the form the evaluator reads.
+
+    The raw-text scan sees a JSON escape (``\\u0070assword``) as written, so a
+    label can get past it (#1240). This scans what ``json.loads`` produced, in
+    two forms. The document re-serialized with non-ASCII left unescaped
+    catches a pattern that spans a key and its value
+    (``"password": "hunter2"``). Each key and string value on its own catches
+    one that serializing would split again, such as a tab between a label and
+    its colon. Neither form unescapes text that ``json.loads`` left as written.
+    """
+    try:
+        serialized = json.dumps(data, ensure_ascii=False)
+    except RecursionError as exc:
+        # json.dumps accepts what json.loads does (measured on 3.12 and 3.13),
+        # but a smaller C stack must not turn into an unscanned dataset.
+        raise SelectionEvaluationError(
+            "invalid dataset JSON: nested too deeply to scan (RecursionError)"
+        ) from exc
+    if contains_sensitive_content(serialized):
+        raise SelectionEvaluationError("dataset matched sensitive-content patterns")
+    stack = [data]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            stack.extend(node.keys())
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+        elif isinstance(node, str) and contains_sensitive_content(node):
+            raise SelectionEvaluationError("dataset matched sensitive-content patterns")
+
+
 def load_selection_dataset(path: Path | str | None = None) -> dict[str, Any]:
     """Load and strictly validate a sanitized selection-evaluation corpus."""
     resolved = Path(path).expanduser() if path is not None else builtin_dataset_path()
@@ -182,6 +215,7 @@ def load_selection_dataset(path: Path | str | None = None) -> dict[str, Any]:
         raise SelectionEvaluationError(
             "invalid dataset JSON: nested too deeply to parse (RecursionError)"
         ) from exc
+    _reject_sensitive_decoded(data)
     if not isinstance(data, dict) or data.get("schema_version") != DATASET_SCHEMA_VERSION:
         raise SelectionEvaluationError(f"dataset schema_version must be {DATASET_SCHEMA_VERSION}")
     # The report embeds it; a deeply nested value fails `to_json` on 3.12.

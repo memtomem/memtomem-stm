@@ -13,6 +13,7 @@ import pytest
 from click.testing import CliRunner
 
 from memtomem_stm.cli.proxy import cli
+from memtomem_stm.proxy.privacy import contains_sensitive_content
 from memtomem_stm.proxy.selection_eval import (
     SelectionEvaluationError,
     _recommend_variant,
@@ -731,6 +732,53 @@ def test_non_utf8_dataset_is_a_clean_error(tmp_path: Path) -> None:
 
     reason = f"dataset is not valid UTF-8 (byte offset {len(_NON_UTF8_DATASET_PREFIX)})"
     assert str(exc_info.value) == reason
+
+
+def _escaped_label(dataset: dict[str, Any], where: str) -> None:
+    secret = "password: hunter2"
+    case = dataset["cases"][0]
+    if where == "case value":
+        case["note"] = secret
+    elif where == "nested list value":
+        case["candidates"][0]["tags"] = ["ok", secret]
+    elif where == "object key":
+        case[secret] = "x"
+    elif where == "key and its value":
+        # Neither string matches alone; only the decoded document does.
+        case["extra"] = {"password": "hunter2"}
+    else:
+        # Serializing writes the tab back as ``\t``; only the string matches.
+        case["note"] = "password\t: hunter2"
+
+
+@pytest.mark.parametrize(
+    "where",
+    ["case value", "nested list value", "object key", "key and its value", "tab in a value"],
+)
+def test_dataset_sensitive_text_hidden_by_json_escapes_is_rejected(
+    tmp_path: Path, where: str
+) -> None:
+    # The raw-text scan sees ``\u0070assword`` as written; the evaluator reads
+    # the decoded "password" (#1240).
+    dataset = json.loads(builtin_dataset_path().read_text(encoding="utf-8"))
+    _escaped_label(dataset, where)
+    text = json.dumps(dataset).replace("password", "\\u0070assword")
+    assert "password" not in text and not contains_sensitive_content(text)
+    path = tmp_path / "dataset.json"
+    path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(SelectionEvaluationError, match="matched sensitive-content patterns"):
+        load_selection_dataset(path)
+
+
+def test_dataset_escapes_without_sensitive_text_still_load(tmp_path: Path) -> None:
+    # Positive control: escapes alone are not a reason to reject.
+    dataset = json.loads(builtin_dataset_path().read_text(encoding="utf-8"))
+    path = tmp_path / "dataset.json"
+    path.write_text(json.dumps(dataset, ensure_ascii=True), encoding="utf-8")
+    assert "\\u" in path.read_text(encoding="utf-8")
+
+    assert load_selection_dataset(path)["dataset_id"] == dataset["dataset_id"]
 
 
 def test_cli_summary_escapes_a_hostile_dataset_id(tmp_path: Path) -> None:
