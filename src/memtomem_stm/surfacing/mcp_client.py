@@ -993,6 +993,16 @@ class McpClientSearchAdapter:
         """Whether a live session has completed capability negotiation."""
         return self._session is not None
 
+    async def ensure_ready(self) -> bool:
+        """Start or heal the session so ``capabilities`` describes the live core.
+
+        Callers that branch on ``capabilities`` before an RPC await this while
+        ``capabilities_ready`` is False; the RPC methods heal on their own, but
+        only after the caller has already chosen which one to make (#1257).
+        Same contract as ``_heal_if_needed``: False means unavailable.
+        """
+        return await self._heal_if_needed()
+
     @property
     def runtime_profile(self) -> dict[str, Any] | None:
         return self._runtime_profile

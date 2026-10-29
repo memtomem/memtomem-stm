@@ -13,6 +13,13 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- A proxied call that arrives while the LTM connection is still starting now
+  gets Pinned Context and the adjacent context window. Surfacing chose between
+  Core's context composition and legacy search before the LTM had reported
+  what it supports, so such a call took legacy search without either, and
+  dedup then held its match back for `surfacing.dedup_ttl_seconds`. The call
+  now waits for that report, within the existing surfacing timeout. Calls
+  through the shared daemon were not affected. (#1257)
 - On Windows, a process that opens a fresh lock file just after another one
   has initialised and locked it now goes on to its usual lock-contention
   handling instead of failing to open it. A daemon that lost this race exited
