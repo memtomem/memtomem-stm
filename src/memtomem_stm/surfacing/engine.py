@@ -2595,12 +2595,25 @@ class SurfacingEngine:
             search_kwargs["context_window"] = ctx_win
         compose_failed = False
         compose_transport_failed = False
+        ltm_unready = False
         try:
+            # Until the session negotiates, ``capabilities`` holds the schema-0
+            # default, which reads as "core has no compose" and would send a
+            # call made during LTM start-up to legacy search (#1257). Wait for
+            # negotiation first, inside this call's surfacing timeout. A failed
+            # wait is answered here as ``search`` would answer it: a failed
+            # reconnect is not sticky, and ``search``'s own heal would retry
+            # it within the same call.
+            if getattr(self._mcp_adapter, "capabilities_ready", True) is False:
+                ensure_ready = getattr(self._mcp_adapter, "ensure_ready", None)
+                if callable(ensure_ready) and not await ensure_ready():
+                    ltm_unready = True
             capabilities = getattr(self._mcp_adapter, "capabilities", None)
             compose = getattr(self._mcp_adapter, "context_compose", None)
             bundle = None
             if (
-                isinstance(capabilities, LtmCapabilities)
+                not ltm_unready
+                and isinstance(capabilities, LtmCapabilities)
                 and capabilities.context_compose_schema >= 2
                 and callable(compose)
             ):
@@ -2652,6 +2665,8 @@ class SurfacingEngine:
                 results, hints, outcome = [], [], "transport_error"
             elif compose_failed:
                 results, hints, outcome = [], [], "call_error"
+            elif ltm_unready:
+                results, hints, outcome = [], [], "no_session"
             else:
                 results, hints, outcome = await self._mcp_adapter.search(
                     query=query,

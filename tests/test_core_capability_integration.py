@@ -166,6 +166,126 @@ async def test_engine_expands_only_schema_three_wire_budget_for_context() -> Non
     )
 
 
+def _cold_adapter(
+    *, schema: int, start_fails: bool = False, real_search: bool = False
+) -> McpClientSearchAdapter:
+    """A real adapter whose session does not exist until the first lazy start.
+
+    ``start`` stands in for the LTM child coming up: it negotiates capabilities,
+    then publishes the session. The real ``_do_start`` also awaits the rerank
+    probe between the two; nothing here suspends there.
+    """
+    adapter = McpClientSearchAdapter(SurfacingConfig())
+
+    async def start() -> None:
+        if start_fails:
+            raise RuntimeError("ltm child exited")
+        adapter._capabilities = LtmCapabilities(context_compose_schema=schema)
+        adapter._session = object()  # type: ignore[assignment]
+
+    adapter.start = AsyncMock(side_effect=start)  # type: ignore[method-assign]
+    if not real_search:
+        adapter.search = AsyncMock(  # type: ignore[method-assign]
+            return_value=([], [], "empty_results")
+        )
+    adapter.context_compose = AsyncMock(  # type: ignore[method-assign]
+        return_value=ContextComposeResult((), ())
+    )
+    adapter.scratch_list = AsyncMock(return_value=[])  # type: ignore[method-assign]
+    return adapter
+
+
+def _cold_engine(adapter: object, observability: SurfacingObservability | None = None):
+    return SurfacingEngine(
+        SurfacingConfig(
+            min_response_chars=0,
+            min_query_tokens=1,
+            cooldown_seconds=0,
+            fire_webhook=False,
+            max_injection_chars=3000,
+            context_window_size=2,
+        ),
+        mcp_adapter=adapter,
+        observability=observability,
+    )
+
+
+@pytest.mark.asyncio
+async def test_call_before_negotiation_waits_and_takes_compose() -> None:
+    # #1257: the first call after start-up used to read the schema-0 default
+    # and go to legacy search, losing Pinned Context and the adjacent window.
+    adapter = _cold_adapter(schema=4)
+    assert adapter.capabilities_ready is False
+
+    await _cold_engine(adapter).surface(
+        "docs", "read_file", {}, "response", context_query="deployment"
+    )
+
+    adapter.start.assert_awaited_once()
+    # The schema-3+ wire budget proves the branch read the negotiated schema.
+    adapter.context_compose.assert_awaited_once_with(
+        "deployment",
+        max_chars=15_000,
+        top_k=6,
+        namespace=None,
+        context_window=2,
+        trace_id=None,
+    )
+    adapter.search.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_call_before_negotiation_with_old_core_still_takes_legacy() -> None:
+    adapter = _cold_adapter(schema=1)
+
+    await _cold_engine(adapter).surface(
+        "docs", "read_file", {}, "response", context_query="deployment"
+    )
+
+    adapter.start.assert_awaited_once()
+    adapter.context_compose.assert_not_awaited()
+    adapter.search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_call_before_negotiation_with_failed_start_is_ltm_unavailable() -> None:
+    adapter = _cold_adapter(schema=4, start_fails=True, real_search=True)
+    search = AsyncMock(wraps=adapter.search)
+    adapter.search = search  # type: ignore[method-assign]
+    observability = SurfacingObservability()
+
+    result = await _cold_engine(adapter, observability).surface(
+        "docs", "read_file", {}, "response", context_query="deployment"
+    )
+
+    assert result == "response"
+    assert observability.snapshot()["skip_reasons"]["read_file"] == {"ltm_unavailable": 1}
+    adapter.start.assert_awaited_once()
+    adapter.context_compose.assert_not_awaited()
+    search.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failed_reconnect_before_negotiation_is_attempted_once_per_call() -> None:
+    # Unlike the lazy start, a failed reconnect is not sticky: if the engine
+    # fell through to ``search`` after the readiness wait failed, ``search``'s
+    # own heal would run a second reconnect inside the same call.
+    adapter = _cold_adapter(schema=4, real_search=True)
+    adapter._dirty_generation = adapter._generation
+    reconnect = AsyncMock(side_effect=RuntimeError("ltm child exited"))
+    adapter._shared_reconnect = reconnect  # type: ignore[method-assign]
+    observability = SurfacingObservability()
+
+    await _cold_engine(adapter, observability).surface(
+        "docs", "read_file", {}, "response", context_query="deployment"
+    )
+
+    assert observability.snapshot()["skip_reasons"]["read_file"] == {"ltm_unavailable": 1}
+    reconnect.assert_awaited_once()
+    adapter.start.assert_not_awaited()
+    adapter.context_compose.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_direct_schema_two_compose_forwards_scope_fields(
     monkeypatch: pytest.MonkeyPatch,
