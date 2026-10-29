@@ -53,9 +53,12 @@ ALLOWLIST: dict[str, tuple[int, str]] = {
         "delivered, and the non-JSON tiers reach ``TextContent`` unparsed.",
     ),
     "proxy/selection_eval.py": (
-        1,
-        "The one left is a privacy scan over an in-memory string, which is "
-        "searched and discarded. ``to_json`` (echoed by a --json leg) and "
+        2,
+        "Both left are privacy scans over an in-memory string, searched and "
+        "discarded: the generated report, and the decoded dataset in "
+        "``_reject_sensitive_decoded`` (#1240), which may hold the lone "
+        "surrogates ``json.loads`` accepts and is never encoded. "
+        "``to_json`` (echoed by a --json leg) and "
         "the canonical hash input are both routed — the latter encodes on "
         "the very next expression, so 'it is only hashed' did not make it "
         "safe (#757 round 5).",

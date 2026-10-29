@@ -13,6 +13,11 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- The selection-evaluation dataset loader now also checks the decoded dataset
+  against the sensitive-content patterns, both as a whole and key by key and
+  value by value. It checked only the file's raw text, so a label written with
+  JSON escapes (`\u0070assword`) passed the check and reached the evaluator
+  decoded. (#1240)
 - A proxied call that arrives while the LTM connection is still starting now
   gets Pinned Context and the adjacent context window. Surfacing chose between
   Core's context composition and legacy search before the LTM had reported
