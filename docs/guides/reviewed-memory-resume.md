@@ -19,9 +19,15 @@ in an existing checkout.
 Run this from a Git project root. Project-local memory is gitignored and does
 not leave the current checkout.
 
+If memtomem-stm is already installed, `uv tool install` keeps a version the
+range below admits and replaces one it does not, with the newest admitted
+release. Before a replacement that crosses 0.7.0, whose daemon protocol
+changed, quit your MCP hosts and stop the old daemon with the old build, as
+the [Upgrading](operations.md#upgrading) runbook describes.
+
 ```bash
 uv tool install 'memtomem[all]>=0.4,<0.7'
-uv tool install 'memtomem-stm>=0.2,<0.7'
+uv tool install 'memtomem-stm>=0.2,<0.8'
 
 mm status
 mm mem init
@@ -39,10 +45,14 @@ ranges above admit declares `mcp[cli]>=2,<3` itself, so neither needs a
 `--with` constraint the way the 0.3.x/0.1.x stack did. The ranges are what the
 recipe admits, not a claim that every release in them was run: this walkthrough
 was exercised with core 0.4.0 and 0.5.0 alongside memtomem-stm 0.2.x and
-0.3.x, and again with core 0.6.5 and memtomem-stm 0.6.1. They are still two separate `uv tool install`
-environments — the SDK major matters per environment, not across the MCP
-connection between them. Upgrading an existing tool from the older stack takes
-a reinstall:
+0.3.x, again with core 0.6.5 and memtomem-stm 0.6.1, and with core 0.6.12
+(both the installed tool and the server STM launches) and memtomem-stm 0.7.1
+on its default legacy delivery. The 0.7.1 run covered steps 1–3 and the
+cleanup, with an MCP stdio client standing in for the AI client that made the
+read 5 seconds after its session started; step 4 was not rerun. They are still
+two separate `uv tool install` environments — the SDK major matters per
+environment, not across the MCP connection between them. Upgrading an existing
+tool from the older stack takes a reinstall:
 
 ```bash
 uv tool install --reinstall 'memtomem[all]>=0.4,<0.7'
@@ -114,10 +124,25 @@ mms daemon stop
 repeated here — the tool you installed and the server STM launches are two
 different environments.
 
+`mms daemon stop` confirms with `daemon stopped` or `no running daemon`. Since
+0.7.1 a stop it cannot confirm in time exits 1; run `mms daemon status` and wait
+until it reports `stopped` before restarting the client. Step 2 of the
+[Upgrading](operations.md#upgrading) runbook explains each outcome. The same
+applies to the `mms daemon stop` calls in steps 4 and 5.
+
 Restart the AI client so it reloads STM and its environment. Ask it to call the
 proxied `resume_fs__read_file` tool for
 `.memtomem/memories.local/resume-demo.md`. A client-native `Read` tool bypasses
 STM and does not exercise this scenario.
+
+Give STM a few seconds after the client starts before the read. Until STM has
+finished connecting to Core it falls back to plain search, so a read within
+about the first second (measured with a warm `uv` cache; a cold one takes
+longer) shows the match without the Pinned contract or the adjacent snippets.
+Surfacing remembers a match it delivered for `surfacing.dedup_ttl_seconds`
+(7 days by default), so to repeat the read, export
+`MEMTOMEM_STM_SURFACING__DEDUP_TTL_SECONDS=0` alongside the settings above,
+restart the client, and again wait a few seconds before the read.
 
 The returned tool response should retain the original document and append a
 `<surfaced-memories>` block containing:
@@ -130,14 +155,16 @@ Schema 4 retains schema 3's budgeted context arrays and adds score-scale
 metadata. STM accepts at most ten chunks per direction and renders only the
 nearest chunk on each side in its compact preview.
 
-Check durable operational evidence after the call:
+Check durable operational evidence by running this before and after the call:
 
 ```bash
 mms stats --json
 ```
 
-The surfacing section should contain an event for the proxied read and should
-not report an LTM dependency fault.
+Its `surfacing` section reports totals, not individual events: `events_total`
+should grow by the proxied read, and no count in `faults` should grow. `faults`
+covers the last 7 days across all tools, so counts already present before the
+call are not caused by this scenario.
 
 ## 4. Optional: submit a review-first candidate
 
@@ -217,6 +244,7 @@ unset MEMTOMEM_STM_SURFACING__CONTEXT_WINDOW_SIZE
 unset MEMTOMEM_STM_SURFACING__MIN_SCORE
 unset MEMTOMEM_STM_SURFACING__MIN_QUERY_TOKENS
 unset MEMTOMEM_STM_SURFACING__PREVIEW_MAX_CHARS
+unset MEMTOMEM_STM_SURFACING__DEDUP_TTL_SECONDS
 unset MEMTOMEM_STM_FORMATION__ENABLED
 ```
 

@@ -35,6 +35,18 @@ changes inline only. See the deprecation policy in
   `mms daemon status` prints a warning instead of no list. A `data_dir` that
   does not exist still reports none.
 
+### Docs
+
+- The reviewed-memory-resume guide installs memtomem-stm `>=0.2,<0.8`
+  (was `<0.7`, which excluded 0.7.0 and 0.7.1), after its walkthrough was
+  rerun on 0.7.1 with core 0.6.12. Its install step now sends an existing
+  install that would cross 0.7.0 through the Upgrading runbook first. It also
+  says what an unconfirmed `mms daemon stop` means, that `mms stats --json`
+  reports totals to compare before and after the call, and that a read made
+  before STM finishes connecting to Core lacks the Pinned contract and the
+  adjacent snippets, with how to repeat it. A docs-sync test fails
+  when the range stops admitting the release this checkout builds. (#1241)
+
 ## [0.7.1] — 2026-10-28
 
 ### Upgrade notes
