@@ -250,8 +250,8 @@ dropped request is not told `busy`: the hook treats it as an unreachable daemon,
 so `hook.fallback` applies (`skip` surfaces nothing, `cold` searches
 in-process), and the spawn `hook.auto_spawn` requests does nothing while the
 daemon holds its lock; standalone surfacing returns no results for that call, as
-for any failed round trip. `mms daemon status --json` counts these as
-`queue.pre_auth_evictions`; the text `queue:` line does not show it.
+for any failed round trip. `mms daemon status` counts these as
+`queue.pre_auth_evictions` (`pre_auth_evictions=` on the text `queue:` line).
 
 `max_concurrent_ltm_ops` is how many admitted requests may hold the LTM session
 at once. Requests beyond it wait while their client deadline runs, so a low

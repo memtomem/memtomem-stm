@@ -1024,13 +1024,17 @@ def status_cmd(as_json: bool) -> None:
         )
         queue = info.get("queue")
         if isinstance(queue, dict):
+            # Pre-auth evictions are dropped before admission, so the hook sees
+            # an unreachable daemon rather than ``busy``; this line is the
+            # operator's only plain-text sign of them.
             click.echo(
                 "queue: "
                 f"active={queue.get('active', 0)} "
                 f"in_flight={queue.get('in_flight', 0)}/{queue.get('concurrency', 1)} "
                 f"queued={queue.get('queued', 0)} "
                 f"capacity={queue.get('capacity', 0)} "
-                f"busy_rejections={queue.get('busy_rejections', 0)}"
+                f"busy_rejections={queue.get('busy_rejections', 0)} "
+                f"pre_auth_evictions={queue.get('pre_auth_evictions', 0)}"
             )
         surface = (info.get("latency") or {}).get("surface")
         if isinstance(surface, dict) and any(surface.get(key) for key, _ in _SURFACE_COUNTERS):

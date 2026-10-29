@@ -1685,6 +1685,55 @@ class TestDaemonStatusCli:
         assert text.exit_code == 0, text.output
         assert "surface latency" not in text.output
 
+    @pytest.mark.parametrize(
+        ("queue_extra", "expected"),
+        [
+            ({"pre_auth_evictions": 7}, "pre_auth_evictions=7"),
+            ({"pre_auth_evictions": 0}, "pre_auth_evictions=0"),
+            # Defaults like the other queue fields when the key is absent.
+            ({}, "pre_auth_evictions=0"),
+        ],
+    )
+    def test_status_queue_line_shows_pre_auth_evictions(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        queue_extra: dict[str, int],
+        expected: str,
+    ):
+        # Pre-auth drops reach the hook as an unreachable daemon, not ``busy``,
+        # so the plain status line is where an operator first looks (#1256).
+        import time as _time
+
+        from click.testing import CliRunner
+
+        monkeypatch.setenv("MEMTOMEM_STM_DATA_DIR", str(tmp_path))
+
+        async def fake_ping(config, *, timeout=2.0):
+            return {
+                "pid": 11,
+                "host": "127.0.0.1",
+                "port": 4567,
+                "ltm": "warm",
+                "created_at": _time.time(),
+                "queue": {
+                    "active": 0,
+                    "in_flight": 0,
+                    "concurrency": 4,
+                    "busy_rejections": 2,
+                    **queue_extra,
+                },
+            }
+
+        monkeypatch.setattr("memtomem_stm.daemon.client.ping", fake_ping)
+        result = CliRunner().invoke(_cli(), ["daemon", "status"])
+
+        assert result.exit_code == 0, result.output
+        queue_lines = [line for line in result.output.splitlines() if line.startswith("queue: ")]
+        assert len(queue_lines) == 1, result.output
+        fields = queue_lines[0].removeprefix("queue: ").split()
+        assert fields[-2:] == ["busy_rejections=2", expected]
+
     def test_status_tolerates_a_snapshot_without_the_newer_counters(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):

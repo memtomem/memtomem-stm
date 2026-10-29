@@ -79,8 +79,9 @@ capability in the [native-hook guide](native-hooks.md). Cursor and Kimi hooks
 are metrics-only by design.
 
 If it goes quiet only under bursts of concurrent tool calls, compare the
-counters in `mms daemon status --json`: `queue.busy_rejections` counts requests
-turned away past `daemon.max_pending_requests` (32 by default), and
+counters in `mms daemon status --json` (the text `queue:` line shows both as
+`busy_rejections=` and `pre_auth_evictions=`): `queue.busy_rejections` counts
+requests turned away past `daemon.max_pending_requests` (32 by default), and
 `queue.pre_auth_evictions` counts connections the daemon closed because more
 than 64 were waiting for it to read their first frame. See
 [Surfacing Daemon](../configuration.md#surfacing-daemon).
