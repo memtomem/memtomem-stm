@@ -1064,15 +1064,23 @@ def test_mixed_history_averages_and_labels_only_classified_rows(metrics_store: M
 @pytest.mark.parametrize("strategy", ["none", "progressive"])
 @pytest.mark.parametrize("level", ["global", "server", "tool"])
 @pytest.mark.parametrize("violation", [False, True])
-def test_budget_advice_requires_a_budget_using_strategy(metrics_store, strategy, level, violation):
+@pytest.mark.parametrize("delivery_format", ["legacy", "structured"])
+def test_budget_advice_requires_a_budget_using_strategy(
+    metrics_store, strategy, level, violation, delivery_format
+):
+    """H1 and H2 stay suppressed under structured delivery too (#1239)."""
     srv = UpstreamServerConfig(prefix="s", max_result_chars=50000)
     cfg = ProxyConfig(upstream_servers={"srv": srv})
     if level == "global":
         cfg.default_compression = CompressionStrategy(strategy)
+        cfg.delivery_format = delivery_format
     elif level == "server":
         srv.compression = CompressionStrategy(strategy)
+        srv.delivery_format = delivery_format
     else:
-        srv.tool_overrides = {"t": ToolOverrideConfig(compression=strategy)}
+        srv.tool_overrides = {
+            "t": ToolOverrideConfig(compression=strategy, delivery_format=delivery_format)
+        }
     # These rows deliberately predate the current strategy; H1 and H2 would
     # otherwise recommend changes from them regardless of current configuration.
     _seed_metrics(
@@ -1094,7 +1102,9 @@ def test_budget_advice_requires_a_budget_using_strategy(metrics_store, strategy,
 def test_feedback_budget_advice_respects_current_strategy(
     metrics_store, feedback_store, strategy, feedback_kind
 ):
-    srv = UpstreamServerConfig(prefix="s", compression=strategy, max_result_chars=50000)
+    # 8000 is below H4's 16000, so a missing_example raise would be emitted
+    # if the strategy rule let it through (#1262 made 50000 vacuous here).
+    srv = UpstreamServerConfig(prefix="s", compression=strategy, max_result_chars=8000)
     cfg = ProxyConfig(upstream_servers={"srv": srv})
     _seed_metrics(metrics_store, "srv", "t", 10)
     for _ in range(3):
@@ -1300,3 +1310,115 @@ def test_tool_static_mode_outranks_a_unicode_server(metrics_store, feedback_stor
         violation=True,
     )
     assert [a.recommended for a in _budget_actions(metrics_store, feedback_store, cfg)] == ["32000"]
+
+
+# ── #1239: structured progressive reads the budget; only H4 may advise ──
+
+
+def _structured_progressive_cfg(**srv_kw) -> ProxyConfig:
+    srv = UpstreamServerConfig(
+        prefix="s",
+        compression="progressive",
+        delivery_format="structured",
+        max_result_chars=8000,
+        **srv_kw,
+    )
+    return ProxyConfig(upstream_servers={"srv": srv})
+
+
+def _missing_example_profile(metrics_store, feedback_store):
+    _seed_metrics(metrics_store, "srv", "t", 10, original_chars=2000, compressed_chars=2000)
+    _report(feedback_store, "missing_example")
+
+
+def test_structured_progressive_gets_the_feedback_budget_raise(metrics_store, feedback_store):
+    """The budget caps a structured progressive tool's first frame, so a raise
+    from missing-example reports can take effect."""
+    _missing_example_profile(metrics_store, feedback_store)
+    cfg = _structured_progressive_cfg()
+    (action,) = _budget_actions(metrics_store, feedback_store, cfg)
+    assert (action.current, action.recommended) == ("8000", "16000")
+
+
+@pytest.mark.parametrize(
+    ("global_fmt", "server_fmt", "tool_fmt", "raised"),
+    [
+        ("structured", None, None, True),
+        ("legacy", "structured", None, True),
+        ("legacy", None, "structured", True),
+        ("structured", "legacy", None, False),
+        ("legacy", "structured", "legacy", False),
+        ("structured", "legacy", "structured", True),
+    ],
+)
+def test_feedback_budget_raise_follows_the_resolved_delivery_format(
+    metrics_store, feedback_store, global_fmt, server_fmt, tool_fmt, raised
+):
+    _missing_example_profile(metrics_store, feedback_store)
+    srv = UpstreamServerConfig(prefix="s", compression="progressive", max_result_chars=8000)
+    if server_fmt:
+        srv.delivery_format = server_fmt
+    if tool_fmt:
+        srv.tool_overrides = {"t": ToolOverrideConfig(delivery_format=tool_fmt)}
+    cfg = ProxyConfig(upstream_servers={"srv": srv}, delivery_format=global_fmt)
+    actions = _budget_actions(metrics_store, feedback_store, cfg)
+    assert [a.recommended for a in actions] == (["16000"] if raised else [])
+
+
+@pytest.mark.parametrize(
+    "case", ["passthrough", "per_tool_tokens", "unicode_server_tokens", "budget_covers_it"]
+)
+def test_structured_feedback_raise_keeps_the_other_rules(metrics_store, feedback_store, case):
+    """Unlocking the strategy rule leaves the token and direction rules intact."""
+    _missing_example_profile(metrics_store, feedback_store)
+    cfg = _structured_progressive_cfg()
+    srv = cfg.upstream_servers["srv"]
+    if case == "passthrough":
+        srv.compression = CompressionStrategy.NONE
+    elif case == "per_tool_tokens":
+        srv.tool_overrides = {"t": ToolOverrideConfig(max_result_tokens=4000)}
+    elif case == "unicode_server_tokens":
+        srv.max_result_tokens = 4000
+        srv.token_estimation_mode = "unicode"
+    else:
+        srv.max_result_chars = 16000
+    assert _budget_actions(metrics_store, feedback_store, cfg) == []
+
+
+def test_structured_progressive_gets_no_ratio_reduction(metrics_store, feedback_store):
+    """H2's ratio leaves out the calls that produced a frame.
+
+    Nineteen small calls pass through whole (ratio 1.0); the one large call
+    produced a frame and is recorded on the structured basis, which the ratio
+    does not read. The reduction would shrink exactly that call's frame.
+    """
+    _seed_metrics(metrics_store, "srv", "t", 19, original_chars=400, compressed_chars=400)
+    _seed_metrics(
+        metrics_store,
+        "srv",
+        "t",
+        1,
+        original_chars=30000,
+        compressed_chars=4570,
+        accounting="initial_structured_v1",
+    )
+    cfg = _structured_progressive_cfg()
+    assert _budget_actions(metrics_store, feedback_store, cfg) == []
+
+
+def test_structured_hybrid_still_gets_the_ratio_reduction(metrics_store, feedback_store):
+    """Positive control: the same rows do trigger H2 for a strategy it covers."""
+    _seed_metrics(metrics_store, "srv", "t", 19, original_chars=400, compressed_chars=400)
+    _seed_metrics(
+        metrics_store,
+        "srv",
+        "t",
+        1,
+        original_chars=30000,
+        compressed_chars=4570,
+        accounting="initial_structured_v1",
+    )
+    cfg = _structured_progressive_cfg()
+    cfg.upstream_servers["srv"].compression = CompressionStrategy.HYBRID
+    (action,) = _budget_actions(metrics_store, feedback_store, cfg)
+    assert (action.current, action.recommended) == ("8000", "1000")
