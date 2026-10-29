@@ -13,6 +13,24 @@ changes inline only. See the deprecation policy in
 
 ### Fixed
 
+- `mms tune` no longer suggests cutting a budget under a reason that says to
+  raise it. Its `missing_example` feedback heuristic suggested
+  `max(p95, 16000)` without reading the current budget, and the ratio
+  heuristic suggested a reduction beside it; `--apply` keeps the larger of
+  the two, so a 50000-char budget was written down to 16000 for a tool whose
+  agent reported missing examples. The feedback suggestion is now made only
+  when it exceeds the current budget, which it shows as `current`, and that
+  feedback holds back the ratio reduction. Separately, a tool inheriting a
+  server token budget under `token_estimation_mode: "unicode"` gets no budget
+  suggestions: its nominal budget is not what its responses ran under (5000
+  nominal against 33333 for a 40000-char response), so a violation-driven
+  "raise" to 32000 cut that response's budget once the per-tool write cleared
+  the token budget. (#1262)
+  **Behavior change**: `mms tune` and `stm_admin` `tuning_recommendations`
+  suggest fewer `max_result_chars` changes. Those two cases are gone, and a
+  `missing_example` suggestion that remains reports the budget it replaces
+  instead of no current value.
+
 - The selection-evaluation dataset loader now also checks the decoded dataset
   against the sensitive-content patterns, both as a whole and key by key and
   value by value. It checked only the file's raw text, so a label written with

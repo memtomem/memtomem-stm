@@ -81,6 +81,7 @@ from memtomem_stm.proxy.config import (
     effective_compression_pair,
     effective_delivery_format,
     effective_max_result_chars,
+    effective_token_estimation_mode,
 )
 from memtomem_stm.proxy.delivery import (
     DeliveryBudgetExceeded,
@@ -4046,7 +4047,6 @@ class ProxyManager:
         # resolved independently of where the token budget comes from (#929).
         # Resolution order for max_result_tokens: tool override → server.
         # Falls back to existing char-budget paths when no token budget is in force.
-        token_estimation_mode = cfg.token_estimation_mode or config.token_estimation_mode
         llm_cfg = cfg.llm
         sel_cfg = cfg.selective
         cleaning_cfg = cfg.cleaning or CleaningConfig()
@@ -4070,9 +4070,8 @@ class ProxyManager:
         # global.
         compression, hybrid_cfg = effective_compression_pair(cfg, override, config)
         max_chars, token_budget = effective_max_result_chars(cfg, override, config)
+        token_estimation_mode = effective_token_estimation_mode(cfg, override, config)
         if override is not None:
-            if override.token_estimation_mode is not None:
-                token_estimation_mode = override.token_estimation_mode
             if override.retention_floor is not None:
                 retention_floor = override.retention_floor
             if override.llm is not None:

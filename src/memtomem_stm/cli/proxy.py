@@ -6270,9 +6270,10 @@ def _merge_tune_changes(
     * ``compression`` — last-wins. The feedback-driven action is appended
       after the latency pin, and an explicit agent-reported deficiency should
       beat an optimization.
-    * ``max_result_chars`` — numeric max. "Budget too small" signals combine
-      as max; when the budget-savings heuristic collides with feedback asking
-      for more room, feedback wins, which max also yields.
+    * ``max_result_chars`` — numeric max. "Budget too small" signals (the
+      violation and feedback heuristics) combine as max. The budget-savings
+      reduction is not emitted beside dominant missing-example feedback, so a
+      reduction never collides with a feedback raise.
     * ``retention_floor`` — defensive last-wins (no current heuristic emits it).
 
     Recommendations for servers absent from the raw config file are split off
@@ -6335,9 +6336,9 @@ def _merge_tune_changes(
                 server=rec.server,
                 tool=rec.tool,
                 field=action.field,
-                # The feedback heuristic emits ``current=None``; keep the first
-                # action's resolved current so the diff still shows what the
-                # override replaces.
+                # An action may carry ``current=None`` (no resolved budget);
+                # keep the first action's resolved current so the diff still
+                # shows what the override replaces.
                 current=action.current if prior is None else (prior.current or action.current),
                 recommended=action.recommended,
                 value=value,
