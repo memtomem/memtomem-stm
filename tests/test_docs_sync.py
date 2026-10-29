@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 import re
+import tomllib
 from enum import Enum
 from pathlib import Path
 from types import UnionType
@@ -2024,6 +2025,58 @@ def test_core_compat_matrix_parser_reads_every_valid_row_spelling() -> None:
     assert "echo" not in matrix
 
 
+_STM_INSTALL_LINE = re.compile(r"uv tool install 'memtomem-stm>=0\.2,<0\.(\d+)'")
+
+
+def _stm_install_ceiling_admits(guide: str, version: str) -> bool:
+    """Whether ``version`` sits below the ceiling of the guide's STM install line.
+
+    Only the upper bound is read: the ``>=0.2`` floor is part of the regex and
+    of the whole-line pin, and a release this checkout builds is never below
+    it. A missing line admits nothing, so deleting the command cannot pass as a
+    ceiling that is high enough.
+    """
+    match = _STM_INSTALL_LINE.search(guide)
+    if match is None:
+        return False
+    major, minor = (int(part) for part in version.split(".")[:2])
+    return (major, minor) < (0, int(match.group(1)))
+
+
+@pytest.mark.parametrize(
+    ("ceiling", "version", "admitted"),
+    (
+        ("<0.8", "0.7.1", True),
+        ("<0.8", "0.8.0", False),  # the next minor release must rerun the guide
+        ("<0.7", "0.7.0", False),  # #1241: the ceiling 0.7.0 shipped under
+        ("<0.8", "1.0.0", False),
+    ),
+)
+def test_stm_install_ceiling_admits_compares_minor_against_the_ceiling(
+    ceiling: str, version: str, admitted: bool
+) -> None:
+    guide = f"uv tool install 'memtomem-stm>=0.2,{ceiling}'\n"
+    assert _stm_install_ceiling_admits(guide, version) is admitted
+    assert _stm_install_ceiling_admits("no install line\n", version) is False
+
+
+def test_reviewed_memory_resume_guide_admits_this_stm_release() -> None:
+    """The guide's STM range must admit the release this checkout builds.
+
+    Core's range is checked against the newest compat-matrix row; STM's had no
+    such anchor, so it kept excluding 0.7.0 after that shipped (#1241). The
+    version comes from ``pyproject.toml``, the source ``release_check`` ties
+    the tag to. A minor-version bump turns this red on purpose: rerun the
+    walkthrough on the new release, then raise the ceiling.
+    """
+    version = tomllib.loads(_read("pyproject.toml"))["project"]["version"]
+    guide = _read("docs/guides/reviewed-memory-resume.md")
+    assert _stm_install_ceiling_admits(guide, version), (
+        f"reviewed-memory-resume guide's memtomem-stm range does not admit {version}; "
+        "rerun the walkthrough on it and raise the ceiling"
+    )
+
+
 def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     """Keep the copy/paste core CLI flow tied to the released-core advisory."""
     guide = _read("docs/guides/reviewed-memory-resume.md")
@@ -2051,7 +2104,7 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
     # passing over a recipe that no longer installs anything.
     for command in (
         "uv tool install 'memtomem[all]>=0.4,<0.7'",
-        "uv tool install 'memtomem-stm>=0.2,<0.7'",
+        "uv tool install 'memtomem-stm>=0.2,<0.8'",
         "uv tool install --reinstall 'memtomem[all]>=0.4,<0.7'",
         "export MEMTOMEM_STM_SURFACING__LTM_MCP_ARGS="
         '\'["--from","memtomem>=0.4,<0.7","memtomem-server"]\'',
@@ -2074,6 +2127,16 @@ def test_reviewed_memory_resume_guide_matches_core_contract_smoke() -> None:
         "executable block; with a 0.4/0.2 stack that environment cannot resolve"
     )
     assert "does not approve" in guide and "one implicitly." in guide
+    # Raising the STM ceiling across 0.7.0 crosses a daemon-protocol change, so
+    # the install step has to send an existing install through the runbook
+    # that stops the old daemon first -- and before the command, since a reader
+    # who meets it afterwards has already replaced the old build. Step 3 links
+    # the same runbook, so presence alone would not notice this one going.
+    upgrading = guide.find("[Upgrading](operations.md#upgrading)")
+    assert 0 <= upgrading < guide.index("uv tool install 'memtomem-stm"), (
+        "reviewed-memory-resume guide must point to the Upgrading runbook before "
+        "its memtomem-stm install command"
+    )
     assert "\nmms daemon stop --all\n" not in guide
     assert "schema 4" in guide
 
