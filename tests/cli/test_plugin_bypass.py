@@ -443,10 +443,43 @@ class TestCommandsReport:
             input="filesystem\nfs\nstdio\nnpx\n-y @modelcontextprotocol/server-fs\n",
         )
 
+        assert result.exit_code == 0, result.output
         document = json.loads(result.stdout)
+        assert document["ok"] is True
+        assert "filesystem" in json.loads(config.read_text(encoding="utf-8"))["upstream_servers"]
         assert [row["runtime_name"] for row in document["plugin_bypass"]] == [
             "plugin:firebase:firebase"
         ]
+
+    @pytest.mark.parametrize(
+        "argv",
+        [["--demo"], ["--resume"]],
+        ids=["demo", "resume"],
+    )
+    def test_init_json_is_null_when_it_never_asked(self, sandbox, probe, argv):
+        # Neither path runs discovery, so ``[]`` would claim no plugin server
+        # bypasses STM when nothing was checked.
+        probe["out"] = [FIREBASE]
+        config = _config(sandbox["home"]) if argv == ["--resume"] else sandbox["home"] / "n.json"
+
+        result = CliRunner().invoke(
+            cli,
+            ["init", *argv, "--client", "skip", "--no-validate", "--lang", "en", "--json"]
+            + ["--config", str(config)],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["plugin_bypass"] is None
+        assert probe["calls"] == []
+
+    def test_init_json_is_null_when_it_fails_before_discovery(self, sandbox, probe):
+        probe["out"] = [FIREBASE]
+        config = _config(sandbox["home"])  # exists, no --resume → refused
+
+        result = CliRunner().invoke(cli, ["init", "--json", "--config", str(config)])
+
+        assert result.exit_code == 1
+        assert json.loads(result.stdout)["plugin_bypass"] is None
 
     def test_init_json_keeps_the_rows_on_prompt_eof(self, sandbox, probe):
         probe["out"] = [FIREBASE]

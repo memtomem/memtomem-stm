@@ -307,6 +307,8 @@ _SETUP_JSON_MODE: ContextVar[bool] = ContextVar("setup_json_mode", default=False
 # ``--json`` they travel in the result document instead of as text: the
 # decorator captures stderr too and replays it only on success, so a report
 # printed inside ``init`` would vanish on a prompt EOF or a failed write.
+# ``None`` means init never asked (``--demo``, ``--resume``, or a failure
+# before discovery) and renders as ``null``: ``[]`` would claim none exist.
 _SETUP_PLUGIN_BYPASS: ContextVar[list[dict[str, str]] | None] = ContextVar(
     "setup_plugin_bypass", default=None
 )
@@ -393,7 +395,7 @@ def _setup_json_result(action: str):  # noqa: ANN201
                 or kwargs.get("mcp_mode"),
             }
             if action == "init":
-                payload["plugin_bypass"] = _SETUP_PLUGIN_BYPASS.get() or []
+                payload["plugin_bypass"] = _SETUP_PLUGIN_BYPASS.get()
             if write_failure is not None:
                 payload["error"] = write_failure.code
                 payload["message"] = write_failure.raw_message
@@ -5924,10 +5926,11 @@ def init(
     click.echo("")
 
     candidates = [] if demo else _discover_candidates(Path.cwd())
-    plugin_bypass = [] if demo else _plugin_bypass_servers(Path.cwd())
-    _SETUP_PLUGIN_BYPASS.set([row.as_json() for row in plugin_bypass])
-    if not _SETUP_JSON_MODE.get():
-        _echo_plugin_bypass(plugin_bypass, err=False)
+    if not demo:
+        plugin_bypass = _plugin_bypass_servers(Path.cwd())
+        _SETUP_PLUGIN_BYPASS.set([row.as_json() for row in plugin_bypass])
+        if not json_mode:
+            _echo_plugin_bypass(plugin_bypass, err=False)
     if not allow_project_configs:
         # Keyed on the source's own marker, not on one label: the marker is
         # what says "this file came from the checkout", and a second repo-local
