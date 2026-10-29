@@ -542,3 +542,27 @@ class TestCommandsReport:
         assert document["action"] == "register"
         assert "plugin_bypass" not in document
         assert probe["calls"] == []
+
+    def test_init_lock_failure_is_the_shared_envelope_without_the_key(
+        self, sandbox, probe, monkeypatch
+    ):
+        # The write lock wraps init from outside, so a lock failure is raised
+        # before init runs and uses the envelope every mutator shares; docs say
+        # it carries no ``plugin_bypass`` (rather than a null claiming a check).
+        from memtomem_stm.mms import state
+
+        probe["out"] = [FIREBASE]
+
+        def denied(path):
+            raise IsADirectoryError(21, "Is a directory", str(path))
+
+        monkeypatch.setattr(state, "open_lock_fd", denied)
+        config = sandbox["home"] / "new.json"
+
+        result = CliRunner().invoke(cli, ["init", "--json", "--config", str(config)])
+
+        assert result.exit_code == 1
+        document = json.loads(result.stdout)
+        assert document["error"] == "config_lock_unavailable"
+        assert "plugin_bypass" not in document
+        assert probe["calls"] == []
