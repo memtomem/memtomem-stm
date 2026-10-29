@@ -3131,6 +3131,7 @@ class TestInit:
             "config_path": str(config.resolve()),
             "servers": ["demo"],
             "client": "skip",
+            "plugin_bypass": [],
         }
 
     def test_init_demo_json_never_prompts_and_validates_by_default(

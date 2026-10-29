@@ -24,7 +24,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from functools import wraps
-from typing import TYPE_CHECKING, Any, NoReturn, TextIO
+from typing import TYPE_CHECKING, Any, NoReturn, TextIO, TypeGuard
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 import click
@@ -303,6 +303,14 @@ _SETUP_RESOLVED_CLIENT: ContextVar[str | None] = ContextVar("setup_resolved_clie
 # invisible and hangs the caller (or dies as a bare "Aborted!" on EOF).
 _SETUP_JSON_MODE: ContextVar[bool] = ContextVar("setup_json_mode", default=False)
 
+# Plugin MCP servers ``init`` found bypassing STM (#1108), as JSON rows. Under
+# ``--json`` they travel in the result document instead of as text: the
+# decorator captures stderr too and replays it only on success, so a report
+# printed inside ``init`` would vanish on a prompt EOF or a failed write.
+_SETUP_PLUGIN_BYPASS: ContextVar[list[dict[str, str]] | None] = ContextVar(
+    "setup_plugin_bypass", default=None
+)
+
 
 def _setup_json_result(action: str):  # noqa: ANN201
     """Capture a setup command and emit one secret-safe JSON result document."""
@@ -316,6 +324,7 @@ def _setup_json_result(action: str):  # noqa: ANN201
                 return fn(*args, **kwargs)
 
             _SETUP_RESOLVED_CLIENT.set(None)
+            _SETUP_PLUGIN_BYPASS.set(None)
             out = io.StringIO()
             err = io.StringIO()
             exit_code = 0
@@ -383,6 +392,8 @@ def _setup_json_result(action: str):  # noqa: ANN201
                 or kwargs.get("client_mode")
                 or kwargs.get("mcp_mode"),
             }
+            if action == "init":
+                payload["plugin_bypass"] = _SETUP_PLUGIN_BYPASS.get() or []
             if write_failure is not None:
                 payload["error"] = write_failure.code
                 payload["message"] = write_failure.raw_message
@@ -4083,6 +4094,166 @@ def _discover_candidates(cwd: Path) -> list[_DiscoveredCandidate]:
     return list(seen.values())
 
 
+@dataclass(frozen=True)
+class _PluginBypass:
+    """One MCP server a Claude Code plugin registers, which STM does not proxy (#1108).
+
+    Report-only: no field of the server entry is kept, because none is printed.
+    A rebuilt command line would carry whatever the plugin put in ``args``,
+    ``url`` or ``env`` (tokens included) and still not round-trip through
+    ``mms add``, so the report names the server and the operator registers it.
+    """
+
+    plugin_id: str
+    server: str
+    transport: str
+    scope: str
+
+    @property
+    def runtime_name(self) -> str:
+        """The name Claude Code shows in ``/mcp``: ``plugin:<plugin>:<server>``."""
+        return f"plugin:{self.plugin_id.split('@', 1)[0]}:{self.server}"
+
+    def as_json(self) -> dict[str, str]:
+        return {
+            "plugin_id": self.plugin_id,
+            "server": self.server,
+            "runtime_name": self.runtime_name,
+            "transport": self.transport,
+            "scope": self.scope,
+        }
+
+
+_PLUGIN_SCOPES = frozenset({"user", "project", "local"})
+
+
+def _plain_identifier(value: object) -> TypeGuard[str]:
+    """A non-empty str that renders as itself: no lone surrogate, nothing ``_disp`` escapes."""
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and not has_lone_surrogate(value)
+        and not any(_disp_escapes(ch) for ch in value)
+    )
+
+
+def _plugin_server_transport(raw: dict[str, Any]) -> str | None:
+    """Transport of a plugin server entry, reading only ``type`` / ``command`` / ``url``."""
+    type_hint = raw.get("type")
+    if type_hint is not None and not isinstance(type_hint, str):
+        return None
+    url = raw.get("url")
+    if type_hint == "http" and isinstance(url, str) and url:
+        return "streamable_http"
+    if type_hint == "sse" and isinstance(url, str) and url:
+        return "sse"
+    command = raw.get("command")
+    if type_hint in (None, "stdio") and isinstance(command, str) and command:
+        return "stdio"
+    return None
+
+
+def _plugin_bypass_servers(cwd: Path) -> list[_PluginBypass]:
+    """MCP servers that enabled Claude Code plugins register for ``cwd`` (#1108).
+
+    Asks ``claude plugin list --json`` from ``cwd``: whether a plugin is
+    enabled there comes from the settings Claude Code resolves for that
+    directory, so the record's ``enabled`` is the only filter. ``projectPath``
+    names the project a plugin was installed from, not where it is enabled
+    (measured: a local-scope plugin enabled in one directory reported another
+    directory as its ``projectPath``), so it is not read.
+
+    Fails open: no ``claude`` on PATH, a failed or timed-out call, or output
+    that is not a JSON list yields no rows, and malformed records or servers
+    are skipped one by one, so the commands that report this keep working.
+    """
+    if shutil.which("claude") is None:
+        return []
+    try:
+        result = _run_claude_mcp(["claude", "plugin", "list", "--json"], cwd=str(cwd.resolve()))
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        click.echo(
+            f"{_warn('Note:')} could not list Claude Code plugins ({type(exc).__name__}); "
+            "plugin MCP servers are not reported.",
+            err=True,
+        )
+        return []
+    if result.returncode != 0:
+        click.echo(
+            f"{_warn('Note:')} `claude plugin list --json` exited {result.returncode}; "
+            "plugin MCP servers are not reported.",
+            err=True,
+        )
+        return []
+    try:
+        records = json.loads(result.stdout)
+    except (ValueError, RecursionError):
+        records = None
+    if not isinstance(records, list):
+        click.echo(
+            f"{_warn('Note:')} `claude plugin list --json` did not return a JSON list; "
+            "plugin MCP servers are not reported.",
+            err=True,
+        )
+        return []
+
+    rows: dict[tuple[str, str], _PluginBypass] = {}
+    for record in records:
+        if not isinstance(record, dict) or record.get("enabled") is not True:
+            continue
+        plugin_id = record.get("id")
+        servers = record.get("mcpServers")
+        if not _plain_identifier(plugin_id) or not isinstance(servers, dict):
+            continue
+        scope = record.get("scope")
+        scope_label = scope if isinstance(scope, str) and scope in _PLUGIN_SCOPES else "unknown"
+        for server, raw in servers.items():
+            if not _plain_identifier(server) or not isinstance(raw, dict):
+                continue
+            transport = _plugin_server_transport(raw)
+            if transport is None:
+                continue
+            command = raw.get("command")
+            args = raw.get("args")
+            if transport == "stdio" and _is_self_reference(
+                {
+                    "command": command,
+                    "args": [a for a in args if isinstance(a, str)]
+                    if isinstance(args, list)
+                    else [],
+                }
+            ):
+                continue
+            # A plugin installed at two scopes can appear twice; one row per server.
+            rows.setdefault(
+                (plugin_id, server), _PluginBypass(plugin_id, server, transport, scope_label)
+            )
+    return sorted(rows.values(), key=lambda row: row.runtime_name)
+
+
+def _echo_plugin_bypass(rows: list[_PluginBypass], *, err: bool) -> None:
+    """Tell the operator which plugin MCP servers bypass STM, and how to route one through it."""
+    if not rows:
+        return
+    click.echo(
+        f"{_warn('Note:')} {len(rows)} MCP server(s) registered by Claude Code plugins "
+        "bypass STM (not imported; Claude Code still runs them directly):",
+        err=err,
+    )
+    for row in rows:
+        click.echo(f"  {_disp(row.runtime_name)} ({row.transport}, {row.scope})", err=err)
+    click.echo(
+        "  To route one through STM, register it with `mms add ... --validate` "
+        "(see docs/cli.md), then disable the plugin's copy in `/mcp`",
+        err=err,
+    )
+    for plugin_id in dict.fromkeys(row.plugin_id for row in rows):
+        click.echo(
+            f"  or turn the plugin off: {_shell_join(['claude', 'plugin', 'disable', plugin_id])}",
+            err=err,
+        )
+
+
 def _build_origin(cand: _DiscoveredCandidate, imported_at: str) -> dict[str, Any]:
     """Build the per-entry ``origin`` provenance block for an import (#475).
 
@@ -5189,6 +5360,7 @@ def _add_from_clients(
                 "validated": validate,
                 "warnings": warnings,
                 "prune": prune_result,
+                "plugin_bypass": [row.as_json() for row in plugin_bypass],
             }
         )
 
@@ -5199,6 +5371,8 @@ def _add_from_clients(
 
     discovery_cwd = Path.cwd()
     all_candidates = _discover_candidates(discovery_cwd)
+    plugin_bypass = _plugin_bypass_servers(discovery_cwd)
+    _echo_plugin_bypass(plugin_bypass, err=as_json)
 
     if select_names:
         # Resolve the requested names against *everything* discovered, not
@@ -5214,14 +5388,32 @@ def _add_from_clients(
                 f"Discovered: {', '.join(available) if available else '(none)'}"
             )
             click.echo(f"{_err('Error:')} {_disp(msg)}", err=True)
+            plugin_servers = {row.server for row in plugin_bypass}
+            for name in unknown:
+                if name in plugin_servers:
+                    click.echo(
+                        f"  {_disp(name)} is registered by a Claude Code plugin, "
+                        "which STM does not import; see the note above.",
+                        err=True,
+                    )
             if as_json:
-                _json_fail("add", "unknown_server", msg, unknown=unknown, available=available)
+                _json_fail(
+                    "add",
+                    "unknown_server",
+                    msg,
+                    unknown=unknown,
+                    available=available,
+                    plugin_bypass=[row.as_json() for row in plugin_bypass],
+                )
             sys.exit(1)
         requested = set(select_names)
         all_candidates = [cand for cand in all_candidates if cand.name in requested]
 
     if not all_candidates:
-        info("No MCP servers found in Claude Desktop / Code / Cursor / .mcp.json.")
+        # Plugin servers were just reported above; "none found" alone would
+        # contradict that note, so name what was searched as importable.
+        found = "No importable MCP servers" if plugin_bypass else "No MCP servers"
+        info(f"{found} found in Claude Desktop / Code / Cursor / .mcp.json.")
         info("Use `mms add <NAME> --prefix ... --command ...` to register one manually.")
         emit([], skipped, warnings_json)
         return
@@ -5732,6 +5924,10 @@ def init(
     click.echo("")
 
     candidates = [] if demo else _discover_candidates(Path.cwd())
+    plugin_bypass = [] if demo else _plugin_bypass_servers(Path.cwd())
+    _SETUP_PLUGIN_BYPASS.set([row.as_json() for row in plugin_bypass])
+    if not _SETUP_JSON_MODE.get():
+        _echo_plugin_bypass(plugin_bypass, err=False)
     if not allow_project_configs:
         # Keyed on the source's own marker, not on one label: the marker is
         # what says "this file came from the checkout", and a second repo-local
@@ -6959,9 +7155,15 @@ def prune(
                 {"name": n, "source": s, "error": e, "hint": _source_removal_hint(n, s)}
                 for n, s, e in failed
             ],
+            # Plugin servers STM never imported, so prune has nothing to
+            # remove for them; reported so "nothing to prune" is not read as
+            # "everything routes through STM" (#1108).
+            "plugin_bypass": [row.as_json() for row in plugin_bypass],
         }
 
     data = _load(resolved, json_action="prune" if as_json else None)
+    plugin_bypass = _plugin_bypass_servers(Path.cwd())
+    _echo_plugin_bypass(plugin_bypass, err=as_json)
     upstreams: dict[str, dict[str, Any]] = data.get("upstream_servers", {})
     if not upstreams:
         if as_json:
@@ -6998,6 +7200,7 @@ def prune(
                     "not_dual_registered",
                     f"not dual-registered: {', '.join(sorted(missing))}",
                     names=sorted(missing),
+                    plugin_bypass=[row.as_json() for row in plugin_bypass],
                 )
             sys.exit(1)
         requested = set(names)

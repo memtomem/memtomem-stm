@@ -109,6 +109,25 @@ def _no_real_child_sweep(request: pytest.FixtureRequest, monkeypatch: pytest.Mon
 
 
 @pytest.fixture(autouse=True)
+def _no_real_plugin_discovery(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Never let a test run the real ``claude plugin list`` probe (#1108).
+
+    ``mms init``, ``mms add --from-clients`` and ``mms prune`` ask the Claude
+    Code CLI which plugin MCP servers bypass STM. On a machine with ``claude``
+    on PATH that would make the result depend on the developer's plugins, and
+    under the tests' scripted ``_run_claude_mcp`` fakes the probe would consume
+    a result queued for a registration or removal call. Report none by
+    default; a test that needs the real probe marks itself
+    ``real_plugin_discovery`` and scripts the seam itself.
+    """
+    if request.node.get_closest_marker("real_plugin_discovery"):
+        return
+    monkeypatch.setattr("memtomem_stm.cli.proxy._plugin_bypass_servers", lambda _cwd: [])
+
+
+@pytest.fixture(autouse=True)
 def _no_real_teardown_watchdog(monkeypatch: pytest.MonkeyPatch) -> None:
     """Never let a test arm the real hard-exit backstop.
 
