@@ -635,7 +635,7 @@ class TestMcpDisabledServers:
             {"projects": []},
             {"projects": {"__cwd__": []}},
             {"projects": {"__cwd__": {"disabledMcpServers": "plugin:firebase:firebase"}}},
-            # Deeper than the json module recurses: must not abort the report.
+            # Whether decoding fails or yields a nested list, reporting must not abort.
             '{"projects": ' + "[" * 100_000 + "]" * 100_000 + "}",
         ],
         ids=["missing", "invalid", "root-list", "projects-list", "entry-list", "names-str", "deep"],

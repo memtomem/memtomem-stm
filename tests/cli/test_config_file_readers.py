@@ -469,7 +469,8 @@ def test_mcp_json_registration_aborts_cleanly_on_an_unparsable_value(
     before = mcp_path.read_bytes()
 
     if kind == "RecursionError":
-        # Python 3.14's decoder handles this depth without recursion (#1275).
+        # This depth may not raise on every interpreter; inject the error to
+        # cover the recursion handler independently of decoder limits (#1275).
         def too_deep(*args, **kwargs):
             raise RecursionError("injected decoder recursion limit")
 

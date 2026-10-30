@@ -854,7 +854,7 @@ _UNPARSEABLE_DATASETS = {
 
 @pytest.fixture
 def dataset_decoder(monkeypatch):
-    """Exercise the recursion branch even when the decoder is iterative (#1275)."""
+    """Exercise the recursion branch independently of decoder depth limits (#1275)."""
     real_loads = json.loads
 
     def loads(text, *args, **kwargs):
