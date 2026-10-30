@@ -823,7 +823,9 @@ def _run_claude_mcp(
     )
 
 
-def _run_codex_mcp(cmd: list[str], timeout: int = 5) -> subprocess.CompletedProcess[str]:
+def _run_codex_mcp(
+    cmd: list[str], timeout: int = 5, *, cwd: str | None = None, stdin: int | None = None
+) -> subprocess.CompletedProcess[str]:
     """Invoke the official ``codex mcp`` CLI with Windows-safe decoding."""
     return subprocess.run(
         cmd,
@@ -832,6 +834,8 @@ def _run_codex_mcp(cmd: list[str], timeout: int = 5) -> subprocess.CompletedProc
         encoding="utf-8",
         errors="replace",
         timeout=timeout,
+        cwd=cwd,
+        stdin=stdin,
     )
 
 
@@ -5499,7 +5503,7 @@ def _add_from_clients(
     _echo_plugin_bypass(plugin_bypass, err=as_json)
     from memtomem_stm.cli.host_bypass import echo_codex_extras
 
-    echo_codex_extras(discovery_cwd)
+    codex_extras = echo_codex_extras(discovery_cwd, err=as_json)
 
     if select_names:
         # Resolve the requested names against *everything* discovered, not
@@ -5523,6 +5527,12 @@ def _add_from_clients(
                         "which STM does not import; see the note above.",
                         err=True,
                     )
+                if name in codex_extras:
+                    click.echo(
+                        f"  {_disp(name)} is registered in Codex but absent from STM's "
+                        "config-file scan, which STM does not import; see the note above.",
+                        err=True,
+                    )
             if as_json:
                 _json_fail(
                     "add",
@@ -5539,8 +5549,8 @@ def _add_from_clients(
     if not all_candidates:
         # Plugin servers were just reported above; "none found" alone would
         # contradict that note, so name what was searched as importable.
-        found = "No importable MCP servers" if plugin_bypass else "No MCP servers"
-        info(f"{found} found in Claude Desktop / Code / Cursor / .mcp.json.")
+        found = "No importable MCP servers" if plugin_bypass or codex_extras else "No MCP servers"
+        info(f"{found} found in Claude Desktop / Code / Cursor / Codex / .mcp.json.")
         info("Use `mms add <NAME> --prefix ... --command ...` to register one manually.")
         emit([], skipped, warnings_json)
         return
@@ -6058,7 +6068,7 @@ def init(
         codex_extras = codex_extra_servers(Path.cwd())
         _SETUP_CODEX_EXTRAS.set(codex_extras)
         if not json_mode:
-            echo_codex_extras(Path.cwd(), names=codex_extras)
+            echo_codex_extras(Path.cwd(), names=codex_extras, err=False)
         _SETUP_PLUGIN_BYPASS.set([row.as_json() for row in plugin_bypass])
         if not json_mode:
             _echo_plugin_bypass(plugin_bypass, err=False)
@@ -10194,8 +10204,8 @@ def doctor(
                     "Codex MCP servers",
                     "WARN",
                     f"{len(codex_extras)} additional Codex MCP registration(s) absent from "
-                    "STM's config-file scan (possibly plugin-provided; not imported): "
-                    + ", ".join(codex_extras),
+                    "STM's config-file scan (possibly plugin-provided or from another "
+                    "Codex config layer; not imported): " + ", ".join(codex_extras),
                     "inspect in Codex; register with `mms add ... --validate` if needed, "
                     "then disable the direct copy in its host",
                 )

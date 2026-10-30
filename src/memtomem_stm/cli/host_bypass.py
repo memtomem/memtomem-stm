@@ -15,22 +15,25 @@ from pathlib import Path
 import click
 
 from memtomem_stm.cli._display import _disp
-from memtomem_stm.mms.import_hosts import _BLOCKED_IMPORT_NAMES, _is_self_reference, scan_codex
+from memtomem_stm.mms.import_hosts import (
+    _BLOCKED_IMPORT_NAMES,
+    _is_self_reference,
+    codex_declared_names,
+)
 
 
 def codex_extra_servers(cwd: Path) -> list[str]:
+    # Late import avoids a module cycle with proxy's command registration.
+    from memtomem_stm.cli.proxy import _plain_identifier, _run_codex_mcp
+
     executable = shutil.which("codex")
     if executable is None:
         return []
     try:
-        result = subprocess.run(
+        result = _run_codex_mcp(
             [executable, "mcp", "list", "--json"],
             cwd=str(cwd.resolve()),
             stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=5,
         )
         records = json.loads(result.stdout) if result.returncode == 0 else None
@@ -43,10 +46,7 @@ def codex_extra_servers(cwd: Path) -> list[str]:
         )
         return []
 
-    # Late import avoids a module cycle with proxy's command registration.
-    from memtomem_stm.cli.proxy import _plain_identifier
-
-    known = {candidate.name for candidate in scan_codex(cwd)}
+    known = codex_declared_names(cwd)
     extra: set[str] = set()
     for record in records:
         if not isinstance(record, dict) or record.get("enabled") is not True:
@@ -67,21 +67,22 @@ def codex_extra_servers(cwd: Path) -> list[str]:
     return sorted(extra)
 
 
-def echo_codex_extras(cwd: Path, *, names: list[str] | None = None) -> None:
+def echo_codex_extras(cwd: Path, *, names: list[str] | None = None, err: bool = True) -> list[str]:
     if names is None:
         names = codex_extra_servers(cwd)
     if names:
         click.echo(
             f"Note: {len(names)} additional Codex MCP registration(s) are absent from STM's "
-            "config-file scan (possibly plugin-provided; not imported): "
-            + ", ".join(_disp(name) for name in names),
-            err=True,
+            "config-file scan (possibly plugin-provided or from another Codex config layer; "
+            "not imported): " + ", ".join(_disp(name) for name in names),
+            err=err,
         )
         click.echo(
             "  Inspect them in Codex; register with `mms add ... --validate` if needed, "
             "then disable the direct copy in its host.",
-            err=True,
+            err=err,
         )
+    return names
 
 
 def report_host_bypass(cwd: Path, host: str = "all") -> None:

@@ -593,15 +593,18 @@ reconciliation: these commands never import or remove a plugin's server.
 
 `init`, `add --from-clients`, `prune`, `doctor`, `import`, and the host commands
 also query `codex mcp list --json` in the current directory when Codex is on PATH,
-with a five-second timeout. Enabled names absent from STM's Codex config-file
-scan are reported as additional registrations. Codex's list has no plugin
+with a five-second subprocess timeout; host launcher cleanup can take longer.
+Enabled names absent from STM's Codex config-file scan are reported as additional
+registrations. Names declared in those files are excluded even when their
+transport cannot be imported (for example, URL servers). Codex's list has no plugin
 provenance field: these may be plugin-provided or come from another config
 layer. Inspect them in Codex before deciding to route them through STM. Only
 names are reported; command arguments, URLs, environment and headers are omitted.
 The report does not turn these registrations into import or prune candidates.
 
-Codex notices go to stderr, except in `doctor`, where a `codex_extra_servers`
-WARN check appears in both the text and JSON reports, and `init --json`, which
+Codex notices go to stdout in text `init` and `add --from-clients`, matching the
+Claude plugin notices, and otherwise to stderr. In `doctor`, a `codex_extra_servers`
+WARN check appears in both the text and JSON reports. `init --json`
 includes a `codex_extra_servers` array of names when extras were found (also on
 setup failure). That field is omitted when no extras were reported. Registry command JSON
 shapes are unchanged. A failed probe emits a note on stderr and does not abort

@@ -382,9 +382,9 @@ def status_cmd(json_output: bool) -> None:
     """
     from memtomem_stm.cli.host_bypass import report_host_bypass
 
-    report_host_bypass(Path.cwd().resolve())
     registry = state.load_registry()
     import_state = state.load_import_state()
+    report_host_bypass(Path.cwd().resolve())
 
     if not registry.servers:
         if json_output:

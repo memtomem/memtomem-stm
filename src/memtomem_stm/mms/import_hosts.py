@@ -334,33 +334,48 @@ def scan_cursor(cwd: Path) -> list[ImportCandidate]:
     return candidates
 
 
-def scan_codex(cwd: Path) -> list[ImportCandidate]:
-    """Scan CODEX_HOME and the current project's config when it is trusted."""
+def _codex_config_sources(cwd: Path) -> list[tuple[dict[str, Any], str, bool]]:
+    """Share the file scan's layers and trust boundary with advisory reports."""
     codex_home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
     config = _read_toml_safely(codex_home / "config.toml") or {}
-    out: list[ImportCandidate] = []
+    sources = [(config, "Codex CLI", False)]
+    projects = config.get("projects") or {}
+    project = projects.get(str(cwd.resolve()), {}) if isinstance(projects, dict) else {}
+    trusted = isinstance(project, dict) and project.get("trust_level") == "trusted"
+    if trusted:
+        sources.append(
+            (
+                _read_toml_safely(cwd / ".codex" / "config.toml") or {},
+                "Codex CLI (project)",
+                True,
+            )
+        )
+    return sources
 
-    def collect(source: dict[str, Any], label: str, *, repo_local: bool = False) -> None:
+
+def codex_declared_names(cwd: Path) -> set[str]:
+    """Names declared in scanned files, including entries STM cannot import."""
+    names: set[str] = set()
+    for source, _, _ in _codex_config_sources(cwd):
+        servers = source.get("mcp_servers")
+        if isinstance(servers, dict):
+            names.update(servers)
+    return names
+
+
+def scan_codex(cwd: Path) -> list[ImportCandidate]:
+    """Scan CODEX_HOME and the current project's config when it is trusted."""
+    out: list[ImportCandidate] = []
+    for source, label, repo_local in _codex_config_sources(cwd):
         servers = source.get("mcp_servers") or {}
         if not isinstance(servers, dict):
-            return
+            continue
         for name, raw in servers.items():
             if not isinstance(raw, dict):
                 continue
             cand = _wrap(name, raw, label, is_repo_local=repo_local)
             if cand:
                 out.append(cand)
-
-    collect(config, "Codex CLI")
-    projects = config.get("projects") or {}
-    project = projects.get(str(cwd.resolve()), {}) if isinstance(projects, dict) else {}
-    trusted = isinstance(project, dict) and project.get("trust_level") == "trusted"
-    if trusted:
-        collect(
-            _read_toml_safely(cwd / ".codex" / "config.toml") or {},
-            "Codex CLI (project)",
-            repo_local=True,
-        )
     return out
 
 
