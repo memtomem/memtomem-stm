@@ -7599,7 +7599,7 @@ def _json_config_set_entry(
     if raw is not None:
         try:
             loaded = json.loads(raw)
-        except (json.JSONDecodeError, ValueError) as exc:
+        except (json.JSONDecodeError, ValueError, RecursionError) as exc:
             return (False, f"parse error: {exc} — fix or move {path} aside and retry")
         if not isinstance(loaded, dict):
             return (False, f"{path} top-level is not an object")
