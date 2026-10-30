@@ -21,6 +21,12 @@ changes inline only. See the deprecation policy in
   nonempty `CLAUDE_CONFIG_DIR`, whose active config layout STM cannot verify;
   restore manually from `upstream_servers.<name>.origin.original` instead.
 
+- `mms add --from-clients --prune` and `mms prune` report a Claude Desktop
+  config nested too deeply to parse or rewrite as a failed removal, with the
+  manual edit, instead of exiting with a traceback; the file is left
+  unchanged. On Python 3.12 a Desktop config holding a value about 1,500
+  levels deep triggered this. (#1279)
+
 ### Added
 
 - Host setup, import, registry and doctor commands report enabled Codex MCP
