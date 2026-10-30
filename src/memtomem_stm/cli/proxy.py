@@ -4184,10 +4184,7 @@ def _claude_disabled_mcp_servers(cwd: Path) -> frozenset[str]:
     """
     if os.environ.get("CLAUDE_CONFIG_DIR"):
         return frozenset()
-    try:
-        cc = _read_json_safely(Path("~/.claude.json").expanduser())
-    except RecursionError:
-        return frozenset()
+    cc = _read_json_safely(Path("~/.claude.json").expanduser())
     projects = cc.get("projects") if cc else None
     entry = projects.get(str(cwd.resolve())) if isinstance(projects, dict) else None
     disabled = entry.get("disabledMcpServers") if isinstance(entry, dict) else None
@@ -7530,37 +7527,107 @@ def _parse_eject_to(value: str) -> tuple[_SourceSpec, str | None]:
     return spec, None
 
 
-def _read_host_servers(kind: str, path: str | None) -> dict[str, Any] | None:
+class _HostConfigReadError(ValueError):
+    """The eject pre-check cannot establish that a target is safe to write."""
+
+
+def _read_eject_host_json(path: Path, *, strict: bool) -> dict[str, Any] | None:
+    if not strict:
+        return _read_json_safely(path)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except UnicodeDecodeError as exc:
+        raise _HostConfigReadError(
+            f"{path} is not valid UTF-8 (byte offset {exc.start}); fix it before ejecting"
+        ) from exc
+    except (OSError, UnicodeError) as exc:
+        raise _HostConfigReadError(
+            f"cannot read target config {path} ({type(exc).__name__}); fix it before ejecting"
+        ) from exc
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError) as exc:
+        raise _HostConfigReadError(
+            f"cannot parse target config {path} ({type(exc).__name__}); fix it before ejecting"
+        ) from exc
+    if not isinstance(data, dict):
+        raise _HostConfigReadError(f"target config {path} is not an object; fix it before ejecting")
+    return data
+
+
+def _eject_host_config_path(kind: str, path: str | None) -> Path | None:
+    if kind == "mcp-json":
+        return Path(path) if path else None
+    if kind == "claude-desktop":
+        return _desktop_config_path()
+    if kind in {"claude-user", "claude-project"}:
+        return Path("~/.claude.json").expanduser()
+    return None
+
+
+def _read_host_servers(
+    kind: str, path: str | None, *, strict: bool = False
+) -> dict[str, Any] | None:
     """Read-only ``mcpServers`` map for one host target; ``None`` when absent.
 
     Same backing files as :func:`_discover_candidates`. Eject's no-clobber
-    pre-check and post-write verify both read the host config directly
-    rather than parsing ``claude mcp get`` output — the latter has no
+    pre-check (strict: unreadable is an error) and post-write verify both read
+    the host config directly rather than parsing ``claude mcp get`` output — the latter has no
     machine-readable contract, and a parse drift could false-pass the
     verify or leak secret values through diagnostics.
     """
-    if kind == "mcp-json":
-        data = _read_json_safely(Path(path)) if path else None
-    elif kind == "claude-desktop":
-        data = _read_json_safely(_desktop_config_path())
-    elif kind == "claude-user":
-        data = _read_json_safely(Path("~/.claude.json").expanduser())
-    elif kind == "claude-project":
-        cc = _read_json_safely(Path("~/.claude.json").expanduser())
-        projects = cc.get("projects") if cc else None
-        candidate = projects.get(path) if isinstance(projects, dict) else None
-        data = candidate if isinstance(candidate, dict) else None
-    else:
+    if kind in {"claude-user", "claude-project"} and os.environ.get("CLAUDE_CONFIG_DIR"):
+        if strict:
+            raise _HostConfigReadError(
+                "automatic eject to Claude Code is unsupported with CLAUDE_CONFIG_DIR set; "
+                "restore the registration manually in the active Claude configuration"
+            )
         return None
+    config_path = _eject_host_config_path(kind, path)
+    if config_path is None:
+        return None
+    data = _read_eject_host_json(config_path, strict=strict)
+    if kind == "claude-project":
+        cc = data
+        projects = cc.get("projects") if cc else None
+        if strict and cc is not None and "projects" in cc and not isinstance(projects, dict):
+            raise _HostConfigReadError(
+                f"target config {config_path}: projects is not an object; fix it before ejecting"
+            )
+        candidate = projects.get(path) if isinstance(projects, dict) else None
+        if (
+            strict
+            and isinstance(projects, dict)
+            and path in projects
+            and not isinstance(candidate, dict)
+        ):
+            raise _HostConfigReadError(
+                f"target config {config_path}: project {path} is not an object; "
+                "fix it before ejecting"
+            )
+        data = candidate if isinstance(candidate, dict) else None
     if not isinstance(data, dict):
         return None
     servers = data.get("mcpServers")
+    if strict and "mcpServers" in data and not isinstance(servers, dict):
+        raise _HostConfigReadError(
+            f"target config {config_path}: mcpServers is not an object; fix it before ejecting"
+        )
     return servers if isinstance(servers, dict) else None
 
 
-def _host_existing_entry(kind: str, path: str | None, name: str) -> dict[str, Any] | None:
-    servers = _read_host_servers(kind, path)
+def _host_existing_entry(
+    kind: str, path: str | None, name: str, *, strict: bool = False
+) -> dict[str, Any] | None:
+    servers = _read_host_servers(kind, path, strict=strict)
     entry = servers.get(name) if servers else None
+    if strict and servers is not None and name in servers and not isinstance(entry, dict):
+        raise _HostConfigReadError(
+            f"target config {_eject_host_config_path(kind, path)}: server entry is not an object; "
+            "fix it before ejecting"
+        )
     return entry if isinstance(entry, dict) else None
 
 
@@ -7635,7 +7702,7 @@ def _json_config_set_entry(
     if raw is not None:
         try:
             loaded = json.loads(raw)
-        except (json.JSONDecodeError, ValueError) as exc:
+        except (ValueError, RecursionError) as exc:
             return (False, f"parse error: {exc} — fix or move {path} aside and retry")
         if not isinstance(loaded, dict):
             return (False, f"{path} top-level is not an object")
@@ -7645,14 +7712,20 @@ def _json_config_set_entry(
         except OSError:
             pass
     servers = existing.get("mcpServers")
+    if "mcpServers" in existing and not isinstance(servers, dict):
+        return (False, f"{path} mcpServers is not an object — fix it before ejecting")
     if not isinstance(servers, dict):
         servers = {}
         existing["mcpServers"] = servers
     servers[name] = entry
     try:
+        serialized = _json_dumps(existing, indent=2, ensure_ascii=False) + "\n"
+    except RecursionError:
+        return (False, f"{path} is nested too deeply to rewrite — fix or move it aside and retry")
+    try:
         atomic_write_text(
             path,
-            _json_dumps(existing, indent=2, ensure_ascii=False) + "\n",
+            serialized,
             mode=default_mode,
             durable=True,
         )
@@ -7913,7 +7986,10 @@ def _resolve_eject_plan(
 
     # Step 3 — no-clobber guard against the live host config.
     skip_write = overwrite = False
-    existing = _host_existing_entry(kind, path, name)
+    try:
+        existing = _host_existing_entry(kind, path, name, strict=True)
+    except _HostConfigReadError as exc:
+        return _EjectPlan(name=name, error=str(exc))
     if existing is not None:
         existing_norm = _normalize_client_entry(existing)
         payload_norm = _normalize_client_entry(payload)

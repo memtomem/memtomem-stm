@@ -91,7 +91,7 @@ def _read_json_safely(path: Path) -> dict[str, Any] | None:
         if not path.exists():
             return None
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, ValueError):
+    except (OSError, json.JSONDecodeError, ValueError, RecursionError):
         return None
     return data if isinstance(data, dict) else None
 

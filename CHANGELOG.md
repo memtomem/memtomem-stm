@@ -11,6 +11,16 @@ changes inline only. See the deprecation policy in
 
 ## [Unreleased]
 
+### Fixed
+
+- Host discovery ignores JSON decoder recursion failures, and direct host
+  restore leaves the file unchanged when JSON cannot be decoded or re-encoded.
+  (#1273)
+  **Behavior change**: eject refuses unreadable or malformed target configs
+  even with `--force`. Automatic Claude user/project eject also refuses a
+  nonempty `CLAUDE_CONFIG_DIR`, whose active config layout STM cannot verify;
+  restore manually from `upstream_servers.<name>.origin.original` instead.
+
 ### Added
 
 - Host setup, import, registry and doctor commands report enabled Codex MCP

@@ -852,9 +852,21 @@ _UNPARSEABLE_DATASETS = {
 }
 
 
+@pytest.fixture
+def dataset_decoder(monkeypatch, kind):
+    """Exercise the recursion branch independently of decoder depth limits (#1275)."""
+    if kind != "nesting":
+        return
+
+    def loads(*args, **kwargs):
+        raise RecursionError("injected decoder recursion limit")
+
+    monkeypatch.setattr(json, "loads", loads)
+
+
 @pytest.mark.parametrize("kind", sorted(_UNPARSEABLE_DATASETS))
 def test_unparseable_dataset_is_a_clean_error(
-    tmp_path: Path, kind: str, default_digit_limit: None
+    tmp_path: Path, kind: str, default_digit_limit: None, dataset_decoder: None
 ) -> None:
     body, reason = _UNPARSEABLE_DATASETS[kind]
     path = tmp_path / "dataset.json"
@@ -864,6 +876,13 @@ def test_unparseable_dataset_is_a_clean_error(
         load_selection_dataset(path)
 
     assert str(exc_info.value) == f"invalid dataset JSON: {reason}"
+
+
+def test_deep_malformed_dataset_is_a_clean_error(tmp_path: Path) -> None:
+    path = tmp_path / "dataset.json"
+    path.write_text("[" * 100_000, encoding="utf-8")
+    with pytest.raises(SelectionEvaluationError, match="invalid dataset JSON"):
+        load_selection_dataset(path)
 
 
 def _nested(depth: int) -> Any:
@@ -1003,7 +1022,7 @@ def test_non_finite_number_in_a_dataset_is_a_clean_error(tmp_path: Path, literal
 @pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
 @pytest.mark.parametrize("kind", sorted(_UNPARSEABLE_DATASETS))
 def test_cli_reports_an_unparseable_dataset_without_a_traceback(
-    tmp_path: Path, kind: str, json_output: bool, default_digit_limit: None
+    tmp_path: Path, kind: str, json_output: bool, default_digit_limit: None, dataset_decoder: None
 ) -> None:
     body, reason = _UNPARSEABLE_DATASETS[kind]
     path = tmp_path / "dataset.json"

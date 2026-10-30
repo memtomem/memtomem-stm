@@ -53,6 +53,22 @@ class TestHelperReexports:
         listy.write_text("[1, 2, 3]", encoding="utf-8")
         assert ih._read_json_safely(listy) is None
 
+    def test_read_json_safely_returns_none_for_recursion_error(self, tmp_path, monkeypatch):
+        path = tmp_path / "deep.json"
+        path.write_text("[]", encoding="utf-8")
+
+        def too_deep(_text):
+            raise RecursionError("decoder recursion limit")
+
+        monkeypatch.setattr(ih.json, "loads", too_deep)
+        assert ih._read_json_safely(path) is None
+
+    def test_read_json_safely_ignores_deep_array(self, tmp_path):
+        path = tmp_path / "deep.json"
+        path.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+        # Older decoders raise; newer ones parse a non-object. Both are ignored.
+        assert ih._read_json_safely(path) is None
+
     def test_read_json_safely_round_trip(self, tmp_path):
         good = tmp_path / "good.json"
         good.write_text('{"foo": "bar"}', encoding="utf-8")
