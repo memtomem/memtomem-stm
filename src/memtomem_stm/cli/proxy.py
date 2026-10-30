@@ -4177,10 +4177,7 @@ def _claude_disabled_mcp_servers(cwd: Path) -> frozenset[str]:
     """
     if os.environ.get("CLAUDE_CONFIG_DIR"):
         return frozenset()
-    try:
-        cc = _read_json_safely(Path("~/.claude.json").expanduser())
-    except RecursionError:
-        return frozenset()
+    cc = _read_json_safely(Path("~/.claude.json").expanduser())
     projects = cc.get("projects") if cc else None
     entry = projects.get(str(cwd.resolve())) if isinstance(projects, dict) else None
     disabled = entry.get("disabledMcpServers") if isinstance(entry, dict) else None
