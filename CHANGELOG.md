@@ -21,11 +21,14 @@ changes inline only. See the deprecation policy in
   nonempty `CLAUDE_CONFIG_DIR`, whose active config layout STM cannot verify;
   restore manually from `upstream_servers.<name>.origin.original` instead.
 
-- `mms add --from-clients --prune` and `mms prune` report a Claude Desktop
-  config nested too deeply to parse or rewrite as a failed removal, with the
-  manual edit, instead of exiting with a traceback; the file is left
-  unchanged. On Python 3.12 a Desktop config holding a value about 1,500
-  levels deep triggered this. (#1279)
+- When `mms add --from-clients --prune` or `mms prune` removes an entry from
+  a Claude Desktop config it has already discovered, and the file turns out
+  to be nested too deeply to reread or rewrite, the entry is reported as a
+  failed removal with the manual edit instead of exiting with a traceback;
+  the file is left unchanged. On Python 3.12 a value about 1,500 levels deep
+  elsewhere in the file triggered this. A config discovery cannot decode is
+  still skipped without a note, and deep nesting inside a server entry still
+  fails during discovery (#1280). (#1279)
 
 ### Added
 
