@@ -299,6 +299,105 @@ class TestEchoPluginBypass:
         assert expected != "claude plugin disable evil;rm -rf ~&x@m"
 
 
+# Firebase with a second server, so a disable can be shown to drop exactly one.
+FIREBASE_TWO = {
+    **FIREBASE,
+    "mcpServers": {**FIREBASE["mcpServers"], "emulator": {"command": "npx", "args": []}},
+}
+
+
+def _write_claude_json(home: Path, data: object) -> None:
+    text = data if isinstance(data, str) else json.dumps(data)
+    (home / ".claude.json").write_text(text, encoding="utf-8")
+
+
+def _disabled_for(cwd: Path, names: object) -> dict:
+    return {"projects": {str(cwd.resolve()): {"disabledMcpServers": names}}}
+
+
+class TestMcpDisabledServers:
+    """A server disabled in ``/mcp`` for this directory is not reported (#1268)."""
+
+    @pytest.fixture
+    def home(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        home.mkdir()
+        set_home(monkeypatch, home)
+        return home
+
+    def _names(self, cwd: Path) -> list[str]:
+        return [row.runtime_name for row in proxy_mod._plugin_bypass_servers(cwd)]
+
+    def test_disabled_server_is_dropped_and_its_sibling_kept(self, probe, home, tmp_path):
+        # The string `/mcp` wrote for a disabled firebase server (2026-10-30,
+        # Claude Code 2.1.314); `claude plugin list --json` was unchanged.
+        probe["out"] = [FIREBASE_TWO]
+        _write_claude_json(home, _disabled_for(tmp_path, ["plugin:firebase:firebase"]))
+
+        assert self._names(tmp_path) == ["plugin:firebase:emulator"]
+
+    def test_without_a_disable_both_are_reported(self, probe, home, tmp_path):
+        probe["out"] = [FIREBASE_TWO]
+        _write_claude_json(home, _disabled_for(tmp_path, []))
+
+        assert self._names(tmp_path) == ["plugin:firebase:emulator", "plugin:firebase:firebase"]
+
+    def test_another_projects_disable_does_not_apply(self, probe, home, tmp_path):
+        probe["out"] = [FIREBASE_TWO]
+        other = tmp_path / "other"
+        other.mkdir()
+        _write_claude_json(home, _disabled_for(other, ["plugin:firebase:firebase"]))
+
+        assert self._names(tmp_path) == ["plugin:firebase:emulator", "plugin:firebase:firebase"]
+
+    def test_symlinked_cwd_reads_the_resolved_key(self, probe, home, tmp_path):
+        probe["out"] = [FIREBASE_TWO]
+        real = tmp_path / "real"
+        real.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(real, target_is_directory=True)
+        _write_claude_json(home, _disabled_for(real, ["plugin:firebase:firebase"]))
+
+        assert self._names(link) == ["plugin:firebase:emulator"]
+
+    def test_bare_server_key_does_not_disable(self, probe, home, tmp_path):
+        probe["out"] = [FIREBASE_TWO]
+        _write_claude_json(home, _disabled_for(tmp_path, ["firebase", "PLUGIN:FIREBASE:FIREBASE"]))
+
+        assert self._names(tmp_path) == ["plugin:firebase:emulator", "plugin:firebase:firebase"]
+
+    def test_non_string_members_are_ignored_not_fatal(self, probe, home, tmp_path):
+        probe["out"] = [FIREBASE_TWO]
+        _write_claude_json(home, _disabled_for(tmp_path, ["plugin:firebase:firebase", None, 3]))
+
+        assert self._names(tmp_path) == ["plugin:firebase:emulator"]
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            None,
+            "{not json",
+            "[]",
+            {"projects": []},
+            {"projects": {"__cwd__": []}},
+            {"projects": {"__cwd__": {"disabledMcpServers": "plugin:firebase:firebase"}}},
+            # Deeper than the json module recurses: must not abort the report.
+            '{"projects": ' + "[" * 100_000 + "]" * 100_000 + "}",
+        ],
+        ids=["missing", "invalid", "root-list", "projects-list", "entry-list", "names-str", "deep"],
+    )
+    def test_unreadable_disable_data_hides_nothing(self, probe, home, tmp_path, content):
+        probe["out"] = [FIREBASE_TWO]
+        if content is not None:
+            if isinstance(content, dict):
+                content = json.dumps(content).replace(
+                    '"__cwd__"', json.dumps(str(tmp_path.resolve()))
+                )
+            _write_claude_json(home, content)
+
+        assert self._names(tmp_path) == ["plugin:firebase:emulator", "plugin:firebase:firebase"]
+
+
 @pytest.fixture
 def sandbox(tmp_path, monkeypatch):
     set_home(monkeypatch, tmp_path)
@@ -357,6 +456,38 @@ class TestCommandsReport:
         assert "bypass STM" in result.stderr
         for canary in CANARIES:
             assert canary not in result.output
+
+    def test_add_from_clients_json_omits_a_server_disabled_in_mcp(self, sandbox, probe):
+        probe["out"] = [FIREBASE_TWO]
+        _write_claude_json(
+            sandbox["home"], _disabled_for(sandbox["cwd"], ["plugin:firebase:firebase"])
+        )
+        config = _config(sandbox["home"])
+
+        result = CliRunner().invoke(
+            cli, ["add", "--from-clients", "--all", "--json", "--config", str(config)]
+        )
+
+        assert result.exit_code == 0, result.output
+        document = json.loads(result.stdout)
+        assert [row["runtime_name"] for row in document["plugin_bypass"]] == [
+            "plugin:firebase:emulator"
+        ]
+
+    def test_prune_without_upstreams_survives_a_deeply_nested_claude_json(self, sandbox, probe):
+        # prune returns before discovery when nothing is configured, so the
+        # disable read is the only parse of ~/.claude.json on this path.
+        probe["out"] = [FIREBASE]
+        _write_claude_json(sandbox["home"], '{"projects": ' + "[" * 100_000 + "]" * 100_000 + "}")
+        config = _config(sandbox["home"])
+
+        result = CliRunner().invoke(cli, ["prune", "--all", "--json", "--config", str(config)])
+
+        assert result.exit_code == 0, result.output
+        document = json.loads(result.stdout)
+        assert [row["runtime_name"] for row in document["plugin_bypass"]] == [
+            "plugin:firebase:firebase"
+        ]
 
     def test_select_naming_a_plugin_server_says_why_it_is_unknown(self, sandbox, probe):
         probe["out"] = [FIREBASE]

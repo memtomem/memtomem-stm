@@ -4155,6 +4155,30 @@ def _plugin_server_transport(raw: dict[str, Any]) -> str | None:
     return None
 
 
+def _claude_disabled_mcp_servers(cwd: Path) -> frozenset[str]:
+    """Names disabled for ``cwd`` in ``/mcp``, from ``~/.claude.json`` (#1268).
+
+    ``/mcp`` records a disabled plugin server under
+    ``projects[<resolved cwd>].disabledMcpServers`` as the name it shows,
+    ``plugin:<plugin>:<server>``, while ``claude plugin list --json`` keeps
+    listing it unchanged (measured), so this file is the only place to learn it.
+    Names are matched exactly: how ``/mcp`` spells unusual plugin names was not
+    measured, and a name that does not match is still reported.
+
+    Anything unreadable yields no names, so it never hides a server.
+    """
+    try:
+        cc = _read_json_safely(Path("~/.claude.json").expanduser())
+    except RecursionError:
+        return frozenset()
+    projects = cc.get("projects") if cc else None
+    entry = projects.get(str(cwd.resolve())) if isinstance(projects, dict) else None
+    disabled = entry.get("disabledMcpServers") if isinstance(entry, dict) else None
+    if not isinstance(disabled, list):
+        return frozenset()
+    return frozenset(name for name in disabled if isinstance(name, str))
+
+
 def _plugin_bypass_servers(cwd: Path) -> list[_PluginBypass]:
     """MCP servers that enabled Claude Code plugins register for ``cwd`` (#1108).
 
@@ -4163,7 +4187,8 @@ def _plugin_bypass_servers(cwd: Path) -> list[_PluginBypass]:
     directory, so the record's ``enabled`` is the only filter. ``projectPath``
     names the project a plugin was installed from, not where it is enabled
     (measured: a local-scope plugin enabled in one directory reported another
-    directory as its ``projectPath``), so it is not read.
+    directory as its ``projectPath``), so it is not read. A server disabled for
+    ``cwd`` in ``/mcp`` is dropped (:func:`_claude_disabled_mcp_servers`).
 
     Fails open: no ``claude`` on PATH, a failed or timed-out call, or output
     that is not a JSON list yields no rows, and malformed records or servers
@@ -4199,6 +4224,7 @@ def _plugin_bypass_servers(cwd: Path) -> list[_PluginBypass]:
         )
         return []
 
+    disabled = _claude_disabled_mcp_servers(cwd)
     rows: dict[tuple[str, str], _PluginBypass] = {}
     for record in records:
         if not isinstance(record, dict) or record.get("enabled") is not True:
@@ -4230,7 +4256,10 @@ def _plugin_bypass_servers(cwd: Path) -> list[_PluginBypass]:
             rows.setdefault(
                 (plugin_id, server), _PluginBypass(plugin_id, server, transport, scope_label)
             )
-    return sorted(rows.values(), key=lambda row: row.runtime_name)
+    return sorted(
+        (row for row in rows.values() if row.runtime_name not in disabled),
+        key=lambda row: row.runtime_name,
+    )
 
 
 def _echo_plugin_bypass(rows: list[_PluginBypass], *, err: bool) -> None:
