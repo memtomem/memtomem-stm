@@ -4165,8 +4165,17 @@ def _claude_disabled_mcp_servers(cwd: Path) -> frozenset[str]:
     Names are matched exactly: how ``/mcp`` spells unusual plugin names was not
     measured, and a name that does not match is still reported.
 
+    The key is the exact resolved ``cwd``. Claude Code appears to key a
+    project by its repository root, and on Windows with ``/`` separators, so
+    from a subdirectory or on Windows a disabled server may still be reported.
+    With ``CLAUDE_CONFIG_DIR`` set to a nonempty value, Claude Code reads its
+    config elsewhere and ``~/.claude.json`` may hold stale disables, so
+    nothing is read (#1271).
+
     Anything unreadable yields no names, so it never hides a server.
     """
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        return frozenset()
     try:
         cc = _read_json_safely(Path("~/.claude.json").expanduser())
     except RecursionError:

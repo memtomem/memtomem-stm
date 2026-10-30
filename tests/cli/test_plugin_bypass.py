@@ -323,6 +323,7 @@ class TestMcpDisabledServers:
         home = tmp_path / "home"
         home.mkdir()
         set_home(monkeypatch, home)
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
         return home
 
     def _names(self, cwd: Path) -> list[str]:
@@ -366,6 +367,15 @@ class TestMcpDisabledServers:
 
         assert self._names(tmp_path) == ["plugin:firebase:emulator", "plugin:firebase:firebase"]
 
+    def test_claude_config_dir_reads_no_disables(self, probe, home, tmp_path, monkeypatch):
+        # Claude Code reads its config from the override, so a disable left in
+        # ~/.claude.json may be stale: it must not hide a running server.
+        probe["out"] = [FIREBASE_TWO]
+        _write_claude_json(home, _disabled_for(tmp_path, ["plugin:firebase:firebase"]))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+
+        assert self._names(tmp_path) == ["plugin:firebase:emulator", "plugin:firebase:firebase"]
+
     def test_non_string_members_are_ignored_not_fatal(self, probe, home, tmp_path):
         probe["out"] = [FIREBASE_TWO]
         _write_claude_json(home, _disabled_for(tmp_path, ["plugin:firebase:firebase", None, 3]))
@@ -401,6 +411,7 @@ class TestMcpDisabledServers:
 @pytest.fixture
 def sandbox(tmp_path, monkeypatch):
     set_home(monkeypatch, tmp_path)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     proj = tmp_path / "proj"
     proj.mkdir()
     monkeypatch.chdir(proj)

@@ -26,9 +26,10 @@ changes inline only. See the deprecation policy in
   `claude plugin list --json` in the current directory (about 0.6 s), and
   their `--json` documents gain a `plugin_bypass` array, also on the
   `unknown_server` and `not_dual_registered` failures. They also read
-  `~/.claude.json`: a server listed there as disabled for the current
-  directory (what `/mcp` writes) is left out, and disable data that cannot
-  be read never hides a server. (#1268)
+  `~/.claude.json`: a server `/mcp` disabled for exactly the current
+  directory is left out. From a subdirectory, on Windows, or with
+  `CLAUDE_CONFIG_DIR` set to a nonempty value it may still be listed, and
+  disable data that cannot be read never hides a server. (#1268)
 
 ## [0.7.2] — 2026-10-29
 
