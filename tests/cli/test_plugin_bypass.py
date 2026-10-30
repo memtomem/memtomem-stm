@@ -10,6 +10,7 @@ running it.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -22,18 +23,24 @@ from helpers import set_home
 from memtomem_stm.cli import proxy as proxy_mod
 from memtomem_stm.cli.proxy import cli
 
+# Stands for the directory the probe runs in: the ``probe`` fixture replaces a
+# ``projectPath`` equal to this with that directory, so a record carrying it is
+# an install belonging to the project under test (#1270).
+HERE = "<probe cwd>"
+
 # The record `claude plugin list --json` returned for the Firebase plugin,
 # enabled at local scope in a scratch directory (2026-10-29, Claude Code
-# 2.1.312). ``projectPath`` names the directory it was installed from, not the
-# one it is enabled in, and ``projectEnabled`` is false while ``enabled`` is
-# true; installPath is shortened.
+# 2.1.312), with ``projectPath`` set to the directory under test; the recorded
+# value named another directory. ``projectEnabled`` is false while ``enabled``
+# is true (it tracks the project's shared settings only); installPath is
+# shortened.
 FIREBASE = {
     "id": "firebase@firebase",
     "version": "1.0.0",
     "scope": "local",
     "enabled": True,
     "installPath": "/home/u/.claude/plugins/cache/firebase/firebase/1.0.0",
-    "projectPath": "/private/tmp/claude-vibe-coding",
+    "projectPath": HERE,
     "projectEnabled": False,
     "mcpServers": {
         "firebase": {
@@ -90,8 +97,15 @@ def probe(monkeypatch):
             return out
         if isinstance(out, str):
             return _result(out)
-        return _result(json.dumps(out))
+        records = [
+            {**r, "projectPath": cwd} if isinstance(r, dict) and r.get("projectPath") == HERE else r
+            for r in out
+        ]
+        return _result(json.dumps(records))
 
+    # A git hook exports these, which turns the project match off (#1270).
+    for name in proxy_mod._GIT_LOCATION_ENV:
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(proxy_mod.shutil, "which", lambda name: "/usr/bin/claude")
     monkeypatch.setattr(proxy_mod, "_run_claude_mcp", fake_run)
     return state
@@ -127,10 +141,8 @@ class TestPluginBypassServers:
             {"cmd": ["claude", "plugin", "list", "--json"], "cwd": str(tmp_path.resolve())}
         ]
 
-    def test_enabled_is_the_only_filter(self, probe, tmp_path):
-        # A foreign projectPath with projectEnabled false is still live here
-        # (measured); a disabled record is not, whatever its projectPath says.
-        disabled = {**FIREBASE, "id": "off@m", "enabled": False, "projectPath": str(tmp_path)}
+    def test_disabled_record_is_dropped_whatever_its_project(self, probe, tmp_path):
+        disabled = {**FIREBASE, "id": "off@m", "enabled": False}
         probe["out"] = [FIREBASE, disabled]
 
         rows = proxy_mod._plugin_bypass_servers(tmp_path)
@@ -262,6 +274,217 @@ class TestPluginBypassServers:
 
         assert probe["calls"] == []
         assert capsys.readouterr() == ("", "")
+
+
+@pytest.fixture
+def layout(tmp_path, monkeypatch):
+    """Directories shaped like the ones #1270 was measured in (Claude Code 2.1.314).
+
+    Only ``.git`` entries matter to the project match: a directory marks a
+    repository root, a file marks a linked worktree. ``where(name)`` gives the
+    absolute path of a layout entry.
+    """
+    if sys.platform == "win32":
+        pytest.skip("the project match is off on Windows (test_windows_keeps_everything)")
+    for name in proxy_mod._GIT_LOCATION_ENV:
+        monkeypatch.delenv(name, raising=False)
+    base = tmp_path.resolve()
+    if any(os.path.lexists(p / ".git") for p in (base, *base.parents)):
+        pytest.skip("the temporary directory sits inside a git repository")
+    for repo in ("A", "D", "E", "F", "G", "H", "A/nested", "outer/N"):
+        (tmp_path / repo / ".git").mkdir(parents=True)
+    for sub in ("A/sub", "D/sub", "G/sub", "B/sub", "HW"):
+        (tmp_path / sub).mkdir(parents=True)
+    (tmp_path / "HW" / ".git").write_text(
+        f"gitdir: {tmp_path / 'H' / '.git' / 'worktrees' / 'HW'}\n", encoding="utf-8"
+    )
+    (tmp_path / "L").symlink_to(tmp_path / "A", target_is_directory=True)
+    return lambda name: tmp_path.resolve() / name
+
+
+def _deny_lstat(monkeypatch, denied) -> None:
+    """Make ``Path.lstat`` raise ``PermissionError`` for paths ``denied`` accepts."""
+    real_lstat = Path.lstat
+
+    def lstat(self):
+        if denied(self):
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_lstat(self)
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+
+
+def _record(project_path: object, scope: object = "local", plugin: str = "firebase") -> dict:
+    return {**FIREBASE, "id": f"{plugin}@m", "scope": scope, "projectPath": project_path}
+
+
+class TestProjectMatch:
+    """An enabled install that belongs to another repository runs nothing here (#1270)."""
+
+    def _kept(self, probe, cwd: Path, *records: dict) -> list[str]:
+        probe["out"] = list(records)
+        return [row.plugin_id for row in proxy_mod._plugin_bypass_servers(cwd)]
+
+    @pytest.mark.parametrize(
+        ("cwd", "installed", "scope", "runs"),
+        [
+            # Each row: where the probe ran, where the install was made from,
+            # and whether `claude mcp list` there showed the server connected.
+            ("A", "A", "local", True),
+            ("A/sub", "A", "local", True),
+            ("L", "A", "local", True),
+            ("B", "B", "local", True),
+            ("G", "G/sub", "local", True),
+            ("G/sub", "G/sub", "local", True),
+            ("H", "HW", "local", True),
+            ("HW", "A", "local", True),
+            ("E", "E", "project", True),
+            ("D", "A", "local", False),
+            ("D/sub", "B", "local", False),
+            ("D", "G/sub", "local", False),
+            ("F", "E", "project", False),
+        ],
+    )
+    def test_measured_rows(self, probe, layout, cwd, installed, scope, runs):
+        kept = self._kept(probe, layout(cwd), _record(str(layout(installed)), scope))
+
+        assert kept == (["firebase@m"] if runs else [])
+
+    def test_a_linked_worktree_install_is_kept_from_anywhere(self, probe, layout):
+        # Not derivable without git, so it over-reports rather than guess.
+        assert self._kept(probe, layout("D"), _record(str(layout("HW")))) == ["firebase@m"]
+
+    @pytest.mark.parametrize(
+        ("cwd", "installed"),
+        [("outer/N", "outer"), ("A", "A/nested"), ("A/nested", "A/sub")],
+        ids=["install-around-the-repo", "nested-repo-inside", "outer-repo-of-a-nested-cwd"],
+    )
+    def test_nesting_with_unequal_roots_is_kept(self, probe, layout, cwd, installed):
+        assert self._kept(probe, layout(cwd), _record(str(layout(installed)))) == ["firebase@m"]
+
+    def test_install_spelled_through_a_symlink_is_kept(self, probe, layout):
+        assert self._kept(probe, layout("A"), _record(str(layout("L")))) == ["firebase@m"]
+
+    def test_install_spelled_in_another_case_is_kept(self, probe, layout):
+        if not Path(str(layout("A")).lower()).exists():
+            pytest.skip("case-sensitive filesystem")
+        assert self._kept(probe, layout("A"), _record(str(layout("A")).lower())) == ["firebase@m"]
+
+    @pytest.mark.parametrize(
+        ("project_path", "scope"),
+        [
+            ("{D}", "user"),
+            ("{D}", "global"),
+            ("{D}", None),
+            (7, "local"),
+            ("", "local"),
+            ("D", "local"),
+            ("{missing}", "local"),
+            ("{loop}", "local"),
+            ("{D}\x00x", "local"),
+        ],
+        ids=[
+            "user-scope",
+            "unknown-scope",
+            "no-scope",
+            "not-a-string",
+            "empty",
+            "relative",
+            "missing-dir",
+            "symlink-loop",
+            "nul",
+        ],
+    )
+    def test_unsure_records_are_kept(self, probe, layout, tmp_path, project_path, scope):
+        (tmp_path / "loop").symlink_to(tmp_path / "loop")
+        if isinstance(project_path, str):
+            project_path = project_path.format(
+                D=layout("D"), missing=layout("gone"), loop=layout("loop")
+            )
+
+        assert self._kept(probe, layout("A"), _record(project_path, scope)) == ["firebase@m"]
+
+    def test_git_location_in_the_environment_keeps_everything(self, probe, layout, monkeypatch):
+        monkeypatch.setenv("GIT_DIR", str(layout("D") / ".git"))
+
+        assert self._kept(probe, layout("A"), _record(str(layout("D")))) == ["firebase@m"]
+
+    @pytest.mark.parametrize("side", ["cwd", "install"])
+    def test_a_probe_error_on_either_side_keeps_the_record(self, probe, layout, monkeypatch, side):
+        blocked = layout("A" if side == "cwd" else "D") / ".git"
+        _deny_lstat(monkeypatch, lambda p: p == blocked)
+
+        assert self._kept(probe, layout("A"), _record(str(layout("D")))) == ["firebase@m"]
+
+    def test_windows_keeps_everything(self, probe, tmp_path, monkeypatch):
+        # Plain directories, not ``layout``, so this also runs on Windows itself.
+        for repo in ("A", "D"):
+            (tmp_path / repo / ".git").mkdir(parents=True)
+        monkeypatch.setattr(sys, "platform", "win32")
+
+        kept = self._kept(probe, tmp_path / "A", _record(str((tmp_path / "D").resolve())))
+
+        assert kept == ["firebase@m"]
+
+    @pytest.mark.parametrize("foreign_first", [True, False], ids=["foreign-first", "local-first"])
+    def test_records_are_filtered_before_they_are_merged(self, probe, layout, foreign_first):
+        servers = {"shared": {"command": "npx"}}
+        foreign = {
+            **_record(str(layout("D")), "project"),
+            "mcpServers": {**servers, "old-only": {"command": "npx"}},
+        }
+        local = {**_record(str(layout("A")), "local"), "mcpServers": servers}
+        probe["out"] = [foreign, local] if foreign_first else [local, foreign]
+
+        rows = proxy_mod._plugin_bypass_servers(layout("A"))
+
+        assert [(row.server, row.scope) for row in rows] == [("shared", "local")]
+
+
+class TestClaudeProjectRoot:
+    @pytest.mark.parametrize(
+        ("path", "root"),
+        [("A", "A"), ("A/sub", "A"), ("L", "A"), ("B/sub", "B/sub"), ("A/nested", "A/nested")],
+    )
+    def test_root(self, layout, path, root):
+        assert proxy_mod._claude_project_root(layout(path)) == layout(root)
+
+    @pytest.mark.parametrize("path", ["HW", "gone"], ids=["linked-worktree", "missing"])
+    def test_unsure_is_none(self, layout, path):
+        assert proxy_mod._claude_project_root(layout(path)) is None
+
+    @pytest.mark.parametrize("target", ["A/.git", "nowhere"], ids=["to-a-git-dir", "dangling"])
+    def test_symlinked_git_marker_is_none(self, layout, target):
+        (layout("B/sub") / ".git").symlink_to(layout(target))
+
+        assert proxy_mod._claude_project_root(layout("B/sub")) is None
+
+    @pytest.mark.parametrize("path", ["HW", "B/sub"], ids=["worktree", "non-git"])
+    def test_an_unreadable_marker_is_none(self, layout, monkeypatch, path):
+        # Python 3.14's Path.is_dir() / exists() read this as "no .git", which
+        # would turn the worktree into a known non-git root.
+        _deny_lstat(monkeypatch, lambda p: p.name == ".git")
+
+        assert proxy_mod._claude_project_root(layout(path)) is None
+
+    @pytest.mark.parametrize("name", proxy_mod._GIT_LOCATION_ENV)
+    @pytest.mark.parametrize("value", ["", "x"], ids=["empty", "set"])
+    def test_git_location_in_the_environment_is_none(self, layout, monkeypatch, name, value):
+        monkeypatch.setenv(name, value)
+
+        assert proxy_mod._claude_project_root(layout("A")) is None
+
+
+class TestSameOrInside:
+    def test_unreadable_base_counts_as_inside(self, tmp_path):
+        assert proxy_mod._same_or_inside(tmp_path, tmp_path / "gone") is True
+
+    def test_identity_not_spelling(self, tmp_path):
+        (tmp_path / "real" / "sub").mkdir(parents=True)
+        (tmp_path / "link").symlink_to(tmp_path / "real", target_is_directory=True)
+
+        assert proxy_mod._same_or_inside(tmp_path / "real" / "sub", tmp_path / "link") is True
+        assert proxy_mod._same_or_inside(tmp_path / "real", tmp_path / "real" / "sub") is False
 
 
 class TestEchoPluginBypass:
@@ -499,6 +722,21 @@ class TestCommandsReport:
         assert [row["runtime_name"] for row in document["plugin_bypass"]] == [
             "plugin:firebase:firebase"
         ]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the project match is off on Windows")
+    def test_add_from_clients_json_omits_an_install_from_another_project(self, sandbox, probe):
+        elsewhere = sandbox["home"] / "elsewhere"
+        elsewhere.mkdir()
+        probe["out"] = [{**FIREBASE, "projectPath": str(elsewhere)}]
+        config = _config(sandbox["home"])
+
+        result = CliRunner().invoke(
+            cli, ["add", "--from-clients", "--all", "--json", "--config", str(config)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["plugin_bypass"] == []
+        assert "bypass STM" not in result.stderr
 
     def test_select_naming_a_plugin_server_says_why_it_is_unknown(self, sandbox, probe):
         probe["out"] = [FIREBASE]

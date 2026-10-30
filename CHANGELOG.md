@@ -30,6 +30,10 @@ changes inline only. See the deprecation policy in
   directory is left out. From a subdirectory, on Windows, or with
   `CLAUDE_CONFIG_DIR` set to a nonempty value it may still be listed, and
   disable data that cannot be read never hides a server. (#1268)
+  A local- or project-scope install made in another, unrelated repository
+  contributes no servers either, since Claude Code does not run them here;
+  with a linked worktree, a submodule, Windows or a `GIT_DIR` override in
+  play the install still counts. (#1270)
 
 ## [0.7.2] — 2026-10-29
 

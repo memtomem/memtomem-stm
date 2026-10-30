@@ -14,6 +14,7 @@ import re
 import shlex
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tomllib
@@ -4188,16 +4189,92 @@ def _claude_disabled_mcp_servers(cwd: Path) -> frozenset[str]:
     return frozenset(name for name in disabled if isinstance(name, str))
 
 
+_GIT_LOCATION_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
+
+
+def _claude_project_root(path: Path) -> Path | None:
+    """The repository root a plugin install is tied to, or None when unsure (#1270).
+
+    Read from the filesystem only, so nothing in the directory runs: the
+    nearest of ``path`` and its ancestors holding a ``.git`` directory, or
+    ``path`` itself when none holds a ``.git`` at all. A ``.git`` that is a
+    file (a linked worktree, a submodule, a separate git dir) or a symlink
+    points at a repository stored elsewhere, which only git could name, so it
+    yields None rather than a guess, as do a missing directory, a probe error,
+    a git location set in the environment and Windows, where ``projectPath``
+    spelling was not measured.
+    """
+    if sys.platform == "win32" or any(name in os.environ for name in _GIT_LOCATION_ENV):
+        return None
+    # ``lstat`` rather than ``Path.is_dir()`` and friends: those read an
+    # unreadable marker as absent on Python 3.14, which would pass the
+    # directory off as non-git and let its record be dropped.
+    try:
+        resolved = path.resolve()
+        if not stat.S_ISDIR(resolved.stat().st_mode):
+            return None
+        for candidate in (resolved, *resolved.parents):
+            try:
+                mode = (candidate / ".git").lstat().st_mode
+            except FileNotFoundError:
+                continue
+            return candidate if stat.S_ISDIR(mode) else None
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return resolved
+
+
+def _same_or_inside(path: Path, base: Path) -> bool:
+    """Whether ``path`` is ``base`` or below it, by file identity; True when unsure.
+
+    Identity rather than spelling, so a case-insensitive volume reached under
+    another case still matches.
+    """
+    try:
+        target = base.stat()
+        return any(os.path.samestat(p.stat(), target) for p in (path, *path.parents))
+    except (OSError, ValueError):
+        return True
+
+
+def _plugin_record_runs_here(record: dict[str, Any], root: Path | None) -> bool:
+    """Whether Claude Code may run a record's servers in the project at ``root`` (#1270).
+
+    ``enabled`` comes from the settings resolved for the cwd, but Claude Code
+    also needs a ``local`` or ``project`` install belonging to the same
+    repository (measured, Claude Code 2.1.314): a clone whose settings enable a
+    project-scope plugin, or ``claude plugin enable --scope local`` without an
+    install, lists the plugin as enabled with its servers and runs none. An
+    install made from a subdirectory or a linked worktree records that path as
+    ``projectPath`` and still runs in the whole repository.
+
+    So a record is dropped only when the root of its ``projectPath`` is known
+    and is neither the same as, inside, nor around ``root``. Anything unsure
+    keeps it: a report may name a server that is not running, never hide one
+    that is.
+    """
+    if root is None or record.get("scope") not in ("local", "project"):
+        return True
+    project_path = record.get("projectPath")
+    if not isinstance(project_path, str) or not project_path:
+        return True
+    installed = Path(project_path)
+    if not installed.is_absolute():
+        return True
+    installed_root = _claude_project_root(installed)
+    if installed_root is None:
+        return True
+    return _same_or_inside(installed_root, root) or _same_or_inside(root, installed_root)
+
+
 def _plugin_bypass_servers(cwd: Path) -> list[_PluginBypass]:
     """MCP servers that enabled Claude Code plugins register for ``cwd`` (#1108).
 
     Asks ``claude plugin list --json`` from ``cwd``: whether a plugin is
     enabled there comes from the settings Claude Code resolves for that
-    directory, so the record's ``enabled`` is the only filter. ``projectPath``
-    names the project a plugin was installed from, not where it is enabled
-    (measured: a local-scope plugin enabled in one directory reported another
-    directory as its ``projectPath``), so it is not read. A server disabled for
-    ``cwd`` in ``/mcp`` is dropped (:func:`_claude_disabled_mcp_servers`).
+    directory. An enabled record whose install belongs to another repository
+    is dropped (:func:`_plugin_record_runs_here`), and so is a server disabled
+    for ``cwd`` in ``/mcp`` (:func:`_claude_disabled_mcp_servers`).
 
     Fails open: no ``claude`` on PATH, a failed or timed-out call, or output
     that is not a JSON list yields no rows, and malformed records or servers
@@ -4234,9 +4311,12 @@ def _plugin_bypass_servers(cwd: Path) -> list[_PluginBypass]:
         return []
 
     disabled = _claude_disabled_mcp_servers(cwd)
+    root = _claude_project_root(cwd)
     rows: dict[tuple[str, str], _PluginBypass] = {}
     for record in records:
         if not isinstance(record, dict) or record.get("enabled") is not True:
+            continue
+        if not _plugin_record_runs_here(record, root):
             continue
         plugin_id = record.get("id")
         servers = record.get("mcpServers")
