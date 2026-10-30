@@ -460,13 +460,20 @@ def test_doctor_reports_an_integer_past_the_digit_limit(tmp_path, json_output, d
     ids=["digit-limit", "too-deep"],
 )
 def test_mcp_json_registration_aborts_cleanly_on_an_unparsable_value(
-    tmp_path, capsys, content, kind, default_digit_limit
+    tmp_path, capsys, content, kind, default_digit_limit, monkeypatch
 ):
     """``mms init --client json`` merges into an existing ``.mcp.json``; neither
     exception is a ``JSONDecodeError``, so both escaped the parse guard."""
     mcp_path = tmp_path / ".mcp.json"
     mcp_path.write_text(content)
     before = mcp_path.read_bytes()
+
+    if kind == "RecursionError":
+        # Python 3.14's decoder handles this depth without recursion (#1275).
+        def too_deep(*args, **kwargs):
+            raise RecursionError("injected decoder recursion limit")
+
+        monkeypatch.setattr(json, "loads", too_deep)
 
     with pytest.raises(SystemExit) as excinfo:
         proxy_mod._write_mcp_json_for_stm(tmp_path, "memtomem-stm", [])
@@ -477,3 +484,14 @@ def test_mcp_json_registration_aborts_cleanly_on_an_unparsable_value(
     assert f"Failed to parse {mcp_path}: {kind}." in err
     assert "Registration aborted; the file was not modified" in err
     assert "4300" not in err
+
+
+def test_mcp_json_registration_preserves_deep_malformed_json(tmp_path, capsys):
+    path = tmp_path / ".mcp.json"
+    payload = "[" * 100_000
+    path.write_text(payload, encoding="utf-8")
+    with pytest.raises(SystemExit) as info:
+        proxy_mod._write_mcp_json_for_stm(tmp_path, "memtomem-stm", [])
+    assert info.value.code == 1
+    assert path.read_text(encoding="utf-8") == payload
+    assert "Registration aborted; the file was not modified" in capsys.readouterr().err

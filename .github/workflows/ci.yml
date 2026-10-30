@@ -63,6 +63,9 @@ jobs:
           - os: ubuntu-latest
             python: "3.13"
             coverage_args: ""
+          - os: ubuntu-latest
+            python: "3.14"
+            coverage_args: ""
           - os: windows-latest
             python: "3.12"
             coverage_args: ""

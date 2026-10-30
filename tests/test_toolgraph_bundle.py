@@ -2282,8 +2282,16 @@ def test_parser_rejects_an_integer_literal_past_the_digit_limit():
     assert not isinstance(info.value.__cause__, json.JSONDecodeError)
 
 
-def test_parser_rejects_a_bundle_nested_past_the_recursion_limit():
-    payload = b"[" * 100_000
+def test_parser_wraps_decoder_recursion_error(monkeypatch):
+    def too_deep(*args, **kwargs):
+        raise RecursionError("injected decoder recursion limit")
+
+    monkeypatch.setattr(json, "loads", too_deep)
     with pytest.raises(PolicyBundleError, match="nested too deeply") as info:
-        parse_policy_bundle(payload, expected_agent="stm-proxy", expected_profile="strict")
+        parse_policy_bundle(b"[]", expected_agent="stm-proxy", expected_profile="strict")
     assert isinstance(info.value.__cause__, RecursionError)
+
+
+def test_parser_rejects_deep_malformed_json():
+    with pytest.raises(PolicyBundleError):
+        parse_policy_bundle(b"[" * 100_000, expected_agent="stm-proxy", expected_profile="strict")

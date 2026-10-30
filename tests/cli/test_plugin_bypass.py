@@ -253,9 +253,8 @@ class TestPluginBypassServers:
             (FileNotFoundError(2, "No such file"), "FileNotFoundError"),
             ("{not json", "did not return a JSON list"),
             (json.dumps({"id": "x"}), "did not return a JSON list"),
-            ("[" * 100_000 + "]" * 100_000, "did not return a JSON list"),
         ],
-        ids=["rc1", "timeout", "oserror", "garbage", "not-a-list", "deep-nesting"],
+        ids=["rc1", "timeout", "oserror", "garbage", "not-a-list"],
     )
     def test_cli_failures_fail_open_with_a_note(self, probe, tmp_path, capsys, out, note):
         probe["out"] = out
@@ -266,6 +265,24 @@ class TestPluginBypassServers:
         assert captured.out == ""
         assert note in captured.err
         assert "plugin MCP servers are not reported" in captured.err
+
+    def test_decoder_recursion_fails_open_with_a_note(self, probe, tmp_path, capsys, monkeypatch):
+        probe["out"] = "[]"
+
+        def too_deep(*args, **kwargs):
+            raise RecursionError("injected decoder recursion limit")
+
+        monkeypatch.setattr(json, "loads", too_deep)
+        assert proxy_mod._plugin_bypass_servers(tmp_path) == []
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "did not return a JSON list" in captured.err
+        assert "plugin MCP servers are not reported" in captured.err
+
+    def test_deep_list_has_no_plugin_records(self, probe, tmp_path):
+        # Either the decoder rejects it or it parses a list without records.
+        probe["out"] = "[" * 100_000 + "]" * 100_000
+        assert proxy_mod._plugin_bypass_servers(tmp_path) == []
 
     def test_no_claude_on_path_is_silent(self, probe, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(proxy_mod.shutil, "which", lambda name: None)
