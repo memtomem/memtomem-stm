@@ -272,7 +272,7 @@ For `sse`/`streamable_http` servers that need HTTP authentication, pass `--heade
 
 A `--prefix` already used by another registered server is rejected before anything is written (`duplicate_prefix`): the proxy's config loader refuses duplicate prefixes, so saving one would leave a config the server can't start with. The interactive flows (`mms init`, `add --from-clients`) re-prompt on a colliding prefix for the same reason.
 
-With `--json`, stdout carries a single result document — `{"action": "add", "ok": true, "config_path": ..., "name": ..., "prefix": ..., "server": {...}, "validated": ..., "tools_reachable": ..., "warnings": [...]}` — and progress/success text is suppressed (warnings still print to stderr as well). The `server` block is redacted the same way as [`mms list --json`](#list) (all `env`/`headers` values masked). Failures keep exit 1 and emit `{"action": "add", "ok": false, "error": "<code>", "message": ...}` on stdout, where `<code>` is a stable identifier (`already_exists`, `invalid_prefix`, `prefix_too_long`, `duplicate_prefix`, `stdio_requires_command`, `url_required`, `header_requires_http`, `malformed_args`, `invalid_env`, `invalid_header`, `validation_failed`, `config_unreadable`, `config_invalid`). With `--from-clients`, `--json` requires `--all` or `--select` (see below) and emits the bulk-import shape instead — `{"action": "add", "ok": true, "mode": "from_clients", "config_path": ..., "imported": [{"name", "prefix", "source", "server", …}], "skipped": [{"name", "reason"}]  (`reason` is one of `already_registered`, `duplicate_signature`, `ambiguous_identity`), "validated": ..., "warnings": [...], "prune": null | {"pruned": [...], "failed": [...], "manual": [{"name", "source", "hint"}], "conflicts": [{"name", "source"}]}, "plugin_bypass": [...]}` — with `unknown_server` as its one additional failure code (its document also carries `plugin_bypass`, and the stderr note says when a name it could not find belongs to a [plugin server](#claude-code-plugin-servers)). Bare `--from-clients --json` stays a usage error: a formatting flag must not turn the selection prompt into a guess about what to import.
+With `--json`, stdout carries a single result document — `{"action": "add", "ok": true, "config_path": ..., "name": ..., "prefix": ..., "server": {...}, "validated": ..., "tools_reachable": ..., "warnings": [...]}` — and progress/success text is suppressed (warnings still print to stderr as well). The `server` block is redacted the same way as [`mms list --json`](#list) (all `env`/`headers` values masked). Failures keep exit 1 and emit `{"action": "add", "ok": false, "error": "<code>", "message": ...}` on stdout, where `<code>` is a stable identifier (`already_exists`, `invalid_prefix`, `prefix_too_long`, `duplicate_prefix`, `stdio_requires_command`, `url_required`, `header_requires_http`, `malformed_args`, `invalid_env`, `invalid_header`, `validation_failed`, `config_unreadable`, `config_invalid`). With `--from-clients`, `--json` requires `--all` or `--select` (see below) and emits the bulk-import shape instead — `{"action": "add", "ok": true, "mode": "from_clients", "config_path": ..., "imported": [{"name", "prefix", "source", "server", …}], "skipped": [{"name", "reason"}]  (`reason` is one of `already_registered`, `duplicate_signature`, `ambiguous_identity`), "validated": ..., "warnings": [...], "prune": null | {"pruned": [...], "failed": [...], "manual": [{"name", "source", "hint"}], "conflicts": [{"name", "source"}]}, "plugin_bypass": [...], "codex_extra_servers": [...] | null}` — with `unknown_server` as its one additional failure code (its document also carries `plugin_bypass` and `codex_extra_servers`, and the stderr note says when a name it could not find belongs to a [plugin server](#claude-code-plugin-servers)). Bare `--from-clients --json` stays a usage error: a formatting flag must not turn the selection prompt into a guess about what to import.
 
 Use `--from-clients` (alias `--import`) to bulk-pick additional servers from
 the same MCP clients `mms init` scans: `~/.claude.json`, project `.mcp.json`,
@@ -482,7 +482,7 @@ Your upstream definitions in `stm_proxy.json` are never modified — a prune cha
 
 Before deleting a host entry, every prune path appends the verbatim entry (with its source and timestamp) to `~/.memtomem/pruned_upstreams.json` (mode `0600`) — backup-before-delete, so a crash mid-prune never loses the only copy. The log is append-only and advisory: [`mms eject`](#eject) suggests it when an entry has no recorded origin, but never restores from it without your confirmation.
 
-With `--json`, stdout carries a single result document: `{"action": "prune", "ok": ..., "dry_run": ..., "config_path": ..., "planned": [{"name", "source"}], "manual": [{"name", "source", "hint"}], "conflicts": [{"name", "source"}], "pruned": [...], "failed": [{"name", "source", "error", "hint"}], "plugin_bypass": [...]}` — `plugin_bypass` lists the [plugin servers](#claude-code-plugin-servers) that bypass STM, which prune never touches (it is also on the `not_dual_registered` failure document); `planned` contains only sources `mms` will attempt to write; `manual` contains unmanaged sources (currently Cursor) with the edit to make; `conflicts` contains sources holding a different server under the same name, which carry no `hint` because there is no edit to recommend. Each actual `failed` row's `hint` is the exact manual removal command. A manual-only run exits 0 with `ok: true` because no planned action failed. `--json` never prompts: without `--yes` (or `--dry-run`) it refuses with exit 2 and `{"error": "confirmation_required", ...}`. Partial failures keep `ok: false` + exit 1, with the human diagnostics still on stderr.
+With `--json`, stdout carries a single result document: `{"action": "prune", "ok": ..., "dry_run": ..., "config_path": ..., "planned": [{"name", "source"}], "manual": [{"name", "source", "hint"}], "conflicts": [{"name", "source"}], "pruned": [...], "failed": [{"name", "source", "error", "hint"}], "plugin_bypass": [...], "codex_extra_servers": [...] | null}` — `plugin_bypass` lists the [plugin servers](#claude-code-plugin-servers) that bypass STM, which prune never touches (it is also on the `not_dual_registered` failure document); `planned` contains only sources `mms` will attempt to write; `manual` contains unmanaged sources (currently Cursor) with the edit to make; `conflicts` contains sources holding a different server under the same name, which carry no `hint` because there is no edit to recommend. Each actual `failed` row's `hint` is the exact manual removal command. A manual-only run exits 0 with `ok: true` because no planned action failed. `--json` never prompts: without `--yes` (or `--dry-run`) it refuses with exit 2 and `{"error": "confirmation_required", ...}`. Partial failures keep `ok: false` + exit 1, with the human diagnostics still on stderr.
 
 ```bash
 mms prune --all              # remove every writable dual registration (TTY: confirm prompt)
@@ -591,6 +591,70 @@ decide readiness. Its launch arguments are hidden, since they routinely carry
 tokens: on the direct route to a stdio server the text shows `<command> [args hidden]` (the daemon route shows `mms daemon`), and `--json` reports
 `surfacing.ltm_server.args` as one `<REDACTED>` per argument.
 
+### Additional host registrations
+
+`doctor` reports Claude Code plugin MCP servers as a warning. `import` and
+`host status`, `host scan`, and `host sync` report the same servers on stderr,
+including when the registry is empty. They remain outside import and drift
+reconciliation: these commands never import or remove a plugin's server.
+`--from` limits the probes to the selected host where that option is available.
+
+Set `MMS_NO_HOST_PROBE=1` to skip these optional Claude plugin and Codex MCP
+listings in all the commands below, for example:
+
+```bash
+MMS_NO_HOST_PROBE=1 mms host status --json
+```
+
+This disables the additional-registration reports, not file-based discovery,
+explicit host registration/removal, or the server connectivity checks in
+`health` and `doctor`. It is not a global offline mode. No reported registrations
+after opting out means the listings were skipped, not that every server routes
+through STM.
+
+`init`, `add --from-clients`, `prune`, `doctor`, `import`, and the host commands
+also query `codex mcp list --json` in the current directory when Codex is on PATH,
+unless opted out. These listings depend on the current directory. Codex can
+contact configured HTTP endpoints for OAuth discovery even during a list command
+(observed with Codex CLI 0.166.0 against an isolated loopback server). Read-only
+registry inspection does not imply that the host CLI stays offline or leaves its
+own caches untouched. Use the opt-out when those requests are unwanted.
+
+A five-second subprocess timeout is requested. This is not an overall time
+bound on POSIX or Windows: a hung launcher or descendant retaining output pipes
+can keep the command waiting after the timeout. Slow discovery can also cause
+the report to be unavailable; no per-server network timeout is guaranteed here.
+Enabled names absent from the current command's Codex config-file scan are reported
+as additional registrations. `init`, `add --from-clients`, `prune`, and `doctor`
+do not scan Codex files, so they also report registrations declared in those files.
+`mms import` and `mms host` do scan Codex files and exclude their declared names,
+even when the transport cannot be imported (for example, URL servers). Those
+URL-only entries are neither import candidates nor additional-registration reports
+in the registry commands; this feature is not a complete inventory of direct host
+bypasses. Codex's list has no plugin provenance field, so the report does not
+attribute a registration to plugins or a particular config layer.
+Inspect them in Codex before deciding to route them through STM. Only
+names are reported; command arguments, URLs, environment and headers are omitted.
+The report does not turn these registrations into import or prune candidates.
+
+Codex notices go to stdout in text `init`, `add --from-clients`, and `prune`, matching the
+Claude plugin notices, and otherwise to stderr. In `doctor`, a `codex_extra_servers`
+WARN check appears in both the text and JSON reports. `init --json`,
+`add --from-clients --json`, and `prune --json` include `codex_extra_servers`:
+an array of names after a successful probe (`[]` when none), or `null` when the
+probe failed, was disabled, or was unavailable. Init also uses `null` when it
+never reached discovery. Add/prune failures before discovery (including config
+load and write-lock errors) use the existing error envelope without this field;
+their selection errors after discovery include it. Registry command JSON shapes
+are unchanged. A failed probe normally emits a note on stderr and does not abort
+the command. Successful `init --json` also prints the failure note to stderr;
+stdout remains one JSON document with `codex_extra_servers: null`.
+An empty, skipped, or failed probe adds no doctor check, so absence of a
+warning is not proof that every host registration passes through STM. The
+Claude plugin probe retains the scope and disable-data limitations described
+[above](#claude-code-plugin-servers); `.mcpb` bundles and external manifest file
+references have not been verified.
+
 ### `doctor`
 
 ```
@@ -616,6 +680,8 @@ Checks, in order:
 |---|---|---|
 | `config file` | same path resolution as `status`/`health` | FAIL: file missing → `next: mms init` (short-circuits the report) |
 | `config JSON` | the `config validate` parse guard | FAIL: unparseable / non-object root, `not valid UTF-8`, or `cannot read file: <Type>` such as `PermissionError` — the exception type only (short-circuits) |
+| `Codex MCP servers` | enabled, well-formed `codex mcp list --json` entries, excluding STM self-references and reserved names; no config-file subtraction | WARN when registrations exist; read-only, names only, no import |
+| `plugin MCP servers` | the same Claude Code plugin probe as `init` / `add --from-clients` / `prune` | WARN when plugin servers bypass STM; lists their runtime names and a manual routing action. No row when the probe returns no servers or fails; a failed probe prints a note to stderr, so absence of this check is not proof that no plugin servers exist |
 | `config schema` | the `status`/`list`/`health` runtime read | FAIL: valid JSON, invalid schema — a running server would silently fall back to env/defaults; or an environment startup rejects, such as `MEMTOMEM_STM_PROXY='[1]'` — the server cannot start, and `next:` points at the named variables instead of `config validate`. The detail names locations (fields and keys such as server, env variable or header names), error types, or variable names, never values |
 | `proxy enabled` | the shared inert-state predicate (`config validate` + the runtime load advisory) | FAIL: upstream servers configured but top-level `enabled` unset — the silent `false` default advertises none of them to clients while each server still probes green; WARN: explicitly disabled (control-only mode). Omitted when no upstreams are configured |
 | `server transports` | the `add` VAL-3/VAL-4 rule | FAIL: stdio server without `command`, network server without `url` |

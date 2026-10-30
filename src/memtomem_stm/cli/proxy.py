@@ -313,6 +313,7 @@ _SETUP_JSON_MODE: ContextVar[bool] = ContextVar("setup_json_mode", default=False
 _SETUP_PLUGIN_BYPASS: ContextVar[list[dict[str, str]] | None] = ContextVar(
     "setup_plugin_bypass", default=None
 )
+_SETUP_CODEX_EXTRAS: ContextVar[list[str] | None] = ContextVar("setup_codex_extras", default=None)
 
 
 def _setup_json_result(action: str):  # noqa: ANN201
@@ -328,6 +329,7 @@ def _setup_json_result(action: str):  # noqa: ANN201
 
             _SETUP_RESOLVED_CLIENT.set(None)
             _SETUP_PLUGIN_BYPASS.set(None)
+            _SETUP_CODEX_EXTRAS.set(None)
             out = io.StringIO()
             err = io.StringIO()
             exit_code = 0
@@ -397,6 +399,7 @@ def _setup_json_result(action: str):  # noqa: ANN201
             }
             if action == "init":
                 payload["plugin_bypass"] = _SETUP_PLUGIN_BYPASS.get()
+                payload["codex_extra_servers"] = _SETUP_CODEX_EXTRAS.get()
             if write_failure is not None:
                 payload["error"] = write_failure.code
                 payload["message"] = write_failure.raw_message
@@ -819,7 +822,9 @@ def _run_claude_mcp(
     )
 
 
-def _run_codex_mcp(cmd: list[str], timeout: int = 5) -> subprocess.CompletedProcess[str]:
+def _run_codex_mcp(
+    cmd: list[str], timeout: int = 5, *, cwd: str | None = None, stdin: int | None = None
+) -> subprocess.CompletedProcess[str]:
     """Invoke the official ``codex mcp`` CLI with Windows-safe decoding."""
     return subprocess.run(
         cmd,
@@ -828,6 +833,8 @@ def _run_codex_mcp(cmd: list[str], timeout: int = 5) -> subprocess.CompletedProc
         encoding="utf-8",
         errors="replace",
         timeout=timeout,
+        cwd=cwd,
+        stdin=stdin,
     )
 
 
@@ -4277,7 +4284,9 @@ def _plugin_bypass_servers(cwd: Path) -> list[_PluginBypass]:
     that is not a JSON list yields no rows, and malformed records or servers
     are skipped one by one, so the commands that report this keep working.
     """
-    if shutil.which("claude") is None:
+    from memtomem_stm.cli.host_bypass import host_probes_disabled
+
+    if host_probes_disabled() or shutil.which("claude") is None:
         return []
     try:
         result = _run_claude_mcp(["claude", "plugin", "list", "--json"], cwd=str(cwd.resolve()))
@@ -5478,6 +5487,7 @@ def _add_from_clients(
                 "warnings": warnings,
                 "prune": prune_result,
                 "plugin_bypass": [row.as_json() for row in plugin_bypass],
+                "codex_extra_servers": codex_extras,
             }
         )
 
@@ -5490,6 +5500,10 @@ def _add_from_clients(
     all_candidates = _discover_candidates(discovery_cwd)
     plugin_bypass = _plugin_bypass_servers(discovery_cwd)
     _echo_plugin_bypass(plugin_bypass, err=as_json)
+    from memtomem_stm.cli.host_bypass import codex_extra_servers, echo_codex_extras
+
+    codex_extras = codex_extra_servers(discovery_cwd, known=())
+    echo_codex_extras(codex_extras, err=as_json)
 
     if select_names:
         # Resolve the requested names against *everything* discovered, not
@@ -5513,6 +5527,12 @@ def _add_from_clients(
                         "which STM does not import; see the note above.",
                         err=True,
                     )
+                if name in (codex_extras or []):
+                    click.echo(
+                        f"  {_disp(name)} is registered in Codex but absent from this command's "
+                        "config-file scan, which STM does not import; see the note above.",
+                        err=True,
+                    )
             if as_json:
                 _json_fail(
                     "add",
@@ -5521,6 +5541,7 @@ def _add_from_clients(
                     unknown=unknown,
                     available=available,
                     plugin_bypass=[row.as_json() for row in plugin_bypass],
+                    codex_extra_servers=codex_extras,
                 )
             sys.exit(1)
         requested = set(select_names)
@@ -5529,7 +5550,7 @@ def _add_from_clients(
     if not all_candidates:
         # Plugin servers were just reported above; "none found" alone would
         # contradict that note, so name what was searched as importable.
-        found = "No importable MCP servers" if plugin_bypass else "No MCP servers"
+        found = "No importable MCP servers" if plugin_bypass or codex_extras else "No MCP servers"
         info(f"{found} found in Claude Desktop / Code / Cursor / .mcp.json.")
         info("Use `mms add <NAME> --prefix ... --command ...` to register one manually.")
         emit([], skipped, warnings_json)
@@ -6046,6 +6067,12 @@ def init(
         _SETUP_PLUGIN_BYPASS.set([row.as_json() for row in plugin_bypass])
         if not json_mode:
             _echo_plugin_bypass(plugin_bypass, err=False)
+        from memtomem_stm.cli.host_bypass import codex_extra_servers, echo_codex_extras
+
+        codex_extras = codex_extra_servers(Path.cwd(), known=())
+        _SETUP_CODEX_EXTRAS.set(codex_extras)
+        if not json_mode:
+            echo_codex_extras(codex_extras, err=False)
     if not allow_project_configs:
         # Keyed on the source's own marker, not on one label: the marker is
         # what says "this file came from the checkout", and a second repo-local
@@ -7277,11 +7304,16 @@ def prune(
             # remove for them; reported so "nothing to prune" is not read as
             # "everything routes through STM" (#1108).
             "plugin_bypass": [row.as_json() for row in plugin_bypass],
+            "codex_extra_servers": codex_extras,
         }
 
     data = _load(resolved, json_action="prune" if as_json else None)
     plugin_bypass = _plugin_bypass_servers(Path.cwd())
     _echo_plugin_bypass(plugin_bypass, err=as_json)
+    from memtomem_stm.cli.host_bypass import codex_extra_servers, echo_codex_extras
+
+    codex_extras = codex_extra_servers(Path.cwd(), known=())
+    echo_codex_extras(codex_extras, err=as_json)
     upstreams: dict[str, dict[str, Any]] = data.get("upstream_servers", {})
     if not upstreams:
         if as_json:
@@ -7319,6 +7351,7 @@ def prune(
                     f"not dual-registered: {', '.join(sorted(missing))}",
                     names=sorted(missing),
                     plugin_bypass=[row.as_json() for row in plugin_bypass],
+                    codex_extra_servers=codex_extras,
                 )
             sys.exit(1)
         requested = set(names)
@@ -10245,6 +10278,33 @@ def doctor(
             )
 
         if data is not None:
+            from memtomem_stm.cli.host_bypass import codex_extra_servers, codex_registration_detail
+
+            codex_extras = codex_extra_servers(Path.cwd(), known=())
+            if codex_extras:
+                check(
+                    "codex_extra_servers",
+                    "Codex MCP servers",
+                    "WARN",
+                    codex_registration_detail(codex_extras),
+                    "inspect in Codex; register with `mms add ... --validate` if needed, "
+                    "then disable the direct copy in its host",
+                )
+            # Advisory only: these remain direct host registrations (#1269).
+            # The shared probe prints a stderr note on failure. An empty result
+            # is not evidence of complete coverage, so do not emit a PASS row.
+            plugin_bypass = _plugin_bypass_servers(Path.cwd())
+            if plugin_bypass:
+                check(
+                    "plugin_bypass",
+                    "plugin MCP servers",
+                    "WARN",
+                    f"{len(plugin_bypass)} Claude Code plugin MCP server(s) bypass STM: "
+                    + ", ".join(row.runtime_name for row in plugin_bypass),
+                    "register with `mms add ... --validate`, then disable the plugin's "
+                    "copy in `/mcp`; see docs/cli.md#claude-code-plugin-servers",
+                )
+
             # 3. schema validation — the same startup-aware read `status`,
             # `list` and `health` warn through, so a rejected whole proxy env
             # block FAILs here too. Its error names locations and error types

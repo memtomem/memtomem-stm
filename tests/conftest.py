@@ -38,6 +38,7 @@ def isolate_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
     """
     with pytest.MonkeyPatch.context() as patch:
         set_home(patch, tmp_path_factory.mktemp("home"))
+        patch.delenv("MMS_NO_HOST_PROBE", raising=False)
         # This is another home root. Tests that exercise custom Claude config
         # behavior set their own value after isolation.
         patch.delenv("CLAUDE_CONFIG_DIR", raising=False)
@@ -128,6 +129,13 @@ def _no_real_plugin_discovery(
     if request.node.get_closest_marker("real_plugin_discovery"):
         return
     monkeypatch.setattr("memtomem_stm.cli.proxy._plugin_bypass_servers", lambda _cwd: [])
+
+
+@pytest.fixture(autouse=True)
+def _no_real_codex_discovery(request, monkeypatch):
+    if request.node.get_closest_marker("real_codex_discovery"):
+        return
+    monkeypatch.setattr("memtomem_stm.cli.host_bypass.codex_extra_servers", lambda _cwd, **kw: [])
 
 
 @pytest.fixture(autouse=True)
