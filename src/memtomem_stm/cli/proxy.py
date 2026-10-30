@@ -7535,6 +7535,13 @@ def _read_host_servers(
     machine-readable contract, and a parse drift could false-pass the
     verify or leak secret values through diagnostics.
     """
+    if kind in {"claude-user", "claude-project"} and os.environ.get("CLAUDE_CONFIG_DIR"):
+        if strict:
+            raise _HostConfigReadError(
+                "automatic eject to Claude Code is unsupported with CLAUDE_CONFIG_DIR set; "
+                "restore the registration manually in the active Claude configuration"
+            )
+        return None
     if kind == "mcp-json":
         data = _read_eject_host_json(Path(path), strict=strict) if path else None
     elif kind == "claude-desktop":
@@ -7660,6 +7667,8 @@ def _json_config_set_entry(
         except OSError:
             pass
     servers = existing.get("mcpServers")
+    if "mcpServers" in existing and not isinstance(servers, dict):
+        return (False, f"{path} mcpServers is not an object — fix it before ejecting")
     if not isinstance(servers, dict):
         servers = {}
         existing["mcpServers"] = servers

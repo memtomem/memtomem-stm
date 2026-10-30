@@ -100,3 +100,52 @@ def test_strict_eject_read_refuses_io_error(tmp_path, monkeypatch):
     with pytest.raises(proxy._HostConfigReadError, match="PermissionError") as exc:
         proxy._host_existing_entry("mcp-json", str(target), "demo", strict=True)
     assert "private-canary" not in str(exc.value)
+
+
+@pytest.mark.parametrize("servers", [None, [], "private-canary", 42])
+def test_writer_refuses_invalid_servers_map_without_clobbering(tmp_path, servers):
+    target = tmp_path / ".mcp.json"
+    target.write_text(json.dumps({"mcpServers": servers, "other": {"keep": True}}))
+    before = target.read_bytes()
+    ok, error = proxy._json_config_set_entry(target, "demo", {"command": "x"}, default_mode=0o600)
+    assert not ok
+    assert "mcpServers is not an object" in error
+    assert "private-canary" not in error
+    assert target.read_bytes() == before
+
+
+@pytest.mark.parametrize("kind", ["claude-user", "claude-project"])
+@pytest.mark.parametrize("force", [False, True])
+def test_eject_refuses_unsupported_claude_config_dir_before_host_access(
+    tmp_path, monkeypatch, kind, force
+):
+    set_home(monkeypatch, tmp_path)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "private-canary"))
+    config = tmp_path / "stm.json"
+    config.write_text(json.dumps({"upstream_servers": {"demo": {"command": "x"}}}))
+    before = config.read_bytes()
+
+    # Both the stale default config and the unknown active layout must stay untouched.
+    def unexpected(*args, **kwargs):
+        pytest.fail("custom Claude config must be rejected before host reads or writes")
+
+    monkeypatch.setattr(proxy, "_read_eject_host_json", unexpected)
+    monkeypatch.setattr(proxy, "_run_claude_mcp", unexpected)
+    dest = kind + (":" + str(tmp_path) if kind == "claude-project" else "")
+    args = ["eject", "demo", "--to", dest, "--yes", "--json", "--config", str(config)]
+    if force:
+        args.append("--force")
+    result = CliRunner().invoke(proxy.cli, args)
+    assert result.exit_code == 1, result.output
+    assert "unsupported with CLAUDE_CONFIG_DIR set" in result.output
+    assert "private-canary" not in result.output
+    assert config.read_bytes() == before
+
+
+def test_custom_claude_config_does_not_affect_explicit_json_target(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "custom"))
+    target = tmp_path / ".mcp.json"
+    target.write_text('{"mcpServers": {"demo": {"command": "x"}}}')
+    assert proxy._host_existing_entry("mcp-json", str(target), "demo", strict=True) == {
+        "command": "x"
+    }
