@@ -3131,6 +3131,7 @@ class TestInit:
             "config_path": str(config.resolve()),
             "servers": ["demo"],
             "client": "skip",
+            "plugin_bypass": None,
         }
 
     def test_init_demo_json_never_prompts_and_validates_by_default(
@@ -3410,7 +3411,11 @@ class TestInit:
             [
                 sys.executable,
                 "-c",
-                "from memtomem_stm.cli.proxy import cli; cli()",
+                # The conftest probe stub does not reach a child interpreter,
+                # and PATH is inherited: stub it here so init never runs the
+                # developer's real ``claude plugin list`` (#1108).
+                "import memtomem_stm.cli.proxy as p; "
+                "p._plugin_bypass_servers = lambda _cwd: []; p.cli()",
                 "init",
                 "--config",
                 str(config),

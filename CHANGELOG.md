@@ -9,6 +9,25 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
+## [Unreleased]
+
+### Added
+
+- `mms init`, `mms add --from-clients` and `mms prune` now report the MCP
+  servers that enabled Claude Code plugins register, which STM does not
+  proxy: those servers live in the plugin rather than in any client config
+  STM reads, so their tools reached the model directly and nothing said so.
+  The note names each server as Claude Code shows it in `/mcp`
+  (`plugin:<plugin>:<server>`) with its transport and the plugin's scope,
+  and says how to route it through STM. Nothing from a server's command
+  line, environment, headers or URL is printed. Plugin servers are not
+  offered for import. (#1108)
+  **Behavior change**: when `claude` is on `PATH`, these three commands run
+  `claude plugin list --json` in the current directory (about 0.6 s), and
+  their `--json` documents gain a `plugin_bypass` array, also on the
+  `unknown_server` and `not_dual_registered` failures. A server disabled in
+  `/mcp` while its plugin stays enabled may still be listed.
+
 ## [0.7.2] — 2026-10-29
 
 ### Upgrade notes

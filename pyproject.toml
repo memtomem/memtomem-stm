@@ -134,6 +134,7 @@ markers = [
     "bench_qa_perf: per-call latency regression gate (median-of-N total_ms, in-run NONE-compression relative anchor, absolute+relative dual assertion); advisory until promoted, off in default and required CI",
     "real_child_sweep: opts out of the autouse stub so the test sees this process's real direct children",
     "real_client_activity: opts out of the autouse stub so the test pins the real handler-registry wrapping",
+    "real_plugin_discovery: opts out of the autouse stub so the test runs the real Claude Code plugin probe",
 ]
 
 [tool.mypy]
