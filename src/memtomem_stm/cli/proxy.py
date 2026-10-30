@@ -7524,6 +7524,16 @@ def _read_eject_host_json(path: Path, *, strict: bool) -> dict[str, Any] | None:
     return data
 
 
+def _eject_host_config_path(kind: str, path: str | None) -> Path | None:
+    if kind == "mcp-json":
+        return Path(path) if path else None
+    if kind == "claude-desktop":
+        return _desktop_config_path()
+    if kind in {"claude-user", "claude-project"}:
+        return Path("~/.claude.json").expanduser()
+    return None
+
+
 def _read_host_servers(
     kind: str, path: str | None, *, strict: bool = False
 ) -> dict[str, Any] | None:
@@ -7542,18 +7552,16 @@ def _read_host_servers(
                 "restore the registration manually in the active Claude configuration"
             )
         return None
-    if kind == "mcp-json":
-        data = _read_eject_host_json(Path(path), strict=strict) if path else None
-    elif kind == "claude-desktop":
-        data = _read_eject_host_json(_desktop_config_path(), strict=strict)
-    elif kind == "claude-user":
-        data = _read_eject_host_json(Path("~/.claude.json").expanduser(), strict=strict)
-    elif kind == "claude-project":
-        cc = _read_eject_host_json(Path("~/.claude.json").expanduser(), strict=strict)
+    config_path = _eject_host_config_path(kind, path)
+    if config_path is None:
+        return None
+    data = _read_eject_host_json(config_path, strict=strict)
+    if kind == "claude-project":
+        cc = data
         projects = cc.get("projects") if cc else None
         if strict and cc is not None and "projects" in cc and not isinstance(projects, dict):
             raise _HostConfigReadError(
-                "target config projects is not an object; fix it before ejecting"
+                f"target config {config_path}: projects is not an object; fix it before ejecting"
             )
         candidate = projects.get(path) if isinstance(projects, dict) else None
         if (
@@ -7563,16 +7571,17 @@ def _read_host_servers(
             and not isinstance(candidate, dict)
         ):
             raise _HostConfigReadError(
-                "target project config is not an object; fix it before ejecting"
+                f"target config {config_path}: project {path} is not an object; "
+                "fix it before ejecting"
             )
         data = candidate if isinstance(candidate, dict) else None
-    else:
-        return None
     if not isinstance(data, dict):
         return None
     servers = data.get("mcpServers")
     if strict and "mcpServers" in data and not isinstance(servers, dict):
-        raise _HostConfigReadError("target mcpServers is not an object; fix it before ejecting")
+        raise _HostConfigReadError(
+            f"target config {config_path}: mcpServers is not an object; fix it before ejecting"
+        )
     return servers if isinstance(servers, dict) else None
 
 
@@ -7582,7 +7591,10 @@ def _host_existing_entry(
     servers = _read_host_servers(kind, path, strict=strict)
     entry = servers.get(name) if servers else None
     if strict and servers is not None and name in servers and not isinstance(entry, dict):
-        raise _HostConfigReadError("target server entry is not an object; fix it before ejecting")
+        raise _HostConfigReadError(
+            f"target config {_eject_host_config_path(kind, path)}: server entry is not an object; "
+            "fix it before ejecting"
+        )
     return entry if isinstance(entry, dict) else None
 
 
@@ -7674,9 +7686,13 @@ def _json_config_set_entry(
         existing["mcpServers"] = servers
     servers[name] = entry
     try:
+        serialized = _json_dumps(existing, indent=2, ensure_ascii=False) + "\n"
+    except RecursionError:
+        return (False, f"{path} is nested too deeply to rewrite — fix or move it aside and retry")
+    try:
         atomic_write_text(
             path,
-            _json_dumps(existing, indent=2, ensure_ascii=False) + "\n",
+            serialized,
             mode=default_mode,
             durable=True,
         )

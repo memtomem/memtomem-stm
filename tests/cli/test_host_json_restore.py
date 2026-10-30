@@ -149,3 +149,50 @@ def test_custom_claude_config_does_not_affect_explicit_json_target(tmp_path, mon
     assert proxy._host_existing_entry("mcp-json", str(target), "demo", strict=True) == {
         "command": "x"
     }
+
+
+def test_restore_refuses_encoder_recursion_without_writing(tmp_path, monkeypatch):
+    path = tmp_path / ".mcp.json"
+    path.write_text('{"mcpServers": {}, "other": {}}')
+    before = path.read_bytes()
+
+    def fail_encode(*args, **kwargs):
+        raise RecursionError("private-canary")
+
+    monkeypatch.setattr(proxy, "_json_dumps", fail_encode)
+    ok, error = proxy._json_config_set_entry(path, "demo", {"command": "x"}, default_mode=0o600)
+    assert not ok
+    assert str(path) in error and "nested too deeply to rewrite" in error
+    assert "private-canary" not in error
+    assert path.read_bytes() == before
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_restore_handles_real_config_that_may_exceed_encoder_depth(tmp_path):
+    path = tmp_path / ".mcp.json"
+    raw = '{"other":' + "[" * 1500 + "0" + "]" * 1500 + "}"
+    path.write_text(raw)
+    ok, error = proxy._json_config_set_entry(path, "demo", {"command": "x"}, default_mode=0o600)
+    if ok:
+        assert json.loads(path.read_text())["mcpServers"]["demo"] == {"command": "x"}
+    else:
+        assert "nested too deeply" in error or "parse error" in error
+        assert path.read_text() == raw
+
+
+@pytest.mark.parametrize("shape", ["projects", "project", "servers", "entry"])
+def test_strict_layout_error_identifies_target_file(tmp_path, monkeypatch, shape):
+    set_home(monkeypatch, tmp_path)
+    path = tmp_path / ".claude.json"
+    project = str(tmp_path.resolve())
+    content = {
+        "projects": {"projects": []},
+        "project": {"projects": {project: []}},
+        "servers": {"projects": {project: {"mcpServers": []}}},
+        "entry": {"projects": {project: {"mcpServers": {"demo": "private-canary"}}}},
+    }[shape]
+    path.write_text(json.dumps(content))
+    with pytest.raises(proxy._HostConfigReadError) as exc:
+        proxy._host_existing_entry("claude-project", project, "demo", strict=True)
+    assert str(path) in str(exc.value)
+    assert "private-canary" not in str(exc.value)
