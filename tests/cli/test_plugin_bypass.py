@@ -279,10 +279,14 @@ class TestPluginBypassServers:
         assert "did not return a JSON list" in captured.err
         assert "plugin MCP servers are not reported" in captured.err
 
-    def test_deep_list_has_no_plugin_records(self, probe, tmp_path):
+    def test_deep_list_has_no_plugin_records(self, probe, tmp_path, capsys):
         # Either the decoder rejects it or it parses a list without records.
         probe["out"] = "[" * 100_000 + "]" * 100_000
         assert proxy_mod._plugin_bypass_servers(tmp_path) == []
+
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert not captured.err or "did not return a JSON list" in captured.err
 
     def test_no_claude_on_path_is_silent(self, probe, tmp_path, monkeypatch, capsys):
         monkeypatch.setattr(proxy_mod.shutil, "which", lambda name: None)

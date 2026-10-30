@@ -853,14 +853,13 @@ _UNPARSEABLE_DATASETS = {
 
 
 @pytest.fixture
-def dataset_decoder(monkeypatch):
+def dataset_decoder(monkeypatch, kind):
     """Exercise the recursion branch independently of decoder depth limits (#1275)."""
-    real_loads = json.loads
+    if kind != "nesting":
+        return
 
-    def loads(text, *args, **kwargs):
-        if text == _UNPARSEABLE_DATASETS["nesting"][0].encode("utf-8"):
-            raise RecursionError("injected decoder recursion limit")
-        return real_loads(text, *args, **kwargs)
+    def loads(*args, **kwargs):
+        raise RecursionError("injected decoder recursion limit")
 
     monkeypatch.setattr(json, "loads", loads)
 
