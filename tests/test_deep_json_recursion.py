@@ -1,8 +1,8 @@
 """A response nested too deeply to parse must still come back to the caller.
 
-Valid JSON can be deeper than the interpreter recurses: ``json.loads`` gives
-out past a few thousand levels, the recursive ``_sanitize_nonfinite`` walk near
-``sys.getrecursionlimit()``, and the tiers' own tree walks (pretty-printing,
+Valid JSON can be deeper than the interpreter recurses: ``json.loads`` can
+reject deep nesting (its limit varies by Python version), the recursive
+``_sanitize_nonfinite`` walk near ``sys.getrecursionlimit()``, and the tiers' own tree walks (pretty-printing,
 pruning, field extraction) a few levels after a tree that only just parsed —
 where exactly moves with the Python version and the caller's stack.
 ``RecursionError`` used to escape all of them, so ``call_tool`` raised instead
@@ -28,7 +28,8 @@ from memtomem_stm.proxy.metrics import TokenTracker
 # Past the recursion limit, so the ``_sanitize_nonfinite`` walk fails on every
 # supported Python even when ``json.loads`` itself succeeds.
 _WALK_DEPTH = 1200
-# Past the C-level limit of ``json.loads`` itself.
+# Past json.loads' limit on 3.12/3.13; 3.14 may parse this depth. The application
+# depth cap must reject it independently of the decoder's recursion behavior.
 _PARSE_DEPTH = 100_000
 
 

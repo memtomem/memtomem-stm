@@ -53,6 +53,7 @@ jobs:
         run: uv run mypy src
 
   test:
+    continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +63,10 @@ jobs:
             coverage_args: "--cov=memtomem_stm --cov-branch --cov-fail-under=90"
           - os: ubuntu-latest
             python: "3.13"
+            coverage_args: ""
+          - os: ubuntu-latest
+            python: "3.14"
+            experimental: true
             coverage_args: ""
           - os: windows-latest
             python: "3.12"

@@ -238,18 +238,24 @@ def test_json_run_on_a_wrong_shape_emits_config_invalid(tmp_path, content, expec
     assert expected in result.stderr
 
 
-# Nested past the interpreter's recursion limit, ``json.loads`` raises
-# ``RecursionError`` rather than a ``ValueError``.
-DEEP = "[" * 200_000 + "]" * 200_000
+# Malformed at any depth: decoders may reject the nesting or reach the missing
+# closing brackets. Exact RecursionError handling is injected separately below.
+DEEP = "[" * 100_000
+
+
+def _decoder_recursion(*args, **kwargs):
+    raise RecursionError("injected decoder recursion limit")
 
 
 @pytest.mark.parametrize("command", ["status", "remove"])
-def test_json_run_on_a_too_deep_file_emits_config_invalid(tmp_path, command):
+def test_json_run_on_a_too_deep_file_emits_config_invalid(tmp_path, monkeypatch, command):
     path = tmp_path / "proxy.json"
     path.write_text(DEEP)
     argv = ["status", "--json"] if command == "status" else ["remove", "fs", "--yes", "--json"]
 
-    result = CliRunner().invoke(cli, [*argv, "--config", str(path)])
+    with monkeypatch.context() as patch:
+        patch.setattr(json, "loads", _decoder_recursion)
+        result = CliRunner().invoke(cli, [*argv, "--config", str(path)])
 
     document = _failure_document(result, command, "config_invalid", path)
     assert document["message"] == f"Failed to parse {path.resolve()}: RecursionError"
@@ -259,14 +265,16 @@ _NESTED_TOO_DEEPLY = "invalid JSON: nested too deeply to parse (RecursionError)"
 
 
 @pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
-def test_config_validate_reports_a_too_deep_file(tmp_path, json_output):
+def test_config_validate_reports_a_too_deep_file(tmp_path, monkeypatch, json_output):
     # `config validate` parses the file itself, outside `_load` (#1139).
     path = tmp_path / "proxy.json"
     path.write_text(DEEP)
 
-    result = CliRunner().invoke(
-        cli, ["config", "validate", "--config", str(path), *(["--json"] if json_output else [])]
-    )
+    with monkeypatch.context() as patch:
+        patch.setattr(json, "loads", _decoder_recursion)
+        result = CliRunner().invoke(
+            cli, ["config", "validate", "--config", str(path), *(["--json"] if json_output else [])]
+        )
 
     assert result.exit_code == 1, result.output
     assert result.exception is None or isinstance(result.exception, SystemExit), result.exception
@@ -277,14 +285,16 @@ def test_config_validate_reports_a_too_deep_file(tmp_path, json_output):
 
 
 @pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
-def test_doctor_reports_a_too_deep_file(tmp_path, json_output):
+def test_doctor_reports_a_too_deep_file(tmp_path, monkeypatch, json_output):
     # `doctor` parses the file itself too, for its config JSON check (#1139).
     path = tmp_path / "proxy.json"
     path.write_text(DEEP)
 
-    result = CliRunner().invoke(
-        cli, ["doctor", "--config", str(path), *(["--json"] if json_output else [])]
-    )
+    with monkeypatch.context() as patch:
+        patch.setattr(json, "loads", _decoder_recursion)
+        result = CliRunner().invoke(
+            cli, ["doctor", "--config", str(path), *(["--json"] if json_output else [])]
+        )
 
     assert result.exit_code == 1, result.output
     assert result.exception is None or isinstance(result.exception, SystemExit), result.exception
@@ -306,6 +316,28 @@ def test_env_completion_reader_tolerates_a_too_deep_file(tmp_path):
     path.write_text(DEEP)
 
     assert _file_upstream_servers(path) == {}
+
+
+@pytest.mark.parametrize(
+    "argv", [["status"], ["remove", "fs", "--yes"], ["config", "validate"], ["doctor"]]
+)
+def test_real_deep_config_fails_cleanly_without_mutation(tmp_path, argv):
+    path = tmp_path / "proxy.json"
+    path.write_text(DEEP)
+    before = path.read_bytes()
+    result = CliRunner().invoke(cli, [*argv, "--json", "--config", str(path)])
+    assert result.exit_code == 1, result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit), result.exception
+    document = json.loads(result.stdout)
+    if argv[0] == "config":
+        assert any(error.startswith("invalid JSON:") for error in document["errors"])
+    elif argv[0] == "doctor":
+        check = next(item for item in document["checks"] if item["id"] == "config_json")
+        assert check["status"] == "FAIL"
+        assert check["detail"].startswith("invalid JSON")
+    else:
+        assert document["error"] == "config_invalid"
+    assert path.read_bytes() == before
 
 
 def test_json_setup_run_on_a_too_deep_file_still_emits_its_document(tmp_path):
@@ -460,13 +492,21 @@ def test_doctor_reports_an_integer_past_the_digit_limit(tmp_path, json_output, d
     ids=["digit-limit", "too-deep"],
 )
 def test_mcp_json_registration_aborts_cleanly_on_an_unparsable_value(
-    tmp_path, capsys, content, kind, default_digit_limit
+    tmp_path, capsys, content, kind, default_digit_limit, monkeypatch
 ):
     """``mms init --client json`` merges into an existing ``.mcp.json``; neither
     exception is a ``JSONDecodeError``, so both escaped the parse guard."""
     mcp_path = tmp_path / ".mcp.json"
     mcp_path.write_text(content)
     before = mcp_path.read_bytes()
+
+    if kind == "RecursionError":
+        # This depth may not raise on every interpreter; inject the error to
+        # cover the recursion handler independently of decoder limits (#1275).
+        def too_deep(*args, **kwargs):
+            raise RecursionError("injected decoder recursion limit")
+
+        monkeypatch.setattr(json, "loads", too_deep)
 
     with pytest.raises(SystemExit) as excinfo:
         proxy_mod._write_mcp_json_for_stm(tmp_path, "memtomem-stm", [])
@@ -477,3 +517,14 @@ def test_mcp_json_registration_aborts_cleanly_on_an_unparsable_value(
     assert f"Failed to parse {mcp_path}: {kind}." in err
     assert "Registration aborted; the file was not modified" in err
     assert "4300" not in err
+
+
+def test_mcp_json_registration_preserves_deep_malformed_json(tmp_path, capsys):
+    path = tmp_path / ".mcp.json"
+    payload = "[" * 100_000
+    path.write_text(payload, encoding="utf-8")
+    with pytest.raises(SystemExit) as info:
+        proxy_mod._write_mcp_json_for_stm(tmp_path, "memtomem-stm", [])
+    assert info.value.code == 1
+    assert path.read_text(encoding="utf-8") == payload
+    assert "Registration aborted; the file was not modified" in capsys.readouterr().err
