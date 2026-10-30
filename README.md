@@ -272,7 +272,7 @@ uv run mypy src                                            # typecheck (required
 ```
 
 CI runs the same commands on every PR via `.github/workflows/ci.yml`: Python
-3.12 is gated on Ubuntu and Windows, Python 3.13 is gated on Ubuntu, and the
+3.12 is gated on Ubuntu and Windows, Python 3.13 and 3.14 are gated on Ubuntu, and the
 Ubuntu 3.12 lane enforces at least 90% branch coverage. Lint (`ruff check` +
 `ruff format --check`), mypy, and tests must pass.
 

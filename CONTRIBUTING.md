@@ -188,7 +188,7 @@ excludes the drift and performance suites. Before merging an advisory-fork fix:
    Use its uv version (currently 0.12.5), run from the repository root, and start
    with `uv sync --frozen --python 3.12`. Run the checks below, then switch with
    `uv sync --frozen --python 3.13` and repeat the `test` row as CI does.
-   Repeat the `test` row on Python 3.14 as well (Ubuntu CI). `--frozen` keeps
+   Then `uv sync --frozen --python 3.14` and repeat the `test` row (Ubuntu CI). `--frozen` keeps
    verification on the committed lockfile.
 
    | CI job | Local command(s) |
