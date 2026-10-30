@@ -591,24 +591,50 @@ including when the registry is empty. They remain outside import and drift
 reconciliation: these commands never import or remove a plugin's server.
 `--from` limits the probes to the selected host where that option is available.
 
+Set `MMS_NO_HOST_PROBE=1` to skip these optional Claude plugin and Codex MCP
+listings in all the commands below, for example:
+
+```bash
+MMS_NO_HOST_PROBE=1 mms host status --json
+```
+
+This disables the additional-registration reports, not file-based discovery,
+explicit host registration/removal, or the server connectivity checks in
+`health` and `doctor`. It is not a global offline mode. No reported registrations
+after opting out means the listings were skipped, not that every server routes
+through STM.
+
 `init`, `add --from-clients`, `prune`, `doctor`, `import`, and the host commands
 also query `codex mcp list --json` in the current directory when Codex is on PATH,
-with a five-second subprocess timeout; host launcher cleanup can take longer.
+unless opted out. These listings depend on the current directory. Codex can
+contact configured HTTP endpoints for OAuth discovery even during a list command
+(observed with Codex CLI 0.166.0 against an isolated loopback server). Read-only
+registry inspection does not imply that the host CLI stays offline or leaves its
+own caches untouched. Use the opt-out when those requests are unwanted.
+
+A five-second subprocess timeout is requested. This is not an overall time
+bound on POSIX or Windows: a hung launcher or descendant retaining output pipes
+can keep the command waiting after the timeout. Slow discovery can also cause
+the report to be unavailable; no per-server network timeout is guaranteed here.
 Enabled names absent from STM's Codex config-file scan are reported as additional
 registrations. Names declared in those files are excluded even when their
-transport cannot be imported (for example, URL servers). Codex's list has no plugin
+transport cannot be imported (for example, URL servers). Those URL-only entries
+are neither import candidates nor additional-registration reports; this feature
+is not a complete inventory of direct host bypasses. Codex's list has no plugin
 provenance field: these may be plugin-provided or come from another config
 layer. Inspect them in Codex before deciding to route them through STM. Only
 names are reported; command arguments, URLs, environment and headers are omitted.
 The report does not turn these registrations into import or prune candidates.
 
-Codex notices go to stdout in text `init` and `add --from-clients`, matching the
+Codex notices go to stdout in text `init`, `add --from-clients`, and `prune`, matching the
 Claude plugin notices, and otherwise to stderr. In `doctor`, a `codex_extra_servers`
 WARN check appears in both the text and JSON reports. `init --json`
 includes a `codex_extra_servers` array of names when extras were found (also on
 setup failure). That field is omitted when no extras were reported. Registry command JSON
-shapes are unchanged. A failed probe emits a note on stderr and does not abort
-the command. An empty or failed probe adds no doctor check, so absence of a
+shapes are unchanged. A failed probe normally emits a note on stderr and does not
+abort the command. Successful `init --json` suppresses those notes; its omitted
+`codex_extra_servers` field cannot distinguish no extras, an opt-out, or a failed
+probe. An empty, skipped, or failed probe adds no doctor check, so absence of a
 warning is not proof that every host registration passes through STM. The
 Claude plugin probe retains the scope and disable-data limitations described
 [above](#claude-code-plugin-servers); `.mcpb` bundles and external manifest file

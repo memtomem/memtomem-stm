@@ -31,7 +31,7 @@ def probe(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
     monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND", "__missing_ltm__")
     monkeypatch.setenv("MMS_NO_TUI", "1")
-    monkeypatch.setattr(hb.shutil, "which", lambda name: "/bin/codex" if name == "codex" else None)
+    monkeypatch.setattr(hb, "shutil", SimpleNamespace(which=lambda name: "/bin/codex"))
     state = {"records": [record()], "error": None, "calls": []}
 
     def run(argv, **kwargs):
@@ -43,6 +43,13 @@ def probe(tmp_path, monkeypatch):
         return SimpleNamespace(returncode=0, stdout=json.dumps(state["records"]), stderr="")
 
     monkeypatch.setattr(proxy, "_run_codex_mcp", run)
+    # Doctor can also inspect explicit Claude registration. Keep that separate
+    # host seam scripted instead of hiding every executable via global which.
+    monkeypatch.setattr(
+        proxy,
+        "_run_claude_mcp",
+        lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr=""),
+    )
     return state
 
 
@@ -229,12 +236,67 @@ def test_text_init_reports_codex_names_on_stdout(probe, tmp_path, monkeypatch):
     assert "or from another Codex config layer" in result.stdout
 
 
-def test_host_status_does_not_probe_when_registry_cannot_load(probe, tmp_path):
+@pytest.mark.parametrize("command", ["status", "scan", "sync"])
+def test_host_commands_do_not_probe_when_registry_cannot_load(probe, tmp_path, command):
     (tmp_path / ".mms").mkdir()
     (tmp_path / ".mms/registry.toml").write_text("not valid TOML = [")
-    result = CliRunner().invoke(cli, ["host", "status", "--json"])
+    result = CliRunner().invoke(cli, ["host", command, "--json"])
     assert result.exit_code == 1, result.output
     assert probe["calls"] == []
+
+
+@pytest.mark.real_plugin_discovery
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["host", "status", "--json"],
+        ["host", "scan", "--json"],
+        ["host", "sync", "--json"],
+        ["import", "--from", "codex"],
+        ["doctor", "--json"],
+        ["prune", "--all", "--json"],
+        ["add", "--from-clients", "--all", "--json"],
+        ["init", "--json", "--client", "skip"],
+    ],
+)
+def test_opt_out_skips_both_host_listings(probe, tmp_path, monkeypatch, argv):
+    monkeypatch.setenv("MMS_NO_HOST_PROBE", "1")
+    monkeypatch.setattr(proxy, "_discover_candidates", lambda _: [])
+    calls = []
+
+    def unexpected(*args, **kwargs):
+        if args[0][:3] == ["claude", "plugin", "list"]:
+            calls.append((args, kwargs))
+            raise AssertionError("host listing must not run")
+        # Doctor still checks explicit host registration; the opt-out applies
+        # only to optional additional-registration listings.
+        return SimpleNamespace(returncode=1, stdout="", stderr="")
+
+    monkeypatch.setattr(proxy, "_run_claude_mcp", unexpected)
+    config = tmp_path / "proxy.json"
+    if argv[0] in {"doctor", "prune", "add"}:
+        config.write_text('{"upstream_servers": {}}')
+    if argv[0] in {"doctor", "prune", "add", "init"}:
+        argv = [*argv, "--config", str(config)]
+    result = CliRunner().invoke(cli, argv, input="")
+    assert result.exit_code == (1 if argv[0] == "init" else 0), result.output
+    assert calls == []
+    assert probe["calls"] == []
+    assert "plugin-server" not in result.output
+    assert "could not list" not in result.output
+    if "--json" in argv:
+        payload = json.loads(result.stdout)
+        assert "codex_extra_servers" not in payload
+        assert not any(c["id"] == "codex_extra_servers" for c in payload.get("checks", []))
+
+
+def test_text_prune_reports_codex_names_on_stdout(probe, tmp_path):
+    config = tmp_path / "proxy.json"
+    config.write_text('{"upstream_servers": {}}')
+    result = CliRunner().invoke(cli, ["prune", "--all", "--config", str(config)])
+    assert result.exit_code == 0, result.output
+    assert "plugin-server" in result.stdout
+    assert "plugin-server" not in result.stderr
 
 
 def test_codex_seam_forwards_noninteractive_probe_options(monkeypatch, tmp_path):

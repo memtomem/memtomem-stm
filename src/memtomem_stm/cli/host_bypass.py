@@ -8,6 +8,7 @@ additional registrations rather than asserting that every one is a plugin.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -22,7 +23,14 @@ from memtomem_stm.mms.import_hosts import (
 )
 
 
+def host_probes_disabled() -> bool:
+    """Opt out of optional host CLI listings, not explicit registration or health checks."""
+    return os.environ.get("MMS_NO_HOST_PROBE") == "1"
+
+
 def codex_extra_servers(cwd: Path) -> list[str]:
+    if host_probes_disabled():
+        return []
     # Late import avoids a module cycle with proxy's command registration.
     from memtomem_stm.cli.proxy import _plain_identifier, _run_codex_mcp
 
@@ -86,6 +94,8 @@ def echo_codex_extras(cwd: Path, *, names: list[str] | None = None, err: bool = 
 
 
 def report_host_bypass(cwd: Path, host: str = "all") -> None:
+    if host_probes_disabled():
+        return
     if host in {"all", "claude-code"}:
         from memtomem_stm.cli.proxy import _echo_plugin_bypass, _plugin_bypass_servers
 

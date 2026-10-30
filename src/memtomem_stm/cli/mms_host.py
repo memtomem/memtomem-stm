@@ -376,7 +376,9 @@ def _render_json(rows: list[dict]) -> None:
 def status_cmd(json_output: bool) -> None:
     """Show drift state of every registry entry vs sidecar baseline.
 
-    Read-only: never writes to registry, sidecar, or anywhere else.
+    Does not write registry or sidecar state. Optional host CLI listings
+    depend on cwd and may contact remote endpoints. Set MMS_NO_HOST_PROBE=1
+    to skip those listings.
     Exit code is 0 — drift is a normal observation, not a CI failure
     signal — unless the ``~/.mms`` state files cannot be read (exit 1).
     """
@@ -528,13 +530,15 @@ def scan_cmd(from_host: str, json_output: bool) -> None:
     delegated to ``mms host status`` (it surfaces shape mismatches as
     ``changed``).
 
+    Optional host CLI listings depend on cwd and may contact remote endpoints;
+    set MMS_NO_HOST_PROBE=1 to skip them. STM does not write registry state.
     Exit code is 0 (read-only inspection) unless ``registry.toml`` cannot
     be read (exit 1).
     """
     from memtomem_stm.cli.host_bypass import report_host_bypass
 
-    report_host_bypass(Path.cwd().resolve(), from_host.lower())
     registry = state.load_registry()
+    report_host_bypass(Path.cwd().resolve(), from_host.lower())
     candidates = discover(from_host, Path.cwd().resolve())
     rows = _scan_rows(candidates, registry)
     if json_output:
@@ -994,10 +998,10 @@ def sync_cmd(
     cwd = Path.cwd().resolve()
     from memtomem_stm.cli.host_bypass import report_host_bypass
 
-    report_host_bypass(cwd)
-    candidates = discover("all", cwd)
     registry = state.load_registry()
     import_state = state.load_import_state()
+    report_host_bypass(cwd)
+    candidates = discover("all", cwd)
 
     # Two orthogonal classifiers (see Action-bucket matrix in the plan).
     new, conflicts, _idempotent = _classify_against_registry(candidates, registry)

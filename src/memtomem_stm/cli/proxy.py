@@ -4288,7 +4288,9 @@ def _plugin_bypass_servers(cwd: Path) -> list[_PluginBypass]:
     that is not a JSON list yields no rows, and malformed records or servers
     are skipped one by one, so the commands that report this keep working.
     """
-    if shutil.which("claude") is None:
+    from memtomem_stm.cli.host_bypass import host_probes_disabled
+
+    if host_probes_disabled() or shutil.which("claude") is None:
         return []
     try:
         result = _run_claude_mcp(["claude", "plugin", "list", "--json"], cwd=str(cwd.resolve()))
@@ -7310,7 +7312,7 @@ def prune(
     _echo_plugin_bypass(plugin_bypass, err=as_json)
     from memtomem_stm.cli.host_bypass import echo_codex_extras
 
-    echo_codex_extras(Path.cwd())
+    echo_codex_extras(Path.cwd(), err=as_json)
     upstreams: dict[str, dict[str, Any]] = data.get("upstream_servers", {})
     if not upstreams:
         if as_json:
