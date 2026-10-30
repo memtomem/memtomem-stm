@@ -13,6 +13,15 @@ changes inline only. See the deprecation policy in
 
 ### Added
 
+- Host setup, import, registry and doctor commands report enabled Codex MCP
+  registrations outside each command's discovery, by name only. (#1269)
+  **Behavior change**: optional host CLI listings can make network requests;
+  set `MMS_NO_HOST_PROBE=1` to skip those listings. This does not disable other
+  health checks or explicit host writes. Init/add-from-clients/prune JSON gains
+  `codex_extra_servers` (list after a successful probe, null if unavailable).
+  Registry JSON shapes are unchanged; successful `init --json` replays a
+  failed-probe note on stderr while stdout remains a single JSON document.
+
 - `mms init`, `mms add --from-clients` and `mms prune` now report the MCP
   servers that enabled Claude Code plugins register, which STM does not
   proxy: those servers live in the plugin rather than in any client config

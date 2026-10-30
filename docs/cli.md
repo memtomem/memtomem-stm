@@ -623,9 +623,9 @@ do not scan Codex files, so they also report registrations declared in those fil
 even when the transport cannot be imported (for example, URL servers). Those
 URL-only entries are neither import candidates nor additional-registration reports
 in the registry commands; this feature is not a complete inventory of direct host
-bypasses. Codex's list has no plugin
-provenance field: these may be plugin-provided or come from another config
-layer. Inspect them in Codex before deciding to route them through STM. Only
+bypasses. Codex's list has no plugin provenance field, so the report does not
+attribute a registration to plugins or a particular config layer.
+Inspect them in Codex before deciding to route them through STM. Only
 names are reported; command arguments, URLs, environment and headers are omitted.
 The report does not turn these registrations into import or prune candidates.
 
@@ -639,8 +639,9 @@ never reached discovery. Add/prune failures before discovery (including config
 load and write-lock errors) use the existing error envelope without this field;
 their selection errors after discovery include it. Registry command JSON shapes
 are unchanged. A failed probe normally emits a note on stderr and does not abort
-the command. Successful `init --json` suppresses those notes, but retains the
-`null` status in its payload. An empty, skipped, or failed probe adds no doctor check, so absence of a
+the command. Successful `init --json` also prints the failure note to stderr;
+stdout remains one JSON document with `codex_extra_servers: null`.
+An empty, skipped, or failed probe adds no doctor check, so absence of a
 warning is not proof that every host registration passes through STM. The
 Claude plugin probe retains the scope and disable-data limitations described
 [above](#claude-code-plugin-servers); `.mcpb` bundles and external manifest file
@@ -671,7 +672,7 @@ Checks, in order:
 |---|---|---|
 | `config file` | same path resolution as `status`/`health` | FAIL: file missing → `next: mms init` (short-circuits the report) |
 | `config JSON` | the `config validate` parse guard | FAIL: unparseable / non-object root, `not valid UTF-8`, or `cannot read file: <Type>` such as `PermissionError` — the exception type only (short-circuits) |
-| `Codex MCP servers` | effective `codex mcp list --json` minus STM's config-file scan | WARN when enabled additional registrations exist; read-only, names only, no import |
+| `Codex MCP servers` | enabled, well-formed `codex mcp list --json` entries, excluding STM self-references and reserved names; no config-file subtraction | WARN when registrations exist; read-only, names only, no import |
 | `plugin MCP servers` | the same Claude Code plugin probe as `init` / `add --from-clients` / `prune` | WARN when plugin servers bypass STM; lists their runtime names and a manual routing action. No row when the probe returns no servers or fails; a failed probe prints a note to stderr, so absence of this check is not proof that no plugin servers exist |
 | `config schema` | the `status`/`list`/`health` runtime read | FAIL: valid JSON, invalid schema — a running server would silently fall back to env/defaults; or an environment startup rejects, such as `MEMTOMEM_STM_PROXY='[1]'` — the server cannot start, and `next:` points at the named variables instead of `config validate`. The detail names locations (fields and keys such as server, env variable or header names), error types, or variable names, never values |
 | `proxy enabled` | the shared inert-state predicate (`config validate` + the runtime load advisory) | FAIL: upstream servers configured but top-level `enabled` unset — the silent `false` default advertises none of them to clients while each server still probes green; WARN: explicitly disabled (control-only mode). Omitted when no upstreams are configured |

@@ -78,7 +78,8 @@ def test_effective_list_reports_only_extra_enabled_names(probe, tmp_path, capsys
     hb.echo_codex_extras(hb.codex_extra_servers(tmp_path))
     output = capsys.readouterr()
     assert output.out == ""
-    assert "possibly plugin-provided or from another Codex config layer" in output.err
+    assert "outside this command's discovery" in output.err
+    assert "plugin-provided" not in output.err
     assert "canary" not in output.err
 
 
@@ -234,7 +235,7 @@ def test_text_init_reports_codex_names_on_stdout(probe, tmp_path, monkeypatch):
     )
     assert "plugin-server" in result.stdout
     assert "plugin-server" not in result.stderr
-    assert "or from another Codex config layer" in result.stdout
+    assert "outside this command's discovery" in result.stdout
 
 
 @pytest.mark.parametrize("command", ["status", "scan", "sync"])
@@ -334,6 +335,8 @@ def test_proxy_reports_codex_file_declarations_outside_its_scan(probe, tmp_path,
     if command == "select":
         assert "manual is registered in Codex" in result.stderr
     assert "Code / Cursor / Codex" not in result.output
+    assert "plugin-provided" not in result.output
+    assert "another Codex config layer" not in result.output
     assert codex.read_bytes() == before
     assert len(probe["calls"]) == 1
     if config.exists():
@@ -359,6 +362,30 @@ def test_proxy_json_distinguishes_empty_list_from_failed_probe(probe, tmp_path, 
     assert json.loads(result.stdout)["codex_extra_servers"] == (None if failure else [])
     assert len(probe["calls"]) == 1
     assert "canary-secret" not in result.output
+
+
+def test_successful_json_init_replays_failed_probe_note(probe, tmp_path):
+    # Select a real discovered candidate and accept its suggested prefix.
+    (tmp_path / ".claude.json").write_text(
+        '{"mcpServers": {"demo": {"command": "not-executed", "args": []}}}'
+    )
+    probe["error"] = OSError("canary-secret")
+    config = tmp_path / "proxy.json"
+    result = CliRunner().invoke(
+        cli,
+        ["init", "--json", "--client", "skip", "--no-validate", "--config", str(config)],
+        input="all\n\n",
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["servers"] == ["demo"]
+    assert payload["codex_extra_servers"] is None
+    assert "could not list Codex MCP servers" in result.stderr
+    assert "could not list Codex MCP servers" not in result.stdout
+    assert "canary-secret" not in result.output
+    assert len(probe["calls"]) == 1
+    assert "demo" in json.loads(config.read_text())["upstream_servers"]
 
 
 def test_codex_seam_forwards_noninteractive_probe_options(monkeypatch, tmp_path):

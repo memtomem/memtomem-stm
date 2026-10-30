@@ -83,14 +83,17 @@ def codex_extra_servers(cwd: Path, *, known: Collection[str] | None = None) -> l
     return sorted(extra)
 
 
+def codex_registration_detail(names: list[str]) -> str:
+    """Describe the reporting boundary without guessing configuration provenance."""
+    return (
+        f"{len(names)} enabled Codex MCP registration(s) outside this command's discovery "
+        "(not imported): " + ", ".join(_disp(name) for name in names)
+    )
+
+
 def echo_codex_extras(names: list[str] | None, *, err: bool = True) -> None:
     if names:
-        click.echo(
-            f"Note: {len(names)} additional Codex MCP registration(s) are absent from this command's "
-            "config-file scan (possibly plugin-provided or from another Codex config layer; "
-            "not imported): " + ", ".join(_disp(name) for name in names),
-            err=err,
-        )
+        click.echo("Note: " + codex_registration_detail(names), err=err)
         click.echo(
             "  Inspect them in Codex; register with `mms add ... --validate` if needed, "
             "then disable the direct copy in its host.",

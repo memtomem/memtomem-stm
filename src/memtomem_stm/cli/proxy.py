@@ -6067,15 +6067,15 @@ def init(
     candidates = [] if demo else _discover_candidates(Path.cwd())
     if not demo:
         plugin_bypass = _plugin_bypass_servers(Path.cwd())
+        _SETUP_PLUGIN_BYPASS.set([row.as_json() for row in plugin_bypass])
+        if not json_mode:
+            _echo_plugin_bypass(plugin_bypass, err=False)
         from memtomem_stm.cli.host_bypass import codex_extra_servers, echo_codex_extras
 
         codex_extras = codex_extra_servers(Path.cwd(), known=())
         _SETUP_CODEX_EXTRAS.set(codex_extras)
         if not json_mode:
             echo_codex_extras(codex_extras, err=False)
-        _SETUP_PLUGIN_BYPASS.set([row.as_json() for row in plugin_bypass])
-        if not json_mode:
-            _echo_plugin_bypass(plugin_bypass, err=False)
     if not allow_project_configs:
         # Keyed on the source's own marker, not on one label: the marker is
         # what says "this file came from the checkout", and a second repo-local
@@ -10202,7 +10202,7 @@ def doctor(
             )
 
         if data is not None:
-            from memtomem_stm.cli.host_bypass import codex_extra_servers
+            from memtomem_stm.cli.host_bypass import codex_extra_servers, codex_registration_detail
 
             codex_extras = codex_extra_servers(Path.cwd(), known=())
             if codex_extras:
@@ -10210,9 +10210,7 @@ def doctor(
                     "codex_extra_servers",
                     "Codex MCP servers",
                     "WARN",
-                    f"{len(codex_extras)} additional Codex MCP registration(s) absent from "
-                    "this command's config-file scan (possibly plugin-provided or from another "
-                    "Codex config layer; not imported): " + ", ".join(codex_extras),
+                    codex_registration_detail(codex_extras),
                     "inspect in Codex; register with `mms add ... --validate` if needed, "
                     "then disable the direct copy in its host",
                 )
