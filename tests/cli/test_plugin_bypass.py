@@ -337,7 +337,7 @@ class TestProjectMatch:
             ("G", "G/sub", "local", True),
             ("G/sub", "G/sub", "local", True),
             ("H", "HW", "local", True),
-            ("HW", "A", "local", True),
+            ("HW", "H", "local", True),
             ("E", "E", "project", True),
             ("D", "A", "local", False),
             ("D/sub", "B", "local", False),
@@ -353,6 +353,10 @@ class TestProjectMatch:
     def test_a_linked_worktree_install_is_kept_from_anywhere(self, probe, layout):
         # Not derivable without git, so it over-reports rather than guess.
         assert self._kept(probe, layout("D"), _record(str(layout("HW")))) == ["firebase@m"]
+
+    def test_a_linked_worktree_cwd_keeps_an_unrelated_install(self, probe, layout):
+        # HW belongs to H, not A: kept only because a worktree's root is unknown.
+        assert self._kept(probe, layout("HW"), _record(str(layout("A")))) == ["firebase@m"]
 
     @pytest.mark.parametrize(
         ("cwd", "installed"),
