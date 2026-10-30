@@ -6,7 +6,9 @@ Thank you for your interest in contributing to memtomem-stm!
 
 Python 3.12 and 3.13 are supported runtimes. Python 3.14 is experimental;
 its Ubuntu CI test lane is advisory, not a required branch-protection check.
-Keep that lane running to detect compatibility regressions.
+It uses `continue-on-error` so its failure does not fail the workflow.
+Keep that lane running to detect compatibility regressions. The package classifiers
+list the supported 3.12/3.13 runtimes; experimental 3.14 is intentionally omitted.
 
 ```bash
 # Clone

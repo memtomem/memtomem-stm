@@ -277,7 +277,8 @@ uv run mypy src                                            # typecheck (required
 CI runs the same commands on every PR via `.github/workflows/ci.yml`: Python
 3.12 is gated on Ubuntu and Windows, and Python 3.13 is gated on Ubuntu.
 Python 3.14 is tested on Ubuntu as an experimental, advisory lane; it is not a
-required branch-protection check. The Ubuntu 3.12 lane enforces at least 90%
+required branch-protection check, and its failure does not fail the workflow
+(`continue-on-error`). The Ubuntu 3.12 lane enforces at least 90%
 branch coverage. Lint (`ruff check` + `ruff format --check`), mypy, and required
 tests must pass.
 
