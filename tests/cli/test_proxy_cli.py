@@ -3415,6 +3415,8 @@ class TestInit:
                 # and PATH is inherited: stub it here so init never runs the
                 # developer's real ``claude plugin list`` (#1108).
                 "import memtomem_stm.cli.proxy as p; "
+                "import memtomem_stm.cli.host_bypass as h; "
+                "h.codex_extra_servers = lambda _cwd: []; "
                 "p._plugin_bypass_servers = lambda _cwd: []; p.cli()",
                 "init",
                 "--config",

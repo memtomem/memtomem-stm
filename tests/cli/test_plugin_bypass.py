@@ -654,6 +654,76 @@ def _config(home: Path, servers: dict | None = None) -> Path:
 
 
 class TestCommandsReport:
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["import", "--from", "claude-code", "--apply"],
+            ["host", "status", "--json"],
+            ["host", "sync", "--json"],
+            ["host", "scan", "--from", "claude-code", "--json"],
+        ],
+    )
+    def test_registry_commands_report_plugins_without_importing(self, sandbox, probe, argv):
+        probe["out"] = [_leaky_plugin()]
+        result = CliRunner().invoke(cli, argv)
+        assert result.exit_code == 0, result.output
+        if "--json" in argv:
+            json.loads(result.stdout)
+        assert "plugin:leaky:http-srv" in result.stderr
+        assert "bypass STM" in result.stderr
+        for canary in CANARIES:
+            assert canary not in result.output
+        assert not (sandbox["home"] / ".mms/registry.toml").exists()
+
+    @pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+    def test_doctor_warns_without_leaking_or_writing(self, sandbox, probe, monkeypatch, as_json):
+        probe["out"] = [_leaky_plugin()]
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND", "__missing_ltm__")
+        config = _config(sandbox["home"])
+        before = config.read_bytes()
+
+        result = CliRunner().invoke(
+            cli, ["doctor", "--config", str(config), *(["--json"] if as_json else [])]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert config.read_bytes() == before
+        plugin_calls = [
+            c for c in probe["calls"] if c["cmd"] == ["claude", "plugin", "list", "--json"]
+        ]
+        assert len(plugin_calls) == 1
+        assert plugin_calls[0]["cwd"] == str(sandbox["cwd"].resolve())
+        if as_json:
+            report = json.loads(result.stdout)
+            row = next(c for c in report["checks"] if c["id"] == "plugin_bypass")
+            assert row["status"] == "WARN"
+            assert "2 Claude Code plugin MCP server(s) bypass STM" in row["detail"]
+            assert "mms add ... --validate" in row["next_action"]
+        else:
+            assert "2 Claude Code plugin MCP server(s) bypass STM" in result.stdout
+        assert "plugin:leaky:http-srv" in result.stdout
+        for canary in CANARIES:
+            assert canary not in result.output
+
+    @pytest.mark.parametrize("out", [[], subprocess.TimeoutExpired(["claude"], 5)])
+    def test_doctor_empty_or_failed_probe_never_claims_pass(self, sandbox, probe, monkeypatch, out):
+        probe["out"] = out
+        monkeypatch.setenv("MEMTOMEM_STM_SURFACING__LTM_MCP_COMMAND", "__missing_ltm__")
+        config = _config(sandbox["home"])
+        result = CliRunner().invoke(cli, ["doctor", "--config", str(config), "--json"])
+        assert result.exit_code == 0, result.output
+        assert all(c["id"] != "plugin_bypass" for c in json.loads(result.stdout)["checks"])
+        if isinstance(out, BaseException):
+            assert "plugin MCP servers are not reported" in result.stderr
+
+    def test_doctor_invalid_config_skips_plugin_probe(self, sandbox, probe):
+        config = _config(sandbox["home"])
+        config.write_text("{", encoding="utf-8")
+        result = CliRunner().invoke(cli, ["doctor", "--config", str(config), "--json"])
+        assert result.exit_code == 1
+        assert probe["calls"] == []
+        assert all(c["id"] != "plugin_bypass" for c in json.loads(result.stdout)["checks"])
+
     def test_add_from_clients_with_only_plugin_servers(self, sandbox, probe):
         probe["out"] = [FIREBASE]
         config = _config(sandbox["home"])

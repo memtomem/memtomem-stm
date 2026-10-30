@@ -313,6 +313,7 @@ _SETUP_JSON_MODE: ContextVar[bool] = ContextVar("setup_json_mode", default=False
 _SETUP_PLUGIN_BYPASS: ContextVar[list[dict[str, str]] | None] = ContextVar(
     "setup_plugin_bypass", default=None
 )
+_SETUP_CODEX_EXTRAS: ContextVar[list[str] | None] = ContextVar("setup_codex_extras", default=None)
 
 
 def _setup_json_result(action: str):  # noqa: ANN201
@@ -328,6 +329,7 @@ def _setup_json_result(action: str):  # noqa: ANN201
 
             _SETUP_RESOLVED_CLIENT.set(None)
             _SETUP_PLUGIN_BYPASS.set(None)
+            _SETUP_CODEX_EXTRAS.set(None)
             out = io.StringIO()
             err = io.StringIO()
             exit_code = 0
@@ -397,6 +399,8 @@ def _setup_json_result(action: str):  # noqa: ANN201
             }
             if action == "init":
                 payload["plugin_bypass"] = _SETUP_PLUGIN_BYPASS.get()
+                if codex_extras := _SETUP_CODEX_EXTRAS.get():
+                    payload["codex_extra_servers"] = codex_extras
             if write_failure is not None:
                 payload["error"] = write_failure.code
                 payload["message"] = write_failure.raw_message
@@ -5493,6 +5497,9 @@ def _add_from_clients(
     all_candidates = _discover_candidates(discovery_cwd)
     plugin_bypass = _plugin_bypass_servers(discovery_cwd)
     _echo_plugin_bypass(plugin_bypass, err=as_json)
+    from memtomem_stm.cli.host_bypass import echo_codex_extras
+
+    echo_codex_extras(discovery_cwd)
 
     if select_names:
         # Resolve the requested names against *everything* discovered, not
@@ -6046,6 +6053,12 @@ def init(
     candidates = [] if demo else _discover_candidates(Path.cwd())
     if not demo:
         plugin_bypass = _plugin_bypass_servers(Path.cwd())
+        from memtomem_stm.cli.host_bypass import codex_extra_servers, echo_codex_extras
+
+        codex_extras = codex_extra_servers(Path.cwd())
+        _SETUP_CODEX_EXTRAS.set(codex_extras)
+        if not json_mode:
+            echo_codex_extras(Path.cwd(), names=codex_extras)
         _SETUP_PLUGIN_BYPASS.set([row.as_json() for row in plugin_bypass])
         if not json_mode:
             _echo_plugin_bypass(plugin_bypass, err=False)
@@ -7285,6 +7298,9 @@ def prune(
     data = _load(resolved, json_action="prune" if as_json else None)
     plugin_bypass = _plugin_bypass_servers(Path.cwd())
     _echo_plugin_bypass(plugin_bypass, err=as_json)
+    from memtomem_stm.cli.host_bypass import echo_codex_extras
+
+    echo_codex_extras(Path.cwd())
     upstreams: dict[str, dict[str, Any]] = data.get("upstream_servers", {})
     if not upstreams:
         if as_json:
@@ -10169,6 +10185,35 @@ def doctor(
             )
 
         if data is not None:
+            from memtomem_stm.cli.host_bypass import codex_extra_servers
+
+            codex_extras = codex_extra_servers(Path.cwd())
+            if codex_extras:
+                check(
+                    "codex_extra_servers",
+                    "Codex MCP servers",
+                    "WARN",
+                    f"{len(codex_extras)} additional Codex MCP registration(s) absent from "
+                    "STM's config-file scan (possibly plugin-provided; not imported): "
+                    + ", ".join(codex_extras),
+                    "inspect in Codex; register with `mms add ... --validate` if needed, "
+                    "then disable the direct copy in its host",
+                )
+            # Advisory only: these remain direct host registrations (#1269).
+            # The shared probe prints a stderr note on failure. An empty result
+            # is not evidence of complete coverage, so do not emit a PASS row.
+            plugin_bypass = _plugin_bypass_servers(Path.cwd())
+            if plugin_bypass:
+                check(
+                    "plugin_bypass",
+                    "plugin MCP servers",
+                    "WARN",
+                    f"{len(plugin_bypass)} Claude Code plugin MCP server(s) bypass STM: "
+                    + ", ".join(row.runtime_name for row in plugin_bypass),
+                    "register with `mms add ... --validate`, then disable the plugin's "
+                    "copy in `/mcp`; see docs/cli.md#claude-code-plugin-servers",
+                )
+
             # 3. schema validation — the same startup-aware read `status`,
             # `list` and `health` warn through, so a rejected whole proxy env
             # block FAILs here too. Its error names locations and error types

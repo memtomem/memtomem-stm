@@ -128,6 +128,13 @@ def _no_real_plugin_discovery(
 
 
 @pytest.fixture(autouse=True)
+def _no_real_codex_discovery(request, monkeypatch):
+    if request.node.get_closest_marker("real_codex_discovery"):
+        return
+    monkeypatch.setattr("memtomem_stm.cli.host_bypass.codex_extra_servers", lambda _cwd: [])
+
+
+@pytest.fixture(autouse=True)
 def _no_real_teardown_watchdog(monkeypatch: pytest.MonkeyPatch) -> None:
     """Never let a test arm the real hard-exit backstop.
 

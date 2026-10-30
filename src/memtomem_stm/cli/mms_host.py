@@ -380,6 +380,9 @@ def status_cmd(json_output: bool) -> None:
     Exit code is 0 — drift is a normal observation, not a CI failure
     signal — unless the ``~/.mms`` state files cannot be read (exit 1).
     """
+    from memtomem_stm.cli.host_bypass import report_host_bypass
+
+    report_host_bypass(Path.cwd().resolve())
     registry = state.load_registry()
     import_state = state.load_import_state()
 
@@ -528,6 +531,9 @@ def scan_cmd(from_host: str, json_output: bool) -> None:
     Exit code is 0 (read-only inspection) unless ``registry.toml`` cannot
     be read (exit 1).
     """
+    from memtomem_stm.cli.host_bypass import report_host_bypass
+
+    report_host_bypass(Path.cwd().resolve(), from_host.lower())
     registry = state.load_registry()
     candidates = discover(from_host, Path.cwd().resolve())
     rows = _scan_rows(candidates, registry)
@@ -986,6 +992,9 @@ def sync_cmd(
     ``import_command``.
     """
     cwd = Path.cwd().resolve()
+    from memtomem_stm.cli.host_bypass import report_host_bypass
+
+    report_host_bypass(cwd)
     candidates = discover("all", cwd)
     registry = state.load_registry()
     import_state = state.load_import_state()

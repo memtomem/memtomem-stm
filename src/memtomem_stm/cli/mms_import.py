@@ -220,6 +220,9 @@ def import_command(
 ) -> None:
     """Import MCP definitions from host configs into the mms registry."""
     cwd = Path.cwd().resolve()
+    from memtomem_stm.cli.host_bypass import report_host_bypass
+
+    report_host_bypass(cwd, from_host.lower())
     candidates = discover(from_host, cwd)
 
     # Drop entries that cannot survive being stored, BEFORE anything hashes or
