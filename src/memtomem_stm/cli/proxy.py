@@ -399,8 +399,7 @@ def _setup_json_result(action: str):  # noqa: ANN201
             }
             if action == "init":
                 payload["plugin_bypass"] = _SETUP_PLUGIN_BYPASS.get()
-                if codex_extras := _SETUP_CODEX_EXTRAS.get():
-                    payload["codex_extra_servers"] = codex_extras
+                payload["codex_extra_servers"] = _SETUP_CODEX_EXTRAS.get()
             if write_failure is not None:
                 payload["error"] = write_failure.code
                 payload["message"] = write_failure.raw_message
@@ -5491,6 +5490,7 @@ def _add_from_clients(
                 "warnings": warnings,
                 "prune": prune_result,
                 "plugin_bypass": [row.as_json() for row in plugin_bypass],
+                "codex_extra_servers": codex_extras,
             }
         )
 
@@ -5503,9 +5503,10 @@ def _add_from_clients(
     all_candidates = _discover_candidates(discovery_cwd)
     plugin_bypass = _plugin_bypass_servers(discovery_cwd)
     _echo_plugin_bypass(plugin_bypass, err=as_json)
-    from memtomem_stm.cli.host_bypass import echo_codex_extras
+    from memtomem_stm.cli.host_bypass import codex_extra_servers, echo_codex_extras
 
-    codex_extras = echo_codex_extras(discovery_cwd, err=as_json)
+    codex_extras = codex_extra_servers(discovery_cwd, known=())
+    echo_codex_extras(codex_extras, err=as_json)
 
     if select_names:
         # Resolve the requested names against *everything* discovered, not
@@ -5529,9 +5530,9 @@ def _add_from_clients(
                         "which STM does not import; see the note above.",
                         err=True,
                     )
-                if name in codex_extras:
+                if name in (codex_extras or []):
                     click.echo(
-                        f"  {_disp(name)} is registered in Codex but absent from STM's "
+                        f"  {_disp(name)} is registered in Codex but absent from this command's "
                         "config-file scan, which STM does not import; see the note above.",
                         err=True,
                     )
@@ -5543,6 +5544,7 @@ def _add_from_clients(
                     unknown=unknown,
                     available=available,
                     plugin_bypass=[row.as_json() for row in plugin_bypass],
+                    codex_extra_servers=codex_extras,
                 )
             sys.exit(1)
         requested = set(select_names)
@@ -5552,7 +5554,7 @@ def _add_from_clients(
         # Plugin servers were just reported above; "none found" alone would
         # contradict that note, so name what was searched as importable.
         found = "No importable MCP servers" if plugin_bypass or codex_extras else "No MCP servers"
-        info(f"{found} found in Claude Desktop / Code / Cursor / Codex / .mcp.json.")
+        info(f"{found} found in Claude Desktop / Code / Cursor / .mcp.json.")
         info("Use `mms add <NAME> --prefix ... --command ...` to register one manually.")
         emit([], skipped, warnings_json)
         return
@@ -6067,10 +6069,10 @@ def init(
         plugin_bypass = _plugin_bypass_servers(Path.cwd())
         from memtomem_stm.cli.host_bypass import codex_extra_servers, echo_codex_extras
 
-        codex_extras = codex_extra_servers(Path.cwd())
+        codex_extras = codex_extra_servers(Path.cwd(), known=())
         _SETUP_CODEX_EXTRAS.set(codex_extras)
         if not json_mode:
-            echo_codex_extras(Path.cwd(), names=codex_extras, err=False)
+            echo_codex_extras(codex_extras, err=False)
         _SETUP_PLUGIN_BYPASS.set([row.as_json() for row in plugin_bypass])
         if not json_mode:
             _echo_plugin_bypass(plugin_bypass, err=False)
@@ -7305,14 +7307,16 @@ def prune(
             # remove for them; reported so "nothing to prune" is not read as
             # "everything routes through STM" (#1108).
             "plugin_bypass": [row.as_json() for row in plugin_bypass],
+            "codex_extra_servers": codex_extras,
         }
 
     data = _load(resolved, json_action="prune" if as_json else None)
     plugin_bypass = _plugin_bypass_servers(Path.cwd())
     _echo_plugin_bypass(plugin_bypass, err=as_json)
-    from memtomem_stm.cli.host_bypass import echo_codex_extras
+    from memtomem_stm.cli.host_bypass import codex_extra_servers, echo_codex_extras
 
-    echo_codex_extras(Path.cwd(), err=as_json)
+    codex_extras = codex_extra_servers(Path.cwd(), known=())
+    echo_codex_extras(codex_extras, err=as_json)
     upstreams: dict[str, dict[str, Any]] = data.get("upstream_servers", {})
     if not upstreams:
         if as_json:
@@ -7350,6 +7354,7 @@ def prune(
                     f"not dual-registered: {', '.join(sorted(missing))}",
                     names=sorted(missing),
                     plugin_bypass=[row.as_json() for row in plugin_bypass],
+                    codex_extra_servers=codex_extras,
                 )
             sys.exit(1)
         requested = set(names)
@@ -10199,14 +10204,14 @@ def doctor(
         if data is not None:
             from memtomem_stm.cli.host_bypass import codex_extra_servers
 
-            codex_extras = codex_extra_servers(Path.cwd())
+            codex_extras = codex_extra_servers(Path.cwd(), known=())
             if codex_extras:
                 check(
                     "codex_extra_servers",
                     "Codex MCP servers",
                     "WARN",
                     f"{len(codex_extras)} additional Codex MCP registration(s) absent from "
-                    "STM's config-file scan (possibly plugin-provided or from another "
+                    "this command's config-file scan (possibly plugin-provided or from another "
                     "Codex config layer; not imported): " + ", ".join(codex_extras),
                     "inspect in Codex; register with `mms add ... --validate` if needed, "
                     "then disable the direct copy in its host",

@@ -3132,6 +3132,7 @@ class TestInit:
             "servers": ["demo"],
             "client": "skip",
             "plugin_bypass": None,
+            "codex_extra_servers": None,
         }
 
     def test_init_demo_json_never_prompts_and_validates_by_default(
@@ -3416,7 +3417,7 @@ class TestInit:
                 # developer's real ``claude plugin list`` (#1108).
                 "import memtomem_stm.cli.proxy as p; "
                 "import memtomem_stm.cli.host_bypass as h; "
-                "h.codex_extra_servers = lambda _cwd: []; "
+                "h.codex_extra_servers = lambda _cwd, **kw: []; "
                 "p._plugin_bypass_servers = lambda _cwd: []; p.cli()",
                 "init",
                 "--config",

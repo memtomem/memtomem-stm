@@ -75,7 +75,7 @@ def test_effective_list_reports_only_extra_enabled_names(probe, tmp_path, capsys
     assert options["cwd"] == str(tmp_path.resolve())
     assert options["timeout"] == 5
     assert options["stdin"] == subprocess.DEVNULL
-    hb.echo_codex_extras(tmp_path)
+    hb.echo_codex_extras(hb.codex_extra_servers(tmp_path))
     output = capsys.readouterr()
     assert output.out == ""
     assert "possibly plugin-provided or from another Codex config layer" in output.err
@@ -87,7 +87,7 @@ def test_effective_list_reports_only_extra_enabled_names(probe, tmp_path, capsys
 )
 def test_probe_failure_is_nonfatal_and_does_not_echo_values(probe, tmp_path, capsys, error):
     probe["error"] = error
-    assert hb.codex_extra_servers(tmp_path) == []
+    assert hb.codex_extra_servers(tmp_path) is None
     output = capsys.readouterr()
     assert output.out == ""
     assert "additional registrations are not reported" in output.err
@@ -96,13 +96,13 @@ def test_probe_failure_is_nonfatal_and_does_not_echo_values(probe, tmp_path, cap
 
 def test_wrong_shape_is_nonfatal(probe, tmp_path, capsys):
     probe["records"] = {"canary": "secret"}
-    assert hb.codex_extra_servers(tmp_path) == []
+    assert hb.codex_extra_servers(tmp_path) is None
     assert "canary" not in capsys.readouterr().err
 
 
 def test_absent_codex_does_not_probe(probe, tmp_path, monkeypatch):
     monkeypatch.setattr(hb.shutil, "which", lambda _: None)
-    assert hb.codex_extra_servers(tmp_path) == []
+    assert hb.codex_extra_servers(tmp_path) is None
     assert probe["calls"] == []
 
 
@@ -128,6 +128,7 @@ def test_proxy_commands_report_extras_without_importing(probe, tmp_path, monkeyp
         assert "plugin-server" in row["detail"]
     else:
         assert "plugin-server" in result.stderr
+        assert payload["codex_extra_servers"] == ["plugin-server"]
     assert "canary" not in result.output
     assert config.read_bytes() == before
 
@@ -286,7 +287,10 @@ def test_opt_out_skips_both_host_listings(probe, tmp_path, monkeypatch, argv):
     assert "could not list" not in result.output
     if "--json" in argv:
         payload = json.loads(result.stdout)
-        assert "codex_extra_servers" not in payload
+        if argv[0] in {"init", "add", "prune"}:
+            assert payload["codex_extra_servers"] is None
+        else:
+            assert "codex_extra_servers" not in payload
         assert not any(c["id"] == "codex_extra_servers" for c in payload.get("checks", []))
 
 
@@ -297,6 +301,64 @@ def test_text_prune_reports_codex_names_on_stdout(probe, tmp_path):
     assert result.exit_code == 0, result.output
     assert "plugin-server" in result.stdout
     assert "plugin-server" not in result.stderr
+
+
+@pytest.mark.parametrize("command", ["init", "add", "select", "prune", "doctor"])
+def test_proxy_reports_codex_file_declarations_outside_its_scan(probe, tmp_path, command):
+    # Exercise real discovery: the proxy command family does not read Codex
+    # files, unlike `mms import` / `mms host`. No discovery stub can hide that.
+    codex = tmp_path / ".codex/config.toml"
+    codex.parent.mkdir()
+    codex.write_text('[mcp_servers.manual]\ncommand = "gh-mcp"\n')
+    before = codex.read_bytes()
+    probe["records"] = [record("manual")]
+    config = tmp_path / "proxy.json"
+    if command != "init":
+        config.write_text('{"upstream_servers": {}}')
+    args = {
+        "init": ["init", "--client", "skip"],
+        "add": ["add", "--from-clients", "--all"],
+        "select": ["add", "--from-clients", "--select", "manual"],
+        "prune": ["prune", "--all"],
+        "doctor": ["doctor"],
+    }[command]
+    result = CliRunner().invoke(cli, [*args, "--json", "--config", str(config)], input="")
+    assert result.exit_code == (1 if command in {"init", "select"} else 0), result.output
+    payload = json.loads(result.stdout)
+    if command == "doctor":
+        row = next(c for c in payload["checks"] if c["id"] == "codex_extra_servers")
+        assert row["status"] == "WARN"
+        assert "manual" in row["detail"]
+    else:
+        assert payload["codex_extra_servers"] == ["manual"]
+    if command == "select":
+        assert "manual is registered in Codex" in result.stderr
+    assert "Code / Cursor / Codex" not in result.output
+    assert codex.read_bytes() == before
+    assert len(probe["calls"]) == 1
+    if config.exists():
+        assert not json.loads(config.read_text())["upstream_servers"]
+
+
+@pytest.mark.parametrize("command", ["init", "add", "prune"])
+@pytest.mark.parametrize("failure", [False, True])
+def test_proxy_json_distinguishes_empty_list_from_failed_probe(probe, tmp_path, command, failure):
+    probe["records"] = []
+    if failure:
+        probe["error"] = OSError("canary-secret")
+    config = tmp_path / "proxy.json"
+    if command != "init":
+        config.write_text('{"upstream_servers": {}}')
+    args = {
+        "init": ["init", "--client", "skip"],
+        "add": ["add", "--from-clients", "--all"],
+        "prune": ["prune", "--all"],
+    }[command]
+    result = CliRunner().invoke(cli, [*args, "--json", "--config", str(config)], input="")
+    assert result.exit_code == (1 if command == "init" else 0), result.output
+    assert json.loads(result.stdout)["codex_extra_servers"] == (None if failure else [])
+    assert len(probe["calls"]) == 1
+    assert "canary-secret" not in result.output
 
 
 def test_codex_seam_forwards_noninteractive_probe_options(monkeypatch, tmp_path):

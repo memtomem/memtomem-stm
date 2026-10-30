@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import subprocess
+from collections.abc import Collection
 from pathlib import Path
 
 import click
@@ -28,15 +29,21 @@ def host_probes_disabled() -> bool:
     return os.environ.get("MMS_NO_HOST_PROBE") == "1"
 
 
-def codex_extra_servers(cwd: Path) -> list[str]:
+def codex_extra_servers(cwd: Path, *, known: Collection[str] | None = None) -> list[str] | None:
+    """Names outside this command's Codex scan, or None when no list was obtained.
+
+    Registry discovery reads Codex files (the default exclusion set). Proxy
+    commands do not, so they pass an empty set. Names seen in another host's
+    config must not hide a distinct Codex registration with the same name.
+    """
     if host_probes_disabled():
-        return []
+        return None
     # Late import avoids a module cycle with proxy's command registration.
     from memtomem_stm.cli.proxy import _plain_identifier, _run_codex_mcp
 
     executable = shutil.which("codex")
     if executable is None:
-        return []
+        return None
     try:
         result = _run_codex_mcp(
             [executable, "mcp", "list", "--json"],
@@ -52,9 +59,10 @@ def codex_extra_servers(cwd: Path) -> list[str]:
             "Note: could not list Codex MCP servers; additional registrations are not reported.",
             err=True,
         )
-        return []
+        return None
 
-    known = codex_declared_names(cwd)
+    if known is None:
+        known = codex_declared_names(cwd)
     extra: set[str] = set()
     for record in records:
         if not isinstance(record, dict) or record.get("enabled") is not True:
@@ -75,12 +83,10 @@ def codex_extra_servers(cwd: Path) -> list[str]:
     return sorted(extra)
 
 
-def echo_codex_extras(cwd: Path, *, names: list[str] | None = None, err: bool = True) -> list[str]:
-    if names is None:
-        names = codex_extra_servers(cwd)
+def echo_codex_extras(names: list[str] | None, *, err: bool = True) -> None:
     if names:
         click.echo(
-            f"Note: {len(names)} additional Codex MCP registration(s) are absent from STM's "
+            f"Note: {len(names)} additional Codex MCP registration(s) are absent from this command's "
             "config-file scan (possibly plugin-provided or from another Codex config layer; "
             "not imported): " + ", ".join(_disp(name) for name in names),
             err=err,
@@ -90,7 +96,6 @@ def echo_codex_extras(cwd: Path, *, names: list[str] | None = None, err: bool = 
             "then disable the direct copy in its host.",
             err=err,
         )
-    return names
 
 
 def report_host_bypass(cwd: Path, host: str = "all") -> None:
@@ -101,4 +106,4 @@ def report_host_bypass(cwd: Path, host: str = "all") -> None:
 
         _echo_plugin_bypass(_plugin_bypass_servers(cwd), err=True)
     if host in {"all", "codex"}:
-        echo_codex_extras(cwd)
+        echo_codex_extras(codex_extra_servers(cwd))

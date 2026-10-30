@@ -132,7 +132,7 @@ def _no_real_plugin_discovery(
 def _no_real_codex_discovery(request, monkeypatch):
     if request.node.get_closest_marker("real_codex_discovery"):
         return
-    monkeypatch.setattr("memtomem_stm.cli.host_bypass.codex_extra_servers", lambda _cwd: [])
+    monkeypatch.setattr("memtomem_stm.cli.host_bypass.codex_extra_servers", lambda _cwd, **kw: [])
 
 
 @pytest.fixture(autouse=True)
