@@ -269,6 +269,29 @@ def test_contributing_pytest_command_matches_ci() -> None:
     )
 
 
+def test_experimental_python_lane_matches_support_contract() -> None:
+    match = re.search(r"(?ms)^  test:\n.*?(?=^  \S|\Z)", _read(".github/workflows/ci.yml"))
+    assert match is not None
+    job = match.group()
+    assert "    continue-on-error: ${{ matrix.experimental == true }}" in job.splitlines()
+    rows = _matrix_rows(_matrix_block(job))
+    experimental = [row for row in rows if _row_values(row, "experimental") == ["true"]]
+    assert len(experimental) == 1
+    assert _row_values(experimental[0], "python") == ["3.14"]
+    assert _row_values(experimental[0], "os") == ["ubuntu-latest"]
+    supported = [row for row in rows if row not in experimental]
+    assert sorted(_row_values(row, "python")[0] for row in supported) == ["3.12", "3.12", "3.13"]
+    for doc in ("README.md", "CONTRIBUTING.md"):
+        content = _read(doc)
+        assert "3.14" in content and "experimental" in content
+        assert "`continue-on-error`" in content
+    project = tomllib.loads(_read("pyproject.toml"))["project"]
+    classifiers = project["classifiers"]
+    for version in ("3.12", "3.13"):
+        assert f"Programming Language :: Python :: {version}" in classifiers
+    assert "Programming Language :: Python :: 3.14" not in classifiers
+
+
 def test_readme_pytest_command_matches_ci() -> None:
     """README.md's Development ``pytest -m`` filter must match CI's verbatim.
 

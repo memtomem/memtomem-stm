@@ -4,6 +4,12 @@ Thank you for your interest in contributing to memtomem-stm!
 
 ## Development Setup
 
+Python 3.12 and 3.13 are supported runtimes. Python 3.14 is experimental;
+its Ubuntu CI test lane is advisory, not a required branch-protection check.
+It uses `continue-on-error` so its failure does not fail the workflow.
+Keep that lane running to detect compatibility regressions. The package classifiers
+list the supported 3.12/3.13 runtimes; experimental 3.14 is intentionally omitted.
+
 ```bash
 # Clone
 git clone https://github.com/memtomem/memtomem-stm.git
@@ -187,8 +193,10 @@ excludes the drift and performance suites. Before merging an advisory-fork fix:
 2. Compare the commands below with [the current CI workflow](.github/workflows/ci.yml).
    Use its uv version (currently 0.12.5), run from the repository root, and start
    with `uv sync --frozen --python 3.12`. Run the checks below, then switch with
-   `uv sync --frozen --python 3.13` and repeat the `test` row as CI does.
-   `--frozen` keeps verification on the committed lockfile.
+   `uv sync --frozen --python 3.13` and repeat the `test` row as CI does on Ubuntu.
+   Then `uv sync --frozen --python 3.14` and repeat the `test` row for experimental
+   compatibility coverage (advisory Ubuntu CI). `--frozen` keeps verification on
+   the committed lockfile.
 
    | CI job | Local command(s) |
    | --- | --- |
