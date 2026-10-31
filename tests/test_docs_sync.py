@@ -3312,3 +3312,23 @@ def test_daemon_docs_state_the_admission_and_pre_auth_budgets() -> None:
         )
     )
     assert f"more than {pre_auth} simultaneous connections" in hooks
+
+
+def test_plugin_servers_section_says_when_mcp_disables_were_not_read() -> None:
+    """#1289: the note says when ``/mcp`` disables were not read; docs quote it.
+
+    The header is read from the code, so rewording either side fails here, and
+    the JSON limits are pinned to the paragraph that makes the claim.
+    """
+    from memtomem_stm.cli import proxy
+
+    section = _heading_section(_read("docs/cli.md"), "Claude Code plugin servers", "docs/cli.md")
+    paragraph = _paragraph(section, "disabledMcpServers", "docs/cli.md")
+    for needed in (
+        f'"{proxy._DISABLES_UNREAD_HEADER}"',
+        "`doctor` appends the reason to its warning",
+        "the `plugin_bypass` rows themselves do not carry the reason",
+        "`init --json` prints no note",
+    ):
+        if needed not in paragraph:
+            pytest.fail(f"docs/cli.md plugin-servers paragraph lost {needed!r}")

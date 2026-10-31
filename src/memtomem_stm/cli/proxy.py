@@ -17,11 +17,13 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import textwrap
 import tomllib
 from collections.abc import Iterator
 from contextlib import AsyncExitStack, contextmanager, redirect_stderr, redirect_stdout
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from datetime import UTC, datetime
 from pathlib import Path
 from functools import wraps
@@ -4160,6 +4162,10 @@ class _PluginBypass:
     server: str
     transport: str
     scope: str
+    # Why STM did not read ``/mcp`` disables for the directory these rows were
+    # listed for, or None when it did (#1289): a key into
+    # ``_DISABLES_UNREAD_CAVEAT``. Not part of the row's identity or its JSON.
+    disables_unread: str | None = dataclass_field(default=None, compare=False)
 
     @property
     def runtime_name(self) -> str:
@@ -4205,7 +4211,20 @@ def _plugin_server_transport(raw: dict[str, Any]) -> str | None:
     return None
 
 
-def _claude_disabled_mcp_servers(cwd: Path) -> frozenset[str]:
+# What ``_echo_plugin_bypass`` adds when ``/mcp`` disables were not read
+# (#1289): the header, then the reason, which ``doctor`` also appends to its
+# WARN detail. docs/cli.md quotes the header.
+_DISABLES_UNREAD_HEADER = "Servers you disabled in `/mcp` may still be listed"
+_DISABLES_UNREAD_CAVEAT = {
+    "no_key": (
+        "STM cannot tell which project entry Claude Code uses here "
+        "(e.g. a linked worktree, a submodule or a symlinked `.git`)"
+    ),
+    "config_dir": "STM does not read `/mcp` state when CLAUDE_CONFIG_DIR is nonempty",
+}
+
+
+def _claude_disabled_mcp_servers(cwd: Path) -> tuple[frozenset[str], str | None]:
     """Names disabled for ``cwd`` in ``/mcp``, from ``~/.claude.json`` (#1268).
 
     ``/mcp`` records a disabled plugin server under
@@ -4217,27 +4236,31 @@ def _claude_disabled_mcp_servers(cwd: Path) -> frozenset[str]:
 
     The key is the one Claude Code uses for ``cwd``
     (:func:`~memtomem_stm.mms.claude_config.claude_project_key`): the
-    repository root. In a linked worktree, a submodule or behind a symlinked
-    ``.git`` there is no key and no disables are read, and an entry under any
-    other key is not one Claude Code reads for ``cwd``, so it hides nothing.
-    With ``CLAUDE_CONFIG_DIR`` set to a nonempty value, Claude Code reads its
-    config elsewhere and ``~/.claude.json`` may hold stale disables, so
-    nothing is read.
+    repository root. An entry under any other key is not one Claude Code reads
+    for ``cwd``, so it hides nothing.
 
-    Anything unreadable yields no names, so it never hides a server.
+    Returns the names and, when STM did not consult ``/mcp`` state for
+    ``cwd`` at all, why (a key into ``_DISABLES_UNREAD_CAVEAT``) so the caller
+    can say so next to the report (#1289): ``"no_key"`` when there is no key
+    (a linked worktree, a submodule, a symlinked ``.git``, or a ``cwd`` that
+    cannot be resolved), ``"config_dir"`` when ``CLAUDE_CONFIG_DIR`` is
+    nonempty, so Claude Code reads its config elsewhere and ``~/.claude.json``
+    may hold stale disables. Either way no names are returned. When the file
+    is consulted, anything unreadable in it yields no names and no reason, so
+    it never hides a server.
     """
     if os.environ.get("CLAUDE_CONFIG_DIR"):
-        return frozenset()
+        return frozenset(), "config_dir"
     key = claude_project_key(cwd)
     if key is None:
-        return frozenset()
+        return frozenset(), "no_key"
     cc = _read_json_safely(Path("~/.claude.json").expanduser())
     projects = cc.get("projects") if cc else None
     entry = projects.get(key) if isinstance(projects, dict) else None
     disabled = entry.get("disabledMcpServers") if isinstance(entry, dict) else None
     if not isinstance(disabled, list):
-        return frozenset()
-    return frozenset(name for name in disabled if isinstance(name, str))
+        return frozenset(), None
+    return frozenset(name for name in disabled if isinstance(name, str)), None
 
 
 _GIT_LOCATION_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
@@ -4325,7 +4348,8 @@ def _plugin_bypass_servers(cwd: Path) -> list[_PluginBypass]:
     enabled there comes from the settings Claude Code resolves for that
     directory. An enabled record whose install belongs to another repository
     is dropped (:func:`_plugin_record_runs_here`), and so is a server disabled
-    for ``cwd`` in ``/mcp`` (:func:`_claude_disabled_mcp_servers`).
+    for ``cwd`` in ``/mcp`` (:func:`_claude_disabled_mcp_servers`). When those
+    disables were not read, every row records why in ``disables_unread``.
 
     Fails open: no ``claude`` on PATH, a failed or timed-out call, or output
     that is not a JSON list yields no rows, and malformed records or servers
@@ -4363,7 +4387,7 @@ def _plugin_bypass_servers(cwd: Path) -> list[_PluginBypass]:
         )
         return []
 
-    disabled = _claude_disabled_mcp_servers(cwd)
+    disabled, unread = _claude_disabled_mcp_servers(cwd)
     root = _claude_project_root(cwd)
     rows: dict[tuple[str, str], _PluginBypass] = {}
     for record in records:
@@ -4396,12 +4420,19 @@ def _plugin_bypass_servers(cwd: Path) -> list[_PluginBypass]:
                 continue
             # A plugin installed at two scopes can appear twice; one row per server.
             rows.setdefault(
-                (plugin_id, server), _PluginBypass(plugin_id, server, transport, scope_label)
+                (plugin_id, server),
+                _PluginBypass(plugin_id, server, transport, scope_label, unread),
             )
     return sorted(
         (row for row in rows.values() if row.runtime_name not in disabled),
         key=lambda row: row.runtime_name,
     )
+
+
+def _disables_unread_caveat(rows: list[_PluginBypass]) -> str | None:
+    """Why ``/mcp`` disables were not read for ``rows``, or None when they were."""
+    reason = next((row.disables_unread for row in rows if row.disables_unread), None)
+    return None if reason is None else _DISABLES_UNREAD_CAVEAT[reason]
 
 
 def _echo_plugin_bypass(rows: list[_PluginBypass], *, err: bool) -> None:
@@ -4415,6 +4446,11 @@ def _echo_plugin_bypass(rows: list[_PluginBypass], *, err: bool) -> None:
     )
     for row in rows:
         click.echo(f"  {_disp(row.runtime_name)} ({row.transport}, {row.scope})", err=err)
+    caveat = _disables_unread_caveat(rows)
+    if caveat is not None:
+        click.echo(f"  {_DISABLES_UNREAD_HEADER}:", err=err)
+        for line in textwrap.wrap(f"{caveat}.", width=96):
+            click.echo(f"  {line}", err=err)
     click.echo(
         "  To route one through STM, register it with `mms add ... --validate` "
         "(see docs/cli.md), then disable the plugin's copy in `/mcp`",
@@ -10460,12 +10496,14 @@ def doctor(
             # is not evidence of complete coverage, so do not emit a PASS row.
             plugin_bypass = _plugin_bypass_servers(Path.cwd())
             if plugin_bypass:
+                caveat = _disables_unread_caveat(plugin_bypass)
                 check(
                     "plugin_bypass",
                     "plugin MCP servers",
                     "WARN",
                     f"{len(plugin_bypass)} Claude Code plugin MCP server(s) bypass STM: "
-                    + ", ".join(row.runtime_name for row in plugin_bypass),
+                    + ", ".join(row.runtime_name for row in plugin_bypass)
+                    + ("" if caveat is None else f"; `/mcp` disables not read: {caveat}"),
                     "register with `mms add ... --validate`, then disable the plugin's "
                     "copy in `/mcp`; see docs/cli.md#claude-code-plugin-servers",
                 )

@@ -9,6 +9,17 @@ upgrading. The convention starts after 0.1.31; older releases record behavior
 changes inline only. See the deprecation policy in
 [README](README.md#compatibility--deprecation-policy).
 
+## [Unreleased]
+
+### Fixed
+
+- The Claude Code plugin-server note (`init`, `add --from-clients`, `prune`,
+  `import`, `host status|scan|sync`) and `doctor`'s `plugin_bypass` warning now
+  say when STM did not read `/mcp` disables for the current directory — in a
+  linked worktree, a submodule or behind a symlinked `.git`, or with
+  `CLAUDE_CONFIG_DIR` nonempty — so a listed server may be one you already
+  disabled. The `plugin_bypass` JSON rows are unchanged. (#1289)
+
 ## [0.7.3] — 2026-10-31
 
 ### Upgrade notes
